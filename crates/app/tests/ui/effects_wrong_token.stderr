@@ -1,0 +1,37 @@
+error[E0271]: type mismatch resolving `<PaymentCreate as Subject>::Of == EmailSend`
+  --> tests/ui/effects_wrong_token.rs:12:32
+   |
+12 |     let _ = effects.send_email(approved_payment, body).await;
+   |                     ---------- ^^^^^^^^^^^^^^^^ expected `EmailSend`, found `PaymentCreate`
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+note: required by a bound in `Effects::send_email`
+  --> src/effects.rs
+   |
+   |     pub async fn send_email<A: Subject<Of = EmailSend>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::send_email`
+
+error[E0271]: type mismatch resolving `<PaymentCreate as Subject>::Of == EmailSend`
+  --> tests/ui/effects_wrong_token.rs:12:13
+   |
+12 |     let _ = effects.send_email(approved_payment, body).await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `EmailSend`, found `PaymentCreate`
+   |
+note: required by a bound in `Effects::send_email`
+  --> src/effects.rs
+   |
+   |     pub async fn send_email<A: Subject<Of = EmailSend>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::send_email`
+
+error[E0271]: type mismatch resolving `<PaymentCreate as Subject>::Of == EmailSend`
+  --> tests/ui/effects_wrong_token.rs:12:56
+   |
+12 |     let _ = effects.send_email(approved_payment, body).await;
+   |                                                        ^^^^^ expected `EmailSend`, found `PaymentCreate`
+   |
+note: required by a bound in `Effects::send_email`
+  --> src/effects.rs
+   |
+   |     pub async fn send_email<A: Subject<Of = EmailSend>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::send_email`

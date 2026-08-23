@@ -1,0 +1,13 @@
+error: cannot construct `Authorized<_>` with struct literal syntax due to private fields
+  --> tests/ui/gate_forge_literal.rs:15:18
+   |
+15 |     let forged = Authorized {
+   |                  ^^^^^^^^^^
+16 |         action,
+   |         ------ private field
+17 |         decision_id: DecisionId::new_v7(Utc::now()),
+   |         ------------------------------------------- private field
+18 |         reservation: None,
+   |         ----------------- private field
+   |
+   = note: ...and other private field `_seal` that was not provided

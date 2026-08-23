@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/effects_bare_action.rs:9:32
+  |
+9 |     let _ = effects.send_email(EmailSend { to }, body).await;
+  |                     ---------- ^^^^^^^^^^^^^^^^ expected `Authorized<_>`, found `EmailSend`
+  |                     |
+  |                     arguments to this method are incorrect
+  |
+  = note: expected struct `Authorized<_>`
+             found struct `agentos_app::effects::EmailSend`
+note: method defined here
+ --> src/effects.rs
+  |
+  |     pub async fn send_email<A: Subject<Of = EmailSend>>(
+  |                  ^^^^^^^^^^

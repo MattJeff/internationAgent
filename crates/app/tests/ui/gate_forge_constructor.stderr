@@ -1,0 +1,46 @@
+error[E0599]: no associated function or constant named `new` found for struct `Authorized<A>` in the current scope
+  --> tests/ui/gate_forge_constructor.rs:15:25
+   |
+15 |     let _ = Authorized::new(action());
+   |                         ^^^ associated function or constant not found in `Authorized<_>`
+
+error[E0277]: the trait bound `Authorized<Action>: From<Action>` is not satisfied
+  --> tests/ui/gate_forge_constructor.rs:18:42
+   |
+18 |     let _: Authorized<Action> = action().into();
+   |                                          ^^^^ the trait `From<Action>` is not implemented for `Authorized<Action>`
+   |
+   = note: required for `Action` to implement `Into<Authorized<Action>>`
+
+error[E0277]: the trait bound `Authorized<Action>: Default` is not satisfied
+  --> tests/ui/gate_forge_constructor.rs:21:33
+   |
+21 |     let _: Authorized<Action> = Default::default();
+   |                                 ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Authorized<Action>`
+
+error[E0277]: the trait bound `Authorized<Action>: serde::Deserialize<'de>` is not satisfied
+  --> tests/ui/gate_forge_constructor.rs:25:33
+   |
+25 |     let _: Authorized<Action> = serde_json::from_str("{}").unwrap();
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `Authorized<Action>`
+   |
+   = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `Authorized<Action>` type
+   = note: for types from other crates check whether the crate offers a `serde` feature flag
+   = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+             &'a Path
+             &'a RawValue
+             &'a [u8]
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+           and $N others
+note: required by a bound in `serde_json::from_str`
+  --> $CARGO/serde_json-$VERSION/src/de.rs
+   |
+   | pub fn from_str<'a, T>(s: &'a str) -> Result<T>
+   |        -------- required by a bound in this function
+   | where
+   |     T: de::Deserialize<'a>,
+   |        ^^^^^^^^^^^^^^^^^^^ required by this bound in `from_str`
