@@ -50,7 +50,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 
-rmcp = { version = "3.1.4", default-features = false }
+rmcp = { version = "3.1.4", default-features = false, features = [
+  "client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "client-side-sse",
+] }
 a2a-lf = "0.3"
 a2a-server-lf = "0.4"
 
