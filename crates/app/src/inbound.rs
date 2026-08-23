@@ -66,6 +66,14 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+// The server crate deliberately does not depend on `agentos-providers`: the
+// binary must not be able to reach a provider except through this crate's gated
+// facade. Webhook signature verification is the one thing the HTTP layer needs
+// before any of that machinery exists, so it is re-exported here rather than
+// duplicated or reached for directly.
+pub use agentos_providers::Secret;
+pub use agentos_providers::email::{SigError, WebhookHeaders, sign_webhook, verify_signature};
+
 /// `aggregate_type` of a stored raw webhook notice.
 pub const NOTICE_AGGREGATE: &str = "inbound";
 

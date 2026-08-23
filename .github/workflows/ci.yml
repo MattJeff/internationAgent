@@ -32,4 +32,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # One database per package, serialised inside a package. See scripts/test.sh
+      # for why a plain `cargo test --workspace` is flaky against a real Postgres.
+      - run: ./scripts/test.sh
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
