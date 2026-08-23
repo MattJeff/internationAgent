@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+  --> tests/ui/concat_into_system_prompt.rs:13:29
+   |
+13 |     let _ = system_prompt + untrusted;
+   |                             ^^^^^^^^^ expected `&str`, found `Untrusted<String>`
+   |
+   = note: expected reference `&str`
+                 found struct `agentos_domain::untrusted::Untrusted<String>`
