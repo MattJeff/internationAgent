@@ -49,10 +49,6 @@
 //! read the row. When there is: [`Endpoint`] grows a `scheme` field, the
 //! `verify` call below grows a `match`, and nothing else changes.
 
-// Nothing in the binary calls this router yet — the unit that assembles
-// `app()` mounts it. Without this the whole module is "dead" to rustc.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -77,8 +73,18 @@ use crate::error::ApiError;
 /// small enough that a flood of them cannot be an allocation attack.
 pub const MAX_WEBHOOK_BYTES: usize = 256 * 1024;
 
-/// `aggregate_type` of a stored raw delivery. The inbound loop selects on it.
+/// `aggregate_type` of a stored raw delivery.
 pub const RAW_AGGREGATE: &str = "webhook";
+
+/// The `event_type` a stored delivery from `provider` is filed under.
+///
+/// One function rather than two `format!`s, because the other one is in
+/// `main.rs`, where the outbox handler for it is registered — and an event
+/// nobody registered a handler for is retried eight times and then dead-
+/// lettered, which is a very quiet way to stop receiving email.
+pub fn received_event(provider: &str) -> String {
+    format!("webhook.{provider}.received")
+}
 
 /// One registered provider endpoint.
 ///
@@ -192,7 +198,7 @@ async fn ingest(
         // precisely what the loop works out from the payload; nil is the
         // stable placeholder the dedupe id derivation needs.
         aggregate_id: Uuid::nil(),
-        event_type: format!("webhook.{provider}.received"),
+        event_type: received_event(&provider),
         // The provider's own event id, from the header the signature covers.
         // A redelivery reuses it, so the second copy collapses onto the first.
         dedupe_key: Some(format!("{provider}:{}", headers.id)),

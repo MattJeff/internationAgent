@@ -23,6 +23,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
+use agentos_domain::ids::TenantId;
+
 use crate::auth::{ApiKeys, ApiKeysError};
 
 /// Where the listener binds when `APP_BIND` is unset.
@@ -67,6 +69,13 @@ pub enum ConfigError {
         detail: String,
     },
 
+    /// A webhook registration was not `provider:tenant-uuid:secret`.
+    #[error("AGENTOS_WEBHOOK_SECRETS entry {index} is not `provider:tenant-uuid:secret`")]
+    WebhookEntry {
+        /// Zero-based position of the offending entry.
+        index: usize,
+    },
+
     /// Mock adapters were configured without an explicit blessing.
     #[error(
         "refusing to start: {adapters} would run as mocks (set {vars} to use the real thing, \
@@ -106,6 +115,25 @@ pub struct Config {
     /// Adapters that will run as mocks in this process, derived from
     /// [`PROVIDER_CREDENTIALS`].
     pub mock_adapters: Vec<&'static str>,
+    /// `AGENTOS_WEBHOOK_SECRETS` — which provider callbacks this deployment
+    /// accepts, and whose. Empty means every `/v1/webhooks/{provider}` is a
+    /// 404, which is the right answer for a deployment that has integrated
+    /// nobody.
+    pub webhooks: Vec<WebhookRegistration>,
+}
+
+/// One provider callback endpoint.
+///
+/// The tenant is part of the registration and never comes off the wire: a
+/// delivery that could name its own tenant is a delivery that can write into
+/// somebody else's queue. See `routes::webhooks`.
+pub struct WebhookRegistration {
+    /// The `{provider}` path segment, e.g. `email`.
+    pub provider: String,
+    /// Whose queue deliveries here land in.
+    pub tenant_id: TenantId,
+    /// The secret their signatures are MACed with.
+    pub secret: String,
 }
 
 // Hand-written: a derived Debug would print the master key and the API keys
@@ -126,6 +154,14 @@ impl fmt::Debug for Config {
                 &format_args!("{} configured", self.api_keys.len()),
             )
             .field("mock_adapters", &self.mock_adapters)
+            .field(
+                "webhooks",
+                &self
+                    .webhooks
+                    .iter()
+                    .map(|hook| hook.provider.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -192,6 +228,8 @@ impl Config {
             });
         }
 
+        let webhooks = parse_webhooks(&get("AGENTOS_WEBHOOK_SECRETS").unwrap_or_default())?;
+
         Ok(Self {
             bind,
             public_host,
@@ -202,6 +240,7 @@ impl Config {
             rust_log: get("RUST_LOG").unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned()),
             api_keys,
             mock_adapters,
+            webhooks,
         })
     }
 
@@ -224,7 +263,45 @@ impl Config {
                  Set it to `label:tenant-uuid:secret[,…]`."
             );
         }
+        if self.webhooks.is_empty() {
+            tracing::warn!(
+                "AGENTOS_WEBHOOK_SECRETS is empty: every provider callback will be answered \
+                 404 and no inbound message can arrive. Set it to \
+                 `provider:tenant-uuid:signing-secret[,…]`."
+            );
+        }
     }
+}
+
+/// `provider:tenant-uuid:secret,…`, the same shape as the keyring next door so
+/// there is one format to learn rather than two.
+///
+/// An empty string is a valid, empty registry.
+fn parse_webhooks(raw: &str) -> Result<Vec<WebhookRegistration>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+        .map(|(index, entry)| {
+            // `splitn(3)` so a secret may contain colons — `whsec_…` ones do.
+            let mut fields = entry.splitn(3, ':');
+            let (Some(provider), Some(tenant), Some(secret)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(ConfigError::WebhookEntry { index });
+            };
+            if provider.is_empty() || secret.is_empty() {
+                return Err(ConfigError::WebhookEntry { index });
+            }
+            Ok(WebhookRegistration {
+                provider: provider.to_owned(),
+                tenant_id: tenant
+                    .parse()
+                    .map_err(|_| ConfigError::WebhookEntry { index })?,
+                secret: secret.to_owned(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -374,6 +451,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn webhook_registrations_are_optional_and_validated() {
+        let mut env = complete();
+        assert!(
+            parse(&env).expect("valid").webhooks.is_empty(),
+            "an unset registry registers nobody"
+        );
+
+        env.insert(
+            "AGENTOS_WEBHOOK_SECRETS",
+            format!("email:{TENANT}:whsec_has:colons:in:it"),
+        );
+        let config = parse(&env).expect("valid");
+        assert_eq!(config.webhooks.len(), 1);
+        assert_eq!(config.webhooks[0].provider, "email");
+        assert_eq!(config.webhooks[0].tenant_id.as_uuid().to_string(), TENANT);
+        assert_eq!(config.webhooks[0].secret, "whsec_has:colons:in:it");
+        // And the secret is not in the Debug rendering.
+        assert!(!format!("{config:?}").contains("whsec_"));
+
+        for bad in ["email", &format!("email:not-a-uuid:{SECRET}")] {
+            env.insert("AGENTOS_WEBHOOK_SECRETS", bad.to_owned());
+            assert!(matches!(
+                parse(&env),
+                Err(ConfigError::WebhookEntry { index: 0 })
+            ));
+        }
     }
 
     #[test]

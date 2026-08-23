@@ -44,19 +44,15 @@
 //! is testable by advancing an argument instead of sleeping through two hours
 //! of it. [`run`] is the only thing here that calls `Utc::now`.
 
-// ponytail: `main.rs` belongs to another unit and does not spawn this loop or
-// call `lag_secs` yet. Delete this the moment it does — every item below is
-// reachable from the tests, and from nowhere else in the binary.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentos_app::inbound::NOTICE_AGGREGATE;
 use agentos_store::db::{Db, StoreError, TenantTx};
-use agentos_store::outbox::{self, OutboxEvent};
+use agentos_store::outbox::{self, MAX_ATTEMPTS, OutboxEvent};
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -167,7 +163,12 @@ pub async fn run(db: Db, handlers: Handlers, cancel: CancellationToken) {
 /// `JoinSet` with a semaphore — not a second poller, which already works.
 async fn tick(db: &Db, handlers: &Handlers, now: DateTime<Utc>) -> Result<usize, StoreError> {
     let mut tx = db.admin_tx_bypassing_rls().await?;
-    let batch = outbox::claim(&mut tx, BATCH, now).await?;
+    // Everything except the inbound loop's rows. The two pollers share one
+    // table and only one of them has handlers for a webhook notice; claiming
+    // another poller's row burns an attempt off it for nothing, and eight of
+    // those is a customer's email in the dead-letter list. See
+    // [`outbox::claim_except`].
+    let batch = outbox::claim_except(&mut tx, Some(NOTICE_AGGREGATE), BATCH, now).await?;
     // Commit the lease before the first handler runs. See the module docs.
     tx.commit().await?;
 
@@ -277,14 +278,27 @@ async fn fail(db: &Db, event: &OutboxEvent, why: &str) {
 ///
 /// Only counts events that are *due*: an event deliberately backed off to five
 /// minutes from now is not lag, it is the backoff working.
+///
+/// And only events that will actually be claimed again. A dead letter is
+/// unpublished forever and its `available_at` is forever in the past, so
+/// counting one would make this number climb without bound and never come
+/// back down — one poison message would take every replica out of rotation,
+/// permanently, and no amount of draining would fix it. Lag is "the poller is
+/// behind"; a dead letter is "this effect will never happen", which is a
+/// different question with a different answer, and
+/// [`outbox::dead_letters`](agentos_store::outbox::dead_letters) is what
+/// answers it. Alert on that; do not fail readiness on it.
 pub async fn lag_secs(db: &Db) -> Result<i64, StoreError> {
     // Cross-tenant: the backlog is not any one tenant's.
     let mut tx = db.admin_tx_bypassing_rls().await?;
     let lag: Option<i64> = sqlx::query_scalar(
         "SELECT max(extract(epoch FROM now() - available_at))::bigint \
            FROM outbox_events \
-          WHERE published_at IS NULL AND available_at <= now()",
+          WHERE published_at IS NULL \
+            AND available_at <= now() \
+            AND attempt_count < $1::int",
     )
+    .bind(MAX_ATTEMPTS)
     .fetch_one(&mut *tx)
     .await?;
     tx.rollback().await?;
@@ -657,6 +671,26 @@ mod tests {
         // it is the backoff working.
         enqueue(&db, tenant, 3, now + TimeDelta::hours(1)).await;
         assert_eq!(lag_secs(&db).await.expect("lag"), 0);
+
+        // Nor is a dead letter. Its `available_at` is in the past and always
+        // will be, so counting it would take this replica — and every other
+        // one — out of rotation forever over a single poison message, with no
+        // way back. It is an alert (`outbox::dead_letters`), not a readiness
+        // signal.
+        let poisoned = enqueue(&db, tenant, 4, now - TimeDelta::hours(3)).await;
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("UPDATE outbox_events SET attempt_count = $2 WHERE id = $1")
+            .bind(poisoned)
+            .bind(MAX_ATTEMPTS)
+            .execute(&mut *tx)
+            .await
+            .expect("exhaust the attempts");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            lag_secs(&db).await.expect("lag"),
+            0,
+            "a dead letter must not read as a poller that is behind"
+        );
 
         drop_tenant(&db, tenant).await;
     }

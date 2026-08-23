@@ -26,6 +26,20 @@
 //!   implementation.
 //! * The card ships **unsigned**. See `agentos_app::a2a` for why.
 //!
+//! # Two routers, because they are authenticated differently
+//!
+//! [`card_router`] is mounted at the root and **outside** the API-key layer:
+//! discovery is what a peer does *before* it has anything, and a card behind a
+//! credential is a card nobody can fetch. The card is public information by
+//! construction — it is the document whose whole purpose is to be published —
+//! so it carries the employee's handle, address and capabilities and nothing
+//! else. [`router`] is the JSON-RPC binding and is mounted **inside** the API
+//! stack, because the peer's identity *is* the key's label.
+//!
+//! That split is why [`card`] takes no [`Principal`] and resolves the employee
+//! itself. The lookup is deployment-wide rather than tenant-scoped for the same
+//! reason: there is no credential to name a tenant with. See [`discover`].
+//!
 //! # Who the peer is
 //!
 //! From the credential, never from the body. The API key's label is the peer's
@@ -56,12 +70,6 @@
 //! `send_message`/`get_task`/`list_tasks` with three calls into `A2aExecutor`,
 //! and this comment with a `use`.
 
-// The router below is merged into the API stack by `main.rs`, a file this unit
-// does not own; until that line lands, every item here is unreachable from the
-// binary target and `dead_code` fires on all of them. Scoped to this module so
-// it cannot hide unused code anywhere else.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -69,7 +77,7 @@ use agentos_app::a2a::{agent_card, negotiate_version};
 use agentos_app::gate::{Denied, PolicyGate, Principal as ActingPrincipal};
 use agentos_domain::action::{Action, Domain};
 use agentos_domain::employee::{Employee, Step};
-use agentos_domain::ids::EmployeeId;
+use agentos_domain::ids::{EmployeeId, TenantId};
 use agentos_domain::untrusted::Untrusted;
 use agentos_store::a2a as tasks;
 use agentos_store::audit::AuditActor;
@@ -136,12 +144,17 @@ impl A2aState {
     }
 }
 
-/// The card at the root, the binding under `/a2a`.
+/// The JSON-RPC binding. Merge this **inside** the API stack.
 pub fn router(state: A2aState) -> Router {
     Router::new()
-        .route(CARD_PATH, get(card))
         .route(JSONRPC_PATH, post(jsonrpc))
         .with_state(state)
+}
+
+/// The agent card, at the root. Merge this **outside** the API stack — see the
+/// module docs.
+pub fn card_router(state: A2aState) -> Router {
+    Router::new().route(CARD_PATH, get(card)).with_state(state)
 }
 
 /// Which employee's endpoint this is.
@@ -196,11 +209,10 @@ const SKILLS: [(Step, &str, &str); 7] = [
 
 async fn card(
     State(state): State<A2aState>,
-    principal: Principal,
     Query(which): Query<Which>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
-    let id = resolve_employee(&mut tx, which.employee.as_deref()).await?;
+    let (tenant_id, id) = discover(&state.db, which.employee.as_deref()).await?;
+    let mut tx = state.db.tenant_tx(tenant_id).await?;
     let employee = employees::load(&mut tx, id).await?.employee;
     tx.commit().await?;
 
@@ -678,6 +690,56 @@ async fn resolve_employee(
     }
 }
 
+/// Whose card an *unauthenticated* peer reached, and which tenant it belongs
+/// to.
+///
+/// [`resolve_employee`]'s problem, one scope wider: there is no credential
+/// here, so there is no tenant to scope the lookup to, so the read bypasses row
+/// level security. That is safe for exactly this handler and nothing else — an
+/// agent card is a document whose purpose is to be published, and it carries
+/// only what a peer must know to talk to the employee.
+///
+/// ponytail: "the deployment's single active employee" is the same assumption
+/// the well-known path itself makes — one agent per public host — just stated
+/// at the deployment level rather than the tenant level, because that is the
+/// only level available without a key. A deployment with several answers 400
+/// naming the query parameter rather than picking one, and a peer that follows
+/// a published card always has `?employee=`, because that is the URL the card
+/// advertises. The upgrade, when one host really does serve many tenants, is a
+/// `Host`-header to tenant map read here.
+async fn discover(db: &Db, named: Option<&str>) -> Result<(TenantId, EmployeeId), ApiError> {
+    let named: Option<Uuid> = match named {
+        Some(raw) => Some(
+            raw.parse()
+                .map_err(|_| ApiError::bad_request("employee must be a UUID"))?,
+        ),
+        None => None,
+    };
+
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    // One statement for both shapes: a named employee is looked up by id, an
+    // unnamed one is the deployment's only active employee. `LIMIT 2` so
+    // "exactly one" is answerable without counting the whole table.
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, tenant_id FROM employees \
+          WHERE ($1::uuid IS NOT NULL AND id = $1) \
+             OR ($1::uuid IS NULL AND lifecycle = 'active') \
+          ORDER BY created_at, id LIMIT 2",
+    )
+    .bind(named)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    match rows.as_slice() {
+        [(id, tenant_id)] => Ok((TenantId::from_uuid(*tenant_id), EmployeeId::from_uuid(*id))),
+        [] => Err(ApiError::not_found()),
+        _ => Err(ApiError::bad_request(
+            "this deployment runs more than one employee; name one with ?employee=<uuid>",
+        )),
+    }
+}
+
 /// A store failure, as a protocol error. Never leaks SQL to a peer.
 fn unavailable(err: StoreError) -> RpcError {
     tracing::error!(error = %err, "a2a task store failed");
@@ -827,23 +889,30 @@ mod tests {
         )
     }
 
-    /// The app under test, with the auth layer that mints the `Principal` —
-    /// because the peer's identity is the key's label and nothing else.
+    /// The app under test, mounted the way `main::app` mounts it: the card
+    /// outside the key layer, the JSON-RPC binding inside it — because the
+    /// peer's identity is the key's label and nothing else.
     fn app(db: &Db, tenant: TenantId, peer: &str) -> Router {
         let keys = ApiKeys::parse(&format!("{peer}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
-        router(A2aState::new(db.clone(), gate(db), HOST)).layer(
-            axum::middleware::from_fn_with_state(keys, crate::auth::require_api_key),
-        )
+        let state = A2aState::new(db.clone(), gate(db), HOST);
+        card_router(state.clone()).merge(router(state).layer(axum::middleware::from_fn_with_state(
+            keys,
+            crate::auth::require_api_key,
+        )))
     }
 
     async fn get_json(app: Router, uri: &str) -> (StatusCode, Value) {
+        get_json_as(app, uri, Some(SECRET)).await
+    }
+
+    /// `secret` of `None` sends no `Authorization` header at all.
+    async fn get_json_as(app: Router, uri: &str, secret: Option<&str>) -> (StatusCode, Value) {
+        let mut request = HttpRequest::get(uri);
+        if let Some(secret) = secret {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+        }
         let response = app
-            .oneshot(
-                HttpRequest::get(uri)
-                    .header(header::AUTHORIZATION, format!("Bearer {SECRET}"))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+            .oneshot(request.body(Body::empty()).expect("request"))
             .await
             .expect("service");
         let status = response.status();
@@ -891,12 +960,43 @@ mod tests {
         assert!(CARD_PATH.starts_with('/'));
     }
 
+    /// The card is discovery, and discovery happens before a peer has
+    /// anything. A 401 here is a deployment no stranger can ever talk to.
+    #[tokio::test]
+    async fn the_card_needs_no_credential_but_the_binding_does() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let uri = format!("{CARD_PATH}?employee={}", employee.as_uuid());
+
+        let (status, card) = get_json_as(app(&db, tenant, PEER), &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{card:#}");
+        assert!(card["skills"].is_array());
+
+        // ... and the JSON-RPC path next to it is still refused without one.
+        let response = app(&db, tenant, PEER)
+            .oneshot(
+                HttpRequest::post(JSONRPC_PATH)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks"}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("service");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn the_card_is_served_at_the_root_and_carries_no_removed_fields() {
         let Some(db) = db().await else { return };
         let (tenant, employee) = seed(&db).await;
 
-        let (status, card) = get_json(app(&db, tenant, PEER), CARD_PATH).await;
+        let (status, card) = get_json(
+            app(&db, tenant, PEER),
+            &format!("{CARD_PATH}?employee={}", employee.as_uuid()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
 
         // The three fields v1.0 removed. Their absence is the version marker a
@@ -957,7 +1057,11 @@ mod tests {
             .expect("update");
         tx.commit().await.expect("commit");
 
-        let (_, card) = get_json(app(&db, tenant, PEER), CARD_PATH).await;
+        let (_, card) = get_json(
+            app(&db, tenant, PEER),
+            &format!("{CARD_PATH}?employee={}", employee.as_uuid()),
+        )
+        .await;
         let ids = card["skills"]
             .as_array()
             .expect("skills")

@@ -277,6 +277,28 @@ pub async fn record_notice(
     Ok((employee_id, id))
 }
 
+/// Turn one **verified** raw webhook body into a recorded notice.
+///
+/// The bridge between the HTTP edge and this module. `routes/webhooks.rs`
+/// stores the raw bytes and answers 202 without interpreting them — it cannot
+/// interpret them, because [`InboundNotice::parse`] lives in
+/// `agentos-providers` and the binary does not depend on it. So the parse
+/// happens here, later, driven by the outbox handler that claims the stored
+/// delivery.
+///
+/// `raw_body` must be the **exact bytes the signature was checked over**.
+/// Re-serialising them anywhere between the route and here would not break this
+/// function, but it would have broken the verification that makes calling it
+/// safe.
+pub async fn record_raw_email_notice(
+    tx: &mut TenantTx<'_>,
+    raw_body: &[u8],
+    now: DateTime<Utc>,
+) -> Result<(EmployeeId, Uuid), InboundError> {
+    let notice = InboundNotice::parse(raw_body)?;
+    record_notice(tx, &notice, now).await
+}
+
 /// The employee whose address is among `to`, if any.
 ///
 /// The local part is the employee slug (`lena@agents.example.com` -> `lena`),

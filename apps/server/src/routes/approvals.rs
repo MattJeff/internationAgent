@@ -107,10 +107,6 @@ pub struct Approvals {
 }
 
 /// Mount the approval routes.
-// ponytail: `main::app` merges this once U31–U34 are all in; until then nothing
-// in the binary calls it, and the allow keeps `-D warnings` honest about the
-// rest of the file rather than drowning in one known gap.
-#[allow(dead_code)]
 pub fn router(db: Db, gate: PolicyGate) -> Router {
     Router::new()
         .route("/v1/approvals", get(list))

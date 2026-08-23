@@ -278,6 +278,29 @@ pub async fn claim(
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
+    claim_except(conn, None, limit, now).await
+}
+
+/// [`claim`], minus one aggregate type.
+///
+/// This exists because a second poller exists. `outbox_events` is shared by
+/// every kind of asynchronous work, but not every kind is drained by the same
+/// loop: inbound webhook notices have their own poller with its own batch size,
+/// because one of them is two provider round trips and thirty-two of them is a
+/// minute. That poller filters its claim on `aggregate_type`; **this one has to
+/// filter too, or the two are not disjoint** — the general poller would claim a
+/// notice, find no handler registered for it, and burn one of its eight
+/// attempts. Eight polls later a customer's email is a dead letter that nobody
+/// asked for.
+///
+/// `None` claims everything, which is what a deployment running a single poller
+/// wants.
+pub async fn claim_except(
+    conn: &mut PgConnection,
+    skip_aggregate: Option<&str>,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> Result<Vec<OutboxEvent>, StoreError> {
     let rows = sqlx::query(
         "UPDATE outbox_events AS e \
          SET attempt_count = e.attempt_count + 1, \
@@ -291,6 +314,7 @@ pub async fn claim(
              WHERE published_at IS NULL \
                AND available_at <= $1::timestamptz \
                AND attempt_count < $2::int \
+               AND ($4::text IS NULL OR aggregate_type <> $4::text) \
              ORDER BY available_at, id \
              FOR UPDATE SKIP LOCKED \
              LIMIT $3::bigint) \
@@ -300,6 +324,7 @@ pub async fn claim(
     .bind(now)
     .bind(MAX_ATTEMPTS)
     .bind(limit)
+    .bind(skip_aggregate)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -619,6 +644,54 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "a claimed row must not be re-claimable"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// Two pollers, one table. The general one must leave the specialised
+    /// one's rows alone — it has no handler for them, so claiming one burns an
+    /// attempt off somebody's inbound email for nothing.
+    #[tokio::test]
+    async fn an_excluded_aggregate_is_left_for_its_own_poller() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let tenant = seed_tenant(&db, "excluded").await;
+
+        let mine = enqueue_committed(&db, tenant, &event(1), at(T0)).await;
+        let theirs = {
+            let mut e = NewEvent::new("inbound", Uuid::now_v7(), "email.received");
+            e.payload = json!({ "provider_message_id": "email_1" });
+            enqueue_committed(&db, tenant, &e, at(T0)).await
+        };
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim_except(&mut tx, Some("inbound"), 10, at(T0))
+            .await
+            .expect("claim");
+        tx.commit().await.expect("commit");
+
+        let ids: Vec<Uuid> = claimed.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![mine], "the other poller's row was taken");
+
+        // And it is untouched: no attempt burned, still due at the same instant.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT attempt_count FROM outbox_events WHERE id = $1")
+                .bind(theirs)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("attempt_count");
+        // An unfiltered claim still sees it, which is what makes the filter the
+        // thing under test rather than an artefact of the row being invisible.
+        let unfiltered = claim(&mut tx, 10, at(T0)).await.expect("claim");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(attempts, 0, "an excluded row must not be leased");
+        assert_eq!(
+            unfiltered.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![theirs]
         );
 
         drop_tenant(&db, tenant).await;

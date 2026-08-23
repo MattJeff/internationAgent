@@ -43,14 +43,6 @@
 //! [`StoreError::NotFound`], and is answered **404** — not 403, which would
 //! confirm the id exists.
 
-// ponytail: `router` is called by `app()` in main.rs, which is another unit's
-// file and does not merge the route units in yet. Until it does, every item
-// below is unreachable from the *binary* target — reachable from the test
-// target, which is where the whole module is exercised — and `-D warnings`
-// turns that into a build failure. Delete this line the moment main.rs merges
-// this router; it is the only thing hiding a genuinely unused item here.
-#![allow(dead_code)]
-
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Health, Lifecycle, ProviderBinding, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, Slug};
@@ -83,11 +75,17 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
 
 /// The `aggregate_type` every event in this module is filed under.
-const AGGREGATE: &str = "employee";
+pub const AGGREGATE: &str = "employee";
 
 /// The event the provisioning loop waits for. Its payload carries nothing the
 /// loop cannot re-read from the database — the id is the message.
-const CREATED_EVENT: &str = "employee.created";
+pub const CREATED_EVENT: &str = "employee.created";
+
+/// The event a lifecycle move is filed under. `main.rs` registers the outbox
+/// handlers by these names, so they are built here rather than spelled twice.
+pub fn lifecycle_event(to: Lifecycle) -> String {
+    format!("{AGGREGATE}.{}", to.as_str())
+}
 
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack`.
@@ -430,11 +428,7 @@ async fn set_lifecycle(
                 "to": to.as_str(),
             }),
             dedupe_key: Some(format!("lifecycle:{}:{next_version}", id.as_uuid())),
-            ..NewEvent::new(
-                AGGREGATE,
-                id.as_uuid(),
-                format!("{AGGREGATE}.{}", to.as_str()),
-            )
+            ..NewEvent::new(AGGREGATE, id.as_uuid(), lifecycle_event(to))
         },
         now,
     )

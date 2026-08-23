@@ -56,11 +56,6 @@
 //! re-reads the *same* turn event instead of queueing a second one. Both
 //! guards are `agentos_app::inbound`'s and both key on the same dedupe key.
 
-// ponytail: `main.rs` belongs to another unit and does not spawn this loop yet.
-// Delete this the moment it does — every item below is reachable from the
-// tests, and from nowhere else in the binary.
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;

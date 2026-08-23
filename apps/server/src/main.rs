@@ -40,9 +40,15 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentos_domain::ids::{IdempotencyKey, TenantId};
-use agentos_store::db::Db;
+use agentos_app::gate::{PolicyBook, PolicyGate};
+use agentos_app::inbound::{BlobStore, InMemoryBlobs, Secret, record_raw_email_notice};
+use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
+use agentos_domain::employee::{Lifecycle, Step};
+use agentos_domain::ids::{EmployeeId, IdempotencyKey, TenantId};
+use agentos_store::db::{Db, TenantTx};
+use agentos_store::employee as employee_store;
 use agentos_store::idempotency::{self, Begin};
+use agentos_store::outbox::OutboxEvent;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -50,9 +56,12 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -63,6 +72,10 @@ use tracing_subscriber::EnvFilter;
 use crate::auth::{ApiKeys, Principal};
 use crate::config::{Config, ConfigError};
 use crate::error::ApiError;
+use crate::loops::outbox::{Handled, Handlers};
+use crate::loops::provisioning::ProvisioningLoop;
+use crate::routes::a2a::A2aState;
+use crate::routes::webhooks::{Endpoint, Webhooks};
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
@@ -82,6 +95,16 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// defaults to 30s) or the pod is killed mid-drain and the deadline never
 /// applies.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// What the three loops get *after* the HTTP surface has drained.
+///
+/// They are cancelled at the same instant as the listener, so this is the tail
+/// of a window they have already been draining in, not a second full one.
+/// `DRAIN_DEADLINE + LOOP_DRAIN_DEADLINE` still has to fit inside the
+/// orchestrator's grace period: a loop that outlives the drain is a pod that
+/// will not die, so past this deadline the task is aborted rather than waited
+/// for.
+const LOOP_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Oldest unpublished outbox event we will still call "ready", in seconds.
 /// Beyond it the poller is wedged and this replica should stop taking work.
@@ -136,20 +159,95 @@ async fn serve_until_signal(config: Config) -> Result<(), BootError> {
     let db = Db::connect(&config.database_url).await?;
     db.migrate().await?;
 
-    // ponytail: U35–U37 spawn their loops here, and their JoinHandles belong in
-    // the drain below so a SIGTERM stops them too. Nothing to spawn yet.
+    // Built once and shared. A gate per router is a gate with a different
+    // policy book on each, and a second set of adapters is a second mock inbox
+    // that the first one's messages are not in.
+    //
+    // ponytail: `PolicyBook::default()` is the empty platform layer, which
+    // grants nothing — the documented behaviour of an unconfigured gate, and
+    // the correct one. There is no `policies` table and no configuration
+    // format for one yet; when there is, it is loaded here and nothing else
+    // changes.
+    let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+    let ports = Arc::new(agentos_app::mocks::ports());
+    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
+    let engine = ProvisioningEngine::new(
+        db.clone(),
+        agentos_app::mocks::adapters(),
+        EngineConfig::default(),
+    );
+
+    // One token for all three, cancelled by the same signal that stops the
+    // listener, so the loops drain *alongside* the HTTP surface rather than
+    // after it.
+    let cancel = CancellationToken::new();
+    let loops = vec![
+        (
+            "provisioning",
+            tokio::spawn(ProvisioningLoop::new(db.clone(), engine).run(cancel.clone())),
+        ),
+        (
+            "outbox",
+            tokio::spawn(loops::outbox::run(
+                db.clone(),
+                handlers(&config),
+                cancel.clone(),
+            )),
+        ),
+        (
+            "inbound",
+            tokio::spawn(loops::inbound::run(
+                db.clone(),
+                ports,
+                blobs,
+                cancel.clone(),
+            )),
+        ),
+    ];
 
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "listening");
 
-    serve(
+    let served = serve(
         listener,
-        app(db, config.api_keys.clone()),
-        shutdown_signal(),
+        app(db, &config, gate),
+        {
+            let cancel = cancel.clone();
+            async move {
+                shutdown_signal().await;
+                cancel.cancel();
+            }
+        },
         DRAIN_DEADLINE,
     )
-    .await?;
+    .await;
+
+    // Belt and braces: `serve` also returns when the listener fails, and a
+    // process that stops serving must not leave three loops running.
+    cancel.cancel();
+    drain_loops(loops, LOOP_DRAIN_DEADLINE).await;
+
+    served?;
     Ok(())
+}
+
+/// Wait for each loop to notice the token, and abandon any that will not.
+async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Duration) {
+    let until = Instant::now() + deadline;
+    for (name, mut handle) in loops {
+        let left = until.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, &mut handle).await {
+            Ok(Ok(())) => tracing::info!(loop_name = name, "loop drained"),
+            Ok(Err(err)) => tracing::error!(loop_name = name, error = %err, "loop panicked"),
+            Err(_) => {
+                // Aborting, not waiting: whatever it was doing is a row in
+                // Postgres with a lease that expires, and the replacement pod
+                // will find it. A pod that will not die is worse.
+                handle.abort();
+                tracing::error!(loop_name = name, "loop did not stop in time; aborted");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,21 +255,285 @@ async fn serve_until_signal(config: Config) -> Result<(), BootError> {
 // ---------------------------------------------------------------------------
 
 /// The whole HTTP surface.
-fn app(db: Db, keys: ApiKeys) -> Router {
-    // ponytail: U31–U34 `.merge()` their routers into `api`, above the
-    // `with_api_stack` call so they inherit it. Nothing else to do here.
+///
+/// Two tiers, and which router goes in which is a security decision:
+///
+/// * **inside `with_api_stack`** — everything a *customer* calls. Auth, then
+///   the per-tenant rate limit, then idempotency.
+/// * **outside it, inside `with_outer_stack`** — everything a *stranger*
+///   calls: provider webhooks, which carry a signature instead of an API key,
+///   and the A2A agent card, which is the document a peer fetches before it
+///   has anything at all. They still get a request id, a trace, the body limit
+///   and the timeout.
+///
+/// ponytail: the rate limiter is *not* on that second tier, and cannot be —
+/// it is keyed on the tenant from the credential, and there is no credential
+/// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
+/// per-source limit belongs at the ingress proxy, which is also the only thing
+/// that can see the real client address.
+fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
     let api = with_api_stack(
-        Router::new().route("/v1/whoami", get(whoami)),
+        Router::new()
+            .route("/v1/whoami", get(whoami))
+            .merge(routes::employees::router(db.clone()))
+            .merge(routes::approvals::router(db.clone(), gate.clone()))
+            .merge(routes::a2a::router(a2a_state(&db, &gate, config))),
         db.clone(),
-        keys,
+        config.api_keys.clone(),
     );
+
+    // No credential, by design. See the doc comment.
+    let public = routes::webhooks::router(db.clone(), webhooks(config))
+        .merge(routes::a2a::card_router(a2a_state(&db, &gate, config)));
 
     let health = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .with_state(db);
 
-    with_outer_stack(health.merge(api))
+    with_outer_stack(health.merge(public).merge(api))
+}
+
+fn a2a_state(db: &Db, gate: &PolicyGate, config: &Config) -> A2aState {
+    A2aState::new(db.clone(), gate.clone(), &config.public_host)
+}
+
+/// The provider callback endpoints this deployment accepts, from the one place
+/// that reads the environment.
+fn webhooks(config: &Config) -> Webhooks {
+    Webhooks::new(
+        config
+            .webhooks
+            .iter()
+            .map(|hook| {
+                (
+                    hook.provider.clone(),
+                    Endpoint {
+                        tenant_id: hook.tenant_id,
+                        secret: Secret::new(&hook.secret),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The outbox dispatch table
+// ---------------------------------------------------------------------------
+
+/// Every event type this build can emit, and what it means.
+///
+/// **An event with no entry here is not skipped, it is failed** — retried
+/// eight times and then dead-lettered. That is the outbox's design and it is
+/// the right one, but it makes this function load-bearing in a way that is
+/// easy to miss: forgetting a row is a side effect that silently never
+/// happens, *and* a permanently unpublished row, which `/readyz` eventually
+/// reports as lag. If you add an `enqueue` anywhere, add a line here.
+fn handlers(config: &Config) -> Handlers {
+    let mut handlers = Handlers::default()
+        .on(routes::employees::CREATED_EVENT, Arc::new(on_created))
+        .on(
+            routes::employees::lifecycle_event(Lifecycle::Suspended),
+            Arc::new(on_lifecycle),
+        )
+        .on(
+            routes::employees::lifecycle_event(Lifecycle::Terminated),
+            Arc::new(on_lifecycle),
+        )
+        .on("employee.step.ready", Arc::new(on_step_ready))
+        .on("employee.step.pending_external", Arc::new(on_step_noted))
+        .on("employee.step.failed", Arc::new(on_step_noted))
+        .on(agentos_app::inbound::TURN_EVENT, Arc::new(on_turn));
+
+    // One per registered provider: the event type carries the provider's name,
+    // so the table cannot be keyed on a wildcard.
+    for hook in &config.webhooks {
+        handlers = handlers.on(
+            routes::webhooks::received_event(&hook.provider),
+            Arc::new(on_webhook),
+        );
+    }
+    handlers
+}
+
+/// `employee.created`: confirm the provisioner actually has a job.
+///
+/// Nothing here *starts* provisioning. The loop claims off `employee_resources`
+/// directly — the eleven `pending` rows the same transaction wrote — so the
+/// pipeline is connected by the rows, not by this event. What this handler adds
+/// is that the connection is falsifiable: an accepted employee with no
+/// claimable resource row is an employee nobody will ever provision, and
+/// finding that out as a retried outbox event beats finding it out as a support
+/// ticket next week.
+fn on_created<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let claimable: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM employee_resources WHERE employee_id = $1 AND state = 'pending'",
+        )
+        .bind(event.aggregate_id)
+        .fetch_one(&mut ***tx)
+        .await
+        .map_err(|err| format!("could not read the employee's resources: {err}"))?;
+
+        if claimable == 0 {
+            return Err(
+                "this employee was accepted with no pending resource row, so the provisioning \
+                 loop has nothing to claim and it will never be provisioned"
+                    .to_owned(),
+            );
+        }
+        tracing::info!(
+            employee_id = %event.aggregate_id,
+            steps = claimable,
+            "employee accepted; the provisioning loop has work"
+        );
+        Ok(())
+    })
+}
+
+/// `employee.step.ready`: activate the employee once it can do its job.
+///
+/// This is the transition nothing else in the system performs, and without it
+/// an employee is a row: [`PolicyGate`] refuses every action for a principal
+/// that is not [`Lifecycle::Active`], and `Employee::health` never reports
+/// `online`. The rule is the domain's own — every *blocking* step ready — so an
+/// optional channel still in flight degrades the employee rather than holding
+/// it in `draft` forever.
+///
+/// Only from `draft`. Re-activating a suspended employee because a late
+/// provisioning callback landed would be a webhook un-suspending someone.
+fn on_step_ready<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let id = EmployeeId::from_uuid(event.aggregate_id);
+        let stored = employee_store::load(tx, id)
+            .await
+            .map_err(|err| format!("could not load the employee: {err}"))?;
+        let mut employee = stored.employee;
+
+        let ready = Step::ALL
+            .into_iter()
+            .filter(|step| step.is_blocking())
+            .all(|step| employee.resource(step).is_ready());
+        if employee.lifecycle() != Lifecycle::Draft || !ready {
+            return Ok(());
+        }
+
+        employee
+            .set_lifecycle(Lifecycle::Active, Utc::now())
+            .map_err(|err| format!("could not activate the employee: {err}"))?;
+        employee_store::update(tx, &employee, stored.version)
+            .await
+            .map_err(|err| format!("could not record the activation: {err}"))?;
+
+        tracing::info!(employee_id = %event.aggregate_id, "every blocking step is ready; active");
+        Ok(())
+    })
+}
+
+/// `employee.step.pending_external` / `employee.step.failed`: noted.
+///
+/// Deliberately not an escalation. The provisioning loop's own reaper owns
+/// that decision, because it is the thing that knows whether the deadline has
+/// actually passed — asking a human the moment a step reports a three-day
+/// bundle review would be one approval per bundle per poll.
+fn on_step_noted<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        // Read outside the macro: inside one, `Value` resolves to tracing's own
+        // trait of that name rather than serde_json's type.
+        let step = field(event, "step");
+        let state = field(event, "state");
+        tracing::warn!(
+            employee_id = %event.aggregate_id,
+            step,
+            state,
+            "a provisioning step did not reach ready"
+        );
+        Ok(())
+    })
+}
+
+/// One string field of an event payload, or `"?"`.
+fn field<'a>(event: &'a OutboxEvent, key: &str) -> &'a str {
+    event
+        .payload
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+}
+
+/// `employee.suspended` / `employee.terminated`: recorded, and nothing else.
+///
+/// ponytail: **this is a stub, and the gap is real.** Terminating an employee
+/// should release what it holds — cancel the phone number, close the mailbox,
+/// revoke the browser context — and that is a provider call per bound
+/// resource, which needs an `Authorized<A>` and a `release` on each adapter
+/// that no adapter has. Until then a terminated employee stops being able to
+/// act (the gate refuses anything that is not `Active`) but is still billed
+/// for its number. The upgrade is a `release_step` on the provisioning engine
+/// and this handler calling it per bound resource.
+fn on_lifecycle<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        tracing::warn!(
+            employee_id = %event.aggregate_id,
+            event_type = %event.event_type,
+            "lifecycle change recorded; provider resources are NOT released — see on_lifecycle"
+        );
+        Ok(())
+    })
+}
+
+/// `webhook.{provider}.received`: the raw delivery becomes an inbound notice.
+///
+/// The missing joint. The webhook route stores the bytes it verified and
+/// answers 202 without interpreting them — it cannot interpret them, because
+/// the parser lives in `agentos-providers` and the binary does not depend on
+/// it. The inbound loop, meanwhile, claims rows with `aggregate_type =
+/// 'inbound'` and an `email.received` payload it can read. Nothing wrote one.
+/// This does, through `agentos_app`, in the transaction that publishes the
+/// delivery — so a crash between the two re-runs both.
+fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "this stored delivery has no body".to_owned())?;
+
+        // Exactly the bytes the signature was checked over at the edge.
+        let (employee_id, notice) = record_raw_email_notice(tx, body.as_bytes(), Utc::now())
+            .await
+            .map_err(|err| format!("{}: {err}", err.code()))?;
+
+        tracing::info!(%employee_id, %notice, "webhook delivery queued for the inbound loop");
+        Ok(())
+    })
+}
+
+/// `agent.turn.requested`: acknowledged, and the agent does not run.
+///
+/// ponytail: **the other real stub.** Running a turn needs
+/// [`agentos_app::turn::Turn`], which needs an `Arc<dyn Llm>` — and this build
+/// has no LLM adapter, only a mock that replays a script written by whoever
+/// constructed it, which is not a thing a server can construct. So an inbound
+/// message lands, its conversation and its `messages` row are written, and
+/// nobody answers it.
+///
+/// Acknowledging rather than failing is the lesser of two bad options: failing
+/// would dead-letter every inbound message after eight retries and take
+/// `/readyz` down with the backlog, which hides the same gap behind an outage.
+/// The `warn` is the signal. Wiring it up is one `Turn::new` here plus a real
+/// `Llm` behind a constructor in `agentos-app`, next to `mocks::ports`.
+fn on_turn<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let message_id = field(event, "message_id");
+        tracing::warn!(
+            conversation_id = %event.aggregate_id,
+            message_id,
+            "a turn was requested and no agent ran: this build has no LLM adapter"
+        );
+        Ok(())
+    })
 }
 
 /// request-id → trace → body limit → timeout. Applies to health probes too:
@@ -233,31 +595,18 @@ async fn livez() -> &'static str {
 /// and is the outbox draining? A wedged outbox means side effects are being
 /// accepted and not performed, which is worse than refusing the request.
 async fn readyz(State(db): State<Db>) -> Response {
-    // Cross-tenant by nature: the poller's backlog is not any one tenant's.
-    let mut tx = match db.admin_tx_bypassing_rls().await {
-        Ok(tx) => tx,
-        Err(err) => {
-            tracing::warn!(error = %err, "not ready: no database connection");
-            return not_ready("database").into_response();
-        }
-    };
-
-    let lag: Option<i64> = match sqlx::query_scalar(
-        "SELECT max(extract(epoch FROM now() - available_at))::bigint \
-           FROM outbox_events \
-          WHERE published_at IS NULL AND available_at <= now()",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    {
+    // The poller's own definition of "behind", not a second copy of it that
+    // could disagree with the loop it is reporting on. Cross-tenant by nature:
+    // the backlog is not any one tenant's, and `lag_secs` opens the admin
+    // transaction that says so.
+    let lag = match loops::outbox::lag_secs(&db).await {
         Ok(lag) => lag,
         Err(err) => {
-            tracing::warn!(error = %err, "not ready: outbox query failed");
+            tracing::warn!(error = %err, "not ready: could not measure the outbox");
             return not_ready("database").into_response();
         }
     };
 
-    let lag = lag.unwrap_or(0);
     if lag > MAX_OUTBOX_LAG_SECS {
         tracing::warn!(lag_secs = lag, "not ready: the outbox is not draining");
         return not_ready("outbox_lag").into_response();

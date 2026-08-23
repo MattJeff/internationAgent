@@ -9,6 +9,7 @@ pub mod gate; // U20
 pub mod inbound; // U29
 pub mod knowledge; // U26
 pub mod mcp; // U27
+pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod prompt; // U23
 pub mod provisioning; // U24
 pub mod secrets; // U22

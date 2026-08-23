@@ -55,11 +55,6 @@
 //! behind, which costs a human a reconciliation; finishing the employee in
 //! flight costs a few seconds of drain.
 
-// ponytail: the binary does not wire this in yet — main.rs is another unit's
-// file and says so. Without this, every item below is dead code in the bin
-// target and `-D warnings` fails on a module that is complete and tested.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -186,6 +181,15 @@ impl<C: Converge> ProvisioningLoop<C> {
     }
 
     /// Override the knobs.
+    ///
+    /// ponytail: the last `allow(dead_code)` in this binary, and a narrow one.
+    /// `main.rs` takes [`LoopConfig::default`] — a 200ms poll is the right
+    /// answer for every deployment so far, and a knob wired to an environment
+    /// variable nobody sets is a knob that only exists to be wrong. The tests
+    /// below do use it, to poll at 10ms instead of sleeping through the
+    /// default, so this is "unused in the binary" rather than "unused". Delete
+    /// the attribute the day a deployment needs a different rate.
+    #[allow(dead_code)]
     #[must_use]
     pub fn with_config(mut self, cfg: LoopConfig) -> Self {
         self.cfg = cfg;
