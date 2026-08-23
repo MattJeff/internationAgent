@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 agentos-domain.workspace = true
 async-trait.workspace = true
+aes-gcm.workspace = true
 base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
