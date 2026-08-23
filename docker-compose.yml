@@ -1,27 +1,23 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    # pg18 + pgvector >= 0.8.6: 0.8.3-0.8.6 fixed HNSW vacuum index corruption
+    # and IVFFlat buffer overflows present in the 0.8.0-0.8.2 era images.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: agentos
-    ports: ["5432:5432"]
-    volumes: [pgdata:/var/lib/postgresql/data]
-
-  nats:
-    image: nats:2
-    command: ["-js", "-m", "8222"]
-    ports: ["4222:4222", "8222:8222"]
-
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
-    ports: ["9000:9000", "9001:9001"]
-    volumes: [miniodata:/data]
+    # ponytail: host ports offset to 54xx so this stack never collides with the
+    # other Postgres containers already running on this machine.
+    ports: ["5442:5432"]
+    # pg18+ wants the mount at /var/lib/postgresql, NOT .../data — the image
+    # refuses to start on the old path. See docker-library/postgres#1259.
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agentos"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
 volumes:
   pgdata:
-  miniodata:

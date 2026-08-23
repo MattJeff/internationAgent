@@ -1,0 +1,27 @@
+[package]
+name = "agentos-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# agentos-providers is deliberately absent: the server may not touch a provider
+# directly, it goes through agentos-app's Effects facade which requires an
+# Authorized<A> token minted by the Policy Gate.
+[dependencies]
+agentos-app.workspace = true
+agentos-domain.workspace = true
+agentos-store.workspace = true
+axum.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

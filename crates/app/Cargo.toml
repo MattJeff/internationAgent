@@ -1,22 +1,26 @@
 [package]
-name = "agentos-domain"
+name = "agentos-app"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-# Deliberately has NO tokio, NO sqlx, NO reqwest, NO async-trait.
-# The absence of those dependencies is what enforces that business rules
-# cannot reach the network or the database. Do not add I/O deps here.
 [dependencies]
+agentos-domain.workspace = true
+agentos-providers.workspace = true
+agentos-store.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
-unicode-normalization.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
 trybuild.workspace = true

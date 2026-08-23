@@ -1,26 +1,64 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
   "crates/domain",
-  "crates/core",
-  "apps/api",
+  "crates/store",
+  "crates/providers",
+  "crates/app",
+  "apps/server",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.88"
+# sqlx 0.9.0 declares rust-version = 1.94.0; anything lower cannot build the workspace.
+rust-version = "1.94"
 
 [workspace.dependencies]
+agentos-domain = { path = "crates/domain" }
+agentos-store = { path = "crates/store" }
+agentos-providers = { path = "crates/providers" }
+agentos-app = { path = "crates/app" }
+
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "request-id", "cors"] }
+tokio-util = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "request-id", "limit", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-normalization = "0.1"
+url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
+zeroize = "1"
+
+sqlx = { version = "0.9", default-features = false, features = [
+  "runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "migrate", "macros",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+rmcp = { version = "3.1.4", default-features = false }
+a2a-lf = "0.3"
+a2a-server-lf = "0.4"
+
+# dev
+proptest = "1"
+trybuild = "1"
+
+[profile.dev]
+# The workspace is test-heavy and the dependency tree is large; without this a
+# `cargo test` cycle spends most of its time in codegen for crates we never step through.
+opt-level = 0
+debug = 1
