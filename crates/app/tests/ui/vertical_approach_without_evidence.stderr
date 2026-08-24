@@ -1,0 +1,19 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/vertical_approach_without_evidence.rs:11:5
+   |
+11 |     Approach(Outreach {
+   |     ^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/vertical.rs
+   |
+   | pub struct Approach(crate::revenue::Outreach);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^ private field
+help: you might have meant to use the `new` associated function
+   |
+11 -     Approach(Outreach {
+12 -         subject: "your booking flow is wrong".to_owned(),
+13 -         body: "trust me".to_owned(),
+14 -     })
+11 +     Approach::new(_, _)
+   |

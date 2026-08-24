@@ -45,10 +45,12 @@ use std::time::{Duration, Instant};
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyBook, PolicyGate, Principal as ActingAs};
 use agentos_app::inbound::{BlobStore, InMemoryBlobs, Secret, record_raw_email_notice};
+use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::prompt::SystemPrompt;
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
 use agentos_app::turn::{Context, Turn, TurnError};
+use agentos_app::vertical::Charter;
 use agentos_domain::employee::{Lifecycle, Step};
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
 use agentos_domain::untrusted::Untrusted;
@@ -746,34 +748,87 @@ impl Agent {
                 .map_err(|err| format!("could not load the employee: {err}"))?
                 .employee;
 
+            // What this employee was hired to do, if anybody said. `None` is an
+            // employee that answers its mail and has no standing objective,
+            // which is every employee this handler had before the charter
+            // existed — so the fallback below is exactly the old behaviour.
+            let charter = Charter::load(tx, employee_id)
+                .await
+                .map_err(|err| format!("could not load the employee's charter: {err}"))?;
+
+            // Ours, from our own configuration, and byte-identical every turn:
+            // this is the cached prefix. The role's briefing goes at the end of
+            // it because that is where the cache breakpoint sits, and it is a
+            // `&'static str` shared by every employee wearing the role.
+            let identity = format!(
+                "You are {}, an AI employee at {}. You answer from {}.",
+                employee.slug(),
+                employee.domain(),
+                employee.address()
+            );
+            let prompt = charter.as_ref().map_or_else(
+                || SystemPrompt::new(identity.clone()),
+                |charter| charter.system_prompt(&identity),
+            );
+
+            // The counterparty wrote all four of these — who it is from
+            // included — so they travel together inside one frame rather than
+            // being spliced into a sentence of ours.
+            let inbound = Untrusted::new(format!(
+                "from: {sender}\nsubject: {}\n\n{body}",
+                subject.clone().unwrap_or_default()
+            ));
+
+            // The same text is also the retrieval query, and that is a
+            // deliberate choice with a paragraph behind it in
+            // `agentos_app::knowledge::Recall::question`. Two things about this
+            // call are load-bearing here: it takes a connection of its own
+            // rather than `tx`, because a retrieval that times out has its
+            // future dropped and that must not happen to the transaction which
+            // still has to record the reply; and it cannot fail, so there is no
+            // `?` on this line and a database having a bad minute costs the
+            // employee its documents rather than the customer an answer.
+            let recalled = knowledge::recall(
+                &self.db,
+                Embedder::default(),
+                event.tenant_id,
+                &knowledge::Recall::new(&inbound, Some(employee_id)),
+            )
+            .await;
+
             let principal = ActingAs::employee(event.tenant_id, employee_id);
             let turn = Turn::new(
                 self.llm,
                 self.gate,
                 Effects::new(self.db, self.ports, principal.clone()),
                 principal,
-                // Both halves are ours: a slug and a domain the operator chose.
-                // Byte-identical every turn, which is what the prompt cache is.
-                SystemPrompt::new(format!(
-                    "You are {}, an AI employee at {}. You answer from {}.",
-                    employee.slug(),
-                    employee.domain(),
-                    employee.address()
-                )),
+                prompt,
                 self.model,
                 employee.address().to_string(),
             );
 
-            // The counterparty wrote all four of these — who it is from
-            // included — so they travel together inside one frame rather than
-            // being spliced into a sentence of ours.
-            let context = Context::new().with_task(TURN_BRIEF).with_untrusted(
-                &Untrusted::new(format!(
-                    "from: {sender}\nsubject: {}\n\n{body}",
-                    subject.clone().unwrap_or_default()
-                )),
-                &format!("message-{message_id}"),
-            );
+            // Three things reach the model, and the order is the argument.
+            //
+            // Ours first: the standing brief, then the plan. `RolePack::plan`
+            // is a pure function of the objective, recomputed every turn and
+            // stored nowhere, and it is what tells the employee that this
+            // supplier's reply is a quote arriving in the middle of a sourcing
+            // round rather than an email from a stranger.
+            //
+            // Then the message, fenced. Then whatever the document store had to
+            // say about it, fenced by the same `render_fenced` — and joining
+            // its taint into the turn's label, so an employee that consulted a
+            // document is an employee without the payment tool this turn,
+            // exactly like one that read an email. `agentos_app::knowledge`
+            // argues that trade at length, and its argument is the one that
+            // survives: even documents provably ours are *selected* by a query
+            // the counterparty wrote.
+            let mut context = Context::new().with_task(TURN_BRIEF);
+            if let Some(charter) = &charter {
+                context = context.with_task(charter.brief());
+            }
+            let context = recalled
+                .into_context(context.with_untrusted(&inbound, &format!("message-{message_id}")));
 
             let cancel = self.cancel.child_token();
             let deadline = tokio::spawn({

@@ -1436,6 +1436,26 @@ mod tests {
     }
 
     /// Empty the database. Everything cascades from `tenants`.
+    ///
+    /// # This wipes rows belonging to tests that are still running
+    ///
+    /// It bypasses RLS and deletes *every* tenant, not this test's. `seed`
+    /// already mints a fresh `TenantId::new_v7`, so nothing here needs the
+    /// wipe — but the poller tests two modules over read across tenants by
+    /// design, and leftovers from earlier tests would break them, which is why
+    /// it exists at all.
+    ///
+    /// Under `cargo test` with default parallelism that costs two to six
+    /// failures per run, in a *different* set each time, in tests that have
+    /// nothing to do with provisioning. It cost a day of chasing before someone
+    /// spotted the `DELETE`. `scripts/test.sh` passes `--test-threads=1`, which
+    /// is why the suite is green and why that flag is not a performance
+    /// preference.
+    ///
+    /// ponytail: the real fix is to scope the cross-tenant poller tests to a
+    /// tenant filter and delete this function; that is a unit of work, not a
+    /// two-line change, and it is not being done at the point of this comment.
+    /// Until then, do not call this from a test that could run beside another.
     async fn reset(db: &Db) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("DELETE FROM tenants")

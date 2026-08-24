@@ -126,6 +126,20 @@ database, and it refuses to finish if any test skipped itself: roughly three
 dozen tests here opt out silently when they cannot reach a database, which makes
 a run green and empty, the one failure mode nobody notices.
 
+Run one at a time, and do not run `cargo` in another shell while it runs. Both
+share `target/`, cargo serialises on that lock, and a build that loses the race
+is reported as `could not compile` with `signal: 15, SIGTERM` — which reads like
+a compiler error and is not one. If you see that, nothing is wrong with the
+code; re-run with nothing else building.
+
+If you build the same package from two git worktrees into one `CARGO_TARGET_DIR`,
+cargo will hand one worktree's `.rlib` to the other — same package name, same
+version, different path, one artifact. The symptom is a compile error saying a
+field or function does not exist on a type you are looking at in the source.
+`touch crates/*/src/*.rs` forces it back. Better: give each worktree its own
+target directory if the disk allows, because the failure mode is a phantom API
+and the tempting fix is to write code that matches the ghost.
+
 Ports are offset (Postgres `5442`, API `8090`) so the stack does not collide
 with other projects on the same machine.
 

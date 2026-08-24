@@ -606,10 +606,22 @@ mod tests {
                 .execute(&mut **tx)
                 .await
                 .expect_err("audit_log must be append-only");
-            let message = err.to_string();
+            // On the SQLSTATE, never on the message. Postgres translates
+            // `permission denied` into the server's `lc_messages` locale, so a
+            // text match passes under the C locale our container happens to run
+            // and fails on a developer's French or German server — a test that
+            // asserts the language of the database rather than its behaviour.
+            // `42501` is insufficient_privilege; `P0001` is the raise_exception
+            // our append-only trigger uses. Neither is ever translated.
+            let sqlstate = err
+                .as_database_error()
+                .and_then(|e| e.code())
+                .unwrap_or_default()
+                .into_owned();
             assert!(
-                message.contains("permission denied") || message.contains("append-only"),
-                "expected `{statement}` to be refused, got: {message}"
+                sqlstate == "42501" || sqlstate == "P0001",
+                "expected `{statement}` to be refused with 42501 or P0001, \
+                 got SQLSTATE {sqlstate}: {err}"
             );
 
             tx.rollback().await.expect("rollback");
