@@ -19,10 +19,17 @@
 //! server refuses to start with any mock adapter unless `AGENTOS_ALLOW_MOCKS=1`
 //! says out loud that this is a development box — and when it does start, it
 //! says which adapters are fake, at `warn`, every time.
+//!
+//! The model is the one adapter chosen by name rather than by credential:
+//! `AGENTOS_LLM` is `mock` (the default), `cli` or `anthropic`, and only the
+//! last of those counts as real. Picking `anthropic` without `ANTHROPIC_API_KEY`
+//! is a boot failure, because the alternative is an employee that accepts mail
+//! for a week and answers none of it.
 
 use std::fmt;
 use std::net::SocketAddr;
 
+use agentos_app::mocks::LlmBackend;
 use agentos_domain::ids::TenantId;
 
 use crate::auth::{ApiKeys, ApiKeysError};
@@ -40,11 +47,16 @@ const DEFAULT_RUST_LOG: &str = "info,agentos_server=debug";
 /// provider means adding a row here; forgetting to means the new provider can
 /// ship to production as a mock, which is the exact failure this guard exists
 /// for.
-const PROVIDER_CREDENTIALS: [(&str, &str); 5] = [
+///
+/// The LLM is not in it and cannot be: it is chosen by name
+/// (`AGENTOS_LLM=mock|cli|anthropic`), not by whether a credential happens to
+/// be exported, and [`LlmBackend::mock_label`] is the one that answers "is this
+/// one real?". A second variable meaning the same thing would be the two lists
+/// this module exists to avoid.
+const PROVIDER_CREDENTIALS: [(&str, &str); 4] = [
     ("email", "EMAIL_API_KEY"),
     ("telephony", "TELEPHONY_API_KEY"),
     ("browser", "BROWSER_API_KEY"),
-    ("llm", "LLM_API_KEY"),
     ("embedder", "EMBEDDER_API_KEY"),
 ];
 
@@ -108,6 +120,14 @@ pub struct Config {
     pub master_key: String,
     /// `AGENTOS_ALLOW_MOCKS` — `1`/`true` permits mock adapters.
     pub allow_mocks: bool,
+    /// `AGENTOS_LLM` — which model the employees reason with. Defaults to
+    /// [`LlmBackend::Mock`], which is a mock adapter and therefore needs
+    /// `AGENTOS_ALLOW_MOCKS`.
+    pub llm: LlmBackend,
+    /// `ANTHROPIC_API_KEY`, when [`Config::llm`] needs one. Required at boot
+    /// for [`LlmBackend::Anthropic`], so the first inbound email is never where
+    /// a missing key is discovered.
+    pub anthropic_api_key: Option<String>,
     /// `RUST_LOG` — the tracing filter.
     pub rust_log: String,
     /// `AGENTOS_API_KEYS` — the keyring. See [`crate::auth`].
@@ -148,6 +168,8 @@ impl fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("master_key", &"<redacted>")
             .field("allow_mocks", &self.allow_mocks)
+            .field("llm", &self.llm.name())
+            .field("anthropic_api_key", &self.anthropic_api_key.is_some())
             .field("rust_log", &self.rust_log)
             .field(
                 "api_keys",
@@ -206,25 +228,51 @@ impl Config {
             },
         )?;
 
+        // The model, before the mock guard: a typo'd backend name is a more
+        // useful message than "the llm would run as a mock".
+        let llm = match get("AGENTOS_LLM") {
+            None => LlmBackend::default(),
+            Some(spec) => LlmBackend::parse(&spec).ok_or_else(|| ConfigError::Invalid {
+                var: "AGENTOS_LLM",
+                detail: format!("{spec:?} is not one of: {}", LlmBackend::VALUES),
+            })?,
+        };
+        // Here rather than at the first inbound email: a deployment that meant
+        // to run on the real model and forgot the key must crash-loop, not
+        // quietly accept mail it cannot answer.
+        let anthropic_api_key = get(LlmBackend::API_KEY_VAR);
+        if let Some(var) = llm.required_var()
+            && get(var).is_none()
+        {
+            return Err(ConfigError::Missing { var });
+        }
+
         let allow_mocks = matches!(
             get("AGENTOS_ALLOW_MOCKS").unwrap_or_default().as_str(),
             "1" | "true" | "yes"
         );
-        let mock_adapters = PROVIDER_CREDENTIALS
+        let mut mock_adapters = PROVIDER_CREDENTIALS
             .iter()
             .filter(|(_, var)| get(var).is_none())
             .map(|(adapter, _)| *adapter)
             .collect::<Vec<_>>();
+        let mut mock_vars = PROVIDER_CREDENTIALS
+            .iter()
+            .filter(|(adapter, _)| mock_adapters.contains(adapter))
+            .map(|(_, var)| (*var).to_owned())
+            .collect::<Vec<_>>();
+        if let Some(label) = llm.mock_label() {
+            mock_adapters.push(label);
+            mock_vars.push(format!(
+                "AGENTOS_LLM=anthropic and {}",
+                LlmBackend::API_KEY_VAR
+            ));
+        }
 
         if !mock_adapters.is_empty() && !allow_mocks {
             return Err(ConfigError::MocksNotAllowed {
                 adapters: mock_adapters.join(", "),
-                vars: PROVIDER_CREDENTIALS
-                    .iter()
-                    .filter(|(adapter, _)| mock_adapters.contains(adapter))
-                    .map(|(_, var)| *var)
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                vars: mock_vars.join(", "),
             });
         }
 
@@ -237,6 +285,8 @@ impl Config {
             database_url,
             master_key,
             allow_mocks,
+            llm,
+            anthropic_api_key,
             rust_log: get("RUST_LOG").unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned()),
             api_keys,
             mock_adapters,
@@ -324,6 +374,10 @@ mod tests {
             ("AGENTOS_MASTER_KEY", "not-a-real-key".to_owned()),
             ("RUST_LOG", "debug".to_owned()),
             ("AGENTOS_API_KEYS", format!("ops:{TENANT}:{SECRET}")),
+            // The only backend that is not a mock adapter, so that the cases
+            // below are about the adapter they remove and nothing else.
+            ("AGENTOS_LLM", "anthropic".to_owned()),
+            ("ANTHROPIC_API_KEY", "sk-ant-live".to_owned()),
         ]);
         for (_, var) in PROVIDER_CREDENTIALS {
             env.insert(var, "live-credential".to_owned());
@@ -344,6 +398,100 @@ mod tests {
         assert_eq!(config.rust_log, "debug");
         assert!(config.mock_adapters.is_empty());
         assert_eq!(config.api_keys.len(), 1);
+        assert_eq!(config.llm, LlmBackend::Anthropic);
+    }
+
+    // -- the model ---------------------------------------------------------
+
+    /// The point of the whole variable: a deployment that asked for the real
+    /// model and forgot the key stops at boot, naming the key.
+    #[test]
+    fn selecting_anthropic_without_a_key_fails_the_boot_by_name() {
+        let mut env = complete();
+        env.remove("ANTHROPIC_API_KEY");
+
+        let err = parse(&env).expect_err("the real model needs a key");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Missing {
+                    var: "ANTHROPIC_API_KEY"
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY"), "{err}");
+
+        // An exported-but-empty key is the same failure, not a client that
+        // authenticates with the empty string.
+        env.insert("ANTHROPIC_API_KEY", "  ".to_owned());
+        assert!(parse(&env).is_err());
+    }
+
+    #[test]
+    fn the_backends_that_need_nothing_boot_with_nothing() {
+        let mut env = complete();
+        env.remove("ANTHROPIC_API_KEY");
+        env.insert("AGENTOS_ALLOW_MOCKS", "1".to_owned());
+
+        for (spec, backend) in [("mock", LlmBackend::Mock), ("cli", LlmBackend::Cli)] {
+            env.insert("AGENTOS_LLM", spec.to_owned());
+            let config = parse(&env).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert_eq!(config.llm, backend);
+            assert!(config.anthropic_api_key.is_none());
+            // Neither is the real thing, so both are named in the warning.
+            assert_eq!(config.mock_adapters.len(), 1, "{:?}", config.mock_adapters);
+            assert!(config.mock_adapters[0].starts_with("llm ("));
+        }
+    }
+
+    /// Unset is the mock, and the mock is a mock adapter — so a deployment
+    /// cannot end up answering customers with `MOCK_REPLY` by omission.
+    #[test]
+    fn an_unset_backend_is_the_mock_and_the_mock_needs_permission() {
+        let mut env = complete();
+        env.remove("AGENTOS_LLM");
+        env.remove("ANTHROPIC_API_KEY");
+
+        let err = parse(&env).expect_err("the default backend is a mock");
+        let ConfigError::MocksNotAllowed { adapters, vars } = &err else {
+            panic!("expected MocksNotAllowed, got {err:?}");
+        };
+        assert!(adapters.contains("llm"), "{adapters}");
+        assert!(vars.contains("AGENTOS_LLM=anthropic"), "{vars}");
+
+        env.insert("AGENTOS_ALLOW_MOCKS", "1".to_owned());
+        assert_eq!(parse(&env).expect("allowed").llm, LlmBackend::Mock);
+    }
+
+    #[test]
+    fn an_unknown_backend_fails_the_boot_rather_than_falling_back() {
+        let mut env = complete();
+        env.insert("AGENTOS_LLM", "gpt".to_owned());
+
+        let err = parse(&env).expect_err("there is no such backend");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    var: "AGENTOS_LLM",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // And it says what to write instead.
+        assert!(err.to_string().contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn the_api_key_is_not_in_the_debug_rendering() {
+        let mut env = complete();
+        env.insert("ANTHROPIC_API_KEY", "sk-ant-hunter2".to_owned());
+        let rendered = format!("{:?}", parse(&env).expect("valid"));
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("anthropic"), "{rendered}");
     }
 
     #[test]
@@ -412,7 +560,8 @@ mod tests {
     #[test]
     fn every_adapter_is_guarded_not_just_the_first() {
         // The guard is only worth anything if it covers the whole list; a
-        // deployment that forgets the LLM key is the same outage.
+        // deployment that forgets the browser key is the same outage as one
+        // that forgets email. (The model is guarded separately, above.)
         for (adapter, var) in PROVIDER_CREDENTIALS {
             let mut env = complete();
             env.remove(var);
@@ -429,12 +578,16 @@ mod tests {
     fn allowing_mocks_is_explicit_and_recorded() {
         let mut env = complete();
         env.remove("EMAIL_API_KEY");
-        env.remove("LLM_API_KEY");
+        env.insert("AGENTOS_LLM", "mock".to_owned());
         env.insert("AGENTOS_ALLOW_MOCKS", "1".to_owned());
 
         let config = parse(&env).expect("explicitly allowed");
         assert!(config.allow_mocks);
-        assert_eq!(config.mock_adapters, vec!["email", "llm"]);
+        assert_eq!(
+            config.mock_adapters,
+            vec!["email", "llm (scripted mock)"],
+            "the warning has to name every fake, the model included"
+        );
         // Which is what `warn_about_mocks` shouts about on every boot.
         config.warn_about_mocks();
     }
