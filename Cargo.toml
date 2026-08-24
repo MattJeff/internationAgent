@@ -36,6 +36,10 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+# CDP is JSON-RPC over a websocket, and Browserbase launches Chrome for us, so a
+# websocket client is all we need — chromiumoxide would bring a whole browser
+# model we never drive.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "request-id", "limit", "timeout"] }
 tracing = "0.1"
