@@ -29,8 +29,10 @@
 
 mod auth; // U30
 mod config; // U30
+mod doctor;
 mod error; // U30
 mod loops; // U35 U36 U37
+mod metrics;
 mod routes; // U31 U32 U33 U34
 
 use std::collections::HashMap;
@@ -140,6 +142,14 @@ enum BootError {
 }
 
 fn main() -> ExitCode {
+    // `doctor` answers "what do I still need to make this work?" without booting
+    // a server, so it runs before anything that could fail on a missing var —
+    // otherwise the diagnostic tool would need the configuration it exists to
+    // diagnose.
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        return doctor::main();
+    }
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

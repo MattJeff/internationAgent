@@ -13,4 +13,6 @@ pub mod ids; // U1
 pub mod message; // U4
 pub mod money; // U2
 pub mod policy; // U5
-pub mod untrusted; // U4
+pub mod psyche; // wave 8: ported MPCP subset
+pub mod sourcing;
+pub mod untrusted; // U4 // wave 7: buyer vertical

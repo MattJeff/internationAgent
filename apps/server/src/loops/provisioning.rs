@@ -25,7 +25,7 @@
 //! |-------------------------------------------|-----|
 //! | `lifecycle = 'terminated'` and bound      | the resource is real and still billed |
 //! | never `release_not_supported`             | **structural**, not transient — see below |
-//! | `attempt_count`, `updated_at`             | the same backoff columns the retry predicate uses |
+//! | `release_attempt_count`, `release_attempted_at` | the release's **own** budget, not provisioning's |
 //! | one attempt past the cap escalates        | a human is asked once, then the sweep goes quiet |
 //! | `FOR UPDATE ... SKIP LOCKED`              | two replicas do not both call the provider |
 //!
@@ -148,13 +148,12 @@ pub struct LoopConfig {
     pub retry_after: TimeDelta,
     /// Give up retrying a step after this many claims.
     ///
-    /// ponytail: the termination sweep spends the same budget, on the same
-    /// `employee_resources.attempt_count`, rather than carrying a second
-    /// counter that could disagree with it. The known ceiling: a step that
-    /// needed three attempts to *provision* has three fewer to be *released*
-    /// before a human is asked. Asking early is the harmless direction, and the
-    /// escalation names the step either way. Split the columns the day the
-    /// counts need to be independent.
+    /// One number, two independent budgets: provisioning spends
+    /// `employee_resources.attempt_count`, the termination sweep spends
+    /// `release_attempt_count`. A step that needed three attempts to be
+    /// *bought* still gets the full count to be *given back*, because "the
+    /// provider would not sell it" and "the provider will not take it back" are
+    /// different failures and neither should eat the other's retries.
     pub max_attempts: i32,
     /// How long a human has to answer an escalation.
     pub approval_ttl: TimeDelta,
@@ -679,14 +678,14 @@ struct Release {
     tenant_id: TenantId,
     employee_id: EmployeeId,
     step: Step,
-    /// `attempt_count` **after** the claim spent one. Past
+    /// `release_attempt_count` **after** the claim spent one. Past
     /// [`LoopConfig::max_attempts`] this row buys an escalation instead of a
     /// provider call.
     attempt: i32,
 }
 
 /// Terminated, still bound, cold enough to try again, and not structurally
-/// impossible. Claimed by bumping the attempt counter, in one statement.
+/// impossible. Claimed by bumping the release counter, in one statement.
 ///
 /// `$1` now, `$2` the attempt cap, `$3` the retry cutoff, `$4` the code that is
 /// never retried, `$5` the batch size.
@@ -696,27 +695,36 @@ struct Release {
 /// the attempt here rather than after the release means a worker that is killed
 /// mid-call still burns one, so a provider that hangs cannot be retried forever
 /// by a fleet of dying workers. `SKIP LOCKED` is what keeps two replicas off
-/// the same row, and the bumped `updated_at` is what keeps the *next* tick off
-/// it — either alone would do; both is free.
+/// the same row, and the stamped `release_attempted_at` is what keeps the
+/// *next* tick off it — either alone would do; both is free.
+///
+/// **`release_*`, not `attempt_count`.** Provisioning's counter belongs to
+/// provisioning; spending it here would charge a release for the attempts it
+/// took to buy the thing. `coalesce(release_attempted_at, updated_at)` is how a
+/// row written before that column existed keeps the backoff it already had:
+/// NULL means "never swept under this counter", and falling back to
+/// `updated_at` is exactly the old predicate.
 ///
 /// `strpos` rather than `LIKE`: a NULL `last_error` is the common case and must
 /// not fall out of the predicate as NULL.
 const SWEEP_SQL: &str = "\
 UPDATE employee_resources AS r
-   SET attempt_count = r.attempt_count + 1, updated_at = $1
+   SET release_attempt_count = r.release_attempt_count + 1,
+       release_attempted_at = $1,
+       updated_at = $1
  WHERE (r.employee_id, r.step) IN (
        SELECT c.employee_id, c.step
          FROM employee_resources c
          JOIN employees e ON e.id = c.employee_id
         WHERE e.lifecycle = 'terminated'
           AND c.external_id IS NOT NULL
-          AND c.attempt_count <= $2
-          AND c.updated_at < $3
+          AND c.release_attempt_count <= $2
+          AND coalesce(c.release_attempted_at, c.updated_at) < $3
           AND strpos(coalesce(c.last_error, ''), $4) = 0
-        ORDER BY c.updated_at
+        ORDER BY coalesce(c.release_attempted_at, c.updated_at)
         LIMIT $5
         FOR UPDATE OF c SKIP LOCKED)
- RETURNING r.tenant_id, r.employee_id, r.step, r.attempt_count";
+ RETURNING r.tenant_id, r.employee_id, r.step, r.release_attempt_count";
 
 /// Take a batch of resources a terminated employee is still being billed for.
 ///
@@ -1886,11 +1894,22 @@ mod tests {
             scalar::<i32>(
                 &db,
                 &employee,
-                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+                "SELECT max(release_attempt_count) FROM employee_resources \
+                  WHERE employee_id = $1"
             )
             .await,
             1,
-            "concurrent sweepers must not spend the attempt budget twice"
+            "concurrent sweepers must not spend the release budget twice"
+        );
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+            )
+            .await,
+            0,
+            "releasing must not spend provisioning's budget at all"
         );
     }
 
@@ -1987,11 +2006,155 @@ mod tests {
             scalar::<i32>(
                 &db,
                 &employee,
-                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+                "SELECT max(release_attempt_count) FROM employee_resources \
+                  WHERE employee_id = $1"
             )
             .await,
             0,
             "an employee with nothing bound must not even be claimed"
+        );
+    }
+
+    // -- the release budget is the release's own ---------------------------
+
+    /// The gap this column closed: a step that fought to be bought used to
+    /// arrive at termination with most of its retries already spent, so the
+    /// sweep gave up early and asked a human about a resource it had barely
+    /// tried to release.
+    ///
+    /// This is also the migration test. The rows here look exactly like rows
+    /// written before 0008: a large `attempt_count`, and the release columns
+    /// left at what the migration gives an existing row.
+    #[tokio::test]
+    async fn a_step_that_burned_its_provisioning_attempts_gets_a_full_release_budget() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "expensive").await;
+        bind_all(&db, &employee).await;
+        // Every step cost far more than the cap to provision.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources SET attempt_count = 99 WHERE employee_id = $1",
+        )
+        .await;
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(release_attempt_count) FROM employee_resources \
+                  WHERE employee_id = $1"
+            )
+            .await,
+            0,
+            "an existing row must migrate to a full release budget, not an exhausted one"
+        );
+        assert!(
+            scalar::<Option<DateTime<Utc>>>(
+                &db,
+                &employee,
+                "SELECT max(release_attempted_at) FROM employee_resources \
+                  WHERE employee_id = $1"
+            )
+            .await
+            .is_none(),
+            "an existing row has never been swept under the new counter"
+        );
+        terminate(&db, &employee).await;
+
+        // One step's provider refuses transiently, so it needs the whole
+        // budget rather than the nothing the old shared counter left it.
+        let engine = FakeEngine::ready(&db).refusing(Step::Phone, "release_refused");
+        let cfg = LoopConfig {
+            max_attempts: 3,
+            ..fast()
+        };
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(cfg);
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+        for tick in 0..12 {
+            sweeper
+                .tick(now + TimeDelta::hours(tick), &cancel)
+                .await
+                .expect("tick");
+        }
+
+        assert_eq!(
+            engine.releases_of(Step::Phone),
+            3,
+            "the release budget is spent on releases, not on the purchase"
+        );
+        assert_eq!(
+            still_bound(&db, &employee).await,
+            1,
+            "the other ten were given back"
+        );
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+            )
+            .await,
+            99,
+            "the sweep must not have touched provisioning's counter"
+        );
+    }
+
+    /// The backoff has to read the new column, not `updated_at`. Those two
+    /// disagree the moment anything else writes the row — the engine stamping
+    /// `last_error` on a refused release does exactly that.
+    #[tokio::test]
+    async fn the_sweep_backs_off_on_the_release_column_and_not_on_updated_at() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "backoff").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+        let cfg = LoopConfig::default();
+        let now = Utc::now();
+
+        assert_eq!(
+            claim_releases(&db, &cfg, now).await.expect("claim").len(),
+            11,
+            "a NULL release_attempted_at falls back to updated_at, which is cold"
+        );
+
+        // Stale by `updated_at`, hot by the column that now matters. The old
+        // predicate would claim these again immediately.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources SET updated_at = now() - interval '1 hour' \
+              WHERE employee_id = $1",
+        )
+        .await;
+        assert!(
+            claim_releases(&db, &cfg, now)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "a release attempted a moment ago must not be retried on the next tick"
+        );
+
+        // ... and once the release itself has gone cold, it is work again.
+        let later = now + TimeDelta::hours(1);
+        assert_eq!(
+            claim_releases(&db, &cfg, later).await.expect("claim").len(),
+            11
+        );
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(release_attempt_count) FROM employee_resources \
+                  WHERE employee_id = $1"
+            )
+            .await,
+            2,
+            "two claims, two attempts"
         );
     }
 }

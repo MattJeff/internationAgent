@@ -12,4 +12,6 @@ pub mod knowledge; // U14
 pub mod outbox; // U9
 pub mod policy; // U41
 pub mod provisioning; // U8
+pub mod psyche;
+pub mod sourcing;
 pub mod spend; // U12
