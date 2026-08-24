@@ -771,6 +771,56 @@ fn classify(first: &Untrusted<String>, second: &Untrusted<String>) -> Divergence
     }
 }
 
+/// What two panel reads and an authoritative answer come to — the whole
+/// suppression decision, with no browser, no clock and no database in it.
+///
+/// Extracted from [`Prober::run`], which is its only caller in this crate, so
+/// that the rate the module docs ask an operator to read can actually be
+/// *measured*: before this, reaching the classification meant standing up a
+/// Postgres connection, a [`PolicyGate`] and a [`BrowserSession`], which is why
+/// nobody had ever put a number on it. `crates/eval` drives this directly.
+///
+/// Nothing about the bar moved. This is the same three branches in the same
+/// order — challenge check on both runs, then byte comparison, then the
+/// requirement — lifted out verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing to send, and why.
+    ///
+    /// Never [`Checked::Evidence`] — that one still owes a screenshot — and
+    /// never [`Checked::TruthStale`], which is decided before a page is loaded
+    /// and is therefore not a property of what the page said.
+    Nothing(Checked),
+    /// A reproducible discrepancy. The caller still owes it a screenshot and
+    /// the provenance before it is an [`Evidence`].
+    Finding(Finding),
+}
+
+/// See [`Verdict`].
+pub fn verdict(first: &Untrusted<String>, second: &Untrusted<String>, authority: Claim) -> Verdict {
+    // Before the comparison, and on *both* runs. Friction served to us is not a
+    // statement about their product, and two identical challenge pages agree
+    // with each other perfectly — which would make a captcha into a
+    // `Finding::SaysNothing` about a checkout we never reached.
+    if looks_challenged(first) || looks_challenged(second) {
+        return Verdict::Nothing(Checked::Blocked);
+    }
+
+    if first != second {
+        return Verdict::Nothing(Checked::NotReproducible(classify(first, second)));
+    }
+
+    match read_claim(second) {
+        Seen::Unreadable => Verdict::Nothing(Checked::Unreadable),
+        Seen::Nothing => Verdict::Finding(Finding::SaysNothing),
+        Seen::Says(shown) if shown == authority => Verdict::Nothing(Checked::Agrees),
+        Seen::Says(shown) => Verdict::Finding(Finding::Contradicts {
+            shown,
+            correct: authority,
+        }),
+    }
+}
+
 /// What one check came to.
 ///
 /// Five of the six outcomes carry no evidence, and that is the design: this
@@ -987,26 +1037,11 @@ impl Prober {
         let first = self.observe(flow, &plan).await?;
         let second = self.observe(flow, &plan).await?;
 
-        // Before the comparison, and on *both* runs. Friction served to us is
-        // not a statement about their product, and two identical challenge
-        // pages agree with each other perfectly — which would make a captcha
-        // into a `Finding::SaysNothing` about a checkout we never reached.
-        if looks_challenged(&first) || looks_challenged(&second) {
-            return Ok(Checked::Blocked);
-        }
-
-        if first != second {
-            return Ok(Checked::NotReproducible(classify(&first, &second)));
-        }
-
-        let finding = match read_claim(&second) {
-            Seen::Unreadable => return Ok(Checked::Unreadable),
-            Seen::Nothing => Finding::SaysNothing,
-            Seen::Says(shown) if shown == authority.requirement => return Ok(Checked::Agrees),
-            Seen::Says(shown) => Finding::Contradicts {
-                shown,
-                correct: authority.requirement,
-            },
+        // The whole decision, in one pure function so that it is measurable
+        // without a browser — see [`verdict`].
+        let finding = match verdict(&first, &second, authority.requirement) {
+            Verdict::Nothing(checked) => return Ok(checked),
+            Verdict::Finding(finding) => finding,
         };
 
         // Only now, on the run that confirmed it: the picture is for the

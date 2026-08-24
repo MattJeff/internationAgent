@@ -1,0 +1,20 @@
+[package]
+name = "agentos-eval"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Nothing here is a library anyone deploys: it measures the ones that are.
+publish = false
+
+[dependencies]
+agentos-domain.workspace = true
+agentos-app.workspace = true
+agentos-providers.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+# One digest of the rendered system prompt, so a prompt edit invalidates the
+# recorded live scores instead of silently outdating them. Already in the lock.
+sha2.workspace = true
+# Only the `--live` path is async; the deterministic suites are plain functions.
+tokio.workspace = true

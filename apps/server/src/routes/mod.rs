@@ -1,6 +1,7 @@
 pub mod a2a; // U34
 pub mod approvals; // U32
 pub mod employees; // U31
+pub mod initiative;
 pub mod inventory;
 pub mod knowledge;
 pub mod mcp;

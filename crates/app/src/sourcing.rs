@@ -84,12 +84,15 @@ pub use agentos_domain::sourcing::Incoterm;
 use agentos_domain::sourcing::{self as buying, LiveQuote};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::email::ProviderMessageId;
+use agentos_store::db::TenantTx;
 /// A supplier's record as the store derives it, re-exported so a caller does
 /// not need a second import to build a [`shortlist`]. One reputation type in
 /// the workspace, computed by one SQL view over one evidence table.
 pub use agentos_store::sourcing::Reputation;
+use agentos_store::sourcing::{self as sourcing_store, SupplierSummary};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::effects::{EffectError, Effects, EmailSend, McpCall, RenderedEmail};
 use crate::gate::{Denied, PolicyGate, Principal};
@@ -369,6 +372,198 @@ pub fn shortlist(candidates: &[(EmailAddress, Option<Reputation>)]) -> Vec<Email
 /// Have they ever answered, or not yet been asked enough times to say?
 const fn answers_at_all(record: &Reputation) -> bool {
     record.quotes_returned > 0 || record.quotes_missed < IGNORED_RFQS_BEFORE_DROPPING
+}
+
+// ---------------------------------------------------------------------------
+// Suppliers -> addresses
+// ---------------------------------------------------------------------------
+
+/// Why a supplier that matched the search cannot be sent an RFQ.
+///
+/// Three, because they need three different responses from three different
+/// people, and none of them is "drop this supplier from the round quietly".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unreachable {
+    /// No active contact at this supplier has an email on file — either nobody
+    /// ever recorded one, everyone recorded has only a phone, or every contact
+    /// that did has been deactivated. **A data gap**: the supplier qualified
+    /// and we have no way to ask them, which is somebody's afternoon, not a
+    /// reason to compare one fewer quote.
+    NoContact,
+    /// The address is on the `suppressions` list. Not a data gap — see
+    /// [`recipients`] on why the round does not fall through to a colleague.
+    Suppressed {
+        /// The address that was skipped, for the operator to recognise.
+        email: String,
+        /// Why, as `suppressions.reason` records it: `opt_out`, `complaint`,
+        /// `bounce`, `legal_request`, `do_not_contact`. The one field that
+        /// separates "they asked us to stop" from "the mailbox is dead", which
+        /// are the same silence and two different jobs.
+        reason: String,
+    },
+    /// `supplier_contacts.email` is free text and this row is not an address.
+    /// A typo, and one that a silent `filter_map` would have turned into a
+    /// supplier that never gets asked and nobody notices.
+    Malformed {
+        /// The stored text, verbatim.
+        email: String,
+    },
+}
+
+impl Unreachable {
+    /// Stable, low-cardinality metric label.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Unreachable::NoContact => "no_contact",
+            Unreachable::Suppressed { .. } => "suppressed",
+            Unreachable::Malformed { .. } => "malformed_email",
+        }
+    }
+}
+
+/// A supplier that qualified and cannot be reached, named so it can be fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreached {
+    /// The supplier row.
+    pub supplier_id: Uuid,
+    /// Its registered name, so the report reads without a second lookup.
+    pub legal_name: String,
+    /// Which of the three problems it is.
+    pub why: Unreachable,
+}
+
+/// The result of turning a supplier shortlist into an address list.
+///
+/// **Every supplier put in comes out of exactly one of these two vectors** —
+/// `candidates.len() + unreachable.len()` is the number of suppliers passed in.
+/// That is the whole point of the type: a `Vec<EmailAddress>` return would have
+/// made "we asked four of the six you found" indistinguishable from "we found
+/// four", and the two are a sourcing round and a broken one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Recipients {
+    /// Ready for [`Round::candidates`](crate::vertical::Round::candidates) and
+    /// therefore for [`shortlist`]. In the order the suppliers came in.
+    pub candidates: Vec<(EmailAddress, Option<Reputation>)>,
+    /// The ones nobody can write to. **Not an error and not a warning** — an
+    /// operator's queue.
+    pub unreachable: Vec<Unreached>,
+}
+
+/// Turn a shortlist of suppliers into the addresses an RFQ can go to.
+///
+/// The join `find_suppliers` does not do: it answers with `suppliers` rows,
+/// which carry a legal name and no way to contact anybody, while the addresses
+/// live in `supplier_contacts`. This closes it, attaches each supplier's
+/// [`Reputation`] so the result drops straight into [`shortlist`], and accounts
+/// for every supplier that cannot be reached.
+///
+/// # One address per supplier, and which one
+///
+/// The designated contact — `is_primary` — and otherwise the first active
+/// contact by `(full_name, id)`. Not all of them, and this is the judgement
+/// call in this function:
+///
+/// 1. **Everything downstream is keyed by [`EmailAddress`] and treats one
+///    address as one supplier.** [`MIN_SHORTLIST`] would count three people at
+///    one firm as three suppliers and think the round was wide enough when it
+///    had one participant. [`rank`] would sort two quotes from one firm as two
+///    offers, and [`disagreement`] would report a firm disagreeing with itself
+///    as a price spread between suppliers. Those are wrong numbers on the page
+///    a buyer decides from, not a cosmetic difference.
+/// 2. **The gate's cold-outreach budget is per recipient.** One supplier
+///    consuming three of it starves the suppliers further down the list, which
+///    `Buyer::issue_rfq` would report as [`Contacted::Refused`] — a round that
+///    shrinks for a reason that has nothing to do with the suppliers it dropped.
+/// 3. Three people at one firm receiving the same unsolicited RFQ is what a
+///    spam complaint is made of, and the sender reputation it costs is shared
+///    by every other employee on that domain.
+///
+/// The schema already made this decision: `supplier_contacts_primary_key`
+/// exists so that a supplier can designate exactly one person to be written to.
+/// This reads that designation rather than inventing a fan-out policy beside it.
+///
+/// A supplier with several contacts and no primary is a data gap of a milder
+/// kind, and the fallback is deterministic rather than arbitrary so that two
+/// runs of the same round write to the same human.
+///
+/// # A suppressed contact does not fall through to a colleague
+///
+/// If the address we would have used is suppressed, the supplier is
+/// [`Unreachable::Suppressed`] and the round moves on. It does **not** pick the
+/// next contact, and that is deliberate even though the reason is recorded and
+/// a `bounce` is not an `opt_out`. Falling through would have to be right for
+/// every reason in the column or wrong for one of them, and the two directions
+/// are not symmetric: writing to the colleague of somebody who asked us to stop
+/// is a complaint and a sender-reputation hit shared by every employee on our
+/// domain, while not writing to the colleague of a dead mailbox is one missing
+/// quote that appears in `unreachable` with the word `bounce` next to it and is
+/// fixed by fixing the contact row. Fail closed, and report it so it *can* be
+/// fixed.
+///
+/// # Which suppression list
+///
+/// `suppressions` from `0011_revenue.sql`, the one that already exists, read
+/// through `revenue_suppression_of` inside
+/// [`sourcing_store::supplier_contacts`] — so a `scope = 'global'` opt-out
+/// binds this round even though no tenant can read the row that says so.
+/// Purchasing does **not** get a list of its own: a supplier who says "stop
+/// emailing me" has said the same sentence as a prospect who does, and a second
+/// place to have recorded it is the same as not having recorded it.
+///
+/// The row-level half of the same rule, `supplier_contacts.active`, is applied
+/// in the same query. Note that [`crate::revenue::Suppression`] — the in-memory
+/// set the seller carries — is a third thing and is not consulted here; it
+/// predates the table and its own doc comment says so.
+pub async fn recipients(
+    tx: &mut TenantTx<'_>,
+    suppliers: &[SupplierSummary],
+) -> Result<Recipients, sourcing_store::SourcingError> {
+    let ids: Vec<Uuid> = suppliers.iter().map(|supplier| supplier.id).collect();
+    let contacts = sourcing_store::supplier_contacts(tx, &ids).await?;
+
+    let mut out = Recipients::default();
+    for supplier in suppliers {
+        // Ordered best-first by the query, so the first match is the primary
+        // contact where there is one.
+        let chosen = contacts
+            .iter()
+            .find(|contact| contact.supplier_id == supplier.id);
+
+        let why = match chosen {
+            None => Some(Unreachable::NoContact),
+            // Checked before parsing: an address can be both suppressed and
+            // misspelled, and "they asked us to stop" is the answer an operator
+            // needs first.
+            Some(contact) => match (&contact.suppressed, EmailAddress::parse(&contact.email)) {
+                (Some(reason), _) => Some(Unreachable::Suppressed {
+                    email: contact.email.clone(),
+                    reason: reason.clone(),
+                }),
+                (None, Err(_)) => Some(Unreachable::Malformed {
+                    email: contact.email.clone(),
+                }),
+                (None, Ok(address)) => {
+                    // ponytail: one reputation query per reachable supplier. A
+                    // shortlist is tens of rows and this is already inside the
+                    // caller's transaction; batch it into a
+                    // `supplier_id = ANY($1)` read of `supplier_reputation`
+                    // when a profile says the round is spending its time here.
+                    let record = sourcing_store::reputation(tx, supplier.id).await?;
+                    out.candidates.push((address, record));
+                    None
+                }
+            },
+        };
+
+        if let Some(why) = why {
+            out.unreachable.push(Unreached {
+                supplier_id: supplier.id,
+                legal_name: supplier.legal_name.clone(),
+                why,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,6 +2017,351 @@ mod tests {
                 .convert(Money::new(1, Cny).expect("nonzero")),
             Ok(1)
         );
+    }
+
+    // -- suppliers -> addresses ---------------------------------------------
+
+    /// Add a contact to a supplier. `supplier_contacts` has no insert in the
+    /// store — the schema comment says the unit that owns contact discovery
+    /// adds it — so the fixture writes the row itself.
+    async fn add_contact(
+        tx: &mut agentos_store::db::TenantTx<'_>,
+        supplier: Uuid,
+        full_name: &str,
+        email: Option<&str>,
+        is_primary: bool,
+        active: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO supplier_contacts \
+                 (id, tenant_id, supplier_id, full_name, email, phone, is_primary, active) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tx.tenant_id().as_uuid())
+        .bind(supplier)
+        .bind(full_name)
+        .bind(email)
+        // `supplier_contacts_reachable`: a row with no email needs a phone.
+        .bind(email.is_none().then_some("+4930000000"))
+        .bind(is_primary)
+        .bind(active)
+        .execute(&mut ***tx)
+        .await
+        .expect("insert contact");
+    }
+
+    async fn add_supplier(tx: &mut agentos_store::db::TenantTx<'_>, legal_name: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        sourcing_store::insert_supplier(
+            tx,
+            id,
+            &sourcing_store::NewSupplier {
+                legal_name,
+                country: "DE",
+                categories: &["fasteners".to_owned()],
+                website: None,
+            },
+        )
+        .await
+        .expect("supplier");
+        id
+    }
+
+    /// **Gap 2, the whole of it.** `find_suppliers` answers with rows that
+    /// carry no address; this is the join that turns them into an RFQ's `To:`.
+    ///
+    /// Five suppliers, one per interesting case: several contacts, exactly one,
+    /// none at all, only deactivated ones, and a suppressed one. Every one of
+    /// the five comes out somewhere — that is the assertion that matters.
+    #[tokio::test]
+    async fn a_shortlist_of_suppliers_becomes_a_list_of_addresses() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+
+        // 1. Three contacts, one of them designated. The designated one gets
+        //    the RFQ and the other two do not — see `recipients`.
+        let many = add_supplier(&mut tx, "AAA Fasteners GmbH").await;
+        add_contact(
+            &mut tx,
+            many,
+            "Zoe Ziegler",
+            Some("zoe@aaa.example"),
+            false,
+            true,
+        )
+        .await;
+        add_contact(
+            &mut tx,
+            many,
+            "Bo Bauer",
+            Some("bo@aaa.example"),
+            true,
+            true,
+        )
+        .await;
+        add_contact(
+            &mut tx,
+            many,
+            "Al Adler",
+            Some("al@aaa.example"),
+            false,
+            true,
+        )
+        .await;
+
+        // 2. Several contacts and no primary: the fallback is deterministic,
+        //    lowest `full_name` first, so two runs write to the same human.
+        let unranked = add_supplier(&mut tx, "BBB Bolts AG").await;
+        add_contact(
+            &mut tx,
+            unranked,
+            "Yara Yilmaz",
+            Some("yara@bbb.example"),
+            false,
+            true,
+        )
+        .await;
+        add_contact(
+            &mut tx,
+            unranked,
+            "Cem Celik",
+            Some("cem@bbb.example"),
+            false,
+            true,
+        )
+        .await;
+
+        // 3. Contacts, but nobody with an email. A data gap, not a silent drop.
+        let phone_only = add_supplier(&mut tx, "CCC Clamps SARL").await;
+        add_contact(&mut tx, phone_only, "Rue Renard", None, true, true).await;
+
+        // 4. An email that was there and has been deactivated.
+        let gone = add_supplier(&mut tx, "DDD Dowels Ltd").await;
+        add_contact(
+            &mut tx,
+            gone,
+            "Pat Price",
+            Some("pat@ddd.example"),
+            false,
+            false,
+        )
+        .await;
+
+        // 5. Reachable, and on the `suppressions` list — the real one, written
+        //    through the real store call, so the trigger and the
+        //    `security definer` lookup are both in the path.
+        let opted_out = add_supplier(&mut tx, "EEE Eyelets BV").await;
+        add_contact(
+            &mut tx,
+            opted_out,
+            "Sam Smit",
+            Some("sam@eee.example"),
+            true,
+            true,
+        )
+        .await;
+        agentos_store::revenue::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &agentos_store::revenue::NewSuppression {
+                channel: agentos_store::revenue::Channel::Email,
+                address: "sam@eee.example",
+                reason: "opt_out",
+                scope: agentos_store::revenue::Scope::Tenant,
+                contact_id: None,
+                note: Some("replied STOP to an RFQ"),
+                suppressed_at: now(),
+            },
+        )
+        .await
+        .expect("suppress");
+
+        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+            .await
+            .expect("find");
+        assert_eq!(found.len(), 5, "the fixture did not land: {found:?}");
+
+        let out = recipients(&mut tx, &found).await.expect("recipients");
+        tx.rollback().await.expect("rollback");
+
+        // Nobody vanished. The property the type exists for.
+        assert_eq!(
+            out.candidates.len() + out.unreachable.len(),
+            found.len(),
+            "a supplier went missing between the search and the RFQ: {out:?}"
+        );
+
+        // The designated contact, and only the designated contact.
+        let asking: Vec<String> = out
+            .candidates
+            .iter()
+            .map(|(to, _)| to.to_string())
+            .collect();
+        assert_eq!(
+            asking,
+            vec!["bo@aaa.example", "cem@bbb.example"],
+            "one address per supplier, primary first then lowest name"
+        );
+        assert!(
+            !asking
+                .iter()
+                .any(|to| to == "zoe@aaa.example" || to == "al@aaa.example"),
+            "a colleague of the designated contact was also asked: {asking:?}"
+        );
+
+        // No observations yet, so no record — and `None` is not a bad record.
+        assert!(out.candidates.iter().all(|(_, record)| record.is_none()));
+
+        // The three that could not be asked, each with its own reason.
+        let mut why: Vec<(&str, &str)> = out
+            .unreachable
+            .iter()
+            .map(|row| (row.legal_name.as_str(), row.why.code()))
+            .collect();
+        why.sort_unstable();
+        assert_eq!(
+            why,
+            vec![
+                ("CCC Clamps SARL", "no_contact"),
+                ("DDD Dowels Ltd", "no_contact"),
+                ("EEE Eyelets BV", "suppressed"),
+            ],
+            "{:?}",
+            out.unreachable
+        );
+
+        // The suppressed row names the address, and the round did **not** fall
+        // through to another contact at that firm.
+        let sup = out
+            .unreachable
+            .iter()
+            .find(|row| row.supplier_id == opted_out)
+            .expect("the suppressed supplier was dropped rather than reported");
+        assert_eq!(
+            sup.why,
+            Unreachable::Suppressed {
+                email: "sam@eee.example".to_owned(),
+                reason: "opt_out".to_owned(),
+            },
+            "the reason a supplier is not being asked must survive to the report"
+        );
+        assert!(
+            out.unreachable.iter().any(|row| row.supplier_id == gone),
+            "a supplier whose only contact was deactivated vanished silently"
+        );
+        assert!(
+            out.unreachable
+                .iter()
+                .any(|row| row.supplier_id == phone_only)
+        );
+        assert!(
+            out.candidates
+                .iter()
+                .any(|(to, _)| to.to_string() == "bo@aaa.example"),
+            "supplier {many} lost its primary contact"
+        );
+    }
+
+    /// A stored address that is not an address is reported, not filtered away.
+    ///
+    /// `supplier_contacts.email` is free text with no `CHECK`, so this is a
+    /// typo an operator will actually make — and the failure mode it replaces
+    /// is a supplier that is never asked and nobody knows why.
+    #[tokio::test]
+    async fn an_unparseable_stored_address_is_reported_rather_than_skipped() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+
+        let typo = add_supplier(&mut tx, "FFF Flanges Oy").await;
+        add_contact(&mut tx, typo, "Tuo Toivo", Some("tuo@@flanges"), true, true).await;
+
+        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+            .await
+            .expect("find");
+        let out = recipients(&mut tx, &found).await.expect("recipients");
+        tx.rollback().await.expect("rollback");
+
+        assert!(out.candidates.is_empty(), "{out:?}");
+        assert_eq!(out.unreachable.len(), 1, "{out:?}");
+        assert_eq!(
+            out.unreachable[0].why,
+            Unreachable::Malformed {
+                email: "tuo@@flanges".to_owned()
+            }
+        );
+        assert_eq!(out.unreachable[0].supplier_id, typo);
+    }
+
+    /// The join carries the reputation through, so the result feeds
+    /// [`shortlist`] without a second pass over the database.
+    #[tokio::test]
+    async fn the_join_carries_the_reputation_that_the_shortlist_reads() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+
+        let rfq_row = Uuid::now_v7();
+        sourcing_store::insert_rfq(
+            &mut tx,
+            rfq_row,
+            &sourcing_store::NewRfq {
+                employee_id: None,
+                title: "RFQ: brackets",
+                product_category: "fasteners",
+                quantity: 100,
+                unit: "pcs",
+                incoterm: None,
+                destination_country: "DE",
+                currency: Eur,
+                target_unit_price: None,
+                closes_at: None,
+            },
+        )
+        .await
+        .expect("rfq");
+
+        let silent = add_supplier(&mut tx, "GGG Grommets").await;
+        add_contact(
+            &mut tx,
+            silent,
+            "Ines Iversen",
+            Some("ines@ggg.example"),
+            true,
+            true,
+        )
+        .await;
+        for n in 0..IGNORED_RFQS_BEFORE_DROPPING {
+            sourcing_store::record_observation(
+                &mut tx,
+                Uuid::now_v7(),
+                silent,
+                sourcing_store::Observation::QuoteMissed { rfq_id: rfq_row },
+                now() + chrono::TimeDelta::minutes(n),
+            )
+            .await
+            .expect("observation");
+        }
+
+        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+            .await
+            .expect("find");
+        let out = recipients(&mut tx, &found).await.expect("recipients");
+        tx.rollback().await.expect("rollback");
+
+        let (_, record) = out.candidates.first().expect("one candidate");
+        let record = record
+            .as_ref()
+            .expect("the reputation did not come through");
+        assert_eq!(record.quotes_missed, IGNORED_RFQS_BEFORE_DROPPING);
+        assert_eq!(record.supplier_id, silent);
+
+        // Below `MIN_SHORTLIST`, so the floor asks everyone anyway — the
+        // evidence has stopped buying anything. That is `shortlist`'s rule, and
+        // it now reads real rows because `recipients` supplied them.
+        assert_eq!(shortlist(&out.candidates).len(), 1);
     }
 
     // -- the shortlist -----------------------------------------------------

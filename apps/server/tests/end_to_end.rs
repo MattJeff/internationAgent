@@ -573,12 +573,14 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // spawned cannot log, and one that ignores the token is aborted instead —
     // which logs the line asserted against below.
     let logs = server.shutdown();
-    // The MCP binder joined this list when the operator half of MCP shipped.
-    // Adding a loop and not adding it here is the mistake this assertion
-    // exists to catch: a loop that is cancelled but never joined lets the
-    // process exit while it is still inside a transaction, and nothing else
-    // in the suite would notice.
-    for loop_name in ["provisioning", "outbox", "inbound", "mcp"] {
+    // The MCP binder joined this list when the operator half of MCP shipped,
+    // and the initiative loop the moment after. Adding a loop and not adding
+    // it here is the mistake this assertion exists to catch: a loop that is
+    // cancelled but never joined lets the process exit while it is still
+    // inside a transaction, and nothing else in the suite would notice. It has
+    // now caught two additions in a row, which is the whole argument for
+    // asserting the count rather than only the names.
+    for loop_name in ["provisioning", "outbox", "inbound", "mcp", "initiative"] {
         assert!(
             logs.contains(&format!("\"loop_name\":\"{loop_name}\"")),
             "the {loop_name} loop never reported draining; was it spawned?\n{logs}"
@@ -588,7 +590,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // than also catching a loop's own "…loop drained" farewell line.
     assert_eq!(
         logs.matches("\"loop_name\":").count(),
-        4,
+        5,
         "every loop has to be joined, not all but one:\n{logs}"
     );
     assert!(

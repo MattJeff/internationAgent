@@ -41,8 +41,19 @@
 //!
 //! # Where the pool itself is written down
 //!
-//! In configuration, next to the WhatsApp sender it is modelled on
-//! ([`crate::provisioning::EngineConfig::whatsapp_sender`]) — see [`Pool`].
+//! In `phone_numbers`, the table `0010_phone_pool.sql` created for it, read by
+//! [`numbers`]. **Not in configuration and not in this process's memory**: the
+//! numbers a tenant owns are a per-tenant fact, and a per-tenant fact behind a
+//! deploy is a fact one replica can hold a stale copy of. Reading it inside the
+//! request's own [`TenantTx`] costs one indexed query over five to ten rows and
+//! removes the staleness question instead of answering it.
+//!
+//! Do not confuse the two tables this module touches. `phone_numbers` is what
+//! an **operator** put in the shared pool — the tenant owns it. A number
+//! `Step::Phone` bought for one employee lives in `employee_resources` under
+//! the provider that sold it, and is that employee's alone. `employee_resources`
+//! rows with `provider = "phone-pool"` are the third thing: a *seat* on a number
+//! from the first table, which is what [`occupancy`] counts.
 //!
 //! # Inbound routing, and why affinity is correctness
 //!
@@ -77,10 +88,13 @@ use std::collections::BTreeMap;
 
 use agentos_domain::action::E164;
 use agentos_domain::employee::{Employee, ProviderBinding, ResourceState, Step};
-use agentos_domain::ids::{EmployeeId, TenantId};
+use agentos_domain::ids::EmployeeId;
 use agentos_domain::message::Channel;
 use agentos_store::db::{StoreError, TenantTx};
 use agentos_store::employee as employee_store;
+// The pool's own storage. Re-exported rather than restated so a caller that
+// registers a number and a caller that lists one share one vocabulary.
+pub use agentos_store::phone_pool::{NewNumber, NumberState, register};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -170,6 +184,7 @@ pub enum Regulatory {
 pub struct PoolNumber {
     number: E164,
     region: Region,
+    state: NumberState,
     regulatory: Regulatory,
     capacity: u32,
 }
@@ -184,6 +199,7 @@ impl PoolNumber {
         Self {
             number,
             region: Region::new(region),
+            state: NumberState::Active,
             regulatory: Regulatory::NotRequired,
             capacity,
         }
@@ -206,6 +222,21 @@ impl PoolNumber {
         self.region.as_str()
     }
 
+    /// Where the number is in its regulatory life.
+    ///
+    /// The field that decides whether an employee can be put on it *today*, and
+    /// it is not the same question as [`PoolNumber::regulatory`]: a number can
+    /// rest on an approved bundle and still be [`NumberState::Suspended`]
+    /// because somebody is draining it before giving it back.
+    pub const fn state(&self) -> NumberState {
+        self.state
+    }
+
+    /// Whether an employee can be allocated onto it right now.
+    pub fn allocatable(&self) -> bool {
+        self.state == NumberState::Active
+    }
+
     /// Its regulatory standing.
     pub const fn regulatory(&self) -> &Regulatory {
         &self.regulatory
@@ -217,49 +248,60 @@ impl PoolNumber {
     }
 }
 
-/// Every tenant's pool.
+/// Every number **this** tenant owns, lowest number first.
 ///
-/// ponytail: **configuration, not a table.** A tenant owns five to ten numbers
-/// and changes that a few times a year, with a regulatory bundle in hand — the
-/// same shape of fact as the company's verified WhatsApp sender, which is
-/// already an [`crate::provisioning::EngineConfig`] field. A `pool_numbers`
-/// table would need a migration, a CRUD surface nobody asked for, and a
-/// reconciliation job to stop it drifting from what the provider account
-/// actually holds. It also gets the important property for free: nothing in
-/// this module can delete a number, because nothing here writes the list.
+/// The tenant is the transaction's, never an argument: `TenantTx` has already
+/// set `app.tenant_id`, so RLS is what scopes this and there is no predicate
+/// here for anybody to forget. That is also why one tenant cannot name
+/// another's number through `/v1/pool/numbers/{id}` — the row is not merely
+/// unlisted, it is invisible.
 ///
-/// The day an operator needs to add a number without a deploy, this becomes a
-/// load in the route and every signature below is unchanged.
-#[derive(Debug, Clone, Default)]
-pub struct Pool(BTreeMap<TenantId, Vec<PoolNumber>>);
+/// `released` numbers are left out: they went back to the provider and are not
+/// the tenant's any more. `suspended` ones stay, because they are still owned,
+/// still billed, and still carrying the employees already on them — a pool page
+/// that hid them would hide the reason a rollout is stuck.
+pub async fn numbers(tx: &mut TenantTx<'_>) -> Result<Vec<PoolNumber>, StoreError> {
+    let rows: Vec<(String, String, String, i32, Option<String>)> = sqlx::query_as(
+        "SELECT e164, region, state, capacity, bundle_ref \
+           FROM phone_numbers \
+          WHERE state <> 'released' \
+          ORDER BY e164",
+    )
+    .fetch_all(&mut ***tx)
+    .await?;
 
-impl Pool {
-    /// An empty pool: every tenant on dedicated numbers.
-    pub fn new() -> Self {
-        Self::default()
-    }
+    rows.into_iter()
+        .map(|(e164, region, state, capacity, bundle_ref)| {
+            let number = E164::parse(&e164)
+                .map_err(|err| StoreError::Database(sqlx::Error::Decode(Box::new(err))))?;
+            // `phone_numbers_state_check` makes the fallback unreachable; a row
+            // that got past it is corrupt, and reading it as suspended keeps an
+            // unknown state out of the allocatable set rather than into it.
+            let state = NumberState::parse(&state).unwrap_or(NumberState::Suspended);
+            Ok(PoolNumber {
+                number,
+                region: Region::new(&region),
+                state,
+                regulatory: regulatory_of(state, bundle_ref),
+                // `phone_numbers_capacity_positive` makes the fallback
+                // unreachable; zero is the drained reading, which takes nobody
+                // new, and is the safe way to misread a corrupt row.
+                capacity: u32::try_from(capacity).unwrap_or(0),
+            })
+        })
+        .collect()
+}
 
-    /// Add one number to one tenant's pool.
-    #[must_use]
-    pub fn with_number(mut self, tenant_id: TenantId, number: PoolNumber) -> Self {
-        self.0.entry(tenant_id).or_default().push(number);
-        self
-    }
-
-    /// This tenant's numbers. Empty for a tenant that pools nothing.
-    pub fn numbers(&self, tenant_id: TenantId) -> &[PoolNumber] {
-        self.0.get(&tenant_id).map_or(&[], Vec::as_slice)
-    }
-
-    /// The pooled number spelled `number`, if this tenant has it.
-    ///
-    /// Tenant-scoped on purpose: the id in `/v1/pool/numbers/{id}` comes off the
-    /// path, and a lookup that ignored the tenant would let one tenant name
-    /// another's number.
-    pub fn find(&self, tenant_id: TenantId, number: &E164) -> Option<&PoolNumber> {
-        self.numbers(tenant_id)
-            .iter()
-            .find(|pooled| pooled.number == *number)
+/// What `state` and `bundle_ref` together say about the paperwork.
+///
+/// No bundle recorded means the region sold the number without one — US, CA —
+/// which is [`Regulatory::NotRequired`] and not a missing field. A bundle plus
+/// any state short of `active` is a bundle nobody has cleared yet.
+fn regulatory_of(state: NumberState, bundle_ref: Option<String>) -> Regulatory {
+    match bundle_ref {
+        None => Regulatory::NotRequired,
+        Some(bundle) if state == NumberState::Active => Regulatory::Approved { bundle },
+        Some(bundle) => Regulatory::Pending { bundle },
     }
 }
 
@@ -706,7 +748,7 @@ pub async fn reassign(
 #[cfg(test)]
 mod tests {
     use agentos_domain::action::Domain;
-    use agentos_domain::ids::Slug;
+    use agentos_domain::ids::{Slug, TenantId};
     use agentos_providers::EnsureCtx;
     use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
     use agentos_store::db::Db;
@@ -715,6 +757,30 @@ mod tests {
 
     const NUMBER: &str = "+33757590001";
     const SUPPLIER: &str = "+33612345678";
+
+    /// Put a number in the tenant's shared pool, the way the operator route
+    /// does. `external_id` is unique per call because
+    /// `phone_numbers_provider_external_id_key` is global and these tests share
+    /// a database with every previous run.
+    async fn add_pool_number(db: &Db, tenant: TenantId, e164: &str, capacity: i32) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        register(
+            &mut tx,
+            &NewNumber {
+                provider: "twilio".to_owned(),
+                external_id: format!("PN-pool-{}", Uuid::now_v7()),
+                e164: E164::parse(e164).expect("e164"),
+                region: "FR".to_owned(),
+                state: NumberState::Active,
+                capacity,
+                bundle_ref: Some("BU-fr-1".to_owned()),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("register");
+        tx.commit().await.expect("commit");
+    }
 
     /// Real Postgres or nothing: every claim here is about rows.
     async fn db() -> Option<Db> {
@@ -910,7 +976,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let tenant = new_tenant(&db).await;
         let lena = allocate(&db, tenant, "lena").await;
-        let pool = Pool::new().with_number(tenant, PoolNumber::new(number(), "FR", 10));
+        add_pool_number(&db, tenant, NUMBER, 10).await;
 
         for expected in [
             SlotRelease::Freed { number: number() },
@@ -927,13 +993,90 @@ mod tests {
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         let seats = occupancy(&mut tx).await.expect("occupancy");
+        let pool = numbers(&mut tx).await.expect("numbers");
         tx.rollback().await.expect("rollback");
 
         assert!(!seats.contains_key(NUMBER), "nobody is on it: {seats:?}");
+        let still = pool
+            .iter()
+            .find(|pooled| pooled.number() == &number())
+            .expect("an empty number left the pool; the tenant owns it, not its last occupant");
+        assert_eq!(still.capacity(), 10);
+        assert!(still.allocatable());
         assert_eq!(
-            pool.find(tenant, &number()).map(PoolNumber::capacity),
-            Some(10),
-            "an empty number left the pool; the tenant owns it, not its last occupant"
+            still.regulatory(),
+            &Regulatory::Approved {
+                bundle: "BU-fr-1".to_owned()
+            }
+        );
+    }
+
+    /// The load is a per-tenant read, and it is RLS that scopes it: the same
+    /// E.164 registered by two tenants is two rows, and neither sees the other's.
+    #[tokio::test]
+    async fn the_pool_load_is_scoped_by_the_transactions_tenant() {
+        let Some(db) = db().await else { return };
+        let (mine, theirs) = (new_tenant(&db).await, new_tenant(&db).await);
+        add_pool_number(&db, mine, NUMBER, 10).await;
+        add_pool_number(&db, mine, "+33757590002", 5).await;
+        add_pool_number(&db, theirs, NUMBER, 1).await;
+
+        let mut tx = db.tenant_tx(mine).await.expect("tx");
+        let ours = numbers(&mut tx).await.expect("numbers");
+        tx.rollback().await.expect("rollback");
+        // Lowest number first, and only ours.
+        assert_eq!(
+            ours.iter().map(PoolNumber::capacity).collect::<Vec<_>>(),
+            vec![10, 5]
+        );
+
+        let mut tx = db.tenant_tx(theirs).await.expect("tx");
+        let hers = numbers(&mut tx).await.expect("numbers");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(hers.len(), 1, "another tenant's numbers leaked: {hers:?}");
+        assert_eq!(hers[0].capacity(), 1);
+    }
+
+    /// A number given back is not the tenant's; one being drained still is.
+    #[tokio::test]
+    async fn a_released_number_leaves_the_pool_and_a_suspended_one_does_not() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        add_pool_number(&db, tenant, NUMBER, 10).await;
+        add_pool_number(&db, tenant, "+33757590002", 10).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let ids: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, e164 FROM phone_numbers ORDER BY e164")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("ids");
+        for (id, e164) in &ids {
+            let state = if e164 == NUMBER {
+                NumberState::Suspended
+            } else {
+                NumberState::Released
+            };
+            agentos_store::phone_pool::set_state(&mut tx, *id, state, Utc::now())
+                .await
+                .expect("set state");
+        }
+        let pool = numbers(&mut tx).await.expect("numbers");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(pool.len(), 1, "{pool:?}");
+        assert_eq!(pool[0].number().as_str(), NUMBER);
+        assert_eq!(pool[0].state(), NumberState::Suspended);
+        assert!(
+            !pool[0].allocatable(),
+            "a number being drained still takes new employees"
+        );
+        // Still bought, still not cleared: the bundle reads as pending again.
+        assert_eq!(
+            pool[0].regulatory(),
+            &Regulatory::Pending {
+                bundle: "BU-fr-1".to_owned()
+            }
         );
     }
 

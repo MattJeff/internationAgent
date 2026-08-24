@@ -302,14 +302,20 @@ pub async fn claim_except(
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
     let rows = sqlx::query(
-        "UPDATE outbox_events AS e \
-         SET attempt_count = e.attempt_count + 1, \
-             available_at = $1::timestamptz \
-                 + least(interval '1 second' \
-                         * power(2::double precision, e.attempt_count::double precision), \
-                         interval '1 hour') \
-                   * (0.5 + random()) \
-         WHERE e.id IN ( \
+        // MATERIALIZED, and it is not a hint. Written the obvious way —
+        // `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` — the
+        // subplan can be re-executed per outer row, and each re-execution
+        // steps over whichever rows a *concurrent* poller holds locked right
+        // then, so the UPDATE touches the union rather than `$n` rows. The
+        // rows stay disjoint between pollers, so nothing is handled twice;
+        // what breaks is the bound. A poller that claims 16 with a limit of
+        // 10 has silently stopped bounding its own batch, which is the only
+        // thing standing between one tick and the whole table.
+        //
+        // A single-session test returns exactly `$n` and proves nothing. The
+        // initiative loop's two-poller test caught the same query shape
+        // claiming 13, then 16, against a limit of 10.
+        "WITH due AS MATERIALIZED ( \
              SELECT id FROM outbox_events \
              WHERE published_at IS NULL \
                AND available_at <= $1::timestamptz \
@@ -318,6 +324,14 @@ pub async fn claim_except(
              ORDER BY available_at, id \
              FOR UPDATE SKIP LOCKED \
              LIMIT $3::bigint) \
+         UPDATE outbox_events AS e \
+         SET attempt_count = e.attempt_count + 1, \
+             available_at = $1::timestamptz \
+                 + least(interval '1 second' \
+                         * power(2::double precision, e.attempt_count::double precision), \
+                         interval '1 hour') \
+                   * (0.5 + random()) \
+         WHERE e.id IN (SELECT id FROM due) \
          RETURNING e.id, e.tenant_id, e.aggregate_type, e.aggregate_id, e.event_type, \
                    e.payload, e.attempt_count, e.available_at, e.last_error",
     )

@@ -185,6 +185,95 @@ pub async fn find_suppliers(
         .collect())
 }
 
+/// One contact at a supplier that could be written to.
+///
+/// `email` is the column as stored, not a parsed address: `supplier_contacts`
+/// has no `CHECK` on the shape of it, and a store that returned only the rows
+/// it could parse would silently drop a supplier whose address has a typo. The
+/// caller parses, and reports what will not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplierContact {
+    /// Which supplier this human works for.
+    pub supplier_id: Uuid,
+    /// Their name, for the operator reading a report about them.
+    pub full_name: String,
+    /// The address, as stored.
+    pub email: String,
+    /// Whether they are the designated contact. At most one active contact per
+    /// supplier can be — `supplier_contacts_primary_key`.
+    pub is_primary: bool,
+    /// Why this address must not be written to, if it must not: `opt_out`,
+    /// `complaint`, `bounce`, `legal_request`, `do_not_contact`.
+    ///
+    /// **Returned rather than filtered.** A suppressed contact is not the same
+    /// as an absent one — one is a firm that asked us to stop and the other is
+    /// a supplier nobody ever recorded an address for — and only the caller can
+    /// report the difference.
+    pub suppressed: Option<String>,
+}
+
+/// The emailable contacts for these suppliers, **best first within each
+/// supplier**, each carrying its suppression status.
+///
+/// One query for the whole shortlist rather than one per supplier: an RFQ round
+/// is tens of suppliers, and `= ANY($1)` over
+/// `supplier_contacts_supplier_idx` is one round trip where a loop is tens.
+///
+/// The order is `(supplier_id, is_primary DESC, full_name, id)` and every key
+/// is a column, so the first row for a supplier is the same row on every
+/// replica and on every replay. That matters because the caller writes to the
+/// first one and only the first one — see `app::sourcing::recipients`.
+///
+/// # Two layers of "do not write to this person", both already here
+///
+/// `active = false` is the row-level one — somebody left the company, or the
+/// row is stale — and it is applied in the `WHERE`. A supplier whose every
+/// contact is deactivated comes back with no rows at all, which the caller
+/// reports rather than skips.
+///
+/// The address-level one is `suppressions` from `0011_revenue.sql`, read
+/// through `revenue_suppression_of`. That function is `security definer` for a
+/// reason worth knowing: a `scope = 'global'` opt-out binds every tenant and is
+/// readable by none of them, so the check has to happen inside the database. Its
+/// `revenue_` prefix names the migration it was born in, not the vertical it
+/// governs — the table has no vertical column, and a supplier who says "stop
+/// emailing me" has said the same sentence as a prospect who does. **Do not add
+/// a purchasing suppression list beside it**: a second place for that sentence
+/// to have been recorded is the same as not having recorded it.
+///
+/// `lower(email)` because `suppressions_address_normalised` stores addresses
+/// folded, and the check between the two is an equality test.
+pub async fn supplier_contacts(
+    tx: &mut TenantTx<'_>,
+    supplier_ids: &[Uuid],
+) -> Result<Vec<SupplierContact>, SourcingError> {
+    let rows: Vec<(Uuid, String, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT c.supplier_id, c.full_name, c.email, c.is_primary, \
+                revenue_suppression_of(lower(c.email), NULL) \
+           FROM supplier_contacts c \
+          WHERE c.supplier_id = ANY($1) \
+            AND c.active \
+            AND c.email IS NOT NULL \
+          ORDER BY c.supplier_id, c.is_primary DESC, c.full_name, c.id",
+    )
+    .bind(supplier_ids)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(supplier_id, full_name, email, is_primary, suppressed)| SupplierContact {
+                supplier_id,
+                full_name,
+                email,
+                is_primary,
+                suppressed,
+            },
+        )
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // RFQs
 // ---------------------------------------------------------------------------

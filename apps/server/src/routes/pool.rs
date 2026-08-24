@@ -2,9 +2,28 @@
 //!
 //! ```text
 //! GET  /v1/pool/numbers                 the numbers, region, bundle, capacity, occupancy
+//! POST /v1/pool/numbers                 put a number the tenant owns into the pool
 //! GET  /v1/pool/routing                 counterparty -> employee, and whether it still routes
 //! POST /v1/pool/numbers/{id}/reassign   hand one counterparty to another employee
 //! ```
+//!
+//! # Where the numbers come from
+//!
+//! `phone_numbers`, read per request inside the caller's own [`TenantTx`]. Not
+//! from configuration and not from a process-wide cache: which numbers a tenant
+//! shares is a per-tenant fact that an operator changes with a bundle in hand,
+//! and a cached copy of it is a copy that one replica can serve stale after
+//! another replica's `POST`. There is no refresh tick here and no cross-replica
+//! nudge because there is nothing held to go stale — the pool is five to ten
+//! rows on an index, and the read that removes the question is cheaper than the
+//! machinery that would have answered it.
+//!
+//! `POST /v1/pool/numbers` is what closes the loop: without it the table could
+//! only be filled by a migration or by hand, which is why this router used to be
+//! unmountable. It is an upsert on `(tenant, e164)`, so re-posting a number
+//! whose bundle has since cleared is also how `pending_regulatory` becomes
+//! `active` — one endpoint, because a number's paperwork moving is the same
+//! operator writing down the same number.
 //!
 //! # Why an operator needs this at all
 //!
@@ -39,10 +58,8 @@
 //! reads — the same shape as `routes/employees.rs` and `routes/inventory.rs`,
 //! deliberately, because a third house style is a third thing to learn.
 
-use std::sync::Arc;
-
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
-use agentos_app::pool_ops::{self, Occupant, Pool, PoolError, PoolNumber};
+use agentos_app::pool_ops::{self, NewNumber, NumberState, Occupant, PoolError, Regulatory};
 use agentos_domain::action::{Action, E164, McpTool};
 use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
@@ -80,37 +97,27 @@ const TOOL_SERVER: &str = "pool";
 /// The tool half of the reassign tool name.
 const TOOL_NAME: &str = "reassign";
 
-/// The routes' shared state: a database for the reads, a gate for the verdict,
-/// and the declared pool.
+/// The routes' shared state: a database for the reads and the writes, and a
+/// gate for the one verdict.
+///
+/// No pool here on purpose. It is read per request from `phone_numbers` — see
+/// the module docs on why a held copy is the wrong shape for a fact an operator
+/// edits.
 #[derive(Clone)]
 pub struct PoolApi {
     db: Db,
     gate: PolicyGate,
-    /// Which numbers each tenant owns. Configuration — see [`Pool`] — so it is
-    /// shared by every request rather than read per request.
-    pool: Arc<Pool>,
 }
 
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before any handler here.
-///
-#[allow(dead_code)] // not mounted: this binary builds no Pool. See main.rs.
-/// ponytail: `allow(dead_code)` for the same reason `routes/inventory.rs` has
-/// it — this unit owns this file and one `pub mod` line, and `main.rs`, where
-/// routers are merged, belongs to another unit. Delete the attribute in the
-/// same commit that adds `.merge(routes::pool::router(db.clone(), gate.clone(),
-/// pool))` to `api_router`.
-pub fn router(db: Db, gate: PolicyGate, pool: Pool) -> Router {
+pub fn router(db: Db, gate: PolicyGate) -> Router {
     Router::new()
-        .route("/v1/pool/numbers", get_route(numbers))
+        .route("/v1/pool/numbers", get_route(numbers).post(add_number))
         .route("/v1/pool/routing", get_route(routing))
         .route("/v1/pool/numbers/{id}/reassign", post(reassign))
-        .with_state(PoolApi {
-            db,
-            gate,
-            pool: Arc::new(pool),
-        })
+        .with_state(PoolApi { db, gate })
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +159,17 @@ struct NumberView<'a> {
     number: &'a str,
     /// ISO country it was bought in.
     region: &'a str,
+    /// `pending_regulatory`, `active` or `suspended`. Whether an employee can
+    /// be put on it *today*, which is not the same question as the bundle
+    /// below: a number can rest on an approved bundle and still be suspended
+    /// because somebody is draining it.
+    state: &'a str,
+    /// Whether a new employee can be allocated onto it right now.
+    allocatable: bool,
     /// Whether it needed a regulatory bundle and where that bundle got to. The
     /// field a French rollout is actually blocked on.
     #[serde(flatten)]
-    regulatory: &'a pool_ops::Regulatory,
+    regulatory: &'a Regulatory,
     /// How many employees may share it.
     capacity: u32,
     /// How many do.
@@ -173,8 +187,12 @@ struct NumberView<'a> {
 
 /// `GET /v1/pool/numbers` — the tenant's numbers, with live occupancy.
 ///
-/// The numbers come from configuration and the occupancy from the database, so
-/// a number with nobody on it is still listed. That is not cosmetic: the last
+/// Both halves are read in **one** transaction: the numbers from
+/// `phone_numbers` and the seats from `employee_resources`. One transaction
+/// rather than two because a number registered between the two reads would
+/// otherwise appear with somebody else's occupancy beside it.
+///
+/// A number with nobody on it is still listed. That is not cosmetic: the last
 /// employee leaving a number does **not** give the number back, and an endpoint
 /// that dropped empty numbers would make a still-billed, still-regulated asset
 /// invisible the moment it went idle.
@@ -188,14 +206,16 @@ async fn numbers(
 
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     let seats = pool_ops::occupancy(&mut tx).await?;
+    // RLS scopes this to the caller's tenant; there is no tenant argument to
+    // pass wrong and no other tenant's number that could be listed here.
+    let declared = pool_ops::numbers(&mut tx).await?;
     tx.rollback().await?;
 
     let empty: Vec<Occupant> = Vec::new();
-    let mut declared: Vec<&PoolNumber> = state.pool.numbers(principal.tenant_id).iter().collect();
-    declared.sort_by(|a, b| a.number().as_str().cmp(b.number().as_str()));
-
     let views: Vec<NumberView<'_>> = declared
         .iter()
+        // Already ordered by `e164` in SQL, so the keyset walk is a `>` on the
+        // same key the database sorted on.
         .filter(|pooled| match page.after.as_deref() {
             Some(after) => pooled.number().as_str() > after,
             None => true,
@@ -206,6 +226,8 @@ async fn numbers(
             NumberView {
                 number: pooled.number().as_str(),
                 region: pooled.region_str(),
+                state: pooled.state().as_str(),
+                allocatable: pooled.allocatable(),
                 regulatory: pooled.regulatory(),
                 capacity: pooled.capacity(),
                 occupancy: employees.len(),
@@ -221,6 +243,153 @@ async fn numbers(
 
     let next = next_after(&views, limit, |view| view.cursor.to_owned());
     Ok(Json(json!({ "numbers": views, "next_after": next })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/pool/numbers
+// ---------------------------------------------------------------------------
+
+/// A number the tenant already owns, being put into the shared pool.
+///
+/// `provider` and `external_id` are required and are not decoration: a pooled
+/// number is a real DID on a real account, and the row that does not name it
+/// cannot be reconciled, released or billed back. The pair is unique across
+/// *every* tenant (`phone_numbers_provider_external_id_key`), so the same DID
+/// cannot be claimed twice.
+///
+/// **This does not buy anything.** There is no provider call on this path. The
+/// operator has the number and the bundle already; what is missing is the row
+/// that says which tenant shares it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddNumber {
+    /// The number, E.164.
+    number: String,
+    /// ISO 3166-1 alpha-2, e.g. `FR`. Must match the region employees are
+    /// provisioned into or nobody will ever be allocated onto it.
+    region: String,
+    /// How many employees may share it. `1` is a dedicated number under the
+    /// same contract; a French pooled number is 10-20.
+    capacity: i32,
+    /// The provider that issued it, as the adapter spells it.
+    provider: String,
+    /// That provider's own id for it — the Twilio SID, the Telnyx id.
+    external_id: String,
+    /// The regulatory bundle it rests on, where the region needs one. Absent
+    /// means the region sells numbers without one, which is a claim about the
+    /// region and not a missing field.
+    #[serde(default)]
+    bundle_ref: Option<String>,
+    /// `active` (the default) or `pending_regulatory`. Defaulting to active
+    /// because an operator posting a number is saying the tenant owns it and it
+    /// works; a bundle still with a human reviewer is the exception and is
+    /// spelled out. `suspended` and `released` are not accepted here — they are
+    /// things that happen to a number already in the pool, not ways to add one.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// `POST /v1/pool/numbers` — put a number the tenant owns into its pool.
+///
+/// Idempotent on `(tenant, e164)`: posting the same number twice updates its
+/// capacity, state and bundle rather than creating a second row, which is also
+/// how an operator records a bundle clearing. `provider` and `external_id` are
+/// *not* rewritten on that second post — a number bound to one provider id does
+/// not quietly become another's.
+///
+/// # Why this is not behind the Policy Gate
+///
+/// The gate rules on what an *employee* may do, attributed to an employee id;
+/// `reassign` below has one, because handing a supplier over is done to
+/// somebody. Registering a number is the operator configuring the tenant, and
+/// there is no employee to attribute it to — inventing one to satisfy the shape
+/// would make the audit trail say something untrue. The API key is the
+/// operator's credential and the tenant comes off it, never off the body, and
+/// the write leaves an audit row naming the number and the actor.
+async fn add_number(
+    State(state): State<PoolApi>,
+    principal: Principal,
+    body: Result<Json<AddNumber>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let number =
+        E164::parse(&body.number).map_err(|err| ApiError::bad_request(format!("number: {err}")))?;
+
+    // `phone_numbers_capacity_positive` would refuse this as a 500-shaped
+    // constraint violation; refused here as the caller's mistake instead.
+    if body.capacity < 1 {
+        return Err(ApiError::bad_request(
+            "capacity: a pooled number must carry at least one employee",
+        ));
+    }
+    if body.region.len() != 2 || !body.region.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(ApiError::bad_request(
+            "region: expected an upper-case ISO 3166-1 alpha-2 country",
+        ));
+    }
+    let number_state = match body.state.as_deref() {
+        None | Some("active") => NumberState::Active,
+        Some("pending_regulatory") => NumberState::PendingRegulatory,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "state: expected 'active' or 'pending_regulatory', got {other:?}"
+            )));
+        }
+    };
+
+    let now = Utc::now();
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let id = pool_ops::register(
+        &mut tx,
+        &NewNumber {
+            provider: body.provider.clone(),
+            external_id: body.external_id.clone(),
+            e164: number.clone(),
+            region: body.region.clone(),
+            state: number_state,
+            capacity: body.capacity,
+            bundle_ref: body.bundle_ref.clone(),
+        },
+        now,
+    )
+    .await?;
+
+    audit::append(
+        &mut tx,
+        &AuditEvent {
+            // No employee: this is the tenant's configuration, not anybody's
+            // resource. See the doc comment.
+            employee_id: None,
+            payload: json!({
+                "number": number.as_str(),
+                "region": body.region,
+                "capacity": body.capacity,
+                "state": number_state.as_str(),
+                "provider": body.provider,
+                "external_id": body.external_id,
+                "bundle_ref": body.bundle_ref,
+            }),
+            ..AuditEvent::new(
+                principal.actor.clone(),
+                AuditKind::ResourceStateChanged,
+                now,
+            )
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id.to_string(),
+            "number": number.as_str(),
+            "region": body.region,
+            "capacity": body.capacity,
+            "state": number_state.as_str(),
+        })),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +469,16 @@ async fn reassign(
     let to = EmployeeId::from_uuid(body.to_employee);
 
     // A number this tenant does not own is a 404, not a 403: telling one tenant
-    // that another tenant's number exists is telling it something.
-    if state.pool.find(principal.tenant_id, &number).is_none() {
+    // that another tenant's number exists is telling it something. RLS is what
+    // makes that true rather than this `find` — another tenant's row is not in
+    // the result at all.
+    //
+    // ponytail: loads the whole pool to look at one row. A pool is five to ten
+    // numbers; make it a `WHERE e164 = $1` when a tenant has a thousand.
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let owned = pool_ops::numbers(&mut tx).await?;
+    tx.rollback().await?;
+    if !owned.iter().any(|pooled| pooled.number() == &number) {
         return Err(ApiError::not_found());
     }
 
@@ -406,7 +583,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use agentos_app::gate::PolicyBook;
-    use agentos_app::pool_ops::{Regulatory, slot_binding};
+    use agentos_app::pool_ops::slot_binding;
     use agentos_domain::employee::{Employee, Lifecycle, ResourceState, Step};
     use agentos_domain::ids::TenantId;
     use agentos_domain::policy::PolicyLimits;
@@ -423,6 +600,20 @@ mod tests {
     const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const NUMBER: &str = "+33757590001";
     const SUPPLIER: &str = "+33612345678";
+
+    /// A registration body. `external_id` is unique per call:
+    /// `phone_numbers_provider_external_id_key` is global and these tests share
+    /// a database with every previous run.
+    fn registration(number: &str, capacity: i32, bundle: Option<&str>) -> Value {
+        json!({
+            "number": number,
+            "region": "FR",
+            "capacity": capacity,
+            "provider": "twilio",
+            "external_id": format!("PN-{}", Uuid::now_v7()),
+            "bundle_ref": bundle,
+        })
+    }
 
     struct Harness {
         app: Router,
@@ -461,21 +652,24 @@ mod tests {
             }
             let gate = PolicyGate::new(db.clone(), PolicyBook::new(limits));
 
-            let pool = Pool::new()
-                .with_number(
-                    a,
-                    PoolNumber::new(pooled(), "FR", 10).with_regulatory(Regulatory::Approved {
-                        bundle: "BU-fr-1".to_owned(),
-                    }),
-                )
-                .with_number(b, PoolNumber::new(pooled(), "FR", 10));
-
-            Some(Self {
-                app: crate::with_api_stack(router(db.clone(), gate, pool), db.clone(), keys),
+            let h = Self {
+                app: crate::with_api_stack(router(db.clone(), gate), db.clone(), keys),
                 db,
                 a,
                 b,
-            })
+            };
+
+            // The pool is filled the only way it can be: an operator posting to
+            // the route. Both tenants register the *same* E.164, which is legal
+            // — the number is unique per tenant, not globally — and is what the
+            // isolation assertions below rest on.
+            for (secret, bundle) in [(SECRET_A, Some("BU-fr-1")), (SECRET_B, None)] {
+                let (status, body) = h
+                    .post("/v1/pool/numbers", secret, registration(NUMBER, 10, bundle))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+            }
+            Some(h)
         }
 
         async fn get(&self, uri: &str, secret: Option<&str>) -> (StatusCode, Value) {
@@ -643,6 +837,168 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        h.teardown().await;
+    }
+
+    // -- registering ---------------------------------------------------------
+
+    /// **Gap 1, end to end.** An operator puts a number in a tenant's pool, the
+    /// list shows it, and the other tenant does not — for the same number
+    /// string, which is the case a `WHERE` clause gets wrong and RLS does not.
+    #[tokio::test]
+    async fn an_operator_fills_the_pool_and_the_other_tenant_cannot_see_it() {
+        let Some(h) = Harness::new(true).await else {
+            return;
+        };
+
+        // A second number, for tenant A only, still with its bundle in review.
+        let mut pending = registration("+33757590002", 4, Some("BU-fr-2"));
+        pending["state"] = json!("pending_regulatory");
+        let (status, created) = h.post("/v1/pool/numbers", SECRET_A, pending).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["number"], "+33757590002");
+        assert_eq!(created["state"], "pending_regulatory");
+
+        // A sees both, lowest number first, each with its own paperwork.
+        let (status, page) = h.get("/v1/pool/numbers", Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = page["numbers"].as_array().expect("numbers");
+        assert_eq!(rows.len(), 2, "{page}");
+        assert_eq!(rows[0]["number"], NUMBER);
+        assert_eq!(rows[0]["capacity"], 10);
+        assert_eq!(rows[0]["state"], "active");
+        assert_eq!(rows[0]["allocatable"], true);
+        assert_eq!(rows[0]["regulatory"], "approved");
+        assert_eq!(rows[0]["bundle"], "BU-fr-1");
+        assert_eq!(rows[1]["number"], "+33757590002");
+        assert_eq!(rows[1]["capacity"], 4);
+        assert_eq!(rows[1]["state"], "pending_regulatory");
+        assert_eq!(
+            rows[1]["allocatable"], false,
+            "an employee can be put on a number whose bundle is still in review"
+        );
+        assert_eq!(rows[1]["regulatory"], "pending");
+        assert_eq!(rows[1]["bundle"], "BU-fr-2");
+
+        // B registered the same E.164 with its own capacity and no bundle. It
+        // sees exactly that, and nothing of A's.
+        let (status, page) = h.get("/v1/pool/numbers", Some(SECRET_B)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = page["numbers"].as_array().expect("numbers");
+        assert_eq!(rows.len(), 1, "another tenant's numbers leaked: {page}");
+        assert_eq!(rows[0]["number"], NUMBER);
+        assert_eq!(rows[0]["regulatory"], "not_required");
+        assert!(
+            !page.to_string().contains("BU-fr-1"),
+            "another tenant's bundle leaked: {page}"
+        );
+        assert!(
+            !page.to_string().contains("+33757590002"),
+            "another tenant's number leaked: {page}"
+        );
+
+        // And a number only A owns is a 404 to B on the write path too — not a
+        // 403, which would confirm it exists.
+        let alex = allocate(&h.db, h.b, "alex").await;
+        let (status, _) = h
+            .post(
+                "/v1/pool/numbers/+33757590002/reassign",
+                SECRET_B,
+                json!({ "counterparty": SUPPLIER, "to_employee": alex.as_uuid() }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        h.teardown().await;
+    }
+
+    /// Re-posting a number updates it rather than doubling it — which is how a
+    /// cleared bundle is recorded — and the provider's id is not rewritable.
+    #[tokio::test]
+    async fn registering_the_same_number_twice_updates_it() {
+        let Some(h) = Harness::new(true).await else {
+            return;
+        };
+
+        let mut again = registration(NUMBER, 25, Some("BU-fr-1"));
+        let second_external = again["external_id"].clone();
+        again["state"] = json!("active");
+        let (status, body) = h.post("/v1/pool/numbers", SECRET_A, again).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, page) = h.get("/v1/pool/numbers", Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = page["numbers"].as_array().expect("numbers");
+        assert_eq!(rows.len(), 1, "the number was doubled: {page}");
+        assert_eq!(rows[0]["capacity"], 25, "the update did not take");
+
+        // The identity columns are not rewritten on conflict: the row still
+        // names the provider id it was first bound to.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+        let external: String =
+            sqlx::query_scalar("SELECT external_id FROM phone_numbers WHERE e164 = $1")
+                .bind(NUMBER)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("external id");
+        tx.rollback().await.expect("rollback");
+        assert_ne!(
+            Value::String(external),
+            second_external,
+            "a number silently changed which provider resource it names"
+        );
+
+        h.teardown().await;
+    }
+
+    /// The registration body is validated here rather than by a constraint
+    /// violation surfacing as a 500.
+    #[tokio::test]
+    async fn a_bad_registration_is_refused_specifically() {
+        let Some(h) = Harness::new(true).await else {
+            return;
+        };
+
+        for (field, body) in [
+            ("number", {
+                let mut b = registration("0757590003", 10, None);
+                b["number"] = json!("0757590003");
+                b
+            }),
+            ("capacity", registration("+33757590003", 0, None)),
+            ("region", {
+                let mut b = registration("+33757590003", 10, None);
+                b["region"] = json!("france");
+                b
+            }),
+            ("state", {
+                let mut b = registration("+33757590003", 10, None);
+                b["state"] = json!("released");
+                b
+            }),
+        ] {
+            let (status, problem) = h.post("/v1/pool/numbers", SECRET_A, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {problem}");
+        }
+
+        // The same provider resource cannot be claimed by two tenants, and that
+        // index is global rather than tenant-scoped.
+        let stolen = registration("+33757590004", 10, None);
+        let (status, body) = h.post("/v1/pool/numbers", SECRET_A, stolen.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, problem) = h.post("/v1/pool/numbers", SECRET_B, stolen).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+
+        // Nothing above landed in the pool.
+        let (_, page) = h.get("/v1/pool/numbers", Some(SECRET_A)).await;
+        let numbers: Vec<&str> = page["numbers"]
+            .as_array()
+            .expect("numbers")
+            .iter()
+            .map(|row| row["number"].as_str().expect("number"))
+            .collect();
+        assert_eq!(numbers, vec![NUMBER, "+33757590004"], "{page}");
 
         h.teardown().await;
     }

@@ -57,13 +57,21 @@ type ResourceRow = (
 /// The row said something the domain cannot represent. Not a driver failure and
 /// not a missing row, so it gets its own loud spelling on top of
 /// [`StoreError::Database`].
-fn corrupt(what: impl Into<String>) -> StoreError {
+///
+/// `pub(crate)` for [`crate::initiative`], which reads a cadence out of a column
+/// the same way this module reads a lifecycle out of one, and should say so with
+/// the same words rather than inventing a second spelling of "this row is
+/// unparseable".
+pub(crate) fn corrupt(what: impl Into<String>) -> StoreError {
     StoreError::Database(sqlx::Error::Decode(
         format!("corrupt employee aggregate: {}", what.into()).into(),
     ))
 }
 
-fn parse_lifecycle(raw: &str) -> Result<Lifecycle, StoreError> {
+/// `pub(crate)` so that [`crate::initiative`], whose claim predicate turns on
+/// the lifecycle column, reads it through this one match instead of a second
+/// copy that can drift from it.
+pub(crate) fn parse_lifecycle(raw: &str) -> Result<Lifecycle, StoreError> {
     // Exhaustive rather than a `FromStr` in the domain, which is not mine to
     // add. Keep the spellings in step with `Lifecycle::as_str`.
     match raw {

@@ -93,3 +93,15 @@ condition — remove it or teach this script to satisfy it. A suite that \
 silently skips its integration tests and prints 'ok' is worse than a red one."
   fi
 done
+
+# --- the evaluations ---------------------------------------------------------
+# Outside the loop above, and deliberately: `agentos-eval` opens no connection,
+# so giving it a database would mean applying eighteen migrations to prove a
+# ranking still ranks. Its deterministic suites are pure functions over
+# fixtures — a regression in ranking, in the psyche, or in the proof-of-need
+# classification breaks the build here. What is NOT run: the model held-out
+# set, which needs the local `claude` binary and about a minute, and lives
+# behind `cargo run -p agentos-eval -- --live`. A suite that takes twenty
+# minutes is a suite nobody runs.
+echo "==> agentos-eval  (no database; deterministic suites only)"
+cargo test -p agentos-eval -- --test-threads=1

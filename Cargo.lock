@@ -143,6 +143,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-eval"
+version = "0.1.0"
+dependencies = [
+ "agentos-app",
+ "agentos-domain",
+ "agentos-providers",
+ "chrono",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "agentos-providers"
 version = "0.1.0"
 dependencies = [

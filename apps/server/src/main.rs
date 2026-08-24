@@ -1,5 +1,5 @@
-//! One binary: the HTTP control plane plus three tokio loops
-//! (provisioning, outbox, inbound). No separate worker binaries.
+//! One binary: the HTTP control plane plus four tokio loops
+//! (provisioning, outbox, inbound, initiative). No separate worker binaries.
 //!
 //! # The middleware stack, and why the order is the order
 //!
@@ -238,6 +238,11 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         cancel: cancel.clone(),
     };
 
+    // Cloned before `handlers` takes ownership. Five `Arc` bumps, not a second
+    // runtime: a turn an employee starts for itself must be assembled from the
+    // same gate, ports and model as a turn a message starts.
+    let initiative_agent = agent.clone();
+
     let loops = vec![
         (
             "mcp",
@@ -269,6 +274,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 db.clone(),
                 ports,
                 blobs,
+                cancel.clone(),
+            )),
+        ),
+        (
+            "initiative",
+            tokio::spawn(loops::initiative::run(
+                db.clone(),
+                initiative_agent,
                 cancel.clone(),
             )),
         ),
@@ -348,6 +361,7 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
         Router::new()
             .route("/v1/whoami", get(whoami))
             .merge(routes::employees::router(db.clone()))
+            .merge(routes::initiative::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
@@ -358,13 +372,14 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             .merge(routes::turns::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
             .merge(routes::knowledge::router(db.clone()))
-            // `routes::pool` is deliberately NOT here. Its router needs a
-            // `pool_ops::Pool`, and this binary never builds one — there is no
-            // config that says which numbers a tenant shares. Mounting it with
-            // `Pool::new()` would compile and answer 200 with an empty list,
-            // which tells an operator "you have no numbers" when the truth is
-            // "nobody configured this". It stays unmounted until the pool has a
-            // source, and it keeps its `allow(dead_code)` to say so out loud.
+            // The pool has a source now: `phone_numbers`, written by this
+            // router's own `POST /v1/pool/numbers` and read per request. It
+            // used to be unmountable because its router wanted a `Pool` built
+            // from configuration that nothing produced, and mounting an empty
+            // one would have answered 200 with "you have no numbers" when the
+            // truth was "nobody could configure this". Both halves are gone:
+            // there is no held pool to be empty, and there is a way to fill it.
+            .merge(routes::pool::router(db.clone(), gate.clone()))
             .merge(routes::mcp::router(McpState::new(db.clone(), fleets)))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),

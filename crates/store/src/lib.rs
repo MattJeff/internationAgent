@@ -8,6 +8,7 @@ pub mod audit; // U11
 pub mod db; // U6
 pub mod employee; // U7
 pub mod idempotency; // U10
+pub mod initiative;
 pub mod knowledge; // U14
 pub mod org; // wave 13: teams and sections
 pub mod outbox; // U9
