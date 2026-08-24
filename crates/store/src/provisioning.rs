@@ -576,6 +576,74 @@ pub async fn record_release(
     Ok(())
 }
 
+/// A resource a terminated employee still holds — still real, still billed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stranded {
+    /// The employee that was terminated.
+    pub employee_id: EmployeeId,
+    /// The step whose resource is still out there.
+    pub step: Step,
+    /// Who is billing for it.
+    pub provider: String,
+    /// **What to cancel.** The whole reason this row was not thrown away.
+    pub external_id: String,
+    /// Where the resource row got stuck: `failed` after a refused release,
+    /// `ready` if nothing ever tried.
+    pub state: String,
+    /// Why the last release did not happen, verbatim. A `release_not_supported`
+    /// here means no retry will ever fix it — a human has to.
+    pub last_error: Option<String>,
+}
+
+/// Everything this tenant's terminated employees are still being billed for.
+///
+/// **The operator's list.** The termination sweeper retries what it can and
+/// gives up on what it cannot (`release_not_supported` is structural: Resend's
+/// sending domain is shared across the tenant, so the adapter refuses on
+/// purpose and will refuse identically forever). Retrying
+/// that would burn a provider call and re-fire an operator alert on every tick
+/// for the life of the deployment, so it is excluded from the retry set — which
+/// would make it invisible if this query did not exist.
+///
+/// A query rather than a counter: the operator's task is "go and cancel these
+/// by hand", and that needs the provider, the external id and the reason. A
+/// number tells nobody what to cancel. (There is also no metrics exporter in
+/// this workspace, so a gauge would mean adding one.)
+///
+/// Tenant-scoped through [`TenantTx`] like everything else here; an operator
+/// asks about their own tenant, and nothing about this needs to see across.
+pub async fn stranded(tx: &mut TenantTx<'_>, limit: i64) -> Result<Vec<Stranded>, StoreError> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String, String, String, Option<String>)>(
+        "SELECT r.employee_id, r.step, r.provider, r.external_id, r.state, r.last_error \
+         FROM employee_resources r \
+         JOIN employees e ON e.id = r.employee_id \
+         WHERE e.lifecycle = 'terminated' \
+           AND r.provider IS NOT NULL \
+           AND r.external_id IS NOT NULL \
+         ORDER BY r.updated_at \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(employee_id, step, provider, external_id, state, last_error)| {
+                Some(Stranded {
+                    employee_id: EmployeeId::from_uuid(employee_id),
+                    step: parse_step(&step)?,
+                    provider,
+                    external_id,
+                    state,
+                    last_error,
+                })
+            },
+        )
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Recovery
 // ---------------------------------------------------------------------------

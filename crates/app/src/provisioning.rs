@@ -444,8 +444,28 @@ impl ProvisioningEngine {
         &self,
         employee: &Employee,
     ) -> Result<BTreeMap<Step, ReleaseReport>, EngineError> {
+        self.release_steps(employee, &Step::ALL).await
+    }
+
+    /// [`Self::release_all`], narrowed to `steps`.
+    ///
+    /// Same order, same idempotency, same reports — the caller only chooses
+    /// *which* steps are asked about. That choice belongs to the caller because
+    /// the reason to leave one out is never something the engine can see: the
+    /// termination sweeper skips a step whose provider has already refused
+    /// structurally ([`RELEASE_NOT_SUPPORTED`]), and that fact lives in the
+    /// resource row's `last_error`, not in the [`Employee`] aggregate.
+    ///
+    /// The order still comes from [`release_order`] rather than from the order
+    /// `steps` happens to be in, so a caller cannot release the vault before
+    /// the browser profile whose credentials live in it by passing a bad list.
+    pub async fn release_steps(
+        &self,
+        employee: &Employee,
+        steps: &[Step],
+    ) -> Result<BTreeMap<Step, ReleaseReport>, EngineError> {
         let mut reports = BTreeMap::new();
-        for step in release_order() {
+        for step in release_order().into_iter().filter(|s| steps.contains(s)) {
             let report = self.release_step(employee, step).await?;
             if let ReleaseReport::Failed { code } = &report {
                 // Loud, and then carry on: one provider refusing is no reason

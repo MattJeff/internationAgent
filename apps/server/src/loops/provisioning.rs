@@ -1,11 +1,48 @@
-//! The provisioning loop, and the reaper that stops an employee rotting in
-//! `pending_external`.
+//! The provisioning loop, the reaper that stops an employee rotting in
+//! `pending_external`, and the sweeper that stops a terminated one being billed
+//! forever.
 //!
 //! One tokio task. Every ~200ms it claims a batch of resource rows that want
 //! work, hands each employee to [`agentos_app::provisioning::ProvisioningEngine`]
 //! — which is what actually runs `ensure_step` per step, in dependency order,
-//! under a lease — and then escalates anything whose external wait has run out
-//! of patience.
+//! under a lease — escalates anything whose external wait has run out of
+//! patience, and then re-runs the release for terminated employees that still
+//! hold something.
+//!
+//! # The termination sweep
+//!
+//! Termination releases resources from an `employee.terminated` outbox event.
+//! A provider that is transiently down fails that handler, the outbox retries
+//! it on its own backoff, and after eight attempts the event is **dead
+//! lettered** — at which point nothing in the system ever tries again. The
+//! phone number stays bought, the invoice keeps arriving, and the only trace is
+//! a row nobody reads.
+//!
+//! So [`sweep`] is the standing question "is anybody still holding something
+//! they were told to give back", asked of the database rather than of an event:
+//!
+//! | rule                                      | why |
+//! |-------------------------------------------|-----|
+//! | `lifecycle = 'terminated'` and bound      | the resource is real and still billed |
+//! | never `release_not_supported`             | **structural**, not transient — see below |
+//! | `attempt_count`, `updated_at`             | the same backoff columns the retry predicate uses |
+//! | one attempt past the cap escalates        | a human is asked once, then the sweep goes quiet |
+//! | `FOR UPDATE ... SKIP LOCKED`              | two replicas do not both call the provider |
+//!
+//! **`release_not_supported` is never retried.** Resend's sending domain is
+//! shared across the tenant, so the adapter refuses to delete it on purpose and
+//! will refuse identically forever; retrying would spend a provider call and
+//! re-fire an operator alert on every tick for the life of the deployment. The
+//! row keeps its binding and its reason and stays out of the retry set, and
+//! `agentos_store::provisioning::stranded` is where an operator reads the list
+//! of what they have to go and cancel by hand.
+//!
+//! **Nothing here can resurrect a terminated employee.** The sweep reaches
+//! `release_steps` and nothing else — never `converge`, never `ensure_step` —
+//! and [`load_terminated`] refuses to hand an employee to the release path
+//! unless it really is terminated. That matters because a released row lands in
+//! `disabled`, `disabled` *is* claimable, and converging a terminated employee
+//! once re-provisioned all eleven steps and bought a fresh phone number.
 //!
 //! # What counts as work
 //!
@@ -58,9 +95,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use agentos_app::provisioning::{EngineError, ProvisioningEngine, StepReport};
+use agentos_app::provisioning::{
+    EngineError, ProvisioningEngine, RELEASE_NOT_SUPPORTED, ReleaseReport, StepReport,
+};
 use agentos_domain::action::{Action, McpTool};
-use agentos_domain::employee::{Employee, ResourceState, Step};
+use agentos_domain::employee::{Employee, Lifecycle, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::db::{Db, StoreError};
@@ -72,12 +111,17 @@ use uuid::Uuid;
 
 /// Who files an escalation, and who has to answer it.
 const REAPER_ACTOR: &str = "provisioning-reaper";
+/// Who asks a human to go and cancel a resource the sweep could not release.
+const SWEEPER_ACTOR: &str = "termination-sweeper";
 /// The role a human must hold to act on an overdue external wait.
 const OPERATOR_ROLE: &str = "operator";
 /// The MCP server half of the escalation's action name. Distinct from the
 /// engine's own `provisioning/<step>` reconciliation, because the two are
 /// different questions and the approval hash must not conflate them.
 const ESCALATION_SERVER: &str = "provisioning-overdue";
+/// The server half for "this terminated employee is still being billed". A
+/// third distinct name for a third distinct question, for the same reason.
+const RELEASE_SERVER: &str = "release-stuck";
 
 /// Rows a single claim may take.
 const DEFAULT_BATCH: i64 = 32;
@@ -98,8 +142,19 @@ pub struct LoopConfig {
     /// [`Self::max_attempts`] this is what keeps a permanently broken step —
     /// a region with no numbers for sale, a WhatsApp sender that does not
     /// exist — from being re-attempted five times a second forever.
+    ///
+    /// The termination sweep reuses it: a provider that is down must not be
+    /// called once per 200ms tick either.
     pub retry_after: TimeDelta,
     /// Give up retrying a step after this many claims.
+    ///
+    /// ponytail: the termination sweep spends the same budget, on the same
+    /// `employee_resources.attempt_count`, rather than carrying a second
+    /// counter that could disagree with it. The known ceiling: a step that
+    /// needed three attempts to *provision* has three fewer to be *released*
+    /// before a human is asked. Asking early is the harmless direction, and the
+    /// escalation names the step either way. Split the columns the day the
+    /// counts need to be independent.
     pub max_attempts: i32,
     /// How long a human has to answer an escalation.
     pub approval_ttl: TimeDelta,
@@ -123,13 +178,17 @@ impl Default for LoopConfig {
 // The seam
 // ---------------------------------------------------------------------------
 
-/// Drive one employee's provisioning as far as it will go.
+/// Drive one employee's provisioning as far as it will go — and, once it is
+/// terminated, give the resources back.
 ///
 /// A trait with exactly one production implementation, and it earns that: this
 /// crate cannot depend on `agentos-providers` (by design — the binary may not
 /// touch a provider), so it cannot build the `Adapters` a real
 /// [`ProvisioningEngine`] needs, and without this seam the loop below would
 /// have no test at all.
+///
+/// Both halves of the engine are here because both halves are driven from the
+/// one task below, and a second seam would be a second thing to keep in step.
 pub trait Converge: Send + Sync + 'static {
     /// Run every runnable step for this employee and report what each came to.
     fn converge(
@@ -137,6 +196,17 @@ pub trait Converge: Send + Sync + 'static {
         tenant_id: TenantId,
         employee_id: EmployeeId,
     ) -> impl Future<Output = Result<BTreeMap<Step, StepReport>, EngineError>> + Send;
+
+    /// Give these steps back, dependents first, and report what each came to.
+    ///
+    /// The caller chooses the steps: the sweep excludes the ones a provider has
+    /// already refused structurally, and that fact lives in the resource row
+    /// rather than in the employee.
+    fn release(
+        &self,
+        employee: &Employee,
+        steps: Vec<Step>,
+    ) -> impl Future<Output = Result<BTreeMap<Step, ReleaseReport>, EngineError>> + Send;
 }
 
 impl Converge for ProvisioningEngine {
@@ -146,6 +216,14 @@ impl Converge for ProvisioningEngine {
         employee_id: EmployeeId,
     ) -> impl Future<Output = Result<BTreeMap<Step, StepReport>, EngineError>> + Send {
         ProvisioningEngine::converge(self, tenant_id, employee_id)
+    }
+
+    async fn release(
+        &self,
+        employee: &Employee,
+        steps: Vec<Step>,
+    ) -> Result<BTreeMap<Step, ReleaseReport>, EngineError> {
+        self.release_steps(employee, &steps).await
     }
 }
 
@@ -218,7 +296,8 @@ impl<C: Converge> ProvisioningLoop<C> {
         tracing::info!("provisioning loop drained");
     }
 
-    /// One pass: claim a batch, converge each employee, reap what is overdue.
+    /// One pass: claim a batch, converge each employee, reap what is overdue,
+    /// then give back what a terminated employee is still holding.
     ///
     /// Returns how many employees were touched.
     async fn tick(
@@ -243,6 +322,11 @@ impl<C: Converge> ProvisioningLoop<C> {
             self.drive(&work, now).instrument(span).await;
             done += 1;
         }
+
+        // The same tick, the same token, a different question — see the module
+        // docs. Its own claim, because "still provisioning" and "terminated and
+        // still bound" have no rows in common.
+        done += self.sweep(now, cancel).await?;
         Ok(done)
     }
 
@@ -282,6 +366,114 @@ impl<C: Converge> ProvisioningLoop<C> {
         {
             // The work happened; only the correlation is lost.
             tracing::warn!(error = %err, "could not carry the traceparent onto the outbox");
+        }
+    }
+
+    /// Re-run the release for terminated employees that still hold something.
+    ///
+    /// Returns how many employees were swept.
+    async fn sweep(
+        &self,
+        now: DateTime<Utc>,
+        cancel: &CancellationToken,
+    ) -> Result<usize, StoreError> {
+        // Eleven steps of one employee are eleven rows and one unit of work,
+        // exactly as in `claim`: `release_steps` walks them in dependency order
+        // in one pass, and asking per row would release the vault before the
+        // browser profile whose credentials live in it.
+        let mut grouped: Vec<(TenantId, EmployeeId, Vec<Release>)> = Vec::new();
+        for row in claim_releases(&self.db, &self.cfg, now).await? {
+            if let Some((_, _, steps)) =
+                grouped.iter_mut().find(|(_, id, _)| *id == row.employee_id)
+            {
+                steps.push(row);
+            } else {
+                grouped.push((row.tenant_id, row.employee_id, vec![row]));
+            }
+        }
+
+        let swept = grouped.len();
+        for (tenant_id, employee_id, claimed) in grouped {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let span = tracing::info_span!(
+                "release-sweep",
+                tenant = %tenant_id,
+                employee = %employee_id.as_uuid(),
+            );
+            self.give_back(tenant_id, employee_id, claimed, now)
+                .instrument(span)
+                .await;
+        }
+        Ok(swept)
+    }
+
+    /// One terminated employee: release what still has budget, ask a human
+    /// about what does not.
+    async fn give_back(
+        &self,
+        tenant_id: TenantId,
+        employee_id: EmployeeId,
+        claimed: Vec<Release>,
+        now: DateTime<Utc>,
+    ) {
+        let employee = match load_terminated(&self.db, tenant_id, employee_id).await {
+            Ok(Some(employee)) => employee,
+            // Not terminated any more — impossible today, since `Terminated` is
+            // absorbing, and cheap insurance against the day it is not.
+            // Releasing an employee that is back at work would be this loop
+            // taking somebody's phone number away.
+            Ok(None) => {
+                tracing::warn!("skipped a swept employee that is not terminated");
+                return;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "could not load a swept employee");
+                return;
+            }
+        };
+
+        // Past the cap the sweep stops calling providers and starts asking
+        // people. The claim spent the last of the budget getting here, so this
+        // employee is not claimed again and the question is asked once.
+        let (exhausted, retryable): (Vec<Release>, Vec<Release>) = claimed
+            .into_iter()
+            .partition(|release| release.attempt > self.cfg.max_attempts);
+
+        if !retryable.is_empty() {
+            let steps: Vec<Step> = retryable.iter().map(|release| release.step).collect();
+            match self.engine.release(&employee, steps).await {
+                Ok(reports) => {
+                    let stuck: Vec<_> = reports
+                        .iter()
+                        .filter(|(_, report)| !report.is_done())
+                        .map(|(step, report)| format!("{step}={}", report.code()))
+                        .collect();
+                    if stuck.is_empty() {
+                        tracing::info!("released what a dead-lettered termination left bound");
+                    } else {
+                        // Still bound, still billed. The row carries the reason
+                        // and the next sweep — or the cap — takes it from here.
+                        tracing::warn!(steps = %stuck.join(","), "could not release; still billed");
+                    }
+                }
+                Err(err) => tracing::error!(error = %err, "release sweep failed"),
+            }
+        }
+
+        if !exhausted.is_empty() {
+            match escalate_release(&self.db, &self.cfg, &employee, &exhausted, now).await {
+                Ok(steps) if !steps.is_empty() => {
+                    let steps: Vec<_> = steps.into_iter().map(Step::as_str).collect();
+                    tracing::error!(
+                        steps = %steps.join(","),
+                        "gave up releasing these; a human has to cancel them at the provider"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(error = %err, "could not escalate a stuck release"),
+            }
         }
     }
 }
@@ -378,7 +570,7 @@ async fn reap(
     let mut employee = stored.employee;
     let mut escalated = Vec::with_capacity(overdue.len());
     for step in overdue {
-        let action = escalation_action(step);
+        let action = escalation_action(ESCALATION_SERVER, step);
         if !already_asked(&mut tx, &employee, &action).await? {
             let reason = escalation_reason(&employee, step, now);
             approvals::create(
@@ -442,17 +634,18 @@ async fn already_asked(
 
 /// The action an escalation authorises a human to go and do.
 ///
-/// ponytail: an `Action::McpCall` named `provisioning-overdue/<step>`, for the
-/// same reason the engine files one — `Action` is a closed domain enum with no
-/// "chase a regulator" variant and widening it is not this unit's call. The
-/// server half differs from the engine's `provisioning/<step>` so the two
-/// questions hash differently and neither suppresses the other.
-fn escalation_action(step: Step) -> Action {
+/// ponytail: an `Action::McpCall` named `<server>/<step>`, for the same reason
+/// the engine files one — `Action` is a closed domain enum with no "chase a
+/// regulator" variant and widening it is not this unit's call. The server half
+/// is the question being asked ([`ESCALATION_SERVER`], [`RELEASE_SERVER`], the
+/// engine's own `provisioning`) so that three different questions about one
+/// step hash differently and none of them suppresses the others.
+fn escalation_action(server: &str, step: Step) -> Action {
     let name = Slug::parse(&step.as_str().replace('_', "-"))
         .or_else(|_| Slug::parse("step"))
         .expect("`step` is a valid slug");
     Action::McpCall {
-        tool: McpTool::new(Slug::parse(ESCALATION_SERVER).expect("a valid slug"), name),
+        tool: McpTool::new(Slug::parse(server).expect("a valid slug"), name),
     }
 }
 
@@ -472,6 +665,174 @@ fn escalation_reason(employee: &Employee, step: Step, now: DateTime<Utc>) -> Str
          bundle or sender review looks exactly like one still in progress from here), then \
          either resolve it there or disable the channel. The step has been marked failed so \
          it stops reporting as a wait.",
+        employee.id().as_uuid(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The termination sweeper
+// ---------------------------------------------------------------------------
+
+/// One resource row this tick has taken responsibility for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Release {
+    tenant_id: TenantId,
+    employee_id: EmployeeId,
+    step: Step,
+    /// `attempt_count` **after** the claim spent one. Past
+    /// [`LoopConfig::max_attempts`] this row buys an escalation instead of a
+    /// provider call.
+    attempt: i32,
+}
+
+/// Terminated, still bound, cold enough to try again, and not structurally
+/// impossible. Claimed by bumping the attempt counter, in one statement.
+///
+/// `$1` now, `$2` the attempt cap, `$3` the retry cutoff, `$4` the code that is
+/// never retried, `$5` the batch size.
+///
+/// Shaped like `agentos_store::outbox::claim` rather than like [`CLAIM_SQL`],
+/// and for the same reason that one is: the claim has to be the write. Counting
+/// the attempt here rather than after the release means a worker that is killed
+/// mid-call still burns one, so a provider that hangs cannot be retried forever
+/// by a fleet of dying workers. `SKIP LOCKED` is what keeps two replicas off
+/// the same row, and the bumped `updated_at` is what keeps the *next* tick off
+/// it — either alone would do; both is free.
+///
+/// `strpos` rather than `LIKE`: a NULL `last_error` is the common case and must
+/// not fall out of the predicate as NULL.
+const SWEEP_SQL: &str = "\
+UPDATE employee_resources AS r
+   SET attempt_count = r.attempt_count + 1, updated_at = $1
+ WHERE (r.employee_id, r.step) IN (
+       SELECT c.employee_id, c.step
+         FROM employee_resources c
+         JOIN employees e ON e.id = c.employee_id
+        WHERE e.lifecycle = 'terminated'
+          AND c.external_id IS NOT NULL
+          AND c.attempt_count <= $2
+          AND c.updated_at < $3
+          AND strpos(coalesce(c.last_error, ''), $4) = 0
+        ORDER BY c.updated_at
+        LIMIT $5
+        FOR UPDATE OF c SKIP LOCKED)
+ RETURNING r.tenant_id, r.employee_id, r.step, r.attempt_count";
+
+/// Take a batch of resources a terminated employee is still being billed for.
+///
+/// Cross-tenant, like [`claim`] and the outbox poller: an unreleased resource
+/// is not any one tenant's problem. Everything downstream of it runs in a
+/// [`agentos_store::db::Db::tenant_tx`], so the escape hatch is this statement
+/// and nothing else.
+async fn claim_releases(
+    db: &Db,
+    cfg: &LoopConfig,
+    now: DateTime<Utc>,
+) -> Result<Vec<Release>, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    let rows: Vec<(Uuid, Uuid, String, i32)> = sqlx::query_as(SWEEP_SQL)
+        .bind(now)
+        .bind(cfg.max_attempts)
+        .bind(now - cfg.retry_after)
+        .bind(RELEASE_NOT_SUPPORTED)
+        .bind(cfg.batch)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(tenant_id, employee_id, step, attempt)| {
+            Some(Release {
+                tenant_id: TenantId::from_uuid(tenant_id),
+                employee_id: EmployeeId::from_uuid(employee_id),
+                // Text the build has never heard of means the database
+                // disagrees with it about what steps exist. Skip the row rather
+                // than guess which resource is being billed.
+                step: Step::ALL.into_iter().find(|s| s.as_str() == step)?,
+                attempt,
+            })
+        })
+        .collect())
+}
+
+/// The employee, but only if it really is terminated.
+///
+/// The one door between the sweep and the release path. `ensure_step` refuses
+/// to provision anything that is not draft or active; this refuses to release
+/// anything that is not terminated. Neither can be reached from the other side.
+async fn load_terminated(
+    db: &Db,
+    tenant_id: TenantId,
+    employee_id: EmployeeId,
+) -> Result<Option<Employee>, StoreError> {
+    let mut tx = db.tenant_tx(tenant_id).await?;
+    let stored = employee::load(&mut tx, employee_id).await?;
+    tx.rollback().await?;
+    Ok((stored.employee.lifecycle() == Lifecycle::Terminated).then_some(stored.employee))
+}
+
+/// Ask a human to cancel by hand what the sweep could not release.
+///
+/// Guarded by [`already_asked`], like the reaper: a stuck employee is worth one
+/// question, not one per tick. The claim's attempt cap means this is normally
+/// reached exactly once anyway — the guard is what makes that true even if two
+/// replicas reach it in the same instant.
+///
+/// Returns the steps a human was actually asked about.
+async fn escalate_release(
+    db: &Db,
+    cfg: &LoopConfig,
+    employee: &Employee,
+    exhausted: &[Release],
+    now: DateTime<Utc>,
+) -> Result<Vec<Step>, ApprovalError> {
+    let mut tx = db.tenant_tx(employee.tenant_id()).await?;
+    let mut asked = Vec::new();
+
+    for release in exhausted {
+        let action = escalation_action(RELEASE_SERVER, release.step);
+        if already_asked(&mut tx, employee, &action).await? {
+            continue;
+        }
+        let reason = release_reason(employee, release.step, release.attempt);
+        approvals::create(
+            &mut tx,
+            &NewApproval {
+                employee_id: Some(employee.id()),
+                action: &action,
+                requested_by: SWEEPER_ACTOR,
+                required_role: OPERATOR_ROLE,
+                reason: Some(&reason),
+                expires_at: now + cfg.approval_ttl,
+            },
+            now,
+        )
+        .await?;
+        asked.push(release.step);
+    }
+
+    if asked.is_empty() {
+        tx.rollback().await?;
+    } else {
+        tx.commit().await?;
+    }
+    Ok(asked)
+}
+
+/// The whole story, in the one line the operator will actually read.
+fn release_reason(employee: &Employee, step: Step, attempts: i32) -> String {
+    let (provider, external_id) = employee
+        .resource(step)
+        .binding()
+        .map_or(("?", "?"), |binding| {
+            (binding.provider(), binding.external_id())
+        });
+    format!(
+        "{step} for terminated employee {} is still bound to {provider} resource {external_id} \
+         after {attempts} attempts to release it, so it is still being billed. The sweep has \
+         stopped retrying: cancel it at the provider by hand, then clear the binding. The row \
+         keeps the external id because it is the only thing that says what to cancel.",
         employee.id().as_uuid(),
     )
 }
@@ -512,7 +873,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agentos_domain::action::Domain;
-    use agentos_domain::employee::{Health, Lifecycle};
+    use agentos_domain::employee::Health;
 
     use super::*;
 
@@ -600,16 +961,64 @@ mod tests {
         value
     }
 
+    /// Every step provisioned and bound to a resource somebody is billing for,
+    /// touched an hour ago so the sweep's backoff does not hide it.
+    async fn bind_all(db: &Db, employee: &Employee) {
+        exec(
+            db,
+            employee,
+            "UPDATE employee_resources \
+                SET state = 'ready', provider = 'mock', \
+                    external_id = 'ext-' || $1::text || '-' || step, \
+                    updated_at = now() - interval '1 hour' \
+              WHERE employee_id = $1",
+        )
+        .await;
+    }
+
+    /// What the terminate endpoint does: the lifecycle move, persisted. The
+    /// resource rows keep their bindings — that is the whole problem.
+    async fn terminate(db: &Db, employee: &Employee) -> Employee {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let stored = employee::load(&mut tx, employee.id()).await.expect("load");
+        let mut terminated = stored.employee;
+        terminated
+            .set_lifecycle(Lifecycle::Terminated, Utc::now())
+            .expect("active -> terminated");
+        employee::update(&mut tx, &terminated, stored.version)
+            .await
+            .expect("update");
+        tx.commit().await.expect("commit");
+        terminated
+    }
+
+    /// How many resources still name something a provider is billing for.
+    async fn still_bound(db: &Db, employee: &Employee) -> i64 {
+        scalar(
+            db,
+            employee,
+            "SELECT count(*) FROM employee_resources \
+              WHERE employee_id = $1 AND external_id IS NOT NULL",
+        )
+        .await
+    }
+
     // -- a converger that provisions by fiat ------------------------------
 
     /// Stands in for the real engine, which this crate cannot build: it has no
     /// access to `agentos-providers` by design. It does what a successful
-    /// engine run does to the database — every step ready — and counts how
-    /// many times it was asked, which is the assertion that matters.
+    /// engine run does to the database — every step ready, every binding given
+    /// back — and records every call, which is the assertion that matters.
     #[derive(Debug, Clone, Default)]
     struct FakeEngine {
         db: Option<Db>,
         calls: Arc<Mutex<HashMap<EmployeeId, u32>>>,
+        /// Every `release` that reached a provider, in order. Clones share it,
+        /// so two loops driving one engine are counted together.
+        releases: Arc<Mutex<Vec<(EmployeeId, Step)>>>,
+        /// One step whose provider will not let go, and the code it refuses
+        /// with. `release_not_supported` is the structural one.
+        refuse: Option<(Step, &'static str)>,
         /// Claim the work and do nothing, like a step that is still waiting.
         inert: bool,
     }
@@ -629,6 +1038,12 @@ mod tests {
             }
         }
 
+        #[must_use]
+        fn refusing(mut self, step: Step, code: &'static str) -> Self {
+            self.refuse = Some((step, code));
+            self
+        }
+
         fn calls(&self, employee: EmployeeId) -> u32 {
             *self
                 .calls
@@ -636,6 +1051,21 @@ mod tests {
                 .expect("poisoned")
                 .get(&employee)
                 .unwrap_or(&0)
+        }
+
+        /// How many times a provider was asked to give this step back.
+        fn releases_of(&self, step: Step) -> usize {
+            self.releases
+                .lock()
+                .expect("poisoned")
+                .iter()
+                .filter(|(_, released)| *released == step)
+                .count()
+        }
+
+        /// Every release call, in order.
+        fn releases(&self) -> Vec<(EmployeeId, Step)> {
+            self.releases.lock().expect("poisoned").clone()
         }
     }
 
@@ -677,6 +1107,68 @@ mod tests {
                 .into_iter()
                 .map(|step| (step, StepReport::Ready))
                 .collect())
+        }
+
+        /// What the real `release_step` does to the database, in miniature: a
+        /// released resource loses its binding and lands in `disabled`, and a
+        /// refused one **keeps** the binding — it is the only record of what a
+        /// human still has to cancel — and carries the reason.
+        async fn release(
+            &self,
+            employee: &Employee,
+            steps: Vec<Step>,
+        ) -> Result<BTreeMap<Step, ReleaseReport>, EngineError> {
+            let db = self
+                .db
+                .clone()
+                .expect("a releasing engine needs a database");
+            let mut reports = BTreeMap::new();
+
+            for step in steps {
+                if employee.resource(step).binding().is_none() {
+                    reports.insert(step, ReleaseReport::NotBound);
+                    continue;
+                }
+                self.releases
+                    .lock()
+                    .expect("poisoned")
+                    .push((employee.id(), step));
+
+                let mut tx = db.tenant_tx(employee.tenant_id()).await?;
+                let report = match self.refuse {
+                    Some((refused, code)) if refused == step => {
+                        sqlx::query(
+                            "UPDATE employee_resources \
+                                SET state = 'failed', last_error = $3, updated_at = now() \
+                              WHERE employee_id = $1 AND step = $2",
+                        )
+                        .bind(employee.id().as_uuid())
+                        .bind(step.as_str())
+                        .bind(format!("release {code}: the provider refused"))
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(StoreError::from)?;
+                        ReleaseReport::Failed { code }
+                    }
+                    _ => {
+                        sqlx::query(
+                            "UPDATE employee_resources \
+                                SET state = 'disabled', provider = NULL, external_id = NULL, \
+                                    last_error = NULL, updated_at = now() \
+                              WHERE employee_id = $1 AND step = $2",
+                        )
+                        .bind(employee.id().as_uuid())
+                        .bind(step.as_str())
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(StoreError::from)?;
+                        ReleaseReport::Released
+                    }
+                };
+                tx.commit().await?;
+                reports.insert(step, report);
+            }
+            Ok(reports)
         }
     }
 
@@ -1129,6 +1621,377 @@ mod tests {
         assert_eq!(
             stamped, 2,
             "the asynchronous work must stay on the trace that caused it"
+        );
+    }
+
+    // -- the termination sweeper -------------------------------------------
+
+    /// **The whole point.** The `employee.terminated` event was retried eight
+    /// times against a provider that was down, then dead lettered. Nothing in
+    /// the system was ever going to ask again, and eleven resources were going
+    /// to keep billing forever. The sweep is what asks again.
+    #[tokio::test]
+    async fn a_dead_lettered_termination_is_eventually_released_by_the_sweep() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "mara").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+        assert_eq!(still_bound(&db, &employee).await, 11);
+
+        let engine = FakeEngine::ready(&db);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(
+            ProvisioningLoop::new(db.clone(), engine.clone())
+                .with_config(fast())
+                .run(cancel.clone()),
+        );
+
+        for _ in 0..200 {
+            if still_bound(&db, &employee).await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Several more polls: an employee with nothing left must go quiet.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop must stop when cancelled")
+            .expect("no panic");
+
+        assert_eq!(
+            still_bound(&db, &employee).await,
+            0,
+            "these resources are still being billed"
+        );
+        assert_eq!(
+            engine.releases().len(),
+            11,
+            "every bound step is asked for exactly once: {:?}",
+            engine.releases()
+        );
+        assert_eq!(
+            engine.calls(employee.id()),
+            0,
+            "a terminated employee must never be converged"
+        );
+    }
+
+    /// `release_not_supported` is STRUCTURAL. Resend's sending domain is shared
+    /// across the tenant, so the adapter refuses on purpose and will refuse
+    /// identically forever; a sweep that retried it would spend a provider call
+    /// and re-fire an operator alert every 200ms for the life of the
+    /// deployment. Asked once, ever — however many ticks run.
+    #[tokio::test]
+    async fn a_step_that_cannot_be_released_is_never_retried_by_the_sweep() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "resend").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+
+        let engine = FakeEngine::ready(&db).refusing(Step::Email, RELEASE_NOT_SUPPORTED);
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let cancel = CancellationToken::new();
+
+        // A day of ticks, each one long after the last so backoff never hides
+        // anything: if the exclusion were the backoff rather than the code,
+        // this loop would find it out.
+        let now = Utc::now();
+        for tick in 0..24 {
+            sweeper
+                .tick(now + TimeDelta::hours(tick), &cancel)
+                .await
+                .expect("tick");
+        }
+
+        assert_eq!(
+            engine.releases_of(Step::Email),
+            1,
+            "a structural refusal must be asked exactly once, ever"
+        );
+        assert_eq!(
+            still_bound(&db, &employee).await,
+            1,
+            "the binding is the only record of what to cancel; it must survive"
+        );
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1"
+            )
+            .await,
+            0,
+            "an alert nobody can act on differently must not be re-fired"
+        );
+        // Every other step went, because one impossible provider is no reason
+        // to keep paying for the other ten resources.
+        assert_eq!(engine.releases().len(), 11);
+    }
+
+    /// ...and is still visible. It is out of the retry set, so the only thing
+    /// standing between the operator and a silent invoice is this query.
+    #[tokio::test]
+    async fn a_step_that_cannot_be_released_is_still_listed_for_the_operator() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "stranded").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+
+        let engine = FakeEngine::ready(&db).refusing(Step::Email, RELEASE_NOT_SUPPORTED);
+        let cancel = CancellationToken::new();
+        ProvisioningLoop::new(db.clone(), engine.clone())
+            .with_config(fast())
+            .tick(Utc::now(), &cancel)
+            .await
+            .expect("tick");
+
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let stranded = agentos_store::provisioning::stranded(&mut tx, 100)
+            .await
+            .expect("stranded");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(stranded.len(), 1, "{stranded:?}");
+        assert_eq!(stranded[0].employee_id, employee.id());
+        assert_eq!(stranded[0].step, Step::Email);
+        assert_eq!(stranded[0].provider, "mock");
+        assert!(
+            stranded[0].external_id.starts_with("ext-"),
+            "the operator needs the id to cancel: {stranded:?}"
+        );
+        assert!(
+            stranded[0]
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains(RELEASE_NOT_SUPPORTED),
+            "the row must say why nobody is retrying it: {stranded:?}"
+        );
+    }
+
+    /// A provider that is down must not be called once per 200ms tick, and a
+    /// step that will not come back must not ask a human once per tick either.
+    #[tokio::test]
+    async fn a_repeatedly_failing_release_backs_off_and_escalates_exactly_once() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "stubborn").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+
+        let engine = FakeEngine::ready(&db).refusing(Step::Phone, "release_refused");
+        let cfg = LoopConfig {
+            max_attempts: 3,
+            ..fast()
+        };
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(cfg);
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+
+        // Two ticks in the same instant: the second must find nothing, or a
+        // provider that is down is called five times a second.
+        sweeper.tick(now, &cancel).await.expect("tick");
+        sweeper.tick(now, &cancel).await.expect("tick");
+        assert_eq!(
+            engine.releases_of(Step::Phone),
+            1,
+            "backoff is what stops a hammered provider"
+        );
+
+        // A tick an hour, until well past the cap.
+        for tick in 1..12 {
+            sweeper
+                .tick(now + TimeDelta::hours(tick), &cancel)
+                .await
+                .expect("tick");
+        }
+
+        assert_eq!(
+            engine.releases_of(Step::Phone),
+            3,
+            "the attempt cap has to bind, or nothing ever stops"
+        );
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1 AND state = 'pending'"
+            )
+            .await,
+            1,
+            "one stuck resource, one question — not one per tick"
+        );
+        let reason: String = scalar(
+            &db,
+            &employee,
+            "SELECT reason FROM approvals WHERE employee_id = $1",
+        )
+        .await;
+        assert!(
+            reason.contains("ext-"),
+            "the operator needs the id: {reason}"
+        );
+        assert_eq!(
+            still_bound(&db, &employee).await,
+            1,
+            "a resource nobody could release must keep its id"
+        );
+    }
+
+    /// Two replicas, one terminated employee. Release is idempotent by
+    /// contract, so this is about not wasting provider calls and not corrupting
+    /// the attempt count that bounds them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_sweepers_do_not_double_release_a_step() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "twice").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+
+        // One engine, two loops: whatever either replica calls is counted here.
+        let engine = FakeEngine::ready(&db);
+        let one = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let two = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+
+        let (first, second) = tokio::join!(one.tick(now, &cancel), two.tick(now, &cancel));
+        first.expect("tick");
+        second.expect("tick");
+
+        let calls = engine.releases();
+        let mut seen = calls.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            calls.len(),
+            seen.len(),
+            "a step was released twice: {calls:?}"
+        );
+        assert_eq!(calls.len(), 11, "{calls:?}");
+        assert_eq!(still_bound(&db, &employee).await, 0);
+        // One claim per row, so the budget that bounds the retries is intact.
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+            )
+            .await,
+            1,
+            "concurrent sweepers must not spend the attempt budget twice"
+        );
+    }
+
+    /// The bug that already bit once: released rows land in `disabled`,
+    /// `disabled` is claimable, and converging a terminated employee
+    /// re-provisioned all eleven steps and bought a fresh phone number.
+    #[tokio::test]
+    async fn the_sweep_never_resurrects_a_terminated_employee() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "ghost").await;
+        bind_all(&db, &employee).await;
+        terminate(&db, &employee).await;
+
+        let engine = FakeEngine::ready(&db);
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+        for tick in 0..12 {
+            sweeper
+                .tick(now + TimeDelta::hours(tick), &cancel)
+                .await
+                .expect("tick");
+        }
+
+        assert_eq!(
+            engine.calls(employee.id()),
+            0,
+            "the sweep must never reach converge, which is what buys things"
+        );
+        let after = reload(&db, &employee).await;
+        assert_eq!(after.lifecycle(), Lifecycle::Terminated);
+        assert_ne!(after.health(), Health::Online);
+        for step in Step::ALL {
+            assert_eq!(
+                after.resource(step).state(),
+                &ResourceState::Disabled,
+                "{step} came back to life"
+            );
+            assert!(
+                after.resource(step).binding().is_none(),
+                "{step} is still bound to something"
+            );
+        }
+        // And the released rows, which *are* claimable by state, are still not
+        // work: the claim query filters on lifecycle.
+        assert!(
+            claim(&db, &fast(), Utc::now())
+                .await
+                .expect("claim")
+                .is_empty(),
+            "a terminated employee's disabled rows must not read as work"
+        );
+    }
+
+    /// A terminated employee that never bought anything is not a provider call
+    /// waiting to happen. Nothing may be asked about it at all.
+    #[tokio::test]
+    async fn an_employee_with_nothing_bound_is_not_swept_at_all() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "empty").await;
+        // Provisioned, but every step is one of ours: no external id anywhere.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources \
+                SET state = 'ready', updated_at = now() - interval '1 hour' \
+              WHERE employee_id = $1",
+        )
+        .await;
+        terminate(&db, &employee).await;
+
+        let engine = FakeEngine::ready(&db);
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+        for tick in 0..12 {
+            sweeper
+                .tick(now + TimeDelta::hours(tick), &cancel)
+                .await
+                .expect("tick");
+        }
+
+        assert!(
+            engine.releases().is_empty(),
+            "nothing was bound, so nobody should have been called: {:?}",
+            engine.releases()
+        );
+        assert_eq!(engine.calls(employee.id()), 0);
+        assert_eq!(
+            scalar::<i32>(
+                &db,
+                &employee,
+                "SELECT max(attempt_count) FROM employee_resources WHERE employee_id = $1"
+            )
+            .await,
+            0,
+            "an employee with nothing bound must not even be claimed"
         );
     }
 }
