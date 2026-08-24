@@ -97,20 +97,28 @@
 //! the quotes and the sequences do not already say. A crash between the RFQ and
 //! the reply costs nothing: the plan is recomputed and the round is re-read.
 
+use std::num::NonZeroU32;
+
 use agentos_domain::action::{ActionKind, Channel, EmailAddress};
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::money::{Currency, Money};
+use agentos_domain::sourcing as buying;
 use agentos_domain::untrusted::TrustLabel;
-use agentos_store::db::{StoreError, TenantTx};
-use chrono::{DateTime, Utc};
+use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::sourcing::{self as sourcing_store, OpenRfq};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
+use crate::gate::Principal;
 use crate::prompt::SystemPrompt;
 use crate::proof_of_need::{Answer, Checked, Evidence, Flow, Probe, ProbeError, Prober};
 use crate::revenue::{Seller, Sequence};
 use crate::rolepack::{self, CountryCode};
 use crate::rolepack_sales::{self, Segment};
-use crate::sourcing::{self, Buyer, Divergence, Fx, Landed, Lane, Quote, QuoteError, Reputation};
+use crate::sourcing::{
+    self, Buyer, Divergence, Fx, Incoterm, Landed, Lane, Quote, QuoteError, Reputation, Unreached,
+};
 
 // ---------------------------------------------------------------------------
 // The charter
@@ -514,11 +522,7 @@ pub async fn purchase(
     let stage = due(&plan, round);
 
     match stage {
-        rolepack::Stage::Clarify => Ok(Bought::Clarify(
-            plan.iter()
-                .find(|task| task.stage == stage)
-                .map_or_else(String::new, |task| task.instruction.clone()),
-        )),
+        rolepack::Stage::Clarify => Ok(Bought::Clarify(clarification(&plan))),
 
         rolepack::Stage::Rfq => {
             // Upstream of the gate, never instead of it: a role that has no
@@ -543,6 +547,580 @@ pub async fn purchase(
 
         other => Ok(Bought::Model(other)),
     }
+}
+
+/// The one thing a gapped objective plans, as a sentence.
+///
+/// A plan containing [`Stage::Clarify`](crate::rolepack::Stage) contains
+/// nothing else, so this is the whole plan when it is anything at all.
+fn clarification(plan: &[rolepack::Task]) -> String {
+    plan.iter()
+        .find(|task| task.stage == rolepack::Stage::Clarify)
+        .map_or_else(String::new, |task| task.instruction.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Purchasing: the material
+// ---------------------------------------------------------------------------
+
+/// The Incoterm every RFQ this vertical writes asks for.
+///
+/// The plan's own `Stage::Rfq` instruction says "delivered to {to}", and
+/// delivered-duty-paid is what that sentence means in a contract. It is also
+/// the term that leaves the fewest legs to a buyer with no freight data — see
+/// [`Material::read`] on the lane. A supplier who prefers to quote EXW says so
+/// on the quote and [`crate::sourcing::landed_cost`] takes them at their word.
+const RFQ_INCOTERM: Incoterm = Incoterm::Ddp;
+
+/// How long an RFQ stays open for answers.
+///
+/// ponytail: a constant. Two weeks is a fortnight of international post and it
+/// is not the interesting number — nothing reads `closes_at` yet, and the round
+/// ends when a human orders. Make it a field on `Objective` the day an operator
+/// has a deadline the goods depend on.
+const RFQ_OPEN_FOR: TimeDelta = TimeDelta::days(14);
+
+/// What a purchasing turn had in front of it, read out of the store once.
+///
+/// # Exactly one half of this is ever populated
+///
+/// A sourcing round stores no cursor, and [`due`] reads the material rather
+/// than a stage column — so the material has to be able to say "we have not
+/// asked yet" and "we asked and nobody has answered" as two different values.
+/// The `rfqs` row is what says it:
+///
+/// * **No open RFQ** — [`candidates`](Material::candidates) is the supplier
+///   list and there are no quotes, so [`due`] answers `Rfq`. Issuing it writes
+///   the row.
+/// * **An open RFQ** — the suppliers were asked, so `candidates` is *empty* and
+///   the quotes are whatever has come back. [`due`] answers `Negotiate` once
+///   there is one and falls through to `Discover` while there is none, which is
+///   the honest reading of "we are waiting on somebody else": a stage for the
+///   model, not another RFQ.
+///
+/// Without that, `due` would answer `Rfq` on every cadence forever and the same
+/// suppliers would receive the same letter every hour.
+struct Material {
+    /// Suppliers still to be asked, with whatever the store has observed about
+    /// each. Empty once the RFQ has gone out.
+    candidates: Vec<(EmailAddress, Option<Reputation>)>,
+    /// Suppliers that matched and cannot be written to. An operator's queue.
+    unreachable: Vec<Unreached>,
+    /// The answers, each with the address that sent it. Owned, because
+    /// [`Quote::live_at`] borrows the domain quote it proves live.
+    quotes: Vec<(buying::Quote, EmailAddress)>,
+    /// Units the round is priced for.
+    quantity: u64,
+    /// The buyer's own costs on this lane.
+    lane: Lane,
+    /// The rates the comparison runs on.
+    fx: Fx,
+}
+
+impl Material {
+    /// Read one employee's round.
+    ///
+    /// `currency` is the round's, and every amount in it: the open RFQ pins it
+    /// for every quote filed against it — the composite foreign key on `quotes`
+    /// enforces that in the database — and before there is an RFQ it is the
+    /// currency the operator named a ceiling in.
+    ///
+    /// ponytail: a **free lane and an empty rate table**. `Fx` needs no rate
+    /// because a round is single-currency by that same foreign key, so nothing
+    /// converts. `Lane` is zero because freight, duty and brokerage have no
+    /// table, no config and no provider in this product — there is no forwarder
+    /// quote to read. The ceiling that buys: every quote carries the same zero
+    /// legs, so the comparison is on goods value and lead time and an EXW quote
+    /// is not charged the freight a DDP one already includes. `landed_cost`
+    /// already reads both, so the upgrade is a `lanes` row and this constructor,
+    /// not a new comparison.
+    async fn read(
+        tx: &mut TenantTx<'_>,
+        employee_id: EmployeeId,
+        objective: &rolepack::Objective,
+        currency: Currency,
+        now: DateTime<Utc>,
+    ) -> Result<Self, sourcing_store::SourcingError> {
+        let open = sourcing_store::open_rfq(tx, employee_id).await?;
+
+        let (candidates, unreachable, quotes) = match &open {
+            None => {
+                // `None` for the country: `find_suppliers` filters on the
+                // *supplier's* country and a buying objective states only where
+                // the goods must arrive. An international buyer that searched
+                // the delivery country would be a domestic buyer.
+                let found = sourcing_store::find_suppliers(tx, None, category(objective)).await?;
+                let reached = sourcing::recipients(tx, &found).await?;
+                (reached.candidates, reached.unreachable, Vec::new())
+            }
+            Some(open) => (Vec::new(), Vec::new(), answers(tx, open, now).await?),
+        };
+
+        Ok(Self {
+            // The open round's quantity, not the objective's: a quote answers
+            // the number it was asked for, and an operator who edited the
+            // objective mid-round has not changed what the supplier priced.
+            quantity: open.as_ref().map_or_else(
+                || u64::from(objective.quantity),
+                |rfq| u64::try_from(rfq.quantity).unwrap_or(0),
+            ),
+            candidates,
+            unreachable,
+            quotes,
+            lane: Lane::new(currency),
+            fx: Fx::new(currency),
+        })
+    }
+
+    /// The quotes that are still prices at `now`, ready to be ranked.
+    ///
+    /// Borrows `self`, which is why it is not a field: `Quote<'a>` holds the
+    /// domain quote rather than copying the price out of it, so the owned
+    /// `Vec` and the borrowed one cannot live in the same struct.
+    fn comparable(&self, now: DateTime<Utc>) -> Vec<Quote<'_>> {
+        self.quotes
+            .iter()
+            .filter_map(|(quote, from)| {
+                match Quote::live_at(quote, from.clone(), self.quantity, now) {
+                    Ok(live) => Some(live),
+                    // `live_quotes` already applied the same window in SQL, so
+                    // the two checks disagreeing means the row is corrupt —
+                    // `received_at` after `valid_until`. Dropped and named
+                    // rather than ranked: a price nobody was standing behind is
+                    // not a quote.
+                    Err(err) => {
+                        tracing::warn!(error = %err, "a stored quote is not a live price");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+/// The supplier search key, and the RFQ's `product_category`.
+///
+/// The objective's own words. `suppliers.categories` is the buyer's search key
+/// and it is free text, so the operator who seeds a supplier for this objective
+/// and the operator who writes the objective are typing the same phrase — which
+/// is the only join available, there being no category vocabulary anywhere in
+/// this system.
+fn category(objective: &rolepack::Objective) -> &str {
+    objective.what.trim()
+}
+
+/// The quotes on an open round, each paired with the address that sent it.
+///
+/// Two reads and no third: the quotes, and one batched `supplier_contacts` for
+/// the addresses. Everything downstream — [`crate::sourcing::rank`],
+/// [`crate::sourcing::disagreement`] — is keyed by [`EmailAddress`], so a quote
+/// whose supplier has no readable contact row cannot be ranked at all.
+async fn answers(
+    tx: &mut TenantTx<'_>,
+    open: &OpenRfq,
+    now: DateTime<Utc>,
+) -> Result<Vec<(buying::Quote, EmailAddress)>, sourcing_store::SourcingError> {
+    let live = sourcing_store::live_quotes(tx, open.id, now).await?;
+    let ids: Vec<Uuid> = live.iter().map(|quote| quote.supplier_id).collect();
+    let contacts = sourcing_store::supplier_contacts(tx, &ids).await?;
+    // What the RFQ asked for. A supplier who named no term was answering on it.
+    let dictated = open.incoterm.as_deref().and_then(incoterm);
+
+    Ok(live
+        .into_iter()
+        .filter_map(|quote| {
+            // Ordered primary-first by the query. Suppression is not consulted:
+            // comparing a price is not writing to anybody, and the address is
+            // being used as the supplier's identity in the ranking.
+            let Some(from) = contacts
+                .iter()
+                .find(|contact| contact.supplier_id == quote.supplier_id)
+                .and_then(|contact| EmailAddress::parse(&contact.email).ok())
+            else {
+                tracing::warn!(
+                    supplier_id = %quote.supplier_id,
+                    "a quote came from a supplier with no readable contact and cannot be ranked"
+                );
+                return None;
+            };
+            let Some(term) = quote.incoterm.as_deref().and_then(incoterm).or(dictated) else {
+                tracing::warn!(
+                    quote_id = %quote.id,
+                    "a quote names no Incoterm and its RFQ dictated none; there is no honest \
+                     landed cost for it"
+                );
+                return None;
+            };
+
+            Some((
+                buying::Quote {
+                    rfq_id: buying::RfqId::from_uuid(open.id),
+                    supplier_id: buying::SupplierId::from_uuid(quote.supplier_id),
+                    unit_price: quote.unit_price,
+                    // ponytail: `quotes` has no MOQ and no sample column, and
+                    // `app::sourcing::Quote` reads neither — `disagreement`
+                    // says in as many words why MOQ is not compared. Add the
+                    // columns the day a caller needs the values, not to fill
+                    // these two in.
+                    moq: NonZeroU32::MIN,
+                    sample: buying::SampleAvailability::None,
+                    lead_time_days: quote
+                        .lead_time_days
+                        .and_then(|days| u32::try_from(days).ok())
+                        .unwrap_or(0),
+                    valid_from: quote.received_at,
+                    valid_until: quote.valid_until,
+                    incoterm: term,
+                },
+                from,
+            ))
+        })
+        .collect())
+}
+
+/// One of the eleven terms, or nothing. The column is CHECKed against this same
+/// list, so `None` here is a term written by something that bypassed the table.
+fn incoterm(raw: &str) -> Option<Incoterm> {
+    Incoterm::ALL.into_iter().find(|term| term.as_str() == raw)
+}
+
+// ---------------------------------------------------------------------------
+// Purchasing: the turn
+// ---------------------------------------------------------------------------
+
+/// Why a purchasing turn's vertical half did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum RoundError {
+    /// The store was unreachable, or a stored amount will not come back out.
+    #[error(transparent)]
+    Unavailable(#[from] sourcing_store::SourcingError),
+    /// The quotes in hand cannot be normalised onto one lane.
+    #[error(transparent)]
+    Compare(#[from] QuoteError),
+}
+
+impl RoundError {
+    /// Stable, low-cardinality metric label.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            RoundError::Unavailable(_) => "unavailable",
+            RoundError::Compare(err) => err.code(),
+        }
+    }
+}
+
+/// One purchasing turn's vertical half: what the code did, and who it could not
+/// reach.
+#[derive(Debug)]
+pub struct Ran {
+    /// What the due stage came to.
+    pub bought: Bought,
+    /// Suppliers that matched the objective and cannot be written to.
+    ///
+    /// **Not an error and not a warning.** A round that is narrower than the
+    /// supplier list is narrower for a reason somebody can fix, and dropping
+    /// this is exactly what [`crate::sourcing::Recipients`] has two vectors to
+    /// prevent.
+    pub unreachable: Vec<Unreached>,
+}
+
+impl Ran {
+    /// What to tell the employee happened, as the turn's opening note.
+    ///
+    /// **Ours, all of it.** Addresses have been through
+    /// [`EmailAddress::parse`], money through [`Money`], stages and outcomes
+    /// through closed enums — the same bar `app::sourcing` sets for what may
+    /// leave an [`Untrusted`](agentos_domain::untrusted::Untrusted) wrapper. No
+    /// supplier's prose and no supplier's legal name is in it, so the initiative
+    /// loop's claim that its turn starts trusted by construction still holds.
+    pub fn note(&self) -> String {
+        let mut note = match &self.bought {
+            Bought::Clarify(question) => question.clone(),
+
+            Bought::Asked { asking, outcomes } => {
+                let sent = outcomes.iter().filter(|o| o.is_sent()).count();
+                let per: Vec<String> = outcomes
+                    .iter()
+                    .map(|outcome| format!("  {} — {}", outcome.to(), outcome.code()))
+                    .collect();
+                format!(
+                    "This turn's step has already been taken for you: the RFQ for your standing \
+                     objective went out before you were asked to think, to {} supplier(s) on the \
+                     shortlist, {sent} of which the provider accepted.\n{}\n\nThe round is open. \
+                     Quotes come back as ordinary email and a later turn compares them — do not \
+                     send this RFQ again, and do not chase anybody who has not had time to answer.",
+                    asking.len(),
+                    per.join("\n"),
+                )
+            }
+
+            Bought::Compared {
+                landed,
+                divergences,
+            } => {
+                let rows: Vec<String> = landed
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "  {} — {} landed, {} lead time {} days",
+                            l.supplier, l.total, l.incoterm, l.lead_time_days
+                        )
+                    })
+                    .collect();
+                let gaps: Vec<String> = divergences
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "  {}: {} says {}, {} says {} — {} bps apart",
+                            d.field.code(),
+                            d.low,
+                            d.low_value,
+                            d.high,
+                            d.high_value,
+                            d.spread_bps
+                        )
+                    })
+                    .collect();
+                format!(
+                    "The quotes on your open round have already been normalised onto one landed \
+                     cost for you, cheapest first. This is the comparison; it is not a \
+                     decision.\n{}\n\nWhere the suppliers disagree by more than the noise:\n{}\n\n\
+                     Nobody has been written to this turn. Reply to the suppliers, ask for what \
+                     the comparison leaves open, and remember that the outlier is often the one \
+                     telling the truth.",
+                    rows.join("\n"),
+                    if gaps.is_empty() {
+                        "  (nothing wide enough to report)".to_owned()
+                    } else {
+                        gaps.join("\n")
+                    },
+                )
+            }
+
+            Bought::Model(stage) => format!(
+                "No step of your plan could be run for you this turn: the {stage} stage is \
+                 reading and judging, which is yours."
+            ),
+
+            Bought::Forbidden(kind) => format!(
+                "The next stage of your plan needs a {} and your role may not propose one. \
+                 Nothing was sent. Say so and work whatever is not blocked.",
+                kind.as_str()
+            ),
+        };
+
+        if !self.unreachable.is_empty() {
+            let counts: Vec<String> = self
+                .unreachable
+                .iter()
+                .map(|un| un.why.code().to_owned())
+                .collect();
+            note.push_str(&format!(
+                "\n\n{} supplier(s) matched this objective and cannot be written to ({}). That is \
+                 an operator's job, not yours — report it.",
+                self.unreachable.len(),
+                counts.join(", "),
+            ));
+        }
+        note
+    }
+}
+
+/// Run the purchasing vertical for one employee, out of its own store.
+///
+/// **This is the wire.** [`purchase`] above is pure over the material it is
+/// handed; this reads that material, runs it, and writes down the one thing a
+/// sourcing round cannot recompute — that the RFQ went out.
+///
+/// Called *before* the model, never instead of it: what comes back is a note
+/// for the turn's opening context, and the model still writes every word a
+/// human or a supplier reads after this point. See the module docs on why the
+/// role pack decides the stage.
+///
+/// # Three transactions, and none of them spans a provider call
+///
+/// Read, send, record. The read is rolled back before an address is contacted,
+/// because [`Buyer::issue_rfq`](crate::sourcing::Buyer::issue_rfq) is N emails
+/// over the internet and a pooled connection held across them is a connection
+/// held across somebody else's SMTP timeout — the same rule
+/// `loops::initiative::assignment_for` follows.
+///
+/// # The `rfqs` row is written after the send, and that direction is chosen
+///
+/// A crash between the last email and the insert costs one duplicate RFQ next
+/// cadence. The other order costs an open round nobody was ever asked — and
+/// since an open round is exactly what stops the employee asking, that employee
+/// waits for answers to a letter that never went out, forever. One duplicate
+/// email is the cheaper failure and it is the one this takes.
+pub async fn purchasing_turn(
+    db: &Db,
+    buyer: &Buyer,
+    principal: &Principal,
+    pack: &rolepack::RolePack,
+    objective: &rolepack::Objective,
+    now: DateTime<Utc>,
+) -> Result<Ran, RoundError> {
+    let mut tx = db
+        .tenant_tx(principal.tenant_id)
+        .await
+        .map_err(sourcing_store::SourcingError::from)?;
+    let open = sourcing_store::open_rfq(&mut tx, principal.employee_id).await?;
+
+    // The round's one currency. An objective with neither an open round nor a
+    // ceiling is one `plan` answers with `Clarify` alone: there is nothing to
+    // compare, so there is no comparison currency and no material to read.
+    let Some(currency) = open
+        .as_ref()
+        .map(|rfq| rfq.currency)
+        .or_else(|| objective.max_unit_price.map(Money::currency))
+    else {
+        let _ = tx.rollback().await;
+        return Ok(Ran {
+            bought: Bought::Clarify(clarification(&pack.plan(objective))),
+            unreachable: Vec::new(),
+        });
+    };
+
+    let read = Material::read(&mut tx, principal.employee_id, objective, currency, now).await;
+    // Read-only, so the rollback is bookkeeping rather than a decision — but it
+    // is awaited so the pooled connection goes back deliberately.
+    let _ = tx.rollback().await;
+    let material = read?;
+
+    // Minted before the letter so the reference in a supplier's inbox is the
+    // primary key of the row that will hold their answer.
+    let reference = Uuid::now_v7();
+    let quotes = material.comparable(now);
+    let round = Round {
+        candidates: &material.candidates,
+        quotes: &quotes,
+        lane: &material.lane,
+        fx: &material.fx,
+    };
+
+    let bought = purchase(
+        buyer,
+        pack,
+        objective,
+        &round,
+        // Trusted: every byte of it is the operator's objective and our own
+        // words about our own business. Nothing a supplier wrote is in it.
+        &rfq_letter(objective, reference),
+        TrustLabel::Trusted,
+    )
+    .await?;
+
+    if let Bought::Asked { outcomes, .. } = &bought
+        && outcomes.iter().any(sourcing::Contacted::is_sent)
+    {
+        open_the_round(db, principal, objective, currency, reference, now).await?;
+    }
+
+    Ok(Ran {
+        bought,
+        unreachable: material.unreachable,
+    })
+}
+
+/// The letter a supplier reads, built from the objective and from nothing else.
+///
+/// The model does not write it, and that is the same decision
+/// [`Approach::new`] makes on the sales side for the same reason: an RFQ is a
+/// specification, and a specification re-worded every cadence is three
+/// different specifications reaching three suppliers whose quotes then cannot
+/// be compared. The model's language is the conversation *after* this — the
+/// reply to a supplier, the report of what happened — which is the turn that
+/// starts the moment this returns.
+///
+/// [`Objective::max_unit_price`](crate::rolepack::Objective) is deliberately
+/// absent from it. It is the ceiling we will pay and telling a supplier the
+/// ceiling is how the ceiling becomes the price.
+fn rfq_letter(objective: &rolepack::Objective, reference: Uuid) -> sourcing::Outreach {
+    let to = objective
+        .delivery_country
+        .as_ref()
+        .map_or("the delivery address", CountryCode::as_str);
+    let specification: Vec<String> = objective
+        .requirements
+        .iter()
+        .filter(|requirement| !requirement.trim().is_empty())
+        .map(|requirement| format!("  - {}", requirement.trim()))
+        .collect();
+
+    sourcing::Outreach {
+        subject: format!(
+            "RFQ {reference}: {} units of {}, delivered {to}",
+            objective.quantity,
+            objective.what.trim()
+        ),
+        body: format!(
+            "We are sourcing {} units of {}, delivered to {to}.\n\nThe specification is:\n{}\n\n\
+             Please quote: unit price and the currency it is in, your minimum order quantity, \
+             lead time in days, the Incoterm your price is on, payment terms, and how long the \
+             quote holds. We have asked on {} to {to}; quote on your own term if you prefer and \
+             say which it is, because we compare on landed cost and not on unit price.\n\n\
+             Our reference is {reference}. Please keep it in the subject line when you reply.",
+            objective.quantity,
+            objective.what.trim(),
+            if specification.is_empty() {
+                "  - (as discussed)".to_owned()
+            } else {
+                specification.join("\n")
+            },
+            RFQ_INCOTERM,
+        ),
+    }
+}
+
+/// Write down that the round is running.
+///
+/// The only durable thing a purchasing turn produces, and it is durable because
+/// it is the only fact the material cannot recompute: quotes hang off this row
+/// by foreign key, and [`due`] reads its absence as "nobody has been asked".
+async fn open_the_round(
+    db: &Db,
+    principal: &Principal,
+    objective: &rolepack::Objective,
+    currency: Currency,
+    reference: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sourcing_store::SourcingError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let title = format!(
+        "RFQ: {} units of {}",
+        objective.quantity,
+        objective.what.trim()
+    );
+    let result = sourcing_store::insert_rfq(
+        &mut tx,
+        reference,
+        &sourcing_store::NewRfq {
+            employee_id: Some(principal.employee_id),
+            title: &title,
+            product_category: category(objective),
+            quantity: i64::from(objective.quantity),
+            // ponytail: an objective has no unit and the column may not be
+            // null, because a quantity two parties read differently is the
+            // mistake the column exists to prevent. Countable goods until an
+            // objective can say kilograms.
+            unit: "pcs",
+            incoterm: Some(RFQ_INCOTERM.as_str()),
+            destination_country: objective
+                .delivery_country
+                .as_ref()
+                .map_or("ZZ", CountryCode::as_str),
+            currency,
+            target_unit_price: objective.max_unit_price,
+            closes_at: Some(now + RFQ_OPEN_FOR),
+        },
+    )
+    .await;
+
+    if let Err(err) = result {
+        let _ = tx.rollback().await;
+        return Err(err);
+    }
+    tx.commit().await.map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1839,322 @@ mod tests {
             email.sent_count(),
             0,
             "no Authorized<EmailSend> was minted, so the provider was never called"
+        );
+    }
+
+    // -- the wire: material out of the employee's own store -----------------
+
+    /// Two suppliers who sell what the objective is for, each with a contact
+    /// somebody could actually write to.
+    async fn seed_suppliers(
+        db: &Db,
+        principal: &Principal,
+        category: &str,
+    ) -> Vec<(Uuid, EmailAddress)> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let mut seeded = Vec::new();
+        for (name, country) in [("hamburg", "DE"), ("shenzhen", "CN")] {
+            let supplier = Uuid::now_v7();
+            sourcing_store::insert_supplier(
+                &mut tx,
+                supplier,
+                &sourcing_store::NewSupplier {
+                    legal_name: &format!("{name} works"),
+                    country,
+                    categories: &[category.to_owned()],
+                    website: None,
+                },
+            )
+            .await
+            .expect("supplier");
+
+            let email = format!("sales@{name}.example");
+            sqlx::query(
+                "INSERT INTO supplier_contacts \
+                     (id, tenant_id, supplier_id, full_name, email, is_primary) \
+                 VALUES ($1, $2, $3, 'Sales', $4, true)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(principal.tenant_id.as_uuid())
+            .bind(supplier)
+            .bind(&email)
+            .execute(&mut **tx)
+            .await
+            .expect("contact");
+            seeded.push((supplier, address(&email)));
+        }
+        tx.commit().await.expect("commit suppliers");
+        seeded
+    }
+
+    /// The open round this employee is running, if it is running one.
+    async fn open_round(db: &Db, principal: &Principal) -> Option<OpenRfq> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let open = sourcing_store::open_rfq(&mut tx, principal.employee_id)
+            .await
+            .expect("open rfq");
+        tx.rollback().await.expect("rollback");
+        open
+    }
+
+    /// A buyer wired to a gate with `limits`, and the provider behind it.
+    async fn buying_desk(
+        db: &Db,
+        limits: PolicyLimits,
+    ) -> (Principal, Buyer, Arc<MockEmailProvider>) {
+        let principal = seed(db).await;
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(db.clone(), email_ports(email.clone()), principal.clone());
+        let buyer = Buyer::new(
+            gate(db, limits),
+            effects,
+            principal.clone(),
+            "lena@fabrikam.example",
+        );
+        (principal, buyer, email)
+    }
+
+    /// The whole purchasing wire, out of the store and back into it: a
+    /// chartered buyer whose turn has come reads its own suppliers, issues the
+    /// RFQ, and leaves the one row a sourcing round cannot recompute.
+    ///
+    /// Then it runs again on the next cadence and does **not** ask twice. That
+    /// second half is the load-bearing one: `due` reads the material and there
+    /// is no stage column, so without the `rfqs` row the same letter would go
+    /// to the same suppliers every hour forever.
+    #[tokio::test]
+    async fn a_chartered_buyer_issues_its_rfq_from_its_own_store_and_asks_only_once() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_suppliers(&db, &principal, category(&objective)).await;
+        let now = Utc::now();
+
+        let ran = purchasing_turn(&db, &buyer, &principal, &pack, &objective, now)
+            .await
+            .expect("the round was readable");
+
+        let Bought::Asked { asking, outcomes } = &ran.bought else {
+            panic!("a buyer with suppliers and no round should have asked: {ran:?}");
+        };
+        assert_eq!(asking.len(), 2, "both suppliers were reachable");
+        assert!(outcomes.iter().all(sourcing::Contacted::is_sent));
+        assert_eq!(
+            email.sent_count(),
+            2,
+            "one RFQ per supplier, through the gate"
+        );
+        assert!(ran.unreachable.is_empty());
+
+        // The row landed, it names this employee, and it is the round every
+        // quote will hang off by foreign key.
+        let open = open_round(&db, &principal)
+            .await
+            .expect("the round is open");
+        assert_eq!(open.currency, Currency::Usd, "the objective's own currency");
+        assert_eq!(open.quantity, 5_000);
+        assert_eq!(open.incoterm.as_deref(), Some("DDP"));
+
+        // The note is ours: parsed addresses and outcome codes, no supplier's
+        // legal name and no supplier's prose.
+        let note = ran.note();
+        assert!(note.contains("sales@hamburg.example"), "{note}");
+        assert!(
+            !note.contains("hamburg works"),
+            "a legal name reached the prompt: {note}"
+        );
+
+        // The next cadence. Same plan, same objective, nothing answered yet —
+        // and the material now says the suppliers have been asked.
+        let again = purchasing_turn(&db, &buyer, &principal, &pack, &objective, now)
+            .await
+            .expect("the round was readable");
+        assert!(
+            matches!(again.bought, Bought::Model(rolepack::Stage::Discover)),
+            "an open round with no answers is the model's turn, not a second RFQ: {again:?}"
+        );
+        assert_eq!(email.sent_count(), 2, "the same RFQ went out twice");
+        assert_eq!(
+            open_round(&db, &principal).await.map(|r| r.id),
+            Some(open.id),
+            "a second round was opened beside the first"
+        );
+
+        // And the round is the one the suppliers were told to quote against.
+        let _ = seeded;
+    }
+
+    /// Three days later the answers land as rows against that round — which is
+    /// the only thing that changed — and the same plan compares instead of
+    /// asking. No timer, no stored cursor, no scheduler.
+    #[tokio::test]
+    async fn quotes_arriving_days_later_make_the_same_plan_compare_through_the_real_path() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_suppliers(&db, &principal, category(&objective)).await;
+        let now = Utc::now();
+
+        let asked = purchasing_turn(&db, &buyer, &principal, &pack, &objective, now)
+            .await
+            .expect("the round was readable");
+        assert!(matches!(asked.bought, Bought::Asked { .. }), "{asked:?}");
+        let open = open_round(&db, &principal)
+            .await
+            .expect("the round is open");
+
+        // The suppliers reply. In production these rows are written by whatever
+        // reads a supplier's email; here they are written directly, because the
+        // point of the test is what the *next turn* does with them.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        for ((supplier, _), (unit, lead, term)) in seeded
+            .iter()
+            .zip([(300u64, 20i32, "DDP"), (450, 45, "FOB")])
+        {
+            sourcing_store::insert_quote(
+                &mut tx,
+                Uuid::now_v7(),
+                &sourcing_store::NewQuote {
+                    rfq_id: open.id,
+                    supplier_id: *supplier,
+                    unit_price: Money::new(unit, Currency::Usd).expect("non-zero"),
+                    quantity: 5_000,
+                    freight: None,
+                    duties: None,
+                    other_fees: None,
+                    lead_time_days: Some(lead),
+                    incoterm: Some(term),
+                    valid_until: now + TimeDelta::days(30),
+                },
+            )
+            .await
+            .expect("quote");
+        }
+        tx.commit().await.expect("commit quotes");
+
+        let later = now + TimeDelta::days(3);
+        let compared = purchasing_turn(&db, &buyer, &principal, &pack, &objective, later)
+            .await
+            .expect("both quotes are in the round's currency");
+
+        let Bought::Compared {
+            landed,
+            divergences,
+        } = &compared.bought
+        else {
+            panic!("quotes in hand and the plan is still asking for them: {compared:?}");
+        };
+        assert_eq!(landed.len(), 2);
+        assert_eq!(
+            landed[0].supplier, seeded[0].1,
+            "cheapest landed total first"
+        );
+        // What the fan-out bought beyond a sort key: 300 against 450 is 50%
+        // apart on landed cost, and 20 days against 45 is past the doubling
+        // that lead times have to clear before they are worth reporting.
+        //
+        // Both quotes carry their own Incoterm out of the column — one DDP, one
+        // FOB — and neither is charged for the difference, because the lane is
+        // free. That is the documented ceiling of `Material::read` and not an
+        // accident: the day there is a forwarder's quote to put in a lane, the
+        // FOB one gets more expensive here and nothing else changes.
+        assert_eq!(landed[0].incoterm, sourcing::Incoterm::Ddp);
+        assert_eq!(landed[1].incoterm, sourcing::Incoterm::Fob);
+        assert_eq!(
+            divergences.iter().map(|d| d.field).collect::<Vec<_>>(),
+            vec![
+                sourcing::Comparable::LandedTotal,
+                sourcing::Comparable::LeadTimeDays
+            ],
+            "{divergences:?}"
+        );
+        assert_eq!(
+            email.sent_count(),
+            2,
+            "comparing quotes re-asked the suppliers"
+        );
+        assert!(
+            compared.note().contains("normalised"),
+            "{}",
+            compared.note()
+        );
+    }
+
+    /// The gate is the load-bearing refusal and it is inside the vertical — and
+    /// when it refuses everybody, **no round is opened**. An open round is what
+    /// stops the employee asking again, so opening one nobody was asked would
+    /// leave this employee waiting forever for answers to a letter that never
+    /// went out.
+    #[tokio::test]
+    async fn a_forbidden_channel_sends_nothing_and_opens_no_round() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        // Everything the buyer's role grants, except a way to speak.
+        let muted = PolicyLimits {
+            allowed_channels: BTreeSet::new(),
+            ..pack.limits().clone()
+        };
+        let (principal, buyer, email) = buying_desk(&db, muted).await;
+        let objective = buying_objective_value();
+        seed_suppliers(&db, &principal, category(&objective)).await;
+
+        let ran = purchasing_turn(&db, &buyer, &principal, &pack, &objective, Utc::now())
+            .await
+            .expect("the round was readable");
+
+        let Bought::Asked { outcomes, .. } = &ran.bought else {
+            panic!("expected an attempt per supplier: {ran:?}");
+        };
+        assert!(
+            outcomes.iter().all(|outcome| !outcome.is_sent()),
+            "the gate let a vertical operation past a channel it forbids"
+        );
+        assert_eq!(email.sent_count(), 0);
+        assert!(
+            open_round(&db, &principal).await.is_none(),
+            "a round was opened for an RFQ that never went out"
+        );
+    }
+
+    /// A supplier nobody can write to is reported, not skipped — and the round
+    /// still runs for the ones that can be.
+    #[tokio::test]
+    async fn a_supplier_with_no_contact_is_named_rather_than_dropped() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        seed_suppliers(&db, &principal, category(&objective)).await;
+
+        // A third supplier in the same category with nobody on file.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sourcing_store::insert_supplier(
+            &mut tx,
+            Uuid::now_v7(),
+            &sourcing_store::NewSupplier {
+                legal_name: "silent castings",
+                country: "VN",
+                categories: &[category(&objective).to_owned()],
+                website: None,
+            },
+        )
+        .await
+        .expect("supplier");
+        tx.commit().await.expect("commit");
+
+        let ran = purchasing_turn(&db, &buyer, &principal, &pack, &objective, Utc::now())
+            .await
+            .expect("the round was readable");
+
+        assert_eq!(email.sent_count(), 2, "the reachable two were still asked");
+        assert_eq!(ran.unreachable.len(), 1);
+        assert_eq!(ran.unreachable[0].why, sourcing::Unreachable::NoContact);
+        assert!(
+            ran.note().contains("cannot be written to"),
+            "the operator's queue was swallowed: {}",
+            ran.note()
         );
     }
 

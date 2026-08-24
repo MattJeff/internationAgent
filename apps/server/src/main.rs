@@ -377,6 +377,10 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             .merge(routes::usage::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
+            // The only writer of `spend_caps` outside a test. Until it was
+            // mounted the table was empty in every deployment, which the
+            // ledger reads as "may not spend" — safe, and unusable.
+            .merge(routes::spend::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
             .merge(routes::knowledge::router(db.clone()))
             // The pool has a source now: `phone_numbers`, written by this
@@ -401,10 +405,28 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
         .merge(routes::a2a::card_router(a2a))
         .merge(routes::well_known::router(db.clone()));
 
+    // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
+    // and that is a deliberate reading of the two tiers above rather than the
+    // easy option. A scraper holds no API key, and the only credential this
+    // server understands is a tenant's — so putting `/metrics` behind auth
+    // would mean handing one tenant a set of cross-tenant aggregates, plus a
+    // rate limiter and an idempotency layer on a once-a-minute scrape. Every
+    // number it exposes is aggregate by construction (see `metrics.rs` on
+    // cardinality): deny codes, step codes, token totals, three queue depths.
+    // No tenant id, no employee id, no url.
+    //
+    // What that leaves is real and worth saying out loud: **the listener must
+    // not be publicly routable.** `/metrics` tells a stranger the deny-reason
+    // mix and the size of the approval queue, and `/readyz` next to it already
+    // publishes the outbox lag. The ingress is the thing that can see a client
+    // address (the same reason the rate limiter is not on this tier), so the
+    // ingress is where `/metrics`, `/livez` and `/readyz` get restricted to the
+    // scrape network. Prometheus is the expected reader; nothing else.
     let health = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
-        .with_state(db);
+        .with_state(db.clone())
+        .merge(metrics::router(db));
 
     with_outer_stack(health.merge(public).merge(api))
 }

@@ -59,6 +59,50 @@
 //! the turn starts by itself on the first tick after the objective is completed.
 //! Nothing has to notice that it was filled in.
 //!
+//! # The vertical runs *before* the model, not instead of it
+//!
+//! [`RolePack::plan`](agentos_app::rolepack::RolePack::plan) says which stage is
+//! due, and until this loop called [`agentos_app::vertical`] the employee was
+//! *told* the stage and the function that performs it was never called. Closing
+//! that had three shapes and only one of them is this system.
+//!
+//! * **Instead of.** [`vertical::due`](agentos_app::vertical::due) answers
+//!   `Stage::Rfq`, so the loop issues the RFQ and never calls the model.
+//!   Cheapest and most deterministic, and it deletes the employee: nobody
+//!   writes down what happened, nobody notices the supplier who replied "we
+//!   don't make that", and nobody can say a stage is blocked. It also has
+//!   nowhere to put [`Bought::Model`](agentos_app::vertical::Bought), which is
+//!   the vertical's own way of saying *this stage is reading and judging, it is
+//!   the model's* — a value that only makes sense if there is a model turn to
+//!   fall through to.
+//! * **From inside.** The vertical becomes a tool the model may invoke. That is
+//!   `(i)` in `vertical.rs`'s module docs, argued against there at length —
+//!   twelve tool schemas for two roles against a catalogue that is a
+//!   fixed-size array on purpose, and one gate decision covering N recipients
+//!   whose per-recipient budget it never saw. Not reversed here.
+//! * **Before** — what [`take_turn`] does. [`vertical_step`] runs the due
+//!   operation out of the employee's own store, and its
+//!   [`Ran::note`](agentos_app::vertical::Ran) becomes the last message of the
+//!   opening context. The code decides the step; the model does the language.
+//!
+//! That is `vertical.rs`'s own sentence — "the model does the language and the
+//! role pack decides the stage" — and *before* is the only one of the three
+//! that keeps both halves of it. The RFQ's letter is ours rather than the
+//! model's for the same reason
+//! [`Approach::new`](agentos_app::vertical::Approach) builds the sales message
+//! from the evidence rather than from a model: a specification re-worded every
+//! cadence is three specifications reaching three suppliers whose quotes then
+//! do not compare. The language the model does here is the conversation that
+//! follows — the reply to a supplier, the report of what happened, the
+//! judgement about who is worth chasing.
+//!
+//! Nothing about the authority changes. The `Buyer` is built on the same
+//! [`Effects`] the turn is built on, around the same principal, gated by the
+//! same process-wide [`PolicyGate`](agentos_app::gate::PolicyGate), and every
+//! recipient is authorised on its own inside
+//! [`Buyer::issue_rfq`](agentos_app::sourcing::Buyer::issue_rfq). The turn
+//! budget is still reserved once, in [`handle`], before any of it.
+//!
 //! # The cost ceiling
 //!
 //! **Every other limit in this system is on money, or on tool calls inside one
@@ -94,8 +138,9 @@ use std::time::Duration;
 
 use agentos_app::effects::Effects;
 use agentos_app::gate::Principal as ActingAs;
+use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
-use agentos_app::vertical::Charter;
+use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
@@ -503,10 +548,10 @@ async fn record(db: &Db, due: &Due, outcome: &Outcome, now: DateTime<Utc>) {
 /// plan rather than somebody's email.
 async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     let Assignment {
+        due,
         identity,
         address,
         charter,
-        ..
     } = assignment;
     let role = charter.role();
 
@@ -515,11 +560,17 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // transaction spanning this turn to write into.
     let db = agent.db.clone();
 
-    let principal = ActingAs::employee(assignment.due.tenant_id, assignment.due.employee_id);
+    let principal = ActingAs::employee(due.tenant_id, due.employee_id);
+    let effects = Effects::new(agent.db.clone(), agent.ports.clone(), principal.clone());
+
+    // The vertical, before the model and never instead of it. See the module
+    // docs on why this is not a branch that skips the turn.
+    let done = vertical_step(&agent, &effects, &principal, &charter, &address).await;
+
     let turn = Turn::new(
         agent.llm,
         agent.gate,
-        Effects::new(agent.db, agent.ports, principal.clone()),
+        effects,
         principal,
         charter.system_prompt(&identity),
         agent.model,
@@ -530,9 +581,17 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // is a message rather than part of the prompt because it varies per
     // objective — which is what both role packs say about `Task::instruction`,
     // in as many words.
-    let context = Context::new()
+    //
+    // The vertical's note goes after the plan and is ours as thoroughly as the
+    // plan is: parsed addresses, `Money`, and closed enums, with no supplier's
+    // prose and no supplier's legal name in it. So this turn still starts
+    // trusted by construction.
+    let mut context = Context::new()
         .with_task(TURN_BRIEF)
         .with_task(charter.brief());
+    if let Some(note) = done {
+        context = context.with_task(note);
+    }
 
     let cancel = agent.cancel.child_token();
     let deadline = tokio::spawn({
@@ -561,15 +620,12 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
             // turn budget exists for — whose calls are most real and least
             // recorded.
             if failed.turns > 0 {
-                let mut tx = db
-                    .tenant_tx(assignment.due.tenant_id)
-                    .await
-                    .map_err(|err| {
-                        format!("no tenant transaction for the failed turn's tokens: {err}")
-                    })?;
+                let mut tx = db.tenant_tx(due.tenant_id).await.map_err(|err| {
+                    format!("no tenant transaction for the failed turn's tokens: {err}")
+                })?;
                 model_usage::record(
                     &mut tx,
-                    assignment.due.employee_id,
+                    due.employee_id,
                     Utc::now().date_naive(),
                     Consumed::reported(
                         failed.turns,
@@ -619,12 +675,12 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // just before UTC midnight — which books its tokens on the day it finished.
     // ponytail: thread `now` through `Assignment` if that ever matters.
     let mut tx = db
-        .tenant_tx(assignment.due.tenant_id)
+        .tenant_tx(due.tenant_id)
         .await
         .map_err(|err| format!("no tenant transaction for the token ledger: {err}"))?;
     let recorded = model_usage::record(
         &mut tx,
-        assignment.due.employee_id,
+        due.employee_id,
         Utc::now().date_naive(),
         Consumed::reported(
             finished.turns,
@@ -655,6 +711,66 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // `employee_initiative.last_detail` holds only text this codebase authored.
     // Give it a home the day there is a work journal to put it in.
     Ok(())
+}
+
+/// Run whatever vertical operation this charter's plan makes due, and return
+/// what to tell the employee about it.
+///
+/// `None` is "nothing ran", and it is not a failure: a charter this vertical has
+/// no material for, or a store that could not be read. The turn goes ahead
+/// either way — the budget is already spent, and an employee that cannot read
+/// its round can still read its mail and say so.
+///
+/// Every provider call inside this is [`Buyer`]'s, which gates each address on
+/// its own and hands the resulting `Authorized<A>` to the same [`Effects`] the
+/// turn below uses. There is no second path and no widened authority: this is
+/// the employee doing, before the same employee writes.
+async fn vertical_step(
+    agent: &Agent,
+    effects: &Effects,
+    principal: &ActingAs,
+    charter: &Charter,
+    address: &str,
+) -> Option<String> {
+    let Charter::Purchasing { pack, objective } = charter else {
+        // Sales. `vertical::sell` needs a `Flow` — the selectors on a
+        // prospect's own booking page — and an authoritative `Answer` to
+        // compare its output against. Neither has a table, a route or a config
+        // key anywhere in this product, so there is no material to assemble and
+        // nothing here can invent one: a probe pointed at a guessed selector
+        // reads the wrong element and the evidence bar cannot tell the
+        // difference. The sales employee takes the turn it always took.
+        return None;
+    };
+
+    let buyer = Buyer::new(
+        agent.gate.clone(),
+        effects.clone(),
+        principal.clone(),
+        address.to_owned(),
+    );
+
+    match vertical::purchasing_turn(&agent.db, &buyer, principal, pack, objective, Utc::now()).await
+    {
+        Ok(ran) => {
+            tracing::info!(
+                unreachable = ran.unreachable.len(),
+                "the purchasing vertical ran before the turn"
+            );
+            Some(ran.note())
+        }
+        // Logged and swallowed. A round that could not be read is not a reason
+        // to spend the reserved turn on nothing, and it is not a reason to pull
+        // the cadence back in either — the next tick reads it again.
+        Err(err) => {
+            tracing::error!(
+                code = err.code(),
+                error = %err,
+                "the purchasing vertical did not run; the employee takes an ordinary turn"
+            );
+            None
+        }
+    }
 }
 
 /// What a self-started turn is, in the model's terms.
@@ -1021,6 +1137,141 @@ pub(crate) mod tests {
         let claimed = tick(&db, &take, &cancel, Utc::now()).await.expect("tick");
         assert_eq!(claimed, 0);
         assert_eq!(started.load(Ordering::SeqCst), 0);
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// One supplier who sells what the charter is for, with somebody on file
+    /// to write to.
+    async fn seed_supplier(db: &Db, tenant: TenantId, category: &str, email: &str) {
+        use agentos_store::sourcing as sourcing_store;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let supplier = Uuid::now_v7();
+        sourcing_store::insert_supplier(
+            &mut tx,
+            supplier,
+            &sourcing_store::NewSupplier {
+                legal_name: "Hamburg Praezision GmbH",
+                country: "DE",
+                categories: &[category.to_owned()],
+                website: None,
+            },
+        )
+        .await
+        .expect("insert supplier");
+        sqlx::query(
+            "INSERT INTO supplier_contacts \
+                 (id, tenant_id, supplier_id, full_name, email, is_primary) \
+             VALUES ($1, $2, $3, 'Sales', $4, true)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(supplier)
+        .bind(email)
+        .execute(&mut **tx)
+        .await
+        .expect("insert contact");
+        tx.commit().await.expect("commit supplier");
+    }
+
+    /// Emails this employee actually got out of a provider, counted in the one
+    /// place every effect lands: the audit trail, each row naming the gate
+    /// decision that permitted it.
+    async fn emails_sent(db: &Db, tenant: TenantId, employee: EmployeeId) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log \
+              WHERE employee_id = $1 \
+                AND decision_id IS NOT NULL \
+                AND payload->>'effect' = 'email_send' \
+                AND payload->>'outcome' = 'ok'",
+        )
+        .bind(employee.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// The whole seam, through the real path: a chartered buyer whose cadence
+    /// comes due reaches [`take_turn`], the vertical runs **before** the model,
+    /// the RFQ goes out through the gate, and the row that makes the round
+    /// resumable lands.
+    ///
+    /// And the budget is spent once. The vertical is inside the reservation
+    /// [`handle`] already took, not beside it: an employee that emails five
+    /// suppliers and then thinks about it has taken one turn, not two.
+    #[tokio::test]
+    async fn a_due_buyer_issues_its_rfq_through_the_loop_and_spends_one_turn() {
+        use agentos_app::gate::{PolicyBook, PolicyGate};
+        use agentos_store::sourcing as sourcing_store;
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "buyer", Some(workable())).await;
+        // The objective's own words are the supplier search key — there is no
+        // category vocabulary in this system and `suppliers.categories` is the
+        // buyer's search key, so this is the join the operator makes by typing
+        // the same phrase twice.
+        seed_supplier(
+            &db,
+            tenant,
+            "anodised aluminium enclosures",
+            "sales@hamburg.example",
+        )
+        .await;
+
+        let cancel = CancellationToken::new();
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(agentos_app::mocks::scripted_mock()),
+            // The buyer's own role layer as the platform layer: the widest this
+            // employee could ever be granted, so a refusal below would be the
+            // vertical's and not a fixture's.
+            gate: PolicyGate::new(
+                db.clone(),
+                PolicyBook::new(rolepack::RolePack::international_buyer().limits().clone()),
+            ),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            // No binder loop here, so every tenant's fleet is empty and every
+            // MCP call is refused by name.
+            fleets: crate::routes::mcp::Fleets::new().0,
+            model: "claude-opus-5",
+            cancel: cancel.clone(),
+        };
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        let claimed = tick(&db, &take, &cancel, Utc::now()).await.expect("tick");
+        assert_eq!(claimed, 1);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "turn");
+        assert_eq!(
+            emails_sent(&db, tenant, employee).await,
+            1,
+            "the RFQ never reached a provider through the gate"
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let open = sourcing_store::open_rfq(&mut tx, employee)
+            .await
+            .expect("open rfq");
+        let spent = turns::taken_today(&mut tx, employee, Utc::now().date_naive())
+            .await
+            .expect("taken today");
+        tx.rollback().await.expect("rollback");
+
+        let open = open.expect("the employee emailed a supplier and opened no round");
+        assert_eq!(open.quantity, 5_000);
+        assert_eq!(
+            spent, 1,
+            "one cadence must cost exactly one turn, vertical or no vertical"
+        );
 
         drop_tenant(&db, tenant).await;
     }

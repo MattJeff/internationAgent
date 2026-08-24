@@ -2178,7 +2178,7 @@ mod tests {
         .await
         .expect("suppress");
 
-        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+        let found = sourcing_store::find_suppliers(&mut tx, Some("DE"), "fasteners")
             .await
             .expect("find");
         assert_eq!(found.len(), 5, "the fixture did not land: {found:?}");
@@ -2278,7 +2278,7 @@ mod tests {
         let typo = add_supplier(&mut tx, "FFF Flanges Oy").await;
         add_contact(&mut tx, typo, "Tuo Toivo", Some("tuo@@flanges"), true, true).await;
 
-        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+        let found = sourcing_store::find_suppliers(&mut tx, Some("DE"), "fasteners")
             .await
             .expect("find");
         let out = recipients(&mut tx, &found).await.expect("recipients");
@@ -2345,7 +2345,7 @@ mod tests {
             .expect("observation");
         }
 
-        let found = sourcing_store::find_suppliers(&mut tx, "DE", "fasteners")
+        let found = sourcing_store::find_suppliers(&mut tx, Some("DE"), "fasteners")
             .await
             .expect("find");
         let out = recipients(&mut tx, &found).await.expect("recipients");

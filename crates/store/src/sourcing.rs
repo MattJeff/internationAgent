@@ -148,20 +148,30 @@ pub struct SupplierSummary {
     pub state: String,
 }
 
-/// Suppliers in one country that sell one category, name-ordered.
+/// Suppliers that sell one category, optionally narrowed to one country,
+/// name-ordered.
 ///
 /// Suspended and blocked suppliers are excluded here rather than by the caller:
 /// a blocked supplier that shows up in a search is a blocked supplier someone
 /// will eventually send an RFQ to.
+///
+/// `country` is the **supplier's** country and it is optional because half the
+/// callers do not have one. A buying objective states where the goods must
+/// *arrive* (`rolepack::Objective::delivery_country`) and says nothing about
+/// where they come from — an international buyer that searched only the
+/// delivery country would be a domestic buyer. `None` therefore means "any
+/// origin", and the category predicate still rides `suppliers_categories_idx`,
+/// the GIN index, so dropping the country narrows the plan rather than
+/// widening it to a scan.
 pub async fn find_suppliers(
     tx: &mut TenantTx<'_>,
-    country: &str,
+    country: Option<&str>,
     category: &str,
 ) -> Result<Vec<SupplierSummary>, SourcingError> {
     let rows: Vec<(Uuid, String, String, Vec<String>, String)> = sqlx::query_as(
         "SELECT id, legal_name, country, categories, state \
            FROM suppliers \
-          WHERE country = $1 \
+          WHERE ($1::text IS NULL OR country = $1) \
             AND categories @> array[$2::text] \
             AND state IN ('candidate', 'active') \
           ORDER BY legal_name, id",
@@ -345,6 +355,59 @@ pub async fn insert_rfq(
     Ok(())
 }
 
+/// The round an employee already has running, as the buyer needs to read it
+/// back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRfq {
+    /// RFQ id — the key [`live_quotes`] takes.
+    pub id: Uuid,
+    /// How many units were asked for.
+    pub quantity: i64,
+    /// The one currency every quote against it is denominated in.
+    pub currency: Currency,
+    /// The Incoterm the RFQ dictated, if it dictated one. A quote that names
+    /// no term of its own was answering on this one.
+    pub incoterm: Option<String>,
+}
+
+/// The open RFQ this employee is running, most recent first.
+///
+/// **This is what stops an RFQ going out twice.** A sourcing round stores no
+/// cursor and no workflow row — see `app::vertical` — so the only thing that
+/// distinguishes "nobody has been asked yet" from "we asked on Tuesday and
+/// nobody has answered" is whether an open `rfqs` row exists. The buyer reads
+/// this before deciding, and an employee that has one is past asking.
+///
+/// One row, not all of them: an employee runs one objective, and the plan
+/// `RolePack::plan` recomputes is that objective's. A second open round for the
+/// same employee is an operator having re-chartered mid-round, and the newest
+/// is the one the current objective belongs to.
+pub async fn open_rfq(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+) -> Result<Option<OpenRfq>, SourcingError> {
+    let row: Option<(Uuid, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, quantity, currency, incoterm \
+           FROM rfqs \
+          WHERE employee_id = $1 AND state = 'open' \
+          ORDER BY created_at DESC, id DESC \
+          LIMIT 1",
+    )
+    .bind(employee_id.as_uuid())
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    let Some((id, quantity, currency, incoterm)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(OpenRfq {
+        id,
+        quantity,
+        currency: currency.parse::<Currency>()?,
+        incoterm,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Quotes
 // ---------------------------------------------------------------------------
@@ -426,6 +489,19 @@ pub struct LiveQuote {
     pub landed_total: Money,
     /// Quoted lead time.
     pub lead_time_days: Option<i32>,
+    /// The Incoterm this price is quoted on, if the supplier named one.
+    ///
+    /// Returned rather than assumed, because it is the one field that decides
+    /// how much of the landed cost is *not* in the quoted price. A caller that
+    /// defaulted every quote to the RFQ's term would compare an EXW price
+    /// against a DDP price and pick the wrong supplier — see
+    /// `app::sourcing::landed_cost`. `None` really is "they did not say", and
+    /// the RFQ's own term is the honest fallback for that.
+    pub incoterm: Option<String>,
+    /// When the quote arrived. The opening edge of its validity window: the
+    /// closing one is `valid_until` and the column pair is what
+    /// `domain::sourcing::Quote::live_at` is checked against.
+    pub received_at: DateTime<Utc>,
     /// When this stops being a live quote.
     pub valid_until: DateTime<Utc>,
 }
@@ -449,12 +525,14 @@ pub async fn live_quotes(
         i64,
         i64,
         Option<i32>,
+        Option<String>,
+        DateTime<Utc>,
         DateTime<Utc>,
     );
 
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, supplier_id, currency, unit_price_minor, quantity, landed_total_minor, \
-                lead_time_days, valid_until \
+                lead_time_days, incoterm, received_at, valid_until \
            FROM quotes \
           WHERE rfq_id = $1 AND state = 'received' AND valid_until > $2 \
           ORDER BY landed_total_minor, id",
@@ -474,6 +552,8 @@ pub async fn live_quotes(
                 quantity,
                 landed,
                 lead_time_days,
+                incoterm,
+                received_at,
                 valid_until,
             )| {
                 Ok(LiveQuote {
@@ -483,6 +563,8 @@ pub async fn live_quotes(
                     quantity,
                     landed_total: money_of(landed, &currency)?,
                     lead_time_days,
+                    incoterm,
+                    received_at,
                     valid_until,
                 })
             },
@@ -1256,7 +1338,7 @@ mod tests {
 
         // And the store API agrees, asked by primary key.
         assert!(
-            find_suppliers(&mut tx, "CN", "fasteners")
+            find_suppliers(&mut tx, Some("CN"), "fasteners")
                 .await
                 .expect("search")
                 .is_empty()
@@ -1281,7 +1363,7 @@ mod tests {
 
         // Tenant A still sees its own.
         let mut tx = db.tenant_tx(a).await.expect("tenant tx");
-        let found = find_suppliers(&mut tx, "CN", "fasteners")
+        let found = find_suppliers(&mut tx, Some("CN"), "fasteners")
             .await
             .expect("search");
         assert_eq!(found.len(), 1);
@@ -1289,13 +1371,13 @@ mod tests {
         assert_eq!(found[0].categories, vec!["fasteners", "hardware"]);
         // ... and not for a category it does not sell, or another country.
         assert!(
-            find_suppliers(&mut tx, "CN", "castings")
+            find_suppliers(&mut tx, Some("CN"), "castings")
                 .await
                 .expect("search")
                 .is_empty()
         );
         assert!(
-            find_suppliers(&mut tx, "VN", "fasteners")
+            find_suppliers(&mut tx, Some("VN"), "fasteners")
                 .await
                 .expect("search")
                 .is_empty()
@@ -1434,6 +1516,22 @@ mod tests {
         assert_eq!(live[0].landed_total, usd(110_000));
         assert_eq!(live[0].unit_price, usd(10));
         assert_eq!(live[2].landed_total, usd(290_000));
+
+        // The two columns a landed-cost comparison cannot be built without: the
+        // term the price is quoted on, and the instant the window opened. The
+        // seeded quote named FOB and these three named nothing — which is a
+        // different answer from "FOB", and the reason the field is an `Option`
+        // rather than a default filled in here.
+        let seeded = live
+            .iter()
+            .find(|q| q.supplier_id == graph.supplier)
+            .expect("the seeded quote is standing");
+        assert_eq!(seeded.incoterm.as_deref(), Some("FOB"));
+        assert_eq!(live[0].incoterm, None);
+        assert!(
+            live.iter().all(|q| q.received_at <= q.valid_until),
+            "a quote cannot have arrived after it expired: {live:?}"
+        );
 
         // One second past its expiry the cheapest is gone; one second before,
         // it leads. The boundary is the cutoff, not a rounding.
