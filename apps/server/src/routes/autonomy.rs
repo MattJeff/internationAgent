@@ -153,18 +153,24 @@ pub fn router(db: Db) -> Router {
 /// `to` is **inclusive**, because an operator asking for "the 1st to the 31st"
 /// means the 31st. The half-open bound the SQL wants is derived once, in
 /// [`Window::resolve`], rather than left for each reader to remember.
+///
+/// `pub(super)` so [`super::usage`] parses its window with this one rather than
+/// a copy. The two endpoints are meant to be read side by side — how much of the
+/// work was the agent's, and what it burned doing it — and two window parsers
+/// that disagreed about what `?from` defaults to would make that comparison
+/// quietly wrong.
 #[derive(Debug, Deserialize)]
-struct WindowQuery {
-    from: Option<NaiveDate>,
-    to: Option<NaiveDate>,
+pub(super) struct WindowQuery {
+    pub(super) from: Option<NaiveDate>,
+    pub(super) to: Option<NaiveDate>,
 }
 
 /// The resolved window: `[from, to]` inclusive as the caller sees it, `[from,
 /// end)` half-open as the query runs it.
 #[derive(Debug, Clone, Copy)]
-struct Window {
-    from: NaiveDate,
-    to: NaiveDate,
+pub(super) struct Window {
+    pub(super) from: NaiveDate,
+    pub(super) to: NaiveDate,
 }
 
 impl Window {
@@ -172,7 +178,7 @@ impl Window {
     ///
     /// The day is UTC throughout, matching `spend_buckets` and the turn
     /// budget — an employee must not have two "todays".
-    fn resolve(query: &WindowQuery) -> Result<Self, ApiError> {
+    pub(super) fn resolve(query: &WindowQuery) -> Result<Self, ApiError> {
         let today = Utc::now().date_naive();
         let to = query.to.unwrap_or(today);
         let from = query.from.unwrap_or_else(|| {
@@ -193,7 +199,7 @@ impl Window {
     }
 
     /// The exclusive upper bound the SQL uses.
-    fn end(self) -> NaiveDate {
+    pub(super) fn end(self) -> NaiveDate {
         self.to
             .checked_add_signed(Duration::days(1))
             .unwrap_or(self.to)

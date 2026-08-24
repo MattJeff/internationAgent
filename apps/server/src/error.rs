@@ -189,6 +189,20 @@ impl From<Denied> for ApiError {
     /// problem+json body under a 2xx confuses every client library. Revisit if
     /// the API grows a polling endpoint that wants a Location header.
     fn from(denied: Denied) -> Self {
+        // Every REST refusal is counted here, once, because every REST refusal
+        // comes through here: one funnel beats a `record_denial` in each route
+        // that somebody eventually forgets. `record_denial` takes the `Denied`
+        // rather than a string precisely so this line cannot leak the approval
+        // id that `PendingApproval` carries.
+        //
+        // ponytail: the JSON-RPC surface has its own funnel and its own line,
+        // in `routes::a2a::denied`. What is *not* counted is a refusal that
+        // never becomes an HTTP response — the turn loop's, `app::sourcing`'s —
+        // because those live in `crates/app`, which cannot depend on this
+        // binary. Counting them needs a sink the app crate can hold, which is a
+        // bigger change than a metric is worth until somebody wants the number.
+        crate::metrics::record_denial(&denied);
+
         let code = denied.code();
         match denied {
             Denied::Unavailable(err) => err.into(),

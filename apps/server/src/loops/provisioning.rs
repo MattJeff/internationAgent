@@ -334,6 +334,13 @@ impl<C: Converge> ProvisioningLoop<C> {
     async fn drive(&self, work: &Work, now: DateTime<Utc>) {
         match self.engine.converge(work.tenant_id, work.employee_id).await {
             Ok(reports) => {
+                // Every outcome, ready included: a `rate(ready)` that is flat
+                // is how you tell "no failures" from "no provisioning". Both
+                // labels are `&'static str` from a closed match, so eleven
+                // steps times eight codes is the whole series count, forever.
+                for (step, report) in &reports {
+                    crate::metrics::record_provisioning(*step, report);
+                }
                 let unready: Vec<_> = reports
                     .iter()
                     .filter(|(_, report)| !report.is_ready())

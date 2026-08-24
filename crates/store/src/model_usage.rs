@@ -1,0 +1,560 @@
+//! The token ledger: what the models cost, per employee, per UTC day.
+//!
+//! Every other cost in this workspace is written down. Payments go through
+//! [`crate::spend`], turns through [`crate::turns`], and every effect leaves an
+//! audit row. Model tokens — the single largest operating cost of this system —
+//! went to a process-local counter that drops the tenant and to two `tracing`
+//! lines, and nowhere else. `migrations/0023_model_usage.sql` is the table and
+//! the argument; this module is the only thing that writes it.
+//!
+//! # Where the write happens is the whole design
+//!
+//! [`record`] is **additive**. It has to be: two model calls with identical
+//! usage on the same day are two real calls and must read as two, so there is
+//! no idempotency key that could make a second write a no-op without also
+//! erasing a real one.
+//!
+//! Idempotence therefore comes from *where* it is called, not from a key. In
+//! `Agent::on_turn` it runs inside the outbox handler's own transaction — the
+//! same one that records the reply — so the row exists exactly when the turn
+//! committed. There is no state where the reply landed and the tokens did not,
+//! and none where one call was counted twice: a redelivered outbox event
+//! re-runs the model, and the second row describes a second real call that was
+//! really paid for.
+//!
+//! **The risk that buys, stated plainly: a usage write that fails aborts a turn
+//! that would otherwise have committed.** That is deliberate. The alternative —
+//! a best-effort write in a transaction of its own, logged and swallowed the way
+//! `loops::initiative::record` swallows a lost outcome — loses rows silently,
+//! and a silently lost row reads as *lower* consumption. That is the direction
+//! that flatters a number this project intends to quote in public, and a
+//! bookkeeping failure that quietly improves the figure is the worst of the
+//! available failures. A loud one that costs a retried turn is the better trade.
+//!
+//! # Unknown is not zero
+//!
+//! `providers::llm::WireUsage` is `#[serde(default)]`, so a response with no
+//! usage block parses into three zeroes. The `claude` CLI backend is lossy by
+//! construction and says so in its own first paragraph. Neither is a call that
+//! cost nothing, and a ledger that records them as zero is a ledger that
+//! averages a real bill down towards free.
+//!
+//! So [`Consumed`] carries `calls_unmetered` beside `calls`, and
+//! [`Consumed::reported`] is the single place the judgement is made: **a call
+//! that happened and reported no tokens at all is recorded as unmetered, not as
+//! free.** Both write sites go through it, so they cannot disagree.
+//!
+//! ponytail: the ceiling of that rule is that it reads a *batch* of calls, not
+//! one. `Finished::usage` is summed across a run, so a run where two calls
+//! reported and one did not looks fully metered here and its tokens are a floor
+//! by the missing call. In practice every call in one run goes to one backend,
+//! which either reports usage or does not, so the mixed case needs a provider
+//! that answers inconsistently within a single conversation. The upgrade path,
+//! if that ever happens, is a per-call counter on `agentos_app::turn::Spent`
+//! incremented where `spent.usage.add(response.usage)` already is — not a
+//! change here, which would still only see the sum.
+//!
+//! # What this ledger still cannot see
+//!
+//! **A turn that did not finish records nothing.** `Turn::run` returns
+//! `TurnError` on a blown budget, a deadline or an unreachable store, and drops
+//! `Spent` with it — so the model calls that run already made are invisible
+//! here, and their absence reads as zero. This is the same lie one level up, and
+//! it is the largest remaining hole: a crash-looping employee is exactly the
+//! scenario the turn budget exists for, and it is the scenario whose tokens this
+//! table misses. Closing it means carrying `Usage` out of `TurnError`, which is
+//! a public enum matched in several crates. [`crate::turns::taken_today`] is the
+//! honest cross-check in the meantime: a turn is reserved *before* the model is
+//! called, so `turns_taken` counts the runs this table does not.
+//!
+//! **Cache writes are inside `input_tokens`.** `llm_anthropic.rs` folds
+//! `cache_creation_input_tokens` in on the way through and `Usage` has no field
+//! for it, so there is no column for it here. See decision 2 of the migration.
+
+use agentos_domain::ids::EmployeeId;
+use chrono::NaiveDate;
+use serde::Serialize;
+
+use crate::db::{StoreError, TenantTx};
+
+/// What a stretch of model calls consumed.
+///
+/// The same struct is written and read, and the read side's rollup deserialises
+/// into it too (`sum(...)::bigint AS <column>`), so the column list exists once
+/// and the ledger, the JSON and the arithmetic cannot drift apart.
+///
+/// `i64` rather than `u64` because that is what the columns are and what sqlx
+/// binds; the narrowing happens once, in [`Consumed::reported`], where it can be
+/// argued about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct Consumed {
+    /// Model round trips. One `Llm::complete` that returned a response is one
+    /// call, whether or not it said what it cost.
+    pub calls: i64,
+    /// Of [`Self::calls`], the ones that came back with no usage figure at all.
+    /// They contribute nothing to the token counts below, so those counts are a
+    /// **floor** whenever this is non-zero.
+    pub calls_unmetered: i64,
+    /// Fresh input tokens, billed at full rate. Cache writes are folded in here
+    /// by the provider adapter; no separate count reaches this layer.
+    pub input_tokens: i64,
+    /// Generated tokens.
+    pub output_tokens: i64,
+    /// Input served from the prefix cache, billed at a fraction of fresh input.
+    pub cache_read_tokens: i64,
+}
+
+impl Consumed {
+    /// What `calls` model round trips reported between them.
+    ///
+    /// **A call that happened and reported no tokens at all is unmetered, not
+    /// free.** That is the one judgement in this module and it lives here so
+    /// that both write sites make it identically. A 200 from a model that read a
+    /// prompt necessarily consumed input tokens; three zeroes therefore mean
+    /// nobody counted, not that nothing was counted — see the module docs for
+    /// the batch-granularity ceiling.
+    ///
+    /// Saturating **upward** on the `u64` → `i64` narrowing, which is the only
+    /// direction worth choosing: clamping down would under-state a bill, and
+    /// under-stating is the failure this table exists to end. Nothing real will
+    /// reach `i64::MAX` tokens in a day; if it does, the row is wrong in the
+    /// direction that makes somebody look.
+    pub fn reported(
+        calls: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Self {
+        let reported_nothing = input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0;
+        Self {
+            calls: i64::from(calls),
+            calls_unmetered: if reported_nothing {
+                i64::from(calls)
+            } else {
+                0
+            },
+            input_tokens: clamp(input_tokens),
+            output_tokens: clamp(output_tokens),
+            cache_read_tokens: clamp(cache_read_tokens),
+        }
+    }
+
+    /// Fold another row in. Saturating, because a wrapped total would be a
+    /// silently wrong public claim.
+    pub fn add(&mut self, other: &Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.calls_unmetered = self.calls_unmetered.saturating_add(other.calls_unmetered);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+    }
+
+    /// Every token anybody told us about, cached or not.
+    ///
+    /// A **floor** when [`Self::is_complete`] is false: the unmetered calls
+    /// contributed nothing to it, and there is no defensible way to fill them
+    /// in.
+    pub const fn tokens_measured(&self) -> i64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// True when every call in this row reported what it cost.
+    ///
+    /// The question to ask before quoting [`Self::tokens_measured`] anywhere.
+    pub const fn is_complete(&self) -> bool {
+        self.calls_unmetered == 0
+    }
+}
+
+/// `u64` → `i64`, saturating up. See [`Consumed::reported`].
+fn clamp(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Add one run's consumption to this employee's day.
+///
+/// Call it in the transaction that commits the turn's own work — see the module
+/// docs for why that placement is the whole idempotency story, and what it
+/// costs.
+///
+/// A run with no calls writes nothing: an empty row would claim an employee was
+/// billed for a day it never woke on, and "no row" already means "nothing
+/// recorded" everywhere else in this schema.
+///
+/// The tenant comes from `tx`, which is the only thing row-level security
+/// honours anyway; there is no tenant parameter to pass wrongly.
+pub async fn record(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    day: NaiveDate,
+    consumed: Consumed,
+) -> Result<(), StoreError> {
+    if consumed.calls == 0 {
+        return Ok(());
+    }
+
+    // Additive on conflict, deliberately not idempotent. Two calls that cost the
+    // same on the same day are two calls; see the module docs.
+    sqlx::query(
+        "INSERT INTO model_usage_daily \
+           (tenant_id, employee_id, day, calls, calls_unmetered, \
+            input_tokens, output_tokens, cache_read_tokens) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (tenant_id, employee_id, day) DO UPDATE SET \
+           calls             = model_usage_daily.calls + excluded.calls, \
+           calls_unmetered   = model_usage_daily.calls_unmetered + excluded.calls_unmetered, \
+           input_tokens      = model_usage_daily.input_tokens + excluded.input_tokens, \
+           output_tokens     = model_usage_daily.output_tokens + excluded.output_tokens, \
+           cache_read_tokens = model_usage_daily.cache_read_tokens \
+                             + excluded.cache_read_tokens, \
+           updated_at        = now()",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(employee_id.as_uuid())
+    .bind(day)
+    .bind(consumed.calls)
+    .bind(consumed.calls_unmetered)
+    .bind(consumed.input_tokens)
+    .bind(consumed.output_tokens)
+    .bind(consumed.cache_read_tokens)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(())
+}
+
+/// What this employee consumed on `day`. The operator's narrowest question.
+///
+/// All zeroes for a day with no row, which is the same answer as a row of zeroes
+/// and means the same thing: nothing was recorded. It does **not** mean no calls
+/// were made — see the module docs on turns that did not finish.
+pub async fn on_day(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    day: NaiveDate,
+) -> Result<Consumed, StoreError> {
+    // No `WHERE tenant_id`: RLS adds it, and a hand-written filter would be a
+    // second place to forget it.
+    let row: Option<Consumed> = sqlx::query_as(
+        "SELECT calls, calls_unmetered, input_tokens, output_tokens, cache_read_tokens \
+           FROM model_usage_daily WHERE employee_id = $1 AND day = $2",
+    )
+    .bind(employee_id.as_uuid())
+    .bind(day)
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    Ok(row.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use agentos_domain::ids::TenantId;
+    use chrono::Utc;
+
+    use super::*;
+    use crate::db::Db;
+
+    const DAY: NaiveDate = match NaiveDate::from_ymd_opt(2026, 8, 23) {
+        Some(d) => d,
+        None => panic!("valid date"),
+    };
+    const NEXT_DAY: NaiveDate = match NaiveDate::from_ymd_opt(2026, 8, 24) {
+        Some(d) => d,
+        None => panic!("valid date"),
+    };
+
+    async fn db() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the token ledger needs a real Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
+    }
+
+    async fn seed_tenant(db: &Db, label: &str) -> TenantId {
+        let tenant = TenantId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
+            .bind(tenant.as_uuid())
+            .bind(format!("{label}-{}", tenant.as_uuid().simple()))
+            .bind(label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+        tenant
+    }
+
+    async fn seed_employee(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+        let id = EmployeeId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(id.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit employee");
+        id
+    }
+
+    async fn drop_tenant(db: &Db, tenant: TenantId) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit teardown");
+    }
+
+    /// Record in its own committed transaction, the way a caller's turn would.
+    async fn record_committed(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        day: NaiveDate,
+        consumed: Consumed,
+    ) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        record(&mut tx, employee, day, consumed)
+            .await
+            .expect("record");
+        tx.commit().await.expect("commit");
+    }
+
+    async fn read(db: &Db, tenant: TenantId, employee: EmployeeId, day: NaiveDate) -> Consumed {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let consumed = on_day(&mut tx, employee, day).await.expect("read");
+        tx.rollback().await.expect("rollback");
+        consumed
+    }
+
+    // -- the judgement, with no database -----------------------------------
+
+    /// The distinction the whole table exists for, at the one place it is made.
+    #[test]
+    fn a_call_nobody_metered_is_not_a_call_that_cost_nothing() {
+        // A provider that did not report: the call is on the record, its cost is
+        // on the record as unknown, and the tokens stay at zero rather than
+        // being invented.
+        let unknown = Consumed::reported(3, 0, 0, 0);
+        assert_eq!(unknown.calls, 3);
+        assert_eq!(unknown.calls_unmetered, 3);
+        assert_eq!(unknown.tokens_measured(), 0);
+        assert!(
+            !unknown.is_complete(),
+            "3 calls of unknown cost is not zero"
+        );
+
+        // A metered call, even a tiny one, is complete.
+        let metered = Consumed::reported(3, 1, 0, 0);
+        assert_eq!(metered.calls_unmetered, 0);
+        assert!(metered.is_complete());
+
+        // A cache-only read is metered too: it reported something.
+        assert!(Consumed::reported(1, 0, 0, 4096).is_complete());
+
+        // No calls at all is neither — it is an employee that did not wake.
+        let idle = Consumed::default();
+        assert_eq!(idle.calls, 0);
+        assert!(idle.is_complete());
+
+        // And the narrowing saturates upward, so an absurd count is loud rather
+        // than negative.
+        assert_eq!(Consumed::reported(1, u64::MAX, 0, 0).input_tokens, i64::MAX);
+    }
+
+    #[test]
+    fn folding_rows_together_keeps_the_unknown_visible() {
+        let mut total = Consumed::reported(2, 100, 20, 0);
+        total.add(&Consumed::reported(3, 0, 0, 0));
+
+        assert_eq!(total.calls, 5);
+        assert_eq!(total.calls_unmetered, 3);
+        assert_eq!(total.tokens_measured(), 120);
+        assert!(
+            !total.is_complete(),
+            "120 tokens over 5 calls is a floor, and the reader has to be told"
+        );
+    }
+
+    // -- attribution -------------------------------------------------------
+
+    #[tokio::test]
+    async fn usage_is_attributed_to_the_employee_that_spent_it() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db, "attr").await;
+        let lena = seed_employee(&db, tenant, "lena").await;
+        let mo = seed_employee(&db, tenant, "mo").await;
+
+        record_committed(&db, tenant, lena, DAY, Consumed::reported(1, 50, 10, 0)).await;
+        record_committed(&db, tenant, lena, DAY, Consumed::reported(2, 30, 4, 900)).await;
+        record_committed(&db, tenant, mo, DAY, Consumed::reported(1, 7, 1, 0)).await;
+
+        // Two runs on one day accumulate; they do not overwrite.
+        let lena_day = read(&db, tenant, lena, DAY).await;
+        assert_eq!(lena_day.calls, 3);
+        assert_eq!(lena_day.input_tokens, 80);
+        assert_eq!(lena_day.output_tokens, 14);
+        assert_eq!(lena_day.cache_read_tokens, 900);
+        assert!(lena_day.is_complete());
+
+        // Mo's bill is Mo's.
+        assert_eq!(read(&db, tenant, mo, DAY).await.input_tokens, 7);
+        // And the day is a real dimension, not decoration.
+        assert_eq!(read(&db, tenant, lena, NEXT_DAY).await, Consumed::default());
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// A tenant's bill is its own. RLS, not a `WHERE` clause somebody adds.
+    #[tokio::test]
+    async fn one_tenants_usage_is_invisible_to_another() {
+        let Some(db) = db().await else { return };
+        let a = seed_tenant(&db, "usage-a").await;
+        let b = seed_tenant(&db, "usage-b").await;
+        let theirs = seed_employee(&db, a, "lena").await;
+
+        record_committed(&db, a, theirs, DAY, Consumed::reported(4, 1_000, 200, 0)).await;
+        assert_eq!(read(&db, a, theirs, DAY).await.calls, 4);
+
+        // B, holding A's real employee id, learns nothing at all — not a
+        // filtered zero, an invisible row.
+        assert_eq!(read(&db, b, theirs, DAY).await, Consumed::default());
+
+        drop_tenant(&db, a).await;
+        drop_tenant(&db, b).await;
+    }
+
+    /// The table is not a thing an operator edits before a board meeting.
+    #[tokio::test]
+    async fn rls_is_on_forced_and_the_ledger_cannot_be_rewritten_by_hand() {
+        let Some(db) = db().await else { return };
+        let a = seed_tenant(&db, "rls-a").await;
+        let b = seed_tenant(&db, "rls-b").await;
+        let theirs = seed_employee(&db, b, "theirs").await;
+        record_committed(&db, b, theirs, DAY, Consumed::reported(1, 10, 2, 0)).await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let (enabled, forced, policies): (bool, bool, i64) = sqlx::query_as(
+            "SELECT c.relrowsecurity, c.relforcerowsecurity, \
+                    (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) \
+               FROM pg_class c \
+              WHERE c.oid = 'model_usage_daily'::regclass",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pg_class");
+        tx.rollback().await.expect("rollback");
+        assert!(enabled, "RLS must be enabled on model_usage_daily");
+        assert!(
+            forced,
+            "RLS must be forced, or the table owner walks past it"
+        );
+        assert_eq!(policies, 1, "exactly one policy, like every other table");
+
+        // A cannot file a row wearing B's id: usage on somebody else's ledger is
+        // a bill on somebody else's ledger.
+        let mut tx = db.tenant_tx(a).await.expect("tenant tx");
+        let wearing_b = sqlx::query(
+            "INSERT INTO model_usage_daily (tenant_id, employee_id, day, calls) \
+             VALUES ($1, $2, $3, 1)",
+        )
+        .bind(b.as_uuid())
+        .bind(theirs.as_uuid())
+        .bind(DAY)
+        .execute(&mut **tx)
+        .await;
+        assert!(
+            wearing_b.is_err(),
+            "one tenant must not write a row wearing another's id"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // And nobody deletes what was spent. The grant is not there, so this
+        // fails on privilege rather than on the row being invisible.
+        let mut tx = db.tenant_tx(b).await.expect("tenant tx");
+        let deleted = sqlx::query("DELETE FROM model_usage_daily WHERE employee_id = $1")
+            .bind(theirs.as_uuid())
+            .execute(&mut **tx)
+            .await;
+        assert!(
+            deleted.is_err(),
+            "a consumption ledger you can delete rows from is not one"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // The row is still there, unchanged.
+        assert_eq!(read(&db, b, theirs, DAY).await.calls, 1);
+
+        // The subset invariant is a constraint, not a convention: a row claiming
+        // more unknown calls than calls is refused outright.
+        let mut tx = db.tenant_tx(b).await.expect("tenant tx");
+        let impossible = sqlx::query(
+            "INSERT INTO model_usage_daily (tenant_id, employee_id, day, calls, calls_unmetered) \
+             VALUES ($1, $2, $3, 1, 2)",
+        )
+        .bind(b.as_uuid())
+        .bind(theirs.as_uuid())
+        .bind(NEXT_DAY)
+        .execute(&mut **tx)
+        .await;
+        assert!(impossible.is_err(), "unmetered calls are a subset of calls");
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, a).await;
+        drop_tenant(&db, b).await;
+    }
+
+    /// **The B decision, tested.** The write is additive and therefore not
+    /// idempotent on its own — so what stops one call being counted twice is
+    /// that the row commits with the turn and not before it.
+    ///
+    /// A rolled-back turn leaves nothing behind: no row, no partial row, and
+    /// nothing for a retry to add to a second time. A retry re-runs the model,
+    /// and the call it then makes is a real second call that really is paid for.
+    #[tokio::test]
+    async fn the_ledger_commits_with_the_turn_or_not_at_all() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db, "atomic").await;
+        let employee = seed_employee(&db, tenant, "lena").await;
+
+        // A turn that made its model call and then failed before commit.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        record(&mut tx, employee, DAY, Consumed::reported(1, 50, 10, 0))
+            .await
+            .expect("record");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            read(&db, tenant, employee, DAY).await,
+            Consumed::default(),
+            "an uncommitted turn must leave no bill behind"
+        );
+
+        // The retry, which really did call the model again.
+        record_committed(&db, tenant, employee, DAY, Consumed::reported(1, 50, 10, 0)).await;
+        let after = read(&db, tenant, employee, DAY).await;
+        assert_eq!(after.calls, 1, "one committed turn, one call");
+        assert_eq!(after.input_tokens, 50);
+
+        // And a genuinely separate second call adds, because it was genuinely
+        // paid for. A ledger that deduplicated this would be under-reporting a
+        // real bill, which is the failure this table exists to end.
+        record_committed(&db, tenant, employee, DAY, Consumed::reported(1, 50, 10, 0)).await;
+        assert_eq!(read(&db, tenant, employee, DAY).await.calls, 2);
+
+        drop_tenant(&db, tenant).await;
+    }
+}

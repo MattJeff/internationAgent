@@ -356,6 +356,28 @@ impl Budgets {
 // Outcome
 // ---------------------------------------------------------------------------
 
+/// A turn that did not finish, and what it had already spent when it stopped.
+///
+/// The `usage` is the point. Before this existed, `run` dropped `Spent` on
+/// every error path, so a turn killed by its deadline or by a blown budget
+/// reported nothing — and nothing reads as *zero tokens*, which is the same lie
+/// the ledger's `calls_unmetered` column exists to prevent one level down. A
+/// crash-looping employee is exactly the case where the calls are real and the
+/// record is empty, and it is also exactly the case the turn budget was built
+/// for.
+///
+/// So every exit from [`Turn::run`] carries the bill, whether or not it carries
+/// an answer.
+#[derive(Debug)]
+pub struct Failed {
+    /// Why it stopped.
+    pub error: TurnError,
+    /// What it had spent by then. Real tokens, already paid for.
+    pub usage: Usage,
+    /// Model round trips that happened before it stopped.
+    pub turns: u32,
+}
+
 /// A run that ended because the model stopped asking for tools.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
@@ -577,13 +599,34 @@ impl Turn {
         &self,
         context: Context,
         cancel: &CancellationToken,
+    ) -> Result<Finished, Failed> {
+        // `spent` lives out here so the bill survives the error. Every `?` in
+        // `attempt` would otherwise drop it, and a turn killed by its deadline
+        // would report nothing — which reads as *zero tokens*, the same lie the
+        // ledger's `calls_unmetered` column exists to prevent one level down.
+        let mut spent = Spent::default();
+        match self.attempt(context, cancel, &mut spent).await {
+            Ok(finished) => Ok(finished),
+            Err(error) => Err(Failed {
+                error,
+                usage: spent.usage,
+                turns: spent.turns,
+            }),
+        }
+    }
+
+    /// The loop itself. Fallible in the ordinary way; `run` owns the meter.
+    async fn attempt(
+        &self,
+        context: Context,
+        cancel: &CancellationToken,
+        spent: &mut Spent,
     ) -> Result<Finished, TurnError> {
         let mut messages = context.messages;
         let mut trust = context.trust;
-        let mut spent = Spent::default();
 
         loop {
-            self.budgets.check(&spent, cancel)?;
+            self.budgets.check(spent, cancel)?;
             spent.turns += 1;
 
             // The whole request is recomputed every turn, because the taint can
@@ -624,7 +667,7 @@ impl Turn {
                 let Content::ToolUse { id, name, input } = block else {
                     continue;
                 };
-                self.budgets.check(&spent, cancel)?;
+                self.budgets.check(spent, cancel)?;
                 spent.tool_calls += 1;
 
                 let reply = match self.propose(name, input) {
@@ -1098,7 +1141,10 @@ mod tests {
             .await
             .expect_err("a looping model must be stopped");
 
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::Turns)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::Turns)
+        ));
         assert_eq!(llm.calls(), 3, "exactly the budget, not one turn more");
     }
 
@@ -1128,7 +1174,10 @@ mod tests {
             .run(Context::new(), &CancellationToken::new())
             .await
             .expect_err("turns");
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::Turns)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::Turns)
+        ));
 
         // 2. Tool calls. Two per turn, so the second one trips it inside the
         //    first turn — the checkpoint is before every call, not per turn.
@@ -1158,7 +1207,10 @@ mod tests {
             .run(Context::new(), &CancellationToken::new())
             .await
             .expect_err("tool calls");
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::ToolCalls)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::ToolCalls)
+        ));
         assert_eq!(h.email.sent_count(), 1, "the second call never happened");
 
         // 3. Tokens. Each scripted turn costs 120.
@@ -1172,7 +1224,10 @@ mod tests {
             .run(Context::new(), &CancellationToken::new())
             .await
             .expect_err("tokens");
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::Tokens)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::Tokens)
+        ));
 
         // 4. The deadline.
         let h = harness(&db, forever(), "{}").await;
@@ -1184,7 +1239,10 @@ mod tests {
             .run(Context::new(), &cancel)
             .await
             .expect_err("deadline");
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::Deadline)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::Deadline)
+        ));
     }
 
     /// The whole point of the module, end to end: injected text asks for a
@@ -1341,7 +1399,10 @@ mod tests {
             .await
             .expect_err("a cancelled run does not finish");
 
-        assert!(matches!(err, TurnError::BudgetExceeded(Budget::Deadline)));
+        assert!(matches!(
+            err.error,
+            TurnError::BudgetExceeded(Budget::Deadline)
+        ));
         assert!(
             h.payments.calls().is_empty(),
             "the effect ran after the cancellation: {:?}",

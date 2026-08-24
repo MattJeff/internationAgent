@@ -29,6 +29,12 @@
 //! spend is the ledger's job, behind a key. The aggregate is what an operator
 //! pages on anyway: "the token spend rate doubled", not "which tenant".
 //!
+//! The corollary is a deployment requirement, not a code one: **the listener
+//! must not be publicly routable.** The deny-reason mix and the approval-queue
+//! depth are operational intelligence, and `/readyz` beside it already
+//! publishes the outbox lag. `app()` in `main.rs` carries the argument for why
+//! authentication is the wrong tool here and the ingress is the right one.
+//!
 //! # Where the numbers come from
 //!
 //! The three counters are process-local and reset when the pod restarts, which
@@ -36,10 +42,18 @@
 //! from Postgres at scrape time — the outbox lag through
 //! [`crate::loops::outbox::lag_secs`], the poller's own definition, so this
 //! endpoint and `/readyz` can never disagree about whether the queue is behind.
-
-// ponytail: `app()` does not merge `router` yet — that wiring is one line in
-// main.rs and belongs to whoever owns that file. Delete this attribute then.
-#![allow(dead_code)]
+//!
+//! Each counter has exactly one production call site, and each is the place the
+//! event funnels through rather than a place it happens to pass:
+//!
+//! * [`record_denial`] — `impl From<Denied> for ApiError` in
+//!   [`crate::error`], and `routes::a2a::denied` for the JSON-RPC surface.
+//! * [`record_provisioning`] — `loops::provisioning`'s `drive`, which is where
+//!   the engine's reports come back.
+//! * [`record_llm_usage`] — still test-only, and deliberately left alone;
+//!   token persistence is landing on that path separately. Until it does,
+//!   `agentos_llm_tokens_total` reads zero, which is a lie with a known
+//!   expiry date rather than an unknown one.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -124,6 +138,13 @@ pub fn record_provisioning(step: Step, report: &StepReport) {
 /// `tenant_id` is taken and deliberately not exported: it goes to a log line,
 /// which is behind the same wall as the rest of the logs, while the metric
 /// stays aggregate. See the module docs.
+///
+/// ponytail: the last `allow(dead_code)` in this module, and the reason it is
+/// on this function rather than on the module. Its call site is being wired by
+/// the change that persists token counts; a module-wide allow would have gone
+/// on hiding the other two the same way it hid all three. Delete it in the
+/// commit that adds the call.
+#[allow(dead_code)]
 pub fn record_llm_usage(tenant_id: TenantId, usage: Usage) {
     tracing::debug!(tenant_id = %tenant_id, tokens = usage.total(), "llm usage");
     counters().llm.add(usage);
@@ -379,6 +400,21 @@ mod tests {
         assert_eq!(sample(&render(None), series), Some(before + 1));
     }
 
+    /// The wiring, not the counter: rendering a refusal as an HTTP problem
+    /// document is what every REST route does with a `Denied`, and it is the
+    /// one place that has to count. A counter nobody increments reads as "no
+    /// denials", which is the worst possible way to be wrong.
+    #[test]
+    fn turning_a_refusal_into_a_response_is_what_counts_it() {
+        let series = "agentos_policy_denials_total{code=\"domain_denied\"}";
+        let before = sample(&render(None), series).unwrap_or(0);
+
+        // Exactly what a handler's `?` does.
+        let _: crate::error::ApiError = Denied::Policy(DenyReason::DomainDenied).into();
+
+        assert_eq!(sample(&render(None), series), Some(before + 1));
+    }
+
     /// The two `Denied` variants that carry an id must still land on a code.
     #[test]
     fn a_denial_that_carries_an_id_still_labels_by_code() {
@@ -514,5 +550,19 @@ mod tests {
         assert!(sample(&out, "agentos_approvals_pending ").is_some());
         assert!(sample(&out, "agentos_outbox_lag_seconds ").is_some());
         assert!(sample(&out, "agentos_outbox_dead_letters ").is_some());
+
+        // And the same cardinality bound holds on what actually goes over the
+        // wire, not only on `render`. This is the body a stranger who can
+        // reach the port would read, so it is the one that has to be free of
+        // ids — `no_label_value_is_ever_an_id` above asserts the property, this
+        // asserts it survived the handler.
+        for value in label_values(&out) {
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "the scrape exposed {value:?}, which is not a low-cardinality code"
+            );
+        }
     }
 }

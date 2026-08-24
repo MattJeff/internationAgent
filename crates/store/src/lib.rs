@@ -10,6 +10,7 @@ pub mod employee; // U7
 pub mod idempotency; // U10
 pub mod initiative;
 pub mod knowledge; // U14
+pub mod model_usage; // le grand livre des jetons
 pub mod org; // wave 13: teams and sections
 pub mod outbox; // U9
 pub mod phone_pool;

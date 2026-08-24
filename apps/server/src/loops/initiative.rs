@@ -100,6 +100,7 @@ use agentos_app::{rolepack, rolepack_sales};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
+use agentos_store::model_usage::{self, Consumed};
 use agentos_store::policy as policy_store;
 use agentos_store::turns;
 use chrono::{DateTime, Utc};
@@ -509,6 +510,11 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     } = assignment;
     let role = charter.role();
 
+    // Cloned before `Effects` takes it: the token ledger below needs a
+    // connection of its own, because unlike `Agent::on_turn` there is no
+    // transaction spanning this turn to write into.
+    let db = agent.db.clone();
+
     let principal = ActingAs::employee(assignment.due.tenant_id, assignment.due.employee_id);
     let turn = Turn::new(
         agent.llm,
@@ -549,7 +555,37 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         // retrying inside this tick would just be the next tick, sooner and at
         // the same cost. `code()` and not the error: a closed vocabulary, going
         // into a column an operator reads.
-        Err(err) => return Err(err.code().to_owned()),
+        Err(failed) => {
+            // The bill first: a turn that blew its deadline still paid for the
+            // calls it made, and it is the crash-looping employee — the one the
+            // turn budget exists for — whose calls are most real and least
+            // recorded.
+            if failed.turns > 0 {
+                let mut tx = db
+                    .tenant_tx(assignment.due.tenant_id)
+                    .await
+                    .map_err(|err| {
+                        format!("no tenant transaction for the failed turn's tokens: {err}")
+                    })?;
+                model_usage::record(
+                    &mut tx,
+                    assignment.due.employee_id,
+                    Utc::now().date_naive(),
+                    Consumed::reported(
+                        failed.turns,
+                        failed.usage.input_tokens,
+                        failed.usage.output_tokens,
+                        failed.usage.cache_read_tokens,
+                    ),
+                )
+                .await
+                .map_err(|err| format!("could not record what the failed turn spent: {err}"))?;
+                tx.commit()
+                    .await
+                    .map_err(|err| format!("could not commit the failed turn's tokens: {err}"))?;
+            }
+            return Err(failed.error.code().to_owned());
+        }
     };
 
     tracing::info!(
@@ -563,6 +599,53 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         reply_len = finished.reply.trim().len(),
         "the employee took a turn of its own"
     );
+
+    // The token ledger. `Agent::on_turn` writes this inside the transaction that
+    // commits the turn's reply; a self-started turn has no such transaction —
+    // everything it did went through `Effects`, which commits per effect — so
+    // this is one short transaction of its own, immediately after the run.
+    //
+    // Its failure is returned rather than swallowed, which is the same trade
+    // `on_turn` makes and it is worth naming what it costs here: an employee
+    // whose ledger write failed is recorded as `Outcome::Failed` and shows
+    // `error` on its status page, even though the turn itself worked. That is
+    // deliberate. `record` next door swallows a lost *outcome* because a stale
+    // status line is cosmetic; a lost usage row is not cosmetic, it is a bill
+    // that silently reads lower, and low is the direction that flatters the
+    // number. Loud and slightly wrong beats quiet and convenient.
+    //
+    // `Utc::now()` for the day rather than the tick's clock: `Assignment` does
+    // not carry one, and the only case where they differ is a turn that started
+    // just before UTC midnight — which books its tokens on the day it finished.
+    // ponytail: thread `now` through `Assignment` if that ever matters.
+    let mut tx = db
+        .tenant_tx(assignment.due.tenant_id)
+        .await
+        .map_err(|err| format!("no tenant transaction for the token ledger: {err}"))?;
+    let recorded = model_usage::record(
+        &mut tx,
+        assignment.due.employee_id,
+        Utc::now().date_naive(),
+        Consumed::reported(
+            finished.turns,
+            finished.usage.input_tokens,
+            finished.usage.output_tokens,
+            finished.usage.cache_read_tokens,
+        ),
+    )
+    .await;
+    match recorded {
+        Ok(()) => tx
+            .commit()
+            .await
+            .map_err(|err| format!("the turn's token usage could not be committed: {err}"))?,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(format!(
+                "the turn's token usage could not be recorded: {err}"
+            ));
+        }
+    }
 
     // ponytail: the closing text is logged and stored nowhere. `on_turn` records
     // its reply because there is a conversation it belongs on and a person who is

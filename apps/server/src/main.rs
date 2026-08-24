@@ -49,7 +49,7 @@ use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::prompt::SystemPrompt;
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
-use agentos_app::turn::{Context, Turn, TurnError};
+use agentos_app::turn::{Context, Failed, Turn, TurnError};
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::{Lifecycle, Step};
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
@@ -57,6 +57,7 @@ use agentos_domain::untrusted::Untrusted;
 use agentos_store::db::{Db, TenantTx};
 use agentos_store::employee as employee_store;
 use agentos_store::idempotency::{self, Begin};
+use agentos_store::model_usage::{self, Consumed};
 use agentos_store::outbox::OutboxEvent;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
@@ -369,6 +370,11 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             // `allow(dead_code)` each carried made the compiler agree to say
             // nothing about it. Mounted here, once, on purpose.
             .merge(routes::autonomy::router(db.clone()))
+            // Beside `autonomy`, deliberately: "how much of the work was the
+            // agent's" and "what did it burn doing it" are the same question
+            // asked twice, they share a window parser, and an operator reading
+            // one without the other is reading half of it.
+            .merge(routes::usage::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
@@ -849,7 +855,7 @@ impl Agent {
             let turn = Turn::new(
                 self.llm,
                 self.gate,
-                Effects::new(self.db, ports, principal.clone()),
+                Effects::new(self.db.clone(), ports, principal.clone()),
                 principal,
                 prompt,
                 self.model,
@@ -889,6 +895,47 @@ impl Agent {
             });
             let outcome = turn.run(context, &cancel).await;
             deadline.abort();
+            let billing_db = self.db.clone();
+
+            // A turn that failed still spent tokens, and they go down in a
+            // transaction of their own rather than in `tx`.
+            //
+            // `tx` is the wrong place for exactly the case that matters: the
+            // retryable arms below return `Err`, which rolls it back, so the
+            // row would vanish — and then the retry runs the model *again* and
+            // spends more. Both calls really happened, so both are recorded.
+            // That is the opposite of the success path's argument, and for the
+            // opposite reason: there, one commit means one call and the
+            // transaction is what makes double-counting impossible; here there
+            // is no commit to ride on, and the failure to avoid is the silent
+            // loss that reads as zero.
+            //
+            // Nothing here is conditional on the *kind* of failure. A deadline,
+            // a blown budget and an unreachable model all paid for the calls
+            // they made.
+            if let Err(failed) = &outcome
+                && failed.turns > 0
+            {
+                let mut bill = billing_db.tenant_tx(event.tenant_id).await.map_err(|err| {
+                    format!("no tenant transaction for the failed turn's tokens: {err}")
+                })?;
+                model_usage::record(
+                    &mut bill,
+                    employee_id,
+                    Utc::now().date_naive(),
+                    Consumed::reported(
+                        failed.turns,
+                        failed.usage.input_tokens,
+                        failed.usage.output_tokens,
+                        failed.usage.cache_read_tokens,
+                    ),
+                )
+                .await
+                .map_err(|err| format!("could not record what the failed turn spent: {err}"))?;
+                bill.commit()
+                    .await
+                    .map_err(|err| format!("could not commit the failed turn's tokens: {err}"))?;
+            }
 
             let finished = match outcome {
                 Ok(finished) => finished,
@@ -899,17 +946,23 @@ impl Agent {
                 // then hit a 429 sends it again on the retry. That is the
                 // outbox's documented ceiling, and `provider_intents` is what
                 // narrows it.
-                Err(TurnError::Unavailable(err)) => {
+                Err(Failed {
+                    error: TurnError::Unavailable(err),
+                    ..
+                }) => {
                     return Err(format!("the store was unreachable mid-turn: {err}"));
                 }
-                Err(TurnError::Llm(err)) if err.is_retryable() => {
+                Err(Failed {
+                    error: TurnError::Llm(err),
+                    ..
+                }) if err.is_retryable() => {
                     return Err(format!("the model was unreachable: {}", err.code()));
                 }
                 // Acknowledged. A budget that ran out, a refusal, a bad API
                 // key: eight more attempts cost eight more model calls and end
                 // the same way, and dead-lettering every inbound message is how
                 // one broken employee takes `/readyz` down for the deployment.
-                Err(err) => {
+                Err(Failed { error: err, .. }) => {
                     tracing::error!(
                         %conversation_id, %employee_id, code = err.code(), error = %err,
                         "the agent turn did not finish; the message is answered by nobody"
@@ -929,6 +982,41 @@ impl Agent {
                 cache_read_tokens = finished.usage.cache_read_tokens,
                 "agent turn finished"
             );
+
+            // The token ledger, in **this** transaction — the same one that
+            // marks the event published and records the reply below. That is
+            // the whole idempotency argument and it is deliberate: the row
+            // exists exactly when the turn committed, so one model call can
+            // never be counted twice, and a redelivered event that re-runs the
+            // model writes a second row for a second call that was really paid
+            // for.
+            //
+            // The `?` is the price of it, and the side of the trade taken on
+            // purpose: a usage write that fails aborts a turn that would
+            // otherwise have committed, and the outbox retries it at the cost
+            // of another model call. The alternative — swallow the error and
+            // carry on — loses the row silently, and a silently lost row reads
+            // as LOWER consumption, which is the direction that flatters a
+            // number this project intends to quote in public.
+            //
+            // Before the empty-reply return below, because a turn that spent
+            // itself entirely on tools still spent tokens.
+            // `agentos_store::model_usage` has the full argument, including why
+            // a run that reported no usage at all is recorded as unmetered
+            // rather than as free.
+            model_usage::record(
+                tx,
+                employee_id,
+                Utc::now().date_naive(),
+                Consumed::reported(
+                    finished.turns,
+                    finished.usage.input_tokens,
+                    finished.usage.output_tokens,
+                    finished.usage.cache_read_tokens,
+                ),
+            )
+            .await
+            .map_err(|err| format!("the turn's token usage could not be recorded: {err}"))?;
 
             let from = employee.address().to_string();
             let reply = finished.reply.trim();
@@ -1669,6 +1757,9 @@ mod tests {
     struct Landed {
         db: Db,
         tenant: TenantId,
+        /// The employee the message was addressed to. Carried so the token
+        /// ledger can be checked for attribution and not merely for existence.
+        employee: EmployeeId,
         conversation: ConvId,
         admin_url: String,
         database: String,
@@ -1800,6 +1891,7 @@ mod tests {
         Some(Landed {
             db,
             tenant,
+            employee: employee_id,
             conversation,
             admin_url,
             database,
@@ -1879,6 +1971,17 @@ mod tests {
             row
         }
 
+        /// The token ledger for this employee, today, read the way an operator
+        /// would — through the store's own verb, under RLS.
+        async fn usage(&self, employee: EmployeeId) -> Consumed {
+            let mut tx = self.db.tenant_tx(self.tenant).await.expect("tx");
+            let consumed = model_usage::on_day(&mut tx, employee, Utc::now().date_naive())
+                .await
+                .expect("the ledger");
+            tx.commit().await.expect("commit read");
+            consumed
+        }
+
         async fn teardown(self) {
             drop_database(self.db, self.admin_url, self.database).await;
         }
@@ -1922,6 +2025,64 @@ mod tests {
         assert!(prompt.contains(agentos_app::prompt::SENTINEL), "{prompt}");
         assert!(prompt.contains("PO-4471"), "{prompt}");
         assert!(!request.system.contains("PO-4471"), "in the system prompt!");
+
+        landed.teardown().await;
+    }
+
+    /// The bill, attributed. Before this the tokens went to a `tracing` line and
+    /// a process-local counter that drops the tenant, so the largest operating
+    /// cost of this system was not in any table.
+    ///
+    /// Run through the real poller and the real handler, so what is asserted is
+    /// the production write and not a call to the store made by the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_turn_writes_its_tokens_where_the_turn_commits() {
+        let Some(landed) = land_a_message("How many are left in stock?").await else {
+            return;
+        };
+        // Nothing before the turn: no row is "nothing recorded", which is the
+        // right answer for an employee that has not run.
+        assert_eq!(landed.usage(landed.employee).await, Consumed::default());
+
+        // Two model calls: one asking for a tool, one answering. `done()` is
+        // Usage::new(50, 10, 0), and the tool turn is metered separately, so the
+        // ledger has to sum them rather than keep the last one.
+        let llm = Arc::new(ScriptedLlm::responses(vec![
+            LlmResponse::tool_use(
+                "toolu_1",
+                "mcp_call",
+                json!({ "server": "inventory", "tool": "count", "arguments": {} }),
+                Usage::new(200, 15, 4_096),
+            ),
+            done("Fourteen."),
+        ]));
+        landed.answer(llm.clone()).await;
+        assert_eq!(llm.calls(), 2);
+
+        let consumed = landed.usage(landed.employee).await;
+        assert_eq!(consumed.calls, 2, "one row per model round trip");
+        assert_eq!(consumed.input_tokens, 250);
+        assert_eq!(consumed.output_tokens, 25);
+        assert_eq!(consumed.cache_read_tokens, 4_096);
+        assert_eq!(consumed.tokens_measured(), 4_371);
+        assert!(
+            consumed.is_complete(),
+            "the model reported, so nothing here is a floor"
+        );
+        // Cache reads are kept apart from fresh input rather than folded in:
+        // cached tokens are billed at a fraction, and a ledger that blended them
+        // would over-state every long conversation.
+        assert_ne!(consumed.input_tokens, consumed.tokens_measured());
+
+        // And it committed with the turn, not beside it: the reply the customer
+        // gets and the bill the operator sees came out of one transaction.
+        assert_eq!(landed.count("SELECT count(*) FROM messages").await, 2);
+
+        // Nobody else was charged for it.
+        assert_eq!(
+            landed.usage(EmployeeId::new_v7(Utc::now())).await,
+            Consumed::default()
+        );
 
         landed.teardown().await;
     }

@@ -905,6 +905,10 @@ fn unavailable(err: StoreError) -> RpcError {
 /// could not reach a verdict is an internal error, because only that one might
 /// succeed on retry.
 fn denied(refusal: Denied) -> RpcError {
+    // The peer surface's own funnel, counted the same way `error.rs` counts the
+    // REST one. Not a double count: a refusal becomes either an `RpcError` here
+    // or an `ApiError` there, never both.
+    crate::metrics::record_denial(&refusal);
     match refusal {
         Denied::Unavailable(err) => unavailable(err),
         other => RpcError::new(
