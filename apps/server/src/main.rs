@@ -332,9 +332,13 @@ fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
         config.api_keys.clone(),
     );
 
-    // No credential, by design. See the doc comment.
+    // No credential, by design. See the doc comment. The key directory joins
+    // the agent card here for the same reason: a verifier who has never heard
+    // of us has nothing to authenticate with, and a key nobody can fetch
+    // verifies nothing.
     let public = routes::webhooks::router(db.clone(), webhooks(config))
-        .merge(routes::a2a::card_router(a2a_state(&db, &gate, config)));
+        .merge(routes::a2a::card_router(a2a_state(&db, &gate, config)))
+        .merge(routes::well_known::router(db.clone()));
 
     let health = Router::new()
         .route("/livez", get(livez))

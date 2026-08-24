@@ -13,10 +13,17 @@
 //! credentials set: `config.rs` refuses to boot with mock adapters unless an
 //! operator says out loud that this is a development box.
 //!
-//! ponytail: the two ports with no adapter anywhere — MCP and payments —
-//! *refuse* rather than pretend. A fake that returns a plausible payment id is
-//! a fake that will one day be believed; `Terminal { code: "not_configured" }`
-//! is the honest answer and shows up in the audit trail as one.
+//! ponytail: the ports with nothing behind them here — payments always, MCP
+//! until a tenant is in hand — *refuse* rather than pretend. A fake that
+//! returns a plausible payment id is a fake that will one day be believed;
+//! `Terminal { code: "not_configured" }` is the honest answer and shows up in
+//! the audit trail as one.
+//!
+//! MCP is the "until" case: [`crate::mcp::Fleet`] is the real adapter, and it
+//! is built per turn from the acting tenant's `mcp_servers` rows, because a
+//! binding is per-tenant configuration and [`ports`] is built once at boot for
+//! every tenant. What is handed out here is what a turn that overrode nothing
+//! would get, and refusing is the right answer for that.
 //!
 //! # The model is here too, and two of the three are real
 //!

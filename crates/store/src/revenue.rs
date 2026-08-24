@@ -35,6 +35,14 @@
 //! `observed_claim` is the prospect's own text, and being in our database does
 //! not make it ours — it stays `Untrusted<T>` on the way to a model or a human.
 //!
+//! **Every check is recorded, not only the ones that found something.**
+//! [`record_attempt`] files one row per proof-of-need check whatever it came to
+//! — evidence, agreement, unreadable, not-reproducible, blocked — so how often
+//! the reproducibility bar suppresses a real finding is a SELECT over
+//! `proof_of_need_suppression` and not an opinion. `0013_proof_of_need.sql`
+//! carries the rules; `agentos_app::proof_of_need` carries how to read the
+//! number.
+//!
 //! **Money is [`Money`] on the way in and on the way out**, never a bare
 //! integer: minor units plus a currency, converted at the boundary.
 //!
@@ -585,6 +593,71 @@ pub async fn evidence_for_account(
             },
         )
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Proof-of-need attempts: the misses, filed next to the hits
+// ---------------------------------------------------------------------------
+
+/// One proof-of-need check, whatever it came to.
+///
+/// [`insert_evidence`] records the checks that produced a finding. This records
+/// **all** of them, so "how often does the two-run bar suppress a real finding"
+/// is a query over `proof_of_need_suppression` rather than a guess. Same idea as
+/// [`Observation::QuoteMissed`](crate::sourcing::Observation::QuoteMissed) one
+/// vertical over: a miss nobody wrote down is a miss nobody can argue with.
+///
+/// No field carries a byte the prospect's page wrote. The classification is
+/// ours; the verbatim quote belongs on the evidence row, when there is one.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAttempt<'a> {
+    /// Registrable domain of the prospect, lower case. The key
+    /// `accounts.domain` is unique on, and not a foreign key — see the migration.
+    pub prospect_domain: &'a str,
+    /// The employee that ran the check.
+    pub employee_id: Option<EmployeeId>,
+    /// `evidence`, `agrees`, `unreadable`, `not_reproducible`, `blocked`,
+    /// `truth_stale` or `error`. In `agentos-app` this is `Checked::code()`.
+    pub outcome: &'a str,
+    /// The sub-reason. Required for `not_reproducible` and `error`, refused for
+    /// everything else — the table repeats that in a CHECK, for writers that do
+    /// not come through here.
+    pub detail: Option<&'a str>,
+    /// Passport country used, ISO 3166-1 alpha-2.
+    pub passport_country: &'a str,
+    /// Destination country used, ISO 3166-1 alpha-2.
+    pub destination_country: &'a str,
+    /// Travel date used.
+    pub travel_date: NaiveDate,
+    /// When the check ran.
+    pub checked_at: DateTime<Utc>,
+}
+
+/// File one attempt. Append-only: `app_role` holds no UPDATE and no DELETE.
+pub async fn record_attempt(
+    tx: &mut TenantTx<'_>,
+    id: Uuid,
+    attempt: &NewAttempt<'_>,
+) -> Result<(), RevenueError> {
+    sqlx::query(
+        "INSERT INTO proof_of_need_attempts \
+             (id, tenant_id, prospect_domain, employee_id, outcome, detail, passport_country, \
+              destination_country, travel_date, checked_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(tx.tenant_id().as_uuid())
+    .bind(attempt.prospect_domain)
+    .bind(attempt.employee_id.map(|e| e.as_uuid()))
+    .bind(attempt.outcome)
+    .bind(attempt.detail)
+    .bind(attempt.passport_country)
+    .bind(attempt.destination_country)
+    .bind(attempt.travel_date)
+    .bind(attempt.checked_at)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,14 +1269,17 @@ mod tests {
     use agentos_domain::ids::TenantId;
     use chrono::TimeDelta;
 
-    /// Every table `0011_revenue.sql` adds.
-    const REVENUE_TABLES: [&str; 6] = [
+    /// Every table the seller vertical adds — `0011_revenue.sql` plus
+    /// `0013_proof_of_need.sql`. A table that joins the vertical and not this
+    /// array is a table whose RLS nobody checked.
+    const REVENUE_TABLES: [&str; 7] = [
         "accounts",
         "contacts",
         "evidence",
         "opportunities",
         "opportunity_events",
         "suppressions",
+        "proof_of_need_attempts",
     ];
 
     /// Connect and migrate, or `None` when there is no database.

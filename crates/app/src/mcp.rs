@@ -40,14 +40,43 @@
 //! A tool result is text a third party wrote. It leaves this module as an
 //! [`Untrusted<CallToolResult>`] so it cannot be spliced into a prompt without
 //! a call site that greps.
+//!
+//! # Where a binding comes from, and what the model is told about it
+//!
+//! [`Fleet`] is this module's production entry point: it reads one tenant's
+//! `mcp_servers` / `mcp_tool_declarations` rows (migration 0013), binds each
+//! one, and is the [`McpCaller`] behind
+//! [`Effects::call_tool`](crate::effects::Effects::call_tool).
+//!
+//! [`Fleet::inventory`] is the other half, and it is the half that was missing:
+//! the turn loop offers ONE `call_mcp_tool` schema for every MCP tool on every
+//! server (see [`crate::turn`] for why that stays), so without a list of names
+//! the model can only guess one and the gate denies the guess. The inventory is
+//! that list, and it is deliberately narrow:
+//!
+//! * **Only tools the operator declared.** A tool nobody declared is named by
+//!   the server and by nobody else, and [`crate::prompt`] exists to keep a
+//!   counterparty's text out of the cached prefix. An undeclared tool is still
+//!   bound and still callable by exact name — it is just not something a
+//!   hostile server gets to write into a system prompt.
+//! * **Names only, never descriptions.** [`BoundTool::description`] is the
+//!   server's own prose, which is why it is an [`Untrusted<String>`]. It is for
+//!   a human reading an approval, not for the prefix.
+//! * **Filtered by the turn's trust label**, by
+//!   [`SystemPrompt::render`](crate::prompt::SystemPrompt::render), on the same
+//!   axis and through the same predicate as the tool schemas —
+//!   [`crate::turn::visible`].
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use agentos_domain::action::McpTool;
+use agentos_domain::action::{McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::policy::{ApprovalReason, Decision, DenyReason};
 use agentos_domain::untrusted::Untrusted;
+use agentos_providers::ProviderError;
+use agentos_store::db::{StoreError, TenantTx};
+use async_trait::async_trait;
 use rmcp::RoleClient;
 use rmcp::ServiceError;
 use rmcp::model::{
@@ -56,8 +85,11 @@ use rmcp::model::{
 };
 use rmcp::service::{ClientLifecycleMode, RunningService, serve_client_with_lifecycle_and_ct};
 use rmcp::transport::StreamableHttpClientTransport;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+use crate::effects::McpCaller;
 
 /// What we tell an MCP server we are. Display only; nothing authorises off it.
 const CLIENT_NAME: &str = "agentos";
@@ -99,6 +131,18 @@ impl RiskClass {
         }
     }
 
+    /// The spelling `mcp_tool_declarations.risk` accepts back.
+    ///
+    /// The same strings [`RiskClass::code`] emits, so the metric label and the
+    /// stored value cannot drift into two vocabularies. An unknown spelling is
+    /// `None` — never a default — because every default here is a class
+    /// somebody did not choose.
+    fn parse(raw: &str) -> Option<Self> {
+        [RiskClass::Read, RiskClass::Write, RiskClass::Destructive]
+            .into_iter()
+            .find(|class| class.code() == raw)
+    }
+
     /// The class a server's own annotations claim.
     ///
     /// Only ever used to *raise* a declared class — see [`classify`]. The
@@ -111,6 +155,22 @@ impl RiskClass {
             RiskClass::Write
         } else {
             RiskClass::Destructive
+        }
+    }
+}
+
+/// The blast radius a [`RiskClass`] is worth on the domain's own axis.
+///
+/// One mapping, in one place, because the trust filter in [`crate::turn`] and
+/// the evaluator in `domain::policy` both reason in [`Risk`], and a second
+/// opinion about what "high" means is how a schema the model can see stops
+/// matching the ruling it will get. `Destructive` is the irreversible one, and
+/// it is the only one an untrusted turn is not told about.
+impl From<RiskClass> for Risk {
+    fn from(class: RiskClass) -> Self {
+        match class {
+            RiskClass::Read | RiskClass::Write => Risk::Low,
+            RiskClass::Destructive => Risk::High,
         }
     }
 }
@@ -294,6 +354,13 @@ pub struct BoundTool {
     /// The server's own one-liner, for an approval prompt. Untrusted: a server
     /// that wanted a human to click "approve" would write it here.
     description: Option<Untrusted<String>>,
+    /// Whether an operator wrote this tool's NAME down.
+    ///
+    /// Not the same question as "what class is it": a declaration whose digest
+    /// no longer matches is `declared` and [`RiskClass::Destructive`]. This bit
+    /// answers only "did a human choose this string", which is what
+    /// [`Fleet::inventory`] needs before it puts the string in a system prompt.
+    declared: bool,
 }
 
 impl BoundTool {
@@ -310,6 +377,11 @@ impl BoundTool {
     /// The server's description, still wrapped.
     pub const fn description(&self) -> Option<&Untrusted<String>> {
         self.description.as_ref()
+    }
+
+    /// Whether an operator named this tool in their configuration.
+    pub const fn is_declared(&self) -> bool {
+        self.declared
     }
 }
 
@@ -607,6 +679,7 @@ fn inventory(
         // declaration for this tool. Falling through to `None` reuses the
         // existing fail-closed branch — Destructive, so a human sees it — rather
         // than adding a second way to refuse.
+        let named_by_operator = declared.contains_key(&handle);
         let vetted = declared.get(&handle).and_then(|d| match d.digest {
             Some(pinned) if pinned != digest(tool) => {
                 tracing::warn!(
@@ -627,6 +700,7 @@ fn inventory(
                     .description
                     .as_ref()
                     .map(|d| Untrusted::new(d.to_string())),
+                declared: named_by_operator,
             },
         );
     }
@@ -683,6 +757,277 @@ async fn resolve_and_vet(url: &Url, reach: Reach) -> Result<Vec<IpAddr>, McpErro
 }
 
 // ---------------------------------------------------------------------------
+// The fleet: every server one tenant has bound
+// ---------------------------------------------------------------------------
+
+/// The bindings one tenant's operator configured, and the [`McpCaller`] the
+/// turn loop reaches them through.
+///
+/// A single [`McpServer`] cannot be the port, because [`McpCaller::call`] is
+/// handed an [`McpTool`] that names *which* server — and one binding "cannot
+/// speak for a binding it is not". This is the thing that can: it routes on
+/// [`McpTool::server`] and hands the rest to that binding's own refusals.
+#[derive(Debug, Default)]
+pub struct Fleet {
+    servers: BTreeMap<Slug, McpServer>,
+}
+
+/// What one row of `mcp_servers` joined to its declarations looks like.
+///
+/// TEXT columns parsed on the way out, not `sqlx` enums: a row this build
+/// cannot read is a binding that is *skipped*, and skipping is the fail-closed
+/// answer. A hard error would let one malformed row take a tenant's whole turn
+/// down with it.
+#[derive(sqlx::FromRow)]
+struct ConfigRow {
+    server: String,
+    url: String,
+    reach: String,
+    tool: Option<String>,
+    risk: Option<String>,
+    digest: Option<Vec<u8>>,
+}
+
+/// Every binding this tenant has, with its declarations alongside.
+///
+/// A LEFT JOIN: a server with no declarations at all is still a binding — every
+/// tool on it is undeclared, which is [`RiskClass::Destructive`], which is the
+/// honest state of a server nobody has vetted yet.
+const SELECT_BINDINGS: &str = "\
+    SELECT s.server, s.url, s.reach, d.tool, d.risk, d.digest \
+      FROM mcp_servers s \
+      LEFT JOIN mcp_tool_declarations d \
+             ON d.tenant_id = s.tenant_id AND d.server = s.server \
+     ORDER BY s.server, d.tool";
+
+impl Fleet {
+    /// No bindings. What a tenant that configured none gets, and what a caller
+    /// falls back to when the servers cannot be reached.
+    pub const fn empty() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+        }
+    }
+
+    /// A fleet over already-bound servers. Two bindings under one handle is a
+    /// configuration that cannot exist — the primary key of `mcp_servers` — so
+    /// the last one wins rather than this returning a `Result` nobody can act
+    /// on.
+    pub fn new(servers: impl IntoIterator<Item = McpServer>) -> Self {
+        Self {
+            servers: servers
+                .into_iter()
+                .map(|server| (server.server.clone(), server))
+                .collect(),
+        }
+    }
+
+    /// Read this tenant's configuration and bind every server in it.
+    ///
+    /// The tenant is `tx`'s, because row-level security honours nothing else.
+    ///
+    /// A server that will not bind — DNS gone, endpoint down, an address the
+    /// SSRF check refuses, two tool names that collapse to one handle — is
+    /// logged and left out. That is deliberate: an MCP server being unreachable
+    /// is an *availability* fact, and it must not stop an employee from
+    /// answering its email. Leaving it out is still fail-closed, because a
+    /// server that is not in the fleet has no tools in the inventory and every
+    /// call naming it is refused.
+    ///
+    /// ponytail: the SQL is here rather than in `agentos-store`, for the same
+    /// reason `gate.rs` reads `spend_buckets` directly — there is one caller.
+    /// Move it to a `store::mcp` the moment there is a second.
+    ///
+    /// ponytail: binds on every call, so a caller that does this per turn pays
+    /// a connect and a `tools/list` per turn. The upgrade path is a
+    /// process-wide cache keyed by tenant with a TTL; it is worth writing the
+    /// day the latency shows up in a trace, and not before — a cache here holds
+    /// a *risk classification*, and a stale one of those is the bug this module
+    /// spends 200 lines preventing.
+    pub async fn bind(tx: &mut TenantTx<'_>, ct: &CancellationToken) -> Result<Self, StoreError> {
+        let rows: Vec<ConfigRow> = sqlx::query_as(SELECT_BINDINGS)
+            .fetch_all(&mut ***tx)
+            .await?;
+
+        let mut configured: BTreeMap<Slug, Binding> = BTreeMap::new();
+        for row in rows {
+            let Ok(server) = Slug::parse(&row.server) else {
+                tracing::warn!(server = %row.server, "mcp binding has no policy handle; skipping");
+                continue;
+            };
+            let entry = configured.entry(server).or_insert_with(|| Binding {
+                url: row.url.clone(),
+                // An unrecognised spelling is the tight one. `mcp_servers_reach_known`
+                // makes it unreachable; if that CHECK is ever dropped, this is
+                // still the answer that refuses loopback.
+                reach: if row.reach == "private" {
+                    Reach::Private
+                } else {
+                    Reach::Public
+                },
+                declared: BTreeMap::new(),
+            });
+            if let Some((handle, declaration)) = declaration(&row) {
+                entry.declared.insert(handle, declaration);
+            }
+        }
+
+        let mut servers = BTreeMap::new();
+        for (name, binding) in configured {
+            match McpServer::bind(
+                name.clone(),
+                &binding.url,
+                &binding.declared,
+                binding.reach,
+                ct.clone(),
+            )
+            .await
+            {
+                Ok(server) => {
+                    servers.insert(name, server);
+                }
+                Err(err) => tracing::warn!(
+                    server = %name,
+                    code = err.code(),
+                    "mcp server did not bind; its tools are not available this turn: {err}"
+                ),
+            }
+        }
+        Ok(Self { servers })
+    }
+
+    /// Every tool an operator named, on every server that bound, with its blast
+    /// radius on the domain's axis.
+    ///
+    /// **Not filtered by trust.** The turn's label changes mid-run — one tool
+    /// result and the rest of the turn is untrusted — so filtering here would
+    /// freeze the wrong answer into a value built once per turn.
+    /// [`SystemPrompt::render`](crate::prompt::SystemPrompt::render) does it,
+    /// per turn, through [`crate::turn::visible`].
+    ///
+    /// Undeclared tools are absent: see this module's docs for why an operator
+    /// has to have written the string before it reaches a system prompt.
+    pub fn inventory(&self) -> Vec<(McpTool, Risk)> {
+        self.servers
+            .values()
+            .flat_map(|server| {
+                server
+                    .tools
+                    .iter()
+                    .filter(|(_, bound)| bound.declared)
+                    .map(|(handle, bound)| {
+                        (
+                            McpTool::new(server.server.clone(), handle.clone()),
+                            bound.risk.into(),
+                        )
+                    })
+            })
+            .collect()
+    }
+}
+
+/// One server's configuration, before it is bound.
+struct Binding {
+    url: String,
+    reach: Reach,
+    declared: BTreeMap<Slug, Declaration>,
+}
+
+/// One declaration out of a joined row, or `None` when the row carries none or
+/// carries one this build cannot read.
+///
+/// Every `None` is a tool that stays undeclared, which is
+/// [`RiskClass::Destructive`], which needs a human. There is no branch here
+/// that can widen anything.
+fn declaration(row: &ConfigRow) -> Option<(Slug, Declaration)> {
+    let (tool, risk) = row.tool.as_deref().zip(row.risk.as_deref())?;
+    let handle = Slug::parse(tool)
+        .inspect_err(|_| tracing::warn!(%tool, "mcp declaration has no policy handle; ignoring"))
+        .ok()?;
+    let class = RiskClass::parse(risk).or_else(|| {
+        tracing::warn!(%tool, %risk, "mcp declaration names an unknown risk class; ignoring");
+        None
+    })?;
+    // `mcp_tool_declarations_digest_is_sha256` makes the wrong length
+    // unreachable; if it is ever dropped, a digest that cannot be read is a
+    // declaration that is not applied, not one applied without its pin.
+    let digest = match row.digest.as_deref() {
+        None => None,
+        Some(bytes) => Some(
+            <[u8; 32]>::try_from(bytes)
+                .inspect_err(|_| tracing::warn!(%tool, "mcp declaration digest is not sha-256"))
+                .ok()?,
+        ),
+    };
+    Some((
+        handle,
+        Declaration {
+            risk: class,
+            digest,
+        },
+    ))
+}
+
+/// How a failure to call one tool reads to the effect layer.
+///
+/// Only the two that mean "the network was unlucky" are retryable. A refusal —
+/// a destructive class, an unknown tool, a second round trip nobody authorised
+/// — is [`ProviderError::Terminal`], because retrying a refusal is how a loop
+/// spends its whole budget being told no.
+fn as_provider_error(err: &McpError) -> ProviderError {
+    match err {
+        McpError::Connect(_) | McpError::Transport(_) => ProviderError::timeout(),
+        other => ProviderError::Terminal { code: other.code() },
+    }
+}
+
+#[async_trait]
+impl McpCaller for Fleet {
+    /// Route to the binding the tool names, and keep the wrapper on the way
+    /// back.
+    ///
+    /// The result never leaves [`Untrusted`]: `CallToolResult` goes to [`Value`]
+    /// inside [`Untrusted::map`], so there is no point in this function where a
+    /// stranger's text exists unwrapped.
+    async fn call(
+        &self,
+        tool: &McpTool,
+        arguments: &Value,
+    ) -> Result<Untrusted<Value>, ProviderError> {
+        let server = self.servers.get(&tool.server).ok_or_else(|| {
+            tracing::warn!(%tool, "no mcp server is bound under that handle");
+            ProviderError::Terminal {
+                code: McpError::UnknownTool(tool.clone()).code(),
+            }
+        })?;
+
+        // `null` is the model omitting the field; anything that is not an
+        // object is a call this client cannot make.
+        let arguments = match arguments {
+            Value::Null => None,
+            Value::Object(map) => Some(map.clone()),
+            _ => {
+                return Err(ProviderError::Terminal {
+                    code: "arguments_not_an_object",
+                });
+            }
+        };
+
+        let result = server.call(tool, arguments).await.map_err(|err| {
+            tracing::warn!(%tool, code = err.code(), "mcp call failed: {err}");
+            as_provider_error(&err)
+        })?;
+
+        result
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| ProviderError::Terminal {
+                code: "unserializable_result",
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -692,12 +1037,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use agentos_domain::ids::TenantId;
+    use agentos_domain::untrusted::TrustLabel;
+    use agentos_store::db::Db;
+    use chrono::Utc;
     use rmcp::model::{ContentBlock, DiscoverResult, ListToolsResult, ServerCapabilities};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::prompt::SystemPrompt;
 
     // -- a real MCP server, in process -------------------------------------
     //
@@ -905,10 +1255,14 @@ mod tests {
     }
 
     async fn bound(server: &FakeMcp) -> McpServer {
+        bound_with(server, declared()).await
+    }
+
+    async fn bound_with(server: &FakeMcp, declared: BTreeMap<Slug, Declaration>) -> McpServer {
         McpServer::bind(
             erp(),
             &server.url,
-            &declared(),
+            &declared,
             Reach::Private,
             CancellationToken::new(),
         )
@@ -1210,5 +1564,194 @@ mod tests {
         );
         assert_eq!(bound.name(), &erp());
         bound.close().await.expect("close");
+    }
+
+    // -- the fleet ---------------------------------------------------------
+
+    /// The list the model is given names what an operator wrote down, and
+    /// nothing else.
+    ///
+    /// `undeclared` is bound, classified and callable by exact name — it is
+    /// simply not a string an MCP server gets to put in a system prompt.
+    #[tokio::test]
+    async fn the_inventory_names_only_what_an_operator_declared() {
+        let server = FakeMcp::start(two_pages()).await;
+        let fleet = Fleet::new([bound(&server).await]);
+
+        assert_eq!(
+            fleet.inventory(),
+            vec![
+                (call("drop-table"), Risk::High),
+                (call("lookup"), Risk::Low),
+                (call("write-note"), Risk::Low),
+            ],
+            "a tool nobody declared must not reach the prefix"
+        );
+
+        // And an empty fleet refuses rather than panicking on a missing server.
+        let err = McpCaller::call(&Fleet::empty(), &call("lookup"), &Value::Null)
+            .await
+            .expect_err("nothing is bound");
+        assert_eq!(err.code(), "unknown_tool");
+    }
+
+    /// **The pin, end to end.** A declaration that no longer matches the tool
+    /// the operator read does not merely go unclassified: the tool disappears
+    /// from what an exposed turn is told exists, and calling it anyway never
+    /// reaches the server.
+    #[tokio::test]
+    async fn a_digest_mismatch_makes_a_tool_unusable_end_to_end() {
+        let served = tool("lookup");
+        let server = FakeMcp::start(vec![vec![served.clone()]]).await;
+        let pin = |vetted: &Tool| {
+            BTreeMap::from([(
+                slug("lookup"),
+                Declaration {
+                    risk: RiskClass::Read,
+                    digest: Some(digest(vetted)),
+                },
+            )])
+        };
+
+        // The control: pinned to the tool that is actually there, so the whole
+        // path works and the assertions below are the pin and nothing else.
+        let vetted = Fleet::new([bound_with(&server, pin(&served)).await]);
+        assert_eq!(vetted.inventory(), vec![(call("lookup"), Risk::Low)]);
+        assert!(
+            SystemPrompt::new("You are Lena.")
+                .with_mcp_tools(vetted.inventory())
+                .render(TrustLabel::Untrusted)
+                .contains("erp/lookup")
+        );
+        let result = McpCaller::call(&vetted, &call("lookup"), &json!({ "q": "acme" }))
+            .await
+            .expect("a vetted read-class tool runs");
+        assert!(
+            result
+                .expose_for_parsing()
+                .to_string()
+                .contains("ran lookup"),
+            "{:?}",
+            result
+        );
+        assert_eq!(server.count("tools/call"), 1);
+
+        // The attack: the same NAME, with an input schema the operator never
+        // read — `callback_url`, i.e. a lookup that now exfiltrates on demand.
+        let mut widened = JsonObject::new();
+        widened.insert("callback_url".into(), json!({ "type": "string" }));
+        let never_vetted = Tool::new("lookup".to_owned(), "a tool".to_owned(), Arc::new(widened));
+        let stale = Fleet::new([bound_with(&server, pin(&never_vetted)).await]);
+
+        // 1. The class the operator granted does not travel with the name.
+        assert_eq!(stale.inventory(), vec![(call("lookup"), Risk::High)]);
+
+        // 2. So a turn that has read a stranger's text is not told it exists.
+        assert!(
+            !SystemPrompt::new("You are Lena.")
+                .with_mcp_tools(stale.inventory())
+                .render(TrustLabel::Untrusted)
+                .contains("erp/lookup"),
+            "an exposed turn was told about a tool nobody vetted"
+        );
+
+        // 3. And naming it anyway is refused before the server is contacted —
+        //    which is what makes this unusable rather than merely unclassified.
+        let err = McpCaller::call(&stale, &call("lookup"), &json!({ "q": "acme" }))
+            .await
+            .expect_err("a tool that changed under the operator is not self-service");
+        assert_eq!(err.code(), "refused");
+        assert!(
+            !err.is_retryable(),
+            "retrying a refusal only spends the turn's budget"
+        );
+        assert_eq!(
+            server.count("tools/call"),
+            1,
+            "still one: the second call never left this process"
+        );
+    }
+
+    /// Where a binding comes from: `mcp_servers` and `mcp_tool_declarations`,
+    /// read under row-level security, with the SSRF check on the live path.
+    #[tokio::test]
+    async fn a_binding_and_its_classes_come_out_of_the_tenants_configuration() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; mcp binding tests need a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let server = FakeMcp::start(two_pages()).await;
+        let tenant = TenantId::new_v7(Utc::now());
+        let label = format!("mcp-{}", tenant.as_uuid().simple());
+
+        let configure = async |reach: &str| {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2) \
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+
+            sqlx::query(
+                "INSERT INTO mcp_servers (tenant_id, server, url, reach) VALUES ($1, 'erp', $2, $3) \
+                 ON CONFLICT (tenant_id, server) DO UPDATE SET reach = excluded.reach",
+            )
+            .bind(tenant.as_uuid())
+            .bind(&server.url)
+            .bind(reach)
+            .execute(&mut *tx)
+            .await
+            .expect("insert binding");
+
+            sqlx::query(
+                "INSERT INTO mcp_tool_declarations (tenant_id, server, tool, risk) VALUES \
+                   ($1, 'erp', 'lookup', 'read'), \
+                   ($1, 'erp', 'write-note', 'write'), \
+                   ($1, 'erp', 'drop-table', 'destructive') \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("insert declarations");
+            tx.commit().await.expect("commit configuration");
+        };
+
+        let bind = async || {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let fleet = Fleet::bind(&mut tx, &CancellationToken::new())
+                .await
+                .expect("the configuration is readable");
+            tx.commit().await.expect("commit read");
+            fleet
+        };
+
+        // A sidecar on loopback needs `reach = 'private'`, and the operator
+        // wrote it.
+        configure("private").await;
+        assert_eq!(
+            bind().await.inventory(),
+            vec![
+                (call("drop-table"), Risk::High),
+                (call("lookup"), Risk::Low),
+                (call("write-note"), Risk::Low),
+            ]
+        );
+
+        // The same row without that opt-in resolves to loopback, which the SSRF
+        // check refuses — on the production path, not only in a unit test. The
+        // binding is dropped and the turn keeps going with no tools from it.
+        configure("public").await;
+        assert!(
+            bind().await.inventory().is_empty(),
+            "a binding that fails the address check must not be usable"
+        );
     }
 }

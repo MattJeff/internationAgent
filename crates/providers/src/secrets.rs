@@ -143,8 +143,15 @@ impl SecretStore for MemorySecretStore {
 /// One encrypted secret: the wrapped data key and the payload it protects.
 ///
 /// The plaintext appears nowhere, and neither does the data key.
-// ponytail: no serde derive yet — nothing persists an Envelope. Add it when the
-// store crate grows the row type, together with a version tag for rewrap.
+///
+/// [`Envelope::to_bytes`] is the persistence form, and it leads with a version
+/// byte rather than deriving `Serialize`. Two reasons, and the second is the
+/// one that matters. A derived encoding is defined by whatever the struct
+/// fields happen to be, so reordering a field silently invalidates every row
+/// already written. And a key rotation has to be able to read the old format
+/// while writing the new one — a rewrap that cannot read what it is replacing
+/// is not a rewrap. The tag is what makes that possible later without a
+/// migration that decrypts the whole table in one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     /// Data key encrypted under the master key, AAD `tenant={tenant_id}`.
@@ -155,6 +162,76 @@ pub struct Envelope {
     ciphertext: Vec<u8>,
     /// Nonce used for the payload.
     nonce: [u8; NONCE_LEN],
+}
+
+/// The only encoding version that exists. A reader that meets any other byte
+/// refuses rather than guessing, because guessing at a ciphertext layout means
+/// handing AES-GCM the wrong nonce and getting an authentication failure that
+/// looks like a corrupt master key.
+const ENVELOPE_V1: u8 = 1;
+
+impl Envelope {
+    /// The persistence form: `[version][key_nonce][nonce][u32 wrapped_len][wrapped_key][ciphertext]`.
+    ///
+    /// Lengths are big-endian and the trailing ciphertext is implicit, so the
+    /// encoding is unambiguous without a length prefix on the last field.
+    /// Nothing secret is exposed by this — both fields are already ciphertext,
+    /// and the data key is wrapped under the master key.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let wrapped_len = u32::try_from(self.wrapped_key.len())
+            .expect("a wrapped AES-256 data key is 40 bytes, not 4 GiB");
+        let mut out = Vec::with_capacity(
+            1 + NONCE_LEN * 2 + 4 + self.wrapped_key.len() + self.ciphertext.len(),
+        );
+        out.push(ENVELOPE_V1);
+        out.extend_from_slice(&self.key_nonce);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&wrapped_len.to_be_bytes());
+        out.extend_from_slice(&self.wrapped_key);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// Read back what [`Envelope::to_bytes`] wrote.
+    ///
+    /// Every length is checked before it is used to slice. A stored row is
+    /// attacker-reachable in exactly one scenario — someone who can already
+    /// write the table — but a panic there would be a denial of service reached
+    /// through a column, so this returns an error for every malformed input
+    /// including the empty one.
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, ProviderError> {
+        const HEAD: usize = 1 + NONCE_LEN * 2 + 4;
+        let malformed = || ProviderError::Terminal {
+            code: "envelope_malformed",
+        };
+
+        if raw.len() < HEAD || raw[0] != ENVELOPE_V1 {
+            return Err(malformed());
+        }
+        let key_nonce: [u8; NONCE_LEN] =
+            raw[1..1 + NONCE_LEN].try_into().map_err(|_| malformed())?;
+        let nonce: [u8; NONCE_LEN] = raw[1 + NONCE_LEN..1 + NONCE_LEN * 2]
+            .try_into()
+            .map_err(|_| malformed())?;
+        let wrapped_len = u32::from_be_bytes(
+            raw[1 + NONCE_LEN * 2..HEAD]
+                .try_into()
+                .map_err(|_| malformed())?,
+        ) as usize;
+
+        // Checked add: a hostile length near u32::MAX would otherwise wrap and
+        // pass the bounds check below on a 32-bit target.
+        let end = HEAD.checked_add(wrapped_len).ok_or_else(malformed)?;
+        if end > raw.len() {
+            return Err(malformed());
+        }
+        Ok(Self {
+            wrapped_key: raw[HEAD..end].to_vec(),
+            key_nonce,
+            ciphertext: raw[end..].to_vec(),
+            nonce,
+        })
+    }
 }
 
 /// AES-256-GCM envelope store with a local master key.

@@ -27,4 +27,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Tests only: recovering the real private key so the "nothing leaks it" test
+# greps for the actual bytes rather than a stand-in.
+base64.workspace = true
 trybuild.workspace = true

@@ -20,6 +20,66 @@
 //! [`Plan`] that was executed ([`Plan::describe`]), not hand-written next to
 //! it. A parallel prose list is a list that drifts from what actually ran.
 //!
+//! # The bar suppresses true positives. Now it counts them.
+//!
+//! Two runs is a bar a prospect's site can fail *because of us*. E-commerce
+//! flows score traffic at checkout and serve graduated friction — a challenge,
+//! a captcha, a different page — and they often serve it on a *later* request
+//! rather than the first. A site that fingerprints us on run two turns a real
+//! finding into "the two runs differ", and until this module counted anything,
+//! a suppressed true positive and a genuinely unstable widget were the same
+//! word.
+//!
+//! Nothing about the bar changed. There is no third run, no 2-of-3 vote, no
+//! close-enough comparison, and no retry. What changed is that a check now says
+//! *why* it produced nothing — [`Divergence`] and [`Checked::Blocked`] — leaves
+//! a row in `proof_of_need_attempts` whatever it came to, and emits one
+//! low-cardinality event per attempt. The rate is the view
+//! `proof_of_need_suppression`, per prospect.
+//!
+//! ## Reading the number
+//!
+//! The denominator is the attempts that actually reached their page:
+//! `evidence + agrees + unreadable + blocked + not_reproducible`.
+//! [`Checked::TruthStale`] never loaded one and a [`ProbeError`] never got past
+//! the gate or the browser, so neither dilutes the rate.
+//!
+//! * **Low, and mostly [`Divergence::Undetermined`]** — working as intended.
+//!   Public booking flows carry clocks, session ids and rotating banners; a
+//!   floor of unrepeatable reads is what the bar costs, and it is cheap.
+//! * **[`Checked::Blocked`] climbing** — not a bar problem at all. Their site is
+//!   serving *us* friction, which is entirely their right. The lever is the
+//!   scheduler that calls [`Prober::check`]: fewer probes, wider gaps. A
+//!   prospect that blocks us consistently is a prospect we cannot make an
+//!   evidence-backed claim about, and the honest move is to drop them from the
+//!   list — not to send a claim we cannot stand behind, and not to evade.
+//! * **[`Divergence::SameAnswer`] dominating** — the bar is **mis-set**, and
+//!   this is the only number that says so. Their flow stated the *same
+//!   requirement* twice and the comparison threw it away over bytes that were
+//!   never about visas. The fix is a narrower [`Flow::panel`] selector, pointed
+//!   at the answer widget instead of at a container with a clock in it, one
+//!   prospect at a time. It is a configuration fix and never a licence to
+//!   loosen the comparison: a selector wide enough to catch a timestamp is wide
+//!   enough to catch the wrong sentence.
+//! * **[`Divergence::Answers`] dominating** — their flow genuinely answers the
+//!   same question two ways. That is the most damning thing anyone could say
+//!   about an entry-requirements widget, and we cannot say it, because they
+//!   cannot reproduce it either. It goes to a human to look at by hand; it does
+//!   not become an automated claim.
+//!
+//! So: high *and* mostly `blocked` or `answers` is the bar working. High and
+//! mostly `same_answer` is a selector bug wearing a discipline's clothes. That
+//! distinction is the entire reason the reasons are separate values rather than
+//! one counter.
+//!
+//! ## What we do not do about it
+//!
+//! No rotating user agents, no proxy rotation, no fingerprint spoofing, no
+//! run-until-they-agree. Evading a company's bot defences and then writing to
+//! that company about its website is a conversation that opens with "under what
+//! authorisation". The suppression rate is a number to report, not a target to
+//! optimise.
+//!
 //! # Three outcomes that must never be conflated
 //!
 //! * The flow says **nothing** about entry requirements → [`Finding::SaysNothing`].
@@ -84,9 +144,12 @@ use agentos_domain::action::{Action, Domain};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
 use agentos_providers::browser::{BrowserOutcome, BrowserSession, BrowserStep};
+use agentos_store::db::Db;
+use agentos_store::revenue::{NewAttempt, RevenueError, record_attempt};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use url::Url;
+use uuid::Uuid;
 
 use crate::effects::{BrowserWrite, EffectError, Effects, Subject};
 use crate::gate::{Authorizable, Authorized, Denied, PolicyGate, Principal};
@@ -308,6 +371,47 @@ fn read_claim(text: &Untrusted<String>) -> Seen {
     } else {
         Seen::Says(claim)
     }
+}
+
+/// Whether the panel we read looks like friction served to *us* rather than an
+/// answer served to a traveller.
+///
+/// This runs on **both** runs, before the byte comparison, and it is the reason
+/// it exists: a challenge page mentions no visa, so without this check two
+/// identical challenge pages agree with each other, read as [`Seen::Nothing`],
+/// and become a [`Finding::SaysNothing`] — a sentence telling an airline its
+/// checkout says nothing about entry requirements, sourced entirely from a
+/// captcha we were shown. That is the exact failure this module exists to
+/// prevent, and it is worse than any suppression.
+///
+/// ponytail: lowercased substring match against a deliberately **short** table,
+/// English only, and the shortness is the design. Every phrase here is one that
+/// does not appear in an entry-requirements answer, because the cost of a false
+/// positive is a miscounted reason — "we are being blocked" is a claim about
+/// somebody else's infrastructure and a wrong one sends an operator after the
+/// wrong lever. Anything more ambiguous ("please enable javascript", a bare
+/// mention of a CDN) is deliberately absent: it falls through to
+/// [`Divergence::Undetermined`], which is the honest answer when we cannot
+/// tell. The upgrade, when a locale needs it, is a per-locale table beside
+/// [`read_claim`]'s — never a looser match.
+fn looks_challenged(text: &Untrusted<String>) -> bool {
+    // Parsing, not rendering. Nothing from the page escapes the wrapper.
+    let hay = text.expose_for_parsing().to_lowercase();
+
+    const CHALLENGE: [&str; 10] = [
+        "captcha", // covers recaptcha / hcaptcha / "solve the captcha"
+        "are you a robot",
+        "verify you are human",
+        "verify you are a human",
+        "checking your browser",
+        "unusual traffic",
+        "automated traffic",
+        "press and hold",
+        "too many requests",
+        "rate limit",
+    ];
+
+    CHALLENGE.iter().any(|needle| hay.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -605,10 +709,74 @@ impl Evidence {
 // Outcomes
 // ---------------------------------------------------------------------------
 
+/// As much as we can honestly say about *why* two identical runs read
+/// differently.
+///
+/// None of these produces evidence. They exist so the suppression rate can be
+/// read rather than merely counted — see the module docs for what each one
+/// should make an operator do.
+///
+/// The hard part is that from outside a browser you frequently cannot tell an
+/// A/B assignment from a flaky widget from a page that changed underneath you.
+/// So this enum does not have variants for those. It splits only on what is
+/// actually observable — whether both runs parsed into a requirement, and
+/// whether it was the same one — and everything else is
+/// [`Divergence::Undetermined`] on purpose. An unknown reason costs an operator
+/// a look; a confidently wrong one costs them a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divergence {
+    /// Both runs stated a requirement and it was the **same** requirement. Only
+    /// the bytes around it moved: a clock, a session id, a rotating banner.
+    ///
+    /// Still no evidence — the bar is byte-for-byte and this does not bend it.
+    /// It is the measurement that says the bar is mis-set *for this prospect*,
+    /// and the fix is a narrower [`Flow::panel`], not a looser comparison.
+    SameAnswer(Claim),
+    /// Both runs stated a requirement and they were **different**
+    /// requirements. Their flow answered the same question two ways.
+    ///
+    /// Evidence about their product, and unusable: they cannot reproduce it
+    /// either. An A/B assignment and a broken widget look identical from here
+    /// and this variant does not pretend to tell them apart.
+    Answers {
+        /// What the first run said.
+        first: Claim,
+        /// What the second run said.
+        second: Claim,
+    },
+    /// The two texts differed and nothing above applies — one or both runs
+    /// parsed to nothing, or to something unreadable. A different page, a
+    /// half-loaded widget, a banner. **Unknown, and recorded as unknown.**
+    Undetermined,
+}
+
+impl Divergence {
+    /// Stable, low-cardinality metric label. The `Claim`s ride on the value,
+    /// not on the label.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Divergence::SameAnswer(_) => "same_answer",
+            Divergence::Answers { .. } => "answers",
+            Divergence::Undetermined => "undetermined",
+        }
+    }
+}
+
+/// Classify a disagreement between two runs, using only what is on the page.
+fn classify(first: &Untrusted<String>, second: &Untrusted<String>) -> Divergence {
+    match (read_claim(first), read_claim(second)) {
+        (Seen::Says(a), Seen::Says(b)) if a == b => Divergence::SameAnswer(a),
+        (Seen::Says(first), Seen::Says(second)) => Divergence::Answers { first, second },
+        _ => Divergence::Undetermined,
+    }
+}
+
 /// What one check came to.
 ///
-/// Four of the five outcomes carry no evidence, and that is the design: this
-/// module's job is to refuse to make a claim, and only then to make one.
+/// Five of the six outcomes carry no evidence, and that is the design: this
+/// module's job is to refuse to make a claim, and only then to make one. The
+/// five say *why*, because a check that produced nothing is a measurement and
+/// an unlabelled measurement is a shrug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Checked {
     /// A reproducible discrepancy.
@@ -619,8 +787,18 @@ pub enum Checked {
     /// Their flow mentions visas and we could not parse a requirement out of
     /// it. Ambiguity is not a finding.
     Unreadable,
-    /// The two runs disagreed. Not evidence, by definition.
-    NotReproducible,
+    /// The two runs disagreed. Not evidence, by definition; the [`Divergence`]
+    /// is what we could tell about why.
+    NotReproducible(Divergence),
+    /// A run served what reads as a bot challenge rather than an answer.
+    ///
+    /// Evidence about **us**, not about them: their site declined to show a
+    /// suspected robot its checkout, which is their prerogative. Distinct from
+    /// [`Checked::NotReproducible`] because it points at a different lever —
+    /// probe less, or drop the prospect — and because two matching challenge
+    /// pages would otherwise sail straight through the comparison and become a
+    /// [`Finding::SaysNothing`] about a page we never saw.
+    Blocked,
     /// The authoritative answer is older than [`MAX_TRUTH_AGE`]. Refused before
     /// any browsing happens — checked first precisely so a stale source costs
     /// the prospect nothing.
@@ -636,14 +814,25 @@ impl Checked {
         }
     }
 
-    /// Stable, low-cardinality metric label.
+    /// Stable, low-cardinality metric label, and the `outcome` column of
+    /// `proof_of_need_attempts`. The CHECK constraint there is this list.
     pub const fn code(&self) -> &'static str {
         match self {
             Checked::Evidence(_) => "evidence",
             Checked::Agrees => "agrees",
             Checked::Unreadable => "unreadable",
-            Checked::NotReproducible => "not_reproducible",
+            Checked::NotReproducible(_) => "not_reproducible",
+            Checked::Blocked => "blocked",
             Checked::TruthStale => "truth_stale",
+        }
+    }
+
+    /// The sub-reason, for the outcomes that have one. Pairs with
+    /// [`Checked::code`] exactly as `proof_of_need_attempts_detail` requires.
+    pub const fn detail(&self) -> Option<&'static str> {
+        match self {
+            Checked::NotReproducible(why) => Some(why.code()),
+            _ => None,
         }
     }
 }
@@ -686,6 +875,7 @@ impl ProbeError {
 /// One employee, its browser session, and the gate that rules on every step.
 #[derive(Clone)]
 pub struct Prober {
+    db: Db,
     gate: PolicyGate,
     effects: Effects,
     principal: Principal,
@@ -697,7 +887,13 @@ impl Prober {
     /// Wire one up. `session` is the employee's own browser context — see
     /// `providers::browser` for why that is a provisioned resource and not a
     /// handle this module could conjure.
+    ///
+    /// `db` is here for one thing: every attempt leaves a row, so the
+    /// suppression rate is a query. It is not a route to the evidence table —
+    /// filing a finding is the caller's decision and `store::revenue` is where
+    /// it happens.
     pub fn new(
+        db: Db,
         gate: PolicyGate,
         effects: Effects,
         principal: Principal,
@@ -705,6 +901,7 @@ impl Prober {
         session: BrowserSession,
     ) -> Self {
         Self {
+            db,
             gate,
             effects,
             principal,
@@ -719,7 +916,56 @@ impl Prober {
     /// `now` is passed in rather than read off the clock, so the same inputs
     /// produce the same [`Evidence`] — which is the machine-checkable half of
     /// "reproducible".
+    ///
+    /// Whatever it comes to — including a [`ProbeError`] — the attempt is
+    /// counted and filed before it is returned. That is deliberately here and
+    /// not in [`Prober::run`]: one place that every path leaves through, rather
+    /// than a `record` call next to each of the eight `return`s, one of which
+    /// somebody eventually forgets.
     pub async fn check(
+        &self,
+        flow: &Flow,
+        probe: &Probe,
+        authority: &Answer,
+        now: DateTime<Utc>,
+    ) -> Result<Checked, ProbeError> {
+        let outcome = self.run(flow, probe, authority, now).await;
+
+        // "error" is not a `Checked`, because a check that never reached an
+        // outcome did not reach one. It is still an attempt, and an attempt
+        // that vanishes is an attempt nobody can put in the denominator.
+        let (code, detail) = match &outcome {
+            Ok(checked) => (checked.code(), checked.detail()),
+            Err(err) => ("error", Some(err.code())),
+        };
+
+        // The metric: two stable, low-cardinality labels and nothing else. The
+        // prospect goes on the row, not on the label — a counter keyed by
+        // prospect domain is one time series per prospect and a leak in every
+        // collector that scrapes it.
+        tracing::info!(
+            outcome = code,
+            reason = detail.unwrap_or("none"),
+            "proof of need checked"
+        );
+
+        if let Err(err) = self.file(flow, probe, code, detail, now).await {
+            // A failed measurement must not destroy the thing it measured.
+            // Loud, and undercounted, which is the safe direction: the rate
+            // this feeds is an argument for the bar, so it may not be flattered
+            // by rows that failed to land.
+            tracing::warn!(
+                error = %err,
+                outcome = code,
+                "proof-of-need attempt not recorded; the suppression rate is now short a row"
+            );
+        }
+
+        outcome
+    }
+
+    /// The check itself. [`Prober::check`] wraps it to count the attempt.
+    async fn run(
         &self,
         flow: &Flow,
         probe: &Probe,
@@ -740,8 +986,17 @@ impl Prober {
         // send.
         let first = self.observe(flow, &plan).await?;
         let second = self.observe(flow, &plan).await?;
+
+        // Before the comparison, and on *both* runs. Friction served to us is
+        // not a statement about their product, and two identical challenge
+        // pages agree with each other perfectly — which would make a captcha
+        // into a `Finding::SaysNothing` about a checkout we never reached.
+        if looks_challenged(&first) || looks_challenged(&second) {
+            return Ok(Checked::Blocked);
+        }
+
         if first != second {
-            return Ok(Checked::NotReproducible);
+            return Ok(Checked::NotReproducible(classify(&first, &second)));
         }
 
         let finding = match read_claim(&second) {
@@ -772,6 +1027,41 @@ impl Prober {
             screenshot,
             _observed: observed::Observed::new(),
         })))
+    }
+
+    /// File the attempt, whatever it came to.
+    ///
+    /// One row per check, the same idea `supplier_observations` applies to the
+    /// purchasing side: the misses are written next to the hits, and the rate is
+    /// derived rather than stored. Nothing the prospect's page wrote goes in —
+    /// the classification is ours, and the verbatim text has a home only when
+    /// there is a finding to attach it to.
+    async fn file(
+        &self,
+        flow: &Flow,
+        probe: &Probe,
+        outcome: &str,
+        detail: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RevenueError> {
+        let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
+        record_attempt(
+            &mut tx,
+            Uuid::now_v7(),
+            &NewAttempt {
+                prospect_domain: flow.domain.as_str(),
+                employee_id: Some(self.principal.employee_id),
+                outcome,
+                detail,
+                passport_country: probe.passport.as_str(),
+                destination_country: probe.destination.as_str(),
+                travel_date: probe.travel_date,
+                checked_at: now,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// One full run of the plan, ending in the panel text.
@@ -1028,6 +1318,22 @@ mod tests {
         prober: Prober,
         browser: Arc<MockBrowser>,
         panels: Arc<ScriptedPanel>,
+        principal: Principal,
+    }
+
+    /// `(outcome, detail)` for every attempt this employee filed, in order.
+    async fn attempts(db: &Db, principal: &Principal) -> Vec<(String, Option<String>)> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let rows = sqlx::query_as(
+            "SELECT outcome, detail FROM proof_of_need_attempts \
+              WHERE employee_id = $1 ORDER BY checked_at, id",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read attempts");
+        tx.commit().await.expect("commit read");
+        rows
     }
 
     async fn harness(db: &Db, panels: Arc<ScriptedPanel>, allowed: PolicyLimits) -> Harness {
@@ -1051,16 +1357,18 @@ mod tests {
 
         Harness {
             prober: Prober::new(
+                db.clone(),
                 // The platform layer, because the layers *intersect*: a
                 // grant that is not in the widest layer is not a grant.
                 PolicyGate::new(db.clone(), PolicyBook::new(allowed)),
                 effects,
-                principal,
+                principal.clone(),
                 panels.clone(),
                 session,
             ),
             browser,
             panels,
+            principal,
         }
     }
 
@@ -1207,7 +1515,13 @@ mod tests {
             .await
             .expect("allowed");
 
-        assert_eq!(checked, Checked::NotReproducible);
+        assert_eq!(
+            checked,
+            Checked::NotReproducible(Divergence::Answers {
+                first: Claim::NoVisa,
+                second: Claim::VisaRequired,
+            })
+        );
         assert!(checked.evidence().is_none());
         // And nothing was screenshotted, because there is nothing to show.
         assert!(
@@ -1217,6 +1531,252 @@ mod tests {
                 .any(|line| line.ends_with("screenshot")),
             "{:?}",
             h.browser.log()
+        );
+    }
+
+    /// The measurement this module gained, and the honest limit of it.
+    ///
+    /// Two suppressed checks that a naive reading calls the same thing — "the
+    /// two runs differ" — are recorded as two different reasons, because from
+    /// outside the browser these two *are* distinguishable: one run served a
+    /// challenge, and no challenge parses as a visa requirement.
+    ///
+    /// What is NOT distinguishable, and is not pretended to be, is A/B
+    /// assignment from a flaky widget: both land in `answers`, and that variant
+    /// says so in its own doc comment rather than picking one.
+    #[tokio::test]
+    async fn a_run_two_challenge_is_recorded_apart_from_a_genuine_a_b_difference() {
+        let Some(db) = db().await else { return };
+
+        // Graduated friction, served on the second request. Classic.
+        let challenged = harness(
+            &db,
+            ScriptedPanel::flaky(
+                "No visa required for this trip.",
+                "Please complete the CAPTCHA to continue.",
+            ),
+            limits(),
+        )
+        .await;
+        let blocked = challenged
+            .prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect("allowed");
+
+        // Their own flow, answering the same question two ways.
+        let split = harness(
+            &db,
+            ScriptedPanel::flaky("No visa required.", "A visa is required."),
+            limits(),
+        )
+        .await;
+        let disagreed = split
+            .prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect("allowed");
+
+        // Two outcomes, not one, and they point at different levers: probe them
+        // less, versus look at their widget by hand.
+        assert_eq!(blocked, Checked::Blocked);
+        assert_eq!(
+            disagreed,
+            Checked::NotReproducible(Divergence::Answers {
+                first: Claim::NoVisa,
+                second: Claim::VisaRequired,
+            })
+        );
+        assert_ne!(blocked.code(), disagreed.code());
+
+        // And the durable rows say the same, so the split is a query and not a
+        // log line somebody has to be watching.
+        assert_eq!(
+            attempts(&db, &challenged.principal).await,
+            vec![("blocked".to_owned(), None)]
+        );
+        assert_eq!(
+            attempts(&db, &split.principal).await,
+            vec![("not_reproducible".to_owned(), Some("answers".to_owned()))]
+        );
+    }
+
+    /// The direction that matters. Neither a bot challenge nor a flow that
+    /// answers two ways may ever become a sentence we send — including the
+    /// nastiest case, where the challenge is served to *both* runs and so
+    /// reproduces perfectly. Two identical captchas mention no visa, and
+    /// without the challenge check they would read as "your checkout shows
+    /// nothing about entry requirements" — a claim about a page we never
+    /// reached.
+    #[tokio::test]
+    async fn neither_a_challenge_nor_a_split_answer_can_become_evidence() {
+        let Some(db) = db().await else { return };
+
+        let cases: [(&str, Arc<ScriptedPanel>); 4] = [
+            (
+                "challenge on run two",
+                ScriptedPanel::flaky("No visa required.", "Verify you are human to continue."),
+            ),
+            (
+                "challenge on both runs, reproducing perfectly",
+                ScriptedPanel::always("Checking your browser before you access this site."),
+            ),
+            (
+                "challenge on run one",
+                ScriptedPanel::flaky("We are seeing unusual traffic.", "No visa required."),
+            ),
+            (
+                "their flow answering two ways",
+                ScriptedPanel::flaky("Visa-free entry.", "An e-visa is required."),
+            ),
+        ];
+
+        for (what, panel) in cases {
+            let h = harness(&db, panel, limits()).await;
+            let checked = h
+                .prober
+                .check(&flow(), &probe(), &authority(), now())
+                .await
+                .expect("allowed");
+
+            assert!(checked.evidence().is_none(), "{what}: {checked:?}");
+            assert_ne!(checked.code(), "evidence", "{what}");
+            assert_ne!(checked.code(), "agrees", "{what}");
+            // No picture either: a screenshot is taken only for a claim.
+            assert!(
+                !h.browser
+                    .log()
+                    .iter()
+                    .any(|line| line.ends_with("screenshot")),
+                "{what}: {:?}",
+                h.browser.log()
+            );
+        }
+    }
+
+    /// Every check leaves a row, so the suppression rate is a SELECT.
+    ///
+    /// Including the ones that produced a finding — a numerator with no
+    /// denominator is not a rate — and including the ones that never reached
+    /// their page, which the view then excludes from the rate on purpose.
+    #[tokio::test]
+    async fn every_attempt_is_recorded_and_the_rate_is_a_query() {
+        let Some(db) = db().await else { return };
+
+        // Same employee throughout: the row is per attempt, not per prober.
+        let h = harness(&db, ScriptedPanel::always("No visa required."), limits()).await;
+        h.prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect("allowed");
+
+        // A stale source: an attempt, but one that never loaded a page.
+        let stale = Answer {
+            retrieved_at: now() - MAX_TRUTH_AGE - TimeDelta::minutes(1),
+            ..authority()
+        };
+        h.prober
+            .check(&flow(), &probe(), &stale, now())
+            .await
+            .expect("allowed");
+
+        assert_eq!(
+            attempts(&db, &h.principal).await,
+            vec![
+                ("evidence".to_owned(), None),
+                ("truth_stale".to_owned(), None),
+            ]
+        );
+
+        // The gate refusing is an attempt too, and it carries the deny code.
+        let refused = harness(
+            &db,
+            ScriptedPanel::always("No visa required."),
+            PolicyLimits {
+                allowed_domains: BTreeSet::from([domain("somewhere.else.example")]),
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+        refused
+            .prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect_err("not allowed");
+        assert_eq!(
+            attempts(&db, &refused.principal).await,
+            vec![("error".to_owned(), Some("domain_not_allowed".to_owned()))]
+        );
+
+        // And the view: one evidence, one truth_stale that is *not* in the
+        // denominator, so the rate is 0% of 1 rather than 0% of 2.
+        let mut tx = db.tenant_tx(h.principal.tenant_id).await.expect("tx");
+        let (attempts_n, evidence_n, rate): (i64, i64, Option<i32>) = sqlx::query_as(
+            "SELECT attempts, evidence, suppression_rate_pct FROM proof_of_need_suppression \
+              WHERE prospect_domain = $1",
+        )
+        .bind(flow().domain.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("suppression view");
+        tx.commit().await.expect("commit read");
+
+        assert_eq!((attempts_n, evidence_n, rate), (2, 1, Some(0)));
+    }
+
+    /// The number that says the bar is mis-set, as opposed to working.
+    ///
+    /// A panel whose only difference between runs is a clock stated the *same*
+    /// requirement twice. It still yields no evidence — the comparison is bytes
+    /// and it is not moving — but it is counted apart from a real disagreement,
+    /// because the fix is a narrower selector and not a looser rule.
+    #[tokio::test]
+    async fn a_difference_that_is_not_about_visas_is_counted_apart() {
+        let Some(db) = db().await else { return };
+
+        let banner = harness(
+            &db,
+            ScriptedPanel::flaky(
+                "No visa required. Checked at 09:00:01.",
+                "No visa required. Checked at 09:00:04.",
+            ),
+            limits(),
+        )
+        .await;
+        let checked = banner
+            .prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect("allowed");
+
+        assert_eq!(
+            checked,
+            Checked::NotReproducible(Divergence::SameAnswer(Claim::NoVisa))
+        );
+        assert!(checked.evidence().is_none(), "the bar does not bend");
+        assert_eq!(
+            attempts(&db, &banner.principal).await,
+            vec![(
+                "not_reproducible".to_owned(),
+                Some("same_answer".to_owned())
+            )]
+        );
+
+        // A difference neither run turned into a requirement stays unknown, and
+        // is recorded as unknown rather than guessed at.
+        let vague = harness(
+            &db,
+            ScriptedPanel::flaky("Baggage: 1 x 23kg.", "Seat 14A."),
+            limits(),
+        )
+        .await;
+        assert_eq!(
+            vague
+                .prober
+                .check(&flow(), &probe(), &authority(), now())
+                .await
+                .expect("allowed"),
+            Checked::NotReproducible(Divergence::Undetermined)
         );
     }
 

@@ -29,6 +29,44 @@
 //! `domain::policy::evaluate` refuses high-risk actions outright — so guessing
 //! a tool name that was not offered still ends in an audited denial.
 //!
+//! The taint filter is [`visible`], and it is one function on purpose:
+//! [`tools_for`] filters the schemas with it and
+//! [`SystemPrompt::render`](crate::prompt::SystemPrompt::render) filters the
+//! MCP inventory with it. Two predicates would be two chances for a tool to be
+//! *named* to a turn that may not *call* it, which is the leak this whole unit
+//! is about.
+//!
+//! # Why MCP tools do not each get a schema
+//!
+//! [`catalogue`] has one `call_mcp_tool` entry with `{server, tool, arguments}`
+//! for every tool on every bound server, and expanding it into one schema per
+//! bound tool was considered and rejected.
+//!
+//! The reason is not effort, it is arithmetic. Tool count is a property of the
+//! model's accuracy, not of our plumbing: past roughly seventy tools a model
+//! starts picking the almost-right one, and MCP inventory is exactly the thing
+//! that grows without bound — one ERP server is forty tools nobody at this
+//! company wrote. The collapsed form is what keeps this catalogue at three
+//! entries no matter how many servers a tenant binds, and it keeps the *gate*
+//! at one subject type too: `Action::McpCall { tool }`, one allowlist,
+//! `allowed_mcp_tools`. N schemas would be N names to keep in step with that
+//! allowlist, and a schema whose name has drifted out of the allowlist is a
+//! tool the model is offered and always denied.
+//!
+//! What was genuinely missing was smaller and is fixed elsewhere: **nothing
+//! told the model which server and tool names exist.** The schema says
+//! `{"server": "string", "tool": "string"}` and the model had to guess, so it
+//! guessed, and `allowed_mcp_tools` denied the guess — a real MCP integration
+//! looked like a broken one. [`crate::mcp::Fleet::inventory`] produces the list
+//! of names and `SystemPrompt` renders it into the prefix, trust-filtered. One
+//! schema, a named inventory.
+//!
+//! The one thing the collapsed form gives up is per-tool argument validation:
+//! `arguments` is an open object, and a wrong shape is found by the MCP server
+//! rather than by the model's decoder. That is a wasted tool call, not an
+//! unauthorised effect — the gate ruled on `server/tool`, which is what
+//! `arguments` cannot change.
+//!
 //! # Four budgets, one checkpoint
 //!
 //! Turns, tool calls, tokens and a [`CancellationToken`]. They are checked in
@@ -132,6 +170,19 @@ fn catalogue() -> [(&'static str, Risk, &'static str, Value); 3] {
     ]
 }
 
+/// **The taint filter**, and the only one.
+///
+/// Whether a turn at this trust level may be told that something of this blast
+/// radius exists — not whether it may call it, which is the gate's ruling.
+/// Everything the model is shown about its capabilities goes through here:
+/// [`tools_for`] for the schemas, and
+/// [`SystemPrompt::render`](crate::prompt::SystemPrompt::render) for the MCP
+/// inventory. One predicate, so "offered but not callable" and "callable but
+/// never named" are both unrepresentable.
+pub(crate) const fn visible(trust: TrustLabel, risk: Risk) -> bool {
+    !(trust.is_untrusted() && risk.is_high())
+}
+
 /// The tool schemas a turn at this trust level may see.
 ///
 /// **The taint wire.** Untrusted context, no high-risk schemas — the model is
@@ -140,7 +191,7 @@ fn catalogue() -> [(&'static str, Risk, &'static str, Value); 3] {
 pub fn tools_for(trust: TrustLabel) -> Vec<ToolDef> {
     catalogue()
         .into_iter()
-        .filter(|(_, risk, _, _)| !(trust.is_untrusted() && risk.is_high()))
+        .filter(|(_, risk, _, _)| visible(trust, *risk))
         .map(|(name, _, description, input_schema)| ToolDef {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -535,14 +586,13 @@ impl Turn {
             self.budgets.check(&spent, cancel)?;
             spent.turns += 1;
 
-            // Tools are recomputed every turn, because the taint can change
-            // mid-run: one MCP result and the high-risk schemas are gone.
-            let request = self.prompt.request(
-                &self.model,
-                self.max_tokens,
-                tools_for(trust),
-                messages.clone(),
-            );
+            // The whole request is recomputed every turn, because the taint can
+            // change mid-run: one MCP result and the high-risk schemas are
+            // gone — and so are the high-risk MCP tools' names in the prefix.
+            // `trust` is the only knob, so the two cannot disagree.
+            let request =
+                self.prompt
+                    .request(&self.model, self.max_tokens, trust, messages.clone());
 
             let response = tokio::select! {
                 biased;

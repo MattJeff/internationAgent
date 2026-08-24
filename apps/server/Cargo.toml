@@ -25,3 +25,8 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Tests only: asserting that the key directory serves the public key and no
+# encoding of the sealed private one.
+base64.workspace = true

@@ -46,6 +46,23 @@
 //! and the incoterm is what decides how much of the landed cost is *not* in the
 //! quoted price.
 //!
+//! # The shortlist reads the evidence; the ranking does not
+//!
+//! [`shortlist`] is the one place a supplier's past behaviour is allowed to
+//! change what happens, and it sits *before* [`Buyer::issue_rfq`] — deciding who
+//! is worth asking, never who won. [`rank`] is deliberately untouched: it sorts
+//! on landed cost with tie-breaks on lead time and address so that the same
+//! quotes always produce the same order, and a reputation term inside it would
+//! trade that property for a number the landed cost already contains.
+//!
+//! # Two suppliers disagreeing is bought information
+//!
+//! An RFQ fan-out pays for N answers and [`rank`] reduces them to a sort key.
+//! [`disagreement`] reads what is left: how far apart the answers are, on the
+//! fields that survive [`landed_cost`] normalisation. It names the two ends of
+//! the gap and stops there — nothing in this module adjudicates a quote, and the
+//! supplier who is the outlier is quite often the one telling the truth.
+//!
 //! # An order always needs a human
 //!
 //! [`Buyer::place_order`] proposes an [`Action::ContractSign`], which
@@ -67,6 +84,10 @@ pub use agentos_domain::sourcing::Incoterm;
 use agentos_domain::sourcing::{self as buying, LiveQuote};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::email::ProviderMessageId;
+/// A supplier's record as the store derives it, re-exported so a caller does
+/// not need a second import to build a [`shortlist`]. One reputation type in
+/// the workspace, computed by one SQL view over one evidence table.
+pub use agentos_store::sourcing::Reputation;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -251,6 +272,103 @@ pub fn qualify(candidate: &Candidate, requirements: &Requirements) -> Result<(),
         return Err(Unqualified::CertificationMissing);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The shortlist: who out of the qualified actually gets asked
+// ---------------------------------------------------------------------------
+
+/// Unanswered RFQs before we stop asking.
+///
+/// A count of silences, not a rate: a supplier is dropped only once they have
+/// been asked this many times and have **never once** answered. A single
+/// returned quote, ever, puts them back on the list and keeps them there.
+///
+/// ponytail: a constant, like [`STALLED_AFTER`], not a policy field. Four is
+/// "we tried a month of Tuesdays". Make it a field on [`Requirements`] the day
+/// somebody has a lane where it is wrong.
+pub const IGNORED_RFQS_BEFORE_DROPPING: i64 = 4;
+
+/// Never RFQ fewer than this many suppliers, whatever the evidence says.
+///
+/// The safety valve, and the honest one. Two landed quotes is the smallest
+/// thing [`disagreement`] can read at all and one is not a comparison, so a
+/// round narrower than this has stopped being a sourcing round and started
+/// being a rubber stamp on an incumbent.
+pub const MIN_SHORTLIST: usize = 3;
+
+/// Which of these qualified candidates are worth an RFQ.
+///
+/// Input order is preserved and the addresses come back unchanged, so the
+/// result drops straight into [`Buyer::issue_rfq`].
+///
+/// # Reputation is a requirement here, never a preference
+///
+/// [`qualify`] answers yes or no and leaves ordering to [`rank`]; this does the
+/// same with the evidence. There is no score, no weighting and no reordering —
+/// a supplier is on the list or is not. Two reasons, and the second is the one
+/// that matters:
+///
+/// 1. Ordering the shortlist buys nothing. Everyone on it gets the same RFQ,
+///    and what comes back is ordered by [`rank`] on the landed cost, which is
+///    the number we actually pay.
+/// 2. **Preferring the supplier you already trust is how you stop learning
+///    about the others.** A preference term compounds: the trusted supplier
+///    gets asked, answers, gets more trusted, gets asked again. The candidate
+///    with no record never accumulates one, and "no observations" is not a bad
+///    record — [`Reputation`] is `None` for them precisely so that nothing can
+///    read it as zero.
+///
+/// So the only thing the evidence is allowed to do is remove a supplier who has
+/// been asked [`IGNORED_RFQS_BEFORE_DROPPING`] times and has never answered.
+/// That is not a judgement about their goods or their prices; it is the
+/// observation that the outreach budget spent on them buys no quote.
+///
+/// # Why the response signal and not the delivery record
+///
+/// `quote_returned` / `quote_missed` is the one signal an RFQ fan-out generates
+/// for **everybody it touches**, winners and losers alike — see
+/// `supplier_observations` in `0007_sourcing.sql`. On-time rate and quality
+/// rate only exist for suppliers we have actually bought from, so gating
+/// outreach on them would mean never asking anyone new, which is the feedback
+/// loop in its purest form.
+///
+/// # What we chose not to build
+///
+/// **No epsilon-greedy explore/exploit.** It is the textbook answer and it is
+/// wrong here, because asking is not buying: a supplier who receives an RFQ
+/// every twentieth round and never an order learns that we are not a customer
+/// and stops replying — destroying exactly the signal the exploration was
+/// bought to collect. The floor below is the honest version of the same
+/// instinct.
+///
+/// # The floor
+///
+/// If dropping the silent leaves fewer than [`MIN_SHORTLIST`] suppliers, the
+/// evidence has stopped buying anything and everyone is asked. This is also the
+/// only compensation for the one asymmetry in the design: a dropped supplier
+/// accrues no further evidence, so being dropped is sticky. Deliberate — a firm
+/// that ignored four RFQs is not sitting by the inbox — and cheap to undo, since
+/// one `quote_returned` row from any other channel reinstates them.
+pub fn shortlist(candidates: &[(EmailAddress, Option<Reputation>)]) -> Vec<EmailAddress> {
+    let asking: Vec<EmailAddress> = candidates
+        .iter()
+        .filter(|(_, record)| record.as_ref().is_none_or(answers_at_all))
+        .map(|(supplier, _)| supplier.clone())
+        .collect();
+
+    if asking.len() < MIN_SHORTLIST {
+        return candidates
+            .iter()
+            .map(|(supplier, _)| supplier.clone())
+            .collect();
+    }
+    asking
+}
+
+/// Have they ever answered, or not yet been asked enough times to say?
+const fn answers_at_all(record: &Reputation) -> bool {
+    record.quotes_returned > 0 || record.quotes_missed < IGNORED_RFQS_BEFORE_DROPPING
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +743,185 @@ pub fn rank(quotes: &[Quote<'_>], lane: &Lane, fx: &Fx) -> Result<Vec<Landed>, Q
             .then_with(|| a.supplier.to_string().cmp(&b.supplier.to_string()))
     });
     Ok(landed)
+}
+
+// ---------------------------------------------------------------------------
+// The disagreement probe
+// ---------------------------------------------------------------------------
+
+/// A field two suppliers can still be compared on *after* normalisation.
+///
+/// Short on purpose. Every entry has to survive the question "would two honest
+/// suppliers legitimately answer this differently?", and most fields do not —
+/// see [`disagreement`] for the ones that were left out and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Comparable {
+    /// Total landed cost, in minor units of the comparison currency: the goods
+    /// converted, plus the duty and the legs the incoterm left to us.
+    LandedTotal,
+    /// Days from order to the delivery the incoterm describes.
+    LeadTimeDays,
+}
+
+impl Comparable {
+    /// Stable, low-cardinality metric label.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Comparable::LandedTotal => "landed_total",
+            Comparable::LeadTimeDays => "lead_time_days",
+        }
+    }
+
+    /// How far apart the two ends have to be before the gap is worth reading,
+    /// in basis points of the smaller value.
+    ///
+    /// ponytail: constants, one per field, because the two fields have nothing
+    /// like the same natural variance and a single shared threshold would be
+    /// wrong for both. They are set to be quiet: a probe that fires on every
+    /// round teaches its reader to close the tab.
+    const fn threshold_bps(self) -> u64 {
+        match self {
+            // Landed cost has already had the incoterm, the currency and the
+            // duty taken out of it. A fifth is not a fuel surcharge.
+            Comparable::LandedTotal => 2_000,
+            // A doubling. Lead times legitimately vary a lot — stock on hand
+            // against a production slot — so the bar is high and the signal it
+            // leaves is the "30 days against 90" kind, not the 30-against-38
+            // kind.
+            //
+            // ponytail: mode of transport is not modelled, so a supplier who
+            // air-freights and one who sails read as a divergence here. The day
+            // [`Lane`] carries a mode, compare within mode instead of raising
+            // the number.
+            Comparable::LeadTimeDays => 10_000,
+        }
+    }
+}
+
+/// Two suppliers, asked the same question, whose answers are far enough apart
+/// that the gap is itself information.
+///
+/// It records who and how far. **It does not say who is right.** The cheap
+/// quote may be a supplier who has misread the drawing and the dear one may be
+/// the only firm that priced the tooling; the fast lead time may be a stocked
+/// part or a promise nobody can keep. Adjudicating is a human's job and this
+/// type deliberately gives them the two ends and the size of the gap to do it
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Divergence {
+    /// What they disagree about.
+    pub field: Comparable,
+    /// The supplier at the low end.
+    pub low: EmailAddress,
+    /// Their answer.
+    pub low_value: u64,
+    /// The supplier at the high end.
+    pub high: EmailAddress,
+    /// Their answer.
+    pub high_value: u64,
+    /// `(high - low) / low` in basis points, truncated.
+    ///
+    /// Truncated rather than rounded up — the opposite of [`Fx::convert`], and
+    /// for the same reason stated the other way round. A rounding error that
+    /// understates a cost picks the wrong supplier; a rounding error that
+    /// overstates a spread files a report nobody asked for.
+    pub spread_bps: u64,
+}
+
+/// What the quotes in one round disagree about, once they are comparable.
+///
+/// Takes [`Landed`] and not [`Quote`] on purpose: [`landed_cost`] is the only
+/// constructor of a `Landed`, so "compare only after normalisation" is not a
+/// rule a caller has to remember — it is the signature. Feed it [`rank`]'s
+/// output.
+///
+/// Fewer than two quotes disagree about nothing. At most one [`Divergence`] per
+/// field, naming the two extremes, rather than a row per pair: `n²` rows about
+/// one outlier is the same fact repeated until it is ignored.
+///
+/// # What this deliberately does not compare
+///
+/// The whole difficulty of this function is that **two quotes differing is
+/// usually legitimate**, so the list of things it stays quiet about is longer
+/// than the list it reads:
+///
+/// - **Incoterm.** This is the one [`landed_cost`] exists to remove. A €6.00
+///   EXW quote and a €10.70 DDP quote that land at the same total agree
+///   completely, and a comparator that flagged the differing term would fire on
+///   every round that got more than one kind of answer — which is every round.
+/// - **Currency.** Same argument: [`Fx`] already took it out, and a quote in a
+///   currency with no rate stopped the whole comparison back in [`rank`].
+/// - **MOQ.** The textbook legitimate difference — every supplier has its own
+///   tier and none of them is wrong about its own factory. It is already a hard
+///   ceiling in [`Requirements::max_moq`], which is where a MOQ we cannot
+///   absorb belongs; one we can absorb is not news. It is also not on
+///   [`Landed`], so the omission is structural rather than a line somebody
+///   deleted.
+/// - **Quantity breaks.** Not modelled. `Quote::quantity` is the RFQ's, the
+///   same for every quote in a round by construction, and a caller who varies
+///   it has already made [`rank`]'s ordering meaningless.
+/// - **Sample availability, certifications, the supplier's prose.** Claims
+///   rather than prices, and two suppliers making different claims is a fact
+///   about marketing.
+///
+/// # This does not feed reputation, on purpose
+///
+/// There is no new `Evidence` variant and no new `supplier_observations.kind`
+/// behind this, and that is a decision rather than an omission. Every kind that
+/// table accepts is adjudicated by something outside the quote — a delivery
+/// date, an inspection, a dispute somebody filed — and the CHECK constraint
+/// makes each row name the RFQ or purchase order that proves it. A divergence
+/// is adjudicated by nobody by design, so it has no truth value to fold into a
+/// score.
+///
+/// Worse, it would invert: an observation for "quoted unlike the others" scores
+/// suppliers by their distance from the consensus, and wired to [`shortlist`]
+/// it would quietly converge the panel on the suppliers who agree with each
+/// other. That is the shape of the thing a buyer is meant to be watching for,
+/// rebuilt as a machine that rewards it.
+pub fn disagreement(landed: &[Landed]) -> Vec<Divergence> {
+    [
+        divergence(landed, Comparable::LandedTotal, |l| l.total.minor()),
+        divergence(landed, Comparable::LeadTimeDays, |l| {
+            u64::from(l.lead_time_days)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The gap between the extremes of one field, if it is wide enough to report.
+fn divergence(
+    landed: &[Landed],
+    field: Comparable,
+    value: impl Fn(&Landed) -> u64,
+) -> Option<Divergence> {
+    if landed.len() < 2 {
+        return None;
+    }
+    // Ties on the value break on the address, so the pair named is the same one
+    // whatever order the quotes came back in — the same reproducibility `rank`
+    // takes its third sort key for.
+    let low = landed.iter().min_by_key(|l| (value(l), &l.supplier))?;
+    let high = landed.iter().max_by_key(|l| (value(l), &l.supplier))?;
+    let (low_value, high_value) = (value(low), value(high));
+
+    // u128 so a pathological pair cannot wrap the ×10_000, and `max(1)` because
+    // a lead time can legitimately be zero — an ex-stock supplier against a
+    // 40-day one is a divergence, not a division by zero.
+    let spread_bps =
+        u64::try_from(u128::from(high_value - low_value) * 10_000 / u128::from(low_value.max(1)))
+            .unwrap_or(u64::MAX);
+
+    (spread_bps >= field.threshold_bps()).then(|| Divergence {
+        field,
+        low: low.supplier.clone(),
+        low_value,
+        high: high.supplier.clone(),
+        high_value,
+        spread_bps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,8 +1314,10 @@ mod tests {
     use agentos_providers::email::MockEmailProvider;
     use agentos_providers::telephony::MockTelephony;
     use agentos_store::db::Db;
+    use agentos_store::sourcing as sourcing_store;
     use async_trait::async_trait;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
     use crate::effects::{McpCaller, PaymentInstruction, PaymentProvider, Ports};
@@ -1523,6 +1822,335 @@ mod tests {
                 .convert(Money::new(1, Cny).expect("nonzero")),
             Ok(1)
         );
+    }
+
+    // -- the shortlist -----------------------------------------------------
+
+    /// A supplier we have asked `missed` times and who answered `returned` of
+    /// them. Only those two counters are read by [`shortlist`]; the rest are
+    /// filled coherently so the fixture cannot claim something the view could
+    /// not produce.
+    fn record(returned: i64, missed: i64) -> Reputation {
+        Reputation {
+            supplier_id: Uuid::nil(),
+            observation_count: returned + missed,
+            quotes_returned: returned,
+            quotes_missed: missed,
+            delivered_on_time: 0,
+            delivered_late: 0,
+            quality_accepted: 0,
+            quality_rejected: 0,
+            disputes: 0,
+            on_time_rate_pct: None,
+            response_rate_pct: (returned + missed > 0).then(|| {
+                i32::try_from(100 * returned / (returned + missed)).expect("a percentage")
+            }),
+            quality_rate_pct: None,
+            last_observed_at: now(),
+        }
+    }
+
+    /// The shortlist moves when the evidence does — through the real view, so
+    /// the claim covers the columns and not just the struct.
+    ///
+    /// Four qualified suppliers. One has ignored every RFQ we ever sent it, and
+    /// stops being asked; the moment it answers one, it is asked again.
+    #[tokio::test]
+    async fn the_shortlist_narrows_when_the_evidence_does() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+
+        let rfq_row = Uuid::now_v7();
+        sourcing_store::insert_rfq(
+            &mut tx,
+            rfq_row,
+            &sourcing_store::NewRfq {
+                employee_id: None,
+                title: "RFQ 4471: 5000 aluminium brackets",
+                product_category: "fasteners",
+                quantity: 5_000,
+                unit: "pcs",
+                incoterm: None,
+                destination_country: "DE",
+                currency: Eur,
+                target_unit_price: None,
+                closes_at: None,
+            },
+        )
+        .await
+        .expect("rfq");
+
+        // Four suppliers: one that answers, one that has never answered four
+        // asks, and two we have never contacted at all.
+        let who = [
+            ("sales@answers.example.com", 1, 3),
+            ("sales@silent.example.com", 0, IGNORED_RFQS_BEFORE_DROPPING),
+            ("sales@newone.example.com", 0, 0),
+            ("sales@newtwo.example.com", 0, 0),
+        ];
+        let mut rows = Vec::new();
+        for (raw, returned, missed) in who {
+            let supplier = Uuid::now_v7();
+            sourcing_store::insert_supplier(
+                &mut tx,
+                supplier,
+                &sourcing_store::NewSupplier {
+                    legal_name: raw,
+                    country: "DE",
+                    categories: &["fasteners".to_owned()],
+                    website: None,
+                },
+            )
+            .await
+            .expect("supplier");
+            for (n, observation) in std::iter::repeat_n(
+                sourcing_store::Observation::QuoteReturned { rfq_id: rfq_row },
+                usize::try_from(returned).expect("small"),
+            )
+            .chain(std::iter::repeat_n(
+                sourcing_store::Observation::QuoteMissed { rfq_id: rfq_row },
+                usize::try_from(missed).expect("small"),
+            ))
+            .enumerate()
+            {
+                sourcing_store::record_observation(
+                    &mut tx,
+                    Uuid::now_v7(),
+                    supplier,
+                    observation,
+                    now() + chrono::TimeDelta::minutes(i64::try_from(n).expect("small")),
+                )
+                .await
+                .expect("observation");
+            }
+            rows.push((raw, supplier));
+        }
+
+        // What the buyer would ask, read straight off the view.
+        async fn panel(
+            tx: &mut agentos_store::db::TenantTx<'_>,
+            rows: &[(&str, Uuid)],
+        ) -> Vec<(EmailAddress, Option<Reputation>)> {
+            let mut panel = Vec::new();
+            for (raw, supplier) in rows {
+                panel.push((
+                    address(raw),
+                    sourcing_store::reputation(tx, *supplier)
+                        .await
+                        .expect("read reputation"),
+                ));
+            }
+            panel
+        }
+
+        let before = panel(&mut tx, &rows).await;
+        // The view is where the claim actually lives: "never answered" has to
+        // be four `quote_missed` rows and zero `quote_returned` ones.
+        assert_eq!(before[1].1.as_ref().expect("observed").quotes_missed, 4);
+        assert_eq!(before[1].1.as_ref().expect("observed").quotes_returned, 0);
+        assert!(
+            before[2].1.is_none(),
+            "a supplier nobody has observed has no record, which is not a bad one"
+        );
+
+        let asked = shortlist(&before);
+        assert_eq!(
+            asked,
+            vec![
+                address("sales@answers.example.com"),
+                address("sales@newone.example.com"),
+                address("sales@newtwo.example.com"),
+            ],
+            "four asks and never an answer stops earning outreach; \
+             never having been asked does not"
+        );
+
+        // One answer — from any channel, on any RFQ — and they are back.
+        sourcing_store::record_observation(
+            &mut tx,
+            Uuid::now_v7(),
+            rows[1].1,
+            sourcing_store::Observation::QuoteReturned { rfq_id: rfq_row },
+            now() + chrono::TimeDelta::hours(1),
+        )
+        .await
+        .expect("observation");
+
+        let after = panel(&mut tx, &rows).await;
+        assert_eq!(
+            shortlist(&after).len(),
+            4,
+            "the shortlist follows the evidence: {after:?}"
+        );
+        tx.commit().await.expect("commit");
+    }
+
+    /// The floor outranks the evidence, and there is no explore/exploit dice
+    /// roll underneath it.
+    #[test]
+    fn the_shortlist_never_narrows_past_the_floor() {
+        let silent = |raw: &str| (address(raw), Some(record(0, 10)));
+        let three = [
+            silent("a@supplier.example.com"),
+            silent("b@supplier.example.com"),
+            silent("c@supplier.example.com"),
+        ];
+        assert_eq!(
+            shortlist(&three).len(),
+            MIN_SHORTLIST,
+            "below the floor the evidence has stopped buying anything"
+        );
+
+        // One returned quote, ever, is enough to stay on the list — the rule is
+        // a count of silences and not a rate, so a 1-in-11 supplier is kept
+        // while a 0-in-4 one is not.
+        let mixed = [
+            (address("a@supplier.example.com"), Some(record(1, 10))),
+            silent("b@supplier.example.com"),
+            (address("c@supplier.example.com"), None),
+            (address("d@supplier.example.com"), Some(record(0, 3))),
+        ];
+        assert_eq!(
+            shortlist(&mixed),
+            vec![
+                address("a@supplier.example.com"),
+                address("c@supplier.example.com"),
+                address("d@supplier.example.com"),
+            ]
+        );
+        // Deterministic, and in the order it was given: no sampling anywhere.
+        assert_eq!(shortlist(&mixed), shortlist(&mixed));
+        assert!(shortlist(&[]).is_empty());
+    }
+
+    // -- the disagreement probe --------------------------------------------
+
+    /// The false positive the probe exists to not generate.
+    ///
+    /// A €6.00 EXW quote and a €10.70 DDP quote on this lane land at exactly
+    /// the same €1,070.00. They differ in incoterm and in unit price and they
+    /// agree completely, which is the whole point of normalising first.
+    #[test]
+    fn two_quotes_differing_only_by_incoterm_do_not_diverge() {
+        let lane = Lane {
+            export_handling_minor: 5_000,
+            freight_minor: 30_000,
+            insurance_minor: 2_000,
+            clearance_minor: 4_000,
+            last_mile_minor: 3_000,
+            duty_bps: 500,
+            ..Lane::new(Eur)
+        };
+        let fx = Fx::new(Eur);
+        let exw = quoted(eur(600), Incoterm::Exw, 30);
+        let ddp = quoted(eur(1_070), Incoterm::Ddp, 30);
+        let panel = |a: &buying::Quote, b: &buying::Quote| {
+            rank(
+                &[
+                    Quote::live_at(a, address("sales@exw.example.com"), 100, now())
+                        .expect("standing"),
+                    Quote::live_at(b, address("sales@ddp.example.com"), 100, now())
+                        .expect("standing"),
+                ],
+                &lane,
+                &fx,
+            )
+            .expect("no conversion needed")
+        };
+
+        let landed = panel(&exw, &ddp);
+        // Not vacuous: the terms really do differ and the totals really are the
+        // same. €600 goods + €30 duty + €440 legs, against €1070 all-in.
+        assert_ne!(landed[0].incoterm, landed[1].incoterm);
+        assert_eq!(landed[0].total, landed[1].total);
+        assert_eq!(landed[0].total, eur(107_000));
+        assert_eq!(
+            disagreement(&landed),
+            vec![],
+            "a differing incoterm is what landed_cost removed, not a divergence"
+        );
+        // Neither is one quote on its own, whatever it says.
+        assert!(disagreement(&landed[..1]).is_empty());
+
+        // The two things it does report. A 40% spread on the landed total...
+        let dear = quoted(eur(1_500), Incoterm::Ddp, 30);
+        assert_eq!(
+            disagreement(&panel(&exw, &dear)),
+            vec![Divergence {
+                field: Comparable::LandedTotal,
+                low: address("sales@exw.example.com"),
+                low_value: 107_000,
+                high: address("sales@ddp.example.com"),
+                high_value: 150_000,
+                spread_bps: 4_018,
+            }]
+        );
+        // ...and 30 days against 90 on the same lane, with the prices agreeing.
+        let slow = quoted(eur(1_070), Incoterm::Ddp, 90);
+        assert_eq!(
+            disagreement(&panel(&exw, &slow)),
+            vec![Divergence {
+                field: Comparable::LeadTimeDays,
+                low: address("sales@exw.example.com"),
+                low_value: 30,
+                high: address("sales@ddp.example.com"),
+                high_value: 90,
+                spread_bps: 20_000,
+            }]
+        );
+        // 30 against 38 is not news, and neither is 3% on the total.
+        let brisk = quoted(eur(1_100), Incoterm::Ddp, 38);
+        assert!(disagreement(&panel(&exw, &brisk)).is_empty());
+        assert_eq!(Comparable::LandedTotal.code(), "landed_total");
+    }
+
+    /// The property `rank`'s third sort key exists for, unchanged: reputation
+    /// went into the shortlist and stayed out of the ordering.
+    #[test]
+    fn ranking_stays_reproducible_whatever_the_evidence_says() {
+        let lane = Lane {
+            freight_minor: 30_000,
+            duty_bps: 500,
+            ..Lane::new(Eur)
+        };
+        let fx = Fx::new(Eur);
+        // Two quotes that tie on landed total *and* on lead time, so only the
+        // address can separate them, plus a cheaper third.
+        let same = quoted(eur(1_000), Incoterm::Ddp, 30);
+        let cheap = quoted(eur(900), Incoterm::Ddp, 30);
+        fn by<'a>(raw: &str, q: &'a buying::Quote) -> Quote<'a> {
+            Quote::live_at(q, address(raw), 100, now()).expect("standing")
+        }
+        let order = |quotes: [Quote<'_>; 3]| {
+            rank(&quotes, &lane, &fx)
+                .expect("no conversion needed")
+                .into_iter()
+                .map(|l| l.supplier)
+                .collect::<Vec<_>>()
+        };
+
+        let expected = vec![
+            address("c@supplier.example.com"),
+            address("a@supplier.example.com"),
+            address("b@supplier.example.com"),
+        ];
+        // Every arrival order of the same three quotes, and one ordering.
+        for permutation in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let quotes = permutation.map(|i| match i {
+                0 => by("a@supplier.example.com", &same),
+                1 => by("b@supplier.example.com", &same),
+                _ => by("c@supplier.example.com", &cheap),
+            });
+            assert_eq!(order(quotes), expected, "arrival order {permutation:?}");
+        }
     }
 
     // -- qualification -----------------------------------------------------

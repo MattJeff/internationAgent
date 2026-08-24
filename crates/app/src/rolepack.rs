@@ -918,7 +918,7 @@ mod tests {
                 .with_credential(
                     &SecretRef::new(tenant, employee, "alibaba-api-key").expect("secret name"),
                 )
-                .render()
+                .render(TrustLabel::Trusted)
         };
         let a = prompt_for(lena);
         let b = prompt_for(marco);
@@ -936,8 +936,10 @@ mod tests {
         // The fragment itself is a constant: same bytes, every construction.
         assert_eq!(buyer.briefing(), RolePack::international_buyer().briefing());
         assert_eq!(
-            buyer.system_prompt().render(),
-            RolePack::international_buyer().system_prompt().render()
+            buyer.system_prompt().render(TrustLabel::Trusted),
+            RolePack::international_buyer()
+                .system_prompt()
+                .render(TrustLabel::Trusted)
         );
 
         // The two things that silently poison a prefix.

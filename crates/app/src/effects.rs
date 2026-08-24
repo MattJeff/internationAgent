@@ -251,7 +251,7 @@ pub struct PaymentInstruction {
 }
 
 // ---------------------------------------------------------------------------
-// The two ports this workspace has no adapter for yet
+// The two ports whose adapters are not in `agentos-providers`
 // ---------------------------------------------------------------------------
 
 /// Calling a tool on an MCP server.
@@ -261,9 +261,15 @@ pub struct PaymentInstruction {
 /// a bare `Value` would let tool output reach a prompt with no wrapper to grep
 /// for.
 ///
-/// ponytail: declared here rather than in `agentos-providers` because that
-/// crate has no MCP adapter and this is its only consumer. Move it there when
-/// a second one appears.
+/// The implementation is [`crate::mcp::Fleet`], which routes on the tool's
+/// server handle across everything one tenant has bound;
+/// [`crate::mocks::ports`] still hands out a refusing stub, because a process
+/// with no tenant in hand has nothing to bind.
+///
+/// ponytail: declared here rather than in `agentos-providers` because the MCP
+/// client lives in this crate — it needs the domain's risk vocabulary and the
+/// gate's decisions, neither of which a provider adapter may see. Move it the
+/// day a second consumer appears.
 #[async_trait]
 pub trait McpCaller: Send + Sync {
     /// Invoke `tool` with `arguments`.

@@ -25,6 +25,11 @@ async-trait = "0.1"
 axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+# Ed25519 signing. Default features only: "zeroize" is one of them, and the
+# "rand_core" feature is deliberately NOT enabled — it wants rand_core 0.6 while
+# the workspace is on rand 0.9, and seeding from `rand::rng()` avoids carrying
+# two copies of rand_core for one 32-byte fill.
+ed25519-dalek = "2"
 hmac = "0.12"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -106,6 +106,9 @@ pub enum AuditKind {
     ApprovalDecided,
     MessageReceived,
     MessageSent,
+    /// An employee signed a payload with its own key. A signature is an
+    /// assertion made in the company name, so it leaves a row like any other.
+    MessageSigned,
     ProviderCallAttempted,
     SecretAccessed,
     PolicyChanged,
@@ -123,6 +126,7 @@ impl AuditKind {
             AuditKind::ApprovalDecided => "approval_decided",
             AuditKind::MessageReceived => "message_received",
             AuditKind::MessageSent => "message_sent",
+            AuditKind::MessageSigned => "message_signed",
             AuditKind::ProviderCallAttempted => "provider_call_attempted",
             AuditKind::SecretAccessed => "secret_accessed",
             AuditKind::PolicyChanged => "policy_changed",

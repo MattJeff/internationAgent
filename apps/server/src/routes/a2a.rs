@@ -162,9 +162,21 @@ pub fn card_router(state: A2aState) -> Router {
 /// Optional, because the common deployment is one employee per public host and
 /// a discovery URL with a query string is a discovery URL people mistype. The
 /// card it produces advertises the explicit form, so a peer never has to guess.
+///
+/// Shared with [`crate::routes::well_known`], which scopes the public key
+/// directory the same way: two unauthenticated root endpoints that answer
+/// "which employee is this about" differently would be two answers a verifier
+/// has to reconcile.
 #[derive(Debug, Deserialize)]
 pub struct Which {
     employee: Option<String>,
+}
+
+impl Which {
+    /// The employee named in the query string, if the caller named one.
+    pub fn employee(&self) -> Option<&str> {
+        self.employee.as_deref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +719,10 @@ async fn resolve_employee(
 /// a published card always has `?employee=`, because that is the URL the card
 /// advertises. The upgrade, when one host really does serve many tenants, is a
 /// `Host`-header to tenant map read here.
-async fn discover(db: &Db, named: Option<&str>) -> Result<(TenantId, EmployeeId), ApiError> {
+pub(crate) async fn discover(
+    db: &Db,
+    named: Option<&str>,
+) -> Result<(TenantId, EmployeeId), ApiError> {
     let named: Option<Uuid> = match named {
         Some(raw) => Some(
             raw.parse()

@@ -16,5 +16,6 @@ pub mod policy; // U41
 pub mod provisioning; // U8
 pub mod psyche;
 pub mod revenue; // wave 12: seller vertical
+pub mod signing;
 pub mod sourcing;
 pub mod spend; // U12

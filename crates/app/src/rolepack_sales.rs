@@ -1032,7 +1032,7 @@ mod tests {
                 .with_credential(
                     &SecretRef::new(tenant, employee, "resend-api-key").expect("secret name"),
                 )
-                .render()
+                .render(TrustLabel::Trusted)
         };
         let a = prompt_for(ines);
         let b = prompt_for(tomas);
@@ -1046,8 +1046,10 @@ mod tests {
 
         assert_eq!(sales.briefing(), RolePack::sales_development().briefing());
         assert_eq!(
-            sales.system_prompt().render(),
-            RolePack::sales_development().system_prompt().render()
+            sales.system_prompt().render(TrustLabel::Trusted),
+            RolePack::sales_development()
+                .system_prompt()
+                .render(TrustLabel::Trusted)
         );
 
         // The things that silently poison a prefix.
