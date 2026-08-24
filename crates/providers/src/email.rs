@@ -45,7 +45,10 @@ use serde::Deserialize;
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{EnsureCtx, FaultMode, ProviderError, Provisioned, Secret};
+use crate::{
+    EnsureCtx, FaultMode, ProviderBinding, ProviderError, Provisioned, RELEASE_NOT_SUPPORTED,
+    Secret,
+};
 
 /// The provider's own id for a message. Same newtype the domain already uses
 /// for provider handles — a second one would only need converting.
@@ -426,6 +429,16 @@ pub trait EmailProvider: Send + Sync {
     /// [`EnsureCtx::tag`] before creating anything. See the crate docs.
     async fn ensure_identity(&self, ctx: &EnsureCtx) -> Result<Provisioned, ProviderError>;
 
+    /// Give the sending identity back.
+    ///
+    /// Idempotent and tolerant of an identity that is already gone — see the
+    /// crate-level release contract. An adapter whose identity is shared by
+    /// every employee on the tenant (one verified sending domain, say) cannot
+    /// honour this for a single employee and must return `Terminal { code:
+    /// `[`crate::RELEASE_NOT_SUPPORTED`]` }` rather than deleting it out from
+    /// under everybody else.
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError>;
+
     /// Send one email. Idempotent on `key`: the same key must return the same
     /// [`ProviderMessageId`] and must not send a second copy.
     async fn send(
@@ -581,6 +594,19 @@ impl EmailProvider for MockEmailProvider {
         // buys a second one — unless the lookup above runs first next time.
         self.fault.check_after()?;
         Ok(Provisioned::new(Self::PROVIDER, external_id))
+    }
+
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError> {
+        self.fault.check_before()?;
+        // Indexed by tag, released by id: a caller holding a binding has the
+        // id, not the tag it was created under. An identity that is not there
+        // is already the state we were asked for.
+        self.state
+            .lock()
+            .expect("mock state poisoned")
+            .identities
+            .retain(|_, id| *id != binding.external_id);
+        Ok(())
     }
 
     async fn send(
@@ -786,6 +812,26 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P) {
         CanonicalMessage::dedupe_key(employee_id, Channel::Email, &raw.provider_message_id),
         "inbound dedupe must use the canonical key so a redelivered webhook collapses"
     );
+
+    // -- release is idempotent, or honestly refuses ------------------------
+    // Last, because it destroys `other`. Two acceptable answers and no third:
+    // an adapter that cannot give a resource back must say so rather than
+    // report a success that would clear the binding on a live resource.
+    match p.release(&other.binding()).await {
+        Ok(()) => {
+            p.release(&other.binding())
+                .await
+                .expect("releasing twice is the same desired state, not an error");
+            p.release(&ProviderBinding {
+                provider: other.provider.to_owned(),
+                external_id: "identity-that-never-existed".to_owned(),
+            })
+            .await
+            .expect("releasing what the provider no longer has is success");
+        }
+        Err(ProviderError::Terminal { code }) if code == RELEASE_NOT_SUPPORTED => {}
+        Err(err) => panic!("release must succeed or say it cannot, got {err}"),
+    }
 }
 
 #[cfg(test)]

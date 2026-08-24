@@ -221,13 +221,16 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     let loops = vec![
         (
             "provisioning",
-            tokio::spawn(ProvisioningLoop::new(db.clone(), engine).run(cancel.clone())),
+            tokio::spawn(ProvisioningLoop::new(db.clone(), engine.clone()).run(cancel.clone())),
         ),
         (
             "outbox",
             tokio::spawn(loops::outbox::run(
                 db.clone(),
-                handlers(&config, agent),
+                // The same engine the provisioning loop drives: termination
+                // releases through it, and a second one would be a second set
+                // of adapters that has never heard of the first's resources.
+                handlers(&config, agent, engine),
                 cancel.clone(),
             )),
         ),
@@ -367,16 +370,16 @@ fn webhooks(config: &Config) -> Webhooks {
 /// easy to miss: forgetting a row is a side effect that silently never
 /// happens, *and* a permanently unpublished row, which `/readyz` eventually
 /// reports as lag. If you add an `enqueue` anywhere, add a line here.
-fn handlers(config: &Config, agent: Agent) -> Handlers {
+fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handlers {
     let mut handlers = Handlers::default()
         .on(routes::employees::CREATED_EVENT, Arc::new(on_created))
         .on(
             routes::employees::lifecycle_event(Lifecycle::Suspended),
-            Arc::new(on_lifecycle),
+            Arc::new(on_suspended),
         )
         .on(
             routes::employees::lifecycle_event(Lifecycle::Terminated),
-            Arc::new(on_lifecycle),
+            Arc::new(move |event, tx| on_terminated(engine.clone(), event, tx)),
         )
         .on("employee.step.ready", Arc::new(on_step_ready))
         .on("employee.step.pending_external", Arc::new(on_step_noted))
@@ -502,22 +505,111 @@ fn field<'a>(event: &'a OutboxEvent, key: &str) -> &'a str {
         .unwrap_or("?")
 }
 
-/// `employee.suspended` / `employee.terminated`: recorded, and nothing else.
+/// `employee.suspended`: recorded, and nothing else.
 ///
-/// ponytail: **this is a stub, and the gap is real.** Terminating an employee
-/// should release what it holds — cancel the phone number, close the mailbox,
-/// revoke the browser context — and that is a provider call per bound
-/// resource, which needs an `Authorized<A>` and a `release` on each adapter
-/// that no adapter has. Until then a terminated employee stops being able to
-/// act (the gate refuses anything that is not `Active`) but is still billed
-/// for its number. The upgrade is a `release_step` on the provisioning engine
-/// and this handler calling it per bound resource.
-fn on_lifecycle<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+/// Suspension is a pause, not an end: the employee must stop acting, which the
+/// gate already enforces, and its resources must survive so that resuming it is
+/// one lifecycle change rather than a re-provisioning. Releasing here would
+/// make "suspend" quietly mean "buy a new phone number next week".
+fn on_suspended<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
     Box::pin(async move {
-        tracing::warn!(
+        tracing::info!(
             employee_id = %event.aggregate_id,
-            event_type = %event.event_type,
-            "lifecycle change recorded; provider resources are NOT released — see on_lifecycle"
+            "employee suspended; resources deliberately kept so a resume is free"
+        );
+        Ok(())
+    })
+}
+
+/// `employee.terminated`: give every provider resource back.
+///
+/// The other half of termination. The gate already refuses to let a
+/// non-`Active` employee act; without this it would go on paying for the phone
+/// number, the browser context and the vault it can no longer use.
+///
+/// Two things make this safe to hang off a retried outbox event:
+///
+/// * `release_all` is idempotent — a second run reports `NotBound` for
+///   everything the first freed and retries only what failed.
+/// * A refusal returns `Err`, so the event comes back on the outbox's own
+///   backoff and is dead-lettered rather than forgotten if it keeps failing.
+///   The binding is still on the row the whole time, which is what says *what*
+///   is still being billed.
+///
+/// The engine opens its own transactions: a provider call must not happen with
+/// one held, and the handler's `tx` is the outbox's, not ours to stretch.
+fn on_terminated<'a>(
+    engine: ProvisioningEngine,
+    event: &'a OutboxEvent,
+    tx: &'a mut TenantTx<'_>,
+) -> Handled<'a> {
+    Box::pin(async move {
+        let id = EmployeeId::from_uuid(event.aggregate_id);
+        let stored = employee_store::load(tx, id)
+            .await
+            .map_err(|err| format!("could not load the employee: {err}"))?;
+        let employee = stored.employee;
+
+        // A terminate event for an employee that is not terminated is a stale
+        // event, and releasing on one would be a webhook taking somebody's
+        // phone number away.
+        if employee.lifecycle() != Lifecycle::Terminated {
+            tracing::warn!(
+                employee_id = %event.aggregate_id,
+                lifecycle = %employee.lifecycle(),
+                "ignoring a termination event for an employee that is not terminated"
+            );
+            return Ok(());
+        }
+
+        let reports = engine
+            .release_all(&employee)
+            .await
+            .map_err(|err| format!("could not release the employee's resources: {err}"))?;
+
+        let stuck: Vec<String> = reports
+            .iter()
+            .filter(|(_, report)| !report.is_done())
+            .filter(|(_, report)| report.code() != agentos_app::provisioning::RELEASE_NOT_SUPPORTED)
+            .map(|(step, report)| format!("{step}={}", report.code()))
+            .collect();
+
+        // A provider that *structurally cannot* release — Resend's sending
+        // domain is shared across the tenant, so deleting it on one
+        // termination would take everyone's email down — is not a transient
+        // failure, and retrying it eight times before dead-lettering would
+        // make every single termination end in the dead-letter queue. Separate
+        // the impossible from the merely failed: the impossible gets an
+        // operator alert and a binding left in place (the external id is the
+        // only record of what a human still has to cancel), and the event
+        // completes.
+        let manual: Vec<String> = reports
+            .iter()
+            .filter(|(_, report)| report.code() == agentos_app::provisioning::RELEASE_NOT_SUPPORTED)
+            .map(|(step, _)| step.to_string())
+            .collect();
+        if !manual.is_empty() {
+            tracing::error!(
+                employee_id = %event.aggregate_id,
+                steps = %manual.join(","),
+                "employee terminated but these resources CANNOT be released by their provider \
+                 and are still being billed - they need cancelling by hand"
+            );
+        }
+
+        if !stuck.is_empty() {
+            // Retried, then dead-lettered. Either way it is somebody's problem
+            // rather than nobody's, and the bindings are still on the rows.
+            return Err(format!(
+                "terminated, but these resources are still bound and still billed: {}",
+                stuck.join(",")
+            ));
+        }
+
+        tracing::info!(
+            employee_id = %event.aggregate_id,
+            steps = reports.len(),
+            "employee terminated; every provider resource released"
         );
         Ok(())
     })
@@ -1445,18 +1537,23 @@ mod tests {
         database: String,
     }
 
-    async fn land_a_message(body: &str) -> Option<Landed> {
+    /// A migrated database of this test's own, plus what it takes to drop it.
+    ///
+    /// The real outbox poller is cross-tenant by design, so any test that runs
+    /// one has to own its database or it will claim, answer and burn attempts
+    /// off every other test's events.
+    async fn own_database(prefix: &str) -> Option<(Db, String, String)> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the agent turn needs a real Postgres");
+            eprintln!("SKIP: DATABASE_URL is unset; this test needs a real Postgres");
             return None;
         };
         let (base_url, _) = url.rsplit_once('/').expect("DATABASE_URL has a path");
         let admin_url = format!("{base_url}/postgres");
-        let database = format!("turn_{}", Uuid::now_v7().simple());
+        let database = format!("{prefix}_{}", Uuid::now_v7().simple());
         let admin = sqlx::PgPool::connect(&admin_url).await.expect("postgres");
-        // No bind parameters on CREATE DATABASE. The name is `turn_` plus the
-        // hex of a UUID minted two lines up, which is the audit AssertSqlSafe
-        // is asking for.
+        // No bind parameters on CREATE DATABASE. The name is a fixed prefix
+        // plus the hex of a UUID minted two lines up, which is the audit
+        // AssertSqlSafe is asking for.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .execute(&admin)
             .await
@@ -1467,6 +1564,26 @@ mod tests {
             .await
             .expect("connect");
         db.migrate().await.expect("migrate");
+        Some((db, admin_url, database))
+    }
+
+    /// The database goes with the test. A panic leaks one, which is a named
+    /// database an operator can drop — cheaper than a guard that runs during
+    /// unwinding.
+    async fn drop_database(db: Db, admin_url: String, database: String) {
+        drop(db);
+        if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {database} (FORCE)"
+            )))
+            .execute(&admin)
+            .await;
+            admin.close().await;
+        }
+    }
+
+    async fn land_a_message(body: &str) -> Option<Landed> {
+        let (db, admin_url, database) = own_database("turn").await?;
 
         let now = Utc::now();
         let tenant = TenantId::new_v7(now);
@@ -1622,20 +1739,8 @@ mod tests {
             row
         }
 
-        /// The database goes with the test. A panic leaks one, which is a
-        /// `turn_<uuid>` an operator can drop — cheaper than a guard that runs
-        /// during unwinding.
         async fn teardown(self) {
-            let (admin_url, database) = (self.admin_url, self.database);
-            drop(self.db);
-            if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
-                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DROP DATABASE IF EXISTS {database} (FORCE)"
-                )))
-                .execute(&admin)
-                .await;
-                admin.close().await;
-            }
+            drop_database(self.db, self.admin_url, self.database).await;
         }
     }
 
@@ -1741,6 +1846,184 @@ mod tests {
         assert!(body.contains("not acted"), "{body}");
 
         landed.teardown().await;
+    }
+
+    // -- termination releases what the employee holds ----------------------
+
+    /// The wire, end to end and through the real dispatch table: the event the
+    /// terminate endpoint files, the table [`handlers`] builds, the real outbox
+    /// poller, and a real [`ProvisioningEngine`].
+    ///
+    /// The regression it guards is not subtle — before this handler existed, a
+    /// terminated employee kept its phone number and kept being invoiced for
+    /// it, forever, and nothing anywhere said so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminated_employee_has_its_resources_released_by_the_outbox() {
+        use agentos_domain::employee::{ProviderBinding, ResourceState};
+        use agentos_store::outbox::{self, NewEvent};
+
+        let Some((db, admin_url, database)) = own_database("terminate").await else {
+            return;
+        };
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::from_uuid(Uuid::now_v7());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("term-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        // An employee in the state termination actually finds one in: every
+        // step ready and every step naming a resource somebody is billing for.
+        let mut employee = Employee::new(
+            employee_id,
+            tenant,
+            Slug::parse("lena").expect("slug"),
+            Domain::parse("agents.example.com").expect("domain"),
+            now,
+        );
+        employee
+            .set_lifecycle(Lifecycle::Active, now)
+            .expect("draft to active");
+        for step in Step::ALL {
+            employee
+                .set_resource(step, ResourceState::Provisioning, now)
+                .expect("pending -> provisioning");
+        }
+        // By fixpoint: `Step::ALL` is the workflow order, not the dependency
+        // order, so `Browser` cannot go ready on the first pass.
+        for _ in 0..Step::ALL.len() {
+            for step in Step::ALL {
+                let _ = employee.set_resource(step, ResourceState::Ready, now);
+            }
+        }
+        for step in Step::ALL {
+            employee
+                .bind(
+                    step,
+                    ProviderBinding::new("mock", format!("{step}-{}", employee_id.as_uuid())),
+                    now,
+                )
+                .expect("bind");
+        }
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let version = employee_store::insert(&mut tx, &employee)
+            .await
+            .expect("insert employee");
+        tx.commit().await.expect("commit employee");
+
+        // What `POST /v1/employees/{id}/terminate` does: the lifecycle move and
+        // the event, in one transaction.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        employee
+            .set_lifecycle(Lifecycle::Terminated, now)
+            .expect("active -> terminated");
+        employee_store::update(&mut tx, &employee, version)
+            .await
+            .expect("update");
+        outbox::enqueue(
+            &mut tx,
+            &NewEvent::new(
+                routes::employees::AGGREGATE,
+                employee_id.as_uuid(),
+                routes::employees::lifecycle_event(Lifecycle::Terminated),
+            ),
+            now,
+        )
+        .await
+        .expect("enqueue");
+        tx.commit().await.expect("commit termination");
+
+        // The real table, built by the function the binary calls at boot: an
+        // event type nobody registered would fail here rather than be skipped.
+        let cancel = CancellationToken::new();
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            agentos_app::mocks::adapters(),
+            EngineConfig::default(),
+        );
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
+            gate: PolicyGate::new(db.clone(), PolicyBook::default()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            model: "claude-opus-5",
+            cancel: cancel.clone(),
+        };
+        let poller = tokio::spawn(loops::outbox::run(
+            db.clone(),
+            handlers(&test_config(tenant), agent, engine),
+            cancel.clone(),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let published: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM outbox_events WHERE published_at IS NOT NULL",
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+            tx.rollback().await.expect("rollback");
+            if published == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the termination event was never handled: is employee.terminated registered?"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        poller.await.expect("the poller task");
+
+        // Nothing left naming a provider resource, and the employee is still
+        // terminated: releasing is not a way back into service.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let stored = employee_store::load(&mut tx, employee_id)
+            .await
+            .expect("load");
+        tx.rollback().await.expect("rollback");
+
+        let still_bound: Vec<Step> = Step::ALL
+            .into_iter()
+            .filter(|step| stored.employee.resource(*step).binding().is_some())
+            .collect();
+        assert!(
+            still_bound.is_empty(),
+            "these resources are still bound, so still billed: {still_bound:?}"
+        );
+        assert_eq!(stored.employee.lifecycle(), Lifecycle::Terminated);
+
+        drop_database(db, admin_url, database).await;
+    }
+
+    /// A [`Config`] with nothing in it but what [`handlers`] reads.
+    fn test_config(tenant: TenantId) -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            public_host: "http://localhost".to_owned(),
+            agent_email_domain: "agents.example.com".to_owned(),
+            database_url: String::new(),
+            master_key: String::new(),
+            allow_mocks: true,
+            llm: agentos_app::mocks::LlmBackend::Mock,
+            anthropic_api_key: None,
+            rust_log: "info".to_owned(),
+            api_keys: ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
+                .expect("keyring"),
+            mock_adapters: Vec::new(),
+            // No provider callbacks registered, so no webhook handlers. The
+            // termination entry does not depend on any of it.
+            webhooks: Vec::new(),
+        }
     }
 
     // -- idempotency -------------------------------------------------------

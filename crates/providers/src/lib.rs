@@ -33,6 +33,27 @@
 //!
 //! [`FaultMode::FailAfterExternalSuccess`] exists to make chaos tests reproduce
 //! exactly that crash window.
+//!
+//! # The release contract, which is the same discipline pointing the other way
+//!
+//! Every `release` implementation MUST be **idempotent and tolerant of an
+//! already-gone resource**. Releasing twice, or releasing something the
+//! provider no longer has, is `Ok(())`: the caller is asserting a desired state
+//! ("this must not exist"), and if the state is already true there is nothing
+//! to report. A 404 from a delete is success, not a failure.
+//!
+//! `ensure` reconciles before it creates because a *duplicate* is the expensive
+//! mistake; `release` tolerates the missing resource because a *stranded
+//! binding nobody may clear* is. The asymmetry in the write order follows:
+//! `ensure` records its intent before it calls, `release` clears the binding
+//! only after the provider has confirmed. A crash in either gap is repaired by
+//! running the same operation again.
+//!
+//! A provider that genuinely **cannot** release something must say so —
+//! `Terminal { code: `[`RELEASE_NOT_SUPPORTED`]` }` — and must not return
+//! `Ok(())`. Pretending success clears the binding on a resource that still
+//! exists, which is precisely how a thing gets billed forever with nothing left
+//! pointing at it.
 
 pub mod browser; // U18
 pub mod email; // U16
@@ -197,6 +218,15 @@ pub enum ProviderError {
         code: &'static str,
     },
 }
+
+/// The `code` a provider returns from `release` when it has no way to give the
+/// resource back.
+///
+/// Not a transport failure and not something a retry fixes: the resource is
+/// still there, still billed, and the binding must stay put so somebody can
+/// still find it. The engine records it as a failed release rather than
+/// clearing the binding.
+pub const RELEASE_NOT_SUPPORTED: &str = "release_not_supported";
 
 impl ProviderError {
     /// Default backoff when the provider gives no advice.

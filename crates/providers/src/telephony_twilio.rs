@@ -44,7 +44,7 @@ use crate::telephony::{
     InboundCtx, OutboundSms, OutboundWhatsapp, PROVIDER, ParseError, ProviderMessageId, Region,
     SigError, TelephonyProvider, WebhookBody, normalize_twilio_form, verify_twilio_signature,
 };
-use crate::{EnsureCtx, ProviderError, Provisioned, Secret};
+use crate::{EnsureCtx, ProviderBinding, ProviderError, Provisioned, Secret};
 
 /// Twilio's public API root.
 pub const API_ROOT: &str = "https://api.twilio.com";
@@ -346,6 +346,22 @@ impl TelephonyProvider for TwilioTelephony {
         }
     }
 
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError> {
+        // `DELETE IncomingPhoneNumbers/{sid}` is what actually stops the
+        // monthly charge; nothing else does.
+        let url = self.account_url(&format!(
+            "IncomingPhoneNumbers/{}.json",
+            binding.external_id
+        ));
+        match self.call(self.http.delete(url)).await {
+            Ok(_) => Ok(()),
+            // 404: somebody already released it, which is the state we asked
+            // for. Reporting it as a failure would strand the binding.
+            Err(refused) if refused.error.code() == "not_found" => Ok(()),
+            Err(refused) => Err(refused.into()),
+        }
+    }
+
     async fn send_sms(
         &self,
         key: &IdempotencyKey,
@@ -571,6 +587,27 @@ mod tests {
                 state.numbers.push((sid.clone(), name.clone()));
                 (201, json!({"sid": sid, "friendly_name": name}))
             }
+            ("DELETE", p) if p.contains("/IncomingPhoneNumbers/") => {
+                let sid = p
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".json")
+                    .to_owned();
+                let before = state.numbers.len();
+                state.numbers.retain(|(have, _)| *have != sid);
+                if state.numbers.len() == before {
+                    // Twilio's own answer for a sid it does not have, and the
+                    // one the adapter has to read as "already released".
+                    return (404, json!({"code": 20_404, "message": "not found"}));
+                }
+                // Twilio answers 204. This fake speaks a single framing —
+                // status, Content-Length, body — and a 204 carrying one is
+                // malformed HTTP that breaks the next request on the same
+                // connection. The adapter treats every 2xx alike and never
+                // reads the body, so 200 exercises the identical path.
+                (200, json!({}))
+            }
             ("GET", p) if p.contains("/AvailablePhoneNumbers/") => (
                 200,
                 json!({"available_phone_numbers": [{"phone_number": "+4930111222"}]}),
@@ -721,6 +758,37 @@ mod tests {
         assert_eq!(twilio.state().purchases, 1, "posted a second purchase");
         // And the tag we searched on is the one we stamped.
         assert_eq!(twilio.state().numbers[0].1, ctx.tag());
+    }
+
+    /// Termination has to actually stop the bill, and the retry that follows a
+    /// crashed release must not turn a freed number into a permanent error.
+    #[tokio::test]
+    async fn releasing_a_number_deletes_it_and_a_second_release_still_succeeds() {
+        let twilio = FakeTwilio::start().await;
+        let client = twilio.client();
+
+        let bought = client
+            .ensure_number(&ctx(), &Region::new("US"))
+            .await
+            .expect("purchase");
+        assert_eq!(twilio.state().numbers.len(), 1);
+
+        client
+            .release(&bought.binding())
+            .await
+            .expect("the number is given back");
+        assert_eq!(
+            twilio.state().numbers.len(),
+            0,
+            "the number is still on the account, so still on the bill"
+        );
+
+        // The fake now answers 404, exactly as Twilio does for a sid it no
+        // longer has. Already-gone is the state we asked for, so: success.
+        client
+            .release(&bought.binding())
+            .await
+            .expect("releasing a number the provider no longer has is success");
     }
 
     #[tokio::test]

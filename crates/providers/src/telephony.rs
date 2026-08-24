@@ -37,7 +37,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest as _, Sha256};
 
-use crate::{EnsureCtx, FaultMode, ProviderError, Provisioned, Secret};
+use crate::{EnsureCtx, FaultMode, ProviderBinding, ProviderError, Provisioned, Secret};
 
 /// The id a provider hands back for a message it accepted. Same newtype the
 /// canonical message stores, so no conversion is needed at the edge.
@@ -247,6 +247,13 @@ pub trait TelephonyProvider: Send + Sync {
         ctx: &EnsureCtx,
         region: &Region,
     ) -> Result<Provisioned, ProviderError>;
+
+    /// Give the number back, so it stops appearing on the bill.
+    ///
+    /// Idempotent and tolerant of a number that is already gone — see the
+    /// crate-level release contract. A 404 on the delete means somebody already
+    /// released it, which is the state we were asking for.
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError>;
 
     /// Send an SMS. Re-sending with the same `key` returns the first message's
     /// id instead of sending twice.
@@ -631,6 +638,17 @@ impl TelephonyProvider for MockTelephony {
         Ok(Provisioned::new(PROVIDER, sid))
     }
 
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError> {
+        self.fault.check_before()?;
+        // Indexed by tag, released by sid: whoever holds a binding holds the
+        // sid. A number that is not there is already the state we were asked
+        // for, so this is a `retain` rather than a lookup that can fail.
+        self.state()
+            .numbers
+            .retain(|_, sid| *sid != binding.external_id);
+        Ok(())
+    }
+
     async fn send_sms(
         &self,
         key: &IdempotencyKey,
@@ -768,11 +786,46 @@ mod tests {
         let id = provider.send_sms(&k, &sms()).await.unwrap();
         assert_eq!(provider.send_sms(&k, &sms()).await.unwrap(), id);
         assert_ne!(provider.send_sms(&key("send:2"), &sms()).await.unwrap(), id);
+
+        // Release gives the number back, twice over, and does not mind one it
+        // has never heard of: all three are the same desired state.
+        provider.release(&first.binding()).await.unwrap();
+        provider.release(&first.binding()).await.unwrap();
+        provider
+            .release(&ProviderBinding {
+                provider: PROVIDER.to_owned(),
+                external_id: "PN-never-bought".to_owned(),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn mock_satisfies_the_contract() {
-        contract_suite(&mock()).await;
+        let mock = mock();
+        contract_suite(&mock).await;
+        // Two numbers were bought and exactly one of them was given back.
+        assert_eq!(mock.number_count(), 1);
+    }
+
+    /// The termination path: a released number stops existing at the provider,
+    /// and asking again is not an error — the caller retries.
+    #[tokio::test]
+    async fn releasing_a_number_gives_it_back_and_is_safe_to_repeat() {
+        let provider = mock();
+        let bought = provider
+            .ensure_number(&ctx(), &Region::new("us"))
+            .await
+            .expect("buy");
+        assert_eq!(provider.number_count(), 1);
+
+        provider.release(&bought.binding()).await.expect("release");
+        assert_eq!(provider.number_count(), 0, "still on the bill");
+        provider
+            .release(&bought.binding())
+            .await
+            .expect("releasing twice is the same desired state");
+        assert_eq!(provider.number_count(), 0);
     }
 
     // -- reconcile before create -------------------------------------------

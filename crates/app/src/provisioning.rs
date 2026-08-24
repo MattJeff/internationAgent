@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentos_domain::action::{Action, McpTool};
-use agentos_domain::employee::{Employee, ProviderBinding, ResourceState, Step};
+use agentos_domain::employee::{Employee, Lifecycle, ProviderBinding, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, IdempotencyKey, SecretRef, Slug, TenantId};
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::email::EmailProvider;
@@ -191,6 +191,10 @@ pub enum StepReport {
     /// **Unknown outcome.** A worker died mid-call; an approval is filed and
     /// this step will not be touched again until a human reconciles it.
     Parked,
+    /// An operator suspended or terminated the employee, so nothing is
+    /// provisioned for it. Not a failure and not a wait: a refusal to spend
+    /// money on an employee that is not going to use it.
+    Inactive,
     /// Another worker holds the lease.
     Busy,
     /// Our lease lapsed and was stolen while we were talking to the provider,
@@ -216,9 +220,52 @@ impl StepReport {
             StepReport::PendingExternal { .. } => "pending_external",
             StepReport::Failed { code } => code,
             StepReport::Parked => "parked",
+            StepReport::Inactive => "inactive",
             StepReport::Busy => "busy",
             StepReport::LeaseLost => "lease_lost",
             StepReport::Blocked { .. } => "blocked",
+        }
+    }
+}
+
+// The server may not name `agentos-providers`, so the one release code it has
+// to branch on is re-exported here alongside the report that carries it.
+pub use agentos_providers::RELEASE_NOT_SUPPORTED;
+
+/// What one release came to.
+///
+/// Deliberately not a [`StepReport`]: a release has three outcomes and none of
+/// `Parked`, `Busy`, `LeaseLost` or `Blocked` is one of them. Releasing is safe
+/// to repeat and safe to race, so it needs neither a lease nor a human — see
+/// [`ProvisioningEngine::release_step`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseReport {
+    /// The resource is gone and the binding is cleared. Also the answer when
+    /// the provider had already lost it: same desired state, same report.
+    Released,
+    /// Nothing was ever bound, so there is nothing out there costing anything.
+    NotBound,
+    /// The provider would not let go. **The binding is still there**, on
+    /// purpose: the resource still exists, somebody is still being billed, and
+    /// the external id is the only thing that says what to cancel.
+    Failed {
+        /// Low-cardinality label, safe as a metric dimension.
+        code: &'static str,
+    },
+}
+
+impl ReleaseReport {
+    /// Is there nothing left to give back for this step?
+    pub const fn is_done(&self) -> bool {
+        matches!(self, ReleaseReport::Released | ReleaseReport::NotBound)
+    }
+
+    /// Stable metric label.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            ReleaseReport::Released => "released",
+            ReleaseReport::NotBound => "not_bound",
+            ReleaseReport::Failed { code } => code,
         }
     }
 }
@@ -319,6 +366,15 @@ impl ProvisioningEngine {
         employee: &Employee,
         step: Step,
     ) -> Result<StepReport, EngineError> {
+        // Nothing is bought for an employee an operator has retired. The
+        // provisioning loop's claim query already filters on lifecycle, but
+        // this engine is public and `release_all` leaves rows in `disabled` —
+        // which *is* claimable. Without this guard, converging a terminated
+        // employee buys it a fresh phone number that nobody will ever look at,
+        // one release after somebody carefully gave the old one back.
+        if !matches!(employee.lifecycle(), Lifecycle::Draft | Lifecycle::Active) {
+            return Ok(StepReport::Inactive);
+        }
         if let Some(blocker) = first_unmet(employee, step) {
             return Ok(StepReport::Blocked { on: blocker });
         }
@@ -366,6 +422,190 @@ impl ProvisioningEngine {
         };
         self.finish(employee.tenant_id(), &claim, outcome, report)
             .await
+    }
+
+    // -- releasing ---------------------------------------------------------
+
+    /// Give back everything this employee holds, dependents first.
+    ///
+    /// The order is [`release_order`]: the dependency graph topologically
+    /// sorted and then **reversed**, so the browser context goes before the
+    /// vault its credentials live in, and identity goes last. Derived from
+    /// [`Step::depends_on`] on every call for the same reason `converge`
+    /// derives the forward order — a hardcoded list is a list that will not
+    /// notice a new edge.
+    ///
+    /// Sequential, not a [`JoinSet`]: the order *is* the point.
+    ///
+    /// Idempotent. A second run reports [`ReleaseReport::NotBound`] for
+    /// everything the first one freed and retries only what failed, which is
+    /// what makes it safe to hang off a retried outbox event.
+    pub async fn release_all(
+        &self,
+        employee: &Employee,
+    ) -> Result<BTreeMap<Step, ReleaseReport>, EngineError> {
+        let mut reports = BTreeMap::new();
+        for step in release_order() {
+            let report = self.release_step(employee, step).await?;
+            if let ReleaseReport::Failed { code } = &report {
+                // Loud, and then carry on: one provider refusing is no reason
+                // to leave the other ten resources running.
+                tracing::error!(
+                    employee = %employee.id().as_uuid(), %step, code,
+                    "could not release a provider resource; it is still bound and still billed"
+                );
+            }
+            reports.insert(step, report);
+        }
+        Ok(reports)
+    }
+
+    /// Give one resource back, and only then forget its id.
+    ///
+    /// # Why this has no lease and no write-ahead intent
+    ///
+    /// `ensure_step` writes its intent *before* the call and parks a step whose
+    /// outcome nobody knows, because a created-but-unrecorded resource is
+    /// invisible and a blind retry buys a second one. Release is the mirror
+    /// image: every adapter is required to be idempotent and to tolerate a
+    /// resource that is already gone, so a call whose outcome was lost costs
+    /// nothing but another call. There is no orphan to park, no human to ask,
+    /// and no reason to serialise two workers that both want the same resource
+    /// destroyed.
+    ///
+    /// What does matter is the write order, and it is the opposite of ensure's:
+    /// **ask the provider first, clear the binding second.** A crash in that
+    /// window leaves the binding intact and the resource findable, and the next
+    /// pass tries again. Clearing first and crashing would leave a paid-for
+    /// resource with nothing left pointing at it.
+    ///
+    /// A refusal is recorded rather than retried in-process: the binding stays,
+    /// the row carries the reason, and the caller's own retry (the outbox event
+    /// that asked for the termination) comes back round.
+    pub async fn release_step(
+        &self,
+        employee: &Employee,
+        step: Step,
+    ) -> Result<ReleaseReport, EngineError> {
+        let Some(binding) = employee.resource(step).binding().cloned() else {
+            // Never bound, or already released. Either way nothing out there is
+            // costing anything, and that is a success.
+            return Ok(ReleaseReport::NotBound);
+        };
+
+        // No transaction is open across this, and the timeout is not optional
+        // for the same reason it is not optional in `call_until`.
+        let outcome = match tokio::time::timeout(
+            self.cfg.call_timeout,
+            self.release_call(employee, step, &binding),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ProviderError::timeout()),
+        };
+
+        let now = Utc::now();
+        let mut tx = self.db.tenant_tx(employee.tenant_id()).await?;
+        let stored = employee::load(&mut tx, employee.id()).await?;
+        let mut current = stored.employee;
+
+        let report = match &outcome {
+            Ok(()) => {
+                // `Employee::release` is the only thing in the system that
+                // clears a binding, and this is the only place that calls it.
+                // Guarded on the id we actually released: if the stored binding
+                // has moved on since the snapshot, it names a different
+                // resource and forgetting it would strand that one instead.
+                if current.resource(step).binding() == Some(&binding) {
+                    current.release(step, now);
+                }
+                // Released, not merely unbound. `Disabled` is the domain's word
+                // for "deliberately off for this employee", which is exactly
+                // what a terminated employee's resources are.
+                if let Err(err) = current.set_resource(step, ResourceState::Disabled, now) {
+                    tracing::warn!(%step, error = %err, "released, but could not disable the row");
+                }
+                ReleaseReport::Released
+            }
+            Err(err) => {
+                // The binding is untouched, on purpose: the resource is still
+                // out there and the external id is what says so.
+                if let Err(err) = current.set_resource(step, ResourceState::Failed, now) {
+                    tracing::warn!(%step, error = %err, "could not mark a failed release");
+                }
+                ReleaseReport::Failed { code: err.code() }
+            }
+        };
+
+        employee::update(&mut tx, &current, stored.version).await?;
+        // Only steps that reach a provider get a row, exactly as with the
+        // provisioning intent: a resource that is us has no outcome to be
+        // uncertain about.
+        if let Some(adapter) = adapter_of(step) {
+            let error = outcome
+                .as_ref()
+                .err()
+                .map(|err| format!("release {}: {err}", err.code()));
+            provisioning::record_release(
+                &mut tx,
+                employee.id(),
+                step,
+                adapter,
+                error.as_deref(),
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(report)
+    }
+
+    /// **The exhaustive match, in the other direction.** What giving each step
+    /// back actually means.
+    ///
+    /// No `_` arm, like [`ProvisioningEngine::call`]: a twelfth [`Step`] has to
+    /// answer "who cancels this, and what does it cost until somebody does"
+    /// before it compiles.
+    async fn release_call(
+        &self,
+        employee: &Employee,
+        step: Step,
+        binding: &ProviderBinding,
+    ) -> Result<(), ProviderError> {
+        let binding = agentos_providers::ProviderBinding {
+            provider: binding.provider().to_owned(),
+            external_id: binding.external_id().to_owned(),
+        };
+        match step {
+            Step::Email => self.adapters.email.release(&binding).await,
+            Step::Phone => self.adapters.telephony.release(&binding).await,
+            Step::Browser => self.adapters.browser.release(&binding).await,
+
+            // The vault has no per-resource handle to hand back: the resource
+            // *is* the employee's subtree, and `delete_prefix` is the store's
+            // own word for offboarding. Deleting nothing is not an error there
+            // either, so this is idempotent for free.
+            Step::Vault => {
+                let gone = self
+                    .adapters
+                    .secrets
+                    .delete_prefix(employee.tenant_id(), Some(employee.id()))
+                    .await?;
+                tracing::info!(secrets = gone, "vault subtree deleted");
+                Ok(())
+            }
+
+            // Ours. The row is the resource: no external system, nothing to
+            // cancel, nobody billing us. Clearing the binding *is* the release.
+            Step::Identity
+            | Step::Whatsapp
+            | Step::Wallet
+            | Step::CompanyKnowledge
+            | Step::Mcp
+            | Step::A2a
+            | Step::Permissions => Ok(()),
+        }
     }
 
     // -- transactions ------------------------------------------------------
@@ -742,6 +982,34 @@ fn first_unmet(employee: &Employee, step: Step) -> Option<Step> {
         .find(|dep| !employee.resource(*dep).is_ready())
 }
 
+/// Every step, dependents first and dependencies last.
+///
+/// The order [`ProvisioningEngine::converge`] runs, reversed — and computed the
+/// same way, from [`Step::depends_on`], so a new edge in the domain changes
+/// both without either being edited. Writing the list down instead is how you
+/// release the vault before the browser profile whose credentials live in it.
+fn release_order() -> Vec<Step> {
+    let mut order: Vec<Step> = Vec::with_capacity(Step::ALL.len());
+    let mut pending: Vec<Step> = Step::ALL.to_vec();
+
+    while !pending.is_empty() {
+        let (runnable, blocked): (Vec<Step>, Vec<Step>) = std::mem::take(&mut pending)
+            .into_iter()
+            .partition(|step| step.depends_on().iter().all(|dep| order.contains(dep)));
+        if runnable.is_empty() {
+            // Unreachable: the domain has a test that the graph is acyclic.
+            // Appending the remainder beats a worker looping forever.
+            order.extend(blocked);
+            break;
+        }
+        order.extend(runnable);
+        pending = blocked;
+    }
+
+    order.reverse();
+    order
+}
+
 /// Split the outstanding steps into `(already ready, runnable now, blocked)`.
 ///
 /// The topological order, recomputed every wave from the dependency edges, so
@@ -792,7 +1060,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use agentos_domain::action::Domain;
-    use agentos_domain::employee::{Health, Lifecycle};
+    use agentos_domain::employee::Health;
     use agentos_domain::ids::IdempotencyKey;
     use agentos_domain::message::CanonicalMessage;
     use agentos_providers::FaultMode;
@@ -931,6 +1199,50 @@ mod tests {
         stored.employee
     }
 
+    /// What the terminate endpoint does: the lifecycle move, persisted.
+    async fn terminate(db: &Db, employee: &Employee) -> Employee {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let stored = employee::load(&mut tx, employee.id()).await.expect("load");
+        let mut terminated = stored.employee;
+        terminated
+            .set_lifecycle(Lifecycle::Terminated, Utc::now())
+            .expect("active -> terminated");
+        employee::update(&mut tx, &terminated, stored.version)
+            .await
+            .expect("update");
+        tx.commit().await.expect("commit");
+        terminated
+    }
+
+    /// Steps that still name a provider resource, i.e. that are still billed.
+    fn bound(employee: &Employee) -> Vec<Step> {
+        Step::ALL
+            .into_iter()
+            .filter(|step| employee.resource(*step).binding().is_some())
+            .collect()
+    }
+
+    /// The order the rows were last touched in — the observed release order,
+    /// read back out of the database rather than assumed.
+    ///
+    /// Every step is released in its own transaction with its own `now`, so
+    /// `updated_at` is a faithful sequence rather than a tie.
+    async fn touch_order(db: &Db, employee: &Employee) -> Vec<Step> {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT step FROM employee_resources WHERE employee_id = $1 ORDER BY updated_at",
+        )
+        .bind(employee.id().as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("rows");
+        tx.rollback().await.expect("rollback");
+
+        rows.into_iter()
+            .filter_map(|(step,)| Step::ALL.into_iter().find(|s| s.as_str() == step))
+            .collect()
+    }
+
     // -- a provider that hangs ---------------------------------------------
 
     /// Buys the number, then hangs the way a real provider does when the
@@ -984,6 +1296,103 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             Ok(Provisioned::new(Self::PROVIDER, sid))
+        }
+
+        async fn release(
+            &self,
+            _binding: &agentos_providers::ProviderBinding,
+        ) -> Result<(), ProviderError> {
+            let mut bought = self.bought.lock().expect("poisoned");
+            *bought = None;
+            Ok(())
+        }
+
+        async fn send_sms(
+            &self,
+            _key: &IdempotencyKey,
+            _sms: &OutboundSms,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("provisioning never sends")
+        }
+
+        async fn send_whatsapp(
+            &self,
+            _key: &IdempotencyKey,
+            _message: &OutboundWhatsapp,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("provisioning never sends")
+        }
+
+        fn verify_webhook(
+            &self,
+            _url: &str,
+            _body: WebhookBody<'_>,
+            _headers: &[(String, String)],
+        ) -> Result<(), SigError> {
+            unimplemented!("provisioning never receives")
+        }
+
+        fn normalize(
+            &self,
+            _ctx: &InboundCtx,
+            _raw: &[u8],
+        ) -> Result<CanonicalMessage, ParseError> {
+            unimplemented!("provisioning never receives")
+        }
+    }
+
+    // -- a provider that will not let go -----------------------------------
+
+    /// Sells numbers happily and refuses to take them back: the delete endpoint
+    /// is broken, or the account lost the permission. The failure mode this
+    /// whole path exists for, because the number keeps billing either way.
+    #[derive(Debug, Default)]
+    struct StubbornTelephony {
+        /// tag -> sid, so `ensure_number` still reconciles properly.
+        numbers: Mutex<BTreeMap<String, String>>,
+        release_attempts: AtomicU32,
+    }
+
+    impl StubbornTelephony {
+        const PROVIDER: &'static str = "stubborn-telephony";
+        /// The code it refuses with. Terminal: retrying inside one pass would
+        /// not help, and the record is what makes a later pass possible.
+        const REFUSED: &'static str = "release_refused";
+
+        fn release_attempts(&self) -> u32 {
+            self.release_attempts.load(Ordering::SeqCst)
+        }
+
+        /// Numbers still on the account, i.e. still on the invoice.
+        fn number_count(&self) -> usize {
+            self.numbers.lock().expect("poisoned").len()
+        }
+    }
+
+    #[async_trait]
+    impl TelephonyProvider for StubbornTelephony {
+        async fn ensure_number(
+            &self,
+            ctx: &EnsureCtx,
+            _region: &Region,
+        ) -> Result<Provisioned, ProviderError> {
+            let mut numbers = self.numbers.lock().expect("poisoned");
+            let next = numbers.len() + 1;
+            let sid = numbers
+                .entry(ctx.tag().to_owned())
+                .or_insert_with(|| format!("PN-stubborn-{next}"))
+                .clone();
+            Ok(Provisioned::new(Self::PROVIDER, sid))
+        }
+
+        async fn release(
+            &self,
+            _binding: &agentos_providers::ProviderBinding,
+        ) -> Result<(), ProviderError> {
+            self.release_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::Terminal {
+                code: Self::REFUSED,
+            })
         }
 
         async fn send_sms(
@@ -1057,6 +1466,48 @@ mod tests {
         assert_eq!(done, vec![Step::Identity]);
         assert_eq!(runnable, vec![Step::Browser]);
         assert!(blocked.is_empty());
+    }
+
+    /// The mirror claim. Releasing is the ensure order backwards, and it has to
+    /// come from the same edges: a vault released before the browser profile
+    /// whose credentials live in it takes the credentials with it.
+    #[test]
+    fn the_release_order_is_the_dependency_order_reversed() {
+        let order = release_order();
+        assert_eq!(order.len(), Step::ALL.len());
+        assert_eq!(
+            order
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            Step::ALL
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "every step must be released, not just the ones with adapters"
+        );
+
+        let position = |step: Step| {
+            order
+                .iter()
+                .position(|s| *s == step)
+                .expect("every step is in the order")
+        };
+        // The general claim, checked against the edges rather than a list.
+        for step in Step::ALL {
+            for dep in step.depends_on() {
+                assert!(
+                    position(step) < position(*dep),
+                    "{step} must be released before {dep}, which it depends on"
+                );
+            }
+        }
+        // ... and the two that cost real money if they are wrong, spelled out.
+        assert!(position(Step::Browser) < position(Step::Vault));
+        assert_eq!(
+            order.last(),
+            Some(&Step::Identity),
+            "identity is the root, so it is released last"
+        );
     }
 
     fn ready(employee: &mut Employee, step: Step, now: DateTime<Utc>) {
@@ -1498,6 +1949,382 @@ mod tests {
             count(&db, &employee, "SELECT count(*) FROM provider_intents").await,
             4,
             "one write-ahead row per step that reaches a network, not per attempt"
+        );
+    }
+
+    // -- releasing ---------------------------------------------------------
+
+    /// The whole point: terminating an employee has to stop the bill.
+    ///
+    /// Before this existed, terminating stopped the employee acting (the gate
+    /// refuses anything that is not `Active`) and left the phone number, the
+    /// browser process and the vault subtree exactly where they were.
+    #[tokio::test]
+    async fn terminating_an_employee_releases_every_bound_resource() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let email = Arc::new(MockEmailProvider::new());
+        let browser = Arc::new(MockBrowser::new());
+        let secrets = Arc::new(MemorySecretStore::new());
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            Adapters {
+                email: email.clone(),
+                telephony: telephony.clone(),
+                browser: browser.clone(),
+                secrets: secrets.clone(),
+            },
+            cfg(),
+        );
+
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        let provisioned = reload(&db, &employee).await;
+        assert_eq!(
+            bound(&provisioned),
+            Step::ALL.to_vec(),
+            "every step should be bound before anything is released"
+        );
+        assert_eq!(telephony.number_count(), 1);
+        assert_eq!(email.identity_count(), 1);
+        assert_eq!(browser.context_count(), 1);
+        let canary =
+            SecretRef::new(employee.tenant_id(), employee.id(), VAULT_CANARY).expect("ref");
+        assert!(
+            secrets.get(&canary).await.is_ok(),
+            "the vault canary is what proves the subtree exists"
+        );
+
+        let terminated = terminate(&db, &provisioned).await;
+        let reports = engine.release_all(&terminated).await.expect("release");
+
+        for step in Step::ALL {
+            assert_eq!(
+                reports.get(&step),
+                Some(&ReleaseReport::Released),
+                "{step} was not released"
+            );
+        }
+
+        // Nothing at any provider, and nothing left naming it.
+        assert_eq!(telephony.number_count(), 0, "the number is still billing");
+        assert_eq!(email.identity_count(), 0);
+        assert_eq!(browser.context_count(), 0, "the browser is still running");
+        assert!(
+            secrets.get(&canary).await.is_err(),
+            "the vault subtree survived the employee"
+        );
+
+        let released = reload(&db, &employee).await;
+        assert!(
+            bound(&released).is_empty(),
+            "these bindings still name a resource: {:?}",
+            bound(&released)
+        );
+        for step in Step::ALL {
+            assert_eq!(
+                released.resource(step).state(),
+                &ResourceState::Disabled,
+                "{step} should read as deliberately off, not as merely unbound"
+            );
+        }
+        assert_eq!(released.lifecycle(), Lifecycle::Terminated);
+    }
+
+    /// Releasing is retried by whoever asked — the outbox redelivers a
+    /// `employee.terminated` event on its own backoff — so a second pass must
+    /// be a no-op and not a second, failing, provider call.
+    #[tokio::test]
+    async fn releasing_twice_is_idempotent_and_the_second_pass_calls_nobody() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let browser = Arc::new(MockBrowser::new());
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            Adapters {
+                email: Arc::new(MockEmailProvider::new()),
+                telephony: telephony.clone(),
+                browser: browser.clone(),
+                secrets: Arc::new(MemorySecretStore::new()),
+            },
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+
+        let first = engine.release_all(&terminated).await.expect("release");
+        assert!(first.values().all(|r| *r == ReleaseReport::Released));
+
+        // The caller re-reads and asks again, exactly as a redelivered event
+        // would. Nothing is bound any more, so nothing is called.
+        let again = reload(&db, &employee).await;
+        let second = engine.release_all(&again).await.expect("release again");
+        for step in Step::ALL {
+            assert_eq!(
+                second.get(&step),
+                Some(&ReleaseReport::NotBound),
+                "{step} should have had nothing left to release"
+            );
+        }
+        // A third, from the stale snapshot that still carries the bindings:
+        // the provider no longer has them and says so by succeeding.
+        let third = engine
+            .release_all(&terminated)
+            .await
+            .expect("release again");
+        assert!(third.values().all(|r| *r == ReleaseReport::Released));
+        assert_eq!(telephony.number_count(), 0);
+        assert_eq!(browser.context_count(), 0);
+    }
+
+    /// Somebody cancelled the number in the provider's console last week. The
+    /// binding is still ours to clear, and a delete that 404s is the state we
+    /// were asking for — not an error that strands the row forever.
+    #[tokio::test]
+    async fn releasing_a_resource_the_provider_no_longer_has_succeeds() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+        let binding = terminated
+            .resource(Step::Phone)
+            .binding()
+            .expect("a number was bought");
+
+        // Behind the engine's back: the number is gone, the binding is not.
+        telephony
+            .release(&agentos_providers::ProviderBinding {
+                provider: binding.provider().to_owned(),
+                external_id: binding.external_id().to_owned(),
+            })
+            .await
+            .expect("cancelled in the console");
+        assert_eq!(telephony.number_count(), 0);
+
+        let reports = engine.release_all(&terminated).await.expect("release");
+        assert_eq!(reports.get(&Step::Phone), Some(&ReleaseReport::Released));
+        assert!(
+            reload(&db, &employee)
+                .await
+                .resource(Step::Phone)
+                .binding()
+                .is_none(),
+            "an already-gone resource must still let its binding go"
+        );
+    }
+
+    /// The failure that must never be silent. The provider refuses, so the
+    /// number is still on the invoice — and the row still says which number,
+    /// why nobody released it, and that somebody should try again.
+    #[tokio::test]
+    async fn a_provider_that_refuses_to_release_leaves_a_retryable_record() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(StubbornTelephony::default());
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+        let reports = engine.release_all(&terminated).await.expect("release");
+
+        assert_eq!(
+            reports.get(&Step::Phone),
+            Some(&ReleaseReport::Failed {
+                code: StubbornTelephony::REFUSED
+            })
+        );
+        assert_eq!(telephony.release_attempts(), 1);
+        assert_eq!(telephony.number_count(), 1, "it really is still out there");
+        // Everything else still went, because one stubborn provider is no
+        // reason to keep paying for the other ten resources.
+        for step in Step::ALL.into_iter().filter(|s| *s != Step::Phone) {
+            assert_eq!(reports.get(&step), Some(&ReleaseReport::Released), "{step}");
+        }
+
+        // The record. The external id is the only thing that says what to
+        // cancel, so it is exactly what must NOT have been thrown away.
+        let (state, _, provider, external, last_error) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "failed");
+        assert_eq!(provider.as_deref(), Some(StubbornTelephony::PROVIDER));
+        assert!(
+            external.is_some(),
+            "the binding was cleared on a live number"
+        );
+        let last_error = last_error.expect("the row must say why");
+        assert!(
+            last_error.contains(StubbornTelephony::REFUSED),
+            "{last_error}"
+        );
+
+        let (kind, intent_state): (String, String) = {
+            let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+            let found = sqlx::query_as(
+                "SELECT intent_kind, state FROM provider_intents \
+                 WHERE employee_id = $1 AND step = 'phone' AND intent_kind = 'release_step'",
+            )
+            .bind(employee.id().as_uuid())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("a release intent");
+            tx.rollback().await.expect("rollback");
+            found
+        };
+        assert_eq!(kind, "release_step");
+        assert_eq!(intent_state, "failed");
+
+        // Retryable means retried: the next pass asks again rather than
+        // treating the failure as settled.
+        let stuck = reload(&db, &employee).await;
+        let again = engine.release_all(&stuck).await.expect("release again");
+        assert_eq!(
+            again.get(&Step::Phone),
+            Some(&ReleaseReport::Failed {
+                code: StubbornTelephony::REFUSED
+            })
+        );
+        assert_eq!(
+            telephony.release_attempts(),
+            2,
+            "a refusal is not a verdict"
+        );
+    }
+
+    /// The dependency claim, observed rather than assumed: the order the rows
+    /// were actually touched in, read back out of Postgres.
+    #[tokio::test]
+    async fn the_observed_release_order_is_the_reverse_of_the_dependency_order() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(
+                Arc::new(MockTelephony::new(Utc::now(), "tok")),
+                Arc::new(MockEmailProvider::new()),
+            ),
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+
+        engine.release_all(&terminated).await.expect("release");
+        let observed = touch_order(&db, &employee).await;
+        assert_eq!(observed.len(), Step::ALL.len());
+
+        let position = |step: Step| {
+            observed
+                .iter()
+                .position(|s| *s == step)
+                .unwrap_or_else(|| panic!("{step} was never released"))
+        };
+        for step in Step::ALL {
+            for dep in step.depends_on() {
+                assert!(
+                    position(step) < position(*dep),
+                    "observed order {observed:?} released {dep} before {step}, which needs it"
+                );
+            }
+        }
+        // The edge that costs credentials rather than money.
+        assert!(
+            position(Step::Browser) < position(Step::Vault),
+            "the vault went first, so the browser profile lost its credentials: {observed:?}"
+        );
+        assert_eq!(observed.last(), Some(&Step::Identity));
+    }
+
+    /// A release is a write against a terminated employee, and `Terminated` is
+    /// absorbing. Nothing here may hand an employee back to work.
+    #[tokio::test]
+    async fn a_late_release_cannot_resurrect_a_terminated_employee() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(
+                Arc::new(MockTelephony::new(Utc::now(), "tok")),
+                Arc::new(MockEmailProvider::new()),
+            ),
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        assert_eq!(reload(&db, &employee).await.health(), Health::Online);
+
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+        engine.release_all(&terminated).await.expect("release");
+
+        let after = reload(&db, &employee).await;
+        assert_eq!(after.lifecycle(), Lifecycle::Terminated);
+        assert_ne!(after.health(), Health::Online);
+        // And the domain still refuses, so no later handler can undo it either.
+        let mut resurrected = after.clone();
+        assert!(
+            resurrected
+                .set_lifecycle(Lifecycle::Active, Utc::now())
+                .is_err(),
+            "terminated must stay terminated"
+        );
+
+        // A re-converge is the other way back in, and it does not open either:
+        // every released row is `disabled`, which is not claimable work.
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge after termination");
+        assert!(
+            !reports.values().any(StepReport::is_ready),
+            "a terminated employee must not re-provision itself: {reports:?}"
+        );
+        assert_eq!(
+            reload(&db, &employee).await.lifecycle(),
+            Lifecycle::Terminated
         );
     }
 }

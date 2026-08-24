@@ -47,7 +47,9 @@ use crate::email::{
     EmailProvider, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
     WebhookHeaders, verify_signature,
 };
-use crate::{EnsureCtx, ProviderError, Provisioned, Secret};
+use crate::{
+    EnsureCtx, ProviderBinding, ProviderError, Provisioned, RELEASE_NOT_SUPPORTED, Secret,
+};
 
 /// Resend's public API root.
 pub const API_BASE: &str = "https://api.resend.com";
@@ -248,6 +250,24 @@ impl EmailProvider for ResendEmailProvider {
             )
             .await?;
         Ok(Provisioned::new(Self::PROVIDER, created.id))
+    }
+
+    /// **Not supported, on purpose.**
+    ///
+    /// The resource `ensure_identity` binds is the account's *sending domain*,
+    /// reconciled by name — one adapter, one domain, every employee on it. So
+    /// there is no per-employee thing to give back: `DELETE /domains/{id}` here
+    /// would stop email for the whole tenant because one employee was
+    /// terminated. Saying so is the only honest answer; returning `Ok(())`
+    /// would clear the binding on a domain that is still very much alive.
+    ///
+    /// The day Resend grows a per-employee identity (a dedicated subdomain, a
+    /// per-address suppression), this becomes a real delete and nothing above
+    /// it changes.
+    async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
+        Err(ProviderError::Terminal {
+            code: RELEASE_NOT_SUPPORTED,
+        })
     }
 
     async fn send(

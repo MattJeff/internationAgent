@@ -486,6 +486,97 @@ pub async fn finish_step(
 }
 
 // ---------------------------------------------------------------------------
+// Releasing
+// ---------------------------------------------------------------------------
+
+/// The key a release of one step is recorded under.
+///
+/// Deliberately **not** `IdempotencyKey::for_step(employee, step)`. That key
+/// already names the provisioning intent for the same step, and the two are
+/// different questions about one resource — *was it ever created* and *was it
+/// ever destroyed*. Sharing a key would have a release close the purchase's
+/// intent, and a re-provision close the release's.
+pub fn release_key(employee: EmployeeId, step: Step) -> IdempotencyKey {
+    IdempotencyKey::for_step(employee, &format!("release:{}", step.as_str()))
+}
+
+/// Record how an attempt to give a provider resource back went.
+///
+/// Written **after** the call, not before, which is the one place release
+/// deliberately differs from [`begin_intent`]. A provisioning intent has to be
+/// durable before the call because a created-but-unrecorded resource is
+/// invisible and a blind retry buys a second one. A release has the opposite
+/// shape: every adapter is required to be idempotent and to tolerate a resource
+/// that is already gone, so a call whose outcome was lost costs nothing but
+/// another call. There is no orphan to park and no human to ask.
+///
+/// `error: None` means released. `Some(why)` means the resource is **still
+/// there and still being billed** — so the caller has not cleared the binding,
+/// and this stamps the reason onto both the intent and
+/// `employee_resources.last_error`, which is the column an operator actually
+/// reads. That pair is the retryable record: the external id still names what
+/// to cancel, and the row says why nobody has.
+///
+/// ponytail: no outbox event. Nothing subscribes to a release yet, and an event
+/// type with no handler in the server's dispatch table is a dead letter by
+/// construction. Add one here the day something needs to react.
+pub async fn record_release(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    step: Step,
+    provider: &str,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let tenant = tx.tenant_id();
+    let key = release_key(employee, step);
+    let state = if error.is_some() {
+        IntentState::Failed
+    } else {
+        IntentState::Succeeded
+    };
+
+    sqlx::query(
+        "INSERT INTO provider_intents \
+           (id, tenant_id, employee_id, provider, intent_kind, step, \
+            idempotency_key, state, request, last_error, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'release_step', $5, $6, $7, $8, $9, $10, $10) \
+         ON CONFLICT (tenant_id, idempotency_key) \
+         DO UPDATE SET state = excluded.state, \
+                       last_error = excluded.last_error, \
+                       updated_at = excluded.updated_at",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant.as_uuid())
+    .bind(employee.as_uuid())
+    .bind(provider)
+    .bind(step.as_str())
+    .bind(key.as_str())
+    .bind(state.as_str())
+    .bind(sqlx::types::Json(json!({ "step": step.as_str() })))
+    .bind(error)
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    // The binding is not touched here, in either direction: clearing one is
+    // `Employee::release`'s job and nothing else's, and a failed release must
+    // leave the external id exactly where it is.
+    sqlx::query(
+        "UPDATE employee_resources SET last_error = $3, updated_at = $4 \
+         WHERE employee_id = $1 AND step = $2",
+    )
+    .bind(employee.as_uuid())
+    .bind(step.as_str())
+    .bind(error)
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Recovery
 // ---------------------------------------------------------------------------
 
@@ -1115,6 +1206,133 @@ mod tests {
         assert_eq!(payload["step"], "vault");
         assert_eq!(payload["error"], "kms refused");
         assert_eq!(intent_state, IntentState::Failed.as_str());
+
+        teardown(&db, tenant).await;
+    }
+
+    /// A release is recorded *beside* the purchase it undoes, never on top of
+    /// it — and a failed one leaves the external id exactly where it is.
+    ///
+    /// If the two shared an idempotency key, recording a release would rewrite
+    /// the row that says a number was bought, and the one durable trace of the
+    /// purchase would be gone.
+    #[tokio::test]
+    async fn a_failed_release_is_a_second_row_and_keeps_the_binding() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "release").await;
+
+        assert_ne!(
+            release_key(employee, Step::Phone).as_str(),
+            IdempotencyKey::for_step(employee, Step::Phone.as_str()).as_str(),
+            "a release must not be able to close the purchase's intent"
+        );
+
+        // Buy the number, the ordinary way.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let claim = claim_step(
+            &mut tx,
+            employee,
+            Step::Phone,
+            Uuid::now_v7(),
+            lease(),
+            at(T0),
+        )
+        .await
+        .expect("claim")
+        .expect("claim");
+        begin_intent(&mut tx, &claim, "twilio", &json!({}), at(T0))
+            .await
+            .expect("intent");
+        finish_step(
+            &mut tx,
+            &claim,
+            StepOutcome::Ready {
+                binding: ProviderBinding::new("twilio", format!("PN-{}", employee.as_uuid())),
+            },
+            at(T0 + 1),
+        )
+        .await
+        .expect("finish");
+        tx.commit().await.expect("commit");
+
+        // Now the provider refuses to take it back.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        record_release(
+            &mut tx,
+            employee,
+            Step::Phone,
+            "twilio",
+            Some("release release_refused"),
+            at(T0 + 2),
+        )
+        .await
+        .expect("record the refusal");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let intents: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT intent_kind, state, last_error FROM provider_intents \
+             WHERE employee_id = $1 ORDER BY intent_kind",
+        )
+        .bind(employee.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("intents");
+        let last_error: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM employee_resources WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .bind(employee.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("resource row");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            intents.len(),
+            2,
+            "the purchase and the release are two facts"
+        );
+        assert_eq!(intents[0].0, "provisioning_step");
+        assert_eq!(intents[0].1, IntentState::Succeeded.as_str());
+        assert_eq!(intents[1].0, "release_step");
+        assert_eq!(intents[1].1, IntentState::Failed.as_str());
+        assert_eq!(intents[1].2.as_deref(), Some("release release_refused"));
+        assert_eq!(last_error.as_deref(), Some("release release_refused"));
+
+        // The number is still ours, still named, still cancellable by hand.
+        // Recording a refusal must not be a way to lose the id.
+        let (state, _, provider, external) = resource_row(&db, tenant, employee, Step::Phone).await;
+        assert_eq!(state, "ready", "this function does not move the state");
+        assert_eq!(provider.as_deref(), Some("twilio"));
+        assert!(external.is_some());
+
+        // And when it finally works, the reason is cleared rather than left to
+        // haunt the row.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        record_release(&mut tx, employee, Step::Phone, "twilio", None, at(T0 + 3))
+            .await
+            .expect("record the success");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (state, last_error): (String, Option<String>) = sqlx::query_as(
+            "SELECT i.state, r.last_error FROM provider_intents i \
+             JOIN employee_resources r \
+               ON r.employee_id = i.employee_id AND r.step = i.step \
+             WHERE i.employee_id = $1 AND i.intent_kind = 'release_step'",
+        )
+        .bind(employee.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("release intent");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, IntentState::Succeeded.as_str());
+        assert_eq!(last_error, None);
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM provider_intents").await,
+            2,
+            "a retried release updates its row rather than fanning out"
+        );
 
         teardown(&db, tenant).await;
     }

@@ -141,6 +141,15 @@ pub trait BrowserProvider: Send + Sync {
         session: &BrowserSession,
         step: BrowserStep<'_>,
     ) -> Result<BrowserOutcome, ProviderError>;
+
+    /// Destroy the context: stop the process, drop the profile directory, stop
+    /// paying for the seat.
+    ///
+    /// Idempotent and tolerant of a context that is already gone — see the
+    /// crate-level release contract. `Ok(())` means "no such context exists any
+    /// more", which is equally true whether this call destroyed it or a
+    /// previous one did.
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +200,12 @@ impl MockBrowser {
     /// across a crash-and-retry.
     pub fn created(&self) -> u32 {
         self.lock().created
+    }
+
+    /// How many contexts still exist. Unlike [`Self::created`] this goes down
+    /// again: it is the assertion that a release actually released something.
+    pub fn context_count(&self) -> usize {
+        self.lock().contexts.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MockState> {
@@ -263,6 +278,18 @@ impl BrowserProvider for MockBrowser {
         state.fault.check_after()?;
         Ok(outcome)
     }
+
+    async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError> {
+        let mut state = self.lock();
+        state.fault.check_before()?;
+        // Indexed by tag, released by id: whoever holds a binding holds the id
+        // and not the tag it was created under. A context that is not there is
+        // the desired state already, so this is a `retain`, not a lookup that
+        // can fail.
+        state.contexts.retain(|_, id| *id != binding.external_id);
+        state.log.push(format!("{} release", binding.external_id));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +341,17 @@ mod tests {
                 .unwrap(),
             BrowserOutcome::Navigated(url)
         );
+
+        // And it can be given back — twice, and for a context that was never
+        // there. Both are the same desired state, so both succeed.
+        p.release(&first.binding()).await.unwrap();
+        p.release(&first.binding()).await.unwrap();
+        p.release(&ProviderBinding {
+            provider: first.provider.to_owned(),
+            external_id: "ctx-never-existed".to_owned(),
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -321,6 +359,26 @@ mod tests {
         let p = MockBrowser::new();
         verify_contract(&p).await;
         assert_eq!(p.created(), 1);
+        assert_eq!(p.context_count(), 0, "the contract releases what it made");
+    }
+
+    /// Releasing is what a termination does, and it has to actually free the
+    /// process — and then be safe to do again, because the caller retries.
+    #[tokio::test]
+    async fn releasing_a_context_frees_it_and_is_safe_to_repeat() {
+        let p = MockBrowser::new();
+        let provisioned = p
+            .ensure_context(&ctx(EmployeeId::new_v7(Utc::now())))
+            .await
+            .unwrap();
+        assert_eq!(p.context_count(), 1);
+
+        p.release(&provisioned.binding()).await.expect("release");
+        assert_eq!(p.context_count(), 0, "the browser is still running");
+        p.release(&provisioned.binding())
+            .await
+            .expect("releasing twice is the same desired state");
+        assert_eq!(p.context_count(), 0);
     }
 
     #[tokio::test]
