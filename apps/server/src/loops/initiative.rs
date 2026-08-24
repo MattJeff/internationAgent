@@ -610,24 +610,37 @@ pub(crate) mod tests {
     /// this same lock. Two locks would be two halves of one table.
     pub(crate) static LOOP_LOCK: Mutex<()> = Mutex::const_new(());
 
+    /// This module's own database — see [`private_db`](crate::loops::private_db).
+    ///
+    /// It has to be its own for the same reason the other three pollers do, and
+    /// for one more that is this loop's alone. `claim_due` is cross-tenant by
+    /// construction — it takes a bounded batch of whoever is due anywhere — so
+    /// another test's employees are inside its window and no `WHERE tenant_id`
+    /// narrows it. And `platform_turn_budget` below replaces the **platform
+    /// policy layer**, which is `tenant_id IS NULL` and therefore one row for
+    /// the whole database: on the shared database that deleted the layer other
+    /// modules were mid-assertion on, which is exactly how this landed seven
+    /// failures across `loops::outbox`, `loops::provisioning` and
+    /// `routes::turns` in one run. A private database is the fix; a second
+    /// mutex would only have moved the collision.
     async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the initiative loop needs a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+        crate::loops::private_db("initiative").await
     }
 
     use uuid::Uuid;
+
+    /// The slug every tenant this module creates carries, so `clear_schedules`
+    /// names its own rows rather than the table.
+    const TENANT_SLUG: &str = "loop-initiative-";
 
     async fn seed_tenant(db: &Db) -> TenantId {
         let tenant = TenantId::new_v7(Utc::now());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'loop-test')")
             .bind(tenant.as_uuid())
-            .bind(tenant.as_uuid().to_string())
+            // Prefixed so `clear_schedules` can name this module's rows. A bare
+            // uuid is unique but unselectable as a group.
+            .bind(format!("{TENANT_SLUG}{}", tenant.as_uuid().simple()))
             .execute(&mut *tx)
             .await
             .expect("insert tenant");
@@ -692,10 +705,15 @@ pub(crate) mod tests {
 
     async fn clear_schedules(db: &Db) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM employee_initiative")
-            .execute(&mut *tx)
-            .await
-            .expect("clear");
+        // Only this module's tenants. `employee_initiative` cascades from
+        // `tenants`, so naming them there is the whole predicate.
+        sqlx::query(
+            "DELETE FROM employee_initiative WHERE tenant_id IN \
+             (SELECT id FROM tenants WHERE slug LIKE 'loop-initiative-%')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("clear");
         tx.commit().await.expect("commit");
     }
 

@@ -272,6 +272,16 @@ mod tests {
     /// The global platform layer, which is the one layer with nothing above it
     /// to inherit from. Written straight to the table because there is no
     /// writer API for policy layers yet.
+    /// The platform policy layer is one row for the whole database —
+    /// `tenant_id IS NULL` is what makes it the platform layer — and both tests
+    /// below replace it and then take it away again. A fresh `TenantId`
+    /// isolates everything else here; it cannot isolate this, because the row
+    /// belongs to no tenant by definition. So the tests take turns: run in
+    /// parallel, one test's teardown deletes the layer the other is mid-request
+    /// on, and the budget it was asserting on comes back as a 404.
+    /// `crates/store/src/policy.rs` guards the same row the same way.
+    static PLATFORM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn platform_layer(db: &Db, turns: i32) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
@@ -330,6 +340,7 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
+        let _platform = PLATFORM_LOCK.lock().await;
         platform_layer(&h.db, 5).await;
         let id = employee(&h.db, h.a, "lena").await;
 
@@ -365,6 +376,7 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
+        let _platform = PLATFORM_LOCK.lock().await;
         platform_layer(&h.db, 5).await;
         let id = employee(&h.db, h.a, "lena").await;
         burn(&h.db, h.a, id, 2).await;

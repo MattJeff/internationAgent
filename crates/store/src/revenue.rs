@@ -1947,7 +1947,16 @@ mod tests {
         ];
 
         for (table, seed) in SEED {
-            for op in ["UPDATE {} SET tenant_id = tenant_id", "DELETE FROM {}"] {
+            // `WHERE tenant_id = $1`, though the transaction is rolled back and
+            // the statement is expected to fail before it touches anything: the
+            // trigger is `for each row`, so the row it fires on is the one this
+            // loop just seeded either way, and an unscoped `DELETE` in a test is
+            // a line somebody copies into a test that is not rolled back.
+            // `crates/app/tests/scoped_deletes.rs` is what stops that.
+            for op in [
+                "UPDATE {} SET tenant_id = tenant_id WHERE tenant_id = $1",
+                "DELETE FROM {} WHERE tenant_id = $1",
+            ] {
                 // Whole thing in one rolled-back transaction, as `postgres`:
                 // the trigger has to bind the owner too, because a GRANT never
                 // does. Table names come from a const array here, not from a
@@ -1963,6 +1972,7 @@ mod tests {
 
                 let statement = op.replace("{}", table);
                 let err = sqlx::query(sqlx::AssertSqlSafe(statement.clone()))
+                    .bind(tenant)
                     .execute(&mut *tx)
                     .await
                     .expect_err("append-only");

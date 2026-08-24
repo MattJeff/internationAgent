@@ -454,13 +454,17 @@ mod tests {
 
     const T0: i64 = 1_700_000_000;
 
+    /// The name every tenant this module creates carries, so [`clear_outbox`]
+    /// is a scoped statement rather than a wipe.
+    const TENANT_SLUG: &str = "outbox-store-";
+
     /// A committed tenant to hang events off. Returns its id.
     async fn seed_tenant(db: &Db, label: &str) -> TenantId {
         let tenant = TenantId::new_v7(Utc::now());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
             .bind(tenant.as_uuid())
-            .bind(format!("{label}-{}", tenant.as_uuid()))
+            .bind(format!("{TENANT_SLUG}{label}-{}", tenant.as_uuid()))
             .bind(label)
             .execute(&mut *tx)
             .await
@@ -479,11 +483,21 @@ mod tests {
         tx.commit().await.expect("commit teardown");
     }
 
-    /// Clear anything a previously crashed run left behind, so the cross-tenant
-    /// reads below see only what this test wrote. Safe: this is a test database.
+    /// Clear what a previously crashed run of **this module** left behind, so
+    /// the cross-tenant reads below see only what this test wrote. Events
+    /// cascade from the tenant that owns them.
+    ///
+    /// This used to be `DELETE FROM outbox_events` with no `WHERE`, under RLS
+    /// bypass, which deleted the events of every other test in the crate that
+    /// happened to be mid-assertion. What makes the narrower statement enough
+    /// is that these tests claim at [`T0`] — 2023 — while everyone else's
+    /// events are stamped `Utc::now()`, and `claim` only selects rows whose
+    /// `available_at` has already passed. Somebody else's event is not merely
+    /// irrelevant here, it is unclaimable.
     async fn clear_outbox(db: &Db) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM outbox_events")
+        sqlx::query("DELETE FROM tenants WHERE slug LIKE $1 || '%'")
+            .bind(TENANT_SLUG)
             .execute(&mut *tx)
             .await
             .expect("clear outbox");

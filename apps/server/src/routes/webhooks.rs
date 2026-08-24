@@ -573,10 +573,21 @@ mod tests {
         // Visible to the registered tenant...
         assert_eq!(stored(&db, tenant).await.len(), 1);
         // ...and the row's own tenant_id is that one, not the claimed one.
+        //
+        // `IN ($2, $3)` and not just the `event_id`: this read bypasses RLS,
+        // `msg_claim` is a literal, and the tenants are fresh every run — so
+        // without the filter it picks up the row a *previous* run of this test
+        // left behind and reports a stale tenant id as a security failure.
+        // Both candidates are in the list, so the assertion still has to
+        // discriminate between them.
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         let owner: Uuid = sqlx::query_scalar(
-            "SELECT tenant_id FROM outbox_events WHERE payload->>'event_id' = 'msg_claim'",
+            "SELECT tenant_id FROM outbox_events \
+              WHERE payload->>'event_id' = $1 AND tenant_id IN ($2, $3)",
         )
+        .bind("msg_claim")
+        .bind(tenant.as_uuid())
+        .bind(other.as_uuid())
         .fetch_one(&mut *tx)
         .await
         .expect("read row");

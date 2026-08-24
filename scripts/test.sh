@@ -6,7 +6,17 @@
 # are cross-tenant by nature — the outbox poller reads every tenant's rows, which
 # is exactly its job — so two packages sharing one database see each other's
 # fixtures and fail in ways that have nothing to do with the code. One database
-# per package, serialised within a package, and the interference is gone.
+# per package, and the interference is gone.
+#
+# There is no `--test-threads=1` on the package runs any more, and putting it
+# back would hide the next regression rather than prevent one. It used to be
+# load-bearing because four test helpers ran `DELETE FROM tenants` / `DELETE
+# FROM outbox_events` with no `WHERE`, so any test could delete the rows of any
+# test running beside it. Tests that need a whole database to themselves now
+# take one (`apps/server/src/loops/mod.rs`, `apps/server/tests/end_to_end.rs`)
+# and everything else is scoped to the tenant it created, which
+# `crates/app/tests/scoped_deletes.rs` enforces. If this suite goes flaky
+# again, that is a bug to find, not a flag to restore.
 #
 # Why the two guards below: ~34 tests in this workspace open with
 #
@@ -62,9 +72,19 @@ log=$(mktemp)
 # bare DROP for the same reason it is used below.
 cleanup() {
   rm -f "$log"
-  for p in "${PACKAGES[@]}"; do
-    psql_admin -c "DROP DATABASE IF EXISTS ci_${p//-/}_$RUN_ID WITH (FORCE)" >/dev/null 2>&1 || true
-  done
+  # Asked of pg_database rather than rebuilt from PACKAGES: a package's database
+  # is not the only one its run makes. The loop tests derive `<db>_outbox`,
+  # `<db>_inbound` and `<db>_provisioning` from it, because a cross-tenant
+  # poller cannot be isolated by a tenant filter — see
+  # apps/server/src/loops/mod.rs — and those names are the test code's business,
+  # not this script's.
+  psql_admin -tAc \
+    "SELECT datname FROM pg_database \
+      WHERE datname LIKE 'ci\_%\_$RUN_ID' OR datname LIKE 'ci\_%\_${RUN_ID}\_%'" 2>/dev/null |
+    while read -r db; do
+      [ -n "$db" ] || continue
+      psql_admin -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 || true
+    done
 }
 trap cleanup EXIT INT TERM
 
@@ -79,7 +99,7 @@ for pkg in "${PACKAGES[@]}"; do
     PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d "$db" -q -v ON_ERROR_STOP=1 -f "$m"
   done
   DATABASE_URL="postgres://$USER:$PASS@$HOST:$PORT/$db" \
-    cargo test -p "$pkg" -- --test-threads=1 --nocapture 2>&1 | tee "$log"
+    cargo test -p "$pkg" -- --nocapture 2>&1 | tee "$log"
 
   # --- guard 2: "ok" is only ok if nothing opted out ------------------------
   # Unanchored: libtest prints the skip on the same line as the test name,
@@ -104,4 +124,4 @@ done
 # behind `cargo run -p agentos-eval -- --live`. A suite that takes twenty
 # minutes is a suite nobody runs.
 echo "==> agentos-eval  (no database; deterministic suites only)"
-cargo test -p agentos-eval -- --test-threads=1
+cargo test -p agentos-eval

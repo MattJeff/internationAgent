@@ -333,17 +333,16 @@ mod tests {
     /// `None` when there is no database. These tests are worthless against a
     /// mock — the thing under test is `SKIP LOCKED` — so they skip loudly.
     async fn db() -> Option<(Db, tokio::sync::MutexGuard<'static, ()>)> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the outbox loop needs a real Postgres");
-            return None;
-        };
         let guard = OUTBOX_LOCK.lock().await;
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
+        let db = crate::loops::private_db("outbox").await?;
         // Anything a previously crashed run left behind would be claimed by the
-        // loop under test. Safe: this is a test database.
+        // loop under test. The database is this module's own, so the blast
+        // radius is already empty — the predicate is here anyway, because an
+        // unscoped DELETE in a test is the bug even when today's blast radius
+        // happens to be empty, and `crates/app/tests/scoped_deletes.rs` is what
+        // keeps that true. Events cascade from the tenant that owns them.
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM outbox_events")
+        sqlx::query("DELETE FROM tenants WHERE slug LIKE 'outbox-loop-%'")
             .execute(&mut *tx)
             .await
             .expect("clear outbox");

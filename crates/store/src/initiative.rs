@@ -404,7 +404,9 @@ mod tests {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
             .bind(tenant.as_uuid())
-            .bind(format!("{label}-{}", tenant.as_uuid()))
+            // Prefixed so `clear_schedules` names this module's rows rather
+            // than the table. A bare label is not unique across modules.
+            .bind(format!("{TENANT_SLUG}{label}-{}", tenant.as_uuid()))
             .bind(label)
             .execute(&mut *tx)
             .await
@@ -426,12 +428,21 @@ mod tests {
 
     /// Anything a previously crashed run left behind, so the cross-tenant claims
     /// below see only what this test wrote. Safe: this is a test database.
+    /// The slug every tenant this module creates carries, so
+    /// [`clear_schedules`] names its own rows rather than the table.
+    const TENANT_SLUG: &str = "store-initiative-";
+
     async fn clear_schedules(db: &Db) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM employee_initiative")
-            .execute(&mut *tx)
-            .await
-            .expect("clear schedules");
+        // Only this module's tenants, named through the slug its own fixtures
+        // mint. See `crates/app/tests/scoped_deletes.rs`.
+        sqlx::query(
+            "DELETE FROM employee_initiative WHERE tenant_id IN \
+             (SELECT id FROM tenants WHERE slug LIKE 'store-initiative-%')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("clear schedules");
         tx.commit().await.expect("commit clear");
     }
 

@@ -889,19 +889,39 @@ mod tests {
     /// global to it. Tests take turns.
     static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the provisioning loop needs a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+    /// These tests share one database and read across every tenant in it, so
+    /// they go one at a time. `claim` takes a bounded batch of whoever is
+    /// stalest, `claim_releases` *writes* to every tenant it can see, and the
+    /// sweep escalates employees it was never told about — three assertions
+    /// about a global object that a sibling test running beside them changes
+    /// under their feet. The private database keeps other *modules* out; this
+    /// keeps this module out of its own way. Same reason `loops::outbox` has
+    /// one.
+    static PROVISIONING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The slug every tenant this module creates carries, so [`reset`] names
+    /// its own rows rather than the table.
+    const TENANT_SLUG: &str = "loop-provisioning-";
+
+    /// This module's own database — see [`private_db`](crate::loops::private_db).
+    ///
+    /// `claim` takes a bounded batch of whoever is stalest across every tenant,
+    /// so another test's pending rows push this one's out of the window, and
+    /// `claim_releases` *writes* to every tenant it can see. Neither is narrowed
+    /// by a `WHERE tenant_id = $1`: the loop is cross-tenant because that is
+    /// what a poller is.
+    async fn db() -> Option<(Db, tokio::sync::MutexGuard<'static, ()>)> {
+        let guard = PROVISIONING_LOCK.lock().await;
+        let db = crate::loops::private_db("provisioning").await?;
+        Some((db, guard))
     }
 
     async fn reset(db: &Db) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM tenants")
+        // Scoped even though this database is this module's own: see
+        // `crates/app/tests/scoped_deletes.rs` for why the rule has no
+        // exception for "it is safe here".
+        sqlx::query("DELETE FROM tenants WHERE slug LIKE 'loop-provisioning-%'")
             .execute(&mut *tx)
             .await
             .expect("wipe");
@@ -915,7 +935,10 @@ mod tests {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
             .bind(tenant.as_uuid())
-            .bind(format!("t-{}", tenant.as_uuid().simple()))
+            // The prefix is what makes `reset` a scoped statement instead of a
+            // wipe. A predicate that matches nothing deletes nothing and looks
+            // exactly like a fix, so the two have to be changed together.
+            .bind(format!("{TENANT_SLUG}{}", tenant.as_uuid().simple()))
             .execute(&mut *tx)
             .await
             .expect("insert tenant");
@@ -1191,7 +1214,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_employee_is_work_and_a_provisioned_one_is_not() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "lena").await;
@@ -1221,7 +1246,9 @@ mod tests {
     /// row; nothing else in the system will ever look at it again.
     #[tokio::test]
     async fn an_expired_lease_is_reclaimed_and_a_live_one_is_left_alone() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "raj").await;
@@ -1271,7 +1298,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_step_is_retried_cold_and_never_past_the_cap() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "ines").await;
@@ -1336,7 +1365,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_drains_an_employee_to_online_exactly_once() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "kim").await;
@@ -1380,7 +1411,9 @@ mod tests {
     /// between them they provision it once.
     #[tokio::test]
     async fn a_loop_killed_mid_drain_converges_exactly_once_on_restart() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "nils").await;
@@ -1438,7 +1471,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_overdue_pending_external_step_is_escalated_once() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "ada").await;
@@ -1522,7 +1557,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_wait_that_is_not_due_yet_is_left_alone() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "otto").await;
@@ -1575,7 +1612,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_trace_of_the_request_is_inherited_and_carried_onward() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "vera").await;
@@ -1640,7 +1679,9 @@ mod tests {
     /// to keep billing forever. The sweep is what asks again.
     #[tokio::test]
     async fn a_dead_lettered_termination_is_eventually_released_by_the_sweep() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "mara").await;
@@ -1695,7 +1736,9 @@ mod tests {
     /// deployment. Asked once, ever — however many ticks run.
     #[tokio::test]
     async fn a_step_that_cannot_be_released_is_never_retried_by_the_sweep() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "resend").await;
@@ -1746,7 +1789,9 @@ mod tests {
     /// standing between the operator and a silent invoice is this query.
     #[tokio::test]
     async fn a_step_that_cannot_be_released_is_still_listed_for_the_operator() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "stranded").await;
@@ -1789,7 +1834,9 @@ mod tests {
     /// step that will not come back must not ask a human once per tick either.
     #[tokio::test]
     async fn a_repeatedly_failing_release_backs_off_and_escalates_exactly_once() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "stubborn").await;
@@ -1860,7 +1907,9 @@ mod tests {
     /// the attempt count that bounds them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_concurrent_sweepers_do_not_double_release_a_step() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "twice").await;
@@ -1918,7 +1967,9 @@ mod tests {
     /// re-provisioned all eleven steps and bought a fresh phone number.
     #[tokio::test]
     async fn the_sweep_never_resurrects_a_terminated_employee() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "ghost").await;
@@ -1970,7 +2021,9 @@ mod tests {
     /// waiting to happen. Nothing may be asked about it at all.
     #[tokio::test]
     async fn an_employee_with_nothing_bound_is_not_swept_at_all() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "empty").await;
@@ -2027,7 +2080,9 @@ mod tests {
     /// left at what the migration gives an existing row.
     #[tokio::test]
     async fn a_step_that_burned_its_provisioning_attempts_gets_a_full_release_budget() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "expensive").await;
@@ -2107,7 +2162,9 @@ mod tests {
     /// `last_error` on a refused release does exactly that.
     #[tokio::test]
     async fn the_sweep_backs_off_on_the_release_column_and_not_on_updated_at() {
-        let Some(db) = db().await else { return };
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
         let _guard = DB_LOCK.lock().await;
         reset(&db).await;
         let employee = seed(&db, "backoff").await;
