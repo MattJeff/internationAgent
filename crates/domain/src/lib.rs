@@ -12,8 +12,10 @@ pub mod employee; // U3
 pub mod ids; // U1
 pub mod message; // U4
 pub mod money; // U2
+pub mod org; // wave 13: teams and sections
 pub mod phone_pool;
 pub mod policy; // U5
 pub mod psyche; // wave 8: ported MPCP subset
+pub mod revenue; // wave 12: seller vertical
 pub mod sourcing;
 pub mod untrusted; // U4 // wave 7: buyer vertical

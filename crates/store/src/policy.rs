@@ -167,6 +167,15 @@ impl From<sqlx::Error> for PolicyLoadError {
 ///
 /// RLS already confines the tenant rows; the predicates are written out anyway
 /// so the statement says what it means when read on its own.
+///
+/// The `coalesce` on the role layer is the org layer plugging in (0012_org):
+/// an employee that belongs to a team takes that team's role name, and the
+/// `role` argument is the fallback for an employee on no team. It is a
+/// sub-select rather than a second query because this runs on the hot path of
+/// every gate decision, and `team_memberships`' primary key is
+/// `(tenant_id, employee_id)`, so it is one index lookup. That key is also what
+/// makes the sub-select single-valued: an employee is on at most one team, so
+/// there is never a coin-flip between two teams' limits.
 const SELECT_ACTIVE_LAYERS: &str = "\
     SELECT l.id, l.layer, l.spend_currency, l.max_per_transaction_minor, \
            l.max_per_day_minor, l.approval_above_minor, l.allowed_channels, \
@@ -178,14 +187,27 @@ const SELECT_ACTIVE_LAYERS: &str = "\
     WHERE v.active AND ( \
           (l.layer = 'platform' AND v.tenant_id IS NULL) \
        OR (l.layer = 'tenant'   AND v.tenant_id = $1) \
-       OR (l.layer = 'role'     AND v.tenant_id = $1 AND l.role_name = $2) \
+       OR (l.layer = 'role'     AND v.tenant_id = $1 AND l.role_name = coalesce(( \
+              SELECT tp.role_name FROM team_memberships m \
+                JOIN team_policy tp \
+                  ON tp.tenant_id = m.tenant_id AND tp.team_id = m.team_id \
+               WHERE m.tenant_id = $1 AND m.employee_id = $3), $2)) \
        OR (l.layer = 'employee' AND v.tenant_id = $1 AND l.employee_id = $3))";
 
 /// Load and intersect the policy for one employee.
 ///
-/// `role` is the employee's role name, or `None` when it has none — there is no
-/// role model in the domain yet, so the caller names it. An unmatched role is
-/// simply an absent layer, which inherits the tenant's.
+/// The role layer is the employee's **team**, when it has one: `store::org`
+/// records which role name a team's limits are written under, and the statement
+/// above resolves it in the same round trip. `role` is the fallback for an
+/// employee on no team — there is no role model in the domain, so the caller
+/// names it. Either way an unmatched role is simply an absent layer, which
+/// inherits the tenant's; a team that nobody wrote limits for does not become a
+/// team that may do nothing.
+///
+/// A team layer can therefore only ever *tighten*: it goes through
+/// [`EffectivePolicy::try_new`] like every other layer, which takes the minimum
+/// of each cap, so a team naming a bigger number than its tenant gets the
+/// tenant's.
 ///
 /// The tenant is not a parameter: it comes from `tx`, which is the only thing
 /// row-level security honours anyway.
@@ -415,7 +437,7 @@ fn parse_tool(raw: &str) -> Result<McpTool, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::LazyLock;
 
     use agentos_domain::ids::TenantId;
@@ -517,7 +539,11 @@ mod tests {
 
     /// Install the one global platform layer, replacing whatever was there.
     /// Returns the lock that keeps a concurrent test from doing the same.
-    async fn platform(
+    ///
+    /// `pub(crate)` because `store::org`'s tests load policies too, and the
+    /// platform layer is a global singleton: a second mutex in a second module
+    /// would guard nothing.
+    pub(crate) async fn platform(
         db: &Db,
         spend: (i64, i64, i64),
         domains: &[&str],

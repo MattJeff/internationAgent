@@ -12,8 +12,11 @@ pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod pool_ops;
 pub mod prompt; // U23
+pub mod proof_of_need; // wave 12
 pub mod provisioning; // U24
+pub mod revenue; // wave 12
 pub mod rolepack;
+pub mod rolepack_sales; // wave 12
 pub mod secrets; // U22
 pub mod sourcing;
 pub mod turn; // U25

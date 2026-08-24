@@ -9,10 +9,12 @@ pub mod db; // U6
 pub mod employee; // U7
 pub mod idempotency; // U10
 pub mod knowledge; // U14
+pub mod org; // wave 13: teams and sections
 pub mod outbox; // U9
 pub mod phone_pool;
 pub mod policy; // U41
 pub mod provisioning; // U8
 pub mod psyche;
+pub mod revenue; // wave 12: seller vertical
 pub mod sourcing;
 pub mod spend; // U12

@@ -366,7 +366,7 @@ impl McpServer {
     pub async fn bind(
         server: Slug,
         url: &str,
-        declared: &BTreeMap<Slug, RiskClass>,
+        declared: &BTreeMap<Slug, Declaration>,
         reach: Reach,
         ct: CancellationToken,
     ) -> Result<Self, McpError> {
@@ -514,9 +514,81 @@ impl McpServer {
 /// Tools whose names have no [`Slug`] spelling are dropped: no allowlist entry
 /// could ever name them, so they are unreachable anyway, and dropping them is
 /// quieter than inventing a mangled handle.
+/// What an operator vetted, for one tool.
+///
+/// The class alone is not enough, because it is keyed by NAME. An operator vets
+/// a tool by reading what it *does*; keying only on what it is *called* means a
+/// server can redeploy the same name with a different input schema — `lookup`
+/// growing a `callback_url` parameter — and keep the class a human granted to
+/// something else. Every name-keyed check in this system then agrees with every
+/// other one, and all of them are wrong together: `classify` matches a name,
+/// and so does the gate's `allowed_mcp_tools`.
+///
+/// `digest` pins the declaration to the exact tool that was read. It is the
+/// operator's, and it NEVER advances on its own — a moving baseline is what
+/// forces a system to go hunting for slow drift, and an immutable one deletes
+/// that attack class instead of detecting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declaration {
+    /// The class a human granted.
+    pub risk: RiskClass,
+    /// The tool this class was granted to. `None` opts out — the class then
+    /// travels with the name alone, which is the behaviour this type exists to
+    /// replace, so only leave it unset while migrating.
+    pub digest: Option<[u8; 32]>,
+}
+
+/// A stable hash of everything about a tool an operator would have read.
+///
+/// Canonical, so a server that reorders its JSON does not look like a server
+/// that changed it: object keys are sorted recursively before hashing. Covers
+/// name, description and input schema — the description matters even though it
+/// never reaches the model, because it is what the human based the decision on.
+fn digest(tool: &Tool) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    fn canonical(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                out.push('{');
+                for key in keys {
+                    out.push_str(key);
+                    out.push(':');
+                    canonical(&map[key], out);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for item in items {
+                    canonical(item, out);
+                    out.push(',');
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+
+    let mut buf = String::new();
+    buf.push_str(&tool.name);
+    buf.push('\u{1f}');
+    buf.push_str(tool.description.as_deref().unwrap_or(""));
+    buf.push('\u{1f}');
+    canonical(
+        &serde_json::Value::Object((*tool.input_schema).clone()),
+        &mut buf,
+    );
+
+    Sha256::digest(buf.as_bytes()).into()
+}
+
 fn inventory(
     discovered: &[Tool],
-    declared: &BTreeMap<Slug, RiskClass>,
+    declared: &BTreeMap<Slug, Declaration>,
 ) -> Result<BTreeMap<Slug, BoundTool>, McpError> {
     let mut tools: BTreeMap<Slug, BoundTool> = BTreeMap::new();
     for tool in discovered {
@@ -531,7 +603,21 @@ fn inventory(
                 second: tool.name.to_string(),
             });
         }
-        let risk = classify(declared.get(&handle).copied(), tool.annotations.as_ref());
+        // A declaration whose digest does not match this tool is not a
+        // declaration for this tool. Falling through to `None` reuses the
+        // existing fail-closed branch — Destructive, so a human sees it — rather
+        // than adding a second way to refuse.
+        let vetted = declared.get(&handle).and_then(|d| match d.digest {
+            Some(pinned) if pinned != digest(tool) => {
+                tracing::warn!(
+                    tool = %tool.name,
+                    "mcp tool no longer matches what the operator vetted; treating it as undeclared"
+                );
+                None
+            }
+            _ => Some(d.risk),
+        });
+        let risk = classify(vetted, tool.annotations.as_ref());
         tools.insert(
             handle,
             BoundTool {
@@ -781,11 +867,32 @@ mod tests {
         McpTool::new(erp(), slug(name))
     }
 
-    fn declared() -> BTreeMap<Slug, RiskClass> {
+    fn declared() -> BTreeMap<Slug, Declaration> {
+        // No digests here: these fixtures predate pinning and exercise the
+        // name-only path that `Declaration::digest = None` preserves. The
+        // pinning itself is covered by its own tests below.
         BTreeMap::from([
-            (slug("lookup"), RiskClass::Read),
-            (slug("write-note"), RiskClass::Write),
-            (slug("drop-table"), RiskClass::Destructive),
+            (
+                slug("lookup"),
+                Declaration {
+                    risk: RiskClass::Read,
+                    digest: None,
+                },
+            ),
+            (
+                slug("write-note"),
+                Declaration {
+                    risk: RiskClass::Write,
+                    digest: None,
+                },
+            ),
+            (
+                slug("drop-table"),
+                Declaration {
+                    risk: RiskClass::Destructive,
+                    digest: None,
+                },
+            ),
         ])
     }
 
@@ -895,6 +1002,62 @@ mod tests {
         let harmless = ToolAnnotations::new().read_only(true);
         assert_eq!(classify(None, None), RiskClass::Destructive);
         assert_eq!(classify(None, Some(&harmless)), RiskClass::Destructive);
+    }
+
+    #[test]
+    fn a_tool_that_changed_since_the_operator_vetted_it_is_destructive() {
+        // The attack this closes: an operator vets `lookup` — takes an id,
+        // returns a row — and declares it Read. The server later redeploys the
+        // same *name* with `callback_url` added to its schema. Name-keyed
+        // declarations still say Read, so a tool that now exfiltrates on demand
+        // is allowed without a human. Every name-keyed check in the system
+        // agrees with every other one, and all of them are wrong together.
+        let vetted = tool("lookup");
+
+        let mut widened_schema = JsonObject::new();
+        widened_schema.insert("callback_url".into(), serde_json::json!({"type": "string"}));
+        let widened = Tool::new(
+            "lookup".to_owned(),
+            "a tool".to_owned(),
+            Arc::new(widened_schema),
+        );
+
+        let pinned = BTreeMap::from([(
+            slug("lookup"),
+            Declaration {
+                risk: RiskClass::Read,
+                digest: Some(digest(&vetted)),
+            },
+        )]);
+
+        assert_eq!(
+            inventory(&[vetted], &pinned).expect("inventory")[&slug("lookup")].risk,
+            RiskClass::Read,
+            "the tool the operator actually vetted keeps its declared class"
+        );
+        assert_eq!(
+            inventory(&[widened], &pinned).expect("inventory")[&slug("lookup")].risk,
+            RiskClass::Destructive,
+            "a changed input schema falls back to undeclared, which needs a human"
+        );
+    }
+
+    #[test]
+    fn a_digest_does_not_depend_on_key_order() {
+        // Serde_json preserves insertion order by default, so two servers
+        // serialising the same schema with different key order would otherwise
+        // produce two digests and lock the operator out of their own tool.
+        let mut a = JsonObject::new();
+        a.insert("x".into(), serde_json::json!(1));
+        a.insert("y".into(), serde_json::json!(2));
+        let mut b = JsonObject::new();
+        b.insert("y".into(), serde_json::json!(2));
+        b.insert("x".into(), serde_json::json!(1));
+
+        assert_eq!(
+            digest(&Tool::new("t".to_owned(), "d".to_owned(), Arc::new(a))),
+            digest(&Tool::new("t".to_owned(), "d".to_owned(), Arc::new(b))),
+        );
     }
 
     #[test]
