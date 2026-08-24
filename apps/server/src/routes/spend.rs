@@ -280,7 +280,7 @@ async fn employee_in_tenant(tx: &mut TenantTx<'_>, id: EmployeeId) -> Result<(),
 mod tests {
     use std::collections::BTreeSet;
 
-    use agentos_app::gate::{Denied, PolicyBook, PolicyGate, Principal as GatePrincipal};
+    use agentos_app::gate::{Denied, PolicyGate, Principal as GatePrincipal};
     use agentos_domain::action::{Action, Channel};
     use agentos_domain::ids::TenantId;
     use agentos_domain::money::Currency::Eur;
@@ -441,10 +441,10 @@ mod tests {
     /// therefore refused by the **ledger**, which is the thing the route
     /// writes, rather than by a policy layer that never left memory.
     ///
-    /// Deliberately an in-memory `PolicyBook`, exactly as `gate.rs`'s own tests
-    /// build one: the policy loader is another unit's work in flight, and this
-    /// test is about `spend_caps`.
-    fn gate(db: &Db) -> PolicyGate {
+    /// Installed as a real tenant layer, because the gate reads its policy out
+    /// of the database now. It used to be an in-memory `PolicyBook`, which is
+    /// exactly the thing that made every stored layer inert.
+    async fn gate(db: &Db, tenant: TenantId) -> PolicyGate {
         let limits = PolicyLimits {
             spend: Some(
                 SpendLimits::try_new(
@@ -457,7 +457,10 @@ mod tests {
             allowed_channels: BTreeSet::from([Channel::Email]),
             ..PolicyLimits::default()
         };
-        PolicyGate::new(db.clone(), PolicyBook::new(limits))
+        agentos_store::policy::install(db, tenant, agentos_store::policy::Scope::Tenant, &limits)
+            .await
+            .expect("install the tenant policy");
+        PolicyGate::new(db.clone())
     }
 
     fn payment(minor: u64) -> Action {
@@ -489,7 +492,7 @@ mod tests {
             return;
         };
         let id = employee(&h.db, h.a, "lena").await;
-        let gate = gate(&h.db);
+        let gate = gate(&h.db, h.a).await;
         let principal = GatePrincipal::employee(h.a, EmployeeId::from_uuid(id));
 
         // 1. Unconfigured. This is what every shipped deployment looked like

@@ -792,6 +792,7 @@ const TURN_BRIEF: &str = "Nobody has written to you. Your working rhythm has com
 pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
 
     use agentos_app::rolepack::CountryCode;
     use agentos_domain::employee::Lifecycle;
@@ -815,18 +816,18 @@ pub(crate) mod tests {
     /// for one more that is this loop's alone. `claim_due` is cross-tenant by
     /// construction — it takes a bounded batch of whoever is due anywhere — so
     /// another test's employees are inside its window and no `WHERE tenant_id`
-    /// narrows it. And `platform_turn_budget` below replaces the **platform
-    /// policy layer**, which is `tenant_id IS NULL` and therefore one row for
+    /// narrows it. `turn_budget` below used to replace the **platform policy
+    /// layer** as well, which is `tenant_id IS NULL` and therefore one row for
     /// the whole database: on the shared database that deleted the layer other
     /// modules were mid-assertion on, which is exactly how this landed seven
     /// failures across `loops::outbox`, `loops::provisioning` and
-    /// `routes::turns` in one run. A private database is the fix; a second
-    /// mutex would only have moved the collision.
+    /// `routes::turns` in one run. That half is gone — it writes a tenant layer
+    /// now — but the cross-tenant claim is reason enough on its own.
     async fn db() -> Option<Db> {
         crate::loops::private_db("initiative").await
     }
 
-    use uuid::Uuid;
+    use agentos_domain::policy::PolicyLimits;
 
     /// The slug every tenant this module creates carries, so `clear_schedules`
     /// names its own rows rather than the table.
@@ -845,51 +846,40 @@ pub(crate) mod tests {
             .expect("insert tenant");
 
         tx.commit().await.expect("commit");
-        platform_turn_budget(db, 100).await;
+        turn_budget(db, tenant, 100).await;
         tenant
     }
 
-    /// The platform layer, with a turn budget.
+    /// This tenant's turn budget, as a `tenant` policy layer.
     ///
-    /// Two reasons a fixture has to do this. `handle` reserves a turn before it
-    /// calls the model, and `store::policy::load` answers `NoPlatformLayer` —
-    /// an error, not a permissive default — when nothing installs one, so
-    /// without this every employee here is refused before it starts. And the
-    /// budget itself has to be granted: `PolicyLimits::default()` is zero
-    /// turns, which is the fail-closed half of the design working. An
-    /// unconfigured employee never wakes rather than never stopping, so a
-    /// fixture that wants a turn has to ask for one exactly like an operator.
+    /// Two reasons a fixture has to do this at all. `handle` reserves a turn
+    /// before it calls the model, and `store::policy::load` answers
+    /// `NoPlatformLayer` — an error, not a permissive default — when nothing
+    /// installs a ceiling, so without this every employee here is refused
+    /// before it starts. And the budget itself has to be granted:
+    /// `PolicyLimits::default()` is zero turns, which is the fail-closed half
+    /// of the design working. An unconfigured employee never wakes rather than
+    /// never stopping, so a fixture that wants a turn has to ask for one
+    /// exactly like an operator.
     ///
-    /// The platform layer is a global singleton — `tenant_id IS NULL` — so this
-    /// replaces whatever was there rather than adding a second. `scripts/test.sh`
-    /// runs `--test-threads=1`, which is what keeps that safe; see
-    /// `routes::turns::tests`, which does the same thing for the same reason.
-    async fn platform_turn_budget(db: &Db, turns: i32) {
-        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
-            .execute(&mut *tx)
-            .await
-            .expect("clear platform versions");
-        let version = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO policy_versions (id, tenant_id, label, active) \
-             VALUES ($1, NULL, 'initiative-loop-test', true)",
+    /// It used to write the *platform* layer, which is `tenant_id IS NULL` and
+    /// therefore one row for the whole database, and delete whatever was there
+    /// first — safe only under `--test-threads=1`, which `scripts/test.sh`
+    /// stopped passing. `store::policy::install` maintains one ceiling and
+    /// widens it instead, so the number a test cares about goes in its own
+    /// tenant's layer and the intersection takes the minimum.
+    async fn turn_budget(db: &Db, tenant: TenantId, turns: u32) {
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                max_turns_per_day: turns,
+                ..PolicyLimits::default()
+            },
         )
-        .bind(version)
-        .execute(&mut *tx)
         .await
-        .expect("insert platform version");
-        sqlx::query(
-            "INSERT INTO policy_layers (id, version_id, tenant_id, layer, max_turns_per_day) \
-             VALUES ($1, $2, NULL, 'platform', $3)",
-        )
-        .bind(Uuid::now_v7())
-        .bind(version)
-        .bind(turns)
-        .execute(&mut *tx)
-        .await
-        .expect("insert platform layer");
-        tx.commit().await.expect("commit platform");
+        .expect("install the turn budget");
     }
 
     async fn drop_tenant(db: &Db, tenant: TenantId) {
@@ -1205,7 +1195,7 @@ pub(crate) mod tests {
     /// suppliers and then thinks about it has taken one turn, not two.
     #[tokio::test]
     async fn a_due_buyer_issues_its_rfq_through_the_loop_and_spends_one_turn() {
-        use agentos_app::gate::{PolicyBook, PolicyGate};
+        use agentos_app::gate::PolicyGate;
         use agentos_store::sourcing as sourcing_store;
 
         let Some(db) = db().await else { return };
@@ -1225,17 +1215,34 @@ pub(crate) mod tests {
         )
         .await;
 
+        // The buyer's own role limits, as a real tenant layer. The gate reads
+        // its policy out of the database now, so a fixture that only built one
+        // in memory would have the employee refused before it reached the
+        // vertical — which is exactly what this test would then have been
+        // proving nothing about.
+        //
+        // `spend: None`: nothing on this path proposes a payment, and the
+        // buyer's pack is denominated in USD while every other fixture here is
+        // in EUR. A deployment has one ceiling and therefore one currency, so
+        // installing both would make `EffectivePolicy::try_new` refuse the pair
+        // and every action in the test come back `broken_policy`.
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                spend: None,
+                ..rolepack::RolePack::international_buyer().limits().clone()
+            },
+        )
+        .await
+        .expect("install the buyer's limits");
+
         let cancel = CancellationToken::new();
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::scripted_mock()),
-            // The buyer's own role layer as the platform layer: the widest this
-            // employee could ever be granted, so a refusal below would be the
-            // vertical's and not a fixture's.
-            gate: PolicyGate::new(
-                db.clone(),
-                PolicyBook::new(rolepack::RolePack::international_buyer().limits().clone()),
-            ),
+            gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             // No binder loop here, so every tenant's fleet is empty and every
             // MCP call is refused by name.

@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentos_app::effects::{Effects, Ports};
-use agentos_app::gate::{PolicyBook, PolicyGate, Principal as ActingAs};
+use agentos_app::gate::{PolicyGate, Principal as ActingAs};
 use agentos_app::inbound::{BlobStore, InMemoryBlobs, Secret, record_raw_email_notice};
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
@@ -201,12 +201,13 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // policy book on each, and a second set of adapters is a second mock inbox
     // that the first one's messages are not in.
     //
-    // ponytail: `PolicyBook::default()` is the empty platform layer, which
-    // grants nothing — the documented behaviour of an unconfigured gate, and
-    // the correct one. There is no `policies` table and no configuration
-    // format for one yet; when there is, it is loaded here and nothing else
-    // changes.
-    let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+    // The gate takes a database and nothing else: the policy is four rows and
+    // it reads them per decision, inside the decision's own transaction. So a
+    // cap an operator changes takes effect on the next action rather than the
+    // next deploy — and a deployment with no `platform` policy layer refuses
+    // every action until somebody installs one, loudly, rather than falling
+    // back to a permissive default nobody wrote.
+    let gate = PolicyGate::new(db.clone());
     let ports = Arc::new(agentos_app::mocks::ports());
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
     let engine = ProvisioningEngine::new(
@@ -1909,6 +1910,25 @@ mod tests {
         .expect("land the inbound message");
         tx.commit().await.expect("commit the message");
 
+        // The policy the gate will read. Email and a generous contact budget,
+        // so the reply goes out on its own merit — and **no spend limits at
+        // all**, so a payment is refused by the rule rather than by an
+        // unconfigured deployment. Without a stored policy every action here
+        // would be refused with `no_platform_policy`, which is a refusal for
+        // the wrong reason and proves nothing about the taint wire.
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                allowed_channels: std::collections::BTreeSet::from([Channel::Email]),
+                max_new_contacts_per_day: 100,
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+
         assert!(!landed.duplicate);
         Some(Landed {
             db,
@@ -1932,7 +1952,7 @@ mod tests {
             let agent = Agent {
                 db: self.db.clone(),
                 llm,
-                gate: PolicyGate::new(self.db.clone(), PolicyBook::default()),
+                gate: PolicyGate::new(self.db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
                 // No binder loop in this test, so every tenant's fleet is
                 // empty and every MCP call is refused by name.
@@ -2274,7 +2294,7 @@ mod tests {
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
-            gate: PolicyGate::new(db.clone(), PolicyBook::default()),
+            gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: Fleets::new().0,
             model: "claude-opus-5",

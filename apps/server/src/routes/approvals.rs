@@ -396,7 +396,7 @@ async fn deny(
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::gate::{Denied, PolicyBook};
+    use agentos_app::gate::Denied;
     use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, header};
@@ -447,12 +447,25 @@ mod tests {
         .expect("insert employee");
         tx.commit().await.expect("commit seed");
 
+        // A policy that grants nothing. The gate reads its policy out of the
+        // database now, and a tenant with no layer at all is refused before the
+        // rule is reached — which would make every "pending approval" below a
+        // `broken_policy` instead.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits::default(),
+        )
+        .await
+        .expect("install the policy");
+
         (tenant, employee)
     }
 
-    /// Contracts always need a human, whatever the policy says — so an empty
-    /// [`PolicyBook`] is enough to file one, and the fixture cannot accidentally
-    /// be testing a spend limit.
+    /// Contracts always need a human, whatever the policy says — so a policy
+    /// that grants nothing is enough to file one, and the fixture cannot
+    /// accidentally be testing a spend limit.
     fn contract(title: &str) -> Action {
         Action::ContractSign {
             title: title.to_owned(),
@@ -522,7 +535,7 @@ mod tests {
     #[tokio::test]
     async fn the_queue_is_tenant_scoped_and_oldest_first() {
         let Some(db) = db().await else { return };
-        let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+        let gate = PolicyGate::new(db.clone());
         let (mine, my_employee) = seed(&db).await;
         let (theirs, their_employee) = seed(&db).await;
 
@@ -594,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn approving_a_mutated_action_is_refused_and_approving_twice_fails() {
         let Some(db) = db().await else { return };
-        let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+        let gate = PolicyGate::new(db.clone());
         let (tenant, employee) = seed(&db).await;
         let approved = contract("supply agreement with A");
         let id = file(&gate, &GatePrincipal::employee(tenant, employee), &approved).await;
@@ -634,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_approval_cannot_be_approved() {
         let Some(db) = db().await else { return };
-        let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+        let gate = PolicyGate::new(db.clone());
         let (tenant, employee) = seed(&db).await;
         let action = contract("late");
         let id = file(&gate, &GatePrincipal::employee(tenant, employee), &action).await;
@@ -667,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn a_requester_cannot_approve_itself_and_the_wrong_role_cannot_decide() {
         let Some(db) = db().await else { return };
-        let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+        let gate = PolicyGate::new(db.clone());
         let (tenant, employee) = seed(&db).await;
         let action = contract("self service");
 
@@ -701,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn a_deny_is_recorded_and_the_action_never_executes() {
         let Some(db) = db().await else { return };
-        let gate = PolicyGate::new(db.clone(), PolicyBook::default());
+        let gate = PolicyGate::new(db.clone());
         let (tenant, employee) = seed(&db).await;
         let action = contract("a deal we will not sign");
         let id = file(&gate, &GatePrincipal::employee(tenant, employee), &action).await;

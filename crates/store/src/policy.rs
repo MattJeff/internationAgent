@@ -39,14 +39,14 @@ use std::fmt;
 use std::str::FromStr;
 
 use agentos_domain::action::{CallingCode, Domain, McpTool};
-use agentos_domain::ids::{EmployeeId, Slug};
+use agentos_domain::ids::{EmployeeId, Slug, TenantId};
 use agentos_domain::message::Channel;
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{EffectivePolicy, PolicyError, PolicyLimits, SpendLimits};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::db::{StoreError, TenantTx};
+use crate::db::{Db, StoreError, TenantTx};
 
 // ---------------------------------------------------------------------------
 // Layers
@@ -275,6 +275,242 @@ pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), Sto
         // those indistinguishable on purpose.
         return Err(StoreError::NotFound);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Writing a layer
+// ---------------------------------------------------------------------------
+
+/// Which layer [`install`] is writing.
+///
+/// Not `platform`: the ceiling is not a scope anybody installs on purpose, it
+/// is the one row [`install`] maintains for everybody. See its docs.
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    /// The tenant's own layer.
+    Tenant,
+    /// A role layer, matched on `role_name` — which is what a team's
+    /// `team_policy` row points at, so this is how a team gets limits.
+    Role(&'a str),
+    /// One employee's layer.
+    Employee(EmployeeId),
+}
+
+/// The one platform ceiling [`install`] maintains. Fixed ids, because the
+/// active platform version is a global singleton: concurrent callers have to
+/// upsert the *same* row rather than race to be the one active version.
+const CEILING_VERSION: Uuid = Uuid::from_u128(0x0006_0000_0000_7000_8000_0000_0000_0001);
+const CEILING_LAYER: Uuid = Uuid::from_u128(0x0006_0000_0000_7000_8000_0000_0000_0002);
+
+/// Write `limits` as one layer of `tenant_id`'s active policy version, under a
+/// platform ceiling wide enough not to bind.
+///
+/// **This is fixture and bootstrap support, not an operator API.** There is no
+/// route that writes `policy_layers` yet; when one lands it will write a *new*
+/// version and activate it, because that is what makes a policy change
+/// reversible, and this replaces a layer of the active one in place. What it is
+/// for is the thing every test that touches [`crate::db::Db`] now needs: a
+/// deployment with a policy in it, because the gate reads the stored one and
+/// [`PolicyLoadError::NoPlatformLayer`] refuses everything.
+///
+/// # Why the ceiling is widened rather than written
+///
+/// There is exactly one active platform version per database
+/// (`policy_versions_one_active_idx`), so callers cannot each have their own.
+/// The row is therefore *unioned* with every `limits` installed through here:
+/// the maximum of each cap, the concatenation of each allowlist, the OR of each
+/// flag. That is safe in the only direction that matters — a wider ceiling
+/// grants nothing on its own, because every caller also writes its own layer
+/// and [`EffectivePolicy::try_new`] takes the minimum. It is also why
+/// `denied_domains` is deliberately **not** unioned into the ceiling: denials
+/// union rather than intersect, so one caller's block would become every
+/// tenant's.
+///
+/// Concurrency-safe without a lock: the ceiling row is one row, and concurrent
+/// upserts of it serialise on it.
+pub async fn install(
+    db: &Db,
+    tenant_id: TenantId,
+    scope: Scope<'_>,
+    limits: &PolicyLimits,
+) -> Result<(), StoreError> {
+    let (layer, role_name, employee_id) = match scope {
+        Scope::Tenant => (PolicyLayer::Tenant, None, None),
+        Scope::Role(name) => (PolicyLayer::Role, Some(name), None),
+        Scope::Employee(id) => (PolicyLayer::Employee, None, Some(id.as_uuid())),
+    };
+
+    // Saturating rather than failing: every cap here is smaller than i64::MAX by
+    // eleven orders of magnitude in practice, and a saturated *ceiling* is
+    // wider, never narrower, so it cannot silently tighten a limit either.
+    let minor = |m: Money| i64::try_from(m.minor()).unwrap_or(i64::MAX);
+    let (currency, per_txn, per_day, approval) =
+        limits.spend.map_or((None, None, None, None), |s| {
+            (
+                Some(s.currency().code().to_owned()),
+                Some(minor(s.max_per_transaction())),
+                Some(minor(s.max_per_day())),
+                Some(minor(s.approval_above())),
+            )
+        });
+    let strings = |set: &BTreeSet<Domain>| set.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    // The ceiling. Anything else claiming to be the active platform version is
+    // a leftover from a fixture that wrote one by hand; there is one ceiling.
+    sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL AND id <> $1")
+        .bind(CEILING_VERSION)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO policy_versions (id, tenant_id, label, active) \
+         VALUES ($1, NULL, 'ceiling', true) ON CONFLICT DO NOTHING",
+    )
+    .bind(CEILING_VERSION)
+    .execute(&mut *tx)
+    .await?;
+
+    // This tenant's active version, created on first use. A second layer for
+    // the same tenant joins the version already there rather than starting a
+    // rival one, which would leave two versions fighting over `active`.
+    let version: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM policy_versions WHERE tenant_id = $1 AND active")
+            .bind(tenant_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let version = match version {
+        Some(id) => id,
+        None => {
+            let id = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO policy_versions (id, tenant_id, label, active) \
+                 VALUES ($1, $2, 'installed', true)",
+            )
+            .bind(id)
+            .bind(tenant_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+            id
+        }
+    };
+
+    // Replace this scope's layer rather than add a second one: the unique index
+    // is (version, layer, role, employee), so a second would be rejected, and
+    // installing twice is what a fixture that re-seeds does.
+    sqlx::query(
+        "DELETE FROM policy_layers WHERE version_id = $1 AND layer = $2 \
+           AND role_name IS NOT DISTINCT FROM $3 \
+           AND employee_id IS NOT DISTINCT FROM $4",
+    )
+    .bind(version)
+    .bind(layer.as_str())
+    .bind(role_name)
+    .bind(employee_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Both rows in one statement, sharing one set of binds: the ceiling widens
+    // on conflict, the scope row is a fresh id and simply inserts.
+    sqlx::query(
+        "INSERT INTO policy_layers \
+           (id, version_id, tenant_id, layer, role_name, employee_id, \
+            spend_currency, max_per_transaction_minor, max_per_day_minor, \
+            approval_above_minor, allowed_channels, allowed_calling_codes, \
+            allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
+            max_new_contacts_per_day, max_turns_per_day, \
+            allow_file_upload, allow_credential_change, allow_data_delete) \
+         VALUES \
+           ($1, $2, NULL, 'platform', NULL, NULL, \
+            $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23), \
+           ($3, $4, $5, $6, $7, $8, \
+            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+         ON CONFLICT (id) DO UPDATE SET \
+           spend_currency = coalesce(policy_layers.spend_currency, excluded.spend_currency), \
+           max_per_transaction_minor = \
+             greatest(policy_layers.max_per_transaction_minor, excluded.max_per_transaction_minor), \
+           max_per_day_minor = greatest(policy_layers.max_per_day_minor, excluded.max_per_day_minor), \
+           approval_above_minor = \
+             greatest(policy_layers.approval_above_minor, excluded.approval_above_minor), \
+           allowed_channels = policy_layers.allowed_channels || excluded.allowed_channels, \
+           allowed_calling_codes = \
+             policy_layers.allowed_calling_codes || excluded.allowed_calling_codes, \
+           allowed_domains = policy_layers.allowed_domains || excluded.allowed_domains, \
+           allowed_mcp_tools = policy_layers.allowed_mcp_tools || excluded.allowed_mcp_tools, \
+           allowed_a2a_peers = policy_layers.allowed_a2a_peers || excluded.allowed_a2a_peers, \
+           max_new_contacts_per_day = \
+             greatest(policy_layers.max_new_contacts_per_day, excluded.max_new_contacts_per_day), \
+           max_turns_per_day = greatest(policy_layers.max_turns_per_day, excluded.max_turns_per_day), \
+           allow_file_upload = policy_layers.allow_file_upload OR excluded.allow_file_upload, \
+           allow_credential_change = \
+             policy_layers.allow_credential_change OR excluded.allow_credential_change, \
+           allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete",
+    )
+    .bind(CEILING_LAYER)
+    .bind(CEILING_VERSION)
+    .bind(Uuid::now_v7())
+    .bind(version)
+    .bind(tenant_id.as_uuid())
+    .bind(layer.as_str())
+    .bind(role_name)
+    .bind(employee_id)
+    .bind(currency)
+    .bind(per_txn)
+    .bind(per_day)
+    .bind(approval)
+    .bind(
+        limits
+            .allowed_channels
+            .iter()
+            .map(|c| c.as_str().to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        limits
+            .allowed_calling_codes
+            .iter()
+            .map(|c| i32::from(c.as_u16()))
+            .collect::<Vec<_>>(),
+    )
+    .bind(strings(&limits.allowed_domains))
+    .bind(strings(&limits.denied_domains))
+    .bind(
+        limits
+            .allowed_mcp_tools
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .bind(strings(&limits.allowed_a2a_peers))
+    .bind(i32::try_from(limits.max_new_contacts_per_day).unwrap_or(i32::MAX))
+    .bind(i32::try_from(limits.max_turns_per_day).unwrap_or(i32::MAX))
+    .bind(limits.allow_file_upload)
+    .bind(limits.allow_credential_change)
+    .bind(limits.allow_data_delete)
+    .execute(&mut *tx)
+    .await?;
+
+    // One deployment, one ceiling, therefore one spend currency — that is the
+    // schema and the loader, not this function: layers in two currencies cannot
+    // be intersected and `load` refuses them. Said out loud here because the
+    // symptom otherwise is every action in the deployment being refused with
+    // `broken_policy`, which reads like a bug in whatever was being tested.
+    let ceiling: Option<String> =
+        sqlx::query_scalar("SELECT spend_currency FROM policy_layers WHERE id = $1")
+            .bind(CEILING_LAYER)
+            .fetch_one(&mut *tx)
+            .await?;
+    if let (Some(ceiling), Some(mine)) = (ceiling.as_deref(), limits.spend.map(|s| s.currency()))
+        && ceiling != mine.code()
+    {
+        return Err(StoreError::conflict(format!(
+            "this deployment's policy ceiling is denominated in {ceiling} and these limits are in \
+             {mine}: a policy in two currencies cannot be intersected"
+        )));
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 

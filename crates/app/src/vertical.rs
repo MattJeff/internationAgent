@@ -1334,7 +1334,7 @@ mod tests {
 
     use super::*;
     use crate::effects::{Effects, Ports};
-    use crate::gate::{Authorized, PolicyBook, PolicyGate, Principal};
+    use crate::gate::{Authorized, PolicyGate, Principal};
     use crate::proof_of_need::{Browse, Claim, PanelReader};
     use crate::revenue::{Contacted, Suppression};
 
@@ -1450,10 +1450,34 @@ mod tests {
         }
     }
 
-    /// A gate whose platform layer is `limits`. The layers intersect, so this is
-    /// the widest thing any employee under it can be granted.
-    fn gate(db: &Db, limits: PolicyLimits) -> PolicyGate {
-        PolicyGate::new(db.clone(), PolicyBook::new(limits))
+    /// A gate, with `limits` written into this tenant's policy layer.
+    ///
+    /// The gate holds a `Db` and loads the four layers per decision, so a
+    /// fixture that wants a policy writes one — and a tenant that has none is
+    /// refused everything.
+    ///
+    /// The spend limits are dropped, and that is not a shortcut. Nothing in
+    /// this module proposes a payment — it sends RFQs, compares quotes and
+    /// writes approaches — and a *deployment* has one platform layer, so it has
+    /// one spend currency: the international buyer's pack is denominated in USD
+    /// and every other fixture sharing this database is in EUR, which
+    /// `EffectivePolicy::try_new` refuses to intersect and is right to
+    /// (`store::policy::layers_in_different_currencies_do_not_load`). Carrying
+    /// the pack's USD caps here would make every assertion below pass or fail
+    /// on a `broken_policy` refusal instead of the rule it names.
+    async fn gate(db: &Db, principal: &Principal, limits: PolicyLimits) -> PolicyGate {
+        agentos_store::policy::install(
+            db,
+            principal.tenant_id,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                spend: None,
+                ..limits
+            },
+        )
+        .await
+        .expect("install the policy");
+        PolicyGate::new(db.clone())
     }
 
     fn email_ports(email: Arc<MockEmailProvider>) -> Arc<Ports> {
@@ -1610,7 +1634,7 @@ mod tests {
         let effects = Effects::new(db.clone(), email_ports(email.clone()), principal.clone());
         let pack = rolepack::RolePack::international_buyer();
         let buyer = Buyer::new(
-            gate(&db, pack.limits().clone()),
+            gate(&db, &principal, pack.limits().clone()).await,
             effects,
             principal,
             "lena@fabrikam.example",
@@ -1677,7 +1701,7 @@ mod tests {
         let effects = Effects::new(db.clone(), email_ports(email.clone()), principal.clone());
         let pack = rolepack::RolePack::international_buyer();
         let buyer = Buyer::new(
-            gate(&db, pack.limits().clone()),
+            gate(&db, &principal, pack.limits().clone()).await,
             effects,
             principal,
             "lena@fabrikam.example",
@@ -1755,7 +1779,7 @@ mod tests {
         let effects = Effects::new(db.clone(), email_ports(email.clone()), principal.clone());
         let pack = rolepack::RolePack::international_buyer();
         let buyer = Buyer::new(
-            gate(&db, pack.limits().clone()),
+            gate(&db, &principal, pack.limits().clone()).await,
             effects,
             principal,
             "lena@fabrikam.example",
@@ -1798,7 +1822,7 @@ mod tests {
             ..pack.limits().clone()
         };
         let buyer = Buyer::new(
-            gate(&db, muted),
+            gate(&db, &principal, muted).await,
             effects,
             principal,
             "lena@fabrikam.example",
@@ -1906,7 +1930,7 @@ mod tests {
         let email = Arc::new(MockEmailProvider::new());
         let effects = Effects::new(db.clone(), email_ports(email.clone()), principal.clone());
         let buyer = Buyer::new(
-            gate(db, limits),
+            gate(db, &principal, limits).await,
             effects,
             principal.clone(),
             "lena@fabrikam.example",
@@ -2219,14 +2243,14 @@ mod tests {
         SalesDesk {
             prober: Prober::new(
                 db.clone(),
-                gate(db, limits.clone()),
+                gate(db, &principal, limits.clone()).await,
                 effects.clone(),
                 principal.clone(),
                 panels,
                 session,
             ),
             seller: Seller::new(
-                gate(db, limits),
+                gate(db, &principal, limits).await,
                 effects,
                 principal,
                 "ines@orizn.example",

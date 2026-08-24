@@ -64,7 +64,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentos_app::effects::Effects;
-use agentos_app::gate::{PolicyBook, PolicyGate, Principal};
+use agentos_app::gate::{PolicyGate, Principal};
 use agentos_app::mocks::{LlmResponse, ScriptedLlm, Usage};
 use agentos_app::rolepack::{CountryCode as RoleCountry, Objective, RolePack, Stage};
 use agentos_app::sourcing::{
@@ -598,11 +598,14 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     // -- the role ----------------------------------------------------------
     //
     // GAP 3 — **nothing gives an employee a role.** `POST /v1/employees` takes
-    // a slug and a domain and nothing else; the `employees` table has no role
-    // column; `PolicyBook` has a platform, a tenant and an employee layer and
-    // no role slot (`gate.rs` folds the role into the employee layer and says
-    // so). So the RolePack is applied *here*, by hand, which is the one thing
-    // this test cannot claim the product does.
+    // a slug and a domain and nothing else, and the `employees` table has no
+    // role column. The *storage* half of this gap has closed since it was
+    // written: there is a `role` policy layer, and `store::policy::load`
+    // resolves it through the employee's team, so `POST /v1/teams` plus a role
+    // layer would give this employee its limits for real. What is still missing
+    // is anything that writes a `policy_layers` row — there is no route for it
+    // — so the RolePack is applied *here*, by hand, which is the one thing this
+    // test cannot claim the product does.
     let pack = RolePack::international_buyer();
     assert_eq!(pack.name(), "international-buyer");
     assert!(pack.may_propose(ActionKind::ContractSign));
@@ -629,11 +632,19 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         max_new_contacts_per_day: OUTREACH_CAP,
         ..pack.limits().clone()
     };
-    let policies = PolicyBook::new(limits);
-
     let db = Db::connect(&server.database_url).await.expect("connect");
+    // Into the database, because that is where the gate reads it: it holds a
+    // `Db` and loads platform ∧ tenant ∧ role ∧ employee per decision.
+    agentos_store::policy::install(
+        &db,
+        server.tenant,
+        agentos_store::policy::Scope::Tenant,
+        &limits,
+    )
+    .await
+    .expect("install the policy");
     let ports = Arc::new(agentos_app::mocks::ports());
-    let gate = PolicyGate::new(db.clone(), policies);
+    let gate = PolicyGate::new(db.clone());
     let effects_facade = Effects::new(db.clone(), ports, principal.clone());
     let buyer = Buyer::new(
         gate.clone(),

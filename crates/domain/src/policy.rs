@@ -343,6 +343,13 @@ pub enum DenyReason {
     CurrencyMismatch,
     PerTransactionLimit,
     DailyLimit,
+    /// The employee is on a team with no budget in this currency. Distinct from
+    /// [`DenyReason::NoSpendPolicy`] because the remedy is a different one: the
+    /// employee's own caps were fine and the team has none.
+    NoTeamBudget,
+    /// The team's daily budget, not the employee's. Same distinction, same
+    /// reason: raising the employee's cap would not help.
+    TeamDailyLimit,
     /// The secret does not belong to the acting principal.
     CrossTenantSecret,
     CredentialChangeNotAllowed,
@@ -369,6 +376,8 @@ impl DenyReason {
             DenyReason::CurrencyMismatch => "currency_mismatch",
             DenyReason::PerTransactionLimit => "per_transaction_limit",
             DenyReason::DailyLimit => "daily_limit",
+            DenyReason::NoTeamBudget => "no_team_budget",
+            DenyReason::TeamDailyLimit => "team_daily_limit",
             DenyReason::CrossTenantSecret => "cross_tenant_secret",
             DenyReason::CredentialChangeNotAllowed => "credential_change_not_allowed",
             DenyReason::DataDeleteNotAllowed => "data_delete_not_allowed",

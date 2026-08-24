@@ -928,7 +928,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use agentos_app::effects::A2aSend;
-    use agentos_app::gate::{Authorized, PolicyBook};
+    use agentos_app::gate::Authorized;
     use agentos_app::identity::Identity;
     use agentos_domain::employee::{Lifecycle, ResourceState};
     use agentos_domain::identity::PublicKey;
@@ -1024,14 +1024,15 @@ mod tests {
         .expect("set caps");
         tx.commit().await.expect("commit employee");
 
-        (tenant, id)
-    }
-
-    /// One allowed peer, and room for a €50,000 payment.
-    fn gate(db: &Db) -> PolicyGate {
-        PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        // The policy the gate will read: one allowed peer, and room for a
+        // €50,000 payment. A row, not a constructor argument — the gate loads
+        // the four layers per decision, and a tenant with no policy layer is
+        // refused everything.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
                 spend: Some(
                     SpendLimits::try_new(
                         Money::new(10_000_000, Currency::Eur).expect("nonzero"),
@@ -1043,8 +1044,16 @@ mod tests {
                 allowed_a2a_peers: BTreeSet::from([Domain::parse(PEER).expect("domain")]),
                 max_new_contacts_per_day: 20,
                 ..PolicyLimits::default()
-            }),
+            },
         )
+        .await
+        .expect("install the policy");
+
+        (tenant, id)
+    }
+
+    fn gate(db: &Db) -> PolicyGate {
+        PolicyGate::new(db.clone())
     }
 
     /// The app under test, mounted the way `main::app` mounts it: the card
@@ -1804,15 +1813,21 @@ mod tests {
             .expect("sign");
         let signed = to_sign.finish(&signature);
 
-        // The gate has to allow this peer for the fetch to be attempted at all.
-        let allowing = PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        // The stored policy has to allow this peer for the fetch to be
+        // attempted at all.
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
                 allowed_a2a_peers: BTreeSet::from([Domain::parse(unreachable).expect("domain")]),
                 max_new_contacts_per_day: 20,
                 ..PolicyLimits::default()
-            }),
-        );
+            },
+        )
+        .await
+        .expect("install the policy");
+        let allowing = PolicyGate::new(db.clone());
         let keys =
             ApiKeys::parse(&format!("{unreachable}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
         let app = router(A2aState::new(db.clone(), allowing, HOST)).layer(

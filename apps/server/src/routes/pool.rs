@@ -582,7 +582,6 @@ impl From<PoolError> for ApiError {
 mod tests {
     use std::collections::BTreeSet;
 
-    use agentos_app::gate::PolicyBook;
     use agentos_app::pool_ops::slot_binding;
     use agentos_domain::employee::{Employee, Lifecycle, ResourceState, Step};
     use agentos_domain::ids::TenantId;
@@ -650,7 +649,19 @@ mod tests {
             if allow_reassign {
                 limits.allowed_mcp_tools = BTreeSet::from([tool()]);
             }
-            let gate = PolicyGate::new(db.clone(), PolicyBook::new(limits));
+            // Both tenants: the gate reads the acting tenant's own layers, so
+            // one install is not enough for a test that acts as two.
+            for tenant in [a, b] {
+                agentos_store::policy::install(
+                    &db,
+                    tenant,
+                    agentos_store::policy::Scope::Tenant,
+                    &limits,
+                )
+                .await
+                .expect("install the policy");
+            }
+            let gate = PolicyGate::new(db.clone());
 
             let h = Self {
                 app: crate::with_api_stack(router(db.clone(), gate), db.clone(), keys),

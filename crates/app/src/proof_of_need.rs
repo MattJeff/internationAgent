@@ -1248,7 +1248,7 @@ mod tests {
 
     use super::*;
     use crate::effects::Ports;
-    use crate::gate::{PolicyBook, PolicyGate};
+    use crate::gate::PolicyGate;
 
     /// The prospect's page is the subject of the investigation, and it is also
     /// a place a stranger can write. This sits in the panel text of every test
@@ -1417,6 +1417,17 @@ mod tests {
 
     async fn harness(db: &Db, panels: Arc<ScriptedPanel>, allowed: PolicyLimits) -> Harness {
         let principal = seed(db).await;
+        // The tenant layer, because the layers *intersect*: a grant that is not
+        // in the stored policy is not a grant. The gate reads it per decision;
+        // there is nothing to hand it at construction.
+        agentos_store::policy::install(
+            db,
+            principal.tenant_id,
+            agentos_store::policy::Scope::Tenant,
+            &allowed,
+        )
+        .await
+        .expect("install the policy");
         // Our own browser handle, so the test can read the step log back; the
         // other four ports are the development fakes, unmodified.
         let browser = Arc::new(MockBrowser::new());
@@ -1437,9 +1448,7 @@ mod tests {
         Harness {
             prober: Prober::new(
                 db.clone(),
-                // The platform layer, because the layers *intersect*: a
-                // grant that is not in the widest layer is not a grant.
-                PolicyGate::new(db.clone(), PolicyBook::new(allowed)),
+                PolicyGate::new(db.clone()),
                 effects,
                 principal.clone(),
                 panels.clone(),

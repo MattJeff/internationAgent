@@ -22,17 +22,29 @@
 //! 1. **Lifecycle before policy.** A suspended employee is refused before any
 //!    policy is read. A suspension implemented as "remove its permissions"
 //!    leaves behind exactly the permissions nobody remembered to remove.
-//! 2. **Context from real state.** Spend already reserved today, contacts
-//!    first reached today, the trust label of the input that produced the
-//!    action — read from the database inside the same transaction, never taken
-//!    from the caller and never from model output.
+//! 2. **Context from real state.** The policy itself, spend already reserved
+//!    today, contacts first reached today, the trust label of the input that
+//!    produced the action — read from the database inside the same
+//!    transaction, never taken from the caller and never from model output.
+//!    The policy is [`agentos_store::policy::load`]: platform ∧ tenant ∧ role ∧
+//!    employee, four rows, one indexed query, read *here* rather than handed to
+//!    the gate at construction. Inside the transaction because the ruling and
+//!    the reservation below must be made against the same policy — a load
+//!    outside it lets an operator's change land between the two, so the gate
+//!    would allow a payment under yesterday's cap and reserve it under today's.
+//!    A deployment with no platform layer has no ceiling to enforce, and the
+//!    gate refuses every action until an operator installs one. That is
+//!    deliberate: the alternative is a misconfigured deployment that is
+//!    silently permissive.
 //! 3. **Exactly one audit row for every outcome.** Allow, deny and
 //!    approval-required alike. A gate that only records denials cannot answer
 //!    "why was this payment allowed?", which is the only question anybody ever
 //!    asks after the fact.
 //! 4. **Allowing a payment reserves it.** In the same transaction, against the
-//!    same day's bucket. Checking a cap without consuming it is what lets an
-//!    agent turn one refused payment into ten accepted ones.
+//!    same day's bucket — and against the team's, through
+//!    [`agentos_store::org::reserve`], which is where a per-team budget stops
+//!    being a number somebody wrote down. Checking a cap without consuming it
+//!    is what lets an agent turn one refused payment into ten accepted ones.
 //!
 //! # Trust
 //!
@@ -43,20 +55,18 @@
 //! action derived from untrusted input, so a supplier PDF saying "wire
 //! $10,000" cannot produce an `Authorized<_>` at all.
 
-use std::collections::HashMap;
-
 use agentos_domain::action::{Action, ActionCtx, Actor, ContactStanding};
 use agentos_domain::employee::Lifecycle;
 use agentos_domain::ids::{ApprovalId, DecisionId, EmployeeId, TenantId};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{
-    Decision, DenyReason, EffectivePolicy, PolicyError, PolicyLimits, evaluate,
-};
+use agentos_domain::policy::{Decision, DenyReason, evaluate};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
-use agentos_store::spend::{self, CapExceeded, Reservation};
+use agentos_store::org::{self, TeamSpendRefused};
+use agentos_store::policy::{self as policy_store, PolicyLoadError};
+use agentos_store::spend::{CapExceeded, Reservation};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Map, Value, json};
 
@@ -133,9 +143,11 @@ impl<A> Authorized<A> {
 
     /// The spend headroom consumed by this authorization, for payments.
     ///
-    /// The executor owes it a [`spend::settle`] on success or a
-    /// [`spend::release`] on failure; nothing here does that for it, because
-    /// only the caller knows whether the money moved.
+    /// The executor owes it an [`agentos_store::spend::settle`] on success or
+    /// an [`org::release`] on failure; nothing here does that for it, because
+    /// only the caller knows whether the money moved. `org::release` rather
+    /// than `spend::release`, for the same reason the reservation was taken
+    /// through [`org::reserve`]: the team's headroom has to come back too.
     pub const fn reservation(&self) -> Option<&Reservation> {
         self.reservation.as_ref()
     }
@@ -296,10 +308,13 @@ pub enum Denied {
     #[error("approval refused: {}", .0.code())]
     Redemption(RedemptionFailure),
 
-    /// The configured policy layers do not intersect coherently. Fails closed:
-    /// a policy nobody can evaluate authorises nothing.
-    #[error("policy layers are incoherent: {0}")]
-    BrokenPolicy(PolicyError),
+    /// The stored policy could not be turned into an enforceable one: no
+    /// platform ceiling, a column the domain cannot represent, layers that do
+    /// not intersect. Fails closed — a policy nobody can evaluate authorises
+    /// nothing — and deliberately *not* a fallback to some in-memory default,
+    /// which is how a misconfigured deployment becomes a permissive one.
+    #[error("the stored policy is unusable: {0}")]
+    BrokenPolicy(PolicyLoadError),
 
     /// The gate could not reach a verdict — the database was unavailable, or a
     /// row was not what the schema promised. Not a denial of *this* action so
@@ -317,71 +332,23 @@ impl Denied {
             Denied::Policy(reason) => reason.code(),
             Denied::PendingApproval(_) => "pending_approval",
             Denied::Redemption(failure) => failure.code(),
-            Denied::BrokenPolicy(_) => "broken_policy",
+            Denied::BrokenPolicy(err) => broken_code(err),
             Denied::Unavailable(_) => "unavailable",
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Policy layers
-// ---------------------------------------------------------------------------
-
-/// The policy layers, in memory, keyed by who they apply to.
+/// Stable, low-cardinality label for a policy that would not load.
 ///
-/// `Default` is the empty platform layer, which grants nothing — an
-/// unconfigured gate denies everything, which is the correct behaviour for an
-/// unconfigured gate.
-///
-/// A layer that is absent for a principal does not widen anything: it is
-/// filled with the layer above it, and intersection is idempotent.
-///
-/// ponytail: in memory, and the *role* layer is folded into the employee
-/// layer, because neither the schema nor the domain models roles yet. When a
-/// `policies` table and a role model land, this becomes a load inside the
-/// gate's transaction and a third `HashMap` — `effective` is the only function
-/// that changes.
-#[derive(Debug, Clone, Default)]
-pub struct PolicyBook {
-    platform: PolicyLimits,
-    tenant: HashMap<TenantId, PolicyLimits>,
-    employee: HashMap<EmployeeId, PolicyLimits>,
-}
-
-impl PolicyBook {
-    /// The platform layer: the widest anything can ever be.
-    pub fn new(platform: PolicyLimits) -> Self {
-        Self {
-            platform,
-            tenant: HashMap::new(),
-            employee: HashMap::new(),
-        }
-    }
-
-    /// Narrow one tenant.
-    #[must_use]
-    pub fn with_tenant(mut self, tenant_id: TenantId, limits: PolicyLimits) -> Self {
-        self.tenant.insert(tenant_id, limits);
-        self
-    }
-
-    /// Narrow one employee.
-    #[must_use]
-    pub fn with_employee(mut self, employee_id: EmployeeId, limits: PolicyLimits) -> Self {
-        self.employee.insert(employee_id, limits);
-        self
-    }
-
-    /// platform ∧ tenant ∧ role ∧ employee.
-    fn effective(&self, principal: &Principal) -> Result<EffectivePolicy, PolicyError> {
-        let tenant = self
-            .tenant
-            .get(&principal.tenant_id)
-            .unwrap_or(&self.platform);
-        let employee = self.employee.get(&principal.employee_id).unwrap_or(tenant);
-        // The role slot is the employee layer until roles exist; intersecting a
-        // layer with itself is a no-op, so this widens nothing.
-        EffectivePolicy::try_new(&self.platform, tenant, employee, employee)
+/// A missing ceiling gets its own code because it is a different problem with a
+/// different fix: not "somebody wrote a policy wrong" but "nobody installed
+/// one", and it refuses every action for every tenant in the deployment until
+/// they do. That is a page, not a dashboard line, and it cannot be one if it
+/// shares a label with a malformed row.
+const fn broken_code(err: &PolicyLoadError) -> &'static str {
+    match err {
+        PolicyLoadError::NoPlatformLayer => "no_platform_policy",
+        _ => "broken_policy",
     }
 }
 
@@ -390,10 +357,14 @@ impl PolicyBook {
 // ---------------------------------------------------------------------------
 
 /// The one door every side effect goes through.
+///
+/// A database and nothing else. There is no policy field: the four layers are
+/// rows, and they are read per decision inside the decision's own transaction —
+/// see the module docs. A gate that held a policy would be a gate an operator
+/// could not change without a redeploy, which is what this used to be.
 #[derive(Debug, Clone)]
 pub struct PolicyGate {
     db: Db,
-    policies: PolicyBook,
 }
 
 /// What the decision came to, before it is turned into an audit row and a
@@ -407,14 +378,14 @@ enum Outcome {
     Approval { id: ApprovalId, decision: Decision },
     NotActive(Lifecycle),
     UnknownEmployee,
-    BrokenPolicy(PolicyError),
+    BrokenPolicy(PolicyLoadError),
     Redemption(RedemptionFailure),
 }
 
 impl PolicyGate {
-    /// Wire the gate to a database and a set of policy layers.
-    pub const fn new(db: Db, policies: PolicyBook) -> Self {
-        Self { db, policies }
+    /// Wire the gate to a database. The policy comes out of it, per decision.
+    pub const fn new(db: Db) -> Self {
+        Self { db }
     }
 
     /// Rule on one action.
@@ -549,10 +520,36 @@ impl PolicyGate {
             None => return Ok(Outcome::UnknownEmployee),
         }
 
-        // 2. The intersected policy.
-        let policy = match self.policies.effective(principal) {
+        // 2. The intersected policy, out of the database, inside this
+        //    transaction — so the rule below and the reservation after it are
+        //    the same policy even if an operator changes one between them.
+        //
+        //    `None` for the role: `store::policy::load` resolves the role layer
+        //    through the employee's team when it has one, and this argument is
+        //    the fallback for an employee on no team. There is no role on a
+        //    `Principal` and inventing one here would be a second way to answer
+        //    a question the org chart already answers. Same call, same
+        //    argument, same reasoning as the turn-budget reservation in
+        //    `loops::initiative`.
+        let policy = match policy_store::load(tx, principal.employee_id, None).await {
             Ok(policy) => policy,
-            Err(err) => return Ok(Outcome::BrokenPolicy(err)),
+            // A database that cannot answer is not a verdict — same treatment
+            // as any other read here, and the transaction is dropped unaudited.
+            Err(PolicyLoadError::Store(err)) => return Err(Denied::Unavailable(err)),
+            // A policy that is missing or unusable *is* a verdict, and a loud
+            // one: every action for this tenant is refused until it is fixed,
+            // so it is logged at error, coded for an alert, and audited like
+            // every other outcome.
+            Err(err) => {
+                tracing::error!(
+                    tenant_id = %principal.tenant_id.as_uuid(),
+                    employee_id = %principal.employee_id.as_uuid(),
+                    code = broken_code(&err),
+                    error = %err,
+                    "the stored policy could not be loaded; refusing the action"
+                );
+                return Ok(Outcome::BrokenPolicy(err));
+            }
         };
 
         // 3. Context, from state, inside this transaction.
@@ -703,7 +700,25 @@ impl PolicyGate {
             .and_then(|minor| Money::new(minor, currency).ok()))
     }
 
-    /// Take the headroom, or turn the ledger's refusal into a policy reason.
+    /// Take the headroom — the employee's *and* its team's — or turn the
+    /// ledger's refusal into a policy reason.
+    ///
+    /// [`org::reserve`] rather than [`agentos_store::spend::reserve`]: the
+    /// employee's own caps do nothing about ten employees on one team each
+    /// making a payment that is legal on its own merit, and this is the only
+    /// production call site either has. An employee on no team is exactly
+    /// `spend::reserve` plus one indexed lookup of the roster.
+    ///
+    /// # The savepoint
+    ///
+    /// `org::reserve` documents that **on refusal the caller must roll back**:
+    /// a team refusal arrives after the employee's own reservation is already
+    /// in this transaction, and committing anyway would burn the employee's
+    /// headroom on a payment that never happened. The gate cannot roll the
+    /// whole transaction back — the audit row for this very refusal has not
+    /// been written yet, and "every outcome is audited" is not negotiable — so
+    /// it rolls back to a savepoint instead. The reservation vanishes, the
+    /// ruling is still recorded, and one commit still covers both.
     async fn reserve(
         &self,
         tx: &mut TenantTx<'_>,
@@ -711,21 +726,49 @@ impl PolicyGate {
         amount: Money,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
-        match spend::reserve(tx, principal.employee_id, now.date_naive(), amount).await {
-            Ok(reservation) => Ok(Outcome::Allow {
-                reservation: Some(reservation),
-            }),
-            Err(CapExceeded::Store(err)) => Err(Denied::Unavailable(err)),
-            Err(CapExceeded::NoCaps { .. }) => Ok(Outcome::Deny(DenyReason::NoSpendPolicy)),
-            Err(CapExceeded::PerTransaction { .. }) => {
-                Ok(Outcome::Deny(DenyReason::PerTransactionLimit))
+        sqlx::query("SAVEPOINT gate_reservation")
+            .execute(&mut ***tx)
+            .await
+            .map_err(|e| Denied::Unavailable(e.into()))?;
+
+        let refused = match org::reserve(tx, principal.employee_id, now.date_naive(), amount).await
+        {
+            Ok(reservation) => {
+                sqlx::query("RELEASE SAVEPOINT gate_reservation")
+                    .execute(&mut ***tx)
+                    .await
+                    .map_err(|e| Denied::Unavailable(e.into()))?;
+                return Ok(Outcome::Allow {
+                    reservation: Some(reservation),
+                });
             }
-            // Both remaining refusals are the day's ceiling: one on value, one
-            // on count. They share a reason because they share a remedy.
-            Err(CapExceeded::DailyTotal { .. } | CapExceeded::DailyCount { .. }) => {
-                Ok(Outcome::Deny(DenyReason::DailyLimit))
+            Err(
+                TeamSpendRefused::Store(err) | TeamSpendRefused::Employee(CapExceeded::Store(err)),
+            ) => {
+                return Err(Denied::Unavailable(err));
             }
-        }
+            Err(TeamSpendRefused::Employee(CapExceeded::NoCaps { .. })) => {
+                DenyReason::NoSpendPolicy
+            }
+            Err(TeamSpendRefused::Employee(CapExceeded::PerTransaction { .. })) => {
+                DenyReason::PerTransactionLimit
+            }
+            // Both of these are the day's ceiling: one on value, one on count.
+            // They share a reason because they share a remedy.
+            Err(TeamSpendRefused::Employee(
+                CapExceeded::DailyTotal { .. } | CapExceeded::DailyCount { .. },
+            )) => DenyReason::DailyLimit,
+            // The team's two, which are *not* the employee's: raising this
+            // employee's cap would not help either one.
+            Err(TeamSpendRefused::NoBudget { .. }) => DenyReason::NoTeamBudget,
+            Err(TeamSpendRefused::TeamDailyTotal { .. }) => DenyReason::TeamDailyLimit,
+        };
+
+        sqlx::query("ROLLBACK TO SAVEPOINT gate_reservation")
+            .execute(&mut ***tx)
+            .await
+            .map_err(|e| Denied::Unavailable(e.into()))?;
+        Ok(Outcome::Deny(refused))
     }
 
     /// File the approval, hashed to this exact action.
@@ -874,7 +917,7 @@ fn audit_event(
             None
         }
         Outcome::BrokenPolicy(err) => {
-            payload.insert(DENIED_KEY.to_owned(), json!("broken_policy"));
+            payload.insert(DENIED_KEY.to_owned(), json!(broken_code(err)));
             payload.insert("detail".to_owned(), json!(err.to_string()));
             None
         }
@@ -905,11 +948,14 @@ fn audit_event(
 mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU32;
+    use std::time::{Duration, Instant};
 
     use agentos_domain::action::{Channel, EmailAddress};
+    use agentos_domain::ids::Slug;
     use agentos_domain::money::Currency;
-    use agentos_domain::policy::SpendLimits;
-    use agentos_store::spend::SpendCaps;
+    use agentos_domain::policy::{PolicyLimits, SpendLimits};
+    use agentos_store::policy::Scope;
+    use agentos_store::spend::{self, SpendCaps};
     use uuid::Uuid;
 
     use super::*;
@@ -974,8 +1020,27 @@ mod tests {
         }
     }
 
-    fn gate(db: &Db) -> PolicyGate {
-        PolicyGate::new(db.clone(), PolicyBook::new(limits()))
+    /// The gate, with [`limits`] written into the database as this tenant's
+    /// policy layer.
+    ///
+    /// There is nothing else to configure: the gate holds a `Db` and reads the
+    /// four layers per decision, so a fixture that wants a policy writes one
+    /// exactly like an operator would.
+    async fn gate(db: &Db, principal: &Principal) -> PolicyGate {
+        with_policy(db, principal, Scope::Tenant, &limits()).await
+    }
+
+    /// Install one layer and hand back a gate that will read it.
+    async fn with_policy(
+        db: &Db,
+        principal: &Principal,
+        scope: Scope<'_>,
+        limits: &PolicyLimits,
+    ) -> PolicyGate {
+        agentos_store::policy::install(db, principal.tenant_id, scope, limits)
+            .await
+            .expect("install the policy");
+        PolicyGate::new(db.clone())
     }
 
     fn email(to: &str) -> Action {
@@ -984,10 +1049,101 @@ mod tests {
         }
     }
 
+    fn eur(minor: u64) -> Money {
+        Money::new(minor, Currency::Eur).expect("nonzero")
+    }
+
     fn payment(minor: u64) -> Action {
-        Action::PaymentCreate {
-            amount: Money::new(minor, Currency::Eur).expect("nonzero"),
+        Action::PaymentCreate { amount: eur(minor) }
+    }
+
+    fn spend_limits(per_txn: u64, per_day: u64, approval: u64) -> Option<SpendLimits> {
+        Some(SpendLimits::try_new(eur(per_txn), eur(per_day), eur(approval)).expect("coherent"))
+    }
+
+    /// A second employee inside an existing tenant, for the team tests.
+    async fn seed_mate(db: &Db, principal: &Principal, slug: &str) -> Principal {
+        let employee = EmployeeId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(principal.tenant_id.as_uuid())
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit mate");
+        Principal::employee(principal.tenant_id, employee)
+    }
+
+    /// A team called `name`, with `members` on it and `budget` for the day.
+    ///
+    /// `org::create_team` points the team's policy role at its own slug, which
+    /// is what `policy::load` resolves the role layer through — so a
+    /// `Scope::Role(name)` layer is this team's limits.
+    async fn team(
+        db: &Db,
+        principal: &Principal,
+        name: &str,
+        budget: Option<Money>,
+        members: &[&Principal],
+    ) -> Uuid {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let id = org::create_team(&mut tx, &Slug::parse(name).expect("slug"), name)
+            .await
+            .expect("create team");
+        for member in members {
+            org::set_member(&mut tx, member.employee_id, id, None)
+                .await
+                .expect("set member");
         }
+        if let Some(budget) = budget {
+            org::set_budget(&mut tx, id, budget).await.expect("budget");
+        }
+        tx.commit().await.expect("commit team");
+        id
+    }
+
+    /// A database of this test module's own, for the one property that cannot
+    /// be arranged inside a shared one: the *absence* of the platform layer,
+    /// which is `tenant_id IS NULL` and therefore one row per deployment.
+    ///
+    /// Same mechanism and same reasoning as `apps/server/src/loops/mod.rs`,
+    /// which needs it for the same row.
+    async fn private_db(suffix: &str) -> Option<Db> {
+        use sqlx::Connection as _;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; gate tests need a real Postgres");
+            return None;
+        };
+        let (host_part, tail) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+        let (base, options) = tail.split_once('?').map_or((tail, ""), |(b, o)| (b, o));
+        let name = format!("{base}_{suffix}");
+        let mine = if options.is_empty() {
+            format!("{host_part}/{name}")
+        } else {
+            format!("{host_part}/{name}?{options}")
+        };
+
+        let db = match Db::connect(&mine).await {
+            Ok(db) => db,
+            Err(_) => {
+                let mut admin = sqlx::PgConnection::connect(&url).await.expect("connect");
+                // Ignored: losing the race to create it is fine, the connect
+                // below is the real check.
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+                    .execute(&mut admin)
+                    .await;
+                admin.close().await.expect("close");
+                Db::connect(&mine).await.expect("connect")
+            }
+        };
+        db.migrate().await.expect("migrate");
+        Some(db)
     }
 
     /// `daily_transactions` is deliberately generous: these tests exercise the
@@ -1026,6 +1182,54 @@ mod tests {
         .expect("read audit");
         tx.commit().await.expect("commit read");
         rows
+    }
+
+    /// What this employee's own bucket says it has reserved today.
+    async fn reserved_today(db: &Db, principal: &Principal) -> i64 {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let reserved: Option<i64> = sqlx::query_scalar(
+            "SELECT reserved_minor FROM spend_buckets \
+              WHERE employee_id = $1 AND day = $2 AND currency = 'EUR'",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .bind(Utc::now().date_naive())
+        .fetch_optional(&mut **tx)
+        .await
+        .expect("read bucket");
+        tx.commit().await.expect("commit read");
+        reserved.unwrap_or(0)
+    }
+
+    /// What the team's bucket says it has reserved today.
+    async fn team_spent(db: &Db, principal: &Principal, team_id: Uuid) -> u64 {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let spent = org::spent(&mut tx, team_id, Utc::now().date_naive(), Currency::Eur)
+            .await
+            .expect("read team bucket");
+        tx.commit().await.expect("commit read");
+        spent
+    }
+
+    /// How many backends are stuck on a lock inside a statement that touches
+    /// `spend_buckets` — which is how the concurrency test below knows a
+    /// decision is genuinely mid-flight rather than merely slow.
+    ///
+    /// Asked through an admin transaction on purpose: `pg_stat_activity` hides
+    /// other sessions' `query` text from a non-superuser, and `tenant_tx` runs
+    /// as `app_role`.
+    async fn waiting_on_a_bucket(db: &Db) -> i64 {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() \
+                AND wait_event_type = 'Lock' \
+                AND query ILIKE '%spend_buckets%'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read pg_stat_activity");
+        tx.commit().await.expect("commit read");
+        waiting
     }
 
     async fn reservation_count(db: &Db, principal: &Principal) -> i64 {
@@ -1103,9 +1307,10 @@ mod tests {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "suspended").await;
 
-        // A policy book that would ALLOW this action if it were ever reached:
-        // the refusal below can therefore only have come from the lifecycle.
-        let gate = PolicyGate::new(db.clone(), PolicyBook::new(limits()));
+        // A stored policy that would ALLOW this action if it were ever
+        // reached: the refusal below can therefore only have come from the
+        // lifecycle.
+        let gate = gate(&db, &principal).await;
         let err = gate
             .authorize(&principal, email("supplier@example.com"))
             .await
@@ -1126,7 +1331,8 @@ mod tests {
         let real = seed(&db, "active").await;
         let ghost = Principal::employee(real.tenant_id, EmployeeId::new_v7(Utc::now()));
 
-        let err = gate(&db)
+        let err = gate(&db, &real)
+            .await
             .authorize(&ghost, email("supplier@example.com"))
             .await
             .expect_err("no such employee");
@@ -1137,7 +1343,7 @@ mod tests {
     async fn each_outcome_writes_exactly_one_audit_row() {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
-        let gate = gate(&db);
+        let gate = gate(&db, &principal).await;
 
         // Allow.
         gate.authorize(&principal, email("supplier@example.com"))
@@ -1190,7 +1396,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
         give_caps(&db, &principal, 100_000, 50_000).await;
-        let gate = gate(&db);
+        let gate = gate(&db, &principal).await;
 
         // Under the approval threshold (20_000) and under both caps.
         let token = gate
@@ -1231,7 +1437,8 @@ mod tests {
         let principal = seed(&db, "active").await;
         give_caps(&db, &principal, 100_000, 50_000).await;
 
-        let err = gate(&db)
+        let err = gate(&db, &principal)
+            .await
             .authorize(&principal, Untrusted::new(payment(1_000)))
             .await
             .expect_err("a payment derived from untrusted text is not authorised");
@@ -1245,7 +1452,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
         give_caps(&db, &principal, 100_000, 50_000).await;
-        let gate = gate(&db);
+        let gate = gate(&db, &principal).await;
 
         // 25_000 is over the approval threshold, under both caps.
         let approved = payment(25_000);
@@ -1325,14 +1532,17 @@ mod tests {
     async fn the_cold_outreach_budget_counts_first_contacts_not_messages() {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
-        let gate = PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
                 allowed_channels: BTreeSet::from([Channel::Email]),
                 max_new_contacts_per_day: 2,
                 ..PolicyLimits::default()
-            }),
-        );
+            },
+        )
+        .await;
 
         for who in ["a@example.com", "b@example.com"] {
             gate.authorize(&principal, email(who))
@@ -1359,30 +1569,38 @@ mod tests {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
 
-        let err = PolicyGate::new(db.clone(), PolicyBook::default())
+        // A layer that grants nothing — which is what an operator who created a
+        // tenant and stopped there has.
+        let err = with_policy(&db, &principal, Scope::Tenant, &PolicyLimits::default())
+            .await
             .authorize(&principal, email("supplier@example.com"))
             .await
             .expect_err("an empty policy grants nothing");
         assert_eq!(err.code(), DenyReason::NoRule.code());
     }
 
+    /// A lower layer may only tighten, and the gate is what proves it end to
+    /// end: the employee layer below asks for a channel its tenant never had.
+    ///
+    /// The loader's own suite proves the same property for the platform layer,
+    /// which cannot be varied per test — it is one row for the whole database.
     #[tokio::test]
-    async fn a_tenant_layer_narrows_but_never_widens() {
+    async fn a_lower_layer_narrows_but_never_widens() {
         let Some(db) = db().await else { return };
         let principal = seed(&db, "active").await;
 
-        // The tenant layer allows SMS as well; the platform layer does not.
-        let gate = PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(limits()).with_tenant(
-                principal.tenant_id,
-                PolicyLimits {
-                    allowed_channels: BTreeSet::from([Channel::Email, Channel::Sms]),
-                    max_new_contacts_per_day: 5,
-                    ..PolicyLimits::default()
-                },
-            ),
-        );
+        with_policy(&db, &principal, Scope::Tenant, &limits()).await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Employee(principal.employee_id),
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Sms]),
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
 
         let err = gate
             .authorize(
@@ -1392,8 +1610,393 @@ mod tests {
                 },
             )
             .await
-            .expect_err("a tenant cannot grant itself a channel the platform withheld");
+            .expect_err("an employee cannot grant itself a channel its tenant withheld");
         assert_eq!(err.code(), DenyReason::ChannelNotAllowed.code());
+
+        // ...and the layer is genuinely being read: what the tenant *did* allow
+        // still goes through it.
+        gate.authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect("email is allowed by both layers");
+    }
+
+    // -- the stored policy -------------------------------------------------
+
+    /// **The unit's reason to exist.** A cap an operator writes into
+    /// `policy_layers` refuses an action the gate had just allowed — same
+    /// `PolicyGate` value, no redeploy, no restart, because the gate reads the
+    /// row rather than a struct it was built with.
+    #[tokio::test]
+    async fn a_cap_written_to_the_database_changes_what_the_gate_allows() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        // The ledger is generous throughout, so every refusal below can only
+        // have come from the stored policy.
+        give_caps(&db, &principal, 100_000, 50_000).await;
+        let gate = gate(&db, &principal).await;
+
+        gate.authorize(&principal, payment(15_000))
+            .await
+            .expect("15_000 is inside the installed policy");
+
+        // The operator lowers the tenant's per-transaction cap to 10_000.
+        policy_store::install(
+            &db,
+            principal.tenant_id,
+            Scope::Tenant,
+            &PolicyLimits {
+                spend: spend_limits(10_000, 30_000, 10_000),
+                ..limits()
+            },
+        )
+        .await
+        .expect("install the tightened policy");
+
+        let err = gate
+            .authorize(&principal, payment(15_000))
+            .await
+            .expect_err("the same payment is now over the tenant's cap");
+        assert_eq!(err.code(), DenyReason::PerTransactionLimit.code());
+        assert_eq!(
+            reservation_count(&db, &principal).await,
+            1,
+            "the refused payment consumed no headroom"
+        );
+
+        // Not only money: a channel taken away is taken away. SMS rather than
+        // an empty list, so the refusal is `channel_not_allowed` — an empty
+        // allowlist is `no_rule`, which would be a weaker claim.
+        policy_store::install(
+            &db,
+            principal.tenant_id,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Sms]),
+                ..limits()
+            },
+        )
+        .await
+        .expect("install the muted policy");
+
+        let err = gate
+            .authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect_err("email is no longer an allowed channel");
+        assert_eq!(err.code(), DenyReason::ChannelNotAllowed.code());
+    }
+
+    /// A team's limits reach its members, and only its members — and a team
+    /// that asks for more than its tenant gets its tenant's.
+    ///
+    /// The role layer resolves through `team_memberships`, so this is the whole
+    /// path: employee → team → `team_policy.role_name` → `policy_layers`.
+    #[tokio::test]
+    async fn a_teams_layer_tightens_its_member_and_a_greedy_teams_does_not() {
+        let Some(db) = db().await else { return };
+        let thrifty = seed(&db, "active").await;
+        let greedy = seed_mate(&db, &thrifty, "greedy-one").await;
+        give_caps(&db, &thrifty, 100_000, 100_000).await;
+        give_caps(&db, &greedy, 100_000, 100_000).await;
+
+        // The tenant allows 25_000 a payment, a human above 20_000.
+        let gate = gate(&db, &thrifty).await;
+        team(&db, &thrifty, "thrifty", Some(eur(100_000)), &[&thrifty]).await;
+        team(&db, &thrifty, "greedy", Some(eur(100_000)), &[&greedy]).await;
+
+        with_policy(
+            &db,
+            &thrifty,
+            Scope::Role("thrifty"),
+            &PolicyLimits {
+                spend: spend_limits(5_000, 30_000, 5_000),
+                ..limits()
+            },
+        )
+        .await;
+        with_policy(
+            &db,
+            &thrifty,
+            Scope::Role("greedy"),
+            &PolicyLimits {
+                spend: spend_limits(999_999, 999_999, 999_999),
+                ..limits()
+            },
+        )
+        .await;
+
+        let err = gate
+            .authorize(&thrifty, payment(10_000))
+            .await
+            .expect_err("the team's cap is 5_000");
+        assert_eq!(err.code(), DenyReason::PerTransactionLimit.code());
+
+        // The same payment, from an employee on a different team: the tightened
+        // layer is that team's, not the tenant's.
+        gate.authorize(&greedy, payment(10_000))
+            .await
+            .expect("inside the tenant's cap and its own team's");
+
+        // And the greedy team gets the tenant's ceiling, not the one it wrote.
+        let err = gate
+            .authorize(&greedy, payment(30_000))
+            .await
+            .expect_err("a team may tighten its tenant's cap and never widen it");
+        assert_eq!(err.code(), DenyReason::PerTransactionLimit.code());
+    }
+
+    /// The team budget, through the gate: it refuses the second employee, and
+    /// the first employee's reservation is the only one that survives.
+    ///
+    /// `org::reserve` refuses the team *after* writing the employee's own
+    /// reservation into the transaction and requires the caller to roll back.
+    /// The gate cannot roll the whole transaction back — the audit row for this
+    /// refusal is not written yet — so it unwinds to a savepoint, and this is
+    /// the test of that: nothing half-reserved, and a ruling on the record.
+    #[tokio::test]
+    async fn a_team_budget_refuses_the_second_employee_and_leaves_nothing_half_reserved() {
+        let Some(db) = db().await else { return };
+        let first = seed(&db, "active").await;
+        let second = seed_mate(&db, &first, "second").await;
+        give_caps(&db, &first, 100_000, 100_000).await;
+        give_caps(&db, &second, 100_000, 100_000).await;
+
+        // Each payment is legal on its own merit: 20_000 is inside the policy,
+        // inside each employee's own caps, and under the threshold that would
+        // ask a human — so the only thing that can refuse the second one is the
+        // team.
+        let gate = with_policy(
+            &db,
+            &first,
+            Scope::Tenant,
+            &PolicyLimits {
+                spend: spend_limits(25_000, 100_000, 25_000),
+                ..limits()
+            },
+        )
+        .await;
+        let purchasing = team(
+            &db,
+            &first,
+            "purchasing",
+            Some(eur(25_000)),
+            &[&first, &second],
+        )
+        .await;
+
+        gate.authorize(&first, payment(20_000))
+            .await
+            .expect("the first fits the team's budget");
+
+        let err = gate
+            .authorize(&second, payment(20_000))
+            .await
+            .expect_err("40_000 is over the team's 25_000");
+        assert_eq!(err.code(), DenyReason::TeamDailyLimit.code());
+
+        assert_eq!(
+            reservation_count(&db, &second).await,
+            0,
+            "no reservation row for a payment the team refused"
+        );
+        assert_eq!(
+            reserved_today(&db, &second).await,
+            0,
+            "and no headroom taken out of the employee's own bucket either"
+        );
+        assert_eq!(
+            team_spent(&db, &first, purchasing).await,
+            20_000,
+            "the team's bucket holds the first payment and nothing else"
+        );
+
+        // The ruling itself survives the unwind, which is the whole reason it
+        // is a savepoint and not a rollback.
+        let rows = audit_rows(&db, &second).await;
+        assert_eq!(rows.len(), 1, "exactly one audit row for the refusal");
+        assert_eq!(rows[0].0.as_deref(), Some("deny"));
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some(DenyReason::TeamDailyLimit.code())
+        );
+
+        // A team with no budget at all fails closed rather than open, and says
+        // so in its own words: the employee's caps were never the problem.
+        let stranger = seed_mate(&db, &first, "stranger").await;
+        give_caps(&db, &stranger, 100_000, 100_000).await;
+        team(&db, &first, "unfunded", None, &[&stranger]).await;
+        let err = gate
+            .authorize(&stranger, payment(1_000))
+            .await
+            .expect_err("a team with no budget may not spend");
+        assert_eq!(err.code(), DenyReason::NoTeamBudget.code());
+        assert_eq!(reservation_count(&db, &stranger).await, 0);
+    }
+
+    /// A deployment with no platform layer refuses everything, loudly.
+    ///
+    /// The tempting alternative — fall back to an in-memory default — is what
+    /// makes a misconfigured deployment silently permissive, so the refusal is
+    /// deliberate, it has its own metric code, and it is audited like any other
+    /// outcome. A deployment that denies everything *silently* is as hard to
+    /// diagnose as one that allows everything.
+    ///
+    /// Its own database: the platform layer is `tenant_id IS NULL`, one row for
+    /// the whole deployment, so "there is not one" cannot be arranged inside a
+    /// database other tests are using.
+    #[tokio::test]
+    async fn a_deployment_with_no_platform_layer_refuses_everything() {
+        let Some(db) = private_db("gateceiling").await else {
+            return;
+        };
+        // Its own database, but not a fresh one — the last line of this test
+        // installs a ceiling, and the database outlives the run that made it.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
+            .execute(&mut *admin)
+            .await
+            .expect("clear the ceiling");
+        admin.commit().await.expect("commit");
+
+        let principal = seed(&db, "active").await;
+        give_caps(&db, &principal, 100_000, 50_000).await;
+        let gate = PolicyGate::new(db.clone());
+
+        for action in [email("supplier@example.com"), payment(1_000)] {
+            let err = gate
+                .authorize(&principal, action)
+                .await
+                .expect_err("no ceiling, no authority");
+            assert!(
+                matches!(err, Denied::BrokenPolicy(PolicyLoadError::NoPlatformLayer)),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.code(),
+                "no_platform_policy",
+                "its own code: nobody installed a policy, which is not the same \
+                 operational problem as somebody writing a bad one"
+            );
+        }
+        assert_eq!(reservation_count(&db, &principal).await, 0);
+
+        let rows = audit_rows(&db, &principal).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per refusal, like every other outcome"
+        );
+        for row in &rows {
+            assert_eq!(row.0, None, "the gate never reached the rule");
+            assert_eq!(row.2[DENIED_KEY], json!("no_platform_policy"));
+        }
+
+        // And it is the missing ceiling rather than the fixture: install one
+        // and the same gate allows.
+        with_policy(&db, &principal, Scope::Tenant, &limits())
+            .await
+            .authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect("a ceiling and a tenant layer is a policy");
+    }
+
+    /// The ruling and the reservation are one policy and one commit, even when
+    /// an operator changes the policy in between.
+    ///
+    /// Arranged rather than raced. The test holds the employee's spend bucket,
+    /// which the gate reaches *after* it has read its policy and evaluated the
+    /// rule, so the change below lands squarely in the window between the two.
+    /// While the decision is stuck there, nothing of it is visible — no audit
+    /// row, no reservation — and when it lands, both land together, under the
+    /// policy the ruling read. The next decision, and only the next one, sees
+    /// the new policy: there is no cache to go stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_policy_change_cannot_land_between_the_ruling_and_the_reservation() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        give_caps(&db, &principal, 100_000, 50_000).await;
+        let gate = gate(&db, &principal).await;
+
+        // A first payment, so there is a bucket row to hold.
+        gate.authorize(&principal, payment(1_000))
+            .await
+            .expect("inside every cap");
+
+        let mut holder = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sqlx::query(
+            "SELECT reserved_minor FROM spend_buckets \
+              WHERE employee_id = $1 AND day = $2 AND currency = 'EUR' FOR UPDATE",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .bind(Utc::now().date_naive())
+        .fetch_one(&mut **holder)
+        .await
+        .expect("hold the bucket");
+
+        let in_flight = tokio::spawn({
+            let gate = gate.clone();
+            let principal = principal.clone();
+            async move { gate.authorize(&principal, payment(15_000)).await }
+        });
+
+        // Wait until it is genuinely blocked on that row rather than merely
+        // slow — a green result from a decision that never started proves
+        // nothing.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while waiting_on_a_bucket(&db).await == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the decision never reached the ledger"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Mid-decision: the ruling is made and nothing of it is visible.
+        assert_eq!(
+            audit_rows(&db, &principal).await.len(),
+            1,
+            "the in-flight decision has not committed anything"
+        );
+        assert_eq!(reservation_count(&db, &principal).await, 1);
+
+        // The operator forbids exactly what is in flight.
+        policy_store::install(
+            &db,
+            principal.tenant_id,
+            Scope::Tenant,
+            &PolicyLimits {
+                spend: spend_limits(1_000, 30_000, 1_000),
+                ..limits()
+            },
+        )
+        .await
+        .expect("install the tightened policy");
+
+        holder.rollback().await.expect("release the bucket");
+
+        let token = in_flight
+            .await
+            .expect("join")
+            .expect("ruled under the policy it read, not the one that arrived after");
+        let reservation = token.reservation().expect("an allowed payment reserves");
+        assert_eq!(reservation.amount().minor(), 15_000);
+
+        // Ruling and reservation, one commit: the audit row names the very
+        // reservation the token carries.
+        let rows = audit_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0.as_deref(), Some("allow"));
+        assert_eq!(
+            rows[1].2["reservation_id"],
+            json!(reservation.id().to_string())
+        );
+        assert_eq!(reserved_today(&db, &principal).await, 16_000);
+
+        // The next decision reads the row the operator wrote.
+        let err = gate
+            .authorize(&principal, payment(15_000))
+            .await
+            .expect_err("the new cap is 1_000");
+        assert_eq!(err.code(), DenyReason::PerTransactionLimit.code());
     }
 
     #[test]

@@ -706,7 +706,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::gate::{Denied, PolicyBook, PolicyGate, Principal};
+    use crate::gate::{Denied, PolicyGate, Principal};
 
     /// What a compromised peer sends. The runtime below dutifully proposes the
     /// payment; the assertion is that no money moves anyway.
@@ -769,15 +769,17 @@ mod tests {
         .expect("set caps");
         tx.commit().await.expect("commit caps");
 
-        Principal::employee(tenant, employee)
-    }
-
-    /// One allowed peer, and enough spending room that a €50,000 wire would be
-    /// allowed if it were proposed by a human.
-    fn gate(db: &Db) -> PolicyGate {
-        PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        // The policy the gate will read. One allowed peer, and enough spending
+        // room that a €50,000 wire would be allowed if a human proposed it.
+        //
+        // Written into `policy_layers` rather than handed to the gate: the gate
+        // holds a `Db` and loads the four layers per decision, so a tenant with
+        // no policy row is a tenant whose every action is refused.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
                 spend: Some(
                     SpendLimits::try_new(
                         Money::new(10_000_000, Currency::Eur).expect("nonzero"),
@@ -789,8 +791,16 @@ mod tests {
                 allowed_a2a_peers: BTreeSet::from([Domain::parse(PEER).expect("domain")]),
                 max_new_contacts_per_day: 20,
                 ..PolicyLimits::default()
-            }),
+            },
         )
+        .await
+        .expect("install the policy");
+
+        Principal::employee(tenant, employee)
+    }
+
+    fn gate(db: &Db) -> PolicyGate {
+        PolicyGate::new(db.clone())
     }
 
     fn call_from(peer: &str) -> CallContext {

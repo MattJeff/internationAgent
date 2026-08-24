@@ -450,7 +450,7 @@ async fn get(
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::gate::{Denied, PolicyBook, PolicyGate, Principal as GatePrincipal};
+    use agentos_app::gate::{Denied, PolicyGate, Principal as GatePrincipal};
     use agentos_domain::action::{Action, Channel, EmailAddress};
     use agentos_domain::ids::{ApprovalId, EmployeeId, TenantId};
     use agentos_domain::policy::PolicyLimits;
@@ -475,7 +475,7 @@ mod tests {
     // matches what this test file *believes* the trail looks like, which is
     // precisely the thing the taxonomy has to get right.
 
-    /// Email is allowed and contracts always need a human, so one policy book
+    /// Email is allowed and contracts always need a human, so one policy layer
     /// produces both an autonomous action and an escalation without any
     /// per-test tuning.
     fn limits() -> PolicyLimits {
@@ -516,7 +516,20 @@ mod tests {
                 b.as_uuid()
             ))
             .expect("keyring");
-            let gate = PolicyGate::new(db.clone(), PolicyBook::new(limits()));
+            // Both tenants: the gate reads the acting tenant's own layers out
+            // of the database, so one install is not enough for a test that
+            // acts as two.
+            for tenant in [a, b] {
+                agentos_store::policy::install(
+                    &db,
+                    tenant,
+                    agentos_store::policy::Scope::Tenant,
+                    &limits(),
+                )
+                .await
+                .expect("install the policy");
+            }
+            let gate = PolicyGate::new(db.clone());
 
             Some(Self {
                 app: crate::with_api_stack(router(db.clone()), db.clone(), keys.clone()),

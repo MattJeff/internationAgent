@@ -1872,7 +1872,7 @@ mod tests {
         use agentos_domain::policy::PolicyLimits;
 
         use crate::effects::{Effects, McpCall};
-        use crate::gate::{PolicyBook, PolicyGate, Principal as ActingAs};
+        use crate::gate::{PolicyGate, Principal as ActingAs};
 
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; the gate path needs a real Postgres");
@@ -1905,15 +1905,21 @@ mod tests {
         .expect("insert employee");
         tx.commit().await.expect("commit seed");
 
-        // The gate is told this exact tool is allowed — by name, which is the
-        // only thing a policy allowlist can say.
-        let gate = PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        // The stored policy allows this exact tool — by name, which is the only
+        // thing a policy allowlist can say. Written to `policy_layers`, because
+        // that is where the gate reads it.
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
                 allowed_mcp_tools: BTreeSet::from([call("lookup")]),
                 ..PolicyLimits::default()
-            }),
-        );
+            },
+        )
+        .await
+        .expect("install the policy");
+        let gate = PolicyGate::new(db.clone());
         let principal = ActingAs::employee(tenant, employee);
 
         // The server serves a `lookup` with a `callback_url` the operator never

@@ -221,12 +221,6 @@ mod tests {
         }
 
         async fn teardown(self) {
-            let mut tx = self.db.admin_tx_bypassing_rls().await.expect("admin tx");
-            sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
-                .execute(&mut *tx)
-                .await
-                .expect("clear platform");
-            tx.commit().await.expect("commit");
             for tenant in [self.a, self.b] {
                 let mut tx = self.db.admin_tx_bypassing_rls().await.expect("admin tx");
                 sqlx::query("DELETE FROM tenants WHERE id = $1")
@@ -269,45 +263,27 @@ mod tests {
         id
     }
 
-    /// The global platform layer, which is the one layer with nothing above it
-    /// to inherit from. Written straight to the table because there is no
-    /// writer API for policy layers yet.
-    /// The platform policy layer is one row for the whole database —
-    /// `tenant_id IS NULL` is what makes it the platform layer — and both tests
-    /// below replace it and then take it away again. A fresh `TenantId`
-    /// isolates everything else here; it cannot isolate this, because the row
-    /// belongs to no tenant by definition. So the tests take turns: run in
-    /// parallel, one test's teardown deletes the layer the other is mid-request
-    /// on, and the budget it was asserting on comes back as a 404.
-    /// `crates/store/src/policy.rs` guards the same row the same way.
-    static PLATFORM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn platform_layer(db: &Db, turns: i32) {
-        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
-            .execute(&mut *tx)
-            .await
-            .expect("clear platform versions");
-        let version = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO policy_versions (id, tenant_id, label, active) \
-             VALUES ($1, NULL, 'platform', true)",
+    /// This tenant's turn budget, as a `tenant` policy layer.
+    ///
+    /// It used to be the *platform* layer, replaced per test and guarded by a
+    /// mutex, because that is the layer with nothing above it to inherit from.
+    /// It no longer has to be: `store::policy::install` maintains one platform
+    /// ceiling for the whole database and widens it rather than replacing it,
+    /// so a test writes the number it cares about into its own tenant's layer
+    /// and the intersection takes the minimum. No global row, no lock, no
+    /// teardown that deletes the layer another test is mid-request on.
+    async fn turn_budget(db: &Db, tenant: TenantId, turns: i32) {
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                max_turns_per_day: u32::try_from(turns).expect("non-negative"),
+                ..PolicyLimits::default()
+            },
         )
-        .bind(version)
-        .execute(&mut *tx)
         .await
-        .expect("insert version");
-        sqlx::query(
-            "INSERT INTO policy_layers (id, version_id, tenant_id, layer, max_turns_per_day) \
-             VALUES ($1, $2, NULL, 'platform', $3)",
-        )
-        .bind(Uuid::now_v7())
-        .bind(version)
-        .bind(turns)
-        .execute(&mut *tx)
-        .await
-        .expect("insert platform layer");
-        tx.commit().await.expect("commit platform");
+        .expect("install the turn budget");
     }
 
     /// Burn `n` turns the way the initiative loop will: through the reserving
@@ -340,8 +316,7 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
-        let _platform = PLATFORM_LOCK.lock().await;
-        platform_layer(&h.db, 5).await;
+        turn_budget(&h.db, h.a, 5).await;
         let id = employee(&h.db, h.a, "lena").await;
 
         // Nothing consumed yet: a real answer, not a 404.
@@ -376,8 +351,7 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
-        let _platform = PLATFORM_LOCK.lock().await;
-        platform_layer(&h.db, 5).await;
+        turn_budget(&h.db, h.a, 5).await;
         let id = employee(&h.db, h.a, "lena").await;
         burn(&h.db, h.a, id, 2).await;
 

@@ -406,7 +406,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::gate::{PolicyBook, PolicyGate};
+    use crate::gate::PolicyGate;
 
     // A 32-byte master key, which is what `LocalEnvelopeSecretStore::new` takes.
     // Not a passphrase: there is no KDF here, and inventing one in a test would
@@ -450,6 +450,22 @@ mod tests {
         .expect("employee");
         tx.commit().await.expect("commit");
 
+        // The policy the gate will read: one allowed A2A peer, so a real token
+        // exists. A row rather than a constructor argument — the gate loads the
+        // four layers per decision, and a tenant with no policy is refused.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_a2a_peers: BTreeSet::from([Domain::parse(PEER).expect("domain")]),
+                max_new_contacts_per_day: 20,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+
         let principal = Principal::employee(tenant, employee);
         let identity = Identity::new(
             db.clone(),
@@ -459,16 +475,8 @@ mod tests {
         (principal, identity)
     }
 
-    /// A gate that allows an A2A message to one peer, so a real token exists.
     fn gate(db: &Db) -> PolicyGate {
-        PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
-                allowed_a2a_peers: BTreeSet::from([Domain::parse(PEER).expect("domain")]),
-                max_new_contacts_per_day: 20,
-                ..PolicyLimits::default()
-            }),
-        )
+        PolicyGate::new(db.clone())
     }
 
     async fn token(db: &Db, principal: &Principal) -> Authorized<Action> {

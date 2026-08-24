@@ -669,7 +669,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::gate::{PolicyBook, PolicyGate};
+    use crate::gate::PolicyGate;
 
     // -- test doubles for the two ports that have no adapter ---------------
 
@@ -784,14 +784,14 @@ mod tests {
         .expect("set caps");
         tx.commit().await.expect("commit caps");
 
-        Principal::employee(tenant, employee)
-    }
-
-    /// Email, `portal.example.com`, and a small budget.
-    fn gate(db: &Db) -> PolicyGate {
-        PolicyGate::new(
-            db.clone(),
-            PolicyBook::new(PolicyLimits {
+        // The policy the gate will read: email, `portal.example.com`, and a
+        // small budget. It is a row, not a constructor argument — the gate
+        // loads the four layers per decision.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
                 spend: Some(
                     SpendLimits::try_new(
                         Money::new(25_000, Currency::Eur).expect("nonzero"),
@@ -806,8 +806,16 @@ mod tests {
                 ]),
                 max_new_contacts_per_day: 5,
                 ..PolicyLimits::default()
-            }),
+            },
         )
+        .await
+        .expect("install the policy");
+
+        Principal::employee(tenant, employee)
+    }
+
+    fn gate(db: &Db) -> PolicyGate {
+        PolicyGate::new(db.clone())
     }
 
     fn ports(email: MockEmailProvider, payments: Arc<MockPayments>) -> Arc<Ports> {
