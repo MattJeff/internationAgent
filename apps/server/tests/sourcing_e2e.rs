@@ -34,12 +34,14 @@
 //!
 //! # What this test found and did not paper over
 //!
-//! Four seams that do not line up are bridged **in this file, in the open**,
-//! rather than asserted around. Each is marked `GAP n` where the bridge is
-//! written; read those four comments before trusting the green. In summary:
-//! two unrelated `Incoterm` enums, a `LiveQuote` the comparison cannot take, no
-//! way to give an employee a role, and a `quotes` table that cannot hold two
-//! currencies against one RFQ.
+//! Four seams that did not line up were bridged **in this file, in the open**,
+//! rather than asserted around. Two of them have since been closed in the
+//! product and the bridges are gone: there is now exactly one `Incoterm` in the
+//! workspace (the domain's, re-exported by `app::sourcing`), and
+//! `app::sourcing::Quote::live_at` is the only way into a comparison, so a stale
+//! price cannot be ranked. The two that remain are marked `GAP n` where the
+//! bridge is written — no way to give an employee a role, and a `quotes` table
+//! that cannot hold two currencies against one RFQ.
 //!
 //! And one that is not a seam but an absence: `crates/domain/src/psyche/mod.rs`
 //! declares `pub mod links;` and nothing else, so `beliefs.rs`,
@@ -174,59 +176,20 @@ fn fx() -> Fx {
 }
 
 // ---------------------------------------------------------------------------
-// The bridges that do not exist in the product
+// Quotes, as a supplier sends them
 // ---------------------------------------------------------------------------
 
-/// GAP 1 — **two `Incoterm` enums, no conversion between them.**
+/// Into the comparison, if it is still a price at `now`.
 ///
-/// `domain::sourcing::Incoterm` has all eleven Incoterms 2020 terms;
-/// `app::sourcing::Incoterm` has the five the landed-cost model understands.
-/// Neither crate knows about the other's, and there is no `From`, no `TryFrom`
-/// and no shared parse. The three-letter code is the only thing they agree on,
-/// so that is what this bridges on — and the six terms the comparison cannot
-/// price are a panic here rather than a silent mis-costing.
-fn comparable_incoterm(term: buying::Incoterm) -> Incoterm {
-    match term.as_str() {
-        "EXW" => Incoterm::Exw,
-        "FOB" => Incoterm::Fob,
-        "CIF" => Incoterm::Cif,
-        "DAP" => Incoterm::Dap,
-        "DDP" => Incoterm::Ddp,
-        other => panic!(
-            "the comparison cannot price {other}: the domain models eleven incoterms and \
-             app::sourcing::Incoterm has five, with nothing converting between them"
-        ),
-    }
-}
-
-/// GAP 2 — **the type that proves a quote is live and the type the comparison
-/// ranks are different types, and nothing in the workspace joins them.**
-///
-/// `domain::sourcing::Quote` carries the validity window and yields a
-/// `LiveQuote` that cannot be forged; `app::sourcing::Quote` carries the
-/// quantity and the incoterm the landed cost needs and has **no validity window
-/// at all**. So `rank` cannot refuse a stale price — it has never been told
-/// there is such a thing.
-///
-/// This is where the expiry check has to happen, and it is a check a caller can
-/// forget, because nothing makes them write it. The `?` below is the whole of
-/// requirement 4, and it lives in a test file.
-fn comparable(
-    quote: &buying::Quote,
+/// `Quote::live_at` is `app::sourcing::Quote`'s only constructor and it goes
+/// through the domain's validity window, so this is a thin call and not a
+/// bridge: there is nothing left for a caller to remember.
+fn comparable<'a>(
+    quote: &'a buying::Quote,
     supplier: &EmailAddress,
     now: DateTime<Utc>,
-) -> Result<Quote, buying::SourcingError> {
-    // The only place a validity window is ever checked. No `LiveQuote`, no
-    // comparison entry.
-    let live = quote.live_at(now)?;
-    let live = live.quote();
-    Ok(Quote {
-        supplier: supplier.clone(),
-        unit_price: live.unit_price,
-        quantity: QUANTITY,
-        incoterm: comparable_incoterm(live.incoterm),
-        lead_time_days: live.lead_time_days,
-    })
+) -> Result<Quote<'a>, buying::SourcingError> {
+    Quote::live_at(quote, supplier.clone(), QUANTITY, now)
 }
 
 /// A quote as a supplier sent it, in the supplier's own money and on the
@@ -235,7 +198,7 @@ fn quote(
     rfq_id: buying::RfqId,
     supplier_id: buying::SupplierId,
     unit_price: Money,
-    incoterm: buying::Incoterm,
+    incoterm: Incoterm,
     lead_time_days: u32,
     valid_days: i64,
 ) -> buying::Quote {
@@ -770,7 +733,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         .total;
     assert_eq!(would_have_won, usd(1_502_724), "$15,027.24 delivered");
 
-    let live: Vec<Quote> = [(&cny_exw, &list[0]), (&eur_ddp, &list[1])]
+    let live: Vec<Quote<'_>> = [(&cny_exw, &list[0]), (&eur_ddp, &list[1])]
         .into_iter()
         .map(|(quote, supplier)| comparable(quote, supplier, now).expect("still standing"))
         .collect();
@@ -781,7 +744,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     let table = fx();
     let unit_prices: Vec<u64> = live
         .iter()
-        .map(|q| table.convert(q.unit_price).expect("a rate exists"))
+        .map(|q| table.convert(q.unit_price()).expect("a rate exists"))
         .collect();
     assert_eq!(unit_prices, vec![728, 843]);
 
@@ -1551,22 +1514,39 @@ fn the_shortlist_and_the_ranking_are_the_same_every_run() {
     assert!(name.taint().is_untrusted());
     assert!(name.expose_for_parsing().contains("IGNORE PREVIOUS"));
 
-    // And the ranking, over five identical runs.
+    // And the ranking, over five identical runs. Both quotes go through
+    // `live_at` because there is no other way to build one.
+    let rfq_id = buying::RfqId::new_v7(at(T0));
+    let supplier_id = buying::SupplierId::new_v7(at(T0));
+    let cny_exw = quote(
+        rfq_id,
+        supplier_id,
+        Money::new(5_200, Cny).expect("non-zero"),
+        Incoterm::Exw,
+        38,
+        30,
+    );
+    let eur_ddp = quote(
+        rfq_id,
+        supplier_id,
+        Money::new(780, Eur).expect("non-zero"),
+        Incoterm::Ddp,
+        21,
+        30,
+    );
     let quotes = vec![
-        Quote {
-            supplier: addr("sales@shenzhen-fasteners.example.cn"),
-            unit_price: Money::new(5_200, Cny).expect("non-zero"),
-            quantity: QUANTITY,
-            incoterm: Incoterm::Exw,
-            lead_time_days: 38,
-        },
-        Quote {
-            supplier: addr("vertrieb@hamburg-praezision.example.de"),
-            unit_price: Money::new(780, Eur).expect("non-zero"),
-            quantity: QUANTITY,
-            incoterm: Incoterm::Ddp,
-            lead_time_days: 21,
-        },
+        comparable(
+            &cny_exw,
+            &addr("sales@shenzhen-fasteners.example.cn"),
+            compared_at(),
+        )
+        .expect("still standing"),
+        comparable(
+            &eur_ddp,
+            &addr("vertrieb@hamburg-praezision.example.de"),
+            compared_at(),
+        )
+        .expect("still standing"),
     ];
     let once = rank(&quotes, &lane(), &fx()).expect("comparable");
     for _ in 0..5 {

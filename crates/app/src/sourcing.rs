@@ -33,6 +33,19 @@
 //! [`Fx`] is supplied by the caller and a currency with no rate is an error
 //! rather than a guess.
 //!
+//! # A stale price cannot enter a ranking
+//!
+//! [`Quote`] here is not a struct anyone can fill in. Its only constructor is
+//! [`Quote::live_at`], which goes through [`agentos_domain::sourcing::Quote::live_at`]
+//! and holds the [`LiveQuote`] it minted. So "we compared a price that stopped
+//! standing last week" is not a filter somebody has to remember — it is a value
+//! with no spelling, exactly like [`Authorized`](crate::gate::Authorized).
+//!
+//! The incoterm on it is `domain::sourcing::Incoterm`, re-exported. One concept,
+//! one enum: a second one in this file would be a mapping somebody gets wrong,
+//! and the incoterm is what decides how much of the landed cost is *not* in the
+//! quoted price.
+//!
 //! # An order always needs a human
 //!
 //! [`Buyer::place_order`] proposes an [`Action::ContractSign`], which
@@ -48,6 +61,10 @@ use agentos_domain::action::{Action, EmailAddress, McpTool};
 use agentos_domain::ids::ApprovalId;
 use agentos_domain::money::{Currency, Money, MoneyError};
 use agentos_domain::policy::DenyReason;
+/// The incoterm, from the domain. There is exactly one of these in the
+/// workspace and this is a re-export of it, not a second enum.
+pub use agentos_domain::sourcing::Incoterm;
+use agentos_domain::sourcing::{self as buying, LiveQuote};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::email::ProviderMessageId;
 use chrono::{DateTime, Utc};
@@ -260,81 +277,50 @@ pub enum Leg {
     LastMile,
 }
 
-/// The delivery terms this system understands.
+/// The legs the *buyer* still pays on top of the quoted price.
 ///
-/// ponytail: five, not the full eleven. EXW, FOB, CIF, DAP and DDP span the
-/// range from "collect it yourself" to "delivered, duty paid", which is what a
-/// comparison needs. Add FCA, CPT, CIP and the rest one arm of
-/// [`Incoterm::buyer_pays`] at a time, the day a supplier quotes one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Incoterm {
-    /// Ex Works. The price is the goods on the seller's floor and nothing else.
-    Exw,
-    /// Free On Board. Seller gets it onto the vessel.
-    Fob,
-    /// Cost, Insurance and Freight. Seller pays carriage and insurance to the
-    /// destination port; the buyer is still the importer.
-    Cif,
-    /// Delivered At Place. Seller delivers to our door; duty and clearance are
-    /// ours.
-    Dap,
-    /// Delivered Duty Paid. Everything is the seller's.
-    Ddp,
+/// Free functions rather than methods because [`Incoterm`] is the domain's
+/// type: what an incoterm *means* is the domain's, what one *costs us on this
+/// lane* is ours. Exhaustive by name, no `_` arm, over all eleven terms — a
+/// twelfth cannot be added without somebody deciding what it costs us.
+pub const fn buyer_pays(incoterm: Incoterm) -> &'static [Leg] {
+    match incoterm {
+        // Collect it yourself: every metre and every duty is the buyer's.
+        Incoterm::Exw => &[
+            Leg::ExportHandling,
+            Leg::Freight,
+            Leg::Insurance,
+            Leg::ImportDuty,
+            Leg::Clearance,
+            Leg::LastMile,
+        ],
+        // The seller clears for export; the carriage is still ours.
+        Incoterm::Fca | Incoterm::Fas | Incoterm::Fob => &[
+            Leg::Freight,
+            Leg::Insurance,
+            Leg::ImportDuty,
+            Leg::Clearance,
+            Leg::LastMile,
+        ],
+        // Carriage paid, insurance not.
+        Incoterm::Cfr | Incoterm::Cpt => &[
+            Leg::Insurance,
+            Leg::ImportDuty,
+            Leg::Clearance,
+            Leg::LastMile,
+        ],
+        // Carriage and insurance paid, to the port or to the place.
+        Incoterm::Cif | Incoterm::Cip => &[Leg::ImportDuty, Leg::Clearance, Leg::LastMile],
+        // Delivered, unloaded or not; the buyer is still the importer.
+        Incoterm::Dap | Incoterm::Dpu => &[Leg::ImportDuty, Leg::Clearance],
+        // Delivered duty paid: the price is the price.
+        Incoterm::Ddp => &[],
+    }
 }
 
-impl Incoterm {
-    /// Every term, widest buyer obligation first. Iterate it to prove a rule
-    /// covers the whole space.
-    pub const ALL: [Incoterm; 5] = [
-        Incoterm::Exw,
-        Incoterm::Fob,
-        Incoterm::Cif,
-        Incoterm::Dap,
-        Incoterm::Ddp,
-    ];
-
-    /// The three-letter code, as it appears on a quote.
-    pub const fn code(self) -> &'static str {
-        match self {
-            Incoterm::Exw => "EXW",
-            Incoterm::Fob => "FOB",
-            Incoterm::Cif => "CIF",
-            Incoterm::Dap => "DAP",
-            Incoterm::Ddp => "DDP",
-        }
-    }
-
-    /// The legs the *buyer* still pays on top of the quoted price.
-    ///
-    /// Exhaustive by name, no `_` arm: a sixth term cannot be added without
-    /// somebody deciding what it costs us.
-    pub const fn buyer_pays(self) -> &'static [Leg] {
-        match self {
-            Incoterm::Exw => &[
-                Leg::ExportHandling,
-                Leg::Freight,
-                Leg::Insurance,
-                Leg::ImportDuty,
-                Leg::Clearance,
-                Leg::LastMile,
-            ],
-            Incoterm::Fob => &[
-                Leg::Freight,
-                Leg::Insurance,
-                Leg::ImportDuty,
-                Leg::Clearance,
-                Leg::LastMile,
-            ],
-            Incoterm::Cif => &[Leg::ImportDuty, Leg::Clearance, Leg::LastMile],
-            Incoterm::Dap => &[Leg::ImportDuty, Leg::Clearance],
-            Incoterm::Ddp => &[],
-        }
-    }
-
-    /// Whether the quoted price already includes `leg`.
-    pub fn covers(self, leg: Leg) -> bool {
-        !self.buyer_pays().contains(&leg)
-    }
+/// Whether the quoted price already includes `leg`.
+pub fn covers(incoterm: Incoterm, leg: Leg) -> bool {
+    !buyer_pays(incoterm).contains(&leg)
 }
 
 /// What the legs the seller does not cover cost *us*, on one route.
@@ -479,22 +465,67 @@ impl QuoteError {
     }
 }
 
-/// What a supplier answered.
+/// What a supplier answered, **proven to still be standing**.
 ///
-/// The prose that came with it is the caller's to keep wrapped; what is here is
-/// the part a comparison can be built on, already parsed.
+/// The bridge between the domain's [`agentos_domain::sourcing::Quote`] — which
+/// owns the validity window — and the comparison, which needs a quantity, an
+/// address to rank by, and nothing else the domain does not already have.
+///
+/// There is one constructor, [`Quote::live_at`], and it holds the [`LiveQuote`]
+/// it was given rather than copying the price out of it. An expired quote
+/// therefore cannot be compared: not because [`rank`] filters it out, but
+/// because the value never exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Quote {
+pub struct Quote<'a> {
+    live: LiveQuote<'a>,
+    supplier: EmailAddress,
+    quantity: u64,
+}
+
+impl<'a> Quote<'a> {
+    /// Take a supplier's quote into the comparison, if it is a price at `now`.
+    ///
+    /// The window check is [`agentos_domain::sourcing::Quote::live_at`]'s and
+    /// there is no way past it — no `From`, no public fields, no second
+    /// constructor. `quantity` is the RFQ's, not the supplier's: it is what we
+    /// are buying, and the domain quote carries only the MOQ.
+    pub fn live_at(
+        quote: &'a buying::Quote,
+        supplier: EmailAddress,
+        quantity: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Self, buying::SourcingError> {
+        Ok(Self {
+            live: quote.live_at(now)?,
+            supplier,
+            quantity,
+        })
+    }
+
     /// Who quoted.
-    pub supplier: EmailAddress,
+    pub const fn supplier(&self) -> &EmailAddress {
+        &self.supplier
+    }
+
     /// Price of one unit, in the supplier's currency.
-    pub unit_price: Money,
-    /// How many units the price is for.
-    pub quantity: u64,
+    pub const fn unit_price(&self) -> Money {
+        self.live.quote().unit_price
+    }
+
+    /// How many units we are pricing.
+    pub const fn quantity(&self) -> u64 {
+        self.quantity
+    }
+
     /// Which costs that price already includes.
-    pub incoterm: Incoterm,
+    pub const fn incoterm(&self) -> Incoterm {
+        self.live.quote().incoterm
+    }
+
     /// Days from order to the delivery the incoterm describes.
-    pub lead_time_days: u32,
+    pub const fn lead_time_days(&self) -> u32 {
+        self.live.quote().lead_time_days
+    }
 }
 
 /// One quote, normalised into the comparison currency with every cost the
@@ -523,24 +554,24 @@ pub struct Landed {
 /// CIF value. That is the transaction value a broker starts from; for an EXW
 /// lane a customs authority would add the freight to it. Add the freight to the
 /// duty base the day a broker's bill disagrees — it is one term in one line.
-pub fn landed_cost(quote: &Quote, lane: &Lane, fx: &Fx) -> Result<Landed, QuoteError> {
+pub fn landed_cost(quote: &Quote<'_>, lane: &Lane, fx: &Fx) -> Result<Landed, QuoteError> {
     if lane.currency != fx.currency() {
         return Err(QuoteError::LaneCurrency {
             lane: lane.currency,
             target: fx.currency(),
         });
     }
-    if quote.quantity == 0 {
+    if quote.quantity() == 0 {
         return Err(QuoteError::NoQuantity);
     }
 
     let goods = quote
-        .unit_price
-        .checked_mul_int(quote.quantity)
+        .unit_price()
+        .checked_mul_int(quote.quantity())
         .map_err(|_| QuoteError::Overflow)?;
     let goods_minor = fx.convert(goods)?;
 
-    let duty_minor = if quote.incoterm.covers(Leg::ImportDuty) {
+    let duty_minor = if covers(quote.incoterm(), Leg::ImportDuty) {
         0
     } else {
         u64::try_from(
@@ -552,9 +583,7 @@ pub fn landed_cost(quote: &Quote, lane: &Lane, fx: &Fx) -> Result<Landed, QuoteE
         .map_err(|_| QuoteError::Overflow)?
     };
 
-    let legs_minor = quote
-        .incoterm
-        .buyer_pays()
+    let legs_minor = buyer_pays(quote.incoterm())
         .iter()
         .try_fold(0u64, |sum, &leg| sum.checked_add(lane.fixed(leg)))
         .ok_or(QuoteError::Overflow)?;
@@ -565,9 +594,9 @@ pub fn landed_cost(quote: &Quote, lane: &Lane, fx: &Fx) -> Result<Landed, QuoteE
         .ok_or(QuoteError::Overflow)?;
 
     Ok(Landed {
-        supplier: quote.supplier.clone(),
-        incoterm: quote.incoterm,
-        lead_time_days: quote.lead_time_days,
+        supplier: quote.supplier().clone(),
+        incoterm: quote.incoterm(),
+        lead_time_days: quote.lead_time_days(),
         goods_minor,
         duty_minor,
         legs_minor,
@@ -583,7 +612,7 @@ pub fn landed_cost(quote: &Quote, lane: &Lane, fx: &Fx) -> Result<Landed, QuoteE
 /// A quote in a currency the table has no rate for is an `Err` for the whole
 /// comparison, not a quote quietly left out: a shortlist missing the supplier
 /// nobody could convert is a shortlist that lies.
-pub fn rank(quotes: &[Quote], lane: &Lane, fx: &Fx) -> Result<Vec<Landed>, QuoteError> {
+pub fn rank(quotes: &[Quote<'_>], lane: &Lane, fx: &Fx) -> Result<Vec<Landed>, QuoteError> {
     let mut landed = quotes
         .iter()
         .map(|quote| landed_cost(quote, lane, fx))
@@ -976,11 +1005,12 @@ impl Buyer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
 
     use agentos_domain::action::{Channel, Domain};
     use agentos_domain::ids::{EmployeeId, IdempotencyKey, Slug, TenantId};
-    use agentos_domain::money::Currency::{Cny, Eur};
+    use agentos_domain::money::Currency::{Cny, Eur, Usd};
     use agentos_domain::policy::{PolicyLimits, SpendLimits};
     use agentos_providers::ProviderError;
     use agentos_providers::browser::MockBrowser;
@@ -1200,6 +1230,33 @@ mod tests {
 
     // -- quotes: the pure half --------------------------------------------
 
+    /// A quote as a supplier sent it: a price with a window on it.
+    fn quoted(unit_price: Money, incoterm: Incoterm, lead_time_days: u32) -> buying::Quote {
+        buying::Quote {
+            rfq_id: buying::RfqId::new_v7(at(T0)),
+            supplier_id: buying::SupplierId::new_v7(at(T0)),
+            unit_price,
+            moq: NonZeroU32::new(100).expect("non-zero"),
+            lead_time_days,
+            valid_from: at(T0),
+            valid_until: at(T0 + 30 * DAY),
+            incoterm,
+            sample: buying::SampleAvailability::Free,
+        }
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("a valid instant")
+    }
+
+    const T0: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+    const DAY: i64 = 86_400;
+
+    /// Ten days in: inside every window built by `quoted`.
+    fn now() -> DateTime<Utc> {
+        at(T0 + 10 * DAY)
+    }
+
     /// A EUR EXW quote and a CNY DDP quote, ordered two ways.
     ///
     /// By unit price the European supplier is cheaper — €10.00 against a
@@ -1220,30 +1277,22 @@ mod tests {
         // 100 fen buy 13 cents.
         let fx = Fx::new(Eur).with(Cny, 13, 100);
 
-        let european = Quote {
-            supplier: address("sales@nearby.example.com"),
-            unit_price: eur(1_000),
-            quantity: 100,
-            incoterm: Incoterm::Exw,
-            lead_time_days: 14,
-        };
-        let chinese = Quote {
-            supplier: address("sales@faraway.example.cn"),
-            unit_price: Money::new(8_500, Cny).expect("nonzero"),
-            quantity: 100,
-            incoterm: Incoterm::Ddp,
-            lead_time_days: 45,
-        };
+        let nearby = address("sales@nearby.example.com");
+        let faraway = address("sales@faraway.example.cn");
+        let exw = quoted(eur(1_000), Incoterm::Exw, 14);
+        let ddp = quoted(Money::new(8_500, Cny).expect("nonzero"), Incoterm::Ddp, 45);
+        let european = Quote::live_at(&exw, nearby.clone(), 100, now()).expect("standing");
+        let chinese = Quote::live_at(&ddp, faraway.clone(), 100, now()).expect("standing");
 
         // The naive comparison, made honestly: convert the unit prices and the
         // European quote wins.
-        let european_unit = fx.convert(european.unit_price).expect("same currency");
-        let chinese_unit = fx.convert(chinese.unit_price).expect("a rate exists");
+        let european_unit = fx.convert(european.unit_price()).expect("same currency");
+        let chinese_unit = fx.convert(chinese.unit_price()).expect("a rate exists");
         assert_eq!((european_unit, chinese_unit), (1_000, 1_105));
 
-        let ranked = rank(&[european.clone(), chinese.clone()], &lane, &fx).expect("comparable");
+        let ranked = rank(&[european, chinese], &lane, &fx).expect("comparable");
         assert_eq!(
-            ranked[0].supplier, chinese.supplier,
+            ranked[0].supplier, faraway,
             "the dearer unit price landed cheaper: {ranked:?}"
         );
 
@@ -1261,8 +1310,110 @@ mod tests {
         assert_eq!(ranked[0].total.currency(), fx.currency());
     }
 
-    /// The same goods on the same lane, quoted five ways: every term the seller
-    /// takes on can only make the landed cost smaller.
+    /// The e2e's comparison, in one process with no server: the same two
+    /// quotes, the same lane, the same rates, the same six figures.
+    ///
+    /// Here because those numbers are the claim `landed_cost` exists to make,
+    /// and a claim that only a Postgres-bound end-to-end test checks is a claim
+    /// that goes unchecked on every machine without a database.
+    #[test]
+    fn the_end_to_end_ordering_reproduces_exactly() {
+        const QUANTITY: u64 = 2_000;
+        let lane = Lane {
+            export_handling_minor: 12_000,
+            freight_minor: 90_000,
+            insurance_minor: 6_000,
+            clearance_minor: 15_000,
+            last_mile_minor: 9_000,
+            duty_bps: 850,
+            ..Lane::new(Usd)
+        };
+        let fx = Fx::new(Usd).with(Cny, 14, 100).with(Eur, 108, 100);
+
+        // ¥52.00 EXW, €7.80 DDP, and a €5.90 FOB that stopped standing.
+        let cny_exw = quoted(Money::new(5_200, Cny).expect("nonzero"), Incoterm::Exw, 38);
+        let eur_ddp = quoted(Money::new(780, Eur).expect("nonzero"), Incoterm::Ddp, 21);
+        let mut eur_fob = quoted(Money::new(590, Eur).expect("nonzero"), Incoterm::Fob, 45);
+        eur_fob.valid_until = at(T0 + 5 * DAY);
+
+        let shenzhen = address("sales@shenzhen-fasteners.example.cn");
+        let hamburg = address("vertrieb@hamburg-praezision.example.de");
+        let istanbul = address("satis@istanbul-metal.example.tr");
+
+        let live = [
+            Quote::live_at(&cny_exw, shenzhen, QUANTITY, now()).expect("standing"),
+            Quote::live_at(&eur_ddp, hamburg.clone(), QUANTITY, now()).expect("standing"),
+        ];
+        let ranked = rank(&live, &lane, &fx).expect("every currency has a rate");
+
+        // Landed, the ordering reverses: EXW pays every leg and 8.5% duty.
+        assert_eq!(ranked[0].supplier, hamburg);
+        assert_eq!(
+            ranked[0].total,
+            Money::new(1_684_800, Usd).expect("nonzero")
+        );
+        assert_eq!((ranked[0].duty_minor, ranked[0].legs_minor), (0, 0));
+        assert_eq!(
+            ranked[1].total,
+            Money::new(1_711_760, Usd).expect("nonzero")
+        );
+        assert_eq!(
+            (
+                ranked[1].goods_minor,
+                ranked[1].duty_minor,
+                ranked[1].legs_minor
+            ),
+            (1_456_000, 123_760, 132_000)
+        );
+
+        // The expired quote WOULD have won — $15,027.24 — which is the only
+        // reason excluding it matters. Two days in it is a price...
+        let as_if_live =
+            Quote::live_at(&eur_fob, istanbul.clone(), QUANTITY, at(T0 + 2 * DAY)).expect("early");
+        assert_eq!(
+            landed_cost(&as_if_live, &lane, &fx)
+                .expect("comparable")
+                .total,
+            Money::new(1_502_724, Usd).expect("nonzero")
+        );
+        // ...and at comparison time it is not one, so there is no value to rank.
+        assert!(matches!(
+            Quote::live_at(&eur_fob, istanbul, QUANTITY, now()),
+            Err(buying::SourcingError::QuoteExpired { .. })
+        ));
+    }
+
+    /// An expired price cannot be compared, and not because anything filters it.
+    ///
+    /// `Quote::live_at` is the only constructor — the fields are private and
+    /// there is no `From` — so the refusal below is the whole of "expired quotes
+    /// are excluded". A caller cannot forget a line it is impossible to skip.
+    #[test]
+    fn an_expired_quote_cannot_be_built_into_a_comparable_value() {
+        let supplier = address("sales@supplier.example.com");
+        let q = quoted(eur(1_000), Incoterm::Ddp, 30);
+
+        assert!(matches!(
+            Quote::live_at(&q, supplier.clone(), 100, at(T0 + 31 * DAY)),
+            Err(buying::SourcingError::QuoteExpired { .. })
+        ));
+        assert!(matches!(
+            Quote::live_at(&q, supplier.clone(), 100, at(T0 - 1)),
+            Err(buying::SourcingError::QuoteNotYetValid { .. })
+        ));
+        // Inclusive at both ends, and a window nothing can be live in is refused.
+        assert!(Quote::live_at(&q, supplier.clone(), 100, q.valid_from).is_ok());
+        assert!(Quote::live_at(&q, supplier.clone(), 100, q.valid_until).is_ok());
+        let mut empty = q.clone();
+        empty.valid_until = empty.valid_from;
+        assert!(matches!(
+            Quote::live_at(&empty, supplier, 100, at(T0)),
+            Err(buying::SourcingError::EmptyValidityWindow { .. })
+        ));
+    }
+
+    /// The same goods on the same lane, quoted eleven ways: every term the
+    /// seller takes on can only make the landed cost smaller.
     #[test]
     fn a_wider_incoterm_never_costs_the_buyer_more() {
         let lane = Lane {
@@ -1275,47 +1426,76 @@ mod tests {
             ..Lane::new(Eur)
         };
         let fx = Fx::new(Eur);
-        let quote = |incoterm| Quote {
-            supplier: address("sales@supplier.example.com"),
-            unit_price: eur(1_000),
-            quantity: 100,
-            incoterm,
-            lead_time_days: 30,
+        let supplier = address("sales@supplier.example.com");
+        let total = |incoterm| {
+            let q = quoted(eur(1_000), incoterm, 30);
+            landed_cost(
+                &Quote::live_at(&q, supplier.clone(), 100, now()).expect("standing"),
+                &lane,
+                &fx,
+            )
+            .expect("no conversion needed")
+            .total
+            .minor()
         };
 
-        let totals: Vec<u64> = Incoterm::ALL
-            .into_iter()
-            .map(|incoterm| {
-                landed_cost(&quote(incoterm), &lane, &fx)
-                    .expect("no conversion needed")
-                    .total
-                    .minor()
-            })
-            .collect();
-
-        assert_eq!(totals, vec![149_000, 144_000, 112_000, 109_000, 100_000]);
-        assert!(
-            totals.windows(2).all(|pair| pair[0] >= pair[1]),
-            "Incoterm::ALL is ordered widest-buyer-obligation first: {totals:?}"
+        // Every term the domain models is priced — no panic, no `_` arm, no
+        // six terms the comparison cannot take.
+        let totals: Vec<(Incoterm, u64)> =
+            Incoterm::ALL.into_iter().map(|t| (t, total(t))).collect();
+        assert_eq!(
+            totals
+                .iter()
+                .filter(|(t, _)| matches!(
+                    t,
+                    Incoterm::Exw | Incoterm::Fob | Incoterm::Cif | Incoterm::Dap | Incoterm::Ddp
+                ))
+                .map(|(_, minor)| *minor)
+                .collect::<Vec<_>>(),
+            vec![149_000, 144_000, 112_000, 109_000, 100_000]
         );
+        // The ordering claim itself, over the whole space rather than over one
+        // hand-sorted list: a term that leaves the buyer strictly fewer legs
+        // never costs the buyer more.
+        for (wide, wide_total) in &totals {
+            for (narrow, narrow_total) in &totals {
+                if buyer_pays(*narrow)
+                    .iter()
+                    .all(|leg| buyer_pays(*wide).contains(leg))
+                {
+                    assert!(
+                        wide_total >= narrow_total,
+                        "{wide} pays for more than {narrow} and landed cheaper: {totals:?}"
+                    );
+                }
+            }
+        }
         // And the claim each of those numbers rests on.
-        assert!(Incoterm::Ddp.covers(Leg::ImportDuty));
-        assert!(!Incoterm::Dap.covers(Leg::ImportDuty));
-        assert!(Incoterm::Dap.covers(Leg::LastMile));
-        assert!(!Incoterm::Exw.covers(Leg::Freight));
+        assert!(covers(Incoterm::Ddp, Leg::ImportDuty));
+        assert!(!covers(Incoterm::Dap, Leg::ImportDuty));
+        assert!(covers(Incoterm::Dap, Leg::LastMile));
+        assert!(!covers(Incoterm::Exw, Leg::Freight));
+    }
+
+    /// One incoterm in the workspace, not two.
+    ///
+    /// The annotation is the assertion: it stops compiling the day `app` grows
+    /// an `Incoterm` of its own again, and a second enum is a mapping between
+    /// eleven terms and five that somebody eventually gets wrong.
+    #[test]
+    fn the_incoterm_here_is_the_domain_incoterm() {
+        let term: agentos_domain::sourcing::Incoterm = Incoterm::Ddp;
+        assert_eq!(term.as_str(), "DDP");
+        assert_eq!(Incoterm::ALL.len(), 11);
     }
 
     #[test]
     fn a_currency_with_no_rate_stops_the_whole_comparison() {
         let lane = Lane::new(Eur);
         let fx = Fx::new(Eur);
-        let quote = Quote {
-            supplier: address("sales@faraway.example.cn"),
-            unit_price: Money::new(8_500, Cny).expect("nonzero"),
-            quantity: 100,
-            incoterm: Incoterm::Ddp,
-            lead_time_days: 45,
-        };
+        let cny = quoted(Money::new(8_500, Cny).expect("nonzero"), Incoterm::Ddp, 45);
+        let quote = Quote::live_at(&cny, address("sales@faraway.example.cn"), 100, now())
+            .expect("standing");
 
         assert_eq!(
             rank(std::slice::from_ref(&quote), &lane, &fx),
@@ -1669,6 +1849,6 @@ mod tests {
         );
         assert_eq!(QuoteError::NoRate(Cny).code(), "no_rate");
         assert_eq!(Unqualified::MoqTooHigh.code(), "moq_too_high");
-        assert_eq!(Incoterm::Ddp.code(), "DDP");
+        assert_eq!(Incoterm::Ddp.as_str(), "DDP");
     }
 }

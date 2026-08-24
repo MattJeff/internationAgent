@@ -250,6 +250,22 @@ pub enum Incoterm {
 }
 
 impl Incoterm {
+    /// Every term. Iterate it to prove a rule covers the whole space — the
+    /// landed-cost model in `app::sourcing` does exactly that.
+    pub const ALL: [Incoterm; 11] = [
+        Incoterm::Exw,
+        Incoterm::Fca,
+        Incoterm::Fas,
+        Incoterm::Fob,
+        Incoterm::Cfr,
+        Incoterm::Cif,
+        Incoterm::Cpt,
+        Incoterm::Cip,
+        Incoterm::Dap,
+        Incoterm::Dpu,
+        Incoterm::Ddp,
+    ];
+
     /// Stable wire spelling, identical to the serde representation.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1571,10 +1587,14 @@ mod tests {
 
     #[test]
     fn wire_spellings_are_stable() {
-        for term in [Incoterm::Exw, Incoterm::Fob, Incoterm::Ddp] {
+        for term in Incoterm::ALL {
             assert_eq!(
                 serde_json::to_string(&term).unwrap(),
                 format!("\"{}\"", term.as_str())
+            );
+            assert_eq!(
+                serde_json::from_str::<Incoterm>(&format!("\"{}\"", term.as_str())).unwrap(),
+                term
             );
         }
         for state in [

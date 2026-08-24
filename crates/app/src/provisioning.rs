@@ -34,6 +34,17 @@
 //! unbounded await is how a worker hangs forever holding a lease that nobody
 //! else may steal until it lapses.
 //!
+//! # Two ways to have a phone number
+//!
+//! [`EngineConfig::number_strategy`] decides whether `Step::Phone` buys a
+//! number ([`NumberStrategy::Dedicated`], and unchanged) or takes a slot on one
+//! the tenant already owns ([`NumberStrategy::Pooled`]). The pooled path is the
+//! cheaper *regulatory* path, not the cheaper invoice: one French bundle and
+//! one human review serve twenty employees instead of twenty of each. It buys
+//! only when no slot is free, releases the slot rather than the number, and
+//! spells its binding exactly like `Step::Whatsapp`'s shared company sender —
+//! see `ProvisioningEngine::take_pooled_slot`.
+//!
 //! # Orphans are never retried
 //!
 //! An intent left `in_flight` by a worker whose lease has lapsed has an
@@ -55,6 +66,7 @@ use std::time::Duration;
 use agentos_domain::action::{Action, McpTool};
 use agentos_domain::employee::{Employee, Lifecycle, ProviderBinding, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, IdempotencyKey, SecretRef, Slug, TenantId};
+use agentos_domain::phone_pool::NumberStrategy;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::email::EmailProvider;
 use agentos_providers::secrets::SecretStore;
@@ -63,12 +75,15 @@ use agentos_providers::{EnsureCtx, ProviderError, Provisioned, Secret};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::employee;
+use agentos_store::phone_pool;
 use agentos_store::provisioning::{self, Claim, IntentState, StepOutcome};
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::Rng;
 use serde_json::json;
 use tokio::task::JoinSet;
 use uuid::Uuid;
+
+use crate::pool_ops;
 
 /// Provider name for a resource that is us: no external system, nothing to
 /// cancel, nothing to be billed for.
@@ -90,6 +105,11 @@ const RECONCILER_ROLE: &str = "operator";
 /// The `constraint` [`provisioning::finish_step`] reports when our lease was
 /// stolen while we were talking to the provider.
 const LEASE_CONFLICT: &str = "employee_resources.lease_owner";
+
+/// Reported when a tenant is configured to pool numbers in a region it owns no
+/// number in. Not a wait and not a provider's fault: somebody pointed a
+/// deployment at a pool that was never bought.
+const EMPTY_POOL: &str = "empty_pool";
 
 // ---------------------------------------------------------------------------
 // Adapters
@@ -145,6 +165,15 @@ pub struct EngineConfig {
     pub approval_ttl: TimeDelta,
     /// Where to buy phone numbers.
     pub region: Region,
+    /// Whether an employee gets a number of its own or a slot on one the
+    /// tenant already owns.
+    ///
+    /// A per-region operational decision, not a per-employee one, and
+    /// deliberately not derived from [`Self::region`]: which countries make a
+    /// number cost a human-reviewed regulatory bundle is the provider's
+    /// opinion and it changes monthly. [`NumberStrategy::Dedicated`] is the
+    /// default and behaves exactly as it always has.
+    pub number_strategy: NumberStrategy,
     /// The company's verified WhatsApp sender, if it has one.
     pub whatsapp_sender: Option<String>,
 }
@@ -163,6 +192,9 @@ impl Default for EngineConfig {
             // enough for a human to get to it, and a month is not urgency.
             approval_ttl: TimeDelta::days(7),
             region: Region::new("US"),
+            // A US number needs no bundle and a number of one's own is a
+            // better identity where it is free.
+            number_strategy: NumberStrategy::Dedicated,
             whatsapp_sender: None,
         }
     }
@@ -399,6 +431,24 @@ impl ProvisioningEngine {
             Claimed::Parked => return Ok(StepReport::Parked),
         };
 
+        // A pooled number is not bought, it is *joined*: the tenant already
+        // owns it and this employee takes a slot on it. Handled before the
+        // crash window because there is no call to be uncertain about — the
+        // slot and the binding are one commit. See [`Self::take_pooled_slot`].
+        //
+        // It falls through only when every number in the region is at
+        // capacity. The one way a pool grows is somebody buying another
+        // number, so that case goes on to the provider — and in a region worth
+        // pooling that number needs a regulatory bundle, so the answer is the
+        // `PendingExternal` the Twilio path has always returned. The wait
+        // already exists; a second waiting mechanism for it would not.
+        if step == Step::Phone
+            && matches!(self.cfg.number_strategy, NumberStrategy::Pooled)
+            && let Some(report) = self.take_pooled_slot(employee, &claim).await?
+        {
+            return Ok(report);
+        }
+
         // The crash window. Nothing is held open across it: no transaction, no
         // row lock — only the lease, and it expires by itself.
         let (outcome, report) = match self.call_until(employee, step, &claim).await {
@@ -422,6 +472,105 @@ impl ProvisioningEngine {
         };
         self.finish(employee.tenant_id(), &claim, outcome, report)
             .await
+    }
+
+    /// Put this employee on a number the tenant already owns.
+    ///
+    /// `Ok(None)` means the region has numbers but no room on any of them, and
+    /// the caller falls through to the provider. [`PoolError::Full`] and
+    /// [`PoolError::AwaitingBundle`] are deliberately not told apart here: both
+    /// say the same thing to this engine — *ask for another number* — and the
+    /// adapter answers with the bundle to poll and when to expect it, which is
+    /// the wait, spelled the one way this system spells waits.
+    /// [`PoolError::Empty`] is the third one, and it is nobody's wait: a
+    /// deployment pooling a region it never bought into provisions nobody, so
+    /// it fails loudly rather than quietly buying a dedicated number and
+    /// looking like it worked.
+    ///
+    /// # Nothing here reaches a provider
+    ///
+    /// A slot is a row about a number that already exists, so `ensure_number`
+    /// is not called. That is the entire point: one French bundle and one human
+    /// review serve twenty employees instead of twenty of each.
+    ///
+    /// # A crash cannot leak a slot
+    ///
+    /// The allocation and the binding are the **same commit**, so there is no
+    /// window in which a slot is taken and nothing points at it — a process
+    /// that dies before the commit leaves neither, and one that dies after it
+    /// leaves a step that is simply `Ready`. And a slot that did commit cannot
+    /// be doubled by any retry from anywhere: `allocate_atomic` hands back the
+    /// seat this employee already holds, and
+    /// `number_allocations_live_employee_region_key` refuses a second live one
+    /// even to a worker that raced past that check. Ensure twice, one slot.
+    ///
+    /// [`PoolError::Full`]: agentos_domain::phone_pool::PoolError::Full
+    /// [`PoolError::AwaitingBundle`]: agentos_domain::phone_pool::PoolError::AwaitingBundle
+    /// [`PoolError::Empty`]: agentos_domain::phone_pool::PoolError::Empty
+    async fn take_pooled_slot(
+        &self,
+        employee: &Employee,
+        claim: &Claim,
+    ) -> Result<Option<StepReport>, EngineError> {
+        let now = Utc::now();
+        let region = self.cfg.region.as_str();
+        let mut tx = self.db.tenant_tx(employee.tenant_id()).await?;
+
+        let Some(seat) = phone_pool::allocate_atomic(&mut tx, employee.id(), region, now).await?
+        else {
+            // No room. `allocate_atomic` says "full" and "there is no pool"
+            // with the same `None`, and they need two different humans.
+            let owned: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM phone_numbers WHERE region = $1")
+                    .bind(region)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(StoreError::from)?;
+            tx.rollback().await?;
+            if owned > 0 {
+                return Ok(None);
+            }
+            tracing::error!(
+                tenant = %employee.tenant_id().as_uuid(), region,
+                "pooled number strategy, but this tenant owns no number in this region: \
+                 nobody gets a phone until one is registered"
+            );
+            return self
+                .finish(
+                    employee.tenant_id(),
+                    claim,
+                    StepOutcome::Failed {
+                        error: format!("{EMPTY_POOL}: the tenant owns no {region} number"),
+                    },
+                    StepReport::Failed { code: EMPTY_POOL },
+                )
+                .await
+                .map(Some);
+        };
+
+        // Same convention as `Step::Whatsapp`'s shared company sender, because
+        // it is the same problem: the employee id is in the external id so that
+        // N employees on one number are N distinct rows under
+        // `employee_resources_provider_external_id_key`, and so that a slot's
+        // id can never be mistaken for the number's own provider id by
+        // something that deletes.
+        let binding = pool_ops::slot_binding(&seat.e164, employee.id());
+        match provisioning::finish_step(&mut tx, claim, StepOutcome::Ready { binding }, now).await {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(Some(StepReport::Ready))
+            }
+            Err(StoreError::Conflict(what)) if what == LEASE_CONFLICT => {
+                // The seat goes back with the rollback: this worker is not the
+                // one writing this employee's phone any more.
+                tx.rollback().await?;
+                Ok(Some(StepReport::LeaseLost))
+            }
+            Err(err) => {
+                tx.rollback().await?;
+                Err(err.into())
+            }
+        }
     }
 
     // -- releasing ---------------------------------------------------------
@@ -513,20 +662,52 @@ impl ProvisioningEngine {
             return Ok(ReleaseReport::NotBound);
         };
 
+        // A pooled slot is given back to the tenant's pool, and to nobody else.
+        //
+        // **Do not "fix" the missing provider call here.**
+        // `TelephonyProvider::release` is `DELETE IncomingPhoneNumbers/{sid}`.
+        // There is no "give up our share" of a shared number: it takes the
+        // number off the account, cutting off every colleague still sending
+        // from it and throwing away a regulatory bundle that cost a human
+        // review to obtain. The number is the tenant's property and one
+        // employee leaving is not an instruction to give it back. Freeing the
+        // row *is* the release, exactly as it is for `Step::Whatsapp`, whose
+        // company sender is shared the same way and released the same way.
+        let pooled = step == Step::Phone && pool_ops::is_pooled(&binding);
+
         // No transaction is open across this, and the timeout is not optional
         // for the same reason it is not optional in `call_until`.
-        let outcome = match tokio::time::timeout(
-            self.cfg.call_timeout,
-            self.release_call(employee, step, &binding),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ProviderError::timeout()),
+        let outcome = if pooled {
+            Ok(())
+        } else {
+            match tokio::time::timeout(
+                self.cfg.call_timeout,
+                self.release_call(employee, step, &binding),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Err(ProviderError::timeout()),
+            }
         };
 
         let now = Utc::now();
         let mut tx = self.db.tenant_tx(employee.tenant_id()).await?;
+        if pooled {
+            // In the same transaction as the binding clear below: the seat and
+            // the thing that names it go together in both directions.
+            //
+            // ponytail: keyed by the engine's configured region, which is the
+            // region the slot was taken in. A deployment that changes region
+            // under a live employee wants a migration, not a lookup here.
+            let freed = phone_pool::release(&mut tx, employee.id(), self.cfg.region.as_str(), now)
+                .await?
+                .is_some();
+            tracing::info!(
+                employee = %employee.id().as_uuid(), freed,
+                "pooled slot returned to the tenant's pool; the number stays"
+            );
+        }
         let stored = employee::load(&mut tx, employee.id()).await?;
         let mut current = stored.employee;
 
@@ -599,6 +780,9 @@ impl ProvisioningEngine {
         };
         match step {
             Step::Email => self.adapters.email.release(&binding).await,
+            // Only ever a number of this employee's own: `release_step`
+            // short-circuits a pooled slot before it gets here, because this
+            // call would delete a number four colleagues are still using.
             Step::Phone => self.adapters.telephony.release(&binding).await,
             Step::Browser => self.adapters.browser.release(&binding).await,
 
@@ -853,6 +1037,11 @@ impl ProvisioningEngine {
             Step::Permissions => Ok(local(employee, "permissions")),
 
             Step::Email => Ok(bind(self.adapters.email.ensure_identity(ctx).await?)),
+            // Under `NumberStrategy::Pooled` this is only reached when the pool
+            // has no free slot, i.e. as the request that grows it. In a region
+            // worth pooling the adapter answers `PendingExternal` with a bundle
+            // in human review, which is the wait; where it answers with a
+            // number, the employee has one of its own and releases it as such.
             Step::Phone => Ok(bind(
                 self.adapters
                     .telephony
@@ -1079,7 +1268,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use agentos_domain::action::Domain;
+    use agentos_domain::action::{Domain, E164};
     use agentos_domain::employee::Health;
     use agentos_domain::ids::IdempotencyKey;
     use agentos_domain::message::CanonicalMessage;
@@ -1137,10 +1326,17 @@ mod tests {
             .expect("insert tenant");
         tx.commit().await.expect("commit tenant");
 
+        colleague(db, tenant, "lena").await
+    }
+
+    /// Another active employee in an existing tenant — the one already holding
+    /// the last slot in the pool.
+    async fn colleague(db: &Db, tenant: TenantId, slug: &str) -> Employee {
+        let now = Utc::now();
         let mut employee = Employee::new(
             EmployeeId::new_v7(now),
             tenant,
-            Slug::parse("lena").expect("slug"),
+            Slug::parse(slug).expect("slug"),
             Domain::parse("example.com").expect("domain"),
             now,
         );
@@ -1174,6 +1370,61 @@ mod tests {
             whatsapp_sender: Some("wa-company-sender".to_owned()),
             ..EngineConfig::default()
         }
+    }
+
+    // -- the pool ----------------------------------------------------------
+
+    /// The region the pool tests use. France, because France is why the pool
+    /// exists: every number there costs a human-reviewed bundle.
+    const FR: &str = "FR";
+    /// The tenant's shared number.
+    const POOLED: &str = "+33755000001";
+
+    /// The same engine, told to pool French numbers instead of buying them.
+    fn pooled_cfg() -> EngineConfig {
+        EngineConfig {
+            region: Region::new(FR),
+            number_strategy: NumberStrategy::Pooled,
+            ..cfg()
+        }
+    }
+
+    /// Put a number the tenant owns into the pool. `capacity` is the whole
+    /// switch: 1 is a dedicated number under the same contract.
+    async fn add_pool_number(db: &Db, tenant: TenantId, e164: &str, capacity: i32) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        phone_pool::register(
+            &mut tx,
+            &phone_pool::NewNumber {
+                provider: "twilio".to_owned(),
+                external_id: format!("PN-pool-{}", Uuid::now_v7()),
+                e164: E164::parse(e164).expect("e164"),
+                region: FR.to_owned(),
+                state: phone_pool::NumberState::Active,
+                capacity,
+                bundle_ref: Some("BU-fr-1".to_owned()),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("register a pooled number");
+        tx.commit().await.expect("commit");
+    }
+
+    /// Seats currently taken across the tenant's whole pool. The "never two"
+    /// assertion.
+    async fn live_slots(db: &Db, employee: &Employee) -> i64 {
+        count(
+            db,
+            employee,
+            "SELECT count(*) FROM number_allocations WHERE released_at IS NULL",
+        )
+        .await
+    }
+
+    /// The slot binding this employee should be holding on `POOLED`.
+    fn expected_slot(employee: &Employee) -> String {
+        format!("{POOLED}/{}", employee.id().as_uuid())
     }
 
     /// `(state, lease_owner, provider, external_id, last_error)`.
@@ -2345,6 +2596,327 @@ mod tests {
         assert_eq!(
             reload(&db, &employee).await.lifecycle(),
             Lifecycle::Terminated
+        );
+    }
+
+    // -- pooled numbers ----------------------------------------------------
+
+    /// The point of the whole strategy: an employee gets a working phone step
+    /// and the provider is never asked for anything. Twenty employees, one
+    /// French bundle, one human review.
+    #[tokio::test]
+    async fn a_pooled_employee_takes_a_slot_and_buys_nothing() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+        add_pool_number(&db, employee.tenant_id(), POOLED, 5).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            pooled_cfg(),
+        );
+
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::Ready));
+        assert_eq!(
+            telephony.number_count(),
+            0,
+            "a pooled slot must not buy a number"
+        );
+
+        let (state, lease, provider, external, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "ready");
+        assert_eq!(lease, None, "a finished step releases its lease");
+        assert_eq!(provider.as_deref(), Some(pool_ops::PHONE_POOL));
+        assert_eq!(
+            external.as_deref(),
+            Some(expected_slot(&employee).as_str()),
+            "the slot must carry the employee id, like the WhatsApp sender does"
+        );
+        assert_eq!(live_slots(&db, &employee).await, 1);
+        assert_eq!(reload(&db, &employee).await.health(), Health::Online);
+
+        // Ensure twice: one allocation, the same binding, one slot.
+        let again = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge again");
+        assert!(again.values().all(StepReport::is_ready));
+        let (_, _, _, second, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(second, external, "the binding moved under a live employee");
+        assert_eq!(
+            live_slots(&db, &employee).await,
+            1,
+            "ensure twice must consume one slot, not two"
+        );
+        assert_eq!(telephony.number_count(), 0);
+    }
+
+    /// A full pool is the signal to buy another number, and another number is
+    /// another regulatory bundle in human review. That is a wait with something
+    /// to poll — not a failure, and not a second waiting mechanism.
+    #[tokio::test]
+    async fn a_full_pool_waits_on_a_bundle_instead_of_failing() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let lena = seed(&db).await;
+        let alex = colleague(&db, lena.tenant_id(), "alex").await;
+        // One number, one seat, two employees.
+        add_pool_number(&db, lena.tenant_id(), POOLED, 1).await;
+
+        let telephony =
+            Arc::new(MockTelephony::new(Utc::now(), "tok").with_regulated(Region::new(FR)));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            pooled_cfg(),
+        );
+
+        let reports = engine
+            .converge(lena.tenant_id(), lena.id())
+            .await
+            .expect("converge lena");
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::Ready));
+
+        let reports = engine
+            .converge(alex.tenant_id(), alex.id())
+            .await
+            .expect("converge alex");
+        let Some(StepReport::PendingExternal { poll_ref }) = reports.get(&Step::Phone) else {
+            panic!(
+                "a full pool must be a wait, got {:?}",
+                reports.get(&Step::Phone)
+            );
+        };
+        assert!(poll_ref.starts_with("BU:FR:"), "{poll_ref}");
+        assert_eq!(telephony.number_count(), 0, "nothing was bought");
+        assert_eq!(live_slots(&db, &lena).await, 1, "one seat, one holder");
+
+        // Everything else converged around it, and a second pass is still the
+        // same wait rather than a second attempt at the pool.
+        for step in Step::ALL.into_iter().filter(|s| *s != Step::Phone) {
+            assert_eq!(reports.get(&step), Some(&StepReport::Ready), "{step}");
+        }
+        let again = engine
+            .converge(alex.tenant_id(), alex.id())
+            .await
+            .expect("converge alex again");
+        assert!(matches!(
+            again.get(&Step::Phone),
+            Some(StepReport::PendingExternal { .. })
+        ));
+        assert_eq!(live_slots(&db, &lena).await, 1);
+    }
+
+    /// The regression bar. `Dedicated` is what every other test in this file
+    /// exercises, and it must not notice that a pool exists at all.
+    #[tokio::test]
+    async fn the_dedicated_strategy_ignores_the_pool_and_buys_its_own_number() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+        // A perfectly good free seat, which `Dedicated` must not take.
+        add_pool_number(&db, employee.tenant_id(), POOLED, 5).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            EngineConfig {
+                region: Region::new(FR),
+                ..cfg()
+            },
+        );
+
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::Ready));
+        assert_eq!(telephony.number_count(), 1, "a dedicated number is bought");
+
+        let (_, _, provider, _, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(provider.as_deref(), Some("twilio"));
+        assert_eq!(
+            live_slots(&db, &employee).await,
+            0,
+            "the dedicated path must not touch the pool"
+        );
+    }
+
+    /// The crash story. A slot and the binding that names it are one commit, so
+    /// the only state a crash can leave behind is a seat this employee already
+    /// holds — and the next pass lands on that same seat rather than taking a
+    /// second one.
+    #[tokio::test]
+    async fn a_slot_left_by_a_crashed_run_is_reused_never_doubled() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+        add_pool_number(&db, employee.tenant_id(), POOLED, 5).await;
+
+        // The dead worker's evidence: the seat is taken, nothing points at it.
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let seat = phone_pool::allocate_atomic(&mut tx, employee.id(), FR, Utc::now())
+            .await
+            .expect("allocate")
+            .expect("room in the pool");
+        tx.commit().await.expect("commit the orphaned seat");
+        assert!(
+            reload(&db, &employee)
+                .await
+                .resource(Step::Phone)
+                .binding()
+                .is_none()
+        );
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            pooled_cfg(),
+        );
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge after the crash");
+
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::Ready));
+        assert_eq!(
+            live_slots(&db, &employee).await,
+            1,
+            "the crashed run's seat was taken twice"
+        );
+        let (_, _, _, external, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(
+            external.as_deref(),
+            Some(format!("{}/{}", seat.e164.as_str(), employee.id().as_uuid()).as_str()),
+            "the reconciled binding must name the seat that already existed"
+        );
+        assert_eq!(telephony.number_count(), 0);
+    }
+
+    /// Termination gives the *slot* back, never the number: four colleagues are
+    /// still sending from it, and its bundle cost a human review.
+    ///
+    /// The adapter here refuses every release, so a `Released` report is proof
+    /// that nothing asked the provider to delete anything.
+    #[tokio::test]
+    async fn releasing_a_pooled_slot_frees_the_seat_and_leaves_the_number() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let lena = seed(&db).await;
+        let alex = colleague(&db, lena.tenant_id(), "alex").await;
+        add_pool_number(&db, lena.tenant_id(), POOLED, 5).await;
+
+        let telephony = Arc::new(StubbornTelephony::default());
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            pooled_cfg(),
+        );
+        for who in [&lena, &alex] {
+            engine
+                .converge(who.tenant_id(), who.id())
+                .await
+                .expect("converge");
+        }
+        assert_eq!(live_slots(&db, &lena).await, 2, "both share one number");
+        assert_eq!(telephony.number_count(), 0, "nothing was bought");
+
+        let terminated = terminate(&db, &reload(&db, &lena).await).await;
+        let reports = engine.release_all(&terminated).await.expect("release");
+
+        assert_eq!(reports.get(&Step::Phone), Some(&ReleaseReport::Released));
+        assert_eq!(
+            telephony.release_attempts(),
+            0,
+            "the provider was asked to delete a number four colleagues share"
+        );
+        // The seat is free, the number is still the tenant's, and the colleague
+        // still holds his.
+        assert_eq!(live_slots(&db, &lena).await, 1);
+        assert_eq!(
+            count(&db, &lena, "SELECT count(*) FROM phone_numbers").await,
+            1,
+            "the number left the pool with the employee"
+        );
+        let mut tx = db.tenant_tx(lena.tenant_id()).await.expect("tx");
+        assert!(
+            phone_pool::current_allocation(&mut tx, alex.id(), FR)
+                .await
+                .expect("current")
+                .is_some(),
+            "the colleague lost his seat when somebody else was terminated"
+        );
+        assert!(
+            phone_pool::current_allocation(&mut tx, lena.id(), FR)
+                .await
+                .expect("current")
+                .is_none()
+        );
+        tx.rollback().await.expect("rollback");
+        assert!(
+            reload(&db, &lena)
+                .await
+                .resource(Step::Phone)
+                .binding()
+                .is_none()
+        );
+
+        // And it is idempotent, like every other release here.
+        let again = engine
+            .release_all(&reload(&db, &lena).await)
+            .await
+            .expect("release again");
+        assert_eq!(again.get(&Step::Phone), Some(&ReleaseReport::NotBound));
+        assert_eq!(live_slots(&db, &lena).await, 1);
+    }
+
+    /// Pooling a region the tenant never bought into provisions nobody. It must
+    /// say so instead of quietly buying a dedicated number and looking healthy.
+    #[tokio::test]
+    async fn a_pooled_region_with_no_numbers_fails_loudly_rather_than_buying() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
+            pooled_cfg(),
+        );
+
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        assert_eq!(
+            reports.get(&Step::Phone),
+            Some(&StepReport::Failed { code: EMPTY_POOL })
+        );
+        assert_eq!(telephony.number_count(), 0, "an empty pool must not buy");
+
+        let (state, lease, _, _, last_error) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "failed");
+        assert_eq!(lease, None, "a finished step releases its lease");
+        assert!(
+            last_error
+                .expect("the row must say why")
+                .contains(EMPTY_POOL),
+            "the operator has to be able to see what is misconfigured"
         );
     }
 }
