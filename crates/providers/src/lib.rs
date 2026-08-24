@@ -56,6 +56,7 @@
 //! pointing at it.
 
 pub mod browser; // U18
+pub mod browser_browserbase;
 pub mod email; // U16
 pub mod email_resend; // real Resend client
 pub mod embedder; // U19

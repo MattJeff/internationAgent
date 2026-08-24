@@ -5,36 +5,96 @@ on:
     branches: [main]
   pull_request:
 
+# A second push supersedes the first; nobody reads the older run's result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  DATABASE_URL: postgres://postgres:postgres@localhost:5432/agentos
 
+# ponytail: one job, not four. Splitting fmt / clippy / test / migrations across
+# jobs pays for four container boots and four cache restores to parallelise a
+# pipeline whose slow step is a single `cargo test` anyway. Split it when the
+# wall clock says to.
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     services:
+      # Same image as docker-compose.yml, deliberately. pg18 + pgvector >= 0.8.6.
       postgres:
         image: pgvector/pgvector:pg18
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: agentos
+          POSTGRES_DB: postgres
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U postgres -d agentos"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 2s --health-timeout 3s --health-retries 30
+
+    # scripts/test.sh and the psql steps below read these; no step hardcodes a
+    # host. DATABASE_URL is deliberately NOT set here — test.sh builds one per
+    # package, and a global one would quietly configure the doctor step.
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+
     steps:
       - uses: actions/checkout@v5
-      # rust-toolchain.toml pins the version; this action honours it.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+
+      # rust-toolchain.toml is the one pin and it also lists rustfmt + clippy;
+      # the rustup proxies install all of it on first use. Nothing to restate
+      # here — a version repeated in a workflow is a version that goes stale,
+      # and a `toolchain:` input that says "stable" silently ignores the pin.
+      # These four lines are the receipt: the log shows what actually ran.
+      - name: rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          cargo --version
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version
+
       - uses: Swatinem/rust-cache@v2
+
+      # Cheapest first: fmt needs no build, clippy needs no database.
       - run: cargo fmt --all -- --check
+
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
       # One database per package, serialised inside a package. See scripts/test.sh
-      # for why a plain `cargo test --workspace` is flaky against a real Postgres.
-      - run: ./scripts/test.sh
-        env:
-          PGHOST: localhost
-          PGPORT: 5432
+      # for why a plain `cargo test --workspace` is flaky against a real Postgres,
+      # and why the script refuses to run without one.
+      - name: test suite
+        run: ./scripts/test.sh
+
+      # A migration that only applies to a database already holding the previous
+      # state is a migration that fails on the first real deploy. test.sh gets
+      # this right per package, but that is a side effect of how it builds its
+      # fixtures; this step is the assertion.
+      - name: migrations apply in order to a virgin database
+        run: |
+          psql -c 'DROP DATABASE IF EXISTS virgin' -c 'CREATE DATABASE virgin'
+          for m in migrations/*.sql; do
+            echo "==> $m"
+            psql -d virgin -q -v ON_ERROR_STOP=1 -f "$m"
+          done
+
+      # The doctor is the operator's first contract: with nothing configured it
+      # must say so and exit non-zero. A doctor that silently succeeds is worse
+      # than no doctor.
+      #
+      # `env -i` because this job exports PG* — inheriting them would be testing
+      # a configured doctor. PATH is kept because the doctor shells out to curl.
+      - name: doctor fails when nothing is configured
+        run: |
+          cargo build -p agentos-server --bin agentos-server
+          if env -i PATH="$PATH" ./target/debug/agentos-server doctor; then
+            echo "::error::doctor exited 0 with nothing configured"
+            exit 1
+          fi

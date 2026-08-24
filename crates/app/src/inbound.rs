@@ -50,15 +50,28 @@
 //! [`CanonicalMessage`] and stays that way. This module unwraps in exactly two
 //! places, both of them writes to a `text` column and neither of them a render
 //! into an instruction: `grep expose_for_parsing` here and read them.
+//!
+//! # Two ways to be addressed, one way to be routed
+//!
+//! Email routes on the local part: `lena@agents.example.com` is Lena's, and
+//! nobody else's. A **shared** phone number cannot work that way — every
+//! employee on the pool has the same `To`, so the address says nothing about
+//! who the message is for. [`resolve_phone_recipient`] is the answer, and its
+//! rule is written out there. Both strategies land through the same
+//! [`land`] and both satisfy the same contract: a dedicated number is just a
+//! pool of one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use agentos_domain::action::E164;
+use agentos_domain::employee::Step;
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
 use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
 use agentos_providers::email::{EmailProvider, InboundNotice, ParseError, Route};
+use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use async_trait::async_trait;
@@ -105,6 +118,12 @@ pub enum InboundError {
     #[error("no employee owns the recipient address")]
     UnknownRecipient,
 
+    /// The number was dialled, and nobody is on it. A misconfiguration — the
+    /// pool holds a number no employee is allocated to — so it is parked for an
+    /// operator rather than retried or guessed at.
+    #[error("no employee is allocated to the number this arrived on")]
+    Unallocated,
+
     /// The stored notice is not one this build can act on.
     #[error("stored notice is unusable: {0}")]
     BadNotice(&'static str),
@@ -116,6 +135,11 @@ pub enum InboundError {
     /// The fetched message could not be normalised.
     #[error(transparent)]
     Normalize(#[from] ParseError),
+
+    /// A verified telephony payload was missing a field the provider always
+    /// sends. Not retryable: the same bytes will be missing it next time.
+    #[error(transparent)]
+    TelephonyNormalize(#[from] telephony::ParseError),
 
     /// The database said no.
     #[error(transparent)]
@@ -142,9 +166,10 @@ impl InboundError {
         match self {
             InboundError::NotReady => "not_ready",
             InboundError::UnknownRecipient => "unknown_recipient",
+            InboundError::Unallocated => "unallocated_number",
             InboundError::BadNotice(_) => "bad_notice",
             InboundError::Provider(err) => err.code(),
-            InboundError::Normalize(_) => "unnormalizable",
+            InboundError::Normalize(_) | InboundError::TelephonyNormalize(_) => "unnormalizable",
             InboundError::Store(_) => "store",
         }
     }
@@ -322,6 +347,208 @@ async fn resolve_recipient(
         }
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Telephony: many employees, one number
+// ---------------------------------------------------------------------------
+
+/// The two numbers a telephony delivery is routed by.
+///
+/// Read off the **verified** form body by our own edge, so these are routing
+/// metadata and not [`Untrusted`]: they are compared against our own tables and
+/// never rendered. Everything the counterparty actually *wrote* stays wrapped,
+/// because it is [`TelephonyProvider::normalize`] that produces it and it wraps
+/// every field the sender chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelephonyRoute {
+    /// The number that was dialled: a pooled number, or a dedicated one.
+    pub dialled: E164,
+    /// Who dialled it.
+    pub counterparty: E164,
+    /// [`Channel::Whatsapp`] on the WhatsApp sender, [`Channel::Sms`]
+    /// otherwise. A voice webhook carries the same two numbers and no way to
+    /// tell it apart here, so that edge passes [`Channel::Voice`] to
+    /// [`resolve_phone_recipient`] itself.
+    pub channel: Channel,
+}
+
+impl TelephonyRoute {
+    /// Read the routing pair out of a verified Twilio form body.
+    ///
+    /// ponytail: two fields out of the same bytes
+    /// [`normalize`](TelephonyProvider::normalize) parses again a moment later.
+    /// Routing has to happen *before* normalising — the message cannot be built
+    /// without the employee and the thread it belongs to — and a second pass
+    /// over a kilobyte of form is cheaper than a routing struct threaded
+    /// through the provider trait.
+    pub fn read(raw_form: &[u8]) -> Result<Self, InboundError> {
+        let (mut to, mut from) = (None, None);
+        for (key, value) in url::form_urlencoded::parse(raw_form) {
+            match key.as_ref() {
+                "To" => to = Some(value.into_owned()),
+                "From" => from = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        let to = to.ok_or(telephony::ParseError { field: "To" })?;
+        let from = from.ok_or(telephony::ParseError { field: "From" })?;
+
+        // The `whatsapp:` prefix is the only thing in the payload that tells
+        // the two channels apart — same rule as `normalize_twilio_form`.
+        let channel = match from.starts_with("whatsapp:") {
+            true => Channel::Whatsapp,
+            false => Channel::Sms,
+        };
+        let number = |raw: &str, field| {
+            E164::parse(raw.trim_start_matches("whatsapp:"))
+                .map_err(|_| InboundError::BadNotice(field))
+        };
+
+        Ok(Self {
+            dialled: number(&to, "the To number is not E.164")?,
+            counterparty: number(&from, "the From number is not E.164")?,
+            channel,
+        })
+    }
+}
+
+/// Which employee an inbound call or text on `dialled` belongs to.
+///
+/// # Why this is not "the employee who owns the number"
+///
+/// A regulated French number costs a regulatory bundle with a French address
+/// and a human review, so one per employee does not scale to a hundred of them.
+/// The tenant owns a handful of numbers instead and employees are *allocated*
+/// onto them — the same shape [`Step::Whatsapp`] already uses for one shared
+/// company sender, where the binding's external id is `{address}/{employee}`.
+/// This reads exactly that: the address is `split_part(external_id, '/', 1)`,
+/// which is the whole binding for a dedicated number and the pool number for a
+/// shared one. Both route through this function; a dedicated number is a pool
+/// of one.
+///
+/// # The rule
+///
+/// One `ORDER BY` over the employees allocated to `dialled`, in three tiers:
+///
+/// 1. **Affinity wins.** An employee who already has a thread with this
+///    counterparty keeps it. This is not politeness: in wave 8 that employee
+///    holds the trust links, the learned expectations and the beliefs about
+///    *this* counterparty, and the one next to them holds none of it. Routing
+///    the supplier elsewhere silently throws the relationship away. Threads on
+///    every channel the address serves count, so a supplier who has been
+///    texting Lena and then *calls* still reaches Lena.
+/// 2. **Arbitration: the oldest thread.** Two employees who have both talked to
+///    this counterparty on this number is a genuine ambiguity. The earlier
+///    relationship is the deeper one, so `created_at` decides it, with the
+///    conversation id breaking the tie — never row order.
+/// 3. **First contact: the oldest allocation.** A number nobody has spoken to
+///    yet has no relationship to preserve, so it goes to the front desk: the
+///    employee allocated to this number longest, tie broken by employee id.
+///    ponytail: deterministic and boring, and it does mean one employee fields
+///    every cold call on a number. Spread them by hashing the counterparty when
+///    that load is a real complaint rather than an imagined one.
+///
+/// Suspended and terminated employees are not routed to, and neither is an
+/// allocation that is not `ready` — a released number is not a number.
+///
+/// No row at all means nobody is allocated to a number we were nonetheless
+/// dialled on: [`InboundError::Unallocated`], which is a misconfiguration for
+/// an operator and never a guess.
+pub async fn resolve_phone_recipient(
+    tx: &mut TenantTx<'_>,
+    dialled: &E164,
+    counterparty: &E164,
+    channel: Channel,
+) -> Result<EmployeeId, InboundError> {
+    let Some((step, threads)) = telephony_scope(channel) else {
+        return Err(InboundError::BadNotice("not a telephony channel"));
+    };
+
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "SELECT r.employee_id \
+           FROM employee_resources r \
+           JOIN employees e ON e.id = r.employee_id AND e.lifecycle = 'active' \
+           LEFT JOIN conversations c \
+                  ON c.employee_id = r.employee_id \
+                 AND c.channel = ANY($3::text[]) \
+                 AND c.external_ref = $2 \
+          WHERE r.step = $4 \
+            AND r.state = 'ready' \
+            AND r.external_id IS NOT NULL \
+            AND split_part(r.external_id, '/', 1) = $1 \
+          ORDER BY (c.id IS NULL), c.created_at, c.id, r.created_at, r.employee_id \
+          LIMIT 1",
+    )
+    .bind(dialled.as_str())
+    .bind(counterparty.as_str())
+    .bind(threads)
+    .bind(step.as_str())
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    found
+        .map(EmployeeId::from_uuid)
+        .ok_or(InboundError::Unallocated)
+}
+
+/// The step that owns an address on this channel, and the channels whose
+/// threads count as a relationship with it.
+const fn telephony_scope(channel: Channel) -> Option<(Step, &'static [&'static str])> {
+    match channel {
+        // One number carries both, and a supplier who texts and then calls is
+        // one relationship.
+        Channel::Sms | Channel::Voice => Some((Step::Phone, &["sms", "voice"])),
+        Channel::Whatsapp => Some((Step::Whatsapp, &["whatsapp"])),
+        Channel::Email | Channel::A2a | Channel::Web => None,
+    }
+}
+
+/// Land one **verified** inbound SMS or WhatsApp message.
+///
+/// One phase, unlike email: Twilio's webhook carries the body, so there is
+/// nothing to fetch and nothing to race the provider for. Call it from the
+/// handler that drains the stored delivery, inside that handler's transaction —
+/// the raw bytes are already durable in `outbox_events` by then, which is what
+/// makes every error below a park rather than a lost message.
+///
+/// Routing, the thread and the message commit **together**. The thread *is* the
+/// affinity [`resolve_phone_recipient`] reads next time, so writing it in a
+/// second transaction would lose the relationship exactly when the first
+/// message from a new supplier is the one that established it.
+pub async fn land_inbound_text(
+    tx: &mut TenantTx<'_>,
+    telephony: &dyn TelephonyProvider,
+    raw_form: &[u8],
+    now: DateTime<Utc>,
+) -> Result<Landed, InboundError> {
+    let route = TelephonyRoute::read(raw_form)?;
+    let employee_id =
+        resolve_phone_recipient(tx, &route.dialled, &route.counterparty, route.channel).await?;
+
+    // Creates the thread on first contact, finds it on every message after —
+    // which is the affinity, recorded, in this transaction.
+    let conversation_id = conversation_for(
+        tx,
+        employee_id,
+        route.channel,
+        route.counterparty.as_str(),
+        None,
+        now,
+    )
+    .await?;
+
+    let message = telephony.normalize(
+        &InboundCtx {
+            tenant_id: tx.tenant_id(),
+            employee_id,
+            conversation_id,
+            received_at: now,
+        },
+        raw_form,
+    )?;
+    land(tx, &message, now).await
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +968,7 @@ const fn trust_str(label: TrustLabel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use agentos_providers::email::{MockEmailProvider, RawAttachment, RawInbound};
+    use agentos_providers::telephony::MockTelephony;
     use chrono::Duration;
 
     use super::*;
@@ -784,6 +1012,137 @@ mod tests {
         tx.commit().await.expect("commit seed");
 
         (tenant, employee)
+    }
+
+    /// A second active employee in the same tenant.
+    async fn hire(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+        let employee = EmployeeId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit hire");
+        employee
+    }
+
+    /// Put `employee` on `number`, the way N1's `Step::Phone` does.
+    ///
+    /// `pooled` picks the binding shape: `{number}/{employee}` for a shared
+    /// number — the `Step::Whatsapp` trick, so two employees on one number do
+    /// not collide on the `(provider, external_id)` unique index — and the bare
+    /// number for a dedicated purchase.
+    async fn allocate(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        number: &E164,
+        pooled: bool,
+        since: DateTime<Utc>,
+    ) {
+        let external_id = match pooled {
+            true => format!("{}/{}", number.as_str(), employee.as_uuid()),
+            false => number.as_str().to_owned(),
+        };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+                 (employee_id, step, tenant_id, state, provider, external_id, created_at) \
+             VALUES ($1, 'phone', $2, 'ready', 'twilio', $3, $4)",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(&external_id)
+        .bind(since)
+        .execute(&mut *tx)
+        .await
+        .expect("allocate");
+        tx.commit().await.expect("commit allocation");
+    }
+
+    /// A number no other run has used: `(provider, external_id)` is unique
+    /// across the whole table, and these tests leave their rows behind.
+    fn number(tag: u32) -> E164 {
+        let nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .unsigned_abs();
+        E164::parse(&format!("+33{:09}{:03}", nanos % 1_000_000_000, tag % 1000))
+            .expect("a valid E.164")
+    }
+
+    /// A Twilio messaging webhook body, as the edge verified it.
+    fn form(sid: &str, from: &str, to: &E164, body: &str) -> Vec<u8> {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("MessageSid", sid)
+            .append_pair("From", from)
+            .append_pair("To", to.as_str())
+            .append_pair("Body", body)
+            .finish()
+            .into_bytes()
+    }
+
+    /// Deliver one text, committing only what landed — the outbox handler that
+    /// calls this in production rolls its transaction back on an error.
+    async fn text(
+        db: &Db,
+        tenant: TenantId,
+        telephony: &MockTelephony,
+        raw: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<Landed, InboundError> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let landed = land_inbound_text(&mut tx, telephony, raw, now).await;
+        match landed.is_ok() {
+            true => tx.commit().await.expect("commit text"),
+            false => tx.rollback().await.expect("rollback text"),
+        }
+        landed
+    }
+
+    /// The employee a landed message was filed against.
+    async fn owner_of(db: &Db, tenant: TenantId, message_id: Uuid) -> EmployeeId {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let id: Uuid = sqlx::query_scalar("SELECT employee_id FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read owner");
+        tx.commit().await.expect("commit read");
+        EmployeeId::from_uuid(id)
+    }
+
+    /// A thread this employee already has with `contact`, as an outbound-first
+    /// relationship would have left behind.
+    async fn thread(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        contact: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO conversations \
+                 (id, tenant_id, employee_id, channel, external_ref, trust_label, created_at, \
+                  updated_at) \
+             VALUES ($1, $2, $3, 'sms', $4, 'untrusted', $5, $5)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(employee.as_uuid())
+        .bind(contact)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await
+        .expect("insert thread");
+        tx.commit().await.expect("commit thread");
     }
 
     fn notice(id: &str, now: DateTime<Utc>) -> InboundNotice {
@@ -1205,5 +1564,264 @@ mod tests {
             .await,
             0
         );
+    }
+
+    // -- the shared number --------------------------------------------------
+
+    /// The routing pair is read off the payload, not guessed, and a body that
+    /// is not a telephony webhook is refused rather than routed somewhere.
+    #[test]
+    fn a_route_is_two_numbers_and_a_channel() {
+        let pool = number(0);
+        let route = TelephonyRoute::read(&form("SM0", "+33612345678", &pool, "hi")).expect("route");
+        assert_eq!(route.dialled, pool);
+        assert_eq!(route.counterparty.as_str(), "+33612345678");
+        assert_eq!(route.channel, Channel::Sms);
+
+        // The `whatsapp:` prefix is the channel, on both ends.
+        let wa = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("MessageSid", "SM0")
+            .append_pair("From", "whatsapp:+33612345678")
+            .append_pair("To", &format!("whatsapp:{}", pool.as_str()))
+            .finish()
+            .into_bytes();
+        let route = TelephonyRoute::read(&wa).expect("route");
+        assert_eq!(route.channel, Channel::Whatsapp);
+        assert_eq!(route.dialled, pool);
+
+        assert!(matches!(
+            TelephonyRoute::read(b"MessageSid=SM0"),
+            Err(InboundError::TelephonyNormalize(_))
+        ));
+        assert!(matches!(
+            TelephonyRoute::read(b"From=nonsense&To=%2B33755500001"),
+            Err(InboundError::BadNotice(_))
+        ));
+    }
+
+    /// **The test that protects the relationship.** A pooled number carries two
+    /// employees; who gets a message is decided by who the counterparty already
+    /// knows, and a first contact is decided by a written-down rule rather than
+    /// by whichever row the planner returned first.
+    #[tokio::test]
+    async fn a_pooled_number_routes_by_relationship_and_first_contact_by_rule() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let alex = hire(&db, tenant, "alex").await;
+        let now = Utc::now();
+        let pool = number(1);
+        // Lena is on the number first, so Lena is the front desk.
+        allocate(&db, tenant, lena, &pool, true, now - Duration::days(2)).await;
+        allocate(&db, tenant, alex, &pool, true, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        // First contact: nobody knows this supplier, so the rule decides.
+        let first = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM1", "+33612345678", &pool, "Bonjour, PO-4471?"),
+            now,
+        )
+        .await
+        .expect("first contact lands");
+        assert_eq!(owner_of(&db, tenant, first.message_id).await, lena);
+
+        // Deterministic, not row order: a *different* unknown supplier gets the
+        // same answer.
+        let stranger = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM2", "+33698765432", &pool, "devis?"),
+            now,
+        )
+        .await
+        .expect("second stranger lands");
+        assert_eq!(owner_of(&db, tenant, stranger.message_id).await, lena);
+
+        // The second message from the first supplier must reach the SAME
+        // employee — the affinity was written in the same transaction as the
+        // message, so it is there for this delivery.
+        let again = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM3", "+33612345678", &pool, "et la facture?"),
+            now + Duration::minutes(5),
+        )
+        .await
+        .expect("the follow-up lands");
+        assert_eq!(owner_of(&db, tenant, again.message_id).await, lena);
+        assert_eq!(
+            again.conversation_id, first.conversation_id,
+            "one thread per counterparty, not one per message"
+        );
+
+        // Affinity beats the front desk: this supplier has been dealing with
+        // Alex, and Alex is the one holding the psyche links for them.
+        thread(&db, tenant, alex, "+33777000111", now - Duration::days(3)).await;
+        let known = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM4", "+33777000111", &pool, "rappel"),
+            now,
+        )
+        .await
+        .expect("lands");
+        assert_eq!(
+            owner_of(&db, tenant, known.message_id).await,
+            alex,
+            "a supplier who knows Alex must not be handed to Lena"
+        );
+
+        // Arbitration: both employees have talked to this supplier on this
+        // number. The older thread wins, every time, never row order.
+        thread(&db, tenant, lena, "+33777000111", now - Duration::days(1)).await;
+        for sid in ["SM5", "SM6"] {
+            let landed = text(
+                &db,
+                tenant,
+                &telephony,
+                &form(sid, "+33777000111", &pool, "et encore"),
+                now,
+            )
+            .await
+            .expect("lands");
+            assert_eq!(owner_of(&db, tenant, landed.message_id).await, alex);
+        }
+
+        assert_eq!(messages(&db, tenant).await, 6);
+        assert_eq!(turns(&db, tenant).await, 6);
+    }
+
+    /// Pooling is a strategy, not a replacement: a dedicated number — worth
+    /// buying where no regulatory bundle is needed — routes through exactly the
+    /// same function. And nobody routes to an employee who has left.
+    #[tokio::test]
+    async fn a_dedicated_number_routes_to_its_owner_until_they_leave() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let mine = number(2);
+        allocate(&db, tenant, lena, &mine, false, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        let landed = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM7", "+15551230000", &mine, "hi"),
+            now,
+        )
+        .await
+        .expect("lands");
+        assert_eq!(owner_of(&db, tenant, landed.message_id).await, lena);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("UPDATE employees SET lifecycle = 'terminated' WHERE id = $1")
+            .bind(lena.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("terminate");
+        tx.commit().await.expect("commit");
+
+        let err = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM8", "+15551230000", &mine, "still there?"),
+            now,
+        )
+        .await
+        .expect_err("a terminated employee is not a recipient");
+        assert_eq!(err.code(), "unallocated_number");
+        assert_eq!(messages(&db, tenant).await, 1);
+    }
+
+    /// A number in the pool that nobody is allocated to is a misconfiguration.
+    /// It is parked with a reason an operator can act on — the raw delivery is
+    /// already durable in `outbox_events`, so nothing is lost and nobody is
+    /// guessed at.
+    #[tokio::test]
+    async fn a_text_to_a_number_with_no_allocation_is_parked_not_guessed() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let telephony = MockTelephony::new(now, "tok");
+
+        let err = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM9", "+33612345678", &number(3), "anyone?"),
+            now,
+        )
+        .await
+        .expect_err("nobody is on that number");
+
+        assert_eq!(err.code(), "unallocated_number");
+        assert!(!err.is_retryable(), "retrying will not allocate anybody");
+        assert_eq!(
+            err.to_string(),
+            "no employee is allocated to the number this arrived on",
+            "the reason is authored text an operator can act on"
+        );
+        assert_eq!(messages(&db, tenant).await, 0);
+        assert_eq!(turns(&db, tenant).await, 0);
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM conversations").await,
+            0,
+            "and no half-created thread left behind"
+        );
+    }
+
+    /// Twilio redelivers too. The dedupe key is the employee's, and routing is
+    /// deterministic, so three deliveries agree on the employee and then
+    /// collapse onto one message and one turn.
+    #[tokio::test]
+    async fn three_deliveries_of_one_text_produce_one_message_and_one_turn() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let pool = number(4);
+        allocate(&db, tenant, lena, &pool, true, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+        let raw = form("SM10", "+33612345678", &pool, INJECTION);
+
+        let first = text(&db, tenant, &telephony, &raw, now)
+            .await
+            .expect("lands");
+        assert!(!first.duplicate);
+
+        for attempt in 2..=3 {
+            let again = text(&db, tenant, &telephony, &raw, now)
+                .await
+                .unwrap_or_else(|e| panic!("delivery {attempt}: {e}"));
+            assert!(again.duplicate, "delivery {attempt} must be a duplicate");
+            assert_eq!(again.message_id, first.message_id);
+            assert_eq!(again.turn_event_id, first.turn_event_id);
+        }
+
+        assert_eq!(messages(&db, tenant).await, 1);
+        assert_eq!(turns(&db, tenant).await, 1);
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM conversations").await,
+            1
+        );
+
+        // What the supplier wrote went into a text column and nowhere near an
+        // instruction, and it comes back out wrapped.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (body, label): (String, String) =
+            sqlx::query_as("SELECT body, trust_label FROM messages WHERE id = $1")
+                .bind(first.message_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read back");
+        tx.commit().await.expect("commit read");
+        assert_eq!(body, INJECTION);
+        assert_eq!(label, "untrusted");
     }
 }

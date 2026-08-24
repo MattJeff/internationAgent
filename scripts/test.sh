@@ -7,7 +7,19 @@
 # is exactly its job — so two packages sharing one database see each other's
 # fixtures and fail in ways that have nothing to do with the code. One database
 # per package, serialised within a package, and the interference is gone.
+#
+# Why the two guards below: ~34 tests in this workspace open with
+#
+#     let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: …"); return };
+#
+# so a run with no database is not red, it is *green and empty* — the one test
+# failure mode nobody notices. So: refuse to start without a reachable Postgres,
+# and refuse to finish if any test skipped itself anyway. `--nocapture` is what
+# makes the second guard possible at all; libtest throws away the output of
+# passing tests, and a skipped test passes.
 set -euo pipefail
+
+cd "$(dirname "$0")/.."
 
 HOST=${PGHOST:-localhost}
 PORT=${PGPORT:-5442}
@@ -17,13 +29,48 @@ PACKAGES=(agentos-domain agentos-providers agentos-store agentos-app agentos-ser
 
 psql_admin() { PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -q "$@"; }
 
+die() { echo >&2; echo "FATAL: $*" >&2; exit 1; }
+
+# --- guard 1: a database has to be there before anything is worth running ----
+command -v psql >/dev/null 2>&1 ||
+  die "psql is not on PATH. macOS: brew install libpq && brew link --force libpq"
+
+if ! psql_admin -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1; then
+  echo >&2
+  echo "FATAL: no PostgreSQL answering at $HOST:$PORT as user '$USER'." >&2
+  echo >&2
+  echo "  Every integration test in this workspace skips itself when it cannot" >&2
+  echo "  reach a database, so continuing would print a green run of nothing." >&2
+  echo >&2
+  echo "  Start one:  docker compose up -d       (publishes 5442, see docker-compose.yml)" >&2
+  echo "  Point here: PGHOST=… PGPORT=… PGUSER=… PGPASSWORD=… scripts/test.sh" >&2
+  echo >&2
+  PGPASSWORD="$PASS" pg_isready -h "$HOST" -p "$PORT" -U "$USER" >&2 || true
+  exit 1
+fi
+
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+
 for pkg in "${PACKAGES[@]}"; do
   db="ci_${pkg//-/}"
   echo "==> $pkg  (database $db)"
-  psql_admin -c "DROP DATABASE IF EXISTS $db" -c "CREATE DATABASE $db"
+  psql_admin -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $db" -c "CREATE DATABASE $db"
   for m in migrations/*.sql; do
     PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d "$db" -q -v ON_ERROR_STOP=1 -f "$m"
   done
   DATABASE_URL="postgres://$USER:$PASS@$HOST:$PORT/$db" \
-    cargo test -p "$pkg" -- --test-threads=1
+    cargo test -p "$pkg" -- --test-threads=1 --nocapture 2>&1 | tee "$log"
+
+  # --- guard 2: "ok" is only ok if nothing opted out ------------------------
+  # Unanchored: libtest prints the skip on the same line as the test name,
+  # `test foo::bar ... SKIP: DATABASE_URL is unset; …`.
+  if grep -q 'SKIP: ' "$log"; then
+    echo >&2
+    grep -o 'SKIP: .*' "$log" | sort -u >&2
+    die "$pkg reported success but skipped the tests above. \
+DATABASE_URL was set and Postgres was reachable, so this is a new skip \
+condition — remove it or teach this script to satisfy it. A suite that \
+silently skips its integration tests and prints 'ok' is worse than a red one."
+  fi
 done

@@ -1,0 +1,1115 @@
+//! Pooled phone numbers: the slot an employee occupies, giving it back, and
+//! the two questions an operator asks about the pool.
+//!
+//! # Why a pool
+//!
+//! `Step::Phone` buys one number per employee. In France that is one regulated
+//! bundle per employee — a French address and a proof of address under three
+//! months, reviewed by a human — so onboarding a hundred employees means a
+//! hundred human reviews. That cost is the same at Twilio, at Telnyx and
+//! anywhere else, because it is the regulator's cost and not the vendor's. A
+//! tenant that owns five numbers and routes a hundred employees over them pays
+//! it five times.
+//!
+//! So a pooled number is **owned by the tenant**, and an employee is
+//! *allocated* onto it. Both models stay: a US number needs no bundle and a
+//! dedicated identity is better there. Pooling is a strategy, not a
+//! replacement, and both satisfy the same contract — a `phone` resource that is
+//! `Ready` with a binding, released idempotently on termination.
+//!
+//! # The pattern is `Step::Whatsapp`, generalised
+//!
+//! One verified company WhatsApp sender already carries many employees
+//! (`provisioning.rs`, `WHATSAPP_ROUTING`), and its routing address carries the
+//! employee id so that two employees on one sender cannot collide on
+//! `employee_resources`' unique `(provider, external_id)` index. A pooled slot
+//! is spelled the same way, for the same reason, and gains a second one:
+//!
+//! ```text
+//! provider    = "phone-pool"
+//! external_id = "+33757590001/018f2c…-employee-uuid"
+//! ```
+//!
+//! **That encoding is what makes releasing a slot safe.** `release_step` hands
+//! `external_id` straight to `TelephonyProvider::release`, which is
+//! `DELETE IncomingPhoneNumbers/{sid}` — and the one thing this unit must never
+//! do is delete a number four colleagues are still working on. A slot's
+//! external id is not a sid and can never name one, so the delete cannot
+//! resolve; and [`release_slot`], the path a termination should take, does not
+//! reach a provider at all. The number is the tenant's property, and no
+//! employee leaving is an instruction to give it back.
+//!
+//! # Where the pool itself is written down
+//!
+//! In configuration, next to the WhatsApp sender it is modelled on
+//! ([`crate::provisioning::EngineConfig::whatsapp_sender`]) — see [`Pool`].
+//!
+//! # Inbound routing, and why affinity is correctness
+//!
+//! A supplier texts the shared number. Which employee gets it? The one that
+//! supplier has been talking to, always: since wave 8 an employee holds trust
+//! links, learned expectations and beliefs with provenance about *that*
+//! counterparty ([`agentos_domain::psyche`]), and a colleague holds none of
+//! them. Routing the supplier elsewhere silently throws the relationship away.
+//!
+//! The affinity is not a new table. It is the `conversations` row that already
+//! records `(employee, channel, counterparty)` and is already maintained by
+//! [`crate::inbound::conversation_for`]. [`route_inbound`] reads it under two
+//! rules, both deterministic and neither a function of row order:
+//!
+//! * **Oldest conversation wins.** Two employees genuinely talking to one
+//!   supplier on one number is an ambiguity, and the tie-break is the employee
+//!   who has held the relationship longest — the one with the most psyche
+//!   behind it. Ties on the timestamp break on the conversation id, which is a
+//!   v7 uuid, so the order is total.
+//! * **First contact goes to the emptiest desk**, tie-broken by employee id.
+//!   An unknown number has no relationship to preserve, so the rule is load,
+//!   not luck: `ORDER BY count(*), employee_id` over the slot holders on that
+//!   number. Lowest-id-wins alone would pile every new supplier onto one
+//!   employee.
+//!
+//! ponytail: least-loaded is counted from `conversations` on every call rather
+//! than kept as a cursor. A pool is five to ten numbers and a tenant is a
+//! hundred employees; when that count shows up in a profile, the upgrade is a
+//! `last_assigned_at` column and `ORDER BY` it.
+
+use std::collections::BTreeMap;
+
+use agentos_domain::action::E164;
+use agentos_domain::employee::{Employee, ProviderBinding, ResourceState, Step};
+use agentos_domain::ids::{EmployeeId, TenantId};
+use agentos_domain::message::Channel;
+use agentos_store::db::{StoreError, TenantTx};
+use agentos_store::employee as employee_store;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use uuid::Uuid;
+
+// The server crate deliberately cannot name `agentos-providers`, and a pooled
+// number has a region for the same reason a bought one does. Re-exported here
+// rather than restated, so there is one `Region` in the workspace.
+pub use agentos_providers::telephony::Region;
+
+/// Provider name on a pooled slot binding.
+///
+/// Deliberately not [`agentos_providers::telephony::PROVIDER`]: a slot is not a
+/// resource at Twilio, it is a routing fact about a number that already exists.
+/// Anything that treats this string as a sid — a release, a reconcile, a
+/// billing export — finds a value that cannot be one.
+pub const PHONE_POOL: &str = "phone-pool";
+
+/// Separates the number from the employee id inside a slot's external id.
+const SLOT_SEP: char = '/';
+
+/// The two channels that ride a phone number. `voice` has no
+/// [`agentos_domain::message::CanonicalMessage`] yet, so it has no conversation
+/// row to carry an affinity.
+const PHONE_CHANNELS: [&str; 2] = [Channel::Sms.as_str(), Channel::Whatsapp.as_str()];
+
+// ---------------------------------------------------------------------------
+// The slot binding
+// ---------------------------------------------------------------------------
+
+/// The binding an allocated employee holds for its pooled number.
+///
+/// `"+33757590001/018f…"`. The employee id is in there so that ten employees on
+/// one number are ten distinct rows under
+/// `employee_resources_provider_external_id_key`, and so that no slot's
+/// external id can ever be mistaken for the number's own provider id.
+pub fn slot_binding(number: &E164, employee_id: EmployeeId) -> ProviderBinding {
+    ProviderBinding::new(
+        PHONE_POOL,
+        format!("{}{SLOT_SEP}{}", number.as_str(), employee_id.as_uuid()),
+    )
+}
+
+/// Is this `phone` binding a pooled slot, or a number of this employee's own?
+pub fn is_pooled(binding: &ProviderBinding) -> bool {
+    binding.provider() == PHONE_POOL
+}
+
+/// The number half of a slot's external id, or `None` if it is not one.
+pub fn slot_number(binding: &ProviderBinding) -> Option<E164> {
+    if !is_pooled(binding) {
+        return None;
+    }
+    let (number, _) = binding.external_id().split_once(SLOT_SEP)?;
+    E164::parse(number).ok()
+}
+
+// ---------------------------------------------------------------------------
+// The pool
+// ---------------------------------------------------------------------------
+
+/// Whether a number needed a regulatory bundle, and where that bundle got to.
+///
+/// The state an operator is actually asking about when they open the pool page:
+/// a number sitting in [`Regulatory::Pending`] is a number nobody can be
+/// allocated to yet, and the reason a French rollout is stuck.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "regulatory", rename_all = "snake_case")]
+pub enum Regulatory {
+    /// The region sells numbers with no bundle at all — US, CA.
+    NotRequired,
+    /// A bundle was approved and this number rests on it. One bundle serves
+    /// every number in the pool, which is the entire point of the pool.
+    Approved {
+        /// The provider's bundle id, for the operator to look up.
+        bundle: String,
+    },
+    /// Filed and waiting on a human at the regulator. No number is buyable in
+    /// this region until it clears, and none should be advertised as usable.
+    Pending {
+        /// The provider's bundle id, for the operator to chase.
+        bundle: String,
+    },
+}
+
+/// One number the tenant owns and routes employees over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolNumber {
+    number: E164,
+    region: Region,
+    regulatory: Regulatory,
+    capacity: u32,
+}
+
+impl PoolNumber {
+    /// Declare a number. `region` is an ISO 3166-1 alpha-2 country.
+    ///
+    /// `capacity` is a real operational limit, not a formality: a shared number
+    /// carries a shared rate limit and a shared reputation at the carrier, and
+    /// an operator who puts sixty employees on one DID discovers both at once.
+    pub fn new(number: E164, region: &str, capacity: u32) -> Self {
+        Self {
+            number,
+            region: Region::new(region),
+            regulatory: Regulatory::NotRequired,
+            capacity,
+        }
+    }
+
+    /// Record the bundle this number rests on.
+    #[must_use]
+    pub fn with_regulatory(mut self, regulatory: Regulatory) -> Self {
+        self.regulatory = regulatory;
+        self
+    }
+
+    /// The number itself.
+    pub const fn number(&self) -> &E164 {
+        &self.number
+    }
+
+    /// The country it was bought in, e.g. `FR`.
+    pub fn region_str(&self) -> &str {
+        self.region.as_str()
+    }
+
+    /// Its regulatory standing.
+    pub const fn regulatory(&self) -> &Regulatory {
+        &self.regulatory
+    }
+
+    /// How many employees may share it.
+    pub const fn capacity(&self) -> u32 {
+        self.capacity
+    }
+}
+
+/// Every tenant's pool.
+///
+/// ponytail: **configuration, not a table.** A tenant owns five to ten numbers
+/// and changes that a few times a year, with a regulatory bundle in hand — the
+/// same shape of fact as the company's verified WhatsApp sender, which is
+/// already an [`crate::provisioning::EngineConfig`] field. A `pool_numbers`
+/// table would need a migration, a CRUD surface nobody asked for, and a
+/// reconciliation job to stop it drifting from what the provider account
+/// actually holds. It also gets the important property for free: nothing in
+/// this module can delete a number, because nothing here writes the list.
+///
+/// The day an operator needs to add a number without a deploy, this becomes a
+/// load in the route and every signature below is unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct Pool(BTreeMap<TenantId, Vec<PoolNumber>>);
+
+impl Pool {
+    /// An empty pool: every tenant on dedicated numbers.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one number to one tenant's pool.
+    #[must_use]
+    pub fn with_number(mut self, tenant_id: TenantId, number: PoolNumber) -> Self {
+        self.0.entry(tenant_id).or_default().push(number);
+        self
+    }
+
+    /// This tenant's numbers. Empty for a tenant that pools nothing.
+    pub fn numbers(&self, tenant_id: TenantId) -> &[PoolNumber] {
+        self.0.get(&tenant_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The pooled number spelled `number`, if this tenant has it.
+    ///
+    /// Tenant-scoped on purpose: the id in `/v1/pool/numbers/{id}` comes off the
+    /// path, and a lookup that ignored the tenant would let one tenant name
+    /// another's number.
+    pub fn find(&self, tenant_id: TenantId, number: &E164) -> Option<&PoolNumber> {
+        self.numbers(tenant_id)
+            .iter()
+            .find(|pooled| pooled.number == *number)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Why a pool operation did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    /// The database said no.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    /// The employee named does not hold a slot on that number, so routing a
+    /// counterparty to it would route to a number the employee cannot send
+    /// from. Refused rather than allocated-on-the-fly: allocation is
+    /// provisioning's job and it costs a `Ready` resource row.
+    #[error("employee is not allocated to that pooled number")]
+    NotAllocated,
+
+    /// Nothing currently reaches that counterparty on that number, so there is
+    /// no affinity to move. See [`reassign`] on why one is not invented.
+    #[error("no affinity for that counterparty on that number")]
+    NoAffinity,
+}
+
+// ---------------------------------------------------------------------------
+// Releasing a slot
+// ---------------------------------------------------------------------------
+
+/// What giving a slot back came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotRelease {
+    /// The slot is free. The number is untouched and still the tenant's.
+    Freed {
+        /// The number the employee was routed over, for the audit line.
+        number: E164,
+    },
+    /// Nothing was allocated, or this ran twice. Idempotent, like every other
+    /// release in this system.
+    AlreadyFree,
+    /// The employee holds a number of its own, not a pooled slot. The caller
+    /// must use `ProvisioningEngine::release_step`, which gives the number back
+    /// to the provider — because for a dedicated number, that is correct.
+    Dedicated,
+}
+
+/// Free one employee's pooled slot. **Never calls the provider.**
+///
+/// # Do not add a provider call here
+///
+/// A pooled number belongs to the tenant and four colleagues are still sending
+/// from it. `TelephonyProvider::release` is `DELETE IncomingPhoneNumbers/{sid}`
+/// — it does not "release our share", there is no share, it takes the number
+/// off the account. Doing that when one employee is terminated silently cuts
+/// off every other employee on it and loses a French number whose bundle took a
+/// human review to obtain. There is nothing to give back on termination:
+/// clearing the binding *is* the release, exactly as it is for
+/// `Step::Whatsapp`, whose company sender is shared the same way.
+///
+/// The write order that matters elsewhere — ask the provider, then forget the
+/// id — has nothing to order here, which is why this is one transaction and has
+/// no lease.
+///
+/// # Affinities are kept
+///
+/// This does not touch the terminated employee's `conversations`. Dropping them
+/// would delete the record of who has been talking to whom, which is the input
+/// to every handover decision an operator makes afterwards; keeping them costs
+/// nothing, because [`route_inbound`] only ever routes to an `active` employee,
+/// so a terminated employee's suppliers stop reaching it the moment the
+/// lifecycle moves. They surface in [`affinities`] as un-routable, which is the
+/// prompt to hand them over deliberately with [`reassign`] — and a deliberate
+/// handover is the only kind that lets somebody notice that Lena's three years
+/// of trust links about that supplier do not travel with the routing.
+pub async fn release_slot(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<SlotRelease, PoolError> {
+    let stored = employee_store::load(tx, employee_id).await?;
+    let mut employee = stored.employee;
+
+    let Some(binding) = employee.resource(Step::Phone).binding().cloned() else {
+        return Ok(SlotRelease::AlreadyFree);
+    };
+    if !is_pooled(&binding) {
+        return Ok(SlotRelease::Dedicated);
+    }
+    let number = slot_number(&binding).ok_or_else(|| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("pooled slot {:?} has no number", binding.external_id()).into(),
+        ))
+    })?;
+
+    // `Employee::release` is the only thing that clears a binding. No provider
+    // call precedes it here, and none should ever be added — see above.
+    employee.release(Step::Phone, now);
+    disable(&mut employee, now);
+    employee_store::update(tx, &employee, stored.version).await?;
+
+    Ok(SlotRelease::Freed { number })
+}
+
+/// `Disabled` is the domain's word for "deliberately off for this employee",
+/// which is what a freed slot is. A refusal is logged rather than propagated:
+/// the binding is already gone, and failing the release now would leave the
+/// caller retrying something that has already happened.
+fn disable(employee: &mut Employee, now: DateTime<Utc>) {
+    if let Err(err) = employee.set_resource(Step::Phone, ResourceState::Disabled, now) {
+        tracing::warn!(error = %err, "pooled slot freed, but the row could not be disabled");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Occupancy
+// ---------------------------------------------------------------------------
+
+/// One employee allocated to a pooled number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Occupant {
+    /// The employee holding the slot.
+    pub employee_id: Uuid,
+    /// The handle an operator recognises.
+    pub slug: String,
+    /// `active`, `suspended`, `terminated`. A slot held by a non-active
+    /// employee is capacity that is spent but not working.
+    pub lifecycle: String,
+}
+
+/// Who is on each pooled number, keyed by the number.
+///
+/// One query for the whole tenant: a pool is a handful of numbers and grouping
+/// in memory beats a round trip per number. Numbers with nobody on them do not
+/// appear — they are in the [`Pool`] with an empty entry, which is exactly how
+/// the endpoint can show a number that has lost its last employee and is still
+/// the tenant's.
+pub async fn occupancy(
+    tx: &mut TenantTx<'_>,
+) -> Result<BTreeMap<String, Vec<Occupant>>, StoreError> {
+    // No `WHERE tenant_id`: RLS adds it, and a hand-written copy is a second
+    // place for it to be forgotten.
+    let rows: Vec<(String, Uuid, String, String)> = sqlx::query_as(
+        "SELECT split_part(r.external_id, $2, 1) AS number, r.employee_id, e.slug, e.lifecycle \
+           FROM employee_resources r \
+           JOIN employees e ON e.id = r.employee_id \
+          WHERE r.step = 'phone' AND r.provider = $1 AND r.external_id IS NOT NULL \
+          ORDER BY number, e.slug",
+    )
+    .bind(PHONE_POOL)
+    .bind(SLOT_SEP.to_string())
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    let mut by_number: BTreeMap<String, Vec<Occupant>> = BTreeMap::new();
+    for (number, employee_id, slug, lifecycle) in rows {
+        by_number.entry(number).or_default().push(Occupant {
+            employee_id,
+            slug,
+            lifecycle,
+        });
+    }
+    Ok(by_number)
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+/// Who a counterparty currently reaches, and on which number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Affinity {
+    /// The `conversations` row this is read from. Also the page cursor.
+    pub conversation_id: Uuid,
+    /// The pooled number the owning employee is allocated to.
+    pub number: String,
+    /// The supplier, as `conversations.external_ref` holds it.
+    pub counterparty: String,
+    /// `sms` or `whatsapp`.
+    pub channel: String,
+    /// Who it reaches.
+    pub employee_id: Uuid,
+    /// Who it reaches, readably.
+    pub employee_slug: String,
+    /// That employee's lifecycle.
+    pub employee_lifecycle: String,
+    /// **Whether a message arriving now would actually land here.** False for a
+    /// suspended or terminated employee: the affinity is kept as the record of
+    /// the relationship, but nothing routes to somebody who cannot answer, and
+    /// a `false` here is an operator's cue to [`reassign`] it.
+    pub routable: bool,
+    /// When the relationship started.
+    pub since: DateTime<Utc>,
+    /// When it was last alive.
+    pub last_message_at: Option<DateTime<Utc>>,
+}
+
+/// One affinity row in SELECT order: conversation id, number, counterparty,
+/// channel, employee id, slug, lifecycle, created_at, last_message_at.
+type AffinityRow = (
+    Uuid,
+    String,
+    String,
+    String,
+    Uuid,
+    String,
+    String,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+);
+
+/// Every counterparty→employee affinity on this tenant's pooled numbers.
+///
+/// Keyset over the conversation id — a v7 uuid, so the order is total and
+/// insertions land in their own place rather than shifting a page boundary
+/// under a client that is walking the list.
+pub async fn affinities(
+    tx: &mut TenantTx<'_>,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<Affinity>, StoreError> {
+    let rows: Vec<AffinityRow> = sqlx::query_as(
+        "SELECT c.id, split_part(r.external_id, $2, 1) AS number, c.external_ref, c.channel, \
+                c.employee_id, e.slug, e.lifecycle, c.created_at, c.last_message_at \
+           FROM conversations c \
+           JOIN employees e ON e.id = c.employee_id \
+           JOIN employee_resources r \
+             ON r.employee_id = c.employee_id AND r.step = 'phone' \
+          WHERE c.channel = ANY($1) \
+            AND c.external_ref IS NOT NULL \
+            AND r.provider = $3 \
+            AND ($4::uuid IS NULL OR c.id > $4::uuid) \
+          ORDER BY c.id \
+          LIMIT $5",
+    )
+    .bind(PHONE_CHANNELS.as_slice())
+    .bind(SLOT_SEP.to_string())
+    .bind(PHONE_POOL)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                conversation_id,
+                number,
+                counterparty,
+                channel,
+                employee_id,
+                employee_slug,
+                employee_lifecycle,
+                since,
+                last_message_at,
+            )| Affinity {
+                conversation_id,
+                number,
+                counterparty,
+                channel,
+                employee_id,
+                employee_slug,
+                routable: employee_lifecycle == "active",
+                employee_lifecycle,
+                since,
+                last_message_at,
+            },
+        )
+        .collect())
+}
+
+/// The employee an inbound message on `number` from `counterparty` belongs to.
+///
+/// Both rules are in the module docs and both are total orders, so this cannot
+/// be decided by the order Postgres happens to return rows in. `None` means the
+/// number has no employee able to take the message — every slot holder is
+/// suspended or terminated — which the caller must surface rather than drop.
+pub async fn route_inbound(
+    tx: &mut TenantTx<'_>,
+    number: &E164,
+    counterparty: &str,
+) -> Result<Option<EmployeeId>, StoreError> {
+    // 1. Affinity: the employee that has held this relationship longest, among
+    //    the ones allocated to this number and able to answer.
+    let held: Option<Uuid> = sqlx::query_scalar(
+        "SELECT c.employee_id \
+           FROM conversations c \
+           JOIN employees e ON e.id = c.employee_id AND e.lifecycle = 'active' \
+           JOIN employee_resources r \
+             ON r.employee_id = c.employee_id AND r.step = 'phone' \
+          WHERE c.external_ref = $2 \
+            AND c.channel = ANY($4) \
+            AND r.provider = $3 \
+            AND r.external_id = $1 || $5 || c.employee_id::text \
+          ORDER BY c.created_at, c.id \
+          LIMIT 1",
+    )
+    .bind(number.as_str())
+    .bind(counterparty)
+    .bind(PHONE_POOL)
+    .bind(PHONE_CHANNELS.as_slice())
+    .bind(SLOT_SEP.to_string())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    if let Some(id) = held {
+        return Ok(Some(EmployeeId::from_uuid(id)));
+    }
+
+    // 2. First contact: the emptiest desk on this number, then the lowest id.
+    let fresh: Option<Uuid> = sqlx::query_scalar(
+        "SELECT r.employee_id \
+           FROM employee_resources r \
+           JOIN employees e ON e.id = r.employee_id AND e.lifecycle = 'active' \
+           LEFT JOIN conversations c \
+             ON c.employee_id = r.employee_id AND c.channel = ANY($3) \
+          WHERE r.step = 'phone' \
+            AND r.provider = $2 \
+            AND split_part(r.external_id, $4, 1) = $1 \
+          GROUP BY r.employee_id \
+          ORDER BY count(c.id), r.employee_id \
+          LIMIT 1",
+    )
+    .bind(number.as_str())
+    .bind(PHONE_POOL)
+    .bind(PHONE_CHANNELS.as_slice())
+    .bind(SLOT_SEP.to_string())
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    Ok(fresh.map(EmployeeId::from_uuid))
+}
+
+/// What a reassignment moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Reassigned {
+    /// The conversations that changed hands. More than one when two employees
+    /// were both talking to this supplier — the ambiguity the arbitration rule
+    /// papered over, now resolved on purpose.
+    pub conversations: Vec<Uuid>,
+    /// Who held them before. Empty is impossible: [`PoolError::NoAffinity`]
+    /// comes first.
+    pub from: Vec<Uuid>,
+}
+
+/// Point a counterparty at a different employee, deliberately.
+///
+/// # Why this moves the rows rather than adding one
+///
+/// Affinity is decided by the *oldest* conversation, so writing a new
+/// conversation for the new owner would lose to the old one and the
+/// reassignment would silently not take effect. Moving `conversations.employee_id`
+/// moves the relationship itself, thread and history together, and the same
+/// arbitration query then answers with the new owner. `messages.employee_id` is
+/// left alone: who actually sent each message is a fact, and rewriting it would
+/// forge the record.
+///
+/// Every conversation this counterparty holds with any slot holder on `number`
+/// moves, so the ambiguous case — two employees, one supplier, one number —
+/// ends up unambiguous instead of half-moved.
+///
+/// # What does not move
+///
+/// The psyche. Trust links, expectations and beliefs are keyed by employee and
+/// stay with the employee that earned them, so a reassignment hands the new
+/// owner the conversation and none of the accumulated judgement about the
+/// counterparty. That is the real cost of this endpoint and the reason it is a
+/// gated, audited action rather than a routing heuristic that could fire on its
+/// own.
+///
+/// The caller must hold an `Authorized<Action>` before calling this — the HTTP
+/// route is where the gate is consulted, in the same shape as
+/// `routes/approvals.rs`.
+pub async fn reassign(
+    tx: &mut TenantTx<'_>,
+    number: &E164,
+    counterparty: &str,
+    to: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<Reassigned, PoolError> {
+    // The target must already be on this number. Otherwise the supplier reaches
+    // an employee that cannot reply from the number they dialled.
+    let allocated: Option<Uuid> = sqlx::query_scalar(
+        "SELECT employee_id FROM employee_resources \
+          WHERE employee_id = $1 AND step = 'phone' AND provider = $2 \
+            AND external_id = $3 || $4 || $1::text",
+    )
+    .bind(to.as_uuid())
+    .bind(PHONE_POOL)
+    .bind(number.as_str())
+    .bind(SLOT_SEP.to_string())
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+    if allocated.is_none() {
+        return Err(PoolError::NotAllocated);
+    }
+
+    let moved: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "UPDATE conversations c \
+            SET employee_id = $1, updated_at = $5 \
+           FROM employee_resources r \
+          WHERE r.employee_id = c.employee_id \
+            AND r.step = 'phone' AND r.provider = $2 \
+            AND split_part(r.external_id, $6, 1) = $3 \
+            AND c.external_ref = $4 \
+            AND c.channel = ANY($7) \
+            AND c.employee_id <> $1 \
+        RETURNING c.id, r.employee_id",
+    )
+    .bind(to.as_uuid())
+    .bind(PHONE_POOL)
+    .bind(number.as_str())
+    .bind(counterparty)
+    .bind(now)
+    .bind(SLOT_SEP.to_string())
+    .bind(PHONE_CHANNELS.as_slice())
+    .fetch_all(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    if moved.is_empty() {
+        // Either nobody talks to this counterparty on this number, or the
+        // target already owns every such thread. The second is not an error to
+        // the caller's intent, but it is not a change either, and a route that
+        // reports "moved 0" as success is a route that hides a typo'd number.
+        return Err(PoolError::NoAffinity);
+    }
+
+    let mut from: Vec<Uuid> = moved.iter().map(|(_, owner)| *owner).collect();
+    from.sort_unstable();
+    from.dedup();
+    Ok(Reassigned {
+        conversations: moved.into_iter().map(|(id, _)| id).collect(),
+        from,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use agentos_domain::action::Domain;
+    use agentos_domain::ids::Slug;
+    use agentos_providers::EnsureCtx;
+    use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
+    use agentos_store::db::Db;
+
+    use super::*;
+
+    const NUMBER: &str = "+33757590001";
+    const SUPPLIER: &str = "+33612345678";
+
+    /// Real Postgres or nothing: every claim here is about rows.
+    async fn db() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; pool_ops needs a real Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
+    }
+
+    async fn new_tenant(db: &Db) -> TenantId {
+        let tenant = TenantId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'pool-test')")
+            .bind(tenant.as_uuid())
+            .bind(tenant.as_uuid().to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit");
+        tenant
+    }
+
+    fn number() -> E164 {
+        E164::parse(NUMBER).expect("e164")
+    }
+
+    /// An active employee holding a pooled slot on [`NUMBER`].
+    ///
+    /// Built through the domain rather than as raw SQL: `employee_store::load`
+    /// insists on all eleven resource rows, and the aggregate is what puts them
+    /// there.
+    async fn allocate(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+        let now = Utc::now();
+        let id = EmployeeId::new_v7(now);
+        let mut employee = Employee::new(
+            id,
+            tenant,
+            Slug::parse(slug).expect("slug"),
+            Domain::parse("agents.example.com").expect("domain"),
+            now,
+        );
+        employee
+            .set_lifecycle(agentos_domain::employee::Lifecycle::Active, now)
+            .expect("activate");
+        employee
+            .bind(Step::Phone, slot_binding(&number(), id), now)
+            .expect("bind slot");
+        employee
+            .set_resource(Step::Identity, ResourceState::Provisioning, now)
+            .and_then(|()| employee.set_resource(Step::Identity, ResourceState::Ready, now))
+            .expect("identity ready");
+        employee
+            .set_resource(Step::Phone, ResourceState::Provisioning, now)
+            .and_then(|()| employee.set_resource(Step::Phone, ResourceState::Ready, now))
+            .expect("phone ready");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        employee_store::insert(&mut tx, &employee)
+            .await
+            .expect("insert employee");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    async fn terminate(db: &Db, tenant: TenantId, id: EmployeeId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query("UPDATE employees SET lifecycle = 'terminated' WHERE id = $1")
+            .bind(id.as_uuid())
+            .execute(&mut **tx)
+            .await
+            .expect("terminate");
+        tx.commit().await.expect("commit");
+    }
+
+    /// A conversation with `SUPPLIER`, created `age_seconds` ago.
+    async fn talk(db: &Db, tenant: TenantId, employee: EmployeeId, age_seconds: i64) -> Uuid {
+        let id = Uuid::now_v7();
+        let when = Utc::now() - chrono::TimeDelta::seconds(age_seconds);
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO conversations \
+                 (id, tenant_id, employee_id, channel, external_ref, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'sms', $4, $5, $5)",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(employee.as_uuid())
+        .bind(SUPPLIER)
+        .bind(when)
+        .execute(&mut **tx)
+        .await
+        .expect("insert conversation");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    async fn binding_of(db: &Db, tenant: TenantId, id: EmployeeId) -> Option<ProviderBinding> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let stored = employee_store::load(&mut tx, id).await.expect("load");
+        tx.rollback().await.expect("rollback");
+        stored.employee.resource(Step::Phone).binding().cloned()
+    }
+
+    // -- the encoding ------------------------------------------------------
+
+    /// Two employees on one number are two distinct external ids, so the
+    /// unique index does not collide them — and neither half can be read as a
+    /// provider sid.
+    #[test]
+    fn a_slot_id_carries_the_employee_and_is_not_a_sid() {
+        let now = Utc::now();
+        let (a, b) = (EmployeeId::new_v7(now), EmployeeId::new_v7(now));
+        let (left, right) = (slot_binding(&number(), a), slot_binding(&number(), b));
+
+        assert_ne!(left.external_id(), right.external_id());
+        assert_eq!(slot_number(&left).as_ref(), Some(&number()));
+        assert_eq!(slot_number(&right).as_ref(), Some(&number()));
+        assert!(is_pooled(&left));
+
+        // A Twilio sid is `PN` + 32 hex. A slot id cannot be mistaken for one,
+        // which is what makes a stray `release` a 404 instead of a deletion.
+        assert!(left.external_id().starts_with('+'));
+        assert!(left.external_id().contains(SLOT_SEP));
+
+        let dedicated = ProviderBinding::new("twilio", "PN0000000000000001");
+        assert!(!is_pooled(&dedicated));
+        assert_eq!(slot_number(&dedicated), None);
+    }
+
+    // -- releasing ---------------------------------------------------------
+
+    /// The headline: terminating frees the slot and the number stays.
+    #[tokio::test]
+    async fn terminating_frees_the_slot_and_leaves_the_number_alone() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let lena = allocate(&db, tenant, "lena").await;
+        let alex = allocate(&db, tenant, "alex").await;
+
+        // A provider that has actually sold the tenant this number. It is here
+        // to be *not* called: `release_slot` takes no adapter, and if a future
+        // edit gives it one, this count is what fails.
+        let telephony = MockTelephony::new(Utc::now(), "token");
+        telephony
+            .ensure_number(
+                &EnsureCtx::new(
+                    tenant,
+                    lena,
+                    Slug::parse("pool").expect("slug"),
+                    Step::Phone.as_str(),
+                ),
+                &Region::new("FR"),
+            )
+            .await
+            .expect("buy the pooled number");
+        assert_eq!(telephony.number_count(), 1);
+
+        terminate(&db, tenant, lena).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let released = release_slot(&mut tx, lena, Utc::now())
+            .await
+            .expect("release");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(released, SlotRelease::Freed { number: number() });
+        assert_eq!(binding_of(&db, tenant, lena).await, None, "slot not freed");
+        assert_eq!(
+            binding_of(&db, tenant, alex).await,
+            Some(slot_binding(&number(), alex)),
+            "a colleague lost its allocation"
+        );
+        assert_eq!(
+            telephony.number_count(),
+            1,
+            "the number was given back to the provider; four colleagues just lost their line"
+        );
+
+        // Occupancy reflects it: one seat free, the number still listed.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let seats = occupancy(&mut tx).await.expect("occupancy");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(seats[NUMBER].len(), 1);
+        assert_eq!(seats[NUMBER][0].employee_id, alex.as_uuid());
+    }
+
+    /// Releasing is idempotent, and the last employee leaving is not a delete
+    /// either — the pool still holds the number, with nobody on it.
+    #[tokio::test]
+    async fn releasing_twice_is_fine_and_the_last_leaver_keeps_the_number() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let lena = allocate(&db, tenant, "lena").await;
+        let pool = Pool::new().with_number(tenant, PoolNumber::new(number(), "FR", 10));
+
+        for expected in [
+            SlotRelease::Freed { number: number() },
+            SlotRelease::AlreadyFree,
+            SlotRelease::AlreadyFree,
+        ] {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let report = release_slot(&mut tx, lena, Utc::now())
+                .await
+                .expect("release");
+            tx.commit().await.expect("commit");
+            assert_eq!(report, expected);
+        }
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let seats = occupancy(&mut tx).await.expect("occupancy");
+        tx.rollback().await.expect("rollback");
+
+        assert!(!seats.contains_key(NUMBER), "nobody is on it: {seats:?}");
+        assert_eq!(
+            pool.find(tenant, &number()).map(PoolNumber::capacity),
+            Some(10),
+            "an empty number left the pool; the tenant owns it, not its last occupant"
+        );
+    }
+
+    /// A dedicated number is refused here rather than half-released: giving it
+    /// back is right for that employee, and only `release_step` can.
+    #[tokio::test]
+    async fn a_dedicated_number_is_not_this_functions_business() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let raj = allocate(&db, tenant, "raj").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        // The external id carries the employee so that a re-run against the
+        // same database does not collide on the global `(provider, external_id)`
+        // index — the very index the slot encoding exists to satisfy.
+        sqlx::query(
+            "UPDATE employee_resources SET provider = 'twilio', external_id = $2 \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .bind(raj.as_uuid())
+        .bind(format!("PN{}", raj.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("make it dedicated");
+        let report = release_slot(&mut tx, raj, Utc::now())
+            .await
+            .expect("release");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(report, SlotRelease::Dedicated);
+        assert!(
+            binding_of(&db, tenant, raj).await.is_some(),
+            "the binding was cleared without anybody cancelling the number"
+        );
+    }
+
+    // -- routing -----------------------------------------------------------
+
+    /// Continuity, arbitration and the fallback, in one flow.
+    #[tokio::test]
+    async fn a_supplier_keeps_reaching_the_employee_that_has_known_it_longest() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let lena = allocate(&db, tenant, "lena").await;
+        let alex = allocate(&db, tenant, "alex").await;
+
+        // Nobody has ever spoken to this supplier: first contact goes to a
+        // desk, deterministically, and the same one every time.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let first = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        let again = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(first, again, "first contact is not deterministic");
+        assert!(first.is_some());
+
+        // Lena has been talking to it for a year; Alex answered it once
+        // yesterday. Lena holds the psyche, so Lena keeps the supplier.
+        talk(&db, tenant, lena, 365 * 24 * 3600).await;
+        talk(&db, tenant, alex, 24 * 3600).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(owner, Some(lena), "the newer thread stole the relationship");
+
+        // Lena leaves. The affinity is kept — it is the record of who knew whom
+        // — but nothing routes to somebody who cannot answer.
+        terminate(&db, tenant, lena).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        let rows = affinities(&mut tx, None, 50).await.expect("affinities");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(owner, Some(alex), "routed to a terminated employee");
+        let orphaned = rows
+            .iter()
+            .find(|row| row.employee_id == lena.as_uuid())
+            .expect("the terminated employee's affinity was deleted");
+        assert!(
+            !orphaned.routable,
+            "a terminated employee reads as routable"
+        );
+        assert_eq!(orphaned.number, NUMBER);
+        assert_eq!(orphaned.counterparty, SUPPLIER);
+    }
+
+    /// Reassigning moves the relationship, and the next message follows it.
+    #[tokio::test]
+    async fn a_reassignment_changes_where_the_next_message_lands() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let lena = allocate(&db, tenant, "lena").await;
+        let alex = allocate(&db, tenant, "alex").await;
+        let held = talk(&db, tenant, lena, 90 * 24 * 3600).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert_eq!(
+            route_inbound(&mut tx, &number(), SUPPLIER)
+                .await
+                .expect("route"),
+            Some(lena)
+        );
+        let moved = reassign(&mut tx, &number(), SUPPLIER, alex, Utc::now())
+            .await
+            .expect("reassign");
+        let after = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(moved.conversations, vec![held], "the thread did not move");
+        assert_eq!(moved.from, vec![lena.as_uuid()]);
+        assert_eq!(after, Some(alex), "the next message still lands on Lena");
+
+        // Nothing left to move the second time: the endpoint says so rather
+        // than reporting a successful no-op.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let repeat = reassign(&mut tx, &number(), SUPPLIER, alex, Utc::now()).await;
+        tx.rollback().await.expect("rollback");
+        assert!(matches!(repeat, Err(PoolError::NoAffinity)), "{repeat:?}");
+    }
+
+    /// An employee that is not on the number cannot be given its suppliers.
+    #[tokio::test]
+    async fn reassigning_to_an_employee_off_the_number_is_refused() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let lena = allocate(&db, tenant, "lena").await;
+        let outsider = allocate(&db, tenant, "mira").await;
+        talk(&db, tenant, lena, 3600).await;
+
+        // Mira gives her slot up, so she is no longer reachable on the number.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        release_slot(&mut tx, outsider, Utc::now())
+            .await
+            .expect("release");
+        let refused = reassign(&mut tx, &number(), SUPPLIER, outsider, Utc::now()).await;
+        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
+            .await
+            .expect("route");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            matches!(refused, Err(PoolError::NotAllocated)),
+            "{refused:?}"
+        );
+        assert_eq!(owner, Some(lena), "a refused reassignment moved something");
+    }
+
+    /// RLS, not a `WHERE` clause we might forget: another tenant's slots and
+    /// affinities are not merely unlisted, they are invisible.
+    #[tokio::test]
+    async fn one_tenants_pool_is_invisible_to_another() {
+        let Some(db) = db().await else { return };
+        let (mine, theirs) = (new_tenant(&db).await, new_tenant(&db).await);
+        let ours = allocate(&db, mine, "lena").await;
+        let hers = allocate(&db, theirs, "raj").await;
+        talk(&db, mine, ours, 60).await;
+        talk(&db, theirs, hers, 60).await;
+
+        let mut tx = db.tenant_tx(theirs).await.expect("tx");
+        let seats = occupancy(&mut tx).await.expect("occupancy");
+        let rows = affinities(&mut tx, None, 50).await.expect("affinities");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(seats[NUMBER].len(), 1);
+        assert_eq!(seats[NUMBER][0].employee_id, hers.as_uuid());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].employee_id, hers.as_uuid());
+    }
+}
