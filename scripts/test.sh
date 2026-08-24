@@ -49,13 +49,32 @@ if ! psql_admin -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1; then
   exit 1
 fi
 
+# One run's databases are that run's alone. Two concurrent runs used to share
+# the fixed names `ci_<pkg>` and deadlock: the second run's DROP DATABASE waits
+# forever on a connection the first run still holds, and neither ever finishes.
+# `$$` is the shell's PID, so a stale set from a killed run can never collide
+# with a live one either. Override RUN_ID to get stable names for debugging.
+RUN_ID=${RUN_ID:-$$}
+
 log=$(mktemp)
-trap 'rm -f "$log"' EXIT
+# Drop this run's databases whichever way we leave — including the ^C that
+# leaves them behind and eventually fills the disk. WITH (FORCE) rather than a
+# bare DROP for the same reason it is used below.
+cleanup() {
+  rm -f "$log"
+  for p in "${PACKAGES[@]}"; do
+    psql_admin -c "DROP DATABASE IF EXISTS ci_${p//-/}_$RUN_ID WITH (FORCE)" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT INT TERM
 
 for pkg in "${PACKAGES[@]}"; do
-  db="ci_${pkg//-/}"
+  db="ci_${pkg//-/}_$RUN_ID"
   echo "==> $pkg  (database $db)"
-  psql_admin -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $db" -c "CREATE DATABASE $db"
+  # WITH (FORCE) terminates any leftover backend instead of blocking on it.
+  # A test binary killed mid-run leaves its connection open, and a plain DROP
+  # then hangs with no output — which reads exactly like a slow build.
+  psql_admin -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" -c "CREATE DATABASE $db"
   for m in migrations/*.sql; do
     PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d "$db" -q -v ON_ERROR_STOP=1 -f "$m"
   done
