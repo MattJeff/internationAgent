@@ -35,7 +35,9 @@
 //! *why* it produced nothing — [`Divergence`] and [`Checked::Blocked`] — leaves
 //! a row in `proof_of_need_attempts` whatever it came to, and emits one
 //! low-cardinality event per attempt. The rate is the view
-//! `proof_of_need_suppression`, per prospect.
+//! `proof_of_need_suppression`, per prospect, and the two reasons that mean
+//! "the bar is mis-set on this prospect" add up in `proof_of_need_bar_misset`
+//! beside it.
 //!
 //! ## Reading the number
 //!
@@ -45,22 +47,30 @@
 //! the gate or the browser, so neither dilutes the rate.
 //!
 //! * **Low, and mostly [`Divergence::Undetermined`]** — working as intended.
-//!   Public booking flows carry clocks, session ids and rotating banners; a
-//!   floor of unrepeatable reads is what the bar costs, and it is cheap.
+//!   Public booking flows half-load, swap a page underneath you, and serve
+//!   friction we do not recognise; a floor of reads we cannot classify is what
+//!   the bar costs, and it is cheap. This is *not* where churn around a panel we
+//!   read fine lands — that is the next bullet, deliberately.
+//! * **`same_answer` + `both_silent` dominating** — the bar is **mis-set**, and
+//!   these two are the only numbers that say so. **Read them as one number.**
+//!   Their flow gave the *same answer* to both runs — the same requirement
+//!   ([`Divergence::SameAnswer`], a suppressed [`Finding::Contradicts`]) or the
+//!   same silence ([`Divergence::BothSilent`], a suppressed
+//!   [`Finding::SaysNothing`]) — and the comparison threw it away over bytes
+//!   that were never about visas. Watching `same_answer` alone sees only the
+//!   half of the loss that happens to have a requirement in it, and a prospect
+//!   whose checkout says nothing is exactly the prospect this vertical is for.
+//!   The fix for both is a narrower [`Flow::panel`] selector, pointed at the
+//!   answer widget instead of at a container with a clock in it, one prospect at
+//!   a time. It is a configuration fix and never a licence to loosen the
+//!   comparison: a selector wide enough to catch a timestamp is wide enough to
+//!   catch the wrong sentence.
 //! * **[`Checked::Blocked`] climbing** — not a bar problem at all. Their site is
 //!   serving *us* friction, which is entirely their right. The lever is the
 //!   scheduler that calls [`Prober::check`]: fewer probes, wider gaps. A
 //!   prospect that blocks us consistently is a prospect we cannot make an
 //!   evidence-backed claim about, and the honest move is to drop them from the
 //!   list — not to send a claim we cannot stand behind, and not to evade.
-//! * **[`Divergence::SameAnswer`] dominating** — the bar is **mis-set**, and
-//!   this is the only number that says so. Their flow stated the *same
-//!   requirement* twice and the comparison threw it away over bytes that were
-//!   never about visas. The fix is a narrower [`Flow::panel`] selector, pointed
-//!   at the answer widget instead of at a container with a clock in it, one
-//!   prospect at a time. It is a configuration fix and never a licence to
-//!   loosen the comparison: a selector wide enough to catch a timestamp is wide
-//!   enough to catch the wrong sentence.
 //! * **[`Divergence::Answers`] dominating** — their flow genuinely answers the
 //!   same question two ways. That is the most damning thing anyone could say
 //!   about an entry-requirements widget, and we cannot say it, because they
@@ -68,9 +78,11 @@
 //!   not become an automated claim.
 //!
 //! So: high *and* mostly `blocked` or `answers` is the bar working. High and
-//! mostly `same_answer` is a selector bug wearing a discipline's clothes. That
-//! distinction is the entire reason the reasons are separate values rather than
-//! one counter.
+//! mostly `same_answer` **or `both_silent`** is a selector bug wearing a
+//! discipline's clothes. That distinction is the entire reason the reasons are
+//! separate values rather than one counter — and the reason the two
+//! "mis-set for this prospect" outcomes are two values rather than one is that
+//! they name two different findings, both of which we lost.
 //!
 //! ## What we do not do about it
 //!
@@ -719,10 +731,17 @@ impl Evidence {
 /// The hard part is that from outside a browser you frequently cannot tell an
 /// A/B assignment from a flaky widget from a page that changed underneath you.
 /// So this enum does not have variants for those. It splits only on what is
-/// actually observable — whether both runs parsed into a requirement, and
-/// whether it was the same one — and everything else is
-/// [`Divergence::Undetermined`] on purpose. An unknown reason costs an operator
-/// a look; a confidently wrong one costs them a decision.
+/// actually observable — whether each run came back with any text at all, what
+/// each one said about entry requirements, and whether the two agreed — and
+/// everything else is [`Divergence::Undetermined`] on purpose. An unknown reason
+/// costs an operator a look; a confidently wrong one costs them a decision.
+///
+/// Two of these are the *same measurement about the same mistake*, one per kind
+/// of finding: [`Divergence::SameAnswer`] is a suppressed
+/// [`Finding::Contradicts`] and [`Divergence::BothSilent`] is a suppressed
+/// [`Finding::SaysNothing`]. Reading one without the other is reading half the
+/// loss, which is exactly what happened while `BothSilent` was pooled into
+/// `Undetermined`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Divergence {
     /// Both runs stated a requirement and it was the **same** requirement. Only
@@ -732,6 +751,21 @@ pub enum Divergence {
     /// It is the measurement that says the bar is mis-set *for this prospect*,
     /// and the fix is a narrower [`Flow::panel`], not a looser comparison.
     SameAnswer(Claim),
+    /// Both runs came back with text and **neither mentioned entry requirements
+    /// at all**. Only the bytes around the silence moved.
+    ///
+    /// The twin of [`Divergence::SameAnswer`], for the other kind of finding: a
+    /// byte-identical repeat of either run would have been a
+    /// [`Finding::SaysNothing`], so this is one of those, suppressed — as
+    /// diagnosable as `SameAnswer` and fixed the same way, with a narrower
+    /// [`Flow::panel`]. It bends the bar no more than `SameAnswer` does: no
+    /// evidence comes out of it.
+    ///
+    /// Named for what was observed and nothing more: two non-empty reads,
+    /// neither of which said anything about entry requirements. A run that came
+    /// back **empty** is not silence, it is a page we never got, and it stays
+    /// [`Divergence::Undetermined`].
+    BothSilent,
     /// Both runs stated a requirement and they were **different**
     /// requirements. Their flow answered the same question two ways.
     ///
@@ -744,9 +778,11 @@ pub enum Divergence {
         /// What the second run said.
         second: Claim,
     },
-    /// The two texts differed and nothing above applies — one or both runs
-    /// parsed to nothing, or to something unreadable. A different page, a
-    /// half-loaded widget, a banner. **Unknown, and recorded as unknown.**
+    /// The two texts differed and nothing above applies: one run stated a
+    /// requirement and the other did not mention them, or a run mentioned them
+    /// without stating one we could parse, or a run came back empty. A different
+    /// page, a half-loaded widget, a challenge we did not recognise.
+    /// **Unknown, and recorded as unknown.**
     Undetermined,
 }
 
@@ -756,6 +792,7 @@ impl Divergence {
     pub const fn code(self) -> &'static str {
         match self {
             Divergence::SameAnswer(_) => "same_answer",
+            Divergence::BothSilent => "both_silent",
             Divergence::Answers { .. } => "answers",
             Divergence::Undetermined => "undetermined",
         }
@@ -764,9 +801,16 @@ impl Divergence {
 
 /// Classify a disagreement between two runs, using only what is on the page.
 fn classify(first: &Untrusted<String>, second: &Untrusted<String>) -> Divergence {
+    // "Their checkout has no visa widget on it" and "the panel never rendered"
+    // both read as `Seen::Nothing`, and only the first of them is a finding this
+    // module would have made. A read with no text in it is the second, so it is
+    // not allowed to count as silence.
+    let read = |text: &Untrusted<String>| !text.expose_for_parsing().trim().is_empty();
+
     match (read_claim(first), read_claim(second)) {
         (Seen::Says(a), Seen::Says(b)) if a == b => Divergence::SameAnswer(a),
         (Seen::Says(first), Seen::Says(second)) => Divergence::Answers { first, second },
+        (Seen::Nothing, Seen::Nothing) if read(first) && read(second) => Divergence::BothSilent,
         _ => Divergence::Undetermined,
     }
 }
@@ -1797,16 +1841,58 @@ mod tests {
             )]
         );
 
-        // A difference neither run turned into a requirement stays unknown, and
-        // is recorded as unknown rather than guessed at.
-        let vague = harness(
+        // The same measurement for the other finding: both runs read fine and
+        // both said nothing about entry requirements, so a byte-identical repeat
+        // of either would have been `Finding::SaysNothing`. Counted apart from
+        // "we do not know", because the fix is the same narrower selector.
+        let silent = harness(
             &db,
-            ScriptedPanel::flaky("Baggage: 1 x 23kg.", "Seat 14A."),
+            ScriptedPanel::flaky("Baggage: 1 x 23kg.", "Baggage: 1 x 23kg. Seat 14A."),
+            limits(),
+        )
+        .await;
+        let checked = silent
+            .prober
+            .check(&flow(), &probe(), &authority(), now())
+            .await
+            .expect("allowed");
+        assert_eq!(checked, Checked::NotReproducible(Divergence::BothSilent));
+        assert!(checked.evidence().is_none(), "the bar does not bend");
+        assert_eq!(
+            attempts(&db, &silent.principal).await,
+            vec![(
+                "not_reproducible".to_owned(),
+                Some("both_silent".to_owned())
+            )]
+        );
+
+        // And the page we never got. An empty panel is not a checkout with no
+        // visa widget on it, and calling it one would send an operator after a
+        // selector when the widget simply had not rendered.
+        let half_loaded = harness(
+            &db,
+            ScriptedPanel::flaky("Baggage: 1 x 23kg.", "   "),
             limits(),
         )
         .await;
         assert_eq!(
-            vague
+            half_loaded
+                .prober
+                .check(&flow(), &probe(), &authority(), now())
+                .await
+                .expect("allowed"),
+            Checked::NotReproducible(Divergence::Undetermined)
+        );
+
+        // So does a run that mentioned entry requirements without stating one.
+        let unreadable = harness(
+            &db,
+            ScriptedPanel::flaky("Baggage: 1 x 23kg.", "Visa information may vary."),
+            limits(),
+        )
+        .await;
+        assert_eq!(
+            unreadable
                 .prober
                 .check(&flow(), &probe(), &authority(), now())
                 .await
@@ -1942,6 +2028,76 @@ mod tests {
         assert!(!RuleAge::Unknown.is_long_standing());
         assert!(RuleAge::Days(400).is_long_standing());
         assert_eq!(RuleAge::between(None, observed), RuleAge::Unknown);
+    }
+
+    /// A suppressed finding is visible whichever kind it was, and an unreadable
+    /// page still is not one.
+    ///
+    /// No database and no browser: the four reasons are a pure function of two
+    /// strings, and the whole point of them is that an operator can add up the
+    /// two that mean "narrow the selector".
+    #[test]
+    fn benign_churn_is_counted_apart_from_a_page_we_could_not_read() {
+        let two = |a: &str, b: &str| classify(&Untrusted::new(a.into()), &Untrusted::new(b.into()));
+
+        // Churn around a stated requirement, and churn around silence: the same
+        // mistake, and now the same shape of answer.
+        assert_eq!(
+            two(
+                "A visa is required. 14:02:11",
+                "A visa is required. 14:02:19"
+            ),
+            Divergence::SameAnswer(Claim::VisaRequired)
+        );
+        assert_eq!(
+            two(
+                "Total EUR 412.00.",
+                "Total EUR 412.00. 3 items in your basket."
+            ),
+            Divergence::BothSilent
+        );
+
+        // Neither is evidence. That is the bar, unmoved.
+        for (a, b) in [
+            (
+                "A visa is required. 14:02:11",
+                "A visa is required. 14:02:19",
+            ),
+            ("Total EUR 412.00.", "Total EUR 412.00. 3 items."),
+        ] {
+            assert!(matches!(
+                verdict(
+                    &Untrusted::new(a.into()),
+                    &Untrusted::new(b.into()),
+                    Claim::NoVisa
+                ),
+                Verdict::Nothing(Checked::NotReproducible(_))
+            ));
+        }
+
+        // A page we did not get is not a silent page. An empty read, a run that
+        // mentioned visas unparseably, and a run that answered against one that
+        // did not, all stay unknown.
+        assert_eq!(two("Total EUR 412.00.", ""), Divergence::Undetermined);
+        assert_eq!(two("", "Total EUR 412.00."), Divergence::Undetermined);
+        assert_eq!(
+            two("Total EUR 412.00.", "Visa information may vary."),
+            Divergence::Undetermined
+        );
+        assert_eq!(
+            two("Total EUR 412.00.", "A visa is required."),
+            Divergence::Undetermined
+        );
+
+        // And the `Contradicts` path is untouched: two different requirements
+        // are still two different requirements.
+        assert_eq!(
+            two("A visa is required.", "No visa is required."),
+            Divergence::Answers {
+                first: Claim::VisaRequired,
+                second: Claim::NoVisa,
+            }
+        );
     }
 
     /// The parser fails towards silence, never towards a claim.

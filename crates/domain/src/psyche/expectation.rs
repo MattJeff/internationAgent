@@ -71,6 +71,31 @@ pub const SURPRISE_FLOOR: f64 = 0.5;
 /// Precision gain (`K_PRECISION`, line 347): `precision = 1 / (1 + K · var)`.
 pub const K_PRECISION: f64 = 1.0;
 
+/// How much of a miss is ordinary noise, as a fraction of the dimension's
+/// scale.
+///
+/// The drift detector below subtracts this from every observation, so a
+/// counterparty that is habitually a little late accumulates nothing at all.
+/// Only misses larger than a quarter of the scale start to count, and only
+/// while they keep pointing the same way.
+pub const DRIFT_SLACK: f64 = 0.25;
+
+/// How much consistent, same-signed miss adds up to a regime change.
+///
+/// Each observation contributes at most `1 - DRIFT_SLACK`, so this is "about
+/// three full-sized misses in a row". Magnitude cannot buy the threshold on its
+/// own — see [`Expectation::observe`], which clamps the per-step contribution
+/// precisely so that one container stuck in a port is not a new supplier.
+pub const DRIFT_THRESHOLD: f64 = 2.0;
+
+/// How far the accumulators may run past the threshold.
+///
+/// Without a ceiling a long drift banks credit that takes as long to drain as
+/// it took to build, and the belief keeps learning at the full rate well after
+/// the counterparty settled. Twice the threshold means a settled counterparty
+/// is back to precision-weighted learning within a few observations.
+pub const DRIFT_CEILING: f64 = 2.0 * DRIFT_THRESHOLD;
+
 /// Normalised variance above which a counterparty is *erratic*
 /// (`SEUIL_VERIF_VAR`, line 388).
 pub const ERRATIC_VARIANCE: f64 = 0.5;
@@ -187,6 +212,16 @@ pub struct PredictionError {
     /// `observed - expected_before`. Signed: positive means worse-than-expected
     /// on every dimension here (later, dearer, slower, more defects).
     pub surprise: f64,
+    /// The drift detector is elevated: several consistent, same-signed misses
+    /// say this counterparty is *moving* rather than merely being noisy, so the
+    /// belief is learning at the full rate instead of the precision-weighted
+    /// one.
+    ///
+    /// A state, not an event — it stays true for as long as the misses keep
+    /// pointing the same way and clears itself once the belief catches up.
+    /// Worth surfacing: "your supplier's lead time is moving" is a fact an
+    /// operator acts on, and it is not visible in the expectation alone.
+    pub regime_change: bool,
     /// Salience in `[SURPRISE_FLOOR, 1]`:
     /// `SURPRISE_FLOOR + (1 - SURPRISE_FLOOR) · min(1, |surprise| / scale)`.
     /// Ported from `poids_surprise` (mpcp.py line 650).
@@ -237,6 +272,13 @@ pub struct Expectation {
     /// What the counterparty says about itself, if it ever said. Kept forever:
     /// `expected - claimed` is the number a buyer wants on the screen.
     claimed: Option<f64>,
+    /// One-sided CUSUM accumulators over normalised, clamped surprise: `up` for
+    /// worse-than-expected, `down` for better. Both are `>= 0` and both reset
+    /// when either crosses [`DRIFT_THRESHOLD`]. They are the memory that tells
+    /// a drift from noise, and they are the only state here that a regime
+    /// change destroys on purpose.
+    drift_up: f64,
+    drift_down: f64,
     first_observed_at: Option<DateTime<Utc>>,
     last_observed_at: Option<DateTime<Utc>>,
 }
@@ -252,6 +294,14 @@ struct ExpectationWire {
     m2: f64,
     n: u32,
     claimed: Option<f64>,
+    /// Absent in every row written before the drift detector existed, which is
+    /// what `default` is for: an old belief comes back with a clean detector
+    /// and starts accumulating from its next observation. It cannot come back
+    /// with a *false* accumulation, which is the failure that would matter.
+    #[serde(default)]
+    drift_up: f64,
+    #[serde(default)]
+    drift_down: f64,
     first_observed_at: Option<DateTime<Utc>>,
     last_observed_at: Option<DateTime<Utc>>,
 }
@@ -275,6 +325,15 @@ impl TryFrom<ExpectationWire> for Expectation {
         if w.m2 < 0.0 || (w.n < 2 && w.m2 != 0.0) {
             return Err(ExpectationError::Corrupt);
         }
+        // Both accumulators are `max(0, …)` by construction, so a negative one
+        // is a corrupt row rather than a belief we can reason about. A stored
+        // value already past the threshold is fine — it means the detector was
+        // one observation short when the row was written.
+        for value in [w.drift_up, w.drift_down] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ExpectationError::Corrupt);
+            }
+        }
         Ok(Expectation {
             dimension: w.dimension,
             expected: w.expected,
@@ -282,6 +341,8 @@ impl TryFrom<ExpectationWire> for Expectation {
             m2: w.m2,
             n: w.n,
             claimed: w.claimed,
+            drift_up: w.drift_up,
+            drift_down: w.drift_down,
             first_observed_at: w.first_observed_at,
             last_observed_at: w.last_observed_at,
         })
@@ -298,6 +359,8 @@ impl Expectation {
             expected: 0.0,
             mean: 0.0,
             m2: 0.0,
+            drift_up: 0.0,
+            drift_down: 0.0,
             n: 0,
             claimed: None,
             first_observed_at: None,
@@ -361,9 +424,50 @@ impl Expectation {
             SURPRISE_FLOOR
                 + (1.0 - SURPRISE_FLOOR) * (surprise.abs() / self.dimension.scale()).min(1.0)
         };
-        // P5 Feldman-Friston: adaptive gain ∝ 1/variance. While ignorant
-        // (`precision()` is None) we learn at the full rate.
-        let gain = LEARNING_RATE * self.precision().unwrap_or(1.0);
+        // --- the drift detector ------------------------------------------
+        //
+        // Precision-weighted gain divides the learning rate by variance, which
+        // is right while a counterparty is merely noisy and *backwards* when it
+        // changes: a regime change is exactly what spikes the variance, because
+        // Welford's running mean ends up sitting between the old regime and the
+        // new one. So the gain collapses at the moment the belief most needs to
+        // move. Measured, before this existed: a supplier going from 23 to 41
+        // days left the belief frozen at 23.8.
+        //
+        // The fix is not to weaken the precision weighting — it earns its keep
+        // on a noisy counterparty — but to notice that noise and drift do not
+        // look alike. Noise is symmetric around zero. Drift is a run of misses
+        // that all point the same way. This is a two-sided CUSUM on that
+        // signal, and while it is elevated the gain ignores precision.
+        //
+        // `clamp(-1, 1)` is the load-bearing line: a miss contributes its
+        // *direction*, not its size, so one container stuck in a port cannot
+        // buy a regime change on its own however late it was. What accumulates
+        // is consistency. `DRIFT_SLACK` comes off every step, so a counterparty
+        // that is habitually a little late accumulates nothing at all.
+        //
+        // Nothing is reset. An earlier version threw the Welford state away on
+        // the theory that a changed counterparty is a new one — and it broke
+        // `Reliability`, which counts observations, so a supplier that moved
+        // twice read as never having been observed. Drift is a **state**, not
+        // an event: the accumulator drains on its own once the belief catches
+        // up and the surprises fall back under the slack, and the gain returns
+        // to precision-weighted without anybody deciding it should.
+        let z = (surprise / self.dimension.scale()).clamp(-1.0, 1.0);
+        self.drift_up = (self.drift_up + z - DRIFT_SLACK).clamp(0.0, DRIFT_CEILING);
+        self.drift_down = (self.drift_down - z - DRIFT_SLACK).clamp(0.0, DRIFT_CEILING);
+        let drifting = !first_contact
+            && (self.drift_up >= DRIFT_THRESHOLD || self.drift_down >= DRIFT_THRESHOLD);
+
+        // P5 Feldman-Friston: adaptive gain is proportional to 1/variance while
+        // the counterparty is holding still. While it is drifting, that
+        // weighting is measuring the transition rather than the noise, so the
+        // full rate applies instead.
+        let gain = if drifting {
+            LEARNING_RATE
+        } else {
+            LEARNING_RATE * self.precision().unwrap_or(1.0)
+        };
 
         // Welford, exactly as in mpcp.py `_welford` — the running mean is
         // updated first and the M2 increment multiplies the deviation from the
@@ -387,6 +491,7 @@ impl Expectation {
         Ok(PredictionError {
             observed,
             expected_before,
+            regime_change: drifting,
             surprise,
             weight,
             first_contact,
@@ -692,6 +797,99 @@ mod tests {
     }
 
     /// Known-answer set: 2,4,4,4,5,5,7,9 has mean 5 and population variance 4.
+    #[test]
+    fn one_bad_delivery_is_not_a_new_supplier() {
+        // The property the clamp buys. A single catastrophic miss — a container
+        // stuck in a port — must not convince the detector, however large it
+        // is, because size is not evidence of a change. Only repetition is.
+        let mut exp = Expectation::new(Dimension::LeadTimeDays);
+        for day in [20.0, 20.0, 20.0, 20.0] {
+            exp.observe(day, at(0)).unwrap();
+        }
+        let outlier = exp.observe(200.0, at(1)).unwrap();
+        assert!(
+            !outlier.regime_change,
+            "one miss, however big, is an outlier and not a regime change"
+        );
+    }
+
+    #[test]
+    fn symmetric_noise_never_trips_the_detector() {
+        // Noise is symmetric around the expectation, so the two accumulators
+        // cancel each other. A counterparty that is wild but stationary must
+        // keep its precision weighting — that weighting is what stops it
+        // yanking the belief around, and it is the whole reason the detector
+        // could not simply be "learn fast when surprised".
+        let mut exp = Expectation::new(Dimension::LeadTimeDays);
+        exp.observe(20.0, at(0)).unwrap();
+        for (i, day) in [26.0, 14.0, 25.0, 15.0, 27.0, 13.0, 24.0, 16.0]
+            .iter()
+            .enumerate()
+        {
+            let err = exp.observe(*day, at(i as i64)).unwrap();
+            assert!(
+                !err.regime_change,
+                "observation {i} ({day}) tripped the detector on symmetric noise"
+            );
+        }
+    }
+
+    #[test]
+    fn a_supplier_that_actually_moved_is_followed_rather_than_averaged() {
+        // The bug this whole mechanism exists for, as a test. Before it, the
+        // belief froze at 23.8 days while reality sat at 41 — precision-
+        // weighted gain divides by variance, and a regime change is exactly
+        // what spikes the variance, so the gain collapsed at the moment the
+        // belief most needed to move.
+        let mut exp = Expectation::new(Dimension::LeadTimeDays);
+        for day in [15.0, 15.0, 16.0, 15.0] {
+            exp.observe(day, at(0)).unwrap();
+        }
+        let settled = exp.expected().expect("observed");
+
+        let mut fired = false;
+        for (i, day) in [40.0, 42.0, 41.0, 40.0, 41.0, 40.0, 41.0]
+            .iter()
+            .enumerate()
+        {
+            fired |= exp.observe(*day, at(i as i64)).unwrap().regime_change;
+        }
+
+        assert!(fired, "seven consistent misses have to read as a change");
+        assert!(
+            exp.expected().expect("observed") > settled + 15.0,
+            "the belief has to follow: settled at {settled:.1}, now {:.1}, reality 41",
+            exp.expected().expect("observed")
+        );
+        // And the history survives it — an earlier version reset the Welford
+        // state here, which made a counterparty that moved twice read as never
+        // having been observed and broke `Reliability` outright.
+        assert_eq!(exp.observations(), 11);
+        assert!(!matches!(exp.reliability(), Reliability::Unknown));
+    }
+
+    #[test]
+    fn the_detector_drains_once_the_belief_catches_up() {
+        // Drift is a state, not an event: when the misses stop, the
+        // accumulator falls back under the threshold on its own and the
+        // precision weighting returns without anybody deciding it should.
+        let mut exp = Expectation::new(Dimension::LeadTimeDays);
+        exp.observe(15.0, at(0)).unwrap();
+        for day in [40.0, 41.0, 40.0, 41.0, 40.0] {
+            exp.observe(day, at(0)).unwrap();
+        }
+        let settled = exp.expected().expect("observed");
+        // Now sit exactly on the new expectation for a while.
+        let mut last = true;
+        for _ in 0..12 {
+            last = exp.observe(settled, at(0)).unwrap().regime_change;
+        }
+        assert!(
+            !last,
+            "the accumulator has to drain when the counterparty holds still"
+        );
+    }
+
     #[test]
     fn welford_matches_the_hand_computed_variance() {
         let mut exp = Expectation::new(Dimension::DefectRatePct);

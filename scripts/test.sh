@@ -95,9 +95,15 @@ for pkg in "${PACKAGES[@]}"; do
   # A test binary killed mid-run leaves its connection open, and a plain DROP
   # then hangs with no output — which reads exactly like a slow build.
   psql_admin -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" -c "CREATE DATABASE $db"
-  for m in migrations/*.sql; do
-    PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d "$db" -q -v ON_ERROR_STOP=1 -f "$m"
-  done
+  # No psql migration loop. `Db::migrate` runs sqlx's migrator, and sqlx tracks
+  # what it applied in `_sqlx_migrations` — a table psql's pass does not write.
+  # So applying them here did not save sqlx the work, it just meant every
+  # migration ran twice against every package's database. That silently made
+  # idempotence a requirement of every migration, and the trap is sharper than
+  # it sounds: `create or replace view` can add a column but never drop one, so
+  # a later migration that widens a view makes the earlier one's own
+  # `create or replace` fail with 42P16 on the second pass — an error about a
+  # migration nobody edited.
   DATABASE_URL="postgres://$USER:$PASS@$HOST:$PORT/$db" \
     cargo test -p "$pkg" -- --nocapture 2>&1 | tee "$log"
 

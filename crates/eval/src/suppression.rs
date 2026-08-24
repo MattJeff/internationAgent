@@ -46,29 +46,43 @@
 //!
 //! # The result worth reading twice
 //!
-//! Benign churn suppresses *both* kinds of finding, but only one of them
-//! visibly. A [`Finding::Contradicts`] page states a requirement in both runs,
-//! so the classifier can see both, and the pair lands as
-//! [`Divergence::SameAnswer`] — the reason code that tells an operator to
-//! narrow [`Flow::panel`]. A [`Finding::SaysNothing`] page has no requirement
-//! to compare, so the identical churn lands as [`Divergence::Undetermined`],
-//! which is indistinguishable from a genuinely unstable widget.
+//! Benign churn suppresses *both* kinds of finding, and since `both_silent` it
+//! does so **visibly for both**. A [`Finding::Contradicts`] page states a
+//! requirement in both runs, so the pair lands as [`Divergence::SameAnswer`]. A
+//! [`Finding::SaysNothing`] page has no requirement to compare, and the
+//! identical churn lands as [`Divergence::BothSilent`]. Two reason codes, one
+//! fix: a narrower [`Flow::panel`]. An operator adds them up.
 //!
-//! So: **suppressed "your checkout says nothing" findings are invisible, and
-//! suppressed "your checkout is wrong" findings are diagnosable.** The rate
-//! measured below is the same for both; the *recoverability* is not. An
-//! operator watching `same_answer` climb is watching only half the loss.
+//! **It did not use to.** `BothSilent` did not exist, the says-nothing half fell
+//! into [`Divergence::Undetermined`] pooled with pages we never got, and this
+//! suite measured it at **0/8 diagnosable against 8/8** for the contradicts
+//! half — half the loss invisible, on the very number the commercial argument
+//! rests on. Both halves now read 8/8.
+//!
+//! What did **not** move: suppression is still 8/8 and 8/8. Every one of these
+//! findings is still thrown away, and no churned pair produces [`Evidence`]. The
+//! bar is untouched; only the label on the loss changed.
+//!
+//! The one thing `both_silent` refuses to claim is a page that came back
+//! **empty**. That is not a checkout being silent about visas, it is a widget
+//! that never rendered, and it stays [`Divergence::Undetermined`] — the
+//! `one run silent, one run blank` fixture below is what holds that line.
 
-use agentos_app::proof_of_need::{Checked, Claim, Verdict, verdict};
+use agentos_app::proof_of_need::{Checked, Claim, Divergence, Verdict, verdict};
 use agentos_domain::untrusted::Untrusted;
 
 use crate::{Row, Surface, Truth};
 
 /// The real suppression rate is a query, not a fixture. Printed in the report
 /// so the number nobody can compute here has an address.
-pub const REAL_RATE_SQL: &str = "select prospect_domain, attempts, suppression_rate_pct, \
-     blocked, same_answer, flow_disagreed, undetermined \
-     from proof_of_need_suppression order by attempts desc;";
+/// `bar_misset` is `same_answer + both_silent`, from `proof_of_need_bar_misset`
+/// (migration 0021) — the same mistake measured on the two kinds of finding.
+/// Reading either alone is the bug this suite measured at 0/8.
+pub const REAL_RATE_SQL: &str = "select s.prospect_domain, s.attempts, s.suppression_rate_pct, \
+     s.blocked, m.bar_misset, s.flow_disagreed, s.undetermined \
+     from proof_of_need_suppression s \
+     join proof_of_need_bar_misset m using (tenant_id, prospect_domain) \
+     order by s.attempts desc;";
 
 // ---------------------------------------------------------------------------
 // Part 1: classification
@@ -161,9 +175,41 @@ const CASES: &[Case] = &[
         expect: ("not_reproducible", Some("answers")),
     },
     Case {
+        // The twin of "same requirement, different bytes", for the other
+        // finding: both runs read fine, neither said a word about entry
+        // requirements, and a byte-identical repeat of either would have been a
+        // `says_nothing` finding. Same mis-set bar, same narrower `Flow::panel`.
+        name: "same silence, different bytes",
+        first: SILENT_TEXT,
+        second: "Review your booking. 2 passengers, 1 bag. Total EUR 412.00. ref=S-8813f2",
+        authority: Claim::VisaRequired,
+        expect: ("not_reproducible", Some("both_silent")),
+    },
+    Case {
         name: "one run loaded, one did not",
         first: WRONG_TEXT,
         second: "",
+        authority: Claim::VisaRequired,
+        expect: ("not_reproducible", Some("undetermined")),
+    },
+    Case {
+        // The line `both_silent` must not cross. An empty panel reads as "no
+        // mention of entry requirements" exactly like a real checkout does, and
+        // it is not one — it is a widget that never rendered. Telling an
+        // operator to narrow a selector at it would be the confidently wrong
+        // reason code, which costs more than an unknown one.
+        name: "one run silent, one run blank",
+        first: SILENT_TEXT,
+        second: "   ",
+        authority: Claim::VisaRequired,
+        expect: ("not_reproducible", Some("undetermined")),
+    },
+    Case {
+        // And a run that mentioned entry requirements without stating one we
+        // could parse is not silence either.
+        name: "one run silent, one run unparseable",
+        first: SILENT_TEXT,
+        second: "Visa information may vary. Total EUR 412.00.",
         authority: Claim::VisaRequired,
         expect: ("not_reproducible", Some("undetermined")),
     },
@@ -286,9 +332,10 @@ fn churn(base: &str, suffix: &str, authority: Claim) -> Churned {
         },
         Verdict::Nothing(Checked::NotReproducible(why)) => Churned {
             suppressed: true,
-            // `same_answer` names the fix: narrow `Flow::panel`. The other two
-            // leave an operator with nothing to act on.
-            diagnosable: why.code() == "same_answer",
+            // Both of these name the same fix — narrow `Flow::panel` — one per
+            // kind of finding. `answers` and `undetermined` leave an operator
+            // with nothing to act on.
+            diagnosable: matches!(why, Divergence::SameAnswer(_) | Divergence::BothSilent),
         },
         Verdict::Nothing(_) => Churned {
             suppressed: true,
@@ -396,10 +443,30 @@ pub fn evaluate() -> Surface {
             ),
             Truth::Characterises,
         )
-        .gated(seen_contradicts == kinds && seen_nothing == 0)
-        .note(
-            "says-nothing losses land as `undetermined`: invisible. same_answer is half the loss",
-        ),
+        .gated(seen_contradicts == kinds && seen_nothing == kinds)
+        .note("same_answer + both_silent is the whole loss; says-nothing used to read 0/8"),
+    );
+
+    // The line the fourth reason is not allowed to cross. Churn around a silent
+    // panel is a suppressed finding; a panel that never rendered is a page we
+    // did not get, and pooling the two would trade one invisible number for one
+    // wrong one.
+    let blank = run(SILENT_TEXT, "   ", Claim::VisaRequired);
+    let unrendered_is_apart = matches!(
+        blank,
+        Verdict::Nothing(Checked::NotReproducible(Divergence::Undetermined))
+    );
+    rows.push(
+        Row::ok(
+            "a blank panel is not a silent one",
+            if unrendered_is_apart {
+                "undetermined, apart from both_silent"
+            } else {
+                "AN UNRENDERED WIDGET IS BEING READ AS A SILENT CHECKOUT"
+            },
+            Truth::Correct,
+        )
+        .gated(unrendered_is_apart),
     );
 
     rows.push(
@@ -421,6 +488,9 @@ pub fn evaluate() -> Surface {
             "the FALSE-NEGATIVE rate: how many real defects the parser reads as SaysNothing or \
              Unreadable. Needs labelled real panel text, which we cannot collect without \
              probing prospects",
+            "whether `both_silent` is ever wrong about a page we did not get: an empty read is \
+             caught, but a skeleton loader rendering placeholder text is silence to us and a \
+             prospect's checkout is not what we measured",
             "non-English panels beyond one French case — read_claim is an English phrase table \
              and 14 of Orizn's locales are untested",
             "looks_challenged against real bot-defence pages: the table is 10 English phrases \
@@ -456,6 +526,8 @@ mod tests {
         );
         // Every expected code in the corpus is one the module can actually
         // produce — a fixture expecting "not_reproducable" would pass forever.
+        // Both halves of the pair: a fixture expecting `Some("both_silant")`
+        // would pass forever too, and that is the newest way to get it wrong.
         let real = [
             "evidence",
             "agrees",
@@ -463,9 +535,31 @@ mod tests {
             "not_reproducible",
             "blocked",
         ];
+        let details = [
+            Finding::SaysNothing.code(),
+            Finding::Contradicts {
+                shown: Claim::NoVisa,
+                correct: Claim::VisaRequired,
+            }
+            .code(),
+            Divergence::SameAnswer(Claim::NoVisa).code(),
+            Divergence::BothSilent.code(),
+            Divergence::Answers {
+                first: Claim::NoVisa,
+                second: Claim::VisaRequired,
+            }
+            .code(),
+            Divergence::Undetermined.code(),
+        ];
         for case in CASES {
             assert!(
                 real.contains(&case.expect.0),
+                "{} expects {:?}",
+                case.name,
+                case.expect
+            );
+            assert!(
+                case.expect.1.is_none_or(|detail| details.contains(&detail)),
                 "{} expects {:?}",
                 case.name,
                 case.expect

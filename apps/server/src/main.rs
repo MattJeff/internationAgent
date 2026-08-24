@@ -368,6 +368,7 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             // route nobody merged is a route nobody can call, and the
             // `allow(dead_code)` each carried made the compiler agree to say
             // nothing about it. Mounted here, once, on purpose.
+            .merge(routes::autonomy::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))

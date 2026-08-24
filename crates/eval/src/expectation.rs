@@ -282,9 +282,19 @@ pub fn evaluate() -> Surface {
     );
 
     // --- the finding that matters most --------------------------------------
-    // Precision-weighting divides the learning rate by the variance. A regime
-    // change is exactly the event that spikes the variance, so the gain
-    // collapses at the moment the belief most needs to move.
+    // This row is why the drift detector exists. Precision-weighting divides
+    // the learning rate by the variance, and a regime change is exactly the
+    // event that spikes it — so the gain used to collapse at the moment the
+    // belief most needed to move, and the prediction froze 17 days short.
+    //
+    // A two-sided CUSUM on clamped, slack-adjusted surprise now tells a drift
+    // from noise and lifts the weighting while the misses keep pointing the
+    // same way. The remaining gap is not the old bug: the detector spends
+    // three observations becoming convinced, deliberately, so that one
+    // container stuck in a port cannot buy a regime change — and this series
+    // only offers five after the jump. A real relationship offers more.
+    // `crates/domain/src/psyche/expectation.rs` has the tests that pin both
+    // directions.
     let regime = scored
         .iter()
         .find(|(s, _)| s.name == Series::REGIME_CHANGE.name)
@@ -298,14 +308,17 @@ pub fn evaluate() -> Surface {
     let stuck = truth_now - regime.final_prediction;
     rows.push(
         Row::ok(
-            "after a regime change, belief is stuck at",
+            "after a regime change, the belief reaches",
             format!(
                 "{:.1} days while reality is {truth_now:.0} ({stuck:+.0} out)",
                 regime.final_prediction
             ),
             Truth::Characterises,
         )
-        .note("adaptive gain collapses when variance spikes — it beats the claim but stops moving"),
+        .note(
+            "was +17 out before the drift detector; the rest is the three observations \
+             it spends refusing to mistake one outlier for a change",
+        ),
     );
 
     // --- the qualitative output a buyer actually reads ----------------------
