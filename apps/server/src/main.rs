@@ -84,6 +84,7 @@ use crate::error::ApiError;
 use crate::loops::outbox::{Handled, Handlers};
 use crate::loops::provisioning::ProvisioningLoop;
 use crate::routes::a2a::A2aState;
+use crate::routes::mcp::{Fleets, McpState};
 use crate::routes::webhooks::{Endpoint, Webhooks};
 
 /// Largest request body we will read. Bigger than any control-plane payload
@@ -213,10 +214,16 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         EngineConfig::default(),
     );
 
-    // One token for all three, cancelled by the same signal that stops the
+    // One token for all four, cancelled by the same signal that stops the
     // listener, so the loops drain *alongside* the HTTP surface rather than
     // after it.
     let cancel = CancellationToken::new();
+
+    // Every tenant's MCP bindings. Empty until the binder loop fills it, which
+    // is why nothing here awaits a bind: an MCP endpoint that is down must not
+    // delay a listener that has nothing else wrong with it. See
+    // `routes::mcp` for why binding is a loop and not a boot step.
+    let (fleets, rebinds) = Fleets::new();
 
     // The agent runtime, wired once and shared by every turn the outbox
     // dispatches. It hangs off the same token, so SIGTERM ends an in-flight
@@ -226,11 +233,21 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         llm,
         gate: gate.clone(),
         ports: ports.clone(),
+        fleets: fleets.clone(),
         model: config.llm.model(),
         cancel: cancel.clone(),
     };
 
     let loops = vec![
+        (
+            "mcp",
+            tokio::spawn(routes::mcp::run(
+                db.clone(),
+                fleets.clone(),
+                rebinds,
+                cancel.clone(),
+            )),
+        ),
         (
             "provisioning",
             tokio::spawn(ProvisioningLoop::new(db.clone(), engine.clone()).run(cancel.clone())),
@@ -262,7 +279,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
 
     let served = serve(
         listener,
-        app(db, &config, gate),
+        app(db, &config, gate, fleets),
         {
             let cancel = cancel.clone();
             async move {
@@ -323,7 +340,7 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
-fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
+fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -348,6 +365,7 @@ fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
             // which tells an operator "you have no numbers" when the truth is
             // "nobody configured this". It stays unmounted until the pool has a
             // source, and it keeps its `allow(dead_code)` to say so out loud.
+            .merge(routes::mcp::router(McpState::new(db.clone(), fleets)))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
         config.api_keys.clone(),
@@ -691,6 +709,13 @@ struct Agent {
     llm: Arc<dyn Llm>,
     gate: PolicyGate,
     ports: Arc<Ports>,
+    /// Every tenant's MCP bindings, kept current by the binder loop.
+    ///
+    /// Not folded into `ports`, and it cannot be: `Ports` is process-wide and
+    /// `McpCaller::call` is handed a tool, never a tenant. So the tenant's own
+    /// fleet is substituted into a per-turn copy of `Ports` in [`Agent::on_turn`]
+    /// — four `Arc` bumps and the one field that is genuinely per-tenant.
+    fleets: Fleets,
     /// Passed to the provider untouched. See [`agentos_app::mocks::LlmBackend`].
     model: &'static str,
     /// The process-wide shutdown token. Each turn takes a child of it under
@@ -797,10 +822,18 @@ impl Agent {
             .await;
 
             let principal = ActingAs::employee(event.tenant_id, employee_id);
+            // The one port that is per-tenant. An unbound tenant gets an empty
+            // fleet, which refuses every MCP call by name — the same answer the
+            // `NotConfigured` stub gives, arrived at without pretending the
+            // adapter is missing.
+            let ports = Arc::new(Ports {
+                mcp: self.fleets.for_tenant(event.tenant_id),
+                ..(*self.ports).clone()
+            });
             let turn = Turn::new(
                 self.llm,
                 self.gate,
-                Effects::new(self.db, self.ports, principal.clone()),
+                Effects::new(self.db, ports, principal.clone()),
                 principal,
                 prompt,
                 self.model,
@@ -1771,6 +1804,9 @@ mod tests {
                 llm,
                 gate: PolicyGate::new(self.db.clone(), PolicyBook::default()),
                 ports: Arc::new(agentos_app::mocks::ports()),
+                // No binder loop in this test, so every tenant's fleet is
+                // empty and every MCP call is refused by name.
+                fleets: Fleets::new().0,
                 model: "claude-opus-5",
                 cancel: cancel.clone(),
             };
@@ -2041,6 +2077,7 @@ mod tests {
             llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
             gate: PolicyGate::new(db.clone(), PolicyBook::default()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: Fleets::new().0,
             model: "claude-opus-5",
             cancel: cancel.clone(),
         };

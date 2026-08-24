@@ -1,0 +1,37 @@
+-- 0016_mcp_operator_writes: give the operator a door that is not psql.
+--
+-- 0013_mcp created `mcp_servers` and `mcp_tool_declarations` and then granted
+-- the runtime `select` only, with this reasoning (decision 3): "Operators write
+-- these tables through `Db::admin_tx_bypassing_rls`, which is the operator
+-- path." That was true when the only operator path was a database client. It is
+-- no longer the shape of this system:
+--
+--   * `apps/server/src/routes/mcp.rs` is now the operator path, and it is
+--     authenticated by an API key that already names a tenant. Every write it
+--     makes goes through `Db::tenant_tx`, so it runs as `app_role` with
+--     `app.tenant_id` set and the `tenant_isolation` policies from 0013 apply
+--     to it — WITH CHECK included, so a handler cannot file a row under a
+--     tenant that is not the key's even if it tries.
+--   * The alternative was for that route to reach for
+--     `admin_tx_bypassing_rls` and hand-write `WHERE tenant_id = $1`. That is
+--     strictly worse: it is the one construction in this codebase where
+--     forgetting a predicate is a cross-tenant read rather than a compile
+--     error, and `crates/store/src/db.rs` names exactly two legitimate callers
+--     (migrations and the outbox poller) precisely so a third cannot appear
+--     without an argument.
+--
+-- So the privilege moves, and RLS — not the absence of a GRANT — is what
+-- confines it. Same shape as 0012_org, where `teams`, `sections` and
+-- `team_memberships` are operator configuration written by `routes/teams.rs`
+-- through a tenant transaction.
+--
+-- What decision 3 was actually defending against is unchanged and is defended
+-- elsewhere: an AI employee cannot reach this. Employees act through
+-- `agentos_app::effects::Effects`, which has no method that writes a binding
+-- and no way to run arbitrary SQL, and the URL it would want is refused at
+-- `McpServer::bind` by the address check regardless of who wrote the row.
+--
+-- No new table, no new column, no `enabled` flag. Deleting the row is still how
+-- a binding is turned off.
+
+grant insert, update, delete on mcp_servers, mcp_tool_declarations to app_role;

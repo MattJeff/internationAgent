@@ -48,6 +48,16 @@
 //! one, and is the [`McpCaller`] behind
 //! [`Effects::call_tool`](crate::effects::Effects::call_tool).
 //!
+//! Those rows come from `apps/server/src/routes/mcp.rs`, which is the operator's
+//! door and the only writer. Two things about it are load-bearing here and are
+//! not this module's to enforce: a [`Declaration::digest`] is only ever accepted
+//! against a digest the server is serving *at that moment*, so a pin cannot be
+//! invented by someone who has not looked; and [`Fleet::bind`] is called from a
+//! background loop rather than from a request, because it resolves DNS and opens
+//! a connection. [`Fleet::failures`] is what that loop reports back — a server
+//! that will not bind is dropped from the fleet on purpose, and a drop nobody
+//! can see is a drop nobody can fix.
+//!
 //! [`Fleet::inventory`] is the other half, and it is the half that was missing:
 //! the turn loop offers ONE `call_mcp_tool` schema for every MCP tool on every
 //! server (see [`crate::turn`] for why that stays), so without a list of names
@@ -137,7 +147,7 @@ impl RiskClass {
     /// stored value cannot drift into two vocabularies. An unknown spelling is
     /// `None` — never a default — because every default here is a class
     /// somebody did not choose.
-    fn parse(raw: &str) -> Option<Self> {
+    pub fn parse(raw: &str) -> Option<Self> {
         [RiskClass::Read, RiskClass::Write, RiskClass::Destructive]
             .into_iter()
             .find(|class| class.code() == raw)
@@ -210,6 +220,26 @@ pub enum Reach {
     /// server running as a sidecar on the same host or the same VPC.
     /// Deliberately opt-in and deliberately per-binding.
     Private,
+}
+
+impl Reach {
+    /// The spelling `mcp_servers.reach` accepts back, and the one an operator
+    /// writes on the wire. Matches `mcp_servers_reach_known`.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Reach::Public => "public",
+            Reach::Private => "private",
+        }
+    }
+
+    /// Parse a stored or submitted spelling. `None` for anything else — the
+    /// caller decides, and every caller here decides [`Reach::Public`], which
+    /// is the one that refuses loopback.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Reach::Public, Reach::Private]
+            .into_iter()
+            .find(|reach| reach.code() == raw)
+    }
 }
 
 /// Where one resolved address sits.
@@ -361,6 +391,14 @@ pub struct BoundTool {
     /// answers only "did a human choose this string", which is what
     /// [`Fleet::inventory`] needs before it puts the string in a system prompt.
     declared: bool,
+    /// The digest of this tool **as the server is serving it right now**.
+    ///
+    /// Not the declared one: [`Declaration::digest`] is what a human vetted, and
+    /// the whole point is that the two are allowed to disagree. This is the
+    /// value an operator has to be shown before they can pin anything, which is
+    /// what [`McpServer::bind`] plus this field make possible without a
+    /// "refresh the digest" verb that would advance the baseline for them.
+    digest: [u8; 32],
 }
 
 impl BoundTool {
@@ -382,6 +420,16 @@ impl BoundTool {
     /// Whether an operator named this tool in their configuration.
     pub const fn is_declared(&self) -> bool {
         self.declared
+    }
+
+    /// The digest of the tool the server served at bind time.
+    ///
+    /// The operator's copy of this is what a [`Declaration`] pins. Showing it
+    /// is the only supported way to obtain one: nothing in this crate writes a
+    /// declaration, so a digest reaches the database only by a human reading
+    /// this and sending it back.
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
     }
 }
 
@@ -680,8 +728,9 @@ fn inventory(
         // existing fail-closed branch — Destructive, so a human sees it — rather
         // than adding a second way to refuse.
         let named_by_operator = declared.contains_key(&handle);
+        let served = digest(tool);
         let vetted = declared.get(&handle).and_then(|d| match d.digest {
-            Some(pinned) if pinned != digest(tool) => {
+            Some(pinned) if pinned != served => {
                 tracing::warn!(
                     tool = %tool.name,
                     "mcp tool no longer matches what the operator vetted; treating it as undeclared"
@@ -701,6 +750,7 @@ fn inventory(
                     .as_ref()
                     .map(|d| Untrusted::new(d.to_string())),
                 declared: named_by_operator,
+                digest: served,
             },
         );
     }
@@ -709,10 +759,12 @@ fn inventory(
 
 /// Parse and scheme-check. Rejects anything that is not http(s) with a host.
 ///
-/// `pub(crate)` for [`crate::peer_keys`], which fetches a peer's key directory
-/// and has exactly this problem. It reuses these two functions rather than
-/// growing a second SSRF check that will eventually disagree with this one.
-pub(crate) fn vet_url(raw: &str) -> Result<Url, McpError> {
+/// Public so an operator route can refuse `file:///etc/passwd` with a 400 at the
+/// moment it is typed, rather than storing it and letting the binder log a
+/// warning nobody is reading. It is *not* the SSRF check — that is
+/// [`resolve_and_vet`], it costs a DNS lookup, and it stays where the connection
+/// is made.
+pub fn vet_url(raw: &str) -> Result<Url, McpError> {
     let url = Url::parse(raw).map_err(|_| McpError::BadUrl(raw.to_owned()))?;
     if !ALLOWED_SCHEMES.contains(&url.scheme()) || url.host_str().is_none() {
         return Err(McpError::BadUrl(raw.to_owned()));
@@ -774,6 +826,22 @@ pub(crate) async fn resolve_and_vet(url: &Url, reach: Reach) -> Result<Vec<IpAdd
 #[derive(Debug, Default)]
 pub struct Fleet {
     servers: BTreeMap<Slug, McpServer>,
+    failures: BTreeMap<Slug, BindFailure>,
+}
+
+/// Why one configured server is not in the fleet.
+///
+/// Kept rather than only logged, because "my tools stopped working" is answered
+/// by *this* string and the operator cannot read the deployment's logs. A
+/// dropped binding is otherwise indistinguishable from a server nobody
+/// configured, which is the failure mode that makes people restart pods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindFailure {
+    /// [`McpError::code`]: stable, low cardinality, safe on a metric.
+    pub code: &'static str,
+    /// The whole error, rendered. Names the address that was refused, the host
+    /// that would not resolve, the two tool names that collided.
+    pub detail: String,
 }
 
 /// What one row of `mcp_servers` joined to its declarations looks like.
@@ -810,6 +878,7 @@ impl Fleet {
     pub const fn empty() -> Self {
         Self {
             servers: BTreeMap::new(),
+            failures: BTreeMap::new(),
         }
     }
 
@@ -823,6 +892,7 @@ impl Fleet {
                 .into_iter()
                 .map(|server| (server.server.clone(), server))
                 .collect(),
+            failures: BTreeMap::new(),
         }
     }
 
@@ -864,11 +934,7 @@ impl Fleet {
                 // An unrecognised spelling is the tight one. `mcp_servers_reach_known`
                 // makes it unreachable; if that CHECK is ever dropped, this is
                 // still the answer that refuses loopback.
-                reach: if row.reach == "private" {
-                    Reach::Private
-                } else {
-                    Reach::Public
-                },
+                reach: Reach::parse(&row.reach).unwrap_or_default(),
                 declared: BTreeMap::new(),
             });
             if let Some((handle, declaration)) = declaration(&row) {
@@ -877,6 +943,7 @@ impl Fleet {
         }
 
         let mut servers = BTreeMap::new();
+        let mut failures = BTreeMap::new();
         for (name, binding) in configured {
             match McpServer::bind(
                 name.clone(),
@@ -890,14 +957,34 @@ impl Fleet {
                 Ok(server) => {
                     servers.insert(name, server);
                 }
-                Err(err) => tracing::warn!(
-                    server = %name,
-                    code = err.code(),
-                    "mcp server did not bind; its tools are not available this turn: {err}"
-                ),
+                Err(err) => {
+                    tracing::warn!(
+                        server = %name,
+                        code = err.code(),
+                        "mcp server did not bind; its tools are not available this turn: {err}"
+                    );
+                    failures.insert(
+                        name,
+                        BindFailure {
+                            code: err.code(),
+                            detail: err.to_string(),
+                        },
+                    );
+                }
             }
         }
-        Ok(Self { servers })
+        Ok(Self { servers, failures })
+    }
+
+    /// Whether this handle is bound. A server with no *declared* tools still
+    /// answers `true`, which is why this is not "does `inventory` mention it".
+    pub fn is_bound(&self, server: &Slug) -> bool {
+        self.servers.contains_key(server)
+    }
+
+    /// Every configured server that did not bind, and why.
+    pub const fn failures(&self) -> &BTreeMap<Slug, BindFailure> {
+        &self.failures
     }
 
     /// Every tool an operator named, on every server that bound, with its blast
@@ -1753,9 +1840,131 @@ mod tests {
         // check refuses — on the production path, not only in a unit test. The
         // binding is dropped and the turn keeps going with no tools from it.
         configure("public").await;
+        let refused = bind().await;
         assert!(
-            bind().await.inventory().is_empty(),
+            refused.inventory().is_empty(),
             "a binding that fails the address check must not be usable"
+        );
+
+        // ... and the operator is told which address, not just that it failed.
+        // A binding that silently disappears is indistinguishable from one
+        // nobody configured, which is the state people restart pods over.
+        let failure = &refused.failures()[&erp()];
+        assert_eq!(failure.code, "blocked_address");
+        assert!(failure.detail.contains("127.0.0.1"), "{failure:?}");
+        assert!(!refused.is_bound(&erp()));
+    }
+
+    /// **The pin outranks the gate.** A tool whose digest no longer matches is
+    /// not merely reclassified — the refusal survives a Policy Gate that has
+    /// already said `Allow`, and it happens before the server is contacted.
+    ///
+    /// This is the assertion that makes the whole scheme worth its complexity.
+    /// `allowed_mcp_tools` is keyed by NAME, and so is every other check in this
+    /// system; a tool that changed under the operator passes all of them. If the
+    /// binding did not refuse independently, the digest would be a warning label
+    /// rather than a control.
+    #[tokio::test]
+    async fn a_stale_pin_refuses_a_call_the_gate_already_authorised() {
+        use std::collections::BTreeSet;
+
+        use agentos_domain::ids::EmployeeId;
+        use agentos_domain::policy::PolicyLimits;
+
+        use crate::effects::{Effects, McpCall};
+        use crate::gate::{PolicyBook, PolicyGate, Principal as ActingAs};
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the gate path needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // A tenant with one active employee. Nothing else: an MCP call moves no
+        // money, so there are no caps to seed.
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee = EmployeeId::new_v7(now);
+        let label = format!("pin-{}", employee.as_uuid().simple());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'lena', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit seed");
+
+        // The gate is told this exact tool is allowed — by name, which is the
+        // only thing a policy allowlist can say.
+        let gate = PolicyGate::new(
+            db.clone(),
+            PolicyBook::new(PolicyLimits {
+                allowed_mcp_tools: BTreeSet::from([call("lookup")]),
+                ..PolicyLimits::default()
+            }),
+        );
+        let principal = ActingAs::employee(tenant, employee);
+
+        // The server serves a `lookup` with a `callback_url` the operator never
+        // read; the declaration pins the one they did.
+        let mut widened = JsonObject::new();
+        widened.insert("callback_url".into(), json!({ "type": "string" }));
+        let served = Tool::new("lookup".to_owned(), "a tool".to_owned(), Arc::new(widened));
+        let server = FakeMcp::start(vec![vec![served]]).await;
+        let vetted = tool("lookup");
+        let stale = Fleet::new([bound_with(
+            &server,
+            BTreeMap::from([(
+                slug("lookup"),
+                Declaration {
+                    risk: RiskClass::Read,
+                    digest: Some(digest(&vetted)),
+                },
+            )]),
+        )
+        .await]);
+
+        let mut ports = crate::mocks::ports();
+        ports.mcp = Arc::new(stale);
+        let effects = Effects::new(db, Arc::new(ports), principal.clone());
+
+        // The gate says yes. It is not wrong — `erp/lookup` is on the
+        // allowlist, and a name is all it has.
+        let authorized = gate
+            .authorize(
+                &principal,
+                McpCall {
+                    tool: call("lookup"),
+                },
+            )
+            .await
+            .expect("the policy allows this tool by name");
+
+        // And the call still does not happen.
+        let err = effects
+            .call_tool(authorized, &json!({ "q": "acme" }))
+            .await
+            .expect_err("a gate ruling cannot revive a declaration that no longer matches");
+        assert_eq!(err.code(), "refused");
+        assert!(
+            !err.is_retryable(),
+            "retrying a refusal only spends the turn's budget"
+        );
+        assert_eq!(
+            server.count("tools/call"),
+            0,
+            "the refusal must precede the request, not follow it"
         );
     }
 }
