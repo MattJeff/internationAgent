@@ -1,15 +1,77 @@
 # Porting MPCP: fidelity audit and integration map
 
-**Status:** normative for the psyche port. Written against `mpcp.py` @ 3836 lines
-(24 Jul 2026), `PROJET.md`, `FONDEMENTS_SCIENTIFIQUES.md`, `VERS_ORIZN.md`,
-`CARTOGRAPHIE_COMPORTEMENT.md` and the measured run artifacts (`run30_j43.json`,
-`pardon_ab40.json`, `mille_run_v4_complete/`, `mille_run_v5_civilisation/`).
+**Status: this is the design note that was written _before_ the port, and the
+port shipped differently. Read §"What actually shipped" first; everything after
+it is a proposal, in a normative voice, that the code did not follow in full.**
+
+Written against `mpcp.py` @ 3836 lines (24 Jul 2026), `PROJET.md`,
+`FONDEMENTS_SCIENTIFIQUES.md`, `VERS_ORIZN.md`, `CARTOGRAPHIE_COMPORTEMENT.md`
+and the measured run artifacts (`run30_j43.json`, `pardon_ab40.json`,
+`mille_run_v4_complete/`, `mille_run_v5_civilisation/`). **None of those files
+are in this repository**, so every `mpcp.py:NNN` line reference below is
+unverifiable from here. Kept because the reasoning is the value; treat the
+citations as provenance, not as something you can check.
 
 This document exists so that in six months nobody has to guess why a constant is
 `0.4`. It is an audit, not a summary: where the source model looks over-fitted to
 a village simulation, or plainly wrong for a purchasing agent, it says so.
 
-Line references are `mpcp.py:NNN` against that revision.
+---
+
+## What actually shipped
+
+Four modules under `crates/domain/src/psyche/`, and **nothing calls them from
+`crates/app` or `apps/server`.** The only callers anywhere are
+`crates/eval/src/expectation.rs` (an offline harness that is not a dependency of
+the server) and one integration test. `crates/store/src/psyche.rs` likewise has
+no production caller.
+
+So §0's invariant — the psyche never reaches `policy::evaluate` — holds, but it
+holds trivially: **the psyche is library-only today.** It is a fully tested,
+fully deterministic model with no seam into the running system yet. Read the
+rest of this file as the map for building that seam, not as a description of one.
+
+### The names, so you are not searching for types that do not exist
+
+| This document proposes | The code has |
+|---|---|
+| `Psyche` with `ingest` / `tick` / `tone` / `rank` / `why` | no `Psyche` type at all — `psyche/mod.rs` is four `pub mod` lines |
+| `Mood { valence, activation, friction }`, `Axis`, `Bounded01` | `Ledger::resting_friction() -> f64` (`forgetting.rs`); no mood vector, no newtype |
+| `Disposition`, `DriftPressure`, `drift()` | not ported |
+| `enum Observation` + `deltas() -> &[(Axis, f64)]` | `links::TrustEvent`, 3 variants, `const fn delta(self) -> f64` |
+| `Belief { episodes, lived, formed_at, revived_at }` | `beliefs::Belief { episode_count, first_hand, last_reinforced_at, sources }` |
+| `Relationship { trust, broken_at }` keyed by `SubjectRef` | `links::TrustLink { confidence, broken_at }` keyed by `Slug` |
+| `Expectation` keyed by `(ObservationKind, SubjectRef)` | `ExpectationBook` keyed by `(Slug, Dimension)`; `Dimension` is `LeadTimeDays, PriceDeltaBps, ResponseLatencyHours, MoqFlexibilityPct, DefectRatePct` |
+| `Intent`, `effective_priority()` | not ported — the psyche exposes **no prioritisation surface**, so "PRIORITISATION" in §0 is aspirational |
+| `tone() -> Tone` | no `Tone`; nearest are `forgetting::Stance` and `links::Standing` |
+| `why(&SubjectRef) -> Vec<Genealogy>` | `BeliefJournal::why(&Subject) -> Provenance` |
+| `state_hash()`, `PsycheOp`, `replay(ops)` | none; determinism is asserted by tests instead |
+| `expunge(supplier, reason, actor)` | not ported, and `psyche_episodes` is append-only by trigger — **there is no reset path at all** |
+| `revisit()` / `HABITUATION` | not ported |
+| salience weights `W1..W5`, `KR` | no salience function |
+
+### Prescriptions here that the code deliberately did not follow
+
+Four are worth knowing before you read the argument for them:
+
+- **The tick anchor was not re-derived.** §"Time" argues every tick-denominated
+  constant must be re-scaled to `1 tick = 1 hour`. The code kept MPCP's village
+  clock verbatim: `DERIVE_SECONDS = 1_440` (24 minutes), `GRACE_DERIVES = 180`
+  (3 days), `FADE_PER_DERIVE = 0.0005`.
+- **`SURPRISE_MIN` was not lowered to 0.25.** It is 0.5, in two places
+  (`forgetting.rs` and `expectation.rs::SURPRISE_FLOOR`).
+- **Consolidation skips resolved episodes** rather than consolidating on a time
+  window regardless of resolution, which is the opposite of what §"Beliefs"
+  argues for and is precisely the "misanthropy generator" it warns about. If you
+  are going to change one thing in the psyche, this is the one to think about.
+- **Precision is `1/(1 + K·var/scale²)`**, not the `1/(1 + K·var)` written here,
+  and low-evidence shrinkage is "`None` below 2 observations" rather than an
+  `n/(n+N0)` prior — `CONF_N0` was not ported.
+
+Constants that **were** ported exactly, and are worth not re-litigating:
+`N_CONSOLIDATION = 3`, `MAX_SUBJECTS = 8`, the `0.25·Σmin(w,2)` strength
+formula, `MISTRUST_FLOOR = 0.4`, `SHOCK_ABSORBER = 0.85`, `BREAKABLE_FROM =
+0.6`, and the ×2 / ×0.5 / ×1.5 appraisal weights.
 
 ---
 
@@ -47,16 +109,26 @@ identity→trace→grudge→reputation→identity loop (`mpcp.py:678-681`, comme
 "MUR 5, F4"). Their firewall sits between identity and dynamics. Ours sits
 between psyche and authorisation. Same shape, higher stakes.
 
-**Cheapest honest enforcement** (do this, it is one line of CI):
+**Cheapest honest enforcement** (one line of CI):
 
 ```sh
-! grep -riE 'psyche|mood|affect' crates/domain/src/policy.rs
+! grep -riE 'psyche|mood|affect' crates/domain/src/policy.rs crates/domain/src/action.rs
 ```
+
+**Neither this guard nor any equivalent is in CI today** — `.github/workflows/ci.yml`
+and `scripts/test.sh` contain no such grep, and the psyche shipped without it.
+
+And note the file list above has been corrected: the original version of this
+document grepped `policy.rs` alone, but **`ActionCtx` is defined in
+`crates/domain/src/action.rs`**, so a psyche field on `ActionCtx` — the exact
+temptation §0 names — would have sailed straight past it. A guard aimed at the
+wrong file is worse than no guard, because it reads as coverage.
 
 A trybuild `tests/ui/` case would be prettier and this repo already has that
 pattern (`gate_forge_literal.rs`, `prompt_secret_in_prompt.rs`), but a negative
-grep on one file cannot be defeated by a clever type. Prefer the grep; add the
-trybuild case if someone tries to route around it.
+grep cannot be defeated by a clever type. Add the grep when the psyche gets its
+first production caller; that is the commit where the invariant stops being
+trivially true.
 
 ---
 
@@ -905,12 +977,15 @@ does not implement `Deserialize` and its resource map is total by construction,
 and a psyche has different persistence needs (oplog + checkpoint). Do not touch
 `employee.rs`.
 
-**Subjects.** `SubjectRef` is the join key to the supplier world. Until a
-supplier type exists in `domain` (today `grep -ri supplier crates/` hits only
-test fixtures in `app/src/effects.rs`), key on the identity the system already
-has: the parsed `EmailAddress` / `Domain` / `E164` a counterparty is reached at,
-or a `Slug`. Do not invent a `SupplierId` in the psyche module; whoever owns the
-supplier model owns that type.
+**Subjects.** The join key to the supplier world. This section argued for a
+`SubjectRef` newtype and against inventing a `SupplierId` in the psyche module,
+on the grounds that no supplier type existed yet.
+
+That premise is now stale: `crates/domain/src/sourcing.rs` defines `SupplierId`
+and `Supplier`, with a store layer and `migrations/0007_sourcing.sql` behind
+them. The advice survived it anyway — the psyche keys on `Slug`, not on
+`SupplierId`, so the two models are still not coupled and whoever owns the
+supplier model still owns that type.
 
 **Read path (allowed).**
 
@@ -935,8 +1010,9 @@ psyche ──X──► any Money that reaches an Action
 matches every `Action` variant with no `_` arm — adding a field there is a
 compile error by design. That mechanism protects against *forgetting* a policy
 field. It does not protect against *adding* a psyche field, because that would
-compile fine. Hence the grep in §0. Add it to CI in the same PR as the first
-psyche module, not later.
+compile fine. Hence the grep in §0 — which was **not** added in the same PR as
+the psyche modules, and is still not in CI. Add it in the PR that gives the
+psyche its first production caller.
 
 **Where the psyche's output is untrusted.** The psyche is host-derived state, so
 it is trusted *as data*. But anything free-text it produces (were the descriptor

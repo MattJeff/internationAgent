@@ -46,6 +46,7 @@
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Health, Lifecycle, ProviderBinding, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, Slug};
+use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, NewEvent};
 use agentos_store::{employee as employee_store, employee::StoredEmployee};
@@ -246,10 +247,11 @@ async fn create(
         now,
     );
 
-    // One transaction: the row, its eleven pending resources, and the event
-    // that makes somebody go and provision them. A subscriber can never see the
-    // event for an employee that was rolled back, and an employee can never
-    // exist with nobody coming for it.
+    // One transaction: the row, its eleven pending resources, the event that
+    // makes somebody go and provision them, and the audit row. A subscriber can
+    // never see the event for an employee that was rolled back, an employee can
+    // never exist with nobody coming for it, and the trail can never claim a
+    // hire that did not happen.
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     employee_store::insert(&mut tx, &employee).await?;
     outbox::enqueue(
@@ -266,6 +268,21 @@ async fn create(
             ..NewEvent::new(AGGREGATE, employee.id().as_uuid(), CREATED_EVENT)
         },
         now,
+    )
+    .await?;
+    // The outbox row is a work item — claimed, completed, eventually reaped —
+    // and it does not carry an actor. This is the only durable record of *who*
+    // minted an employee that will go on to buy a phone number and a domain.
+    audit::append(
+        &mut tx,
+        &AuditEvent {
+            employee_id: Some(employee.id()),
+            payload: json!({
+                "slug": employee.slug().as_str(),
+                "domain": employee.domain().as_str(),
+            }),
+            ..AuditEvent::new(principal.actor.clone(), AuditKind::EmployeeCreated, now)
+        },
     )
     .await?;
     tx.commit().await?;
@@ -433,6 +450,23 @@ async fn set_lifecycle(
         now,
     )
     .await?;
+    // Same transaction as the `employees` row this moved. A suspension is what
+    // the Policy Gate checks before it reads any policy at all, so "who
+    // suspended this employee, and when" is a security question — and the
+    // `employees` row itself only ever holds the *current* lifecycle.
+    audit::append(
+        &mut tx,
+        &AuditEvent {
+            employee_id: Some(id),
+            payload: json!({ "from": from.as_str(), "to": to.as_str() }),
+            ..AuditEvent::new(
+                principal.actor.clone(),
+                AuditKind::EmployeeLifecycleChanged,
+                now,
+            )
+        },
+    )
+    .await?;
     tx.commit().await?;
 
     tracing::info!(%id, %from, %to, "lifecycle changed");
@@ -531,6 +565,18 @@ mod tests {
                 status,
                 serde_json::from_slice(&bytes).unwrap_or(Value::Null),
             )
+        }
+
+        /// One employee's audit trail, as `audit::trail_for_employee` reads it.
+        async fn trail(&self, tenant: TenantId, id: EmployeeId) -> Vec<(String, String, Value)> {
+            let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
+            let rows = audit::trail_for_employee(&mut tx, id, 100)
+                .await
+                .expect("read trail");
+            tx.rollback().await.expect("rollback");
+            rows.into_iter()
+                .map(|r| (r.action_kind, r.actor, r.payload))
+                .collect()
         }
 
         async fn count_employees(&self, tenant: TenantId) -> i64 {
@@ -1065,6 +1111,97 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(problem["code"], "illegal_lifecycle");
+
+        h.teardown().await;
+    }
+
+    // -- the trail ---------------------------------------------------------
+
+    /// Both non-action variants this module writes, produced by the real
+    /// handlers over the real router — no hand-inserted fixture, because a
+    /// fixture would prove the table accepts a row rather than that anybody
+    /// writes one.
+    ///
+    /// It also pins the two things that make the row worth having: the actor is
+    /// the API key that acted, and the lifecycle row says where the employee
+    /// came *from* — which the `employees` row itself no longer holds once it
+    /// has moved.
+    #[tokio::test]
+    async fn creating_and_moving_an_employee_leave_their_own_audit_rows() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key("audit")),
+                Some(body("nadia")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = EmployeeId::from_uuid(
+            created["id"]
+                .as_str()
+                .expect("id")
+                .parse()
+                .expect("employee uuid"),
+        );
+
+        let trail = h.trail(h.a, id).await;
+        assert_eq!(trail.len(), 1, "one create, one row: {trail:?}");
+        assert_eq!(trail[0].0, "employee_created");
+        assert_eq!(trail[0].1, "operator:ops-a", "the key that acted");
+        assert_eq!(trail[0].2["slug"], "nadia");
+        assert_eq!(trail[0].2["domain"], "agents.example.com");
+
+        // Activate it the way the provisioning engine does, so suspend is legal.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let StoredEmployee {
+            mut employee,
+            version,
+        } = employee_store::load(&mut tx, id).await.expect("load");
+        employee
+            .set_lifecycle(Lifecycle::Active, Utc::now())
+            .expect("activate");
+        employee_store::update(&mut tx, &employee, version)
+            .await
+            .expect("update");
+        tx.commit().await.expect("commit");
+
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{}/suspend", id.as_uuid()),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let trail = h.trail(h.a, id).await;
+        assert_eq!(trail.len(), 2, "create then suspend: {trail:?}");
+        assert_eq!(trail[1].0, "employee_lifecycle_changed");
+        assert_eq!(trail[1].1, "operator:ops-a");
+        assert_eq!(trail[1].2["from"], "active");
+        assert_eq!(trail[1].2["to"], "suspended");
+
+        // A refused move writes nothing: the transaction never reaches commit,
+        // which is the whole reason the row is appended inside it.
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{}/terminate", id.as_uuid()),
+                SECRET_B,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(h.trail(h.a, id).await.len(), 2, "a 404 leaves no row");
 
         h.teardown().await;
     }

@@ -43,6 +43,25 @@ What follows from that, and it is the sentence to remember:
 > already permits. `denied_domains` is the one field that *unions* — a lower
 > layer can always add a block, never remove one.
 
+> ### Before you configure anything: the loader is not on the hot path
+>
+> `store::policy::load` behaves exactly as described, and it is tested. But
+> **the Policy Gate does not call it.** `apps/server/src/main.rs` builds
+> `PolicyGate::new(db, PolicyBook::default())` — an in-memory book holding the
+> empty platform layer, with the *employee* layer folded into the role slot.
+>
+> So on today's build, everything you write into `policy_layers` is read by
+> exactly two things: `GET /v1/employees/{id}/turns`, and the initiative loop's
+> turn-budget reservation. **The turn budget is genuinely enforced. No other cap
+> in this document is**, because the gate that would enforce it is loaded with a
+> book that grants nothing — which means it denies every agent-initiated side
+> effect regardless of what you configure.
+>
+> That is the correct failure direction and it is still not enforcement.
+> Configure the layers anyway: they are the thing that becomes live the moment
+> `main.rs` loads them, and that is a one-function change. See the **Known gap**
+> at the end of this file for the second half of the same problem.
+
 Two more consequences that surprise people:
 
 * **A team with no `policy_layers` row is not a team that may do nothing.** It is
@@ -171,7 +190,9 @@ This is the half that pays for the org layer. Each employee already has its own
 cap (`0003_spend`), but ten employees on one team can each be under their own
 cap and jointly blow the team's budget, and every individual decision looks
 correct in the logs. So the team budget is **reserved** under a row lock, not
-checked.
+checked — by `store::org::reserve`, which is written and tested and which
+nothing on the payment path currently calls. Read the **Known gap** at the end
+before you rely on the number you are about to set.
 
 ```sh
 # Purchasing: $5,000 a day, across the whole team.
@@ -340,14 +361,29 @@ SELECT occurred_at, actor, payload ->> 'event' AS event, payload
 `decision_id` is null on all of them, and that is honest: no Policy Gate ruling
 authorised these. They are an operator's key acting directly.
 
-## Known gap
+## Known gaps
 
-The budget you set here is stored, read and reported correctly, and
-`store::org::reserve` enforces it under a row lock — but the Policy Gate's
-payment path (`crates/app/src/gate.rs`) still calls `spend::reserve`, which
-takes the *employee's* headroom only. **Until that call site moves to
-`org::reserve`, a team's daily budget is configuration that nothing on the hot
-path checks.** Per-employee caps are enforced today; the team ceiling is not.
+Two, and they are the same gap seen from two sides: the org layer is fully
+built, fully tested, and has no reader in the running binary.
+
+**The team budget is not checked.** It is stored, read and reported correctly,
+and `store::org::reserve` enforces it under a row lock — but the Policy Gate's
+payment path (`crates/app/src/gate.rs`) calls `spend::reserve`, which takes the
+*employee's* headroom only. `org::reserve` has **no non-test call site**. Until
+that call moves, a team's daily budget is configuration nothing on the hot path
+checks. Per-employee caps are enforced; the team ceiling is not.
+
+**The team's limits are not read at all.** The gate uses an in-memory
+`PolicyBook` and never calls `store::policy::load`, so `policy_layers` — the
+`role` layer this whole document points teams at — reaches the gate through no
+path. `main.rs` constructs the book as `PolicyBook::default()`, the empty
+platform layer, which denies everything. The only live readers of the loader are
+`GET /v1/employees/{id}/turns` and the initiative loop's turn budget, which is
+therefore the one limit in this document that genuinely holds today.
+
+Both are fixed in `main.rs` plus `PolicyBook::effective`, and nothing else has
+to change. Until then, read a configured limit here as *the value that will take
+effect*, not as one that is taking effect.
 
 ## Endpoint summary
 

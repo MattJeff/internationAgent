@@ -92,6 +92,27 @@ impl AuditActor {
 /// restating it, so the audit vocabulary for actions cannot drift from the
 /// vocabulary the Policy Gate rules on. The remaining variants are the events
 /// that are not actions: things that happen *to* an employee.
+///
+/// That sentence is the admission test, and two variants that used to sit here
+/// failed it. Both were things the employee *did*, both already had an
+/// [`ActionKind`], and neither had a writer:
+///
+/// * `ApprovalRequested` — `app::gate` writes exactly one row per outcome, and
+///   for an escalation that row is `Action(kind)` with `decision =
+///   require_approval`, the [`ApprovalReason`](agentos_domain::policy::ApprovalReason)
+///   code in `deny_reason_code`, and `approval_id` / `approval_summary` in the
+///   payload. A second row would say less (no `decision_id` of its own) and
+///   would break the invariant the gate's one `append` call site exists to
+///   hold.
+/// * `MessageSent` — recorded twice already: the gate's `Action(EmailSend |
+///   SmsSend | WhatsappSend | CallPlace | A2aSend)` row carries the ruling that
+///   permitted it, and `app::effects` writes [`AuditKind::ProviderCallAttempted`]
+///   with the same `decision_id`, the outcome, and the provider's message id.
+///
+/// [`AuditKind::MessageReceived`] is deliberately *not* symmetric with them: an
+/// inbound message is not an action, nothing rules on it, and before
+/// `app::inbound::land` wrote this row the trail had no record that a stranger
+/// had reached the employee at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditKind {
@@ -99,13 +120,20 @@ pub enum AuditKind {
     /// `decision_id` — an action row with no decision is the exact gap this
     /// module is meant to close.
     Action(ActionKind),
+    /// An employee was accepted. Written by `routes::employees::create`, in the
+    /// transaction that inserts the row and enqueues its provisioning event.
     EmployeeCreated,
+    /// An employee was suspended or terminated. Written by
+    /// `routes::employees::set_lifecycle`. The gate refuses a non-active
+    /// employee before it reads any policy, so who moved it and when is a
+    /// security fact and not an operational one.
     EmployeeLifecycleChanged,
     ResourceStateChanged,
-    ApprovalRequested,
     ApprovalDecided,
+    /// A message arrived. Written by `app::inbound::land`, in the transaction
+    /// that inserts the `messages` row and wakes the agent, so the trail cannot
+    /// claim a message the conversation does not have.
     MessageReceived,
-    MessageSent,
     /// An employee signed a payload with its own key. A signature is an
     /// assertion made in the company name, so it leaves a row like any other.
     MessageSigned,
@@ -122,10 +150,8 @@ impl AuditKind {
             AuditKind::EmployeeCreated => "employee_created",
             AuditKind::EmployeeLifecycleChanged => "employee_lifecycle_changed",
             AuditKind::ResourceStateChanged => "resource_state_changed",
-            AuditKind::ApprovalRequested => "approval_requested",
             AuditKind::ApprovalDecided => "approval_decided",
             AuditKind::MessageReceived => "message_received",
-            AuditKind::MessageSent => "message_sent",
             AuditKind::MessageSigned => "message_signed",
             AuditKind::ProviderCallAttempted => "provider_call_attempted",
             AuditKind::SecretAccessed => "secret_accessed",
@@ -531,7 +557,7 @@ mod tests {
             AuditKind::EmployeeCreated,
             AuditKind::ResourceStateChanged,
             AuditKind::MessageReceived,
-            AuditKind::MessageSent,
+            AuditKind::MessageSigned,
             AuditKind::EmployeeLifecycleChanged,
         ];
         for (tick, kind) in kinds.into_iter().enumerate() {
@@ -550,7 +576,7 @@ mod tests {
             &mut tx,
             &AuditEvent {
                 employee_id: Some(colleague),
-                ..AuditEvent::new(AuditActor::System, AuditKind::MessageSent, at(T0 + 99))
+                ..AuditEvent::new(AuditActor::System, AuditKind::MessageReceived, at(T0 + 99))
             },
         )
         .await

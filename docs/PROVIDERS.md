@@ -12,9 +12,18 @@ code shortens.
 
 `apps/server/src/main.rs` builds its adapters with
 `agentos_app::mocks::ports()` and `agentos_app::mocks::adapters()`,
-unconditionally. Real Resend and Twilio clients exist in `agentos-providers`,
-are complete, and are tested against hermetic HTTP servers — but nothing
-constructs them. Only the model is chosen at runtime, by `AGENTOS_LLM`.
+unconditionally. Real Resend, Twilio and Browserbase clients exist in
+`agentos-providers`, are complete, and are tested against hermetic HTTP servers —
+but `ResendEmailProvider::new`, `TwilioTelephony::new` and
+`BrowserbaseBrowser::new` appear only inside that crate's own test modules.
+Nothing else constructs them. Only the model is chosen at runtime, by
+`AGENTOS_LLM`.
+
+One thing in `mocks::adapters()` is **not** a mock: the envelope cipher.
+`AGENTOS_MASTER_KEY` is threaded into a real `LocalEnvelopeSecretStore`, because
+`Step::Identity` mints a real Ed25519 keypair and seals its private half into a
+database column. A mock provider that invents a phone number costs nothing; a
+mock cipher costs an identity.
 
 So `EMAIL_API_KEY`, `TELEPHONY_API_KEY`, `BROWSER_API_KEY` and
 `EMBEDDER_API_KEY` do exactly one thing: they satisfy the boot guard in
@@ -28,7 +37,7 @@ sent.
 | local `claude` CLI | yes — `llm_cli.rs` | **yes** | none — `AGENTOS_LLM=cli` |
 | **Resend** | yes — `email_resend.rs` | no | `EMAIL_API_KEY` gates the boot guard only |
 | **Twilio** | yes — `telephony_twilio.rs` | no | `TELEPHONY_API_KEY` gates the boot guard only |
-| **Browserbase** | **no adapter at all** | no | `BROWSER_API_KEY` gates the boot guard only |
+| **Browserbase** | yes — `browser_browserbase.rs` + `cdp.rs` | no | `BROWSER_API_KEY` gates the boot guard only |
 | Meta WhatsApp | no adapter at all | no | — |
 | embedder | mock only (a SHA-256 hash) | n/a | `EMBEDDER_API_KEY` gates the boot guard only |
 | MCP | none — refuses | n/a | — |
@@ -366,19 +375,37 @@ deadline exists.
 browser context per employee, so it can stay logged into a supplier portal
 between tasks.
 
-**Status: there is no Browserbase adapter.** The `BrowserProvider` trait exists
-and `MockBrowser` implements it. `BROWSER_API_KEY` gates the boot guard and
-nothing else. Nothing in this repository has ever talked to Browserbase.
+**Status: real adapter written and tested; not constructed by the server.**
+`BrowserbaseBrowser` (`crates/providers/src/browser_browserbase.rs`) implements
+`BrowserProvider` against `https://api.browserbase.com` — `POST /v1/contexts`
+then `POST /v1/sessions` — and then drives the session over **CDP** through our
+own websocket driver, `CdpWebsocket` (`crates/providers/src/cdp.rs`): `goto`,
+`fill`, `screenshot`, `expect_hit`, `evaluate`.
 
-### If you are opening the account anyway
+The websocket client is `tokio-tungstenite` and the choice is deliberate: CDP is
+JSON-RPC over a websocket and Browserbase launches Chrome for us, so a websocket
+client is all that is needed — `chromiumoxide` would bring a whole browser model
+we never drive.
+
+The `browser` provisioning step still runs against `MockBrowser`, because
+`main.rs` builds `mocks::adapters()`.
+
+### The account
 
 1. [browserbase.com](https://www.browserbase.com) → create a project.
 2. **Settings** → copy the **API key** and the **Project ID**. Both are needed;
-   the API key alone is not enough.
+   `BrowserbaseBrowser::new(project_id, api_key)` takes both, and the API key
+   alone is not enough.
 3. Today: `BROWSER_API_KEY` for the boot guard. There is nowhere for the project
-   id to go.
+   id to go until the adapter is wired.
 
 No human review is involved. This one is credentials-and-go.
+
+**The shared `BrowserProvider` contract suite is private to `browser.rs` and is
+run against `MockBrowser` only** — `BrowserbaseBrowser` has its own tests against
+a hermetic HTTP server but never invokes the suite. Making a vendor swap
+*provable* rather than hopeful means making that suite `pub` and running it, the
+way `EmailProvider`'s is.
 
 ### Why the trait looks the way it does
 
@@ -451,8 +478,17 @@ seeing `not_configured`, the system is working.
 
 ## The two contracts every adapter must satisfy
 
-If you wire one of the above in, or write a new one, these are not optional. The
-shared contract suite in `agentos-providers` tests them.
+If you wire one of the above in, or write a new one, these are not optional.
+
+There is a shared contract suite per trait in `agentos-providers` — but be clear
+about what it currently proves. **Every suite runs against the mock; none of
+them runs against the real adapter.** `SecretStore`'s is the only one exercised
+by two implementations. `EmailProvider`'s is the only one that is `pub` and
+therefore even callable from another module; `TelephonyProvider`'s and
+`BrowserProvider`'s are private to their own `mod tests`. The real adapters have
+their own hand-written tests against hermetic HTTP servers, which is good but is
+not the same guarantee. Making a vendor swap provable means running the suite
+against both.
 
 ### Reconcile before create
 

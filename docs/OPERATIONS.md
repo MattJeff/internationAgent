@@ -80,11 +80,12 @@ They are written `IF NOT EXISTS` / `DROP`-then-`CREATE` and are replayable.
 
 ### 1.4 The tenant row you have to insert yourself
 
-**There is no endpoint that creates a tenant.** The routes are employees,
-approvals, webhooks and A2A, and nothing else. `AGENTOS_API_KEYS` names a
-tenant UUID; `employees.tenant_id` has a foreign key to `tenants(id)`. If the
-row is missing, `POST /v1/employees` fails on the FK and you will spend twenty
-minutes wondering why.
+**There is no endpoint that creates a tenant.** There are routes for employees,
+initiative, turns, approvals, teams, inventory, knowledge, the phone pool, MCP,
+A2A and webhooks — and none for tenants. `AGENTOS_API_KEYS` names a tenant UUID;
+`employees.tenant_id` has a foreign key to `tenants(id)`. If the row is missing,
+`POST /v1/employees` fails on the FK and you will spend twenty minutes wondering
+why. `SPEC.md` §20 is the full route table.
 
 ```sql
 INSERT INTO tenants (id, slug, name)
@@ -165,7 +166,17 @@ cross-tenant by nature (the outbox poller reads every tenant's rows — that is
 its job), so two packages sharing one database see each other's fixtures and
 fail for reasons that have nothing to do with the code. `scripts/test.sh`
 creates one database per package (`ci_agentosdomain`, `ci_agentosstore`, …),
-applies the migrations, and runs each package with `--test-threads=1`.
+applies the migrations, and runs each package's tests. There is no
+`--test-threads=1` any more: the tests isolate themselves, and serialising them
+only hid that.
+
+Two guards, both deliberate. It **refuses to start** without `psql` and a
+reachable Postgres, and it **refuses to finish** if any test skipped itself —
+roughly three dozen opt out silently without a database, which makes a run green
+and empty.
+
+`crates/eval` runs last, outside the per-package database loop, because it opens
+no connection.
 
 Honour `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD`; it defaults to
 `localhost:5442` with `postgres`/`postgres`.
@@ -188,7 +199,7 @@ That is deliberate.
 | `DATABASE_URL` | Postgres connection string | `refusing to start: DATABASE_URL is not set…` |
 | `PUBLIC_HOST` | The origin this deployment is reachable at, **including scheme** | Boot failure. It is interpolated into the A2A agent card's `url` (`{PUBLIC_HOST}/a2a/jsonrpc?employee=…`), so a wrong value means peers call nowhere. There is no defensible default. |
 | `AGENT_EMAIL_DOMAIN` | Domain employee addresses are minted under | Boot failure |
-| `AGENTOS_MASTER_KEY` | Envelope-encryption root key | Boot failure. **But see [§9](#what-is-not-real-yet): nothing reads it back today.** Validated only as "non-empty"; it is not hex-decoded or length-checked at boot despite what `.env.example` implies. |
+| `AGENTOS_MASTER_KEY` | Envelope-encryption root key | Boot failure. **It is read, and it is load-bearing:** every employee's Ed25519 private key is sealed under it. Validated only as "non-empty" — it is not hex-decoded or length-checked at boot despite what `.env.example` implies, and it is bridged to 32 bytes by SHA-256, not a KDF, because the input is a secret with full entropy rather than a password. Losing it is unrecoverable ([§10](#10-backup-and-restore)). |
 
 ### Optional, with defaults
 
@@ -228,11 +239,19 @@ log line is safe to paste into a ticket.
 
 ---
 
-## 3. The three loops
+## 3. The five loops
 
-One binary, three `tokio` tasks, no separate workers. All three hang off one
+One binary, five `tokio` tasks, no separate workers. All five hang off one
 `CancellationToken` cancelled by SIGTERM or SIGINT, so they drain *alongside*
 the HTTP listener rather than after it.
+
+| Loop | Poll | Batch |
+|---|---|---|
+| `mcp` | 300s, plus event-driven rebinds | — |
+| `provisioning` | 200ms | 32 |
+| `outbox` | 250ms idle | 32 |
+| `inbound` | 250ms idle | 8 |
+| `initiative` | 5s | 4 |
 
 ### 3.1 provisioning — `apps/server/src/loops/provisioning.rs`
 
@@ -314,7 +333,68 @@ Three outcomes:
   the row stays in `outbox_events`, unpublished, and shows up as a dead letter.
   Retrying forever would spin; deleting would lose a customer's email.
 
-### 3.4 Shutdown
+### 3.4 initiative — `apps/server/src/loops/initiative.rs`
+
+Polls every **5s**, claims up to **4** employees whose cadence is due, and starts
+a self-directed agent turn for each. This is the loop that makes an employee do
+something nobody asked it to do this minute, so it is the one with the most
+brakes on it.
+
+It reschedules at **claim** time, not at success, so a crash mid-turn is not a
+hot loop. The next time carries up to 10% jitter, computed in SQL, so a fleet on
+one cadence does not stampede.
+
+Before any model call it **reserves a turn** against `turn_buckets` — see §3.6 —
+and it is the only write path that reads `policy_layers`. It runs the turn with
+**no untrusted content and no knowledge recall**: the context is the employee's
+charter and nothing else.
+
+Outcomes are written to `employee_initiative.last_outcome` and are a closed
+vocabulary: `no_charter`, `unreadable_charter`, `clarify`, `turn`, `error`,
+`over_budget`. `clarify` means the charter has a gap and the loop wrote the
+question down instead of spending a turn guessing — read `last_detail`.
+
+```sql
+SELECT employee_id, interval_secs, next_at, claims, last_outcome, last_detail
+FROM   employee_initiative ORDER BY next_at;
+```
+
+### 3.5 mcp — `apps/server/src/routes/mcp.rs::run`
+
+Rebinds every tenant's MCP fleets on a **300s** tick, plus immediately on a
+nudge from an operator write. Binding is a loop and not a boot step because an
+MCP endpoint that is down must not delay a listener that has nothing else wrong
+with it.
+
+### 3.6 The turn budget, and what "over budget" means
+
+`max_turns_per_day` is a column on `policy_layers`, intersected by `.min()` like
+every other cap, and it **defaults to 0** — an employee may not act on its own
+until somebody writes a layer that says it may. There is no env var for it.
+
+It counts turns, not tokens, because the provider counts tokens and no reliable
+count exists *before* the call — the only moment a cap can refuse anything. It
+is reserved before the model call and **there is no release verb**: a turn that
+started already spent its tokens, and a release path is the path a crash loop
+rides.
+
+Exactly one operator alert fires, on the reservation that takes the last slot —
+exactly-once falls out of the row lock, not a flag column. **No operator action
+is needed to restart it.** The day is UTC and the budget resets itself at
+midnight.
+
+Read an employee's position:
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  localhost:8090/v1/employees/<id>/turns | jq
+# {"employee_id":"…","day":"2026-08-25","turns_taken":4,
+#  "max_turns_per_day":8,"turns_remaining":4,"exhausted":false}
+```
+
+An unknown or another tenant's id is **404**, not 403.
+
+### 3.7 Shutdown
 
 SIGTERM or SIGINT cancels the token. In-flight HTTP requests get **20s**
 (`DRAIN_DEADLINE`); the loops then get a further **5s** (`LOOP_DRAIN_DEADLINE`)
@@ -509,8 +589,20 @@ human still has to cancel.
 
 ### Finding them
 
-`agentos_store::provisioning::stranded` is the library function; again there is
-no endpoint. In SQL, per tenant:
+There is an endpoint, and it is the one to use:
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8090/v1/inventory/stranded?limit=50" | jq
+```
+
+It returns `employee_id`, `employee_slug`, `step`, `provider`, `external_id`,
+`state`, `last_error` and `updated_at` — everything a human needs to cancel the
+thing by hand. `limit` defaults to 50 and caps at 200. It is scoped by the API
+key's tenant like everything else.
+
+`agentos_store::provisioning::stranded` is the library equivalent. In SQL, per
+tenant:
 
 ```sql
 SELECT r.employee_id, r.step, r.provider, r.external_id, r.state, r.last_error
@@ -522,9 +614,9 @@ WHERE  e.lifecycle = 'terminated'
 ORDER  BY r.updated_at;
 ```
 
-This is **the operator's list**: "go and cancel these by hand". It is a query
-and not a counter because a number tells nobody what to cancel. (There is also
-no metrics exporter in this workspace, so a gauge would mean adding one.)
+This is **the operator's list**: "go and cancel these by hand". It is a list and
+not a counter because a number tells nobody what to cancel. (A gauge would need
+`/metrics`, which is written and not mounted — see §9.)
 
 Log lines to alert on:
 
@@ -672,8 +764,10 @@ and the payload under the full `SecretRef`. A ciphertext row lifted out of tenan
 A and replayed in B's context fails to authenticate and decrypts to *nothing*,
 not to A's password. AAD is authenticated and not encrypted, so it cannot be
 added later without re-encrypting everything — which is why it is right now.
-**But see [§9](#what-is-not-real-yet): this store is not the one the server
-runs.**
+**This cipher is real on every deployment**: it is what seals each employee's
+Ed25519 private key into `employee_signing_keys`. What is *not* real is the
+credential vault an employee reads from — that is still an in-memory map. See
+[§9](#what-is-not-real-yet).
 
 ### RLS — tenant isolation is a database property
 
@@ -731,10 +825,19 @@ replica. Two known ceilings, both currently acceptable: a tenant can send 2× th
 limit across a window boundary, and the budget is per replica rather than per
 cluster.
 
-Webhooks and the A2A agent card sit outside the API stack — a provider has a
-signature, not an API key — and therefore outside the rate limiter, which is
-keyed on a tenant it cannot know. A per-source limit belongs at your ingress
-proxy, which is also the only thing that can see the real client address.
+Five routes sit outside the API stack: `/livez`, `/readyz`,
+`POST /v1/webhooks/{provider}`, `GET /.well-known/agent-card.json` and
+`GET /.well-known/http-message-signatures-directory`. A provider has a
+signature, not an API key, and a peer fetching your public key has neither. They
+are therefore outside the rate limiter too, which is keyed on a tenant it cannot
+know — a per-source limit belongs at your ingress proxy, which is also the only
+thing that can see the real client address. What protects them is the 1 MiB body
+cap (256 KiB for webhooks) and the 30s timeout.
+
+Note that `POST /a2a/jsonrpc` is **inside** the stack: an A2A peer needs an
+`AGENTOS_API_KEYS` entry whose *label* is its domain. The RFC 9421 signature is
+an additive check on top of that — unsigned requests are accepted, wrongly
+signed ones are refused, and an unreachable key directory is a downgrade.
 
 ---
 
@@ -762,10 +865,19 @@ agent-initiated side effect is denied.** The `policy_versions` / `policy_layers`
 schema from `0006_policy.sql` and the loader in `agentos_store::policy` exist,
 are tested, and have **no caller**. Wiring them is a change in `main.rs`.
 
-**`AGENTOS_MASTER_KEY` is required at boot and read by nothing.** The vault
-adapter in `mocks::adapters()` is `MemorySecretStore` — a plaintext in-memory
-map that forgets on restart. `LocalEnvelopeSecretStore` is the honest local
-store and is not wired.
+**`AGENTOS_MASTER_KEY` is load-bearing, and this is the second exception.**
+`mocks::adapters(master_key)` threads it into a real `LocalEnvelopeSecretStore`
+used as a **cipher**: `Step::Identity` mints a real Ed25519 keypair and seals its
+private half into `employee_signing_keys.sealed_private_key`. A mock provider
+that invents a phone number costs nothing; a mock cipher costs an identity.
+**Lose the master key and every employee's signing key is unrecoverable.** Back
+it up (§10).
+
+The *vault* — the `SecretStore` an employee reads credentials out of — is still
+`MemorySecretStore`, a plaintext in-process map that forgets on restart. On a
+mock deployment it holds a provisioning canary and nothing else. The envelope
+store's own backing map is in-process too; only the signing key is durable, and
+it is durable because it lives in a table rather than in the store.
 
 **MCP and payments refuse rather than pretend.** Both ports return
 `Terminal { code: "not_configured" }` and log it. That is deliberate: a fake
@@ -793,8 +905,31 @@ their own provider account needs a `webhook_endpoints` table.
 environment variable. It has the properties that matter — the secret is never in
 the database, rotation is a redeploy, unset authenticates nobody.
 
-**No tenant endpoint, no knowledge endpoint, no metrics exporter, no
-dead-letter or stranded-resource endpoint.** Those are SQL for now.
+**No tenant endpoint and no dead-letter endpoint.** Those are SQL. There *is* a
+stranded-resource endpoint (§6) and a knowledge *ingest* endpoint
+(`POST /v1/knowledge/documents`) — but no knowledge *search* endpoint; retrieval
+happens inside a turn.
+
+**`/metrics` is written and not mounted.** `apps/server/src/metrics.rs` builds a
+Prometheus router with six families and `app()` never merges it, so the route
+does not exist and the counters are never incremented. Wiring it is one line.
+Until then the operational reads are `/readyz`, `/v1/inventory/stranded` and
+SQL.
+
+**Company knowledge is plaintext and Markdown only, on a hash embedder.** No URL
+fetching, no PDF parsing, no file upload, no malware or content-type validation.
+The embedder is a SHA-256 hash with no semantics, so retrieval quality is not a
+thing this build has yet.
+
+**No voice, no payments, no WhatsApp adapter.** `Channel::Voice` is a policy
+channel with no runtime behind it; the payment port refuses with
+`not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on every
+deployment, which is why `degraded` is the healthy steady state.
+
+**No key rotation.** One signing key per employee is the primary key of the
+table and `UPDATE` is revoked, so rotation is delete-then-insert with no overlap
+window. Revocation is by lifecycle: the key directory joins `lifecycle =
+'active'`, so suspending an employee un-publishes its key.
 
 **The mock email inbox is process-local.** An inbound notice recorded by the
 webhook route can only be fetched back by *this* process's mock. That is a
@@ -897,7 +1032,12 @@ refuse to start on, and you will not find out until the restore.
 
 `AGENTOS_MASTER_KEY`, `AGENTOS_API_KEYS` and `AGENTOS_WEBHOOK_SECRETS` are
 process configuration, not database rows. Back them up wherever you keep
-deployment secrets. Today nothing in the database is encrypted under the master
-key ([§9](#what-is-not-real-yet)), so a lost key costs you nothing yet — that
-stops being true the moment `LocalEnvelopeSecretStore` is wired in, and at that
-point a lost master key is every stored secret, permanently.
+deployment secrets.
+
+**Back up the master key with the same care as the database, and restore them
+together.** `employee_signing_keys.sealed_private_key` is encrypted under it on
+every deployment, mock or not. A dump restored without the matching master key
+gives you every employee's *public* key and no way to sign with any of them —
+and because `UPDATE` on that table is revoked and there is no rotation path,
+recovery means deleting the rows and re-provisioning identity, which changes
+every published `kid`.

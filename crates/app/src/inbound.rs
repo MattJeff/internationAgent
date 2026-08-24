@@ -72,6 +72,7 @@ use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
 use agentos_providers::email::{EmailProvider, InboundNotice, ParseError, Route};
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
+use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use async_trait::async_trait;
@@ -788,6 +789,21 @@ pub async fn conversation_for(
 /// arbiter — not a preceding `SELECT`, which two concurrent pollers would both
 /// pass — and the turn event carries the same key, so one message wakes the
 /// agent once however many times it is delivered.
+///
+/// # The audit row
+///
+/// A first landing also appends one [`AuditKind::MessageReceived`] row, in the
+/// caller's transaction, so the trail and the conversation cannot disagree
+/// about whether a stranger reached this employee. It is written **only on the
+/// insert path**: a redelivery is the same receipt arriving twice, and a trail
+/// that counted deliveries instead of messages would be a worse answer to "how
+/// many times was this employee contacted" than no answer at all.
+///
+/// The actor is [`AuditActor::System`] because nobody here chose anything — a
+/// webhook arrived and a poller drained it. The counterparty goes in the
+/// payload under `from` rather than the `counterparty` key `app::gate` reads
+/// back: that aggregation is over *allowed outbound actions*, and an inbound
+/// message must not quietly enlarge the cold-outreach budget.
 pub async fn land(
     tx: &mut TenantTx<'_>,
     message: &CanonicalMessage,
@@ -851,6 +867,21 @@ pub async fn land(
         message_id,
         &message.idempotency_key,
         now,
+    )
+    .await?;
+
+    audit::append(
+        tx,
+        &AuditEvent {
+            employee_id: Some(message.employee_id),
+            conversation_id: Some(message.conversation_id),
+            payload: json!({
+                "channel": message.channel.as_str(),
+                "message_id": message_id,
+                "from": contact_of(&message.from),
+            }),
+            ..AuditEvent::new(AuditActor::System, AuditKind::MessageReceived, now)
+        },
     )
     .await?;
 
@@ -1823,5 +1854,57 @@ mod tests {
         tx.commit().await.expect("commit read");
         assert_eq!(body, INJECTION);
         assert_eq!(label, "untrusted");
+    }
+
+    /// The audit row, through `ingest_email` — the path the outbox poller runs,
+    /// not a hand-written `append`.
+    ///
+    /// Two claims, and the second is the one worth the test: a redelivery is
+    /// the *same* receipt, so it must not add a row. `land` writes on the
+    /// insert branch only, and the `resume` branch is the branch three
+    /// deliveries take.
+    #[tokio::test]
+    async fn a_landed_message_leaves_one_audit_row_and_a_redelivery_leaves_none() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        let blobs = InMemoryBlobs::new();
+        let notice = notice("msg_audit", now);
+        email.seed_inbound(raw("msg_audit", now, Duration::hours(1)), []);
+
+        for attempt in 1..=3 {
+            deliver(&db, &email, &blobs, tenant, &notice, now)
+                .await
+                .unwrap_or_else(|e| panic!("delivery {attempt}: {e}"));
+        }
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let trail = agentos_store::audit::trail_for_employee(&mut tx, lena, 100)
+            .await
+            .expect("read trail");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            trail.len(),
+            1,
+            "three deliveries, one receipt, one row: {trail:?}"
+        );
+        let row = &trail[0];
+        assert_eq!(row.action_kind, "message_received");
+        // Nobody chose this: a webhook arrived and a poller drained it.
+        assert_eq!(row.actor, "system");
+        assert_eq!(row.employee_id, Some(lena));
+        assert_eq!(row.payload["channel"], "email");
+        assert_eq!(row.payload["from"], "ap@supplier.example");
+        // Ungated by construction — nothing rules on an inbound message — so
+        // there is no decision to point at, and the cold-outreach aggregation
+        // in `app::gate` (which filters `decision = 'allow'`) cannot see it.
+        assert_eq!(row.decision, None);
+        assert_eq!(row.decision_id, None);
+        assert!(
+            row.conversation_id.is_some(),
+            "the row names the thread it landed in"
+        );
     }
 }
