@@ -11,6 +11,7 @@ pub mod action; // U5
 pub mod employee; // U3
 pub mod identity;
 pub mod ids; // U1
+pub mod initiative;
 pub mod message; // U4
 pub mod money; // U2
 pub mod org; // wave 13: teams and sections
