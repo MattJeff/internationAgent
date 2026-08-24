@@ -162,6 +162,18 @@ subject!(
     /// Move money.
     PaymentCreate { amount: Money } => PaymentCreate
 );
+subject!(
+    /// Say something to one peer's agent.
+    ///
+    /// The odd one out: there is no `Effects::send_a2a`, because nothing in this
+    /// crate speaks A2A outbound yet. It exists because
+    /// [`crate::a2a::sign_request`] needs a token that *only* an A2A ruling can
+    /// produce — `Authorized<A2aSend>` is the bound, and `Authorized<Action>`
+    /// does not satisfy it. See `crate::identity` for why a signature must ride
+    /// the authority of the action it attests rather than an `Action::Sign` of
+    /// its own.
+    A2aSend { peer: Domain } => A2aSend
+);
 
 // ---------------------------------------------------------------------------
 // Bodies

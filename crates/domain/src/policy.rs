@@ -20,6 +20,29 @@
 //! The empty [`PolicyLimits`] grants nothing, so an unconfigured system denies
 //! everything. Deny by default is a property of the data, not a rule in the
 //! evaluator that someone can forget to write.
+//!
+//! # The turn budget
+//!
+//! [`PolicyLimits::max_turns_per_day`] is the one limit here that is *not* an
+//! [`Action`], and it exists because every other limit is on money or on tool
+//! calls inside one turn. An employee that wakes on a cadence, thinks, reads
+//! and writes without ever proposing a payment trips none of them while
+//! burning model tokens continuously. Until an initiative loop existed the
+//! natural throttle was that a turn only happened when somebody sent something;
+//! a loop removes it, so the ceiling has to be written down.
+//!
+//! It is intersected exactly like the numeric caps — the minimum across
+//! platform ∧ tenant ∧ role ∧ employee, so a team can only tighten it — but it
+//! is read by [`turns_remaining`] rather than by [`evaluate`], because there is
+//! no `Action::TakeTurn` and inventing one would put a non-effect into the
+//! audit vocabulary, the tool catalogue and the taint wire for no gain.
+//!
+//! **Turns, not tokens.** A token cap is the honest unit of an LLM bill and we
+//! cannot enforce it: the provider counts tokens, and no reliable count exists
+//! *before* the call — which is the only moment a cap can refuse anything. A
+//! turn is the thing we can refuse before it costs money, so turns are the
+//! proxy, and the multiplier from turns to currency lives outside this
+//! workspace with the rate card.
 
 #![deny(unreachable_patterns)]
 
@@ -195,6 +218,12 @@ pub struct PolicyLimits {
     pub allowed_mcp_tools: BTreeSet<McpTool>,
     pub allowed_a2a_peers: BTreeSet<Domain>,
     pub max_new_contacts_per_day: u32,
+    /// How many times a day this employee may run a turn at all.
+    ///
+    /// Zero — the default — means it may not act on its own initiative. See
+    /// the module docs: this is the only limit here that is not about an
+    /// [`Action`], and [`turns_remaining`] is what reads it.
+    pub max_turns_per_day: u32,
     pub allow_file_upload: bool,
     pub allow_credential_change: bool,
     pub allow_data_delete: bool,
@@ -226,6 +255,7 @@ impl PolicyLimits {
             max_new_contacts_per_day: self
                 .max_new_contacts_per_day
                 .min(other.max_new_contacts_per_day),
+            max_turns_per_day: self.max_turns_per_day.min(other.max_turns_per_day),
             allow_file_upload: self.allow_file_upload && other.allow_file_upload,
             allow_credential_change: self.allow_credential_change && other.allow_credential_change,
             allow_data_delete: self.allow_data_delete && other.allow_data_delete,
@@ -268,6 +298,25 @@ impl EffectivePolicy {
     pub const fn limits(&self) -> &PolicyLimits {
         &self.0
     }
+}
+
+/// How many more turns this employee may run today.
+///
+/// The turn budget's pure half: same policy, same count, same answer, forever.
+/// `0` means the day is spent — or that nobody ever granted a turn budget,
+/// which reads the same way on purpose, because [`PolicyLimits::default`]
+/// grants nothing and an unconfigured employee must not be the one that runs
+/// without a ceiling.
+///
+/// It takes an [`EffectivePolicy`], not a [`PolicyLimits`], so the number it
+/// reads can only be one that came out of [`EffectivePolicy::try_new`] — a
+/// single un-intersected layer cannot be passed here, which is how a tenant
+/// would have widened the platform.
+pub const fn turns_remaining(policy: &EffectivePolicy, turns_today: u32) -> u32 {
+    policy
+        .limits()
+        .max_turns_per_day
+        .saturating_sub(turns_today)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +472,11 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
         allowed_mcp_tools,
         allowed_a2a_peers,
         max_new_contacts_per_day,
+        // Deliberately not consulted here, and this binding is the
+        // acknowledgement rather than an oversight: a turn is not an `Action`,
+        // so there is no arm below that could read it. `turns_remaining` is
+        // its evaluator, and `store::turns::reserve` is what enforces it.
+        max_turns_per_day: _,
         allow_file_upload,
         allow_credential_change,
         allow_data_delete,
@@ -685,6 +739,7 @@ mod tests {
                 .collect(),
             allowed_a2a_peers: [domain("partner.example.com")].into_iter().collect(),
             max_new_contacts_per_day: 1_000,
+            max_turns_per_day: 500,
             allow_file_upload: true,
             allow_credential_change: true,
             allow_data_delete: true,
@@ -1170,6 +1225,54 @@ mod tests {
         assert_eq!(limits.max_new_contacts_per_day, 10);
         assert_eq!(limits.allowed_domains, [domain("example.com")].into());
         assert!(!limits.allowed_domains.contains(&domain("anything.com")));
+    }
+
+    /// The turn budget takes the same only-ever-tighter path as every other
+    /// numeric cap, including through the `role` layer a team plugs into.
+    #[test]
+    fn a_team_can_tighten_the_turn_budget_and_a_greedy_one_is_ignored() {
+        let platform = PolicyLimits {
+            max_turns_per_day: 100,
+            ..permissive()
+        };
+        let cautious_team = PolicyLimits {
+            max_turns_per_day: 12,
+            ..permissive()
+        };
+        let greedy_team = PolicyLimits {
+            max_turns_per_day: 100_000,
+            ..permissive()
+        };
+
+        // Tightening lands.
+        let tightened =
+            EffectivePolicy::try_new(&platform, &platform, &cautious_team, &platform).unwrap();
+        assert_eq!(tightened.limits().max_turns_per_day, 12);
+        assert_eq!(turns_remaining(&tightened, 0), 12);
+        assert_eq!(turns_remaining(&tightened, 11), 1);
+        assert_eq!(turns_remaining(&tightened, 12), 0);
+        // And a count past the cap does not wrap into a fresh allowance.
+        assert_eq!(turns_remaining(&tightened, u32::MAX), 0);
+
+        // Widening does not.
+        let greedy =
+            EffectivePolicy::try_new(&platform, &platform, &greedy_team, &platform).unwrap();
+        assert_eq!(greedy.limits().max_turns_per_day, 100);
+
+        // Nor from the employee layer, nor from the tenant's.
+        for widener in [&greedy_team] {
+            for stack in [
+                EffectivePolicy::try_new(&platform, widener, &platform, &platform),
+                EffectivePolicy::try_new(&platform, &platform, &platform, widener),
+            ] {
+                assert_eq!(stack.unwrap().limits().max_turns_per_day, 100);
+            }
+        }
+
+        // An unconfigured employee gets no turns at all: the default grants
+        // nothing here exactly as it does everywhere else in this file.
+        let unconfigured = effective(&PolicyLimits::default());
+        assert_eq!(turns_remaining(&unconfigured, 0), 0);
     }
 
     #[test]

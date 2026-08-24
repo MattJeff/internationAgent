@@ -708,7 +708,11 @@ fn inventory(
 }
 
 /// Parse and scheme-check. Rejects anything that is not http(s) with a host.
-fn vet_url(raw: &str) -> Result<Url, McpError> {
+///
+/// `pub(crate)` for [`crate::peer_keys`], which fetches a peer's key directory
+/// and has exactly this problem. It reuses these two functions rather than
+/// growing a second SSRF check that will eventually disagree with this one.
+pub(crate) fn vet_url(raw: &str) -> Result<Url, McpError> {
     let url = Url::parse(raw).map_err(|_| McpError::BadUrl(raw.to_owned()))?;
     if !ALLOWED_SCHEMES.contains(&url.scheme()) || url.host_str().is_none() {
         return Err(McpError::BadUrl(raw.to_owned()));
@@ -721,7 +725,7 @@ fn vet_url(raw: &str) -> Result<Url, McpError> {
 /// *Every* address, not the first one: a host that resolves to one public
 /// address and one metadata address is a host that will reach the metadata
 /// address on the retry.
-async fn resolve_and_vet(url: &Url, reach: Reach) -> Result<Vec<IpAddr>, McpError> {
+pub(crate) async fn resolve_and_vet(url: &Url, reach: Reach) -> Result<Vec<IpAddr>, McpError> {
     let host = url.host_str().unwrap_or_default().to_owned();
     let port = url.port_or_known_default().unwrap_or(443);
     let resolved = tokio::net::lookup_host((host.as_str(), port))

@@ -181,6 +181,7 @@ const SELECT_ACTIVE_LAYERS: &str = "\
            l.max_per_day_minor, l.approval_above_minor, l.allowed_channels, \
            l.allowed_calling_codes, l.allowed_domains, l.denied_domains, \
            l.allowed_mcp_tools, l.allowed_a2a_peers, l.max_new_contacts_per_day, \
+           l.max_turns_per_day, \
            l.allow_file_upload, l.allow_credential_change, l.allow_data_delete \
     FROM policy_layers l \
     JOIN policy_versions v ON v.id = l.version_id \
@@ -302,6 +303,7 @@ struct LayerRow {
     allowed_mcp_tools: Vec<String>,
     allowed_a2a_peers: Vec<String>,
     max_new_contacts_per_day: i32,
+    max_turns_per_day: i32,
     allow_file_upload: bool,
     allow_credential_change: bool,
     allow_data_delete: bool,
@@ -398,6 +400,11 @@ impl LayerRow {
                 // CHECKed non-negative in the schema; clamping a *budget* to
                 // zero fails closed if it ever is not.
                 max_new_contacts_per_day: u32::try_from(self.max_new_contacts_per_day).unwrap_or(0),
+                // Same treatment, same reason: `policy_layers_turns_nonneg`
+                // CHECKs it, and clamping a budget to zero fails closed — an
+                // employee that does not wake, rather than one that never
+                // stops.
+                max_turns_per_day: u32::try_from(self.max_turns_per_day).unwrap_or(0),
                 allow_file_upload: self.allow_file_upload,
                 allow_credential_change: self.allow_credential_change,
                 allow_data_delete: self.allow_data_delete,
@@ -483,6 +490,9 @@ pub(crate) mod tests {
         currency: Option<&'a str>,
         domains: &'a [&'a str],
         contacts: i32,
+        /// `max_turns_per_day`. Zero by default, like the column, which means
+        /// a layer a test did not think about grants no turns.
+        turns: i32,
     }
 
     async fn insert_version(
@@ -517,8 +527,9 @@ pub(crate) mod tests {
             "INSERT INTO policy_layers \
                (id, version_id, tenant_id, layer, role_name, employee_id, \
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
-                approval_above_minor, allowed_domains, max_new_contacts_per_day) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                approval_above_minor, allowed_domains, max_new_contacts_per_day, \
+                max_turns_per_day) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(Uuid::now_v7())
         .bind(version)
@@ -532,6 +543,7 @@ pub(crate) mod tests {
         .bind(approval)
         .bind(domains)
         .bind(row.contacts)
+        .bind(row.turns)
         .execute(&mut **tx)
         .await
         .expect("insert layer");
@@ -563,6 +575,7 @@ pub(crate) mod tests {
                 spend: Some(spend),
                 domains,
                 contacts: 100,
+                turns: 200,
                 ..Row::default()
             },
         )

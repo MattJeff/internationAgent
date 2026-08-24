@@ -452,6 +452,7 @@ mod tests {
             .collect(),
             allowed_a2a_peers: BTreeSet::new(),
             max_new_contacts_per_day: 100,
+            max_turns_per_day: 200,
             allow_file_upload: true,
             allow_credential_change: false,
             allow_data_delete: false,
@@ -825,6 +826,7 @@ mod tests {
             allowed_mcp_tools,
             allowed_a2a_peers,
             max_new_contacts_per_day,
+            max_turns_per_day,
             allow_file_upload,
             allow_credential_change,
             allow_data_delete,
@@ -849,6 +851,7 @@ mod tests {
             && allowed_mcp_tools.is_subset(&outer.allowed_mcp_tools)
             && allowed_a2a_peers.is_subset(&outer.allowed_a2a_peers)
             && *max_new_contacts_per_day <= outer.max_new_contacts_per_day
+            && *max_turns_per_day <= outer.max_turns_per_day
             && (!*allow_file_upload || outer.allow_file_upload)
             && (!*allow_credential_change || outer.allow_credential_change)
             && (!*allow_data_delete || outer.allow_data_delete)
@@ -903,21 +906,25 @@ mod tests {
             proptest::sample::subsequence(tools.clone(), 0..=tools.len()),
             proptest::sample::subsequence(domains.clone(), 0..=domains.len()),
             0u32..500,
+            0u32..500,
             any::<(bool, bool, bool)>(),
         )
             .prop_map(
-                |(spend, ch, cc, ad, dd, mcp, peers, contacts, (upload, cred, del))| PolicyLimits {
-                    spend,
-                    allowed_channels: ch.into_iter().collect(),
-                    allowed_calling_codes: cc.into_iter().collect(),
-                    allowed_domains: ad.into_iter().collect(),
-                    denied_domains: dd.into_iter().collect(),
-                    allowed_mcp_tools: mcp.into_iter().collect(),
-                    allowed_a2a_peers: peers.into_iter().collect(),
-                    max_new_contacts_per_day: contacts,
-                    allow_file_upload: upload,
-                    allow_credential_change: cred,
-                    allow_data_delete: del,
+                |(spend, ch, cc, ad, dd, mcp, peers, contacts, turns, (upload, cred, del))| {
+                    PolicyLimits {
+                        spend,
+                        allowed_channels: ch.into_iter().collect(),
+                        allowed_calling_codes: cc.into_iter().collect(),
+                        allowed_domains: ad.into_iter().collect(),
+                        denied_domains: dd.into_iter().collect(),
+                        allowed_mcp_tools: mcp.into_iter().collect(),
+                        allowed_a2a_peers: peers.into_iter().collect(),
+                        max_new_contacts_per_day: contacts,
+                        max_turns_per_day: turns,
+                        allow_file_upload: upload,
+                        allow_credential_change: cred,
+                        allow_data_delete: del,
+                    }
                 },
             )
     }

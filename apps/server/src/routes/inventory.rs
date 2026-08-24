@@ -66,7 +66,6 @@ const MAX_LIMIT: i64 = 200;
 /// belongs to another unit. Delete the attribute in the same commit that adds
 /// `.merge(routes::inventory::router(db.clone()))` to `api_router`; until then
 /// the tests below are the only caller and everything here would read as dead.
-#[allow(dead_code)]
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/inventory/stranded", get_route(list_stranded))

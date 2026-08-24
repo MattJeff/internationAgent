@@ -75,6 +75,8 @@ use std::sync::Arc;
 
 use agentos_app::a2a::{agent_card, negotiate_version};
 use agentos_app::gate::{Denied, PolicyGate, Principal as ActingPrincipal};
+use agentos_app::http_signature::{self, Verdict};
+use agentos_app::peer_keys::PeerKeys;
 use agentos_domain::action::{Action, Domain};
 use agentos_domain::employee::{Employee, Step};
 use agentos_domain::ids::{EmployeeId, TenantId};
@@ -84,7 +86,7 @@ use agentos_store::audit::AuditActor;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::employee as employees;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -131,15 +133,33 @@ pub struct A2aState {
     /// built from it, never hardcoded: a card that advertises the wrong origin
     /// sends every peer somewhere else.
     public_host: Arc<str>,
+    /// The key directories of the peers that have called. Clone-shared, so
+    /// every handler in this process reads one cache — a cache per request is
+    /// not a cache. See [`agentos_app::peer_keys`].
+    peers: PeerKeys,
 }
 
 impl A2aState {
     /// Wire the routes to a database, a gate and this deployment's origin.
+    ///
+    /// Peer keys are fetched on demand from each peer's own well-known
+    /// directory; a deployment that wants to pin them instead passes
+    /// [`A2aState::with_peer_keys`].
     pub fn new(db: Db, gate: PolicyGate, public_host: &str) -> Self {
+        Self::with_peer_keys(db, gate, public_host, PeerKeys::default())
+    }
+
+    /// [`A2aState::new`] with the peer key directory supplied.
+    ///
+    /// For a test, which must not depend on a real host answering, and for a
+    /// deployment holding a peer's key out of band — see
+    /// [`PeerKeys::pinned`](agentos_app::peer_keys::PeerKeys::pinned).
+    pub fn with_peer_keys(db: Db, gate: PolicyGate, public_host: &str, peers: PeerKeys) -> Self {
         Self {
             db,
             gate,
             public_host: Arc::from(public_host.trim_end_matches('/')),
+            peers,
         }
     }
 }
@@ -298,7 +318,12 @@ async fn jsonrpc(
     State(state): State<A2aState>,
     principal: Principal,
     Query(which): Query<Which>,
+    uri: Uri,
     headers: HeaderMap,
+    // Last, because it consumes the body, and kept as raw bytes rather than
+    // only as the parsed `Value`: a signature covers what arrived, not what
+    // serde made of it. Re-serialising the `Value` would reorder keys and
+    // rewrite whitespace, and the signature would fail for no reason.
     body: axum::body::Bytes,
 ) -> Json<Value> {
     let Ok(request) = serde_json::from_slice::<Value>(&body) else {
@@ -309,7 +334,7 @@ async fn jsonrpc(
     };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
 
-    match dispatch(&state, &principal, &which, &headers, &request).await {
+    match dispatch(&state, &principal, &which, &uri, &headers, &body, &request).await {
         Ok(result) => Json(json!({"jsonrpc": "2.0", "id": id, "result": result})),
         Err(err) => Json(failure(id, &err)),
     }
@@ -329,11 +354,14 @@ fn failure(id: Value, err: &RpcError) -> Value {
 /// method is looked at; an unknown method is refused before a transaction is
 /// opened; and the gate rules on every method that does exist, including any
 /// added later, because the call is authorized here rather than in each arm.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &A2aState,
     principal: &Principal,
     which: &Which,
+    uri: &Uri,
     headers: &HeaderMap,
+    body: &[u8],
     request: &Value,
 ) -> Result<Value, RpcError> {
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
@@ -386,6 +414,17 @@ async fn dispatch(
         .await
         .map_err(denied)?;
 
+    // **After** the gate, deliberately, and it is the fetch that decides the
+    // order. Verifying a signature means reading the peer's key directory over
+    // the network, and doing that before the ruling would mean any caller
+    // holding a valid API key could make this process fetch a URL derived from
+    // its own domain. Running the gate first bounds the set of hosts this
+    // server ever contacts to the tenant's own A2A allowlist.
+    //
+    // It also puts the call in the audit trail before it can be refused here,
+    // which is the trace you want when a signature stops checking out.
+    verify_signature(state, &peer, uri, headers, body).await?;
+
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     match method {
         "SendMessage" => send_message(state, principal, employee, &params).await,
@@ -421,6 +460,103 @@ fn peer_of(principal: &Principal) -> Result<Domain, RpcError> {
             format!("peer identity is not a domain: {e}"),
         )
     })
+}
+
+/// Check the peer's RFC 9421 signature, when it sent one.
+///
+/// # Unsigned is accepted; wrong is refused; unreachable is a downgrade
+///
+/// Three outcomes and they are deliberately not the same:
+///
+/// * **No signature.** Accepted. No peer signs today, and the call was already
+///   authenticated by an API key whose label *is* this peer's domain. Refusing
+///   would break every existing integration to gain nothing over the credential.
+/// * **A signature that does not check out** — a `keyid` the peer does not
+///   publish, a body whose digest disagrees, a stale window. Refused. A caller
+///   that went to the trouble of signing and got it wrong is either a broken
+///   peer or somebody rewriting traffic in flight, and neither is accepted
+///   quietly.
+/// * **A signature we cannot check**, because the peer's key directory is
+///   unreachable. Accepted, loudly. This is a trust *downgrade*, not a refusal:
+///   the alternative is that a peer's expired TLS certificate takes our
+///   endpoint down for them, in exchange for no security the API key had not
+///   already established.
+///
+/// # What a good signature does not buy
+///
+/// Nothing about the body. The message is [`Untrusted`] before this runs and
+/// after it, and every caller downstream still treats it as a stranger's text.
+/// A verified signature says *who*; it never says *safe*.
+async fn verify_signature(
+    state: &A2aState,
+    peer: &Domain,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), RpcError> {
+    let signature_headers = http_signature::SignatureHeaders {
+        signature_input: text(headers, http_signature::SIGNATURE_INPUT_HEADER),
+        signature: text(headers, http_signature::SIGNATURE_HEADER),
+        content_digest: text(headers, http_signature::CONTENT_DIGEST_HEADER),
+    };
+    // Before the fetch: an unsigned request must not cost a network call, and
+    // today every request is one.
+    if signature_headers.signature_input.is_none() && signature_headers.signature.is_none() {
+        return Ok(());
+    }
+
+    let Some(keys) = state.peers.keys_for(peer).await else {
+        tracing::warn!(
+            %peer,
+            "a signed a2a request from a peer whose key directory we cannot read; \
+             accepting on the api key alone"
+        );
+        return Ok(());
+    };
+
+    // The authority as the peer addressed it: HTTP/2 carries it on the URI,
+    // HTTP/1.1 in `Host`.
+    //
+    // ponytail: a reverse proxy that rewrites `Host` breaks every inbound
+    // signature — visibly, for every peer at once, which is the failure mode to
+    // prefer over silently verifying against something the peer did not sign.
+    // The fix there is to derive it from `PUBLIC_HOST`; do that when a
+    // deployment actually has that proxy.
+    let authority = uri
+        .authority()
+        .map(axum::http::uri::Authority::as_str)
+        .or_else(|| text(headers, header::HOST.as_str()))
+        .unwrap_or_default();
+
+    let request = http_signature::Request {
+        method: "POST",
+        authority,
+        path: uri.path(),
+        query: uri.query(),
+        body,
+    };
+
+    match http_signature::verify_request(&request, &signature_headers, &keys, Utc::now()) {
+        Ok(Verdict::Verified(kid)) => {
+            tracing::debug!(%peer, kid = kid.as_str(), "a2a request signature verified");
+            Ok(())
+        }
+        // Unreachable: the guard above returned for a request with neither
+        // header, and one header alone is `HalfSigned`.
+        Ok(Verdict::Unsigned) => Ok(()),
+        Err(err) => {
+            tracing::warn!(%peer, code = err.code(), "refusing an a2a request: {err}");
+            Err(RpcError::new(
+                code::INVALID_REQUEST,
+                format!("signature rejected ({}): {err}", err.code()),
+            ))
+        }
+    }
+}
+
+/// One header as text, or `None` if it is absent or not ASCII.
+fn text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 /// The headers, as `a2a_server::ServiceParams` — which is a type alias for this
@@ -787,8 +923,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU32;
 
-    use agentos_app::gate::PolicyBook;
+    use agentos_app::effects::A2aSend;
+    use agentos_app::gate::{Authorized, PolicyBook};
+    use agentos_app::identity::Identity;
     use agentos_domain::employee::{Lifecycle, ResourceState};
+    use agentos_domain::identity::PublicKey;
     use agentos_domain::ids::{Slug, TenantId};
     use agentos_domain::money::{Currency, Money};
     use agentos_domain::policy::{DenyReason, PolicyLimits, SpendLimits};
@@ -1321,6 +1460,365 @@ mod tests {
             )
             .await
             .expect("our own proposal clears every cap");
+    }
+
+    // -- signatures --------------------------------------------------------
+
+    /// The authority a peer addresses us at. `HOST` with its scheme removed —
+    /// `@authority` is a host, not an origin.
+    const AUTHORITY: &str = "agents.fabrikam.example";
+
+    /// The envelope root these tests seal a signing key under. Whatever the
+    /// deployment's `AGENTOS_MASTER_KEY` is, it is a string, and
+    /// `identity::envelope` is the one function that turns it into a cipher.
+    const MASTER: &str = "a2a-route-tests-master-key";
+
+    /// An employee with a minted, published keypair.
+    async fn identity(db: &Db, tenant: TenantId, employee: EmployeeId) -> Identity {
+        let identity = Identity::new(
+            db.clone(),
+            agentos_app::identity::envelope(MASTER),
+            ActingPrincipal::employee(tenant, employee),
+        );
+        identity.ensure_key().await.expect("mint");
+        identity
+    }
+
+    /// A real capability token for an A2A call to `PEER`. The gate is the only
+    /// thing that can produce one, which is the whole point of the bound on
+    /// `sign_request`.
+    async fn a2a_token(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        peer: &str,
+    ) -> Authorized<A2aSend> {
+        gate(db)
+            .authorize(
+                &ActingPrincipal::employee(tenant, employee),
+                A2aSend {
+                    peer: Domain::parse(peer).expect("domain"),
+                },
+            )
+            .await
+            .expect("the peer is on the allowlist")
+    }
+
+    /// The keys the **public directory route** serves for this employee, parsed
+    /// exactly as a stranger would parse them.
+    ///
+    /// Deliberately not read out of the database: the whole claim being tested
+    /// is that what we sign with is what that endpoint publishes, and reading
+    /// them from anywhere else would make the test pass even if the route
+    /// served something different.
+    async fn published_keys(db: &Db, employee: EmployeeId) -> Vec<PublicKey> {
+        let response = crate::routes::well_known::router(db.clone())
+            .oneshot(
+                HttpRequest::get(format!(
+                    "{}?employee={}",
+                    agentos_domain::identity::DIRECTORY_PATH,
+                    employee.as_uuid()
+                ))
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("service");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        let document: Value = serde_json::from_slice(&bytes).expect("a jwks");
+
+        document["keys"]
+            .as_array()
+            .expect("a key set")
+            .iter()
+            .map(|jwk| PublicKey::from_jwk_x(jwk["x"].as_str().expect("x")).expect("a key"))
+            .collect()
+    }
+
+    /// One request addressed to us, as a verifier reduces it.
+    fn inbound(body: &[u8]) -> http_signature::Request<'_> {
+        http_signature::Request {
+            method: "POST",
+            authority: AUTHORITY,
+            path: JSONRPC_PATH,
+            query: None,
+            body,
+        }
+    }
+
+    /// The app with this peer's key directory pinned, so no test touches the
+    /// network to find out what a peer publishes.
+    fn signed_app(db: &Db, tenant: TenantId, peer: &str, keys: Vec<PublicKey>) -> Router {
+        let api_keys =
+            ApiKeys::parse(&format!("{peer}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
+        let state = A2aState::with_peer_keys(
+            db.clone(),
+            gate(db),
+            HOST,
+            PeerKeys::pinned([(Domain::parse(peer).expect("domain"), keys)]),
+        );
+        router(state).layer(axum::middleware::from_fn_with_state(
+            api_keys,
+            crate::auth::require_api_key,
+        ))
+    }
+
+    /// One JSON-RPC call over raw bytes, with signature headers if there are
+    /// any. The bytes are sent verbatim — a signature covers what went on the
+    /// wire, so re-serialising them here would be testing the wrong thing.
+    async fn rpc_signed(
+        app: Router,
+        body: &[u8],
+        signed: Option<&http_signature::Signed>,
+    ) -> Value {
+        let mut request = HttpRequest::post(JSONRPC_PATH)
+            .header(header::AUTHORIZATION, format!("Bearer {SECRET}"))
+            .header(header::HOST, AUTHORITY)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in signed.iter().flat_map(|signed| signed.headers()) {
+            request = request.header(name, value);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_vec())).expect("request"))
+            .await
+            .expect("service");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        serde_json::from_slice(&bytes).expect("a JSON-RPC envelope")
+    }
+
+    /// **The end-to-end claim for outbound signing.** A signature this employee
+    /// emits verifies against the document our own public directory route
+    /// serves — and stops verifying the moment a byte of the body moves.
+    #[tokio::test]
+    async fn a_signature_we_emit_verifies_against_our_own_published_directory() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let identity = identity(&db, tenant, employee).await;
+        let token = a2a_token(&db, tenant, employee, PEER).await;
+
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+                          "params": {"message": message("what is the lead time on PO-4471?")}})
+        .to_string();
+        // Outbound: addressed to the peer the ruling named.
+        let request = http_signature::Request {
+            method: "POST",
+            authority: PEER,
+            path: "/a2a/jsonrpc",
+            query: Some("employee=1"),
+            body: body.as_bytes(),
+        };
+
+        let now = Utc::now();
+        let signed = agentos_app::a2a::sign_request(&identity, &token, &request, now)
+            .await
+            .expect("sign");
+
+        // The keys a stranger gets, from the route, not from the table.
+        let keys = published_keys(&db, employee).await;
+        assert_eq!(keys.len(), 1);
+
+        let headers = http_signature::SignatureHeaders {
+            signature_input: Some(&signed.signature_input),
+            signature: Some(&signed.signature),
+            content_digest: Some(&signed.content_digest),
+        };
+        assert_eq!(
+            http_signature::verify_request(&request, &headers, &keys, now),
+            Ok(Verdict::Verified(keys[0].key_id())),
+            "a peer could not verify us against what we publish"
+        );
+        // ...and the signature names the key that is actually in the document.
+        assert!(
+            signed.signature_input.contains(keys[0].key_id().as_str()),
+            "{}",
+            signed.signature_input
+        );
+
+        // One byte of the body moves and it stops verifying.
+        let tampered = body.replace("PO-4471", "PO-4472");
+        assert_eq!(tampered.len(), body.len(), "same length, different bytes");
+        let mut moved = request;
+        moved.body = tampered.as_bytes();
+        assert_eq!(
+            http_signature::verify_request(&moved, &headers, &keys, now),
+            Err(http_signature::VerifyError::DigestMismatch)
+        );
+
+        // And the token is not a general-purpose signing oracle: the ruling
+        // named one peer, so it signs requests to that peer and no other.
+        let mut elsewhere = request;
+        elsewhere.authority = "victim.example.com";
+        let err = agentos_app::a2a::sign_request(&identity, &token, &elsewhere, now)
+            .await
+            .expect_err("a ruling for one peer must not sign a request to another");
+        assert_eq!(err.code(), "wrong_peer");
+    }
+
+    /// **The end-to-end claim for inbound verification**, through the real
+    /// route: a signature made by a key the peer does not publish is refused.
+    #[tokio::test]
+    async fn an_inbound_request_signed_by_an_unknown_key_is_refused() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let identity = identity(&db, tenant, employee).await;
+        let token = a2a_token(&db, tenant, employee, PEER).await;
+        let ours = published_keys(&db, employee).await;
+
+        let body =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}}).to_string();
+        let request = inbound(body.as_bytes());
+
+        // Signed with a real key, correctly, over the real base.
+        let to_sign = http_signature::to_sign(&request, &ours[0].key_id(), Utc::now());
+        let signature = identity
+            .sign(&token, to_sign.base.as_bytes())
+            .await
+            .expect("sign");
+        let signed = to_sign.finish(&signature);
+
+        // The peer publishes a *different* key. Everything about the signature
+        // is well-formed; it simply was not made by anybody this peer vouches
+        // for, which is exactly the impersonation case.
+        let stranger = PublicKey::new([0x2b; 32]);
+        assert_ne!(stranger, ours[0]);
+        let answer = rpc_signed(
+            signed_app(&db, tenant, PEER, vec![stranger]),
+            body.as_bytes(),
+            Some(&signed),
+        )
+        .await;
+        assert_eq!(answer["error"]["code"], json!(code::INVALID_REQUEST));
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("unknown_key")),
+            "{answer:#}"
+        );
+        assert!(answer.get("result").is_none(), "the call must not have run");
+
+        // The same request, against a peer that does publish this key, goes
+        // through — so the refusal above is the key and nothing else.
+        let answer = rpc_signed(
+            signed_app(&db, tenant, PEER, ours.clone()),
+            body.as_bytes(),
+            Some(&signed),
+        )
+        .await;
+        assert!(answer["result"]["tasks"].is_array(), "{answer:#}");
+
+        // A tampered body, against the right key: refused on the digest,
+        // before the curve is ever touched.
+        //
+        // The JSON-RPC *id* is what moves, not the method: the method is
+        // checked before any of this and a rewritten one would be refused as
+        // METHOD_NOT_FOUND without the signature ever being looked at. An id is
+        // a field a man in the middle would plausibly rewrite and the route is
+        // otherwise happy to serve.
+        let tampered = body.replace(r#""id":1"#, r#""id":2"#);
+        assert_ne!(tampered, body, "the tamper must change something: {body}");
+        let answer = rpc_signed(
+            signed_app(&db, tenant, PEER, ours.clone()),
+            tampered.as_bytes(),
+            Some(&signed),
+        )
+        .await;
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("digest_mismatch")),
+            "{answer:#}"
+        );
+
+        // Half a signature is a refusal, not an unsigned request: a stripped
+        // `Signature` header must not read as "this peer never signed".
+        let stripped = http_signature::Signed {
+            signature: String::new(),
+            ..signed.clone()
+        };
+        let mut request_without = HttpRequest::post(JSONRPC_PATH)
+            .header(header::AUTHORIZATION, format!("Bearer {SECRET}"))
+            .header(header::HOST, AUTHORITY)
+            .header(
+                http_signature::SIGNATURE_INPUT_HEADER,
+                &stripped.signature_input,
+            );
+        request_without = request_without.header(header::CONTENT_TYPE, "application/json");
+        let response = signed_app(&db, tenant, PEER, ours.clone())
+            .oneshot(
+                request_without
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("service");
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        let answer: Value = serde_json::from_slice(&bytes).expect("envelope");
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("half_signed")),
+            "{answer:#}"
+        );
+    }
+
+    /// An unsigned call is still served, and a peer whose directory we cannot
+    /// read is a downgrade rather than an outage. Both are deliberate; see
+    /// [`verify_signature`].
+    #[tokio::test]
+    async fn an_unsigned_call_still_works_and_an_unreachable_directory_does_not_break_the_peer() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let identity = identity(&db, tenant, employee).await;
+        let token = a2a_token(&db, tenant, employee, PEER).await;
+        let ours = published_keys(&db, employee).await;
+
+        let body =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}}).to_string();
+
+        // No signature at all: served, and — the part that matters for latency
+        // — without the peer's directory ever being consulted, which is why the
+        // pinned set here is empty and the call still succeeds.
+        let answer = rpc_signed(
+            signed_app(&db, tenant, PEER, Vec::new()),
+            body.as_bytes(),
+            None,
+        )
+        .await;
+        assert!(answer["result"]["tasks"].is_array(), "{answer:#}");
+
+        // Signed, by a peer whose directory is unreachable. `example.invalid`
+        // cannot resolve — that is what the TLD is for — so `keys_for` answers
+        // `None` and the call is accepted on the API key alone.
+        let unreachable = "peer.example.invalid";
+        let request = inbound(body.as_bytes());
+        let to_sign = http_signature::to_sign(&request, &ours[0].key_id(), Utc::now());
+        let signature = identity
+            .sign(&token, to_sign.base.as_bytes())
+            .await
+            .expect("sign");
+        let signed = to_sign.finish(&signature);
+
+        // The gate has to allow this peer for the fetch to be attempted at all.
+        let allowing = PolicyGate::new(
+            db.clone(),
+            PolicyBook::new(PolicyLimits {
+                allowed_a2a_peers: BTreeSet::from([Domain::parse(unreachable).expect("domain")]),
+                max_new_contacts_per_day: 20,
+                ..PolicyLimits::default()
+            }),
+        );
+        let keys =
+            ApiKeys::parse(&format!("{unreachable}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
+        let app = router(A2aState::new(db.clone(), allowing, HOST)).layer(
+            axum::middleware::from_fn_with_state(keys, crate::auth::require_api_key),
+        );
+        let answer = rpc_signed(app, body.as_bytes(), Some(&signed)).await;
+        assert!(
+            answer["result"]["tasks"].is_array(),
+            "an unreachable key directory must be a downgrade, not an outage: {answer:#}"
+        );
     }
 
     // -- small, pure -------------------------------------------------------

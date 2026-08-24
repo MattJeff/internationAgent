@@ -6,11 +6,13 @@
 pub mod a2a; // U28
 pub mod effects; // U21
 pub mod gate; // U20
+pub mod http_signature;
 pub mod identity;
 pub mod inbound; // U29
 pub mod knowledge; // U26
 pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
+pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23
 pub mod proof_of_need; // wave 12

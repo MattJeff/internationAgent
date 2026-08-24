@@ -292,6 +292,14 @@ impl RolePack {
                 // short of a mailshot.
                 max_new_contacts_per_day: 25,
 
+                // How often this role may wake and act on its own objective.
+                // A buyer chases quotes, reads replies and follows up; a
+                // working day of that is tens of turns, not thousands, and the
+                // ceiling is what stops a stuck one billing model tokens all
+                // night. See `agentos_store::turns` for why the unit is turns
+                // and not tokens.
+                max_turns_per_day: 60,
+
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,

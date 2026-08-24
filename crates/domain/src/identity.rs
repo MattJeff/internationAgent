@@ -46,6 +46,14 @@ use crate::ids::{EmployeeId, SecretRef, SecretRefError, TenantId};
 /// Length of an Ed25519 public key. Fixed by the curve, not by us.
 pub const PUBLIC_KEY_LEN: usize = 32;
 
+/// Where a JWKS lives, ours and everybody else's.
+///
+/// Cloudflare's Web Bot Auth directory path. Here, in the crate both sides
+/// depend on, because two spellings of it is two protocols: the route that
+/// serves ours and the fetcher that reads a peer's must agree, and a constant
+/// they share is the only way that stays true after a rename.
+pub const DIRECTORY_PATH: &str = "/.well-known/http-message-signatures-directory";
+
 /// The [`SecretRef`] name an employee's private signing key is stored under.
 ///
 /// One constant, because the name is the envelope's AAD: seal under one

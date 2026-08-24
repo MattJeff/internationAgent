@@ -67,18 +67,26 @@ pub use agentos_providers::llm::{Llm, LlmResponse, ScriptedLlm, Usage};
 /// secret that stops a development box from booting.
 const MOCK_TELEPHONY_TOKEN: &str = "mock-telephony-auth-token";
 
-/// The four adapters [`ProvisioningEngine`](crate::provisioning::ProvisioningEngine)
-/// needs, all fake.
+/// The adapters [`ProvisioningEngine`](crate::provisioning::ProvisioningEngine)
+/// needs. The four providers are fake; the envelope cipher is **not**.
 ///
-/// The vault is a plaintext map: `LocalEnvelopeSecretStore` would be the
-/// honest development store, and it needs the deployment's master key threaded
-/// through — worth doing the day anything reads a secret back out for real.
-pub fn adapters() -> Adapters {
+/// `master_key` is the deployment's `AGENTOS_MASTER_KEY`, and it is threaded
+/// through here because `Step::Identity` now mints a real Ed25519 keypair and
+/// seals its private half with it. That key ends up in a database column and is
+/// published in a JWKS strangers verify against, so sealing it under a
+/// stand-in — however convenient in a test — would produce rows the real
+/// process cannot open. A mock provider that invents a phone number costs
+/// nothing; a mock cipher costs an identity.
+///
+/// The vault (`secrets`) is still a plaintext map, and that is still fine: it
+/// holds a provisioning canary and nothing else in a mock deployment.
+pub fn adapters(master_key: &str) -> Adapters {
     Adapters {
         email: Arc::new(MockEmailProvider::new()),
         telephony: Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
         browser: Arc::new(MockBrowser::new()),
         secrets: Arc::new(MemorySecretStore::new()),
+        envelope: crate::identity::envelope(master_key),
     }
 }
 
@@ -285,7 +293,7 @@ mod tests {
     fn the_adapters_are_all_present() {
         // A field left out is a `ProvisioningEngine` that panics on the step
         // that needed it; the constructor exists so that is a compile error.
-        let _ = adapters();
+        let _ = adapters("mocks-test-master-key");
     }
 
     // -- the model ---------------------------------------------------------

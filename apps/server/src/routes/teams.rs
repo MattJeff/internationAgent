@@ -81,7 +81,6 @@ const MAX_ROWS: i64 = 500;
 /// where every router is merged, belongs to another unit. Delete the attribute
 /// in the same commit that adds `.merge(routes::teams::router(db.clone()))` to
 /// `app`; until then the tests below are the only caller.
-#[allow(dead_code)]
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/teams", post(create_team).get(list_teams))

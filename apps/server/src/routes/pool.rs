@@ -95,12 +95,12 @@ pub struct PoolApi {
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before any handler here.
 ///
+#[allow(dead_code)] // not mounted: this binary builds no Pool. See main.rs.
 /// ponytail: `allow(dead_code)` for the same reason `routes/inventory.rs` has
 /// it — this unit owns this file and one `pub mod` line, and `main.rs`, where
 /// routers are merged, belongs to another unit. Delete the attribute in the
 /// same commit that adds `.merge(routes::pool::router(db.clone(), gate.clone(),
 /// pool))` to `api_router`.
-#[allow(dead_code)]
 pub fn router(db: Db, gate: PolicyGate, pool: Pool) -> Router {
     Router::new()
         .route("/v1/pool/numbers", get_route(numbers))

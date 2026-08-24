@@ -28,11 +28,23 @@
 //! we cannot serve gets JSON-RPC `-32009`, not a best-effort guess — guessing
 //! is how a 2.x client ends up believing our 1.0 answer.
 //!
-//! # The card
+//! # Outbound calls are signed; the card is not
 //!
-//! Shipped **unsigned**. `AgentCard::signatures` stays `None` because this SDK
-//! implements no signing, and a hand-rolled JWS that no client verifies is
-//! worse than an honest absence. v1.0 also removed `url`,
+//! [`sign_request`] puts an RFC 9421 signature on a request we send, so a peer
+//! can check it against the JWKS at
+//! [`DIRECTORY_PATH`](agentos_domain::identity::DIRECTORY_PATH). Read
+//! [`crate::http_signature`] for the format and [`crate::identity`] for why the
+//! `Authorized<A2aSend>` that permitted the *call* is the same token that
+//! permits signing it — there is no `Action::Sign`, because a bare signing
+//! authorization is a signing oracle.
+//!
+//! The **card** is still shipped unsigned. `AgentCard::signatures` stays `None`
+//! because that field wants a JWS over the card document, which is a different
+//! format from the one on the wire, and this SDK implements none of it; a
+//! hand-rolled JWS that no client verifies is worse than an honest absence.
+//! The card is also the one document whose authenticity a peer establishes by
+//! *fetching it from us over TLS*, which is the same trust root the signature
+//! directory has. v1.0 also removed `url`,
 //! `preferredTransport` and the top-level `protocolVersion` in favour of
 //! `supportedInterfaces[]`; we declare exactly one interface, JSON-RPC.
 //!
@@ -123,6 +135,95 @@ pub fn agent_card(
         // Unsigned, deliberately. See the module docs.
         signatures: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Signing what we send
+// ---------------------------------------------------------------------------
+
+/// Why an outbound request could not be signed.
+#[derive(Debug, thiserror::Error)]
+pub enum SignError {
+    /// The ruling permits a call to one peer and the request is addressed to
+    /// another.
+    ///
+    /// **This is the check that keeps a token from being a general-purpose
+    /// signing oracle.** The type bound already says "an A2A ruling signed
+    /// this"; without this check it would still be true that *any* A2A ruling
+    /// signs *any* A2A request, so a token for a supplier we do talk to would
+    /// sign a request to a bank we do not. The token names a peer; the request
+    /// must be to that peer.
+    #[error("the ruling permits a call to {permitted}, not to {addressed}")]
+    WrongPeer {
+        /// The peer the gate ruled on.
+        permitted: Domain,
+        /// The authority the request is actually addressed to.
+        addressed: String,
+    },
+
+    /// No key was ever minted, the key will not unseal, or the trail could not
+    /// be written. Every one of those is a refusal to sign, never an unsigned
+    /// request that goes anyway.
+    #[error(transparent)]
+    Identity(#[from] crate::identity::IdentityError),
+}
+
+impl SignError {
+    /// Stable, low-cardinality metric label.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SignError::WrongPeer { .. } => "wrong_peer",
+            SignError::Identity(err) => err.code(),
+        }
+    }
+}
+
+/// Sign one outbound A2A request, on the authority of the ruling that permitted
+/// it.
+///
+/// The bound is the security argument, and it is worth reading twice.
+/// `A: Subject<Of = A2aSend>` is satisfied by `Authorized<A2aSend>` and
+/// `Authorized<Untrusted<A2aSend>>` and by nothing else — not by
+/// `Authorized<Action>`, not by a payment token, and not by anything a caller
+/// can construct, because `Authorized`'s constructors are private to `gate.rs`.
+/// So a signature in this employee's name cannot exist without a Policy Gate
+/// ruling that an A2A call to this peer was allowed. See [`crate::identity`]
+/// for why there is deliberately no `Action::Sign` that would bypass that.
+///
+/// `ok` is borrowed, not consumed: signing is one step of making the call, and
+/// the caller still needs the token afterwards.
+///
+/// Returns the three headers to set. It does **not** send anything — there is
+/// no outbound A2A client in this workspace yet, and writing one that nobody
+/// calls would be scaffolding. When there is, it sets these headers.
+pub async fn sign_request<A: crate::effects::Subject<Of = crate::effects::A2aSend>>(
+    identity: &crate::identity::Identity,
+    ok: &crate::gate::Authorized<A>,
+    request: &crate::http_signature::Request<'_>,
+    now: chrono::DateTime<Utc>,
+) -> Result<crate::http_signature::Signed, SignError> {
+    let permitted = &ok.action().subject().peer;
+    // An authority may carry a port; the ruling is about the host. Compared
+    // case-insensitively because `Domain` is normalised and an authority header
+    // is whatever the caller typed.
+    let addressed = request
+        .authority
+        .split(':')
+        .next()
+        .unwrap_or(request.authority);
+    if !addressed.eq_ignore_ascii_case(permitted.as_str()) {
+        return Err(SignError::WrongPeer {
+            permitted: permitted.clone(),
+            addressed: request.authority.to_owned(),
+        });
+    }
+
+    // The `kid` comes from the published directory, so the signature names a
+    // key the peer can actually fetch. See `Identity::public_key`.
+    let to_sign =
+        crate::http_signature::to_sign(request, &identity.public_key().await?.key_id(), now);
+    let signature = identity.sign(ok, to_sign.base.as_bytes()).await?;
+    Ok(to_sign.finish(&signature))
 }
 
 // ---------------------------------------------------------------------------

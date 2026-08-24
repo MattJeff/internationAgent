@@ -114,9 +114,11 @@ pub struct Config {
     /// `DATABASE_URL` — Postgres.
     pub database_url: String,
     /// `AGENTOS_MASTER_KEY` — the envelope-encryption root key.
-    // Read by the secrets unit, not by this one; without the allow, the boot
-    // guard that makes it *required* would be deleted as dead code.
-    #[allow(dead_code)]
+    ///
+    /// Handed to `agentos_app::identity::envelope`, which is what turns it into
+    /// the 32 bytes the cipher takes and documents why that is a hash and not a
+    /// KDF. Every employee's private signing key is sealed under it, so
+    /// changing it in place orphans every identity this deployment has issued.
     pub master_key: String,
     /// `AGENTOS_ALLOW_MOCKS` — `1`/`true` permits mock adapters.
     pub allow_mocks: bool,

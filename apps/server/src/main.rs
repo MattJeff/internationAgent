@@ -207,7 +207,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
     let engine = ProvisioningEngine::new(
         db.clone(),
-        agentos_app::mocks::adapters(),
+        agentos_app::mocks::adapters(&config.master_key),
         EngineConfig::default(),
     );
 
@@ -322,12 +322,31 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
 fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
+    // One state, cloned — not two built side by side. It carries the peer key
+    // cache, and a cache per router is two caches, each half as warm.
+    let a2a = a2a_state(&db, &gate, config);
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
             .merge(routes::employees::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
-            .merge(routes::a2a::router(a2a_state(&db, &gate, config))),
+            // Four routers written by four parallel units, each of which could
+            // not mount itself because this file belonged to none of them. A
+            // route nobody merged is a route nobody can call, and the
+            // `allow(dead_code)` each carried made the compiler agree to say
+            // nothing about it. Mounted here, once, on purpose.
+            .merge(routes::teams::router(db.clone()))
+            .merge(routes::turns::router(db.clone()))
+            .merge(routes::inventory::router(db.clone()))
+            .merge(routes::knowledge::router(db.clone()))
+            // `routes::pool` is deliberately NOT here. Its router needs a
+            // `pool_ops::Pool`, and this binary never builds one — there is no
+            // config that says which numbers a tenant shares. Mounting it with
+            // `Pool::new()` would compile and answer 200 with an empty list,
+            // which tells an operator "you have no numbers" when the truth is
+            // "nobody configured this". It stays unmounted until the pool has a
+            // source, and it keeps its `allow(dead_code)` to say so out loud.
+            .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
         config.api_keys.clone(),
     );
@@ -337,7 +356,7 @@ fn app(db: Db, config: &Config, gate: PolicyGate) -> Router {
     // of us has nothing to authenticate with, and a key nobody can fetch
     // verifies nothing.
     let public = routes::webhooks::router(db.clone(), webhooks(config))
-        .merge(routes::a2a::card_router(a2a_state(&db, &gate, config)))
+        .merge(routes::a2a::card_router(a2a))
         .merge(routes::well_known::router(db.clone()));
 
     let health = Router::new()
@@ -1959,7 +1978,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let engine = ProvisioningEngine::new(
             db.clone(),
-            agentos_app::mocks::adapters(),
+            agentos_app::mocks::adapters("outbox-test-master-key"),
             EngineConfig::default(),
         );
         let agent = Agent {

@@ -36,13 +36,16 @@
 //!
 //! Retrieved text comes back as [`Untrusted<String>`]: it is a stranger's PDF,
 //! and it is on its way into a prompt. Each [`Hit`] carries its `source_id` so
-//! the caller can cite it.
+//! the caller can cite it. That wrapper is unconditional and is not read off a
+//! column — see [`NewSource::trust`], which records where a source came from for
+//! the audit trail, and `crates/app/src/knowledge.rs` for why no per-source
+//! label may ever be allowed to remove the wrapper.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use agentos_domain::ids::EmployeeId;
-use agentos_domain::untrusted::Untrusted;
+use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use pgvector::Vector;
 use sqlx::Row;
 use uuid::Uuid;
@@ -104,6 +107,11 @@ pub struct NewSource {
     /// Hash of the fetched bytes, so re-ingesting an unchanged document is a
     /// no-op instead of a duplicate.
     pub checksum: Option<String>,
+    /// **Who wrote the text**, recorded at ingest because by retrieval time
+    /// nothing else in the row remembers. Not optional and not defaulted here:
+    /// a caller that has to name it is a caller that had to think about it, and
+    /// the column's own default only covers rows written before 0016.
+    pub trust: TrustLabel,
 }
 
 /// One chunk of a source, ready to store.
@@ -154,12 +162,22 @@ pub struct Hit {
     pub score: f64,
 }
 
+/// Wire spelling of a trust label, matching `messages.trust_label`. One
+/// vocabulary across every table that records provenance, or a query that joins
+/// two of them compares 'untrusted' against something else.
+const fn trust_str(label: TrustLabel) -> &'static str {
+    match label {
+        TrustLabel::Trusted => "trusted",
+        TrustLabel::Untrusted => "untrusted",
+    }
+}
+
 /// Record an ingested source.
 pub async fn insert_source(tx: &mut TenantTx<'_>, source: &NewSource) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO knowledge_sources \
-             (id, tenant_id, employee_id, kind, uri, title, checksum) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (id, tenant_id, employee_id, kind, uri, title, checksum, trust_label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(source.id)
     .bind(tx.tenant_id().as_uuid())
@@ -168,6 +186,7 @@ pub async fn insert_source(tx: &mut TenantTx<'_>, source: &NewSource) -> Result<
     .bind(&source.uri)
     .bind(&source.title)
     .bind(&source.checksum)
+    .bind(trust_str(source.trust))
     .execute(&mut ***tx)
     .await?;
     Ok(())
@@ -500,6 +519,7 @@ mod tests {
                 uri: Some("https://example.test/handbook.pdf".to_owned()),
                 title: Some("Handbook".to_owned()),
                 checksum: Some("sha256:deadbeef".to_owned()),
+                trust: TrustLabel::Untrusted,
             },
         )
         .await

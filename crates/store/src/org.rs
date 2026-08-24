@@ -537,13 +537,14 @@ mod tests {
         layer: &str,
         role_name: Option<&str>,
         caps: (i64, i64, i64),
+        turns: i32,
     ) {
         sqlx::query(
             "INSERT INTO policy_layers \
                (id, version_id, tenant_id, layer, role_name, spend_currency, \
                 max_per_transaction_minor, max_per_day_minor, approval_above_minor, \
-                allowed_domains, max_new_contacts_per_day) \
-             VALUES ($1, $2, $3, $4, $5, 'USD', $6, $7, $8, '{example.com}', 10)",
+                allowed_domains, max_new_contacts_per_day, max_turns_per_day) \
+             VALUES ($1, $2, $3, $4, $5, 'USD', $6, $7, $8, '{example.com}', 10, $9)",
         )
         .bind(Uuid::now_v7())
         .bind(version)
@@ -553,10 +554,15 @@ mod tests {
         .bind(caps.0)
         .bind(caps.1)
         .bind(caps.2)
+        .bind(turns)
         .execute(&mut **tx)
         .await
         .unwrap_or_else(|e| panic!("insert {layer} layer: {e}"));
     }
+
+    /// The tenant layer's daily turn budget. A number the role layers below
+    /// can be measured against: 40 tightens it, 999 tries to widen it.
+    const TENANT_TURNS: i32 = 120;
 
     /// A tenant policy version with a tenant layer and, optionally, a role
     /// layer. Written straight to the table because there is no writer API for
@@ -568,7 +574,7 @@ mod tests {
         db: &Db,
         tenant: TenantId,
         tenant_caps: (i64, i64, i64),
-        role: Option<(&str, (i64, i64, i64))>,
+        role: Option<(&str, (i64, i64, i64), i32)>,
     ) {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("DELETE FROM policy_versions WHERE tenant_id = $1")
@@ -588,9 +594,27 @@ mod tests {
         .await
         .expect("insert version");
 
-        insert_layer(&mut tx, version, tenant, "tenant", None, tenant_caps).await;
-        if let Some((role_name, caps)) = role {
-            insert_layer(&mut tx, version, tenant, "role", Some(role_name), caps).await;
+        insert_layer(
+            &mut tx,
+            version,
+            tenant,
+            "tenant",
+            None,
+            tenant_caps,
+            TENANT_TURNS,
+        )
+        .await;
+        if let Some((role_name, caps, turns)) = role {
+            insert_layer(
+                &mut tx,
+                version,
+                tenant,
+                "role",
+                Some(role_name),
+                caps,
+                turns,
+            )
+            .await;
         }
         tx.commit().await.expect("commit policy");
     }
@@ -733,6 +757,12 @@ mod tests {
             (20_000, 60_000, 10_000),
             "a team with no layer must inherit the tenant's, not PolicyLimits::default()"
         );
+        assert_eq!(
+            policy.limits().max_turns_per_day,
+            TENANT_TURNS as u32,
+            "an absent team layer inherits the tenant's turn budget too, rather \
+             than collapsing to the zero that PolicyLimits::default() grants"
+        );
 
         drop_tenant(&db, tenant).await;
     }
@@ -754,7 +784,7 @@ mod tests {
             &db,
             tenant,
             (20_000, 60_000, 10_000),
-            Some(("purchasing", (5_000, 15_000, 2_000))),
+            Some(("purchasing", (5_000, 15_000, 2_000), 40)),
         )
         .await;
 
@@ -777,6 +807,9 @@ mod tests {
             .await
             .expect("load buyer");
         assert_eq!(caps(&buyer_policy), (5_000, 15_000, 2_000));
+        // ...on the turn budget as much as on the money. A team that decides
+        // its members should wake less often is a team that can say so.
+        assert_eq!(buyer_policy.limits().max_turns_per_day, 40);
 
         // ...and it does not follow the employee onto another team: sales has
         // no layer of its own, so the seller is back to the tenant's numbers.
@@ -785,6 +818,10 @@ mod tests {
             .await
             .expect("load seller");
         assert_eq!(caps(&seller_policy), (20_000, 60_000, 10_000));
+        assert_eq!(
+            seller_policy.limits().max_turns_per_day,
+            TENANT_TURNS as u32
+        );
 
         // A `role` argument must not override the team the employee is on:
         // otherwise a caller could name the wider team and get its limits.
@@ -799,7 +836,7 @@ mod tests {
             &db,
             tenant,
             (20_000, 60_000, 10_000),
-            Some(("purchasing", (999_999, 999_999, 999_999))),
+            Some(("purchasing", (999_999, 999_999, 999_999), 999)),
         )
         .await;
 
@@ -812,6 +849,11 @@ mod tests {
             caps(&greedy),
             (20_000, 60_000, 10_000),
             "a team must never be able to widen its tenant's limits"
+        );
+        assert_eq!(
+            greedy.limits().max_turns_per_day,
+            TENANT_TURNS as u32,
+            "a team must not be able to buy itself more turns than its tenant has"
         );
 
         drop_tenant(&db, tenant).await;

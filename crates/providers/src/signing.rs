@@ -90,6 +90,19 @@ impl Signature {
     pub fn to_base64(&self) -> String {
         B64.encode(self.0)
     }
+
+    /// The inverse of [`Signature::to_base64`], for a signature off the wire.
+    ///
+    /// Here rather than at the call site so the "standard, not base64url"
+    /// rule above is stated once. A verifier that decodes with the other
+    /// alphabet does not get a wrong answer, it gets no answer at all, and
+    /// that is the kind of bug that only shows up against a real peer.
+    pub fn from_base64(encoded: &str) -> Result<Self, ProviderError> {
+        let bytes = B64.decode(encoded).map_err(|_| ProviderError::Terminal {
+            code: "signature_encoding",
+        })?;
+        Self::from_slice(&bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------

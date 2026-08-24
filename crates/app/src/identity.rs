@@ -89,6 +89,35 @@ const KID_KEY: &str = "kid";
 /// the payload — see the module docs.
 const DIGEST_KEY: &str = "payload_sha256";
 
+/// The envelope cipher every [`Identity`] in this process shares, from the
+/// deployment's `AGENTOS_MASTER_KEY`.
+///
+/// # Why SHA-256 and not a KDF
+///
+/// `LocalEnvelopeSecretStore` takes 32 bytes and the variable is text, so
+/// something has to bridge them, and doing it in one place is the point — two
+/// spellings of this function are two deployments that cannot read each other's
+/// rows. SHA-256 is the bridge because the input is a **secret**, not a
+/// password: it comes out of a secret manager with full entropy, so there is
+/// nothing for a KDF's salt and work factor to defend against. Feeding a
+/// high-entropy secret through Argon2 buys latency, not security.
+///
+/// The corollary is an operational one and it is load-bearing: an
+/// `AGENTOS_MASTER_KEY` that somebody *typed* has the entropy of a typed
+/// string, and this function will not fix that. Generate it (`openssl rand
+/// -base64 32`) and store it where the rest of the credentials live.
+///
+/// ponytail: no key id, no versioning, no rotation path. Rotating this key
+/// means re-sealing every row, which is a migration and a maintenance window,
+/// not a constant. The real answer is KMS — where this argument becomes a key
+/// id and rotation becomes somebody else's problem — and `agentos_providers::secrets`
+/// documents that swap as a body change.
+pub fn envelope(master_key: &str) -> Arc<LocalEnvelopeSecretStore> {
+    Arc::new(LocalEnvelopeSecretStore::new(
+        Sha256::digest(master_key.as_bytes()).into(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -229,6 +258,36 @@ impl Identity {
         tx.commit().await.map_err(IdentityError::Unavailable)?;
 
         PublicKey::from_slice(&stored.public_key).map_err(IdentityError::Corrupt)
+    }
+
+    /// The key this employee currently signs and publishes under.
+    ///
+    /// Read through [`keys::published_keys`] — the *same* query the JWKS route
+    /// runs — and not through [`keys::load`], deliberately. A signer needs to
+    /// name a `kid` in the signature it emits, and the only `kid` worth naming
+    /// is one a verifier will find when it fetches the directory. Reading from
+    /// a different query than the one strangers read is how a signature ends up
+    /// pointing at a key nobody publishes.
+    ///
+    /// [`IdentityError::NoKey`] when nothing is published — no key was ever
+    /// minted, or the employee is not `active`.
+    pub async fn public_key(&self) -> Result<PublicKey, IdentityError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(IdentityError::Unavailable)?;
+        let published = keys::published_keys(&mut tx, self.principal.employee_id)
+            .await
+            .map_err(IdentityError::Unavailable)?;
+        tx.commit().await.map_err(IdentityError::Unavailable)?;
+
+        // One key per employee is the primary key of the table, so `first` is
+        // "the" key and not a choice — see `0014_identity.sql`. It stays `first`
+        // rather than an assertion so that adding a rotation overlap window is a
+        // change to what is *chosen*, not a panic in a signing path.
+        let first = published.first().ok_or(IdentityError::NoKey)?;
+        PublicKey::from_slice(first).map_err(IdentityError::Corrupt)
     }
 
     /// Sign `payload` in this employee's name, on the authority of `ok`.

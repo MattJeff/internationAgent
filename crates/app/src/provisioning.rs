@@ -69,7 +69,7 @@ use agentos_domain::ids::{EmployeeId, IdempotencyKey, SecretRef, Slug, TenantId}
 use agentos_domain::phone_pool::NumberStrategy;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::email::EmailProvider;
-use agentos_providers::secrets::SecretStore;
+use agentos_providers::secrets::{LocalEnvelopeSecretStore, SecretStore};
 use agentos_providers::telephony::{Region, TelephonyProvider};
 use agentos_providers::{EnsureCtx, ProviderError, Provisioned, Secret};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
@@ -77,12 +77,15 @@ use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::employee;
 use agentos_store::phone_pool;
 use agentos_store::provisioning::{self, Claim, IntentState, StepOutcome};
+use agentos_store::signing as keys;
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::Rng;
 use serde_json::json;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+use crate::gate::Principal;
+use crate::identity::{Identity, IdentityError};
 use crate::pool_ops;
 
 /// Provider name for a resource that is us: no external system, nothing to
@@ -127,13 +130,22 @@ pub struct Adapters {
     pub browser: Arc<dyn BrowserProvider>,
     /// Where the employee's credentials live.
     pub secrets: Arc<dyn SecretStore>,
+    /// The cipher that seals an employee's private signing key.
+    ///
+    /// Concrete, not `Arc<dyn SecretStore>`, and not the field above. What
+    /// `Step::Identity` needs is the *cipher* half — `seal` and `open` — over
+    /// rows that belong to `employee_signing_keys`, not the key/value map a
+    /// `SecretStore` owns. See `crate::identity`, which makes the same choice
+    /// for the same reason and explains it at length.
+    pub envelope: Arc<LocalEnvelopeSecretStore>,
 }
 
 impl std::fmt::Debug for Adapters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Trait objects have nothing printable, and an adapter's Debug would be
-        // the place a credential leaks anyway.
-        f.write_str("Adapters { email, telephony, browser, secrets }")
+        // the place a credential leaks anyway — as would the master key inside
+        // the envelope cipher.
+        f.write_str("Adapters { email, telephony, browser, secrets, envelope }")
     }
 }
 
@@ -800,10 +812,66 @@ impl ProvisioningEngine {
                 Ok(())
             }
 
+            // **The employee's private key is destroyed here, and it is not
+            // coming back.**
+            //
+            // Note first what `delete_prefix` above does *not* reach: the
+            // sealed private key is not a `SecretStore` row, it is a column in
+            // `employee_signing_keys` (see `crate::identity`, which explains
+            // why the two are kept apart). So the vault's release does not
+            // touch it, and without this arm an offboarded employee's key would
+            // outlive it forever.
+            //
+            // # Destroy, rather than merely stop publishing
+            //
+            // Publication has *already* stopped: `signing::published_keys`
+            // joins on `lifecycle = 'active'`, so the moment an operator
+            // terminates an employee its key leaves the JWKS and old signatures
+            // stop verifying for anyone who refetches. Destroying the private
+            // half changes nothing about that, which is exactly why it is safe.
+            //
+            // What it does change is that nobody can ever sign in this
+            // employee's name again — not with the master key, not with a
+            // database dump, not with both. `Lifecycle::Terminated` is
+            // absorbing, so there is no future in which that key is wanted,
+            // and a sealed private key for an identity that is never coming
+            // back is pure liability: one master-key compromise away from a
+            // signature a counterparty who cached the old directory still
+            // believes.
+            //
+            // The thing it might have cost — being able to answer "did this
+            // employee sign that?" about an old signature — it does not cost.
+            // That question is answered by verifying against the published key
+            // and by the `message_signed` rows, which carry the `kid` and the
+            // payload digest under the ruling that permitted them. Nobody
+            // re-proves an old signature by making a new one. The trail
+            // survives; the ability to forge does not.
+            //
+            // Suspension deliberately does **not** come through here: it is
+            // reversible, publication already stops, and a suspended employee
+            // that is reinstated keeps the identity its counterparties know.
+            Step::Identity => {
+                let mut tx = self
+                    .db
+                    .tenant_tx(employee.tenant_id())
+                    .await
+                    .map_err(|_| ProviderError::timeout())?;
+                // Idempotent by the store's own contract: deleting a key that
+                // is already gone is `Ok(false)`, which is the desired state.
+                let destroyed = keys::delete(&mut tx, employee.id())
+                    .await
+                    .map_err(|_| ProviderError::timeout())?;
+                tx.commit().await.map_err(|_| ProviderError::timeout())?;
+                tracing::info!(
+                    employee = %employee.id().as_uuid(), destroyed,
+                    "signing key destroyed; this employee can never sign again"
+                );
+                Ok(())
+            }
+
             // Ours. The row is the resource: no external system, nothing to
             // cancel, nobody billing us. Clearing the binding *is* the release.
-            Step::Identity
-            | Step::Whatsapp
+            Step::Whatsapp
             | Step::Wallet
             | Step::CompanyKnowledge
             | Step::Mcp
@@ -1026,10 +1094,40 @@ impl ProvisioningEngine {
         ctx: &EnsureCtx,
     ) -> Result<ProviderBinding, ProviderError> {
         match step {
-            // Identity, permissions, the wallet ledger, the knowledge and MCP
-            // namespaces are ours: they are true the moment they are written
-            // down, and their "external id" names the row that says so.
-            Step::Identity => Ok(ProviderBinding::new(LOCAL, employee.did().to_owned())),
+            // Identity is the one "local" step that produces something: the
+            // employee's Ed25519 keypair, which is what makes it verifiable to
+            // a stranger. Everything downstream — the JWKS at
+            // `/.well-known/http-message-signatures-directory`, every signed
+            // outbound A2A request — is that key, so minting it here is what
+            // makes `Step::Identity` mean anything beyond writing a DID string
+            // into a column.
+            //
+            // # A retry cannot mint a second key
+            //
+            // `Identity::ensure_key` is `INSERT … ON CONFLICT DO NOTHING`
+            // followed by a read-back, against a table whose primary key is
+            // `(tenant_id, employee_id)`. That is the same guarantee
+            // `IdempotencyKey` buys for the phone number, arrived at the other
+            // way round: a number lives at Twilio, where the only way to ask
+            // "did I already buy this?" is to present a key the provider
+            // remembers, so the key is the reconciliation. A signing key lives
+            // in our own database, where the question is a unique constraint —
+            // which is strictly stronger, because it cannot be lost, cannot
+            // expire, and does not depend on a provider honouring it.
+            //
+            // That is also why this step still has no write-ahead intent (see
+            // `adapter_of`): an intent exists to make a *possibly-created,
+            // unrecorded* resource visible after a crash, and there is no such
+            // state here. The mint commits or it does not; a worker that dies
+            // mid-`ensure_key` leaves either no row or a complete one, and the
+            // next pass converges on whichever it is.
+            Step::Identity => {
+                self.identity(employee)
+                    .ensure_key()
+                    .await
+                    .map_err(mint_failure)?;
+                Ok(ProviderBinding::new(LOCAL, employee.did().to_owned()))
+            }
             Step::Wallet => Ok(local(employee, "wallet")),
             Step::CompanyKnowledge => Ok(local(employee, "knowledge")),
             Step::Mcp => Ok(local(employee, "mcp")),
@@ -1083,6 +1181,15 @@ impl ProvisioningEngine {
     }
 
     // -- plumbing ----------------------------------------------------------
+
+    /// This employee's signing identity, over the engine's own pool and cipher.
+    fn identity(&self, employee: &Employee) -> Identity {
+        Identity::new(
+            self.db.clone(),
+            Arc::clone(&self.adapters.envelope),
+            Principal::employee(employee.tenant_id(), employee.id()),
+        )
+    }
 
     async fn load(
         &self,
@@ -1169,6 +1276,25 @@ fn backoff(cfg: &EngineConfig, attempt: u32, err: &ProviderError) -> Duration {
         .saturating_mul(1u32 << attempt.min(16))
         .min(cfg.backoff_cap);
     capped.mul_f64(rand::rng().random_range(0.5..=1.0))
+}
+
+/// A failure to mint a signing key, as the one error type [`ProvisioningEngine::call`]
+/// speaks.
+///
+/// The split is retryable versus not. A database that would not answer is the
+/// engine's ordinary bad afternoon and a later pass mints the key. A wrong
+/// master key or a corrupt row is not fixed by trying again — a step that
+/// retries one of those forever is a step nobody ever looks at — so it becomes
+/// terminal, carrying [`IdentityError::code`] so the dashboard says which.
+fn mint_failure(err: IdentityError) -> ProviderError {
+    let code = err.code();
+    match err {
+        IdentityError::Unavailable(_) => ProviderError::timeout(),
+        // Already a provider error, and its code is the useful one.
+        IdentityError::Unsealable(inner) => inner,
+        // `NoKey` is unreachable from `ensure_key`, which has just written one.
+        IdentityError::NoKey | IdentityError::Corrupt(_) => ProviderError::Terminal { code },
+    }
 }
 
 /// A binding to a resource that is us.
@@ -1287,6 +1413,12 @@ mod tests {
 
     // -- fixtures ----------------------------------------------------------
 
+    /// The envelope root these tests seal signing keys under. A literal,
+    /// because the deployment's is a literal too — it comes out of the
+    /// environment as text and `identity::envelope` is what turns it into 32
+    /// bytes, so the tests go through the same function the binary does.
+    const TEST_MASTER_KEY: &str = "provisioning-tests-master-key";
+
     /// These tests share one database, and the `(provider, external_id)` unique
     /// index is global to it while the mocks number their resources from 1. So
     /// they run one at a time and each starts from an empty database, rather
@@ -1356,6 +1488,7 @@ mod tests {
             telephony,
             browser: Arc::new(MockBrowser::new()),
             secrets: Arc::new(MemorySecretStore::new()),
+            envelope: crate::identity::envelope(TEST_MASTER_KEY),
         }
     }
 
@@ -1850,6 +1983,146 @@ mod tests {
         assert!(advised >= cfg.backoff_cap / 2);
     }
 
+    // -- the signing key ---------------------------------------------------
+
+    /// The keys this employee publishes, read the way a stranger reads them.
+    async fn published(db: &Db, employee: &Employee) -> Vec<Vec<u8>> {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let rows = keys::published_keys(&mut tx, employee.id())
+            .await
+            .expect("published");
+        tx.rollback().await.expect("rollback");
+        rows
+    }
+
+    /// **The one that matters for A: converging twice must not mint a second
+    /// key.**
+    ///
+    /// A second keypair would strand every signature made under the first —
+    /// silently, at whatever moment the retry happened — and the counterparty
+    /// would be the one to find out. So this drives the real engine through the
+    /// real step, twice, and then a third time from a *restarted* engine (a new
+    /// `worker_id`, which is what a redeploy looks like).
+    #[tokio::test]
+    async fn provisioning_twice_mints_exactly_one_signing_key() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let email = Arc::new(MockEmailProvider::new());
+        let adapters = || adapters(telephony.clone(), email.clone());
+        let engine = ProvisioningEngine::new(db.clone(), adapters(), cfg());
+
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        let first = published(&db, &employee).await;
+        assert_eq!(first.len(), 1, "one employee, one published key");
+        assert_eq!(first[0].len(), 32, "and it is an Ed25519 key");
+
+        // Same worker, again.
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge again");
+        assert_eq!(published(&db, &employee).await, first, "the key changed");
+
+        // A restarted process: a fresh `worker_id`, fresh adapters, and — the
+        // part that would catch a mint keyed on anything in memory — the step
+        // forced back to `provisioning` so `ensure_step` actually runs the call
+        // again rather than short-circuiting on `Ready`.
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        sqlx::query(
+            "UPDATE employee_resources SET state = 'provisioning', lease_owner = NULL, \
+             lease_until = NULL WHERE employee_id = $1 AND step = 'identity'",
+        )
+        .bind(employee.id().as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("rewind identity");
+        tx.commit().await.expect("commit");
+
+        let restarted = ProvisioningEngine::new(db.clone(), adapters(), cfg());
+        assert_ne!(restarted.worker_id(), engine.worker_id());
+        assert_eq!(
+            restarted
+                .ensure_step(&reload(&db, &employee).await, Step::Identity)
+                .await
+                .expect("re-ensure"),
+            StepReport::Ready
+        );
+        assert_eq!(
+            published(&db, &employee).await,
+            first,
+            "a re-provisioned identity minted a second key and stranded the first"
+        );
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM employee_signing_keys").await,
+            1,
+            "the table itself must hold exactly one row for this employee"
+        );
+    }
+
+    /// Offboarding destroys the private half. See `release_call`'s
+    /// `Step::Identity` arm for why that is the right call and not a liability.
+    #[tokio::test]
+    async fn offboarding_destroys_the_signing_key() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(
+                Arc::new(MockTelephony::new(Utc::now(), "tok")),
+                Arc::new(MockEmailProvider::new()),
+            ),
+            cfg(),
+        );
+        engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        assert_eq!(published(&db, &employee).await.len(), 1);
+
+        let terminated = terminate(&db, &reload(&db, &employee).await).await;
+        // Publication has already stopped — the lifecycle filter did that, and
+        // it is why destroying the private half costs nothing.
+        assert!(published(&db, &employee).await.is_empty());
+
+        assert_eq!(
+            engine
+                .release_step(&terminated, Step::Identity)
+                .await
+                .expect("release identity"),
+            ReleaseReport::Released
+        );
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM employee_signing_keys").await,
+            0,
+            "the sealed private key outlived the employee"
+        );
+
+        // Releasing twice is fine: the store's delete is idempotent, so a
+        // retried termination event is not an error.
+        assert_eq!(
+            engine
+                .release_step(&reload(&db, &employee).await, Step::Identity)
+                .await
+                .expect("release again"),
+            ReleaseReport::NotBound,
+            "the binding is gone, so there is nothing left to give back"
+        );
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM employee_signing_keys").await,
+            0
+        );
+    }
+
     // -- database tests ----------------------------------------------------
 
     #[tokio::test]
@@ -2248,6 +2521,7 @@ mod tests {
                 telephony: telephony.clone(),
                 browser: browser.clone(),
                 secrets: secrets.clone(),
+                envelope: crate::identity::envelope(TEST_MASTER_KEY),
             },
             cfg(),
         );
@@ -2327,6 +2601,7 @@ mod tests {
                 telephony: telephony.clone(),
                 browser: browser.clone(),
                 secrets: Arc::new(MemorySecretStore::new()),
+                envelope: crate::identity::envelope(TEST_MASTER_KEY),
             },
             cfg(),
         );

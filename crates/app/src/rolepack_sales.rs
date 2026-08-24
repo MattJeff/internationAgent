@@ -254,6 +254,14 @@ impl RolePack {
                 // is not.
                 max_new_contacts_per_day: 0,
 
+                // How often this role may wake and act on its own objective.
+                // Research-heavy and reply-driven rather than continuous: a
+                // day's prospect reading, finding-writing and follow-ups fits
+                // well inside this, and the ceiling is what stops a stuck one
+                // billing model tokens all night. See `agentos_store::turns`
+                // for why the unit is turns and not tokens.
+                max_turns_per_day: 40,
+
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,

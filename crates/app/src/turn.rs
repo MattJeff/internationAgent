@@ -934,6 +934,10 @@ mod tests {
         turn: Turn,
         payments: Arc<MockPayments>,
         email: Arc<MockEmailProvider>,
+        /// The tenant and employee the turn acts as. Exposed because the
+        /// knowledge tests below have to put a document in the same tenant the
+        /// turn will retrieve from.
+        principal: Principal,
     }
 
     async fn harness(db: &Db, llm: Arc<dyn Llm>, mcp_says: &'static str) -> Harness {
@@ -954,13 +958,14 @@ mod tests {
                 llm,
                 gate(db),
                 effects,
-                principal,
+                principal.clone(),
                 SystemPrompt::new("You are Lena, purchasing agent for Fabrikam."),
                 "claude-opus-5",
                 "lena@fabrikam.example",
             ),
             payments,
             email,
+            principal,
         }
     }
 
@@ -1341,6 +1346,164 @@ mod tests {
             h.payments.calls().is_empty(),
             "the effect ran after the cancellation: {:?}",
             h.payments.calls()
+        );
+    }
+
+    // -- company documents -------------------------------------------------
+
+    /// Put one document in this employee's tenant, the way an upload does.
+    async fn upload(db: &Db, principal: &Principal, text: &str) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        crate::knowledge::ingest(
+            &mut tx,
+            crate::knowledge::Embedder::Mock,
+            &crate::knowledge::Document {
+                employee_id: None,
+                uri: Some("https://example.test/handbook.md"),
+                title: Some("Handbook"),
+                format: crate::knowledge::Format::Markdown,
+                // What an uploaded document is. See `knowledge::Document::trust`.
+                trust: TrustLabel::Untrusted,
+                text,
+            },
+        )
+        .await
+        .expect("ingest");
+        tx.commit().await.expect("commit");
+    }
+
+    /// Every text block the model was shown on the nth request, joined.
+    fn shown(requests: &[LlmRequest], nth: usize) -> String {
+        requests[nth]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The end of the wire this unit adds.** A document uploaded on Tuesday
+    /// is retrieved into a prompt on Friday — a stranger's text arriving on a
+    /// turn that never received it. It must land framed, never in the system
+    /// prompt, and it must cost the turn its high-risk tools.
+    #[tokio::test]
+    async fn a_recalled_document_arrives_framed_and_takes_the_payment_tool_with_it() {
+        let Some(db) = db().await else { return };
+        // The model has been steered by the document and asks for the wire.
+        let llm = Arc::new(ScriptedLlm::responses(vec![pay_call("toolu_1"), done()]));
+        let h = harness(&db, llm.clone(), "{}").await;
+
+        upload(
+            &db,
+            &h.principal,
+            &format!("# Payment policy\n\n{INJECTION}\n"),
+        )
+        .await;
+
+        let question = Untrusted::new("what is the payment policy?".to_owned());
+        let recalled = crate::knowledge::recall(
+            &db,
+            crate::knowledge::Embedder::Mock,
+            h.principal.tenant_id,
+            &crate::knowledge::Recall::new(&question, None),
+        )
+        .await;
+        assert!(
+            !recalled.hits().is_empty(),
+            "the fixture must actually be retrieved, or this test proves nothing"
+        );
+
+        let context = recalled.into_context(Context::new().with_task("answer the buyer"));
+        let finished = h
+            .turn
+            .run(context, &CancellationToken::new())
+            .await
+            .expect("the run itself completes");
+
+        let requests = llm.requests();
+
+        // The passage reached the model, inside a frame the document could not
+        // have written ...
+        let framed = shown(&requests, 0);
+        assert!(framed.contains(INJECTION), "the passage never arrived");
+        let block = framed
+            .lines()
+            .position(|line| line.contains(INJECTION))
+            .expect("a line with the injection");
+        assert!(
+            framed.lines().take(block).any(|line| {
+                line.starts_with(crate::prompt::SENTINEL)
+                    && line.contains("BEGIN source=knowledge:")
+            }),
+            "the passage is not inside a knowledge frame: {framed}"
+        );
+
+        // ... and nowhere near the operator's own briefing.
+        assert!(
+            !requests[0].system.contains(INJECTION),
+            "a retrieved document was rendered as the operator's own text"
+        );
+
+        // Retrieving it narrowed the catalogue, so the payment the document
+        // asks for was never on offer — and the gate refuses the guess anyway.
+        assert!(!offered(&requests, 0).contains(&PAY.to_owned()));
+        assert!(
+            h.payments.calls().is_empty(),
+            "money moved: {:?}",
+            h.payments.calls()
+        );
+        assert_eq!(finished.trust, TrustLabel::Untrusted);
+    }
+
+    /// A retrieval that does not happen costs the documents and nothing else.
+    /// The turn finishes, keeps its tools, and the model is told it answered
+    /// without them rather than being left to assume it looked.
+    #[tokio::test]
+    async fn a_turn_whose_documents_are_unreachable_still_answers() {
+        let Some(db) = db().await else { return };
+        let llm = Arc::new(ScriptedLlm::responses(vec![done()]));
+        let h = harness(&db, llm.clone(), "{}").await;
+        upload(
+            &db,
+            &h.principal,
+            "# Payment policy\n\nNet 30, no exceptions.\n",
+        )
+        .await;
+
+        let question = Untrusted::new("what is the payment policy?".to_owned());
+        let recalled = crate::knowledge::recall(
+            &db,
+            crate::knowledge::Embedder::Mock,
+            h.principal.tenant_id,
+            &crate::knowledge::Recall {
+                timeout: std::time::Duration::ZERO,
+                ..crate::knowledge::Recall::new(&question, None)
+            },
+        )
+        .await;
+        assert!(recalled.unavailable());
+
+        let finished = h
+            .turn
+            .run(
+                recalled.into_context(Context::new().with_task("answer the buyer")),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("a failed retrieval must not fail the turn");
+
+        assert_eq!(finished.reply, "All done.");
+        // Nothing third-party arrived, so the turn is still trusted and still
+        // holds the tool it would have lost to a successful recall.
+        assert_eq!(finished.trust, TrustLabel::Trusted);
+        assert!(offered(&llm.requests(), 0).contains(&PAY.to_owned()));
+        assert!(
+            shown(&llm.requests(), 0).contains("could not be reached"),
+            "the model was not told it is answering without its documents"
         );
     }
 

@@ -12,9 +12,19 @@ agentos-store.workspace = true
 a2a-lf.workspace = true
 a2a-server-lf.workspace = true
 async-trait.workspace = true
+# RFC 9421 puts a signature on the wire as base64, and a JWK's `x` member is
+# base64url. Was a dev-dependency; `http_signature` and `peer_keys` need it in
+# the build proper.
+base64.workspace = true
 rmcp.workspace = true
 chrono.workspace = true
 rand.workspace = true
+# One outbound GET: a peer's JWKS. It lives here rather than behind a port in
+# `agentos-providers` because the SSRF check and the connect must be in the same
+# function — split across a crate boundary, the check is one refactor away from
+# being skipped. Same reasoning, same place, as `mcp.rs`, which already dials
+# out from this crate. Already in the lock via `agentos-providers`.
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -27,7 +37,4 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-# Tests only: recovering the real private key so the "nothing leaks it" test
-# greps for the actual bytes rather than a stand-in.
-base64.workspace = true
 trybuild.workspace = true

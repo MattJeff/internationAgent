@@ -80,7 +80,14 @@
 //! deployment decision for the ingress proxy, which is also the thing that
 //! should be absorbing this traffic.
 
-use agentos_domain::identity::{PublicKey, jwks};
+// `DIRECTORY_PATH` is the path Cloudflare's Web Bot Auth directory uses, and
+// the reason this module exists rather than a `did:web` one. It is a literal in
+// the domain crate, never assembled from a prefix — a well-known path built out
+// of parts is a well-known path somebody eventually re-prefixes — and it lives
+// there rather than here because it is now read from both ends:
+// `agentos_app::peer_keys` fetches a *peer's* directory at the same path, and
+// two spellings of it would be two protocols.
+use agentos_domain::identity::{DIRECTORY_PATH, PublicKey, jwks};
 use agentos_store::db::Db;
 use agentos_store::signing;
 use axum::Router;
@@ -91,12 +98,6 @@ use axum::routing::get;
 
 use crate::error::ApiError;
 use crate::routes::a2a::Which;
-
-/// The path Cloudflare's Web Bot Auth directory uses, and the reason this
-/// module exists rather than a `did:web` one. Spelled out as a literal for the
-/// same reason the agent card's path is: a well-known path assembled from a
-/// prefix is a well-known path somebody eventually re-prefixes.
-const DIRECTORY_PATH: &str = "/.well-known/http-message-signatures-directory";
 
 /// The media type the directory draft specifies. It is a JWKS, so
 /// `application/json` would parse everywhere, but a verifier that content-type
