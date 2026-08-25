@@ -1,4 +1,4 @@
-//! `/v1/teams`: the org chart, over HTTP.
+//! `/v1/teams` and `/v1/org`: the org chart, over HTTP.
 //!
 //! `0012_org.sql` and [`agentos_store::org`] shipped together and neither of
 //! them can be reached from outside the process: a team could only be created
@@ -6,6 +6,18 @@
 //! one — everything here is an *administrative* act performed by an operator's
 //! API key, not an action an employee takes, so nothing on this surface goes
 //! through the Policy Gate and everything on it writes an audit row.
+//!
+//! # One call, or twenty
+//!
+//! [`apply_org`] is the door an operator should use, and every `/v1/teams`
+//! route below is the same surface one field at a time. The seven-row table an
+//! operator draws was roughly twenty calls — create team, set mission, hire,
+//! seat, point the line, per row — with **no transaction across them**, so any
+//! failure in the middle left teams with no heads and employees reporting into
+//! seats that were never made. That is not a state to retry; it is a state to
+//! reason about first, and nobody can. `POST /v1/org` is the whole table in one
+//! `TenantTx`. The single-field routes stay because editing one mission is not
+//! re-declaring a company.
 //!
 //! # What a route may not do
 //!
@@ -82,12 +94,16 @@
 //! employee — [`employee_in_tenant`] is what stops a membership row being filed
 //! for someone else's agent.
 
+use agentos_domain::action::Domain;
+use agentos_domain::employee::Employee;
 use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::org::Mission;
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::employee as employee_store;
 use agentos_store::org;
+use agentos_store::outbox::{self, NewEvent};
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -115,14 +131,9 @@ const MAX_ROWS: i64 = 500;
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before any handler here.
-///
-/// ponytail: `allow(dead_code)` for the same reason `routes::inventory` carries
-/// it — this unit owns `routes/teams.rs` and one `pub mod` line, and `main.rs`,
-/// where every router is merged, belongs to another unit. Delete the attribute
-/// in the same commit that adds `.merge(routes::teams::router(db.clone()))` to
-/// `app`; until then the tests below are the only caller.
 pub fn router(db: Db) -> Router {
     Router::new()
+        .route("/v1/org", post(apply_org))
         .route("/v1/teams", post(create_team).get(list_teams))
         .route(
             "/v1/teams/{team_id}/sections",
@@ -148,6 +159,70 @@ pub fn router(db: Db) -> Router {
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
+
+/// The operator's table, as a document. See [`apply_org`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgChart {
+    /// The sending domain given to employees this call *hires*, e.g.
+    /// `agents.example.com`. One per company, not one per row: it becomes the
+    /// local part's host in `slug@domain`, and a company whose founder and
+    /// whose head of growth answer on different domains is two companies.
+    ///
+    /// Ignored for an employee that already exists — its address was minted
+    /// when it was created and re-addressing it would strand every reply in
+    /// flight.
+    domain: String,
+    /// One object per row of the table, in any order. The order of the rows is
+    /// not the shape of the tree: [`apply_org`] resolves every seat before it
+    /// draws a single line, so the CEO may be the last row.
+    rows: Vec<OrgRow>,
+}
+
+/// One row: *Fonction, Responsable, Mission*, plus the line out of the box.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgRow {
+    /// **Fonction**, as a handle — the team's slug, and the identity this row
+    /// is matched on when the document is re-applied. Also the `role_name` the
+    /// team's limits will be read under *if the team is new*; an existing
+    /// team's pointer is never moved by this endpoint.
+    team: String,
+    /// **Fonction**, as the operator wrote it: "Produit et technologie".
+    name: String,
+    /// **Mission**: what this function is for. Prose, never a limit — see
+    /// [`apply_org`].
+    mission: String,
+    /// **Responsable**, as a handle — the employee's slug, and the identity
+    /// *it* is matched on. An employee this tenant does not have yet is hired.
+    head: String,
+    /// **Responsable**, as the operator wrote it: "CFO externalisé". Display
+    /// text; nothing resolves against it and nothing is granted by it.
+    title: String,
+    /// The `head` of another row in this same document. Absent is a seat with
+    /// nobody above it, which is what the CEO's row looks like.
+    #[serde(default)]
+    reports_to: Option<String>,
+}
+
+/// One row of the chart as it now stands in the database.
+#[derive(Debug, Serialize)]
+struct SeatView {
+    team: String,
+    team_id: Uuid,
+    name: String,
+    mission: String,
+    head: String,
+    employee_id: Uuid,
+    title: String,
+    /// The manager's *id*. The slug is in the document the caller just sent;
+    /// the id is the thing they did not have.
+    reports_to: Option<Uuid>,
+    /// Whether this call minted the employee. `true` means eleven resources are
+    /// `pending` and the provisioning loop is coming for them — which is the
+    /// difference between the 202 and the 200 this endpoint answers with.
+    hired: bool,
+}
 
 /// `deny_unknown_fields` throughout, so a client that misspells a field finds
 /// out now rather than wondering why it had no effect. On this surface the
@@ -303,6 +378,417 @@ struct BudgetView {
     spent_minor: u64,
     /// `None` when there is no budget: there is no headroom to report.
     remaining_minor: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// The whole chart, in one call
+// ---------------------------------------------------------------------------
+
+/// One row, validated. Borrows the body, so nothing is copied to say the same
+/// thing twice.
+struct Row<'a> {
+    team: Slug,
+    name: &'a str,
+    mission: Mission,
+    head: Slug,
+    title: &'a str,
+    reports_to: Option<Slug>,
+}
+
+/// What one row turned into. Parallel to the `Row` at the same index, which is
+/// how a reporting line resolves without a map: the document is tens of rows.
+struct Built {
+    team_id: Uuid,
+    employee_id: EmployeeId,
+    hired: bool,
+}
+
+/// `POST /v1/org` — the operator's table, applied whole.
+///
+/// **One transaction.** Either the chart exists or none of it does. The seven
+/// rows were twenty calls with no transaction across them, and the failure mode
+/// was not "the call failed" — it was a company half-built in a way an operator
+/// can neither read nor safely retry: teams with no head, employees on no team,
+/// lines pointing at seats that were never made.
+///
+/// **Two passes, and that is the whole design.** Row 3 names a manager defined
+/// in row 1, so positions cannot be written as the rows are read: a document
+/// listing the CEO last would fail on every line that points at it. So pass one
+/// creates or updates every team, its mission, its head and the head's seat;
+/// pass two, over the same rows, draws the lines. Both inside one [`TenantTx`],
+/// which is what makes a bad line in row 7 undo the team in row 1.
+///
+/// # What "the same" means
+///
+/// A team is its `slug`, an employee is its `slug`. Sending the same body twice
+/// leaves the same company and is not an error. Sending it with a **changed**
+/// mission, name, title or manager *updates* those — this is a declarative
+/// document an operator edits and re-applies, not an append-only log of
+/// intentions, and a re-apply that refused to change anything would leave the
+/// operator back on the twenty calls for every correction.
+///
+/// It never *removes*. A team or a seat that has dropped out of the document is
+/// left standing: removing a head takes down every line under it, and doing
+/// that as a side effect of an edit somebody made to a different row is the one
+/// outcome there is no defence for. `DELETE …/members/{id}` is how a seat goes,
+/// and it refuses to orphan reports.
+///
+/// No `Idempotency-Key` is required, unlike `POST /v1/employees`. That header
+/// exists because a create keyed on nothing mints a second employee on every
+/// retry; every object here is keyed on a slug the caller chose, so a retry
+/// converges on the same rows by construction rather than by remembering a
+/// header.
+///
+/// # It hires
+///
+/// A row may name an employee this tenant does not have, and it is created —
+/// otherwise the caller is back to twenty calls. Hiring here is exactly what
+/// `POST /v1/employees` does, through the same [`employee_store::insert`] and
+/// the same [`CREATED_EVENT`](crate::routes::employees::CREATED_EVENT): the
+/// employee row, its eleven `pending` resources and the outbox event that makes
+/// somebody go and provision them. A second spelling of that event name would
+/// be a fleet of employees the provisioning loop never picks up.
+///
+/// An employee that already exists is *found*, never re-created and never
+/// re-slugged: the slug is the identity, `employees_tenant_slug_key` would
+/// refuse the duplicate anyway, and a "hire" that silently renamed somebody to
+/// `growth-2` is an org chart that no longer matches the addresses in flight.
+/// The response says `hired` per row, so the operator can see which of them
+/// this call actually minted.
+///
+/// # It grants nothing
+///
+/// **Not one `policy_layers` row is written here, and none ever should be.** A
+/// mission is prose an employee is told; it is not a limit. Every restriction
+/// stays in the four-layer intersection — platform ∧ tenant ∧ role ∧ employee —
+/// where `store::policy::load` can take the minimum of each cap and where a
+/// lower layer can only ever tighten. An endpoint that draws the org chart *and*
+/// could widen a cap would be a second gate: two places to write a limit is one
+/// place to forget to tighten, and this one takes a 500-row document from a
+/// single call.
+///
+/// The one policy-adjacent row it touches is `team_policy`, and only for a team
+/// it creates: that is a *pointer* at the `role_name` a team's limits are read
+/// under, written so a new team has a scope at all. An existing team's pointer
+/// is left alone — re-applying a document must not silently move a team onto a
+/// different role's limits.
+///
+/// # The refusals, and none of them is a 500
+///
+/// | | |
+/// |---|---|
+/// | two rows naming one team, or one head | `400` — the document means two things |
+/// | `reports_to` naming a head no row defines | `400`, and **zero rows written** |
+/// | a line that closes a loop | `409 reporting_cycle`, naming both ends |
+///
+/// The last is the trigger's, not this handler's: `team_memberships_acyclic`
+/// holds the rule for every writer, and all that happens here is that its
+/// SQLSTATE is rendered as a 409 instead of an opaque 500.
+///
+/// 202 when it hired somebody — eleven resources per new employee are pending
+/// and the loop is coming for them — and 200 when it did not, because a
+/// re-apply that changed a mission has nothing outstanding and saying
+/// "Accepted" about it would be a lie an operator learns to ignore.
+async fn apply_org(
+    State(db): State<Db>,
+    principal: Principal,
+    body: Result<Json<OrgChart>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let domain = Domain::parse(&body.domain)
+        .map_err(|err| ApiError::bad_request(format!("domain: {err}")))?;
+    if body.rows.is_empty() {
+        return Err(ApiError::bad_request("rows: an org chart needs a row"));
+    }
+    // Same ceiling as a read, for the same reason and one more: a document is
+    // one transaction, so its length is how long one tenant's org chart is
+    // locked. An org chart is written by humans a few times a year.
+    if body.rows.len() > MAX_ROWS as usize {
+        return Err(ApiError::bad_request(format!(
+            "rows: at most {MAX_ROWS} rows in one chart"
+        )));
+    }
+
+    // Every field of every row through its constructor before the first write.
+    // The index rides along as an extension member because `ApiError`'s detail
+    // is written by the constructor that refused — "slug: too short" is the
+    // useful half, and "which of the seven" is the other.
+    let rows = body
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| parse_row(row).map_err(|err| err.with_extension("row", json!(i))))
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    // ponytail: O(n²) over a document capped at 500. A `HashSet` here would be
+    // two more allocations to save 250k `str` comparisons that never run — the
+    // real charts are seven rows.
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(dup) = rows[..i].iter().find(|other| other.team == row.team) {
+            return Err(ApiError::bad_request(format!(
+                "rows: two rows name the team '{}'; a function has one mission",
+                dup.team.as_str()
+            )));
+        }
+        if let Some(dup) = rows[..i].iter().find(|other| other.head == row.head) {
+            return Err(ApiError::bad_request(format!(
+                "rows: two rows name '{}' as head; an employee holds one seat",
+                dup.head.as_str()
+            )));
+        }
+    }
+
+    let now = Utc::now();
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+
+    // Pass one: every seat exists before any line is drawn.
+    let mut built = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let team_id = upsert_team(&mut tx, &row.team, row.name).await?;
+        org::set_mission(&mut tx, team_id, &row.mission).await?;
+        let (employee_id, hired) =
+            seat_holder(&mut tx, &row.head, &domain, &principal.actor, now).await?;
+        org::set_member(&mut tx, employee_id, team_id, None).await?;
+        built.push(Built {
+            team_id,
+            employee_id,
+            hired,
+        });
+    }
+
+    // Pass two: the lines, now that every seat they can point at is a row.
+    //
+    // A manager must be a `head` in this same document. Resolving against the
+    // tenant at large would make one document mean different things depending
+    // on what happened to be there already, and would turn a typo into a seat
+    // filed under a stranger instead of a 400. Re-declaring the whole chart is
+    // what makes it a document.
+    for (row, seat) in rows.iter().zip(&built) {
+        let manager = match &row.reports_to {
+            None => None,
+            Some(head) => {
+                let Some(idx) = rows.iter().position(|other| &other.head == head) else {
+                    tx.rollback().await?;
+                    return Err(ApiError::bad_request(format!(
+                        "reports_to: no row of this chart defines a seat for '{}'",
+                        head.as_str()
+                    )));
+                };
+                Some(built[idx].employee_id)
+            }
+        };
+
+        if let Err(err) =
+            org::set_position(&mut tx, seat.employee_id, Some(row.title), manager).await
+        {
+            if org::is_reporting_cycle(&err) {
+                tx.rollback().await?;
+                return Err(ApiError::conflict(
+                    "reporting_cycle",
+                    "that reporting line closes a loop in the org chart",
+                )
+                .with_extension("head", json!(row.head.as_str()))
+                .with_extension(
+                    "reports_to",
+                    json!(row.reports_to.as_ref().map(Slug::as_str)),
+                ));
+            }
+            return Err(err.into());
+        }
+    }
+
+    let chart = rows
+        .iter()
+        .zip(&built)
+        .map(|(row, seat)| SeatView {
+            team: row.team.as_str().to_owned(),
+            team_id: seat.team_id,
+            name: row.name.to_owned(),
+            mission: row.mission.as_str().to_owned(),
+            head: row.head.as_str().to_owned(),
+            employee_id: seat.employee_id.as_uuid(),
+            title: row.title.to_owned(),
+            reports_to: row.reports_to.as_ref().and_then(|head| {
+                rows.iter()
+                    .position(|other| &other.head == head)
+                    .map(|idx| built[idx].employee_id.as_uuid())
+            }),
+            hired: seat.hired,
+        })
+        .collect::<Vec<_>>();
+
+    // One act, one audit row, carrying the whole document. Twenty rows claiming
+    // twenty separate decisions would describe a sequence of choices nobody
+    // made; what the operator did was apply this chart, and the payload is the
+    // chart. The per-employee `employee_created` rows are filed separately by
+    // `seat_holder`, because those are the durable record of who minted
+    // something that will go on to buy a phone number.
+    let hired = chart
+        .iter()
+        .filter(|seat| seat.hired)
+        .map(|seat| seat.head.clone())
+        .collect::<Vec<_>>();
+    record(
+        &mut tx,
+        &principal.actor,
+        None,
+        json!({
+            "event": "org.applied",
+            "rows": chart.len(),
+            "hired": hired,
+            "chart": chart,
+        }),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        rows = chart.len(),
+        hired = hired.len(),
+        "org chart applied"
+    );
+
+    let status = if hired.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(json!({ "chart": chart }))).into_response())
+}
+
+/// One row through the constructors. Every string a caller sent becomes a
+/// parsed type here or the request never reaches the database.
+fn parse_row(row: &OrgRow) -> Result<Row<'_>, ApiError> {
+    Ok(Row {
+        team: Slug::parse(&row.team)
+            .map_err(|err| ApiError::bad_request(format!("team: {err}")))?,
+        name: trimmed_name(&row.name)?,
+        mission: Mission::parse(&row.mission)
+            .map_err(|err| ApiError::bad_request(format!("mission: {err}")))?,
+        head: Slug::parse(&row.head)
+            .map_err(|err| ApiError::bad_request(format!("head: {err}")))?,
+        title: trimmed_name(&row.title)?,
+        reports_to: row
+            .reports_to
+            .as_deref()
+            .map(|head| {
+                Slug::parse(head).map_err(|err| ApiError::bad_request(format!("reports_to: {err}")))
+            })
+            .transpose()?,
+    })
+}
+
+/// The team named by this row, created or renamed.
+///
+/// The upsert is on `teams_tenant_slug_key`, which is what makes the slug the
+/// identity of a *Fonction* across re-applies. `updated_at` moves with the name
+/// so a rename is visible to anything watching the column.
+///
+/// `team_policy` is inserted `ON CONFLICT DO NOTHING`, deliberately: a new team
+/// must have a policy scope — an absent one silently inherits the tenant's,
+/// which is the widest possible reading of "no rules yet" — but an existing
+/// team's pointer must not move because a document was re-applied. Repointing is
+/// `PUT …/policy-role`, one team at a time, with its own audit row.
+async fn upsert_team(tx: &mut TenantTx<'_>, slug: &Slug, name: &str) -> Result<Uuid, ApiError> {
+    let tenant = tx.tenant_id().as_uuid();
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO teams (id, tenant_id, slug, name) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (tenant_id, slug) \
+           DO UPDATE SET name = excluded.name, updated_at = now() \
+         RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(slug.as_str())
+    .bind(name)
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    sqlx::query(
+        "INSERT INTO team_policy (tenant_id, team_id, role_name) VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, team_id) DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(id)
+    .bind(slug.as_str())
+    .execute(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    Ok(id)
+}
+
+/// The employee named as this row's head — found, or hired.
+///
+/// The `SELECT` runs under RLS, so it finds this tenant's employee and nobody
+/// else's; another tenant's identical slug is simply not there, and the insert
+/// that follows is legal because `employees_tenant_slug_key` is per tenant.
+///
+/// The insert is the one `POST /v1/employees` makes, minus the HTTP: the row,
+/// eleven `pending` resources, the outbox event the provisioning loop waits on,
+/// and the audit row naming the key that minted it. All four in the caller's
+/// transaction, so a chart that rolls back never leaves an employee behind for
+/// the loop to go and buy a phone number for.
+async fn seat_holder(
+    tx: &mut TenantTx<'_>,
+    slug: &Slug,
+    domain: &Domain,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(EmployeeId, bool), ApiError> {
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM employees WHERE slug = $1")
+        .bind(slug.as_str())
+        .fetch_optional(&mut ***tx)
+        .await
+        .map_err(StoreError::from)?;
+    if let Some(id) = existing {
+        return Ok((EmployeeId::from_uuid(id), false));
+    }
+
+    let employee = Employee::new(
+        EmployeeId::new_v7(now),
+        tx.tenant_id(),
+        slug.clone(),
+        domain.clone(),
+        now,
+    );
+    employee_store::insert(tx, &employee).await?;
+    outbox::enqueue(
+        tx,
+        &NewEvent {
+            payload: json!({
+                "employee_id": employee.id().as_uuid(),
+                "slug": employee.slug().as_str(),
+                "domain": employee.domain().as_str(),
+            }),
+            dedupe_key: Some(format!("created:{}", employee.id().as_uuid())),
+            ..NewEvent::new(
+                crate::routes::employees::AGGREGATE,
+                employee.id().as_uuid(),
+                crate::routes::employees::CREATED_EVENT,
+            )
+        },
+        now,
+    )
+    .await?;
+    audit::append(
+        tx,
+        &AuditEvent {
+            employee_id: Some(employee.id()),
+            payload: json!({
+                "slug": employee.slug().as_str(),
+                "domain": employee.domain().as_str(),
+                "via": "org.applied",
+            }),
+            ..AuditEvent::new(actor.clone(), AuditKind::EmployeeCreated, now)
+        },
+    )
+    .await?;
+
+    Ok((employee.id(), true))
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1754,75 @@ mod tests {
             id
         }
 
+        /// Apply an org chart.
+        async fn apply(&self, secret: &str, chart: Value) -> (StatusCode, Value) {
+            self.send("POST", "/v1/org", Some(secret), Some(chart))
+                .await
+        }
+
+        /// `(teams, memberships, employees, outbox events, policy layers)` for
+        /// this tenant.
+        ///
+        /// One query rather than five, and one helper rather than a table name
+        /// interpolated into SQL. Everything but `policy_layers` is filtered by
+        /// RLS; that one is asked explicitly because the platform layer has a
+        /// null `tenant_id` and is visible to everybody, and the assertion this
+        /// serves is about rows *this tenant* has.
+        async fn counts(&self, tenant: TenantId) -> (i64, i64, i64, i64, i64) {
+            let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
+            let counts = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM teams), \
+                        (SELECT count(*) FROM team_memberships), \
+                        (SELECT count(*) FROM employees), \
+                        (SELECT count(*) FROM outbox_events), \
+                        (SELECT count(*) FROM policy_layers WHERE tenant_id = $1)",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("counts");
+            tx.rollback().await.expect("rollback");
+            counts
+        }
+
+        /// The chart as an operator reads it back: one
+        /// `(team slug, name, mission, title, manager id)` per team, by slug.
+        ///
+        /// Deliberately built from `GET /v1/teams` and the rosters rather than
+        /// from the `POST` response — a body that echoes its own request proves
+        /// nothing about what was written.
+        async fn read_back(&self, secret: &str) -> Vec<(String, String, String, String, Value)> {
+            let (status, page) = self.send("GET", "/v1/teams", Some(secret), None).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let mut chart = Vec::new();
+            for team in page["teams"].as_array().expect("teams") {
+                let id = team["id"].as_str().expect("id");
+                let (status, roster) = self
+                    .send(
+                        "GET",
+                        &format!("/v1/teams/{id}/members"),
+                        Some(secret),
+                        None,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{roster}");
+                let seat = roster["members"]
+                    .as_array()
+                    .expect("members")
+                    .iter()
+                    .find(|m| m["title"] != Value::Null)
+                    .unwrap_or_else(|| panic!("team {id} has no head"));
+                chart.push((
+                    team["slug"].as_str().expect("slug").to_owned(),
+                    team["name"].as_str().expect("name").to_owned(),
+                    team["mission"].as_str().unwrap_or_default().to_owned(),
+                    seat["title"].as_str().expect("title").to_owned(),
+                    seat["reports_to"].clone(),
+                ));
+            }
+            chart
+        }
+
         /// Audit rows filed by this module, newest last.
         async fn audit_events(&self, tenant: TenantId) -> Vec<String> {
             let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
@@ -1756,20 +2311,362 @@ mod tests {
         h.teardown().await;
     }
 
-    // -- the org chart ------------------------------------------------------
+    // -- the org chart, in one call -----------------------------------------
 
-    /// The operator's table, built through the API on a company that is
-    /// already running.
-    ///
-    /// | Fonction | Responsable | Mission |
-    /// |---|---|---|
-    /// | Direction | CEO / fondateur | Vision, stratégie, priorités |
-    /// | Produit et technologie | CTO/CPO | Produit, code, infrastructure, sécurité |
-    /// | Growth | Head of Growth | Acquisition, contenu, SEO, publicité |
-    /// | Commercial | Head of Sales | Prospection, démos, contrats |
-    /// | Clients | Customer Success | Support, activation, fidélisation |
-    /// | Opérations | COO | Automatisation, procédures, partenaires |
-    /// | Finance et juridique | CFO externalisé | Comptabilité, trésorerie, conformité |
+    /// The operator's table: `(team, Fonction, head, Responsable, Mission)`.
+    /// The first row is the CEO — the one seat with nobody above it.
+    const SEVEN: [(&str, &str, &str, &str, &str); 7] = [
+        (
+            "direction",
+            "Direction",
+            "fondateur",
+            "CEO / fondateur",
+            "Vision, stratégie, priorités",
+        ),
+        (
+            "produit-et-technologie",
+            "Produit et technologie",
+            "cto",
+            "CTO/CPO",
+            "Produit, code, infrastructure, sécurité",
+        ),
+        (
+            "growth",
+            "Growth",
+            "head-of-growth",
+            "Head of Growth",
+            "Acquisition, contenu, SEO, publicité",
+        ),
+        (
+            "commercial",
+            "Commercial",
+            "head-of-sales",
+            "Head of Sales",
+            "Prospection, démos, contrats",
+        ),
+        (
+            "clients",
+            "Clients",
+            "customer-success",
+            "Customer Success",
+            "Support, activation, fidélisation",
+        ),
+        (
+            "operations",
+            "Opérations",
+            "coo",
+            "COO",
+            "Automatisation, procédures, partenaires",
+        ),
+        (
+            "finance-et-juridique",
+            "Finance et juridique",
+            "cfo",
+            "CFO externalisé",
+            "Comptabilité, trésorerie, conformité",
+        ),
+    ];
+
+    /// The founder's slug — the head everybody else answers to.
+    const FOUNDER: &str = SEVEN[0].2;
+
+    /// [`SEVEN`] as a `POST /v1/org` body.
+    fn seven_rows() -> Value {
+        let rows = SEVEN
+            .iter()
+            .map(|(team, name, head, title, mission)| {
+                let mut row = json!({
+                    "team": team, "name": name, "mission": mission,
+                    "head": head, "title": title,
+                });
+                if *head != FOUNDER {
+                    row["reports_to"] = json!(FOUNDER);
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        json!({"domain": "agents.example.com", "rows": rows})
+    }
+
+    /// [`SEVEN`] as `read_back` renders it, given the founder's employee id.
+    fn expected_chart(founder: &Value) -> Vec<(String, String, String, String, Value)> {
+        let mut rows = SEVEN
+            .iter()
+            .map(|(team, name, head, title, mission)| {
+                let manager = if *head == FOUNDER {
+                    Value::Null
+                } else {
+                    founder.clone()
+                };
+                (
+                    (*team).to_owned(),
+                    (*name).to_owned(),
+                    (*mission).to_owned(),
+                    (*title).to_owned(),
+                    manager,
+                )
+            })
+            .collect::<Vec<_>>();
+        // `GET /v1/teams` is ordered by slug, not by the operator's row order.
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// The whole table in one call: seven teams, seven missions, seven hires,
+    /// seven seats and six reporting lines — every one of them read back off
+    /// the database rather than out of the response body it was echoed into.
+    #[tokio::test]
+    async fn the_operators_seven_row_table_is_one_call() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, applied) = h.apply(SECRET_A, seven_rows()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "202: seven employees are still being provisioned: {applied}"
+        );
+        let chart = applied["chart"].as_array().expect("chart").clone();
+        assert_eq!(chart.len(), 7);
+        assert!(
+            chart.iter().all(|seat| seat["hired"] == true),
+            "the chart named seven employees this tenant did not have: {applied}"
+        );
+
+        let founder = chart
+            .iter()
+            .find(|seat| seat["head"] == FOUNDER)
+            .expect("the founder")["employee_id"]
+            .clone();
+        assert_eq!(
+            h.read_back(SECRET_A).await,
+            expected_chart(&founder),
+            "the operator's table did not come back"
+        );
+
+        // Hired, not merely inserted. An `employees` row on its own is an
+        // employee nobody is provisioning: what makes this a hire is the same
+        // three writes `POST /v1/employees` makes — the row, its eleven pending
+        // resources, and the event the loop is waiting for. Asked in SQL
+        // because the employee routes are a different router and this harness
+        // mounts only this one.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let (lifecycle, resources, event): (String, i64, String) = sqlx::query_as(
+            "SELECT e.lifecycle, \
+                    (SELECT count(*) FROM employee_resources r \
+                      WHERE r.employee_id = e.id AND r.state = 'pending'), \
+                    (SELECT o.event_type FROM outbox_events o WHERE o.aggregate_id = e.id) \
+               FROM employees e WHERE e.slug = $1",
+        )
+        .bind(FOUNDER)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the founder was never hired");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(lifecycle, "draft");
+        assert_eq!(
+            resources, 11,
+            "a hire with nothing pending is a hire nobody provisions"
+        );
+        assert_eq!(event, crate::routes::employees::CREATED_EVENT);
+
+        let counts = h.counts(h.a).await;
+        assert_eq!(
+            counts,
+            (7, 7, 7, 7, 0),
+            "teams, seats, employees, outbox events — and not one policy layer"
+        );
+        assert_eq!(
+            h.audit_events(h.a).await,
+            vec!["org.applied".to_owned()],
+            "one call is one act, however many rows it carried"
+        );
+
+        // The tenant comes from the key. The same seven slugs applied with the
+        // other key build a second company and touch nothing of this one.
+        let (status, theirs) = h.apply(SECRET_B, seven_rows()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{theirs}");
+        assert_eq!(
+            h.counts(h.a).await,
+            counts,
+            "another tenant's chart leaked in"
+        );
+
+        h.teardown().await;
+    }
+
+    /// Idempotent, and honestly so. The same document twice is the same
+    /// company — in any row order, because the rows are not the shape of the
+    /// tree. A document with a *changed* mission or manager applies the change,
+    /// which is what makes it something an operator edits and re-applies rather
+    /// than a form they fill in once.
+    #[tokio::test]
+    async fn re_applying_a_chart_changes_nothing_and_editing_it_changes_one_thing() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, applied) = h.apply(SECRET_A, seven_rows()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
+        let before = h.read_back(SECRET_A).await;
+        let counts = h.counts(h.a).await;
+
+        // Again, rows reversed. The CEO is now the last row, and every line
+        // above it points at a seat the document has not reached yet.
+        let mut reversed = seven_rows();
+        reversed["rows"].as_array_mut().expect("rows").reverse();
+        let (status, again) = h.apply(SECRET_A, reversed).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "200, not 202: nobody was hired the second time: {again}"
+        );
+        assert!(
+            again["chart"]
+                .as_array()
+                .expect("chart")
+                .iter()
+                .all(|seat| seat["hired"] == false),
+            "a re-apply hired somebody: {again}"
+        );
+        assert_eq!(
+            h.read_back(SECRET_A).await,
+            before,
+            "a re-apply moved something"
+        );
+        assert_eq!(
+            h.counts(h.a).await,
+            counts,
+            "a re-apply duplicated a team, a seat or an employee"
+        );
+
+        // Edit two cells and re-apply: growth gets a shorter mission and
+        // answers to the CTO instead of the founder.
+        let mut edited = seven_rows();
+        edited["rows"][2]["mission"] = json!("Acquisition, contenu, SEO");
+        edited["rows"][2]["reports_to"] = json!("cto");
+        let (status, applied) = h.apply(SECRET_A, edited).await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(
+            h.counts(h.a).await,
+            counts,
+            "an edit created a row instead of changing one"
+        );
+
+        let cto = applied["chart"]
+            .as_array()
+            .expect("chart")
+            .iter()
+            .find(|seat| seat["head"] == "cto")
+            .expect("the CTO")["employee_id"]
+            .clone();
+        let after = h.read_back(SECRET_A).await;
+        let growth = after
+            .iter()
+            .find(|(slug, ..)| slug == "growth")
+            .expect("growth");
+        assert_eq!(
+            growth.2, "Acquisition, contenu, SEO",
+            "a changed mission was not applied"
+        );
+        assert_eq!(growth.4, cto, "a changed reporting line was not applied");
+        assert_eq!(
+            after.iter().filter(|row| row.4 == Value::Null).count(),
+            1,
+            "an org chart has exactly one top"
+        );
+
+        h.teardown().await;
+    }
+
+    /// One bad row, and there is nothing to clean up. Not "the chart stopped
+    /// six rows in" — the database is **empty**, which is the only state an
+    /// operator can retry from without reading it first. The bad row is the
+    /// last one, so the six good rows above it were all written before the
+    /// refusal and every one of them had to come back out.
+    #[tokio::test]
+    async fn a_row_naming_a_seat_no_row_defines_leaves_zero_rows() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let mut broken = seven_rows();
+        broken["rows"][6]["reports_to"] = json!("directeur-general");
+        let (status, problem) = h.apply(SECRET_A, broken).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("directeur-general"),
+            "the refusal does not say which name it could not find: {problem}"
+        );
+        assert_eq!(
+            h.counts(h.a).await,
+            (0, 0, 0, 0, 0),
+            "six teams, six hires and six seats were left behind"
+        );
+        assert!(h.audit_events(h.a).await.is_empty());
+
+        // A document that means two things is refused before any of it is
+        // written: last-one-wins on a mission or a seat is a company whose
+        // shape depends on the order somebody typed the rows in.
+        for (field, value) in [("team", "growth"), ("head", "head-of-growth")] {
+            let mut doubled = seven_rows();
+            doubled["rows"][5][field] = json!(value);
+            let (status, problem) = h.apply(SECRET_A, doubled).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+            assert!(
+                problem["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(value),
+                "{problem}"
+            );
+        }
+        assert_eq!(h.counts(h.a).await, (0, 0, 0, 0, 0));
+
+        h.teardown().await;
+    }
+
+    /// A loop in the document is a 409 with both ends of the offending line in
+    /// it. The rule is the `team_memberships_acyclic` trigger's, so it holds for
+    /// every writer; all this endpoint does is render the SQLSTATE as something
+    /// other than a 500 — and then put back the six rows it had already written.
+    #[tokio::test]
+    async fn a_chart_that_draws_a_loop_is_a_409_naming_both_ends() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        // The founder answers to the CTO, who answers to the founder.
+        let mut looped = seven_rows();
+        looped["rows"][0]["reports_to"] = json!("cto");
+
+        let (status, problem) = h.apply(SECRET_A, looped).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert_eq!(problem["code"], "reporting_cycle");
+        // The founder's line is drawn first and is legal on its own — the CTO
+        // had no manager yet. It is the second line that closes the loop, and
+        // that is the one the body names.
+        assert_eq!(problem["head"], "cto", "{problem}");
+        assert_eq!(problem["reports_to"], FOUNDER, "{problem}");
+        assert_eq!(
+            h.counts(h.a).await,
+            (0, 0, 0, 0, 0),
+            "a refused chart left rows behind"
+        );
+
+        h.teardown().await;
+    }
+
+    // -- the same table, one field at a time ---------------------------------
+
+    /// The same seven rows, built the long way: the single-field routes, on a
+    /// company that is already running. [`apply_org`] is how an operator should
+    /// do this; these routes are how one cell gets corrected afterwards, and
+    /// both have to keep working.
     ///
     /// "Already running" is load-bearing and is what the first few lines set
     /// up: a growth team with somebody on it, from before anybody drew a chart.

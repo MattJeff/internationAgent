@@ -141,7 +141,7 @@ use agentos_app::gate::Principal as ActingAs;
 use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
-use agentos_app::{rolepack, rolepack_sales};
+use agentos_app::{rolepack, rolepack_sales, rolepack_service};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
@@ -235,7 +235,7 @@ impl Outcome {
 
 /// The plan for a charter, or the question that has to be answered first.
 ///
-/// `Err` is a `Stage::Clarify` task, which both packs return **alone** — a plan
+/// `Err` is a `Stage::Clarify` task, which every pack returns **alone** — a plan
 /// containing it contains nothing else — so collapsing it to a single string
 /// loses nothing and makes the caller's decision a `match` rather than a search
 /// through a vector for a magic stage.
@@ -269,6 +269,25 @@ pub(crate) fn plan_of(charter: &Charter) -> Result<Vec<(&'static str, String)>, 
                     .collect()),
             }
         }
+        // The three packs in `rolepack_service` share one `Task` and one
+        // `Stage`, so they share one arm each and one helper — the branch above
+        // is written twice because the two older packs have neither in common.
+        Charter::Support { objective } => service_plan(objective.plan()),
+        Charter::Growth { objective } => service_plan(objective.plan()),
+        Charter::Finance { objective } => service_plan(objective.plan()),
+    }
+}
+
+/// [`plan_of`]'s answer for a [`rolepack_service`] plan.
+fn service_plan(tasks: Vec<rolepack_service::Task>) -> Result<Vec<(&'static str, String)>, String> {
+    match tasks.first() {
+        Some(first) if first.stage == rolepack_service::Stage::Clarify => {
+            Err(first.instruction.clone())
+        }
+        _ => Ok(tasks
+            .into_iter()
+            .map(|task| (task.stage.code(), task.instruction))
+            .collect()),
     }
 }
 

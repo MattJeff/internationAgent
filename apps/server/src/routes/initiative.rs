@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use agentos_app::rolepack::{self, CountryCode};
 use agentos_app::rolepack_sales::{self, Segment};
+use agentos_app::rolepack_service;
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::Lifecycle;
 use agentos_domain::ids::EmployeeId;
@@ -100,14 +101,17 @@ struct SetInitiative {
 
 /// The objective, tagged by role.
 ///
-/// The two roles' objectives have no field in common — one is a purchase and the
-/// other is a sales beat — so this is a tagged union rather than a struct where
-/// nine fields out of eleven are null for any given employee. The tags are the
-/// role packs' own `name()`s.
+/// No two roles' objectives share a field — one is a purchase, one a sales
+/// beat, one a support queue, one a content brief, one a period close — so this
+/// is a tagged union rather than a struct where fifteen columns out of eighteen
+/// are null for any given employee. The tags are the role packs' own `name()`s,
+/// and they have to stay that way: `Charter::role` writes one of these strings
+/// into `employee_charters.role` and `Charter::of` reads it back.
 ///
 /// Every value here is still a `String` or a number: turning them into
-/// [`CountryCode`], [`Money`] and [`Segment`] is [`ObjectiveBody::into_charter`]'s
-/// job, and it is where a bad one becomes a 400 that names itself.
+/// [`CountryCode`], [`Money`], [`Currency`] and [`Segment`] is
+/// [`ObjectiveBody::into_charter`]'s job, and it is where a bad one becomes a
+/// 400 that names itself.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "role", deny_unknown_fields)]
 enum ObjectiveBody {
@@ -137,6 +141,39 @@ enum ObjectiveBody {
         market: Option<String>,
         #[serde(default)]
         target_accounts: Vec<String>,
+    },
+    #[serde(rename = "customer-success")]
+    Support {
+        #[serde(default)]
+        product: String,
+        #[serde(default)]
+        first_response_hours: u32,
+        /// Who a ticket goes to when it stops being this employee's. Optional
+        /// here and a `Gap` there: an operator who has not decided yet gets the
+        /// question back, not a rejection.
+        #[serde(default)]
+        escalate_to: Option<String>,
+    },
+    #[serde(rename = "growth")]
+    Growth {
+        #[serde(default)]
+        topic: String,
+        #[serde(default)]
+        market: Option<String>,
+        #[serde(default)]
+        measure: Option<String>,
+    },
+    #[serde(rename = "finance")]
+    Finance {
+        #[serde(default)]
+        period: String,
+        /// An ISO-4217 code. Parsed through [`Currency`] itself, so `"dollars"`
+        /// is a 400 naming the field rather than a period nobody can
+        /// denominate.
+        #[serde(default)]
+        currency: Option<String>,
+        #[serde(default)]
+        obligations: Vec<String>,
     },
 }
 
@@ -180,6 +217,39 @@ impl ObjectiveBody {
                     target_accounts,
                 },
             }),
+            ObjectiveBody::Support {
+                product,
+                first_response_hours,
+                escalate_to,
+            } => Ok(Charter::Support {
+                objective: rolepack_service::Support {
+                    product,
+                    first_response_hours,
+                    escalate_to,
+                },
+            }),
+            ObjectiveBody::Growth {
+                topic,
+                market,
+                measure,
+            } => Ok(Charter::Growth {
+                objective: rolepack_service::Growth {
+                    topic,
+                    market: country("market", market)?,
+                    measure,
+                },
+            }),
+            ObjectiveBody::Finance {
+                period,
+                currency,
+                obligations,
+            } => Ok(Charter::Finance {
+                objective: rolepack_service::Books {
+                    period,
+                    currency: parse_currency(currency)?,
+                    obligations,
+                },
+            }),
         }
     }
 }
@@ -194,6 +264,18 @@ impl PriceBody {
         Money::new(self.minor, currency)
             .map_err(|err| field("max_unit_price.minor", err.to_string()))
     }
+}
+
+/// An ISO-4217 code, through [`Currency`]'s own `FromStr` — the one place its
+/// spelling lives, exactly as [`PriceBody::into_money`] goes through its
+/// `Deserialize` rather than growing a second list of codes.
+fn parse_currency(raw: Option<String>) -> Result<Option<Currency>, ApiError> {
+    raw.map(|raw| {
+        raw.to_uppercase()
+            .parse::<Currency>()
+            .map_err(|_| field("currency", "not an ISO-4217 code we support"))
+    })
+    .transpose()
 }
 
 fn country(name: &'static str, raw: Option<String>) -> Result<Option<CountryCode>, ApiError> {
@@ -675,6 +757,86 @@ mod tests {
         h.teardown().await;
     }
 
+    /// **Every role pack is hirable through this endpoint.** A pack the API
+    /// cannot name is a pack no employee can be assigned, and this workspace
+    /// has had five of those.
+    ///
+    /// One `PUT` per role, each read back: the tag reaches the right
+    /// [`Charter`], the `role` string survives `employee_charters`' CHECK, and
+    /// the plan comes back recomputed from the stored objective with the
+    /// operator's own words in it.
+    #[tokio::test]
+    async fn every_role_pack_can_be_hired_for_and_read_back() {
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let id = h.employee(h.a, "polyglot").await;
+        let uri = format!("/v1/employees/{id}/initiative");
+
+        for (objective, role, first_stage, must_say) in [
+            (
+                buying(3_600)["objective"].clone(),
+                "international-buyer",
+                "discover",
+                "anodised aluminium enclosures",
+            ),
+            (
+                json!({"role": "sales-development", "segment": "airline",
+                       "market": "FR", "target_accounts": ["Air France"]}),
+                "sales-development",
+                "research",
+                "Air France",
+            ),
+            (
+                json!({"role": "customer-success", "product": "the Orizn visa API",
+                       "first_response_hours": 4, "escalate_to": "the on-call engineer"}),
+                "customer-success",
+                "triage",
+                "the Orizn visa API",
+            ),
+            (
+                json!({"role": "growth", "topic": "visa requirements by passport",
+                       "market": "FR", "measure": "organic signups"}),
+                "growth",
+                "research",
+                "visa requirements by passport",
+            ),
+            (
+                json!({"role": "finance", "period": "2026-08", "currency": "eur",
+                       "obligations": ["the VAT return"]}),
+                "finance",
+                "reconcile",
+                "2026-08",
+            ),
+        ] {
+            let (status, body) = h
+                .send(
+                    "PUT",
+                    &uri,
+                    SECRET_A,
+                    Some(json!({"interval_secs": 3_600, "objective": objective})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{role}: {body}");
+            assert_eq!(body["role"], json!(role), "{body}");
+
+            let (_, read) = h.send("GET", &uri, SECRET_A, None).await;
+            assert_eq!(read["role"], json!(role), "{role} did not come back");
+            assert!(read["clarify"].is_null(), "{role}: {read}");
+            let plan = read["plan"].as_array().expect("a complete objective plans");
+            assert_eq!(plan[0]["stage"], json!(first_stage), "{role}: {read}");
+            assert!(
+                plan.iter().any(|task| task["instruction"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(must_say))),
+                "{role}'s plan lost the operator's own words: {read}"
+            );
+        }
+
+        h.teardown().await;
+    }
+
     /// A field that is present and wrong is the operator's typo, and the 400 has
     /// to say which one it was.
     #[tokio::test]
@@ -699,6 +861,11 @@ mod tests {
                 json!({"role": "international-buyer",
                        "max_unit_price": {"minor": 0, "currency": "USD"}}),
                 "max_unit_price.minor",
+            ),
+            (json!({"role": "growth", "market": "France"}), "market"),
+            (
+                json!({"role": "finance", "currency": "dollars"}),
+                "currency",
             ),
         ] {
             let (status, body) = h

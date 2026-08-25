@@ -21,6 +21,7 @@ pub mod psyche; // le fil de production de la psyché
 pub mod revenue; // wave 12
 pub mod rolepack;
 pub mod rolepack_sales; // wave 12
+pub mod rolepack_service; // customer success, growth, finance
 pub mod secrets; // U22
 pub mod sourcing;
 pub mod turn; // U25

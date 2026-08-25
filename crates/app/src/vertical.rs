@@ -136,6 +136,7 @@ use crate::psyche;
 use crate::revenue::{Seller, Sequence};
 use crate::rolepack::{self, CountryCode};
 use crate::rolepack_sales::{self, Segment};
+use crate::rolepack_service;
 use crate::sourcing::{
     self, Buyer, Divergence, Fx, Incoterm, Landed, Lane, Quote, QuoteError, Reputation, Unreached,
 };
@@ -174,10 +175,27 @@ impl CharterError {
 /// This is the value the whole module turns into work, and it is deliberately a
 /// closed enum rather than a trait. A role is data — three sets, a
 /// [`PolicyLimits`](agentos_domain::policy::PolicyLimits) and a `&'static str`,
-/// see [`crate::rolepack`] — and the two packs have no shared supertype because
+/// see [`crate::rolepack`] — and the packs have no shared supertype because
 /// their objectives and their [`Stage`](crate::rolepack::Stage) sequences are
 /// genuinely different. A trait here would be one method per pack with a
 /// different return type, which is a match written badly.
+///
+/// # Why only two of the five variants carry their pack
+///
+/// [`Charter::Purchasing`] and [`Charter::Sales`] hold a
+/// [`RolePack`](crate::rolepack::RolePack) because their plans *read* it — the
+/// buyer's discovery step quotes `max_new_contacts_per_day` and the sales
+/// approach step says whether cold outreach is on at all — so a provisioner
+/// that has narrowed the limits hands the narrowed pack back and the plan
+/// speaks about what that employee may really do.
+///
+/// The three in [`crate::rolepack_service`] share one `RolePack` type between
+/// them and their plans read nothing off it, so carrying one would buy nothing
+/// and cost the invariant that matters here: with a shared type, a variant
+/// holding a pack is a variant that can hold the *wrong* pack, and
+/// [`Charter::role`] would then write a `role` column that [`Charter::load`]
+/// reads back as a different job. Naming the role in the variant makes that
+/// unspellable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Charter {
     /// Sourcing physical goods overseas.
@@ -194,22 +212,49 @@ pub enum Charter {
         /// Who is being sold to.
         objective: rolepack_sales::Objective,
     },
+    /// Looking after customers who have already bought.
+    Support {
+        /// What is being supported, and where a ticket goes when it stops
+        /// being this employee's.
+        objective: rolepack_service::Support,
+    },
+    /// Acquisition, content and campaigns — drafted here, published by a human.
+    Growth {
+        /// The topic, the market and the number that decides it worked.
+        objective: rolepack_service::Growth,
+    },
+    /// The books, the obligations and the payment run.
+    Finance {
+        /// The period, its currency, and what has to be settled or filed.
+        objective: rolepack_service::Books,
+    },
 }
 
 impl Charter {
     /// The role's handle, and the `role` column. Display and metrics.
+    ///
+    /// Every string this can return is in the `employee_charters_role` CHECK
+    /// and in [`Charter::of`]'s match — the three are one table written in
+    /// three languages, and `every_pack_round_trips_through_its_name` is what
+    /// notices when they drift.
     pub const fn role(&self) -> &'static str {
         match self {
             Charter::Purchasing { pack, .. } => pack.name(),
             Charter::Sales { pack, .. } => pack.name(),
+            Charter::Support { .. } => rolepack_service::CUSTOMER_SUCCESS,
+            Charter::Growth { .. } => rolepack_service::GROWTH,
+            Charter::Finance { .. } => rolepack_service::FINANCE,
         }
     }
 
     /// The stable, cacheable prompt fragment for this role.
-    pub const fn briefing(&self) -> &'static str {
+    pub fn briefing(&self) -> &'static str {
         match self {
             Charter::Purchasing { pack, .. } => pack.briefing(),
             Charter::Sales { pack, .. } => pack.briefing(),
+            Charter::Support { .. } => rolepack_service::RolePack::customer_success().briefing(),
+            Charter::Growth { .. } => rolepack_service::RolePack::growth().briefing(),
+            Charter::Finance { .. } => rolepack_service::RolePack::finance().briefing(),
         }
     }
 
@@ -241,6 +286,9 @@ impl Charter {
                 .iter()
                 .map(|task| format!("{}: {}", task.stage, task.instruction))
                 .collect(),
+            Charter::Support { objective } => steps_of(&objective.plan()),
+            Charter::Growth { objective } => steps_of(&objective.plan()),
+            Charter::Finance { objective } => steps_of(&objective.plan()),
         };
         format!(
             "Your standing objective, as a plan. Work it in order; a stage you cannot finish is \
@@ -301,19 +349,40 @@ impl Charter {
         let Some((role, objective)) = row else {
             return Ok(None);
         };
+        Self::of(&role, &objective).map(Some)
+    }
 
-        // The `employee_charters_role` CHECK is this list; a role outside it
-        // cannot be written, so reaching the `_` arm means the constraint and
-        // this match have drifted.
-        match role.as_str() {
-            "international-buyer" => Ok(Some(Charter::Purchasing {
+    /// One stored row, as a [`Charter`]: the name-to-pack table, and the only
+    /// place it exists.
+    ///
+    /// Split out of [`Charter::load`] because it is pure, and because the
+    /// interesting claim about it — *every* pack's name comes back as that pack
+    /// and an unknown one is a named error rather than a panic or a default —
+    /// is a claim nobody should need a Postgres to check.
+    ///
+    /// The `employee_charters_role` CHECK is this same list; a role outside it
+    /// cannot be written, so reaching the `_` arm means the constraint and this
+    /// match have drifted, and a `Corrupt("role")` is exactly what an operator
+    /// needs to be told when they have.
+    pub fn of(role: &str, objective: &Value) -> Result<Self, CharterError> {
+        match role {
+            "international-buyer" => Ok(Charter::Purchasing {
                 pack: rolepack::RolePack::international_buyer(),
-                objective: buying_objective(&objective)?,
-            })),
-            "sales-development" => Ok(Some(Charter::Sales {
+                objective: buying_objective(objective)?,
+            }),
+            "sales-development" => Ok(Charter::Sales {
                 pack: rolepack_sales::RolePack::sales_development(),
-                objective: sales_objective(&objective)?,
-            })),
+                objective: sales_objective(objective)?,
+            }),
+            rolepack_service::CUSTOMER_SUCCESS => Ok(Charter::Support {
+                objective: support_objective(objective)?,
+            }),
+            rolepack_service::GROWTH => Ok(Charter::Growth {
+                objective: growth_objective(objective)?,
+            }),
+            rolepack_service::FINANCE => Ok(Charter::Finance {
+                objective: books_objective(objective)?,
+            }),
             _ => Err(CharterError::Corrupt("role")),
         }
     }
@@ -336,6 +405,23 @@ impl Charter {
                 "segment": objective.segment.code(),
                 "market": objective.market.as_ref().map(CountryCode::as_str),
                 "target_accounts": objective.target_accounts,
+            }),
+            Charter::Support { objective } => json!({
+                "product": objective.product,
+                "first_response_hours": objective.first_response_hours,
+                "escalate_to": objective.escalate_to,
+            }),
+            Charter::Growth { objective } => json!({
+                "topic": objective.topic,
+                "market": objective.market.as_ref().map(CountryCode::as_str),
+                "measure": objective.measure,
+            }),
+            Charter::Finance { objective } => json!({
+                "period": objective.period,
+                // The currency's own code, not its `Debug`: `Currency` parses
+                // this back and nothing else.
+                "currency": objective.currency.map(Currency::code),
+                "obligations": objective.obligations,
             }),
         }
     }
@@ -422,6 +508,99 @@ fn sales_objective(raw: &Value) -> Result<rolepack_sales::Objective, CharterErro
         target_accounts: strings(raw.get("target_accounts"))
             .ok_or(CharterError::Corrupt("target_accounts"))?,
     })
+}
+
+/// A customer success objective, re-parsed rather than deserialised. Same
+/// reasoning as [`buying_objective`].
+///
+/// `escalate_to` is `Option<String>` and a missing key is `None` rather than a
+/// corruption: "nobody has said who a ticket goes to" is a state the objective
+/// is designed to hold, and [`Support::gaps`](crate::rolepack_service::Support)
+/// is what turns it into a question. A *corrupt* value is one that is present
+/// and is not a string.
+fn support_objective(raw: &Value) -> Result<rolepack_service::Support, CharterError> {
+    Ok(rolepack_service::Support {
+        product: raw
+            .get("product")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("product"))?
+            .to_owned(),
+        first_response_hours: raw
+            .get("first_response_hours")
+            .and_then(Value::as_u64)
+            .and_then(|hours| u32::try_from(hours).ok())
+            .ok_or(CharterError::Corrupt("first_response_hours"))?,
+        escalate_to: optional_string(raw.get("escalate_to"))
+            .ok_or(CharterError::Corrupt("escalate_to"))?,
+    })
+}
+
+/// A growth objective, re-parsed rather than deserialised.
+fn growth_objective(raw: &Value) -> Result<rolepack_service::Growth, CharterError> {
+    let market = match raw.get("market") {
+        None | Some(Value::Null) => None,
+        Some(market) => Some(
+            CountryCode::parse(market.as_str().ok_or(CharterError::Corrupt("market"))?)
+                .map_err(|_| CharterError::Corrupt("market"))?,
+        ),
+    };
+
+    Ok(rolepack_service::Growth {
+        topic: raw
+            .get("topic")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("topic"))?
+            .to_owned(),
+        market,
+        measure: optional_string(raw.get("measure")).ok_or(CharterError::Corrupt("measure"))?,
+    })
+}
+
+/// A finance objective, re-parsed rather than deserialised.
+///
+/// The currency goes back through [`Currency`]'s own `FromStr`, which is the
+/// one place its spelling lives — a column holding `"dollars"` is a named
+/// corruption rather than a period nobody can denominate.
+fn books_objective(raw: &Value) -> Result<rolepack_service::Books, CharterError> {
+    let currency = match raw.get("currency") {
+        None | Some(Value::Null) => None,
+        Some(currency) => Some(
+            currency
+                .as_str()
+                .ok_or(CharterError::Corrupt("currency"))?
+                .parse::<Currency>()
+                .map_err(|_| CharterError::Corrupt("currency"))?,
+        ),
+    };
+
+    Ok(rolepack_service::Books {
+        period: raw
+            .get("period")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("period"))?
+            .to_owned(),
+        currency,
+        obligations: strings(raw.get("obligations")).ok_or(CharterError::Corrupt("obligations"))?,
+    })
+}
+
+/// A JSON string, or an absent one. `None` is the corruption: a key that is
+/// present and is not a string.
+fn optional_string(raw: Option<&Value>) -> Option<Option<String>> {
+    match raw {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => value.as_str().map(|text| Some(text.to_owned())),
+    }
+}
+
+/// A plan, rendered as the lines [`Charter::brief`] joins.
+///
+/// The three packs in [`crate::rolepack_service`] share one `Task` type, so
+/// they share this instead of three identical closures.
+fn steps_of(plan: &[rolepack_service::Task]) -> Vec<String> {
+    plan.iter()
+        .map(|task| format!("{}: {}", task.stage, task.instruction))
+        .collect()
 }
 
 /// A JSON array of strings, or nothing.
@@ -1743,6 +1922,44 @@ mod tests {
         }
     }
 
+    /// One charter per role pack in the workspace, complete enough to plan.
+    ///
+    /// The list is the point: a sixth pack that nobody adds here is a pack the
+    /// round-trip and name-table tests below never see.
+    fn every_charter() -> Vec<Charter> {
+        vec![
+            Charter::Purchasing {
+                pack: rolepack::RolePack::international_buyer(),
+                objective: buying_objective_value(),
+            },
+            Charter::Sales {
+                pack: rolepack_sales::RolePack::sales_development(),
+                objective: sales_objective_value(),
+            },
+            Charter::Support {
+                objective: rolepack_service::Support {
+                    product: "the Orizn visa API".to_owned(),
+                    first_response_hours: 4,
+                    escalate_to: Some("the on-call engineer".to_owned()),
+                },
+            },
+            Charter::Growth {
+                objective: rolepack_service::Growth {
+                    topic: "visa requirements by passport".to_owned(),
+                    market: Some(CountryCode::parse("fr").expect("country")),
+                    measure: Some("organic signups".to_owned()),
+                },
+            },
+            Charter::Finance {
+                objective: rolepack_service::Books {
+                    period: "2026-08".to_owned(),
+                    currency: Some(Currency::Eur),
+                    obligations: vec!["supplier invoices".to_owned()],
+                },
+            },
+        ]
+    }
+
     fn rfq() -> sourcing::Outreach {
         sourcing::Outreach {
             subject: "RFQ: 5000 anodised aluminium enclosures".to_owned(),
@@ -1794,16 +2011,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let principal = seed(&db).await;
 
-        for charter in [
-            Charter::Purchasing {
-                pack: rolepack::RolePack::international_buyer(),
-                objective: buying_objective_value(),
-            },
-            Charter::Sales {
-                pack: rolepack_sales::RolePack::sales_development(),
-                objective: sales_objective_value(),
-            },
-        ] {
+        for charter in every_charter() {
             let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
             charter
                 .save(&mut tx, principal.employee_id, Utc::now())
@@ -1846,6 +2054,58 @@ mod tests {
         assert!(none.is_none());
     }
 
+    /// **The name table, checked without a Postgres.** Every pack in the
+    /// workspace goes out as a `role` string and comes back as the same pack,
+    /// and a name nothing answers to is a named error rather than a panic, a
+    /// `None`, or — worst — a default charter somebody's employee starts
+    /// working to.
+    #[test]
+    fn every_pack_round_trips_through_its_name() {
+        let mut names: Vec<&'static str> = Vec::new();
+        for charter in every_charter() {
+            let role = charter.role();
+            let read = Charter::of(role, &charter.objective_json())
+                .unwrap_or_else(|err| panic!("{role} did not come back: {err}"));
+            assert_eq!(read, charter, "{role} did not survive its own JSON");
+            assert_eq!(read.role(), role);
+            // The plan is pure, so a charter that round-tripped plans the same.
+            assert_eq!(read.brief(), charter.brief());
+            names.push(role);
+        }
+
+        // The names are the strings in `employee_charters_role`. A pack renamed
+        // without the migration is a charter that saves and cannot load.
+        assert_eq!(
+            names,
+            vec![
+                "international-buyer",
+                "sales-development",
+                "customer-success",
+                "growth",
+                "finance",
+            ]
+        );
+
+        // And everything else is one error, not five behaviours. The near
+        // misses are deliberate: a rename, a legacy spelling, an empty column.
+        for unknown in [
+            "poet",
+            "",
+            "international_buyer",
+            "Customer-Success",
+            "customer-success ",
+            "cfo",
+        ] {
+            assert!(
+                matches!(
+                    Charter::of(unknown, &json!({})),
+                    Err(CharterError::Corrupt("role"))
+                ),
+                "{unknown:?} was not refused cleanly"
+            );
+        }
+    }
+
     /// A stored objective is re-parsed, not deserialised. A country code the
     /// constructor would refuse must not come back out of the column.
     #[test]
@@ -1864,6 +2124,31 @@ mod tests {
         assert!(matches!(
             sales_objective(&json!({ "segment": "railway", "target_accounts": [] })),
             Err(CharterError::Corrupt("segment"))
+        ));
+        // A currency the domain does not know is a period nobody can
+        // denominate, not a period in an unknown currency.
+        assert!(matches!(
+            books_objective(&json!({ "period": "2026-08", "currency": "dollars" })),
+            Err(CharterError::Corrupt("currency"))
+        ));
+        // But an *absent* optional is a gap, which is a question — not a
+        // corruption. `escalate_to` present-and-not-a-string is the corruption.
+        assert!(matches!(
+            support_objective(&json!({ "product": "the API", "first_response_hours": 4 })),
+            Ok(rolepack_service::Support {
+                escalate_to: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            support_objective(&json!({
+                "product": "the API", "first_response_hours": 4, "escalate_to": 7
+            })),
+            Err(CharterError::Corrupt("escalate_to"))
+        ));
+        assert!(matches!(
+            growth_objective(&json!({ "topic": "visas", "market": "France" })),
+            Err(CharterError::Corrupt("market"))
         ));
         assert_eq!(
             CharterError::Corrupt("what").code(),

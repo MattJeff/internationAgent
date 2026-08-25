@@ -19,6 +19,122 @@ deliberate, a 403 would confirm the id exists.
 
 ---
 
+## Start here: the whole company in one call
+
+The org chart an operator actually draws is a table, and `POST /v1/org` takes
+the table. All of it, in one transaction.
+
+```sh
+call -X POST $API/v1/org -d '{
+  "domain": "agents.example.com",
+  "rows": [
+    {"team": "direction", "name": "Direction",
+     "mission": "Vision, stratégie, priorités",
+     "head": "fondateur", "title": "CEO / fondateur"},
+
+    {"team": "produit-et-technologie", "name": "Produit et technologie",
+     "mission": "Produit, code, infrastructure, sécurité",
+     "head": "cto", "title": "CTO/CPO", "reports_to": "fondateur"},
+
+    {"team": "growth", "name": "Growth",
+     "mission": "Acquisition, contenu, SEO, publicité",
+     "head": "head-of-growth", "title": "Head of Growth", "reports_to": "fondateur"},
+
+    {"team": "commercial", "name": "Commercial",
+     "mission": "Prospection, démos, contrats",
+     "head": "head-of-sales", "title": "Head of Sales", "reports_to": "fondateur"},
+
+    {"team": "clients", "name": "Clients",
+     "mission": "Support, activation, fidélisation",
+     "head": "customer-success", "title": "Customer Success", "reports_to": "fondateur"},
+
+    {"team": "operations", "name": "Opérations",
+     "mission": "Automatisation, procédures, partenaires",
+     "head": "coo", "title": "COO", "reports_to": "fondateur"},
+
+    {"team": "finance-et-juridique", "name": "Finance et juridique",
+     "mission": "Comptabilité, trésorerie, conformité",
+     "head": "cfo", "title": "CFO externalisé", "reports_to": "fondateur"}
+  ]
+}'
+```
+
+```json
+{"chart": [
+  {"team": "direction", "team_id": "0198e6c1-…", "name": "Direction",
+   "mission": "Vision, stratégie, priorités",
+   "head": "fondateur", "employee_id": "0198e6b0-…", "title": "CEO / fondateur",
+   "reports_to": null, "hired": true},
+  …
+]}
+```
+
+That was roughly twenty calls until now — create team, set mission, hire, seat,
+point the line, per row — **with no transaction across them.** Any failure in the
+middle left teams with no head, employees on no team and reporting lines aimed
+at seats that were never made. That is not a request to retry; it is a company
+to go and read first, by hand, before you dare send anything else.
+
+Six things to know about it, and then the rest of this document is the same
+table one field at a time.
+
+**It is one transaction.** Either the whole chart exists or none of it does.
+Every seat is resolved before a single reporting line is drawn, so row 3 may
+name a manager that row 7 defines and the rows may be in any order at all. A
+bad row leaves **zero** rows behind — not six good teams and a stuck seventh.
+
+**It is idempotent, and honestly so.** A team is its `team` slug; an employee is
+its `head` slug. Send the same body twice and you have the same company, no
+error. Send it with a *changed* mission, name, title or `reports_to` and that
+cell changes — this is a document you keep in git, edit and re-apply, not a form
+you fill in once. It never *removes*: a row you delete from the document leaves
+its team and its seat standing, because taking down a head takes down every line
+under it and that must be something you asked for. No `Idempotency-Key` header
+is needed; every object is keyed on a slug you chose.
+
+**It hires.** A row may name an employee that does not exist yet, and it is
+created exactly as `POST /v1/employees` creates one — the row, eleven `pending`
+resources, and the outbox event that sends the provisioning loop after them. An
+employee that already exists is found by its slug, never duplicated and never
+re-slugged; `hired` in the response says which is which. `domain` applies only
+to the hires: an existing employee keeps the address it was minted with.
+
+**`202` means somebody is still being provisioned; `200` means nobody is.** A
+first apply hires and answers 202. A re-apply that only corrected a mission has
+nothing outstanding and says so.
+
+**It grants nothing.** Not one `policy_layers` row. A mission is prose; every
+restriction stays in the four-layer intersection at the top of this document,
+where the loader can take the minimum. An endpoint that drew the org chart *and*
+could widen a cap would be a second gate — see below, it is the one rule here
+worth reading twice. The one policy-adjacent row it writes is the `team_policy`
+*pointer* for a team it creates, so a new team has a scope at all; an existing
+team's pointer is never moved by a re-apply.
+
+**The refusals are all readable.**
+
+| | |
+|---|---|
+| two rows naming one team, or one head | `400` — the document means two things |
+| `reports_to` naming a head no row of the document defines | `400`, and nothing written |
+| a reporting line that closes a loop | `409 reporting_cycle`, naming both ends |
+| more than 500 rows | `400` — an org chart is written by humans |
+
+```json
+{
+  "type": "/problems/reporting_cycle",
+  "title": "that reporting line closes a loop in the org chart",
+  "status": 409, "code": "reporting_cycle",
+  "head": "cto", "reports_to": "fondateur"
+}
+```
+
+One audit row per call, `payload.event = "org.applied"`, carrying the whole
+chart — plus one `employee_created` row per hire, because that is the durable
+record of which key minted something that will go on to buy a phone number.
+
+---
+
 ## The one thing to understand first: a team can only tighten
 
 A team does not have a policy mechanism of its own. `policy_layers` already
@@ -74,6 +190,7 @@ Two more consequences that surprise people:
 
 | The API can | The API cannot |
 |---|---|
+| Build the whole org chart in one transaction | Grant one thing by doing so |
 | Create a team and its policy *scope* | Set a cap, an allowlist or a threshold |
 | Repoint a team at a different `role_name` | Widen anything, at any layer, ever |
 | Set a team's daily budget, per currency | Give a **section** a policy or a budget |
@@ -332,6 +449,11 @@ call $API/v1/teams/$PURCHASING/members
 
 ## 7. The org chart: function, head, mission
 
+`POST /v1/org` at the top of this document draws this whole table in one call,
+and that is how you should build it. What follows is the same table one field at
+a time — which is what you reach for to correct one cell, and what the one call
+is doing underneath.
+
 The table an operator actually draws has three columns, and each is one thing
 here:
 
@@ -461,6 +583,7 @@ SELECT occurred_at, actor, payload ->> 'event' AS event, payload
 
 | `payload.event` | written by |
 |---|---|
+| `org.applied` | `POST /v1/org` — one row per call, carrying the whole chart and the slugs it hired |
 | `team.created` | `POST /v1/teams` |
 | `section.created` | `POST /v1/teams/{id}/sections` |
 | `team.member_added` | `POST /v1/teams/{id}/members` |
@@ -492,6 +615,7 @@ durable statement an operator can read back and an employee has not been told.
 
 | Method | Path | |
 |---|---|---|
+| `POST` | `/v1/org` | the whole chart, one transaction, idempotent → `202` if it hired, else `200` |
 | `POST` | `/v1/teams` | create a team and its policy scope → `201` |
 | `GET` | `/v1/teams` | this tenant's teams |
 | `POST` | `/v1/teams/{team_id}/sections` | create a section → `201` |
