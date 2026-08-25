@@ -639,11 +639,15 @@ tools — see §14.
 
 A retrieved document is untrusted data, never executable instruction.
 
-> **Known defect.** The HNSW index in `0004_knowledge.sql` is partial on
-> `where model = 'text-embedding-3-small'`, but every row written today carries
-> `model = 'mock-sha256-1536'`. The vector leg is therefore a sequential scan.
-> Correct at the moment a real embedder is wired; noted here rather than fixed,
-> because this document does not change code.
+The HNSW index is **partial on the model**, and `0023_knowledge_index_model.sql`
+is the migration that made the predicate name the model this system writes
+(`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing ever
+wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on 20 000
+chunks). There is now one constant for it,
+`store::knowledge::DEFAULT_EMBEDDING_MODEL`, and `app::knowledge::model_name`
+returns *that* rather than a second spelling. A second embedding model is a
+second partial index and therefore a migration, deliberately: that migration is
+where somebody has to say whether the new vectors belong in the old space.
 
 ---
 
@@ -1592,6 +1596,20 @@ shortlisted. The shortlist drops only suppliers that have returned zero quotes
 *and* ignored at least four RFQs, with a floor of three suppliers — no scoring
 and no exploration heuristic, because a supplier that has not been asked has not
 refused.
+
+**A round ends at `rfqs.closes_at`**, the deadline the RFQ letter itself named,
+and `vertical::close_due_rounds` is one `UPDATE` at the top of a purchasing turn
+that reads it. It is where both halves of the responsiveness evidence are
+written — `quote_returned` for every recipient a quote ever came back from,
+`quote_missed` for every recipient none did — so a supplier who answers *after*
+the window still counts as having answered, and only silence counts as silence.
+Who was asked is recorded when the round opens, as one `negotiations` row per
+recipient; without it there is no set to subtract the answers from, which is why
+`quote_missed` had no writer at all before this and the shortlist's drop could
+never fire. The state flip is the idempotence: a round already `closed` matches
+no `WHERE`, so a second pass files nothing. Closing is also what un-strands the
+employee — an open `rfqs` row is what stops them asking, so a round nobody
+answered used to keep them waiting forever.
 
 Landed cost is FX-converted goods plus duty (charged on the converted invoice
 value, and skipped when the incoterm already covers import duty) plus whichever

@@ -96,6 +96,17 @@
 //! no state column and no timer, because there is nothing for them to hold that
 //! the quotes and the sequences do not already say. A crash between the RFQ and
 //! the reply costs nothing: the plan is recomputed and the round is re-read.
+//!
+//! The one thing the material cannot say is *when to stop waiting*. Silence is
+//! not a row, so a round nobody answered used to read as "still waiting"
+//! forever and the employee never got back to `Stage::Rfq`. The answer is the
+//! deadline the RFQ already told the supplier — `rfqs.closes_at` — and
+//! [`close_due_rounds`] is one `UPDATE` at the top of this turn that reads it.
+//! Still no timer and still no cursor: a date the letter itself named is not a
+//! scheduler. Closing the round is also the only moment a supplier's
+//! responsiveness can honestly be recorded, so the same pass files the
+//! `quote_returned` and `quote_missed` evidence that
+//! [`shortlist`](crate::sourcing::shortlist) reads on the next round.
 
 use std::num::NonZeroU32;
 
@@ -575,10 +586,15 @@ const RFQ_INCOTERM: Incoterm = Incoterm::Ddp;
 
 /// How long an RFQ stays open for answers.
 ///
-/// ponytail: a constant. Two weeks is a fortnight of international post and it
-/// is not the interesting number — nothing reads `closes_at` yet, and the round
-/// ends when a human orders. Make it a field on `Objective` the day an operator
-/// has a deadline the goods depend on.
+/// This is the round's deadline in both places that hold one: it becomes
+/// `rfqs.closes_at`, which [`close_due_rounds`] sweeps on, and the
+/// `reply_due_at` on each recipient's `negotiations` row. One date, told to the
+/// supplier in the letter, written twice and never derived twice.
+///
+/// ponytail: a constant. Two weeks is a fortnight of international post. Make
+/// it a field on `Objective` the day an operator has a deadline the goods
+/// depend on — the sweep already reads the column, so that day is a field and
+/// not a mechanism.
 const RFQ_OPEN_FOR: TimeDelta = TimeDelta::days(14);
 
 /// What a purchasing turn had in front of it, read out of the store once.
@@ -963,15 +979,18 @@ impl Ran {
 /// human or a supplier reads after this point. See the module docs on why the
 /// role pack decides the stage.
 ///
-/// # Transactions, and none of them spans a provider call
+/// # Four transactions, and none of them spans a provider call
 ///
-/// Read, send, record — and the record half is two, because the `rfqs` row must
-/// commit whether or not the advisory "we are waiting on them" rows do. See
-/// [`open_the_round`]. The read is rolled back before an address is contacted,
-/// because [`Buyer::issue_rfq`](crate::sourcing::Buyer::issue_rfq) is N emails
-/// over the internet and a pooled connection held across them is a connection
-/// held across somebody else's SMTP timeout — the same rule
+/// Close, read, send, record — and the record half is itself two, because the
+/// `rfqs` row must commit whether or not the advisory "we are waiting on them"
+/// rows do. See [`open_the_round`]. The read is rolled back before an address is
+/// contacted, because [`Buyer::issue_rfq`](crate::sourcing::Buyer::issue_rfq)
+/// is N emails over the internet and a pooled connection held across them is a
+/// connection held across somebody else's SMTP timeout — the same rule
 /// `loops::initiative::assignment_for` follows.
+///
+/// The close is first and is its own committed transaction, because everything
+/// after it reads the round it may have just ended — see [`close_due_rounds`].
 ///
 /// # The `rfqs` row is written after the send, and that direction is chosen
 ///
@@ -988,6 +1007,13 @@ pub async fn purchasing_turn(
     objective: &rolepack::Objective,
     now: DateTime<Utc>,
 ) -> Result<Ran, RoundError> {
+    // Before anything is read: any round of this employee's that is past its
+    // own `closes_at` ends here, and the suppliers it went to get their
+    // `quote_returned` or `quote_missed` row. It has to be before, because a
+    // round that has just ended must not be read back as one we are still
+    // waiting on.
+    close_due_rounds(db, principal, now).await?;
+
     let mut tx = db
         .tenant_tx(principal.tenant_id)
         .await
@@ -1051,15 +1077,19 @@ pub async fn purchasing_turn(
     )
     .await?;
 
-    if let Bought::Asked { outcomes, .. } = &bought
-        && outcomes.iter().any(sourcing::Contacted::is_sent)
-    {
-        let asked: Vec<String> = outcomes
+    if let Bought::Asked { outcomes, .. } = &bought {
+        // The addresses the provider actually took. A refused or failed
+        // recipient was not asked, and recording them as asked would produce a
+        // `quote_missed` for a letter nobody sent — a supplier's reputation
+        // decaying because of our own gate.
+        let sent: Vec<String> = outcomes
             .iter()
             .filter(|outcome| outcome.is_sent())
             .map(|outcome| outcome.to().to_string())
             .collect();
-        open_the_round(db, principal, objective, currency, reference, &asked, now).await?;
+        if !sent.is_empty() {
+            open_the_round(db, principal, objective, currency, reference, now, &sent).await?;
+        }
     }
 
     Ok(Ran {
@@ -1119,32 +1149,104 @@ fn rfq_letter(objective: &rolepack::Objective, reference: Uuid) -> sourcing::Out
     }
 }
 
-/// Write down that the round is running, and that we are waiting on the
-/// suppliers it went to.
+/// End the rounds whose deadline has passed, before this turn reads anything.
 ///
-/// The `rfqs` row is the only durable thing a purchasing turn produces that the
-/// material cannot recompute: quotes hang off it by foreign key, and [`due`]
-/// reads its absence as "nobody has been asked".
+/// # Why here, and not in a loop or an outbox event
 ///
-/// `asked` is the second such fact and it has nowhere else to live. `rfqs` does
-/// not record who received the letter, and an outbound RFQ writes no `messages`
-/// row, so without this the employee has no way to know it is owed an answer at
-/// all — which is what makes the chase list in [`Ran::note`] possible. Nothing
-/// about trust is claimed by writing it; see [`crate::psyche`].
+/// **Not the outbox.** The outbox is event-shaped and there is no event: a
+/// round expiring is precisely the absence of one. Driving it from there would
+/// mean enqueuing a timer at send time, and this module's own docs refuse
+/// timers — "no workflow row, no state column and no timer" — for the good
+/// reason that a timer is a second, forgettable copy of a date the `rfqs` row
+/// already holds.
 ///
-/// A failure to record the wait is logged and swallowed. The RFQ went out, the
-/// round is open, and losing the transaction over an advisory row would leave
-/// the employee asking the same suppliers again next cadence — the exact failure
-/// the ordering above was chosen to avoid.
+/// **Not a fifth server loop.** A cross-tenant sweep needs its own shutdown
+/// join, its own poll cadence and its own isolated test database, to run one
+/// `UPDATE`. And it would be a sweep nobody is waiting on, which is how a
+/// background job rots unnoticed.
+///
+/// **Here**, because the employee whose round it is, is the party the stale row
+/// harms: an open `rfqs` row is what stops them asking again, so *they* are the
+/// one stranded by a round that never closed, and their own turn is where the
+/// stranding is visible and cheap to end. It gets the initiative loop's cadence
+/// for free and stays inside one tenant's transaction, so RLS is the only
+/// isolation it needs. It is idempotent, so the extra cadences cost one `UPDATE`
+/// matching no rows.
+///
+/// Its own transaction, committed before the read below: the round it just
+/// closed must not be read back as one we are still waiting on.
+///
+/// # What closing costs, said out loud
+///
+/// A round that *did* get answers also ends at its deadline, so the comparison
+/// ends with it and the next turn canvasses again. That is the honest reading
+/// of a 14-day window — `live_quotes` already refuses prices past their
+/// `valid_until`, and `due` can never reach `Sample` or `Order` on its own, so
+/// the alternative is comparing the same fortnight-old quotes forever. It does
+/// mean a supplier mid-conversation on day 14 is dropped mid-conversation.
+///
+// ponytail: nothing drives `negotiations` in production yet, so there is no
+// conversation to be mid. When something does, the close wants a "extend rather
+// than end a round with a live thread on it" clause, keyed on that table — not
+// a longer constant.
+async fn close_due_rounds(
+    db: &Db,
+    principal: &Principal,
+    now: DateTime<Utc>,
+) -> Result<(), sourcing_store::SourcingError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let closed =
+        match sourcing_store::close_expired_rounds(&mut tx, principal.employee_id, now).await {
+            Ok(closed) => closed,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        };
+    tx.commit().await?;
+
+    for round in closed {
+        tracing::info!(
+            rfq_id = %round.rfq_id,
+            quotes_returned = round.quotes_returned,
+            quotes_missed = round.quotes_missed,
+            "an RFQ round reached its deadline and the evidence is filed"
+        );
+    }
+    Ok(())
+}
+
+/// Write down that the round is running, and who it went to.
+///
+/// The only durable thing a purchasing turn produces, and it is durable because
+/// it is the only fact the material cannot recompute: quotes hang off the
+/// `rfqs` row by foreign key, and [`due`] reads its absence as "nobody has been
+/// asked".
+///
+/// The recipient list is the second half of that same fact and lands in the
+/// same transaction, so a round with no record of who was asked cannot exist.
+/// Without it `close_due_rounds` has nothing to subtract the answers from and
+/// `quote_missed` stays unwritten forever — which is what it did.
+/// `reply_due_at` is the RFQ's own `closes_at`: one deadline, told to the
+/// supplier and written in two tables, never two.
+///
+/// That same list is what makes the chase list in [`Ran::note`] possible — an
+/// outbound RFQ writes no `messages` row, so without it the employee has no way
+/// to know it is owed an answer at all. Nothing about trust is claimed by
+/// writing it; see [`crate::psyche`].
 async fn open_the_round(
     db: &Db,
     principal: &Principal,
     objective: &rolepack::Objective,
     currency: Currency,
     reference: Uuid,
-    asked: &[String],
     now: DateTime<Utc>,
+    // The addresses the provider actually took, and the name matters: an
+    // address the gate refused was never asked, and filing it as a recipient
+    // would earn that supplier a `quote_missed` for a letter nobody sent.
+    sent: &[String],
 ) -> Result<(), sourcing_store::SourcingError> {
+    let closes_at = now + RFQ_OPEN_FOR;
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let title = format!(
         "RFQ: {} units of {}",
@@ -1171,10 +1273,25 @@ async fn open_the_round(
                 .map_or("ZZ", CountryCode::as_str),
             currency,
             target_unit_price: objective.max_unit_price,
-            closes_at: Some(now + RFQ_OPEN_FOR),
+            closes_at: Some(closes_at),
         },
     )
     .await;
+
+    // Sequential rather than combinator-chained: the second write must not be
+    // attempted on a transaction the first one has already poisoned.
+    let result = match result {
+        Err(err) => Err(err),
+        Ok(()) => sourcing_store::record_rfq_recipients(
+            &mut tx,
+            reference,
+            Some(principal.employee_id),
+            sent,
+            closes_at,
+        )
+        .await
+        .map(|_| ()),
+    };
 
     if let Err(err) = result {
         let _ = tx.rollback().await;
@@ -1188,7 +1305,7 @@ async fn open_the_round(
     // The `rfqs` row is the fact the round cannot recompute and it is already
     // committed; the waits are advisory.
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    for supplier in asked {
+    for supplier in sent {
         if let Err(err) =
             psyche::awaiting_reply(&mut tx, principal.employee_id, supplier, now).await
         {
@@ -1949,23 +2066,24 @@ mod tests {
 
     // -- the wire: material out of the employee's own store -----------------
 
-    /// Two suppliers who sell what the objective is for, each with a contact
-    /// somebody could actually write to.
-    async fn seed_suppliers(
+    /// Suppliers who sell what the objective is for, each with a contact
+    /// somebody could actually write to. `sales@{name}.example`.
+    async fn seed_named_suppliers(
         db: &Db,
         principal: &Principal,
         category: &str,
+        names: &[&str],
     ) -> Vec<(Uuid, EmailAddress)> {
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
         let mut seeded = Vec::new();
-        for (name, country) in [("hamburg", "DE"), ("shenzhen", "CN")] {
+        for name in names {
             let supplier = Uuid::now_v7();
             sourcing_store::insert_supplier(
                 &mut tx,
                 supplier,
                 &sourcing_store::NewSupplier {
                     legal_name: &format!("{name} works"),
-                    country,
+                    country: "DE",
                     categories: &[category.to_owned()],
                     website: None,
                 },
@@ -1990,6 +2108,15 @@ mod tests {
         }
         tx.commit().await.expect("commit suppliers");
         seeded
+    }
+
+    /// The two the older tests were written against.
+    async fn seed_suppliers(
+        db: &Db,
+        principal: &Principal,
+        category: &str,
+    ) -> Vec<(Uuid, EmailAddress)> {
+        seed_named_suppliers(db, principal, category, &["hamburg", "shenzhen"]).await
     }
 
     /// The open round this employee is running, if it is running one.
@@ -2261,6 +2388,275 @@ mod tests {
             "the operator's queue was swallowed: {}",
             ran.note()
         );
+    }
+
+    // -- closing a round ---------------------------------------------------
+
+    /// `(quotes_returned, quotes_missed)` for one supplier, out of the view the
+    /// shortlist reads.
+    async fn responsiveness(db: &Db, principal: &Principal, supplier: Uuid) -> (i64, i64) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let record = sourcing_store::reputation(&mut tx, supplier)
+            .await
+            .expect("reputation");
+        tx.rollback().await.expect("rollback");
+        record.map_or((0, 0), |rep| (rep.quotes_returned, rep.quotes_missed))
+    }
+
+    /// The round ends at the deadline the RFQ named, and that is the only thing
+    /// that ever ends it.
+    ///
+    /// Two claims, and the second is the one that had no writer at all:
+    ///
+    /// 1. **The employee is freed.** An open `rfqs` row is what stops them
+    ///    asking, so a round nobody concluded left them reading "we are waiting
+    ///    on somebody" on every cadence forever. Past `closes_at` they are back
+    ///    at `Stage::Rfq` with a fresh round.
+    /// 2. **The evidence is filed, both halves of it.** One supplier answered
+    ///    and one did not; the close writes exactly one `quote_returned` and
+    ///    exactly one `quote_missed`. Before this, `quote_missed` was a `kind`
+    ///    in a CHECK constraint that no code path could produce, so the drop in
+    ///    [`shortlist`](crate::sourcing::shortlist) could never fire.
+    ///
+    /// And the next cadence adds nothing: a round closes once.
+    #[tokio::test]
+    async fn a_round_ends_at_its_deadline_filing_one_answer_one_silence_and_freeing_the_employee() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_suppliers(&db, &principal, category(&objective)).await;
+        let (answering, silent) = (seeded[0].0, seeded[1].0);
+        // Wall clock, not a fixed date: `quotes.received_at` defaults to the
+        // database's `now()` and `Quote::live_at` refuses a price from the
+        // future, so a round set in 2026-03 would compare nothing.
+        let now = Utc::now();
+
+        let asked = purchasing_turn(&db, &buyer, &principal, &pack, &objective, now)
+            .await
+            .expect("the round was readable");
+        assert!(matches!(asked.bought, Bought::Asked { .. }), "{asked:?}");
+        let first = open_round(&db, &principal)
+            .await
+            .expect("the round is open");
+
+        // One of them answers. The other never does.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sourcing_store::insert_quote(
+            &mut tx,
+            Uuid::now_v7(),
+            &sourcing_store::NewQuote {
+                rfq_id: first.id,
+                supplier_id: answering,
+                unit_price: Money::new(300, Currency::Usd).expect("non-zero"),
+                quantity: 5_000,
+                freight: None,
+                duties: None,
+                other_fees: None,
+                lead_time_days: Some(20),
+                incoterm: Some("DDP"),
+                valid_until: now + TimeDelta::days(90),
+            },
+        )
+        .await
+        .expect("quote");
+        tx.commit().await.expect("commit quote");
+
+        // A cadence inside the window changes nothing: the round is not over
+        // because a supplier is slow.
+        let waiting = purchasing_turn(
+            &db,
+            &buyer,
+            &principal,
+            &pack,
+            &objective,
+            now + TimeDelta::days(7),
+        )
+        .await
+        .expect("the round was readable");
+        assert!(
+            matches!(waiting.bought, Bought::Compared { .. }),
+            "a quote is in hand and the plan should be comparing: {waiting:?}"
+        );
+        assert_eq!(responsiveness(&db, &principal, answering).await, (0, 0));
+        assert_eq!(responsiveness(&db, &principal, silent).await, (0, 0));
+        assert_eq!(
+            open_round(&db, &principal).await.map(|r| r.id),
+            Some(first.id)
+        );
+
+        // Past it: the round ends, both observations land, and the employee is
+        // canvassing again rather than waiting on a round that is over.
+        let after = now + RFQ_OPEN_FOR + TimeDelta::days(1);
+        let reopened = purchasing_turn(&db, &buyer, &principal, &pack, &objective, after)
+            .await
+            .expect("the round was readable");
+
+        assert_eq!(
+            responsiveness(&db, &principal, answering).await,
+            (1, 0),
+            "the supplier who quoted was recorded as having quoted"
+        );
+        assert_eq!(
+            responsiveness(&db, &principal, silent).await,
+            (0, 1),
+            "quote_missed has a writer now, and this is it"
+        );
+        assert!(
+            matches!(reopened.bought, Bought::Asked { .. }),
+            "closing the round must hand the employee back its next one: {reopened:?}"
+        );
+        let second = open_round(&db, &principal)
+            .await
+            .expect("a fresh round is open");
+        assert_ne!(second.id, first.id, "the closed round came back open");
+        assert_eq!(
+            email.sent_count(),
+            4,
+            "two suppliers, two rounds, one RFQ each"
+        );
+
+        // The next cadence, same day. Nothing is due to close, so nothing is
+        // filed: recording one supplier as having missed the same round twice
+        // is a reputation decaying for a bookkeeping reason.
+        let again = purchasing_turn(&db, &buyer, &principal, &pack, &objective, after)
+            .await
+            .expect("the round was readable");
+        assert!(
+            matches!(again.bought, Bought::Model(rolepack::Stage::Discover)),
+            "the fresh round has no answers yet: {again:?}"
+        );
+        assert_eq!(responsiveness(&db, &principal, answering).await, (1, 0));
+        assert_eq!(responsiveness(&db, &principal, silent).await, (0, 1));
+        assert_eq!(
+            email.sent_count(),
+            4,
+            "the round that was opened a moment ago went out a second time"
+        );
+    }
+
+    /// **The drop that had never once fired in this codebase.**
+    ///
+    /// `shortlist` removes a supplier that has been asked
+    /// [`IGNORED_RFQS_BEFORE_DROPPING`](crate::sourcing::IGNORED_RFQS_BEFORE_DROPPING)
+    /// times and has never answered. Its input is `supplier_reputation`, whose
+    /// `quotes_missed` was structurally zero, so the branch was dead code
+    /// guarded by a constant. Here the misses are real rows written by
+    /// `close_expired_rounds`, read back through `recipients` → `reputation` →
+    /// `shortlist`, and the fifth RFQ goes to three suppliers and not four.
+    ///
+    /// Four candidates and not three, because
+    /// [`MIN_SHORTLIST`](crate::sourcing::MIN_SHORTLIST) is the floor: dropping
+    /// one out of three would leave a round too narrow to be a comparison, and
+    /// everybody would be asked anyway.
+    #[tokio::test]
+    async fn a_supplier_that_ignored_four_rounds_is_not_asked_a_fifth_time() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_named_suppliers(
+            &db,
+            &principal,
+            category(&objective),
+            &["alfa", "bravo", "charlie", "quiet"],
+        )
+        .await;
+        let silent = seeded[3].0;
+        let now = Utc::now();
+
+        // Four rounds. Everyone is asked, everyone but `quiet` answers, and
+        // each round is left to reach its own deadline.
+        let mut clock = now;
+        for _ in 0..sourcing::IGNORED_RFQS_BEFORE_DROPPING {
+            let ran = purchasing_turn(&db, &buyer, &principal, &pack, &objective, clock)
+                .await
+                .expect("the round was readable");
+            let Bought::Asked { asking, .. } = &ran.bought else {
+                panic!("every one of these rounds should have asked: {ran:?}");
+            };
+            assert_eq!(asking.len(), 4, "nobody is droppable yet");
+
+            let open = open_round(&db, &principal).await.expect("open");
+            let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+            for (supplier, _) in seeded.iter().take(3) {
+                sourcing_store::insert_quote(
+                    &mut tx,
+                    Uuid::now_v7(),
+                    &sourcing_store::NewQuote {
+                        rfq_id: open.id,
+                        supplier_id: *supplier,
+                        unit_price: Money::new(300, Currency::Usd).expect("non-zero"),
+                        quantity: 5_000,
+                        freight: None,
+                        duties: None,
+                        other_fees: None,
+                        lead_time_days: Some(20),
+                        incoterm: Some("DDP"),
+                        valid_until: clock + TimeDelta::days(90),
+                    },
+                )
+                .await
+                .expect("quote");
+            }
+            tx.commit().await.expect("commit quotes");
+            clock += RFQ_OPEN_FOR + TimeDelta::days(1);
+        }
+
+        // Three rounds have reached their deadline and been closed by the turn
+        // that followed them; the fourth is still open and is closed by the
+        // fifth turn below. That ordering is the point — the close runs before
+        // the material is read, so the round that has just ended is evidence
+        // the same turn's shortlist gets to use.
+        assert_eq!(
+            responsiveness(&db, &principal, silent).await,
+            (0, sourcing::IGNORED_RFQS_BEFORE_DROPPING - 1),
+            "one closed round per silence, and the last one is still open"
+        );
+        let sent_before = email.sent_count();
+
+        // The fifth. The evidence has stopped buying anything from this one.
+        let fifth = purchasing_turn(&db, &buyer, &principal, &pack, &objective, clock)
+            .await
+            .expect("the round was readable");
+        assert_eq!(
+            responsiveness(&db, &principal, silent).await,
+            (0, sourcing::IGNORED_RFQS_BEFORE_DROPPING),
+            "four rounds, four silences, and every one of them a row"
+        );
+        let Bought::Asked { asking, outcomes } = &fifth.bought else {
+            panic!("the fifth round should still be an RFQ: {fifth:?}");
+        };
+        assert_eq!(asking.len(), 3, "the supplier who never answers was asked");
+        assert!(
+            !asking.contains(&seeded[3].1),
+            "the shortlist kept a supplier with four silences and no answers"
+        );
+        assert_eq!(outcomes.len(), 3, "one outcome per supplier on the list");
+        assert_eq!(
+            email.sent_count() - sent_before,
+            3,
+            "the outreach budget spent on the silent supplier bought nothing"
+        );
+
+        // And nothing was recorded about a supplier who was not asked: their
+        // `negotiations` row does not exist for this round, so the next close
+        // cannot deepen a hole they were not given a chance to climb out of.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let open = sourcing_store::open_rfq(&mut tx, principal.employee_id)
+            .await
+            .expect("open rfq")
+            .expect("the fifth round is open");
+        let recipients: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM negotiations WHERE rfq_id = $1 AND supplier_id = $2",
+        )
+        .bind(open.id)
+        .bind(silent)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(recipients, 0);
     }
 
     // -- sales -------------------------------------------------------------

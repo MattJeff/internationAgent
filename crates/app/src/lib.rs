@@ -15,9 +15,9 @@ pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23
-pub mod psyche; // le fil de production de la psyché
 pub mod proof_of_need; // wave 12
 pub mod provisioning; // U24
+pub mod psyche; // le fil de production de la psyché
 pub mod revenue; // wave 12
 pub mod rolepack;
 pub mod rolepack_sales; // wave 12

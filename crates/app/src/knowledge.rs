@@ -266,11 +266,17 @@ pub enum KnowledgeError {
 ///
 /// Exhaustive on purpose: a new [`Embedder`] variant must not compile until
 /// someone decides whether its vectors live in the same space as an existing
-/// model's.
+/// model's — and, since the arm has to name a model, whether that model has an
+/// index. There is exactly one today and it is
+/// [`DEFAULT_EMBEDDING_MODEL`](agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL),
+/// referenced rather than re-spelled: the store owns the partial HNSW index and
+/// therefore owns the name, and a second spelling here is precisely what let
+/// the index predicate and the stamped model drift apart until `0023`.
 pub const fn model_name(embedder: Embedder) -> &'static str {
     match embedder {
-        // Deliberately not a real model name — see the module docs.
-        Embedder::Mock => "mock-sha256-1536",
+        // `mock-sha256-1536`, deliberately not a real vendor model name — see
+        // the module docs.
+        Embedder::Mock => agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL,
     }
 }
 
@@ -1267,12 +1273,26 @@ mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// Two claims that used to be one, and were in tension without anybody
+    /// noticing.
+    ///
+    /// The mock must not borrow a real vendor's model name — hash vectors
+    /// labelled `text-embedding-3-small` are the silent mixing this column
+    /// exists to prevent. And the name it *does* use has to be the one the
+    /// partial HNSW index is built on, or every retrieval is a sequential scan.
+    /// Before `0023` the second claim was false while a test asserting the
+    /// first one passed, because the two names lived in two crates.
     #[test]
-    fn the_mock_is_not_labelled_as_a_real_model() {
+    fn the_mock_is_not_labelled_as_a_real_model_and_is_the_model_the_index_covers() {
         assert_eq!(model_name(Embedder::Mock), "mock-sha256-1536");
-        assert_ne!(
+        for vendor in ["text-embedding-3-small", "text-embedding-3-large"] {
+            assert_ne!(model_name(Embedder::Mock), vendor);
+        }
+        assert_eq!(
             model_name(Embedder::Mock),
-            agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL
+            agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL,
+            "the model chunks are stamped with and the model the index is \
+             partial on must be one constant, not two that agree today"
         );
     }
 

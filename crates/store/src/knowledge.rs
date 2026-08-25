@@ -71,10 +71,22 @@ use crate::db::{StoreError, TenantTx};
 /// a different width needs a migration, not a config change.
 pub const EMBEDDING_DIM: usize = 1536;
 
-/// The model the HNSW index is partial on. Anything else stores and searches
-/// fine, it just falls back to a sequential scan until someone adds an index
-/// for it.
-pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+/// The model the HNSW index is partial on, and the one every chunk this system
+/// writes carries — `app::knowledge::model_name` returns *this constant* rather
+/// than a second spelling of it.
+///
+/// That indirection is the fix for a real bug and not tidiness. Until 0023 the
+/// index predicate named `text-embedding-3-small` and nothing but this file's
+/// own tests ever wrote that string, so the index served no query in production
+/// and every retrieval was a sequential scan — while the test that EXPLAINs the
+/// vector leg and demands an HNSW index scan passed, because the test data was
+/// the only data the predicate matched. Two names for one thing is what made
+/// that invisible; there is now one, and the same test guards it.
+///
+/// Anything else stores and searches fine, it just falls back to a sequential
+/// scan until someone adds a partial index for it — see `0023`, which argues
+/// why a second model is a migration rather than a config change.
+pub const DEFAULT_EMBEDDING_MODEL: &str = "mock-sha256-1536";
 
 /// The `k` in `1 / (k + rank)`. 60 is the constant from the original RRF paper
 /// and its job is to flatten the top of the curve, so rank 1 and rank 2 do not
