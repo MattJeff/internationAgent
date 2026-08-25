@@ -1,0 +1,19 @@
+{
+  "spend": null,
+  "allowed_channels": [
+    "email",
+    "internal"
+  ],
+  "allowed_calling_codes": [],
+  "allowed_domains": [
+    "orizn.com"
+  ],
+  "denied_domains": [],
+  "allowed_mcp_tools": [],
+  "allowed_a2a_peers": [],
+  "max_new_contacts_per_day": 0,
+  "max_turns_per_day": 30,
+  "allow_file_upload": false,
+  "allow_credential_change": false,
+  "allow_data_delete": false
+}

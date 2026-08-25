@@ -686,10 +686,12 @@ pub async fn rollback_ceiling(db: &Db) -> Result<Uuid, StoreError> {
 // Writing a layer
 // ---------------------------------------------------------------------------
 
-/// Which layer [`install`] is writing.
+/// Which layer [`install`] or [`install_layer`] is writing.
 ///
-/// Not `platform`: the ceiling is not a scope anybody installs on purpose, it
-/// is the one row [`install`] maintains for everybody. See its docs.
+/// Not `platform`: the ceiling belongs to no tenant, so it is neither a scope
+/// [`install_layer`] can address nor one anybody installs on purpose — it is
+/// the one row [`install`] maintains for everybody and the one row
+/// [`install_ceiling`] versions.
 #[derive(Debug, Clone, Copy)]
 pub enum Scope<'a> {
     /// The tenant's own layer.
@@ -699,6 +701,21 @@ pub enum Scope<'a> {
     Role(&'a str),
     /// One employee's layer.
     Employee(EmployeeId),
+}
+
+impl<'a> Scope<'a> {
+    /// `(layer, role_name, employee_id)` — the three scope columns, of which
+    /// `policy_layers_scope` permits exactly one to be set per layer. Written
+    /// once because both writers bind them and both writers also match on them
+    /// with `IS NOT DISTINCT FROM`, where a spelling that disagreed would
+    /// silently address a different row.
+    fn columns(self) -> (PolicyLayer, Option<&'a str>, Option<Uuid>) {
+        match self {
+            Scope::Tenant => (PolicyLayer::Tenant, None, None),
+            Scope::Role(name) => (PolicyLayer::Role, Some(name), None),
+            Scope::Employee(id) => (PolicyLayer::Employee, None, Some(id.as_uuid())),
+        }
+    }
 }
 
 /// One `policy_layers` row's limit columns, owned and in bind order.
@@ -852,11 +869,7 @@ pub async fn install(
     scope: Scope<'_>,
     limits: &PolicyLimits,
 ) -> Result<(), StoreError> {
-    let (layer, role_name, employee_id) = match scope {
-        Scope::Tenant => (PolicyLayer::Tenant, None, None),
-        Scope::Role(name) => (PolicyLayer::Role, Some(name), None),
-        Scope::Employee(id) => (PolicyLayer::Employee, None, Some(id.as_uuid())),
-    };
+    let (layer, role_name, employee_id) = scope.columns();
 
     let mut tx = db.admin_tx_bypassing_rls().await?;
 
@@ -1012,6 +1025,358 @@ pub async fn install(
 
     tx.commit().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A tenant, and the layers it writes for itself
+// ---------------------------------------------------------------------------
+
+/// Create a tenant **and the active `policy_versions` row its layers hang off**.
+///
+/// One function and one transaction for two rows, because the pair is the
+/// invariant: [`load`]'s predicate is `v.active AND l.layer = 'role' AND
+/// v.tenant_id = $1`, so a tenant with no active version has **invisible
+/// layers** — every row an operator wrote is skipped, the loader falls back to
+/// inheritance, and the deployment runs the whole company on the ceiling with
+/// no error anywhere. That failure is silent in both directions: the rows are in
+/// the table, `psql` shows them, and the gate has never read one. A tenant that
+/// could be created without a version is a tenant somebody will create without
+/// one, so there is no way to spell it here.
+///
+/// The version starts empty. That is not a gap: no layer at all means every
+/// layer is inherited from the ceiling, which is the widest a tenant can ever
+/// be and is exactly what a tenant that has expressed nothing should get.
+/// [`install_layer`] narrows from there.
+///
+/// **Admin transaction, and it has to be.** `0001_core.sql` grants `app_role`
+/// only `SELECT` on `tenants`, and RLS on that table compares `id` to
+/// `app.tenant_id` — so a tenant transaction cannot insert the row that would
+/// give it an identity. There is a deeper reason than the grant: every route in
+/// this server derives its tenant from an API key, and the key for a tenant
+/// that does not exist yet cannot authorise creating it. Tenant creation has no
+/// principal but the operator, and the operator's proof is `DATABASE_URL`.
+///
+/// The id is the caller's, not minted here, because the runbook's API key
+/// carries it: `AGENTOS_API_KEYS=label:tenant-uuid:secret` is written before the
+/// server boots, and a command that minted its own would hand back a uuid that
+/// has to be pasted into a keyring the process already read.
+pub async fn create_tenant(
+    db: &Db,
+    tenant_id: TenantId,
+    slug: &str,
+    name: &str,
+) -> Result<Uuid, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
+        .bind(tenant_id.as_uuid())
+        .bind(slug)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
+    let version = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO policy_versions (id, tenant_id, label, author, active) \
+         VALUES ($1, $2, 'tenant created', 'operator', true)",
+    )
+    .bind(version)
+    .bind(tenant_id.as_uuid())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(version)
+}
+
+/// This tenant's active policy version, created if the tenant has none.
+///
+/// The creation is the second half of [`create_tenant`]'s invariant, from the
+/// other side. A tenant row can predate this module — every fixture in this
+/// workspace writes one directly, and so did every operator who followed the
+/// runbook before `policy new-tenant` existed — and such a tenant has no active
+/// version, which makes every layer written for it invisible. Refusing would be
+/// defensible and is the wrong answer: it leaves the operator with a broken
+/// tenant and a command that will not fix it. Creating one is the repair, and
+/// after it there is no path in this module that returns without a version.
+///
+/// A tenant row that does not exist is [`StoreError::NotFound`] and not a
+/// foreign-key violation, because the caller typed a uuid and the useful answer
+/// names the uuid rather than a constraint.
+async fn active_version(tx: &mut TenantTx<'_>) -> Result<Uuid, StoreError> {
+    let tenant = tx.tenant_id().as_uuid();
+
+    // RLS confines this to the caller's own row, so "not visible" and "does not
+    // exist" are the same answer, which is the point of both.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .fetch_optional(&mut ***tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM policy_versions WHERE tenant_id = $1 AND active")
+            .bind(tenant)
+            .fetch_optional(&mut ***tx)
+            .await?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO policy_versions (id, tenant_id, label, author, active) \
+         VALUES ($1, $2, 'adopted', 'operator', true)",
+    )
+    .bind(id)
+    .bind(tenant)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(id)
+}
+
+/// Write one tenant, role or employee layer as a **new active version** of this
+/// tenant's policy.
+///
+/// The tenant-scoped counterpart of [`install_ceiling`], and the same shape for
+/// the same reasons: a new version rather than an edit, the old one left intact
+/// so [`rollback_layer`] is a pointer flip, and an identical layer answering
+/// [`Installed::Unchanged`] so a provisioning script that runs on every deploy
+/// does not leave a version per deploy.
+///
+/// # It cannot widen anything above it, and that is arithmetic
+///
+/// The row this writes is the *second*, *third* or *fourth* argument to
+/// [`EffectivePolicy::try_new`], which takes the minimum of every cap and the
+/// intersection of every allowlist. A tenant layer naming `max_per_day_minor =
+/// 10_000_000` under a ceiling that says `200_000` is worth `200_000`; a role
+/// layer listing a domain the ceiling does not list resolves to the empty
+/// intersection. [`load`] is the only reader and there is no path around that
+/// call, so a number written wider than the ceiling is not dangerous here, it is
+/// *dead*. `denied_domains` is the single field that unions, which is the same
+/// property from the other end: a lower layer can always add a block and never
+/// remove one.
+///
+/// The honest exception is inheritance, not this function: a scope that has
+/// written **no** layer inherits the layer above rather than
+/// `PolicyLimits::default`, so *removing* a layer widens. That is what
+/// [`rollback_layer`] can do, deliberately, bounded by the ceiling — and it is
+/// why the ceiling is the operator's to write and this is not.
+///
+/// # Two currencies is the trap, in this direction as well
+///
+/// [`install_ceiling`] refuses a ceiling denominated differently from the layers
+/// under it. The same collision arrives from below: a role layer in EUR under a
+/// USD ceiling is not tighter or looser, it is unintersectable —
+/// [`EffectivePolicy::try_new`] answers [`PolicyError::MixedCurrency`], [`load`]
+/// turns that into [`PolicyLoadError::Irreconcilable`], and every action for
+/// every employee that layer touches is refused with `broken_policy`, which
+/// reads like a bug in the gate rather than like a typo in a file. So it is
+/// refused here, before a row is written, naming both currencies.
+///
+/// # What it does not check: empty means deny
+///
+/// A layer with an empty `allowed_domains` is a layer that permits no browsing —
+/// [`agentos_domain::policy::DenyReason::NoRule`], not "unset" — and this
+/// function writes it without comment, because that is a legitimate and
+/// frequently correct thing to want (a finance seat with no bank portal, a chair
+/// with no channel at all). What it cannot tell is *deliberate* empty from a
+/// field somebody forgot, and the two are the same row. That distinction lives
+/// where the operator's file is parsed, in `agentos-server policy install`,
+/// which refuses a layer document that omits a field rather than reading the
+/// omission as "leave it alone".
+pub async fn install_layer(
+    db: &Db,
+    tenant_id: TenantId,
+    scope: Scope<'_>,
+    limits: &PolicyLimits,
+    label: &str,
+) -> Result<Installed, StoreError> {
+    let (layer, role_name, employee_id) = scope.columns();
+    let columns = Columns::from(limits);
+
+    // A tenant transaction, not an admin one — unlike [`install_ceiling`], whose
+    // row belongs to no tenant and is therefore unwritable under RLS. Here the
+    // rows do belong to a tenant, `0006_policy.sql`'s WITH CHECK pins every
+    // insert to `app.tenant_id`, and running under it means a typo in the uuid
+    // cannot write into somebody else's policy: it addresses a tenant that is
+    // simply not there.
+    let mut tx = db.tenant_tx(tenant_id).await?;
+    let version = active_version(&mut tx).await?;
+
+    // The currency guard, before anything is written and against every layer
+    // this one will be intersected with — the platform ceiling (visible through
+    // RLS's `tenant_id IS NULL` arm) and this tenant's own active layers, minus
+    // the one being replaced, which is allowed to have been the odd one out.
+    //
+    // `IS NOT DISTINCT FROM` and not `=` in every scope match below: two of the
+    // three scope columns are NULL on any given row and `NULL = NULL` is NULL,
+    // so an equality spelling matches nothing — which here would compare a
+    // layer against itself and pass, and further down would leave the old row
+    // beside the new one for `policy_layers_scope_key` to reject with a
+    // constraint name instead of a sentence.
+    if let Some(currency) = columns.currency.as_deref() {
+        let clash: Option<String> = sqlx::query_scalar(
+            "SELECT l.spend_currency FROM policy_layers l \
+               JOIN policy_versions v ON v.id = l.version_id \
+              WHERE v.active AND l.spend_currency IS NOT NULL AND l.spend_currency <> $1 \
+                AND NOT (l.layer = $2 AND l.role_name IS NOT DISTINCT FROM $3 \
+                                      AND l.employee_id IS NOT DISTINCT FROM $4) \
+              LIMIT 1",
+        )
+        .bind(currency)
+        .bind(layer.as_str())
+        .bind(role_name)
+        .bind(employee_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(clash) = clash {
+            return Err(StoreError::conflict(format!(
+                "this {layer} layer is denominated in {currency} and this deployment's active \
+                 policy is already in {clash}: a policy in two currencies cannot be intersected, \
+                 and installing this would refuse every action this layer applies to with \
+                 `broken_policy`"
+            )));
+        }
+    }
+
+    // Already exactly this? Then there is nothing to version. Compared as a
+    // `PolicyLimits` rather than column by column, so "the same" means the same
+    // thing here as it does to the loader.
+    let current: Option<LayerRow> = sqlx::query_as(
+        "SELECT * FROM policy_layers WHERE version_id = $1 AND layer = $2 \
+           AND role_name IS NOT DISTINCT FROM $3 \
+           AND employee_id IS NOT DISTINCT FROM $4",
+    )
+    .bind(version)
+    .bind(layer.as_str())
+    .bind(role_name)
+    .bind(employee_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    // A row that does not parse is not "different", it is broken, and replacing
+    // it is the repair — so it falls through to the write, like the ceiling's.
+    if let Some(Ok((_, stored))) = current.map(LayerRow::into_limits)
+        && stored == *limits
+    {
+        tx.rollback().await?;
+        return Ok(Installed::Unchanged(version));
+    }
+
+    let next = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO policy_versions (id, tenant_id, label, author, active) \
+         VALUES ($1, $2, $3, 'operator', false)",
+    )
+    .bind(next)
+    .bind(tenant_id.as_uuid())
+    .bind(label)
+    .execute(&mut **tx)
+    .await?;
+
+    // **Carry every other layer forward.** A tenant version holds all of this
+    // tenant's layers, unlike the platform version which holds exactly one — so
+    // a new version that contained only the layer being installed would silently
+    // delete the other three. Ids are fresh (`gen_random_uuid`, because this is
+    // one set-returning statement and there is no per-row bind to give it a v7)
+    // and the old rows are untouched, which is what the rollback flips back to.
+    sqlx::query(
+        "INSERT INTO policy_layers \
+           (id, version_id, tenant_id, layer, role_name, employee_id, \
+            spend_currency, max_per_transaction_minor, max_per_day_minor, \
+            approval_above_minor, allowed_channels, allowed_calling_codes, \
+            allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
+            max_new_contacts_per_day, max_turns_per_day, \
+            allow_file_upload, allow_credential_change, allow_data_delete) \
+         SELECT gen_random_uuid(), $1, tenant_id, layer, role_name, employee_id, \
+                spend_currency, max_per_transaction_minor, max_per_day_minor, \
+                approval_above_minor, allowed_channels, allowed_calling_codes, \
+                allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
+                max_new_contacts_per_day, max_turns_per_day, \
+                allow_file_upload, allow_credential_change, allow_data_delete \
+           FROM policy_layers \
+          WHERE version_id = $2 \
+            AND NOT (layer = $3 AND role_name IS NOT DISTINCT FROM $4 \
+                                AND employee_id IS NOT DISTINCT FROM $5)",
+    )
+    .bind(next)
+    .bind(version)
+    .bind(layer.as_str())
+    .bind(role_name)
+    .bind(employee_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let insert = columns.bind_to(
+        sqlx::query(
+            "INSERT INTO policy_layers \
+               (id, version_id, tenant_id, layer, role_name, employee_id, \
+                spend_currency, max_per_transaction_minor, max_per_day_minor, \
+                approval_above_minor, allowed_channels, allowed_calling_codes, \
+                allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
+                max_new_contacts_per_day, max_turns_per_day, \
+                allow_file_upload, allow_credential_change, allow_data_delete) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(next)
+        .bind(tenant_id.as_uuid())
+        .bind(layer.as_str())
+        .bind(role_name)
+        .bind(employee_id),
+    );
+    insert.execute(&mut **tx).await?;
+
+    // Deactivate then activate, never one statement — `activate` is that rule,
+    // and it is the same rule `install_ceiling` restates for the platform half.
+    activate(&mut tx, next).await?;
+    tx.commit().await?;
+    Ok(Installed::Version(next))
+}
+
+/// Make this tenant's previous policy version active again — the undo for
+/// [`install_layer`].
+///
+/// Returns the version that is now active. Nothing is deleted, and
+/// `0006_policy.sql` revokes DELETE to keep it that way.
+///
+/// **It is a toggle between the last two versions, not a walk back through
+/// history**, and that is [`rollback_ceiling`]'s behaviour too: "the most
+/// recent version that is not the active one" is the one just deactivated, so
+/// rolling back twice returns to where you started. That is the right shape for
+/// the thing it is for — an operator who has just installed a layer and wants it
+/// gone, and then wants it back. Walking further would need a version to name,
+/// and naming one is `activate`, which is already public.
+///
+/// **It will roll back into a version with no layers, unlike
+/// [`rollback_ceiling`], and the asymmetry is not an oversight.** A deployment
+/// with no ceiling denies every action, so "undo the first ceiling" is never
+/// what an operator means. A *tenant* with no layers inherits the ceiling — the
+/// widest it can be and still bounded — so "undo the first layer I ever wrote"
+/// is a coherent request with a safe answer, and refusing it would leave a bad
+/// first layer with no way out but `psql`.
+///
+/// It does widen, and that is what an undo is. It cannot widen past the ceiling,
+/// for the reason [`install_layer`] argues: every layer still goes through
+/// [`EffectivePolicy::try_new`].
+pub async fn rollback_layer(db: &Db, tenant_id: TenantId) -> Result<Uuid, StoreError> {
+    let mut tx = db.tenant_tx(tenant_id).await?;
+
+    let previous: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM policy_versions WHERE tenant_id = $1 AND NOT active \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(tenant_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(previous) = previous else {
+        return Err(StoreError::NotFound);
+    };
+
+    activate(&mut tx, previous).await?;
+    tx.commit().await?;
+    Ok(previous)
 }
 
 // ---------------------------------------------------------------------------
@@ -2207,5 +2572,403 @@ pub(crate) mod tests {
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;
+    }
+
+    // -- the tenant's own layers ------------------------------------------
+
+    /// A tenant created the way the operator's command creates it, plus one
+    /// active employee to hang a policy on.
+    async fn commissioned(db: &Db, label: &str) -> (TenantId, EmployeeId) {
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee = EmployeeId::new_v7(now);
+        create_tenant(
+            db,
+            tenant,
+            &format!("{label}-{}", tenant.as_uuid().simple()),
+            label,
+        )
+        .await
+        .expect("create the tenant");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $4, 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(label)
+        .bind(label)
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit");
+        (tenant, employee)
+    }
+
+    /// This tenant's active versions. The `tenant_id` predicate is not
+    /// redundant with RLS: `0006_policy.sql`'s USING clause deliberately lets
+    /// every tenant *read* the platform rows, because the loader needs the
+    /// ceiling, so a bare `WHERE active` here counts the ceiling too.
+    async fn active_versions(db: &Db, tenant: TenantId) -> Vec<Uuid> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let ids =
+            sqlx::query_scalar("SELECT id FROM policy_versions WHERE active AND tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_all(&mut **tx)
+                .await
+                .expect("read versions");
+        tx.rollback().await.expect("rollback");
+        ids
+    }
+
+    /// A tight ceiling with a per-transaction cap and one allowed domain, for
+    /// the layer tests below to try and escape from.
+    fn tight_ceiling() -> PolicyLimits {
+        PolicyLimits {
+            spend: Some(
+                SpendLimits::try_new(
+                    Money::new(50_000, Usd).expect("money"),
+                    Money::new(200_000, Usd).expect("money"),
+                    Money::new(100, Usd).expect("money"),
+                )
+                .expect("coherent"),
+            ),
+            allowed_channels: [Channel::Email, Channel::Internal].into(),
+            allowed_domains: [Domain::parse("orizn.com").expect("domain")].into(),
+            max_new_contacts_per_day: 20,
+            max_turns_per_day: 30,
+            ..PolicyLimits::default()
+        }
+    }
+
+    /// **The claim the whole four-layer design rests on, asserted on the
+    /// `EffectivePolicy` rather than on the row.**
+    ///
+    /// A tenant layer that names bigger numbers than the ceiling and an extra
+    /// domain is written — successfully, because writing it is not the
+    /// dangerous part and refusing it would put a second copy of the
+    /// intersection rule in the writer. What it is worth is the ceiling's
+    /// numbers, because `EffectivePolicy::try_new` takes the minimum of every
+    /// cap and the intersection of every allowlist and [`load`] is the only
+    /// reader. Asserting on `policy_layers` would prove the row exists; this
+    /// proves the row is dead.
+    #[tokio::test]
+    async fn a_permissive_tenant_layer_under_a_tight_ceiling_does_not_widen() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "tight")
+            .await
+            .expect("install the ceiling");
+        let (tenant, employee) = commissioned(&db, "no-widen").await;
+
+        let greedy = PolicyLimits {
+            spend: Some(
+                SpendLimits::try_new(
+                    Money::new(9_999_999, Usd).expect("money"),
+                    Money::new(9_999_999, Usd).expect("money"),
+                    Money::new(9_999_999, Usd).expect("money"),
+                )
+                .expect("coherent"),
+            ),
+            allowed_channels: [
+                Channel::Email,
+                Channel::Internal,
+                Channel::Sms,
+                Channel::Voice,
+            ]
+            .into(),
+            allowed_domains: [
+                Domain::parse("orizn.com").expect("domain"),
+                Domain::parse("anything.example.net").expect("domain"),
+            ]
+            .into(),
+            max_new_contacts_per_day: 10_000,
+            max_turns_per_day: 100_000,
+            allow_file_upload: true,
+            allow_credential_change: true,
+            allow_data_delete: true,
+            ..PolicyLimits::default()
+        };
+        install_layer(&db, tenant, Scope::Tenant, &greedy, "greedy")
+            .await
+            .expect("a wider layer is written, not refused");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let effective = load(&mut tx, employee, None).await.expect("load");
+        tx.rollback().await.expect("rollback");
+
+        let ceiling = tight_ceiling();
+        assert_eq!(
+            effective.limits(),
+            &ceiling,
+            "a tenant layer wider than the ceiling must resolve to exactly the ceiling"
+        );
+        // Spelled out as well, because `assert_eq!` on the whole struct is easy
+        // to weaken later and these five are the ones that cost money.
+        assert_eq!(caps(&effective), (50_000, 200_000, 100));
+        assert_eq!(effective.limits().max_turns_per_day, 30);
+        assert_eq!(effective.limits().max_new_contacts_per_day, 20);
+        assert!(
+            !effective
+                .limits()
+                .allowed_channels
+                .contains(&Channel::Voice)
+        );
+        assert!(!effective.limits().allow_credential_change);
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// Applying the same layer twice is not a change, and a deploy script that
+    /// runs the whole set on every rollout must not leave a version per rollout.
+    /// The sibling layers surviving the second install is the other half: a new
+    /// version carries every layer forward, and a version that dropped one would
+    /// silently return that scope to inheritance.
+    #[tokio::test]
+    async fn installing_the_same_layer_twice_leaves_one_active_version() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "tight")
+            .await
+            .expect("install the ceiling");
+        let (tenant, employee) = commissioned(&db, "idempotent").await;
+
+        let role = PolicyLimits {
+            max_turns_per_day: 10,
+            ..tight_ceiling()
+        };
+        let tenant_layer = PolicyLimits {
+            max_new_contacts_per_day: 5,
+            ..tight_ceiling()
+        };
+
+        install_layer(&db, tenant, Scope::Tenant, &tenant_layer, "tenant")
+            .await
+            .expect("tenant layer");
+        let first = install_layer(&db, tenant, Scope::Role("sales"), &role, "role")
+            .await
+            .expect("role layer");
+        assert!(matches!(first, Installed::Version(_)), "{first:?}");
+
+        let again = install_layer(&db, tenant, Scope::Role("sales"), &role, "role")
+            .await
+            .expect("role layer again");
+        assert_eq!(
+            again,
+            Installed::Unchanged(first.version()),
+            "the same layer must not become a second version"
+        );
+        assert_eq!(active_versions(&db, tenant).await, vec![first.version()]);
+
+        // And the tenant layer written before the role layer is still in force,
+        // which is the carry-forward doing its job.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let effective = load(&mut tx, employee, Some("sales")).await.expect("load");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(effective.limits().max_new_contacts_per_day, 5);
+        assert_eq!(effective.limits().max_turns_per_day, 10);
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// The undo an operator needs at 2am: a layer that was a mistake, removed,
+    /// and **the gate ruling differently afterwards** — not merely a different
+    /// row in `policy_versions`.
+    #[tokio::test]
+    async fn rolling_back_a_layer_changes_the_gates_ruling_back() {
+        use agentos_domain::action::{Action, ActionCtx, Actor, ContactStanding, EmailAddress};
+        use agentos_domain::policy::{Decision, evaluate};
+        use agentos_domain::untrusted::TrustLabel;
+
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "tight")
+            .await
+            .expect("install the ceiling");
+        let (tenant, employee) = commissioned(&db, "undo").await;
+
+        let email = Action::EmailSend {
+            to: EmailAddress::parse("buyer@orizn.com").expect("address"),
+        };
+        let ctx = ActionCtx {
+            trust: TrustLabel::Trusted,
+            contact: ContactStanding::Known,
+            ..ActionCtx::new(Actor::new(tenant, employee), Utc::now())
+        };
+        let rule = async |db: &Db| {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let effective = load(&mut tx, employee, None).await.expect("load");
+            tx.rollback().await.expect("rollback");
+            (evaluate(&effective, &email, &ctx), effective)
+        };
+
+        // A tenant layer that keeps email.
+        install_layer(&db, tenant, Scope::Tenant, &tight_ceiling(), "keeps email")
+            .await
+            .expect("tenant layer");
+        let (before, _) = rule(&db).await;
+        assert_eq!(before, Decision::Allow);
+
+        // The mistake: an employee layer that restates the turn budget and
+        // forgets the channel. Nothing errors — this is exactly the shape
+        // `docs/ORIZN.md` warns about, and it is a live employee that can no
+        // longer send mail.
+        let mistake = PolicyLimits {
+            allowed_channels: [Channel::Internal].into(),
+            max_turns_per_day: 5,
+            ..tight_ceiling()
+        };
+        install_layer(&db, tenant, Scope::Employee(employee), &mistake, "oops")
+            .await
+            .expect("employee layer");
+        let (broken, limits) = rule(&db).await;
+        assert_eq!(
+            broken,
+            Decision::Deny {
+                reason: agentos_domain::policy::DenyReason::ChannelNotAllowed
+            }
+        );
+        assert_eq!(limits.limits().max_turns_per_day, 5);
+
+        // The undo, with no database console.
+        rollback_layer(&db, tenant).await.expect("roll it back");
+        let (restored, limits) = rule(&db).await;
+        assert_eq!(restored, Decision::Allow, "the ruling has to change back");
+        assert_eq!(limits.limits().max_turns_per_day, 30);
+        assert_eq!(
+            active_versions(&db, tenant).await.len(),
+            1,
+            "a rollback is a pointer flip, not a second active version"
+        );
+
+        // Nothing was deleted, which is what makes a rollback a toggle between
+        // the last two versions rather than a walk back through history —
+        // exactly as `rollback_ceiling` behaves, and the property that lets an
+        // operator undo their own undo.
+        rollback_layer(&db, tenant).await.expect("and back again");
+        let (redone, _) = rule(&db).await;
+        assert_eq!(
+            redone,
+            Decision::Deny {
+                reason: agentos_domain::policy::DenyReason::ChannelNotAllowed
+            },
+            "rolling back twice returns to the version it came from"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// The currency trap, from below. `install_ceiling` already refuses a
+    /// ceiling that disagrees with the layers under it; this is the same
+    /// collision arriving from a role layer, and the symptom it prevents is
+    /// every action in the deployment being refused with `broken_policy` —
+    /// which reads like a bug in the gate rather than a typo in a file.
+    #[tokio::test]
+    async fn a_layer_in_a_second_currency_is_refused_naming_both() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "dollars")
+            .await
+            .expect("install the ceiling");
+        let (tenant, employee) = commissioned(&db, "two-currencies").await;
+
+        let euros = PolicyLimits {
+            spend: Some(
+                SpendLimits::try_new(
+                    Money::new(10_000, Eur).expect("money"),
+                    Money::new(40_000, Eur).expect("money"),
+                    Money::new(100, Eur).expect("money"),
+                )
+                .expect("coherent"),
+            ),
+            ..tight_ceiling()
+        };
+        let err = install_layer(&db, tenant, Scope::Role("finance"), &euros, "euros")
+            .await
+            .expect_err("EUR under a USD ceiling");
+        let StoreError::Conflict(message) = &err else {
+            panic!("expected a conflict, got {err:?}");
+        };
+        assert!(
+            message.contains("EUR") && message.contains("USD"),
+            "the refusal has to name both currencies: {message}"
+        );
+
+        // And nothing was written: the deployment still loads, which is the
+        // whole point of refusing before the insert rather than after.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        load(&mut tx, employee, Some("finance"))
+            .await
+            .expect("the policy still assembles");
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **A tenant with no active version has invisible layers**, silently, so
+    /// no path in this module may leave one in that state.
+    ///
+    /// Two ways in, both closed here: `create_tenant` writes the version with
+    /// the row, and `install_layer` *adopts* a tenant that predates this module
+    /// — every fixture in this workspace inserts a bare `tenants` row, and so
+    /// did every operator who followed the runbook before `policy new-tenant`
+    /// existed. Refusing those would be defensible and is the wrong answer: it
+    /// leaves a broken tenant and a command that will not fix it.
+    #[tokio::test]
+    async fn no_path_here_leaves_a_tenant_without_an_active_version() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "tight")
+            .await
+            .expect("install the ceiling");
+
+        // The command's own path.
+        let (fresh, _) = commissioned(&db, "with-version").await;
+        assert_eq!(active_versions(&db, fresh).await.len(), 1);
+
+        // The legacy path: a bare row, exactly as `seed` and every fixture in
+        // this workspace writes one.
+        let (legacy, employee) = seed(&db, "no-version").await;
+        assert!(
+            active_versions(&db, legacy).await.is_empty(),
+            "the premise of this test is that a bare tenant has no version"
+        );
+
+        let layer = PolicyLimits {
+            max_turns_per_day: 7,
+            ..tight_ceiling()
+        };
+        install_layer(&db, legacy, Scope::Tenant, &layer, "adopted")
+            .await
+            .expect("install adopts a tenant that has no version");
+        assert_eq!(active_versions(&db, legacy).await.len(), 1);
+
+        // The proof that it matters: the layer is *visible*, which it would not
+        // have been under a version nobody activated.
+        let mut tx = db.tenant_tx(legacy).await.expect("tenant tx");
+        let effective = load(&mut tx, employee, None).await.expect("load");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(effective.limits().max_turns_per_day, 7);
+
+        // A tenant id with no row is NotFound and not a foreign-key violation,
+        // because the operator typed a uuid.
+        let ghost = install_layer(
+            &db,
+            TenantId::new_v7(Utc::now()),
+            Scope::Tenant,
+            &layer,
+            "ghost",
+        )
+        .await;
+        assert!(matches!(ghost, Err(StoreError::NotFound)), "{ghost:?}");
+
+        // Neither tenant this test touched is left in the invisible state.
+        for who in [fresh, legacy] {
+            assert_eq!(active_versions(&db, who).await.len(), 1);
+        }
+        drop_tenant(&db, fresh).await;
+        drop_tenant(&db, legacy).await;
     }
 }

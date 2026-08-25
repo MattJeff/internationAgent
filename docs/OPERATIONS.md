@@ -78,22 +78,46 @@ done
 
 They are written `IF NOT EXISTS` / `DROP`-then-`CREATE` and are replayable.
 
-### 1.4 The tenant row you have to insert yourself
+### 1.4 The tenant you have to create yourself
 
-**There is no endpoint that creates a tenant.** There are routes for employees,
-initiative, turns, approvals, teams, inventory, knowledge, the phone pool, MCP,
-A2A and webhooks — and none for tenants. `AGENTOS_API_KEYS` names a tenant UUID;
+**There is no endpoint that creates a tenant, and there cannot be one.** Every
+route derives its tenant from the API key, so the key for a tenant that does not
+exist yet cannot authorise creating it. `AGENTOS_API_KEYS` names a tenant UUID;
 `employees.tenant_id` has a foreign key to `tenants(id)`. If the row is missing,
 `POST /v1/employees` fails on the FK and you will spend twenty minutes wondering
 why. `SPEC.md` §20 is the full route table.
 
-```sql
-INSERT INTO tenants (id, slug, name)
-VALUES ('00000000-0000-0000-0000-000000000001', 'acme', 'Acme');
+```bash
+agentos-server policy new-tenant acme Acme \
+  --id 00000000-0000-0000-0000-000000000001
 ```
 
-Run it as the connecting role (`psql "$DATABASE_URL"`), not through the app —
-`tenants` is not tenant-scoped and there is no path to it from a `tenant_tx`.
+`--id` because your `AGENTOS_API_KEYS` entry already carries that UUID; leave it
+off and one is minted and printed. It reads `DATABASE_URL` and nothing else, and
+runs as the connecting role — `tenants` is granted `SELECT` only to `app_role`
+and there is no path to it from a `tenant_tx`.
+
+**It writes two rows, and the second one is the point.** A tenant also needs an
+**active `policy_versions` row**, because `store::policy::load` joins on
+`v.active`: a tenant without one has *invisible* layers. Every limit you write
+for it is skipped, every scope falls back to inheriting the ceiling, and nothing
+errors — the rows are in the table and the gate has never read one. That version
+had no writer at all until this command, which is why the two rows are one
+transaction and cannot be asked for separately.
+
+### 1.4b Tenant, role and employee limits
+
+`policy install --tenant` writes them, one layer per invocation, each as a new
+active policy version:
+
+```bash
+agentos-server policy install --tenant $TENANT --role purchasing purchasing.json
+agentos-server policy rollback --tenant $TENANT       # undo the last one
+```
+
+The document must be a **complete** `PolicyLimits` — the layers intersect, so an
+omitted field is *deny*, not "leave it alone", and the installer refuses a
+document that omits one. `docs/TEAMS.md` §2 has the shape and the warning.
 
 ### 1.5 The policy ceiling you have to install
 

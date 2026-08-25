@@ -2231,7 +2231,15 @@ mod tests {
     /// The real outbox poller is cross-tenant by design, so any test that runs
     /// one has to own its database or it will claim, answer and burn attempts
     /// off every other test's events.
-    async fn own_database(prefix: &str) -> Option<(Db, String, String)> {
+    ///
+    /// `pub(crate)` for the same reason: `policy`'s tests install a platform
+    /// ceiling, which is a global singleton (`policy_versions_one_active_idx`
+    /// permits exactly one active version with `tenant_id IS NULL`). Two tests
+    /// in this binary doing that concurrently is a coin flip over which ceiling
+    /// the other one is asserting on. A database each is what makes them
+    /// independent, and a second copy of this helper over there would be the
+    /// same code with a different bug.
+    pub(crate) async fn own_database(prefix: &str) -> Option<(Db, String, String)> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; this test needs a real Postgres");
             return None;
@@ -2259,7 +2267,7 @@ mod tests {
     /// The database goes with the test. A panic leaks one, which is a named
     /// database an operator can drop — cheaper than a guard that runs during
     /// unwinding.
-    async fn drop_database(db: Db, admin_url: String, database: String) {
+    pub(crate) async fn drop_database(db: Db, admin_url: String, database: String) {
         drop(db);
         if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
             let _ = sqlx::query(sqlx::AssertSqlSafe(format!(

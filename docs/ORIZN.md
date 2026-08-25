@@ -11,18 +11,25 @@ This is how you build *that* company on this platform, in order, with the
 commands you type. `docs/TEAMS.md` is the reference for what each call does;
 this is the sequence, the numbers, and what those numbers cost.
 
-Three files are the company, and they are meant to be read, edited and
+Three documents are the company, and they are meant to be read, edited and
 re-applied rather than typed once:
 
 | file | what it is |
 |---|---|
 | `docs/orizn-ceiling.json` | the platform ceiling — the widest anything in this deployment may be |
 | `docs/orizn-org.json` | the org chart: five functions, five missions, five seats, one reporting line |
-| `docs/orizn-policy.sql` | the role layers — the limits, because **no route writes one** |
+| `docs/orizn-roles/*.json` | the role layers — one document per function, one command each |
 
-`apps/server/tests/orizn.rs` applies all three against a real database and
+`apps/server/tests/orizn.rs` applies all of them against a real database and
 asserts the company they produce. If this document and those files drift apart,
 that test is what says so.
+
+> **There is no `psql` in this runbook any more.** Three steps used to be
+> hand-written SQL — creating the tenant, creating its active policy version,
+> and writing the role layers — because nothing in the codebase wrote those
+> rows. All three are `agentos-server policy` subcommands now. Steps **3** and
+> **5** are the ones that changed; the only SQL left below *reads*, and a read
+> was never the problem. See "What stopped being SQL" at the end.
 
 ---
 
@@ -56,9 +63,9 @@ channel, no domain, no spend.
 That row exists for one reason. An **absent** role layer inherits the layer
 above it, so a team pointed at a `role_name` nobody has written limits for runs
 on the ceiling. Leave `direction` unwritten and the seat at the root of the org
-chart quietly becomes the most permissive employee in the company. The layer is
-one `INSERT` with almost no columns, and it is the cheapest thing in this
-document.
+chart quietly becomes the most permissive employee in the company.
+`docs/orizn-roles/direction.json` is the emptiest document in this repository
+and it is the cheapest thing in this runbook.
 
 The founder is a person. This seat is the person's place in the chart and the
 `reports_to` target of every head, and it is `UNCHARTERED` — `SystemPrompt::new`
@@ -103,8 +110,13 @@ that unions, so a lower layer can always add a block and never remove one.
 > ceiling that says `200_000` is worth `200_000`; a role layer that lists a
 > domain the ceiling does not list resolves to the empty intersection. Writing a
 > number bigger than the ceiling is not dangerous here, it is *dead* — and the
-> only way to widen is `agentos-server policy install`, at the platform layer,
-> by somebody with the database URL.
+> only way to widen past it is `agentos-server policy install` with no
+> `--tenant`, at the platform layer, by somebody with the database URL.
+>
+> The one thing that does widen is a **rollback**: removing a layer returns that
+> scope to inheriting the layer above. That is what an undo is, it is bounded by
+> the ceiling like everything else, and it is why the ceiling is the operator's
+> to write and a tenant's layers are not.
 
 ### The ceiling — `docs/orizn-ceiling.json`
 
@@ -124,11 +136,40 @@ that unions, so a lower layer can always add a block and never remove one.
 platform ceiling *is* Orizn's ceiling. A second, identical layer would be a
 second place to forget to tighten. Write one the day a second tenant exists.
 
-### The role layers — `docs/orizn-policy.sql`
+### The role layers — `docs/orizn-roles/*.json`
 
-Every number is at or below the ceiling. The full table with its inline
-arguments is in the SQL file; the reasoning that does not fit in a comment is
-here.
+Every number is at or below the ceiling. One document per function, named after
+the `role_name` it is installed under, and the reasoning is here rather than in
+the file because JSON has no comments.
+
+Three fields are `[]` in every document and that emptiness is the control:
+
+* `allowed_calling_codes` — Orizn phones nobody. The sales pack lists thirteen
+  calling codes and the ceiling's empty set intersects all of them away before
+  these documents are even read.
+* `allowed_mcp_tools` — Orizn has bound no MCP server. When one is bound, its
+  tools go into the *ceiling* first: a tool named here and not there is a tool
+  no employee can reach.
+* `allowed_a2a_peers` — selling to a company is not talking to its agent.
+
+`denied_domains` is `[]` too, and it is the one field that *unions* across
+layers, so a later document can add a block and nothing can remove one.
+
+> **Empty means deny, and a missing field means deny too.** An empty allowlist
+> is `DenyReason::NoRule` — not "unset", not "inherit". Because the layers
+> intersect, **every document has to restate every grant it wants to keep**;
+> there is no inherit marker and there deliberately is not one. That makes a
+> hand-written layer lethal in a way that reads as harmless:
+> `{"max_turns_per_day": 30}` looks like an edit and is a total replacement, and
+> the seat that receives it quietly loses its channels, its domains and its
+> spend while continuing to answer.
+>
+> So `policy install` **refuses a document that omits a field**, naming the ones
+> missing. `"allowed_domains": []` is accepted and means deny — a finance seat
+> with no bank portal is real, and so is a chair with no channel at all — but
+> leaving the key out is not. The quickest complete starting point is what
+> `agentos-server policy install` prints back: it is a whole layer, and every
+> layer here is a whole layer.
 
 #### `sales-development` — 30 turns, **0 new contacts**, `{email,internal}`, `orizn.com`
 
@@ -158,12 +199,17 @@ personally read that day, and at a company of one founder that is single digits.
 Five approaches on thirty turns is a seller that spends most of its day on
 evidence, which is what the pack's own plan puts before contacting anyone.
 
-```sql
-update policy_layers set max_new_contacts_per_day = 5
- where layer = 'role' and role_name = 'sales-development'
-   and version_id = (select id from policy_versions
-                      where tenant_id = :tenant and active);
+Edit `max_new_contacts_per_day` in `docs/orizn-roles/sales-development.json`
+and install it again:
+
+```sh
+agentos-server policy install --tenant $TENANT \
+  --role sales-development docs/orizn-roles/sales-development.json
 ```
+
+That is a **new policy version**, not an edit: the old one stays in
+`policy_versions` and `agentos-server policy rollback --tenant $TENANT` puts it
+back. The gate picks the change up on the next action, not the next deploy.
 
 Thirty turns a day is roughly ten findings, because the briefing makes a finding
 require *two* runs of the same passport/destination pair — an unreproduced claim
@@ -378,18 +424,34 @@ Re-running the same file changes nothing and says so — the installer compares
 the parsed ceiling to the active one. To undo: `agentos-server policy rollback`,
 which re-activates the previous version and deletes nothing.
 
-### 3. Create the tenant row
-
-There is no route and no CLI subcommand for this. `tenants` is RLS-protected
-with `grant select` only, so a tenant can read its own row and cannot insert it.
+### 3. Create the tenant — and the policy version its layers hang off
 
 ```sh
-psql "$DATABASE_URL" -c \
-  "insert into tenants (id, slug, name) values ('$TENANT', 'orizn', 'Orizn')"
+agentos-server policy new-tenant orizn Orizn --id $TENANT
 ```
 
-**It worked:** `INSERT 0 1`, and `call $API/v1/whoami` returns your `tenant_id`
-and the key's label.
+**This used to be `psql`.** `tenants` is RLS-protected with `grant select` only,
+so a tenant transaction can read its own row and cannot insert it — and there is
+no route that could, because every route derives its tenant from the API key and
+the key for a tenant that does not exist yet cannot authorise creating it. The
+authorisation for this is `DATABASE_URL`, which is why it is a subcommand.
+
+`--id` because your `AGENTOS_API_KEYS` entry already carries that uuid. Leave it
+off and one is minted and printed, and then you have to put it in the keyring
+and restart.
+
+**It worked:** it names the tenant id **and an active policy version**. Then
+`call $API/v1/whoami` returns your `tenant_id` and the key's label.
+
+**Why one command writes two rows, and this is the part worth reading.** The
+loader's predicate is `v.active AND l.layer = 'role' AND v.tenant_id = $1`. A
+tenant with no *active* `policy_versions` row therefore has **invisible layers**:
+every row you write in step 5 is skipped, every scope falls back to inheritance,
+and the whole company runs on the ceiling. Nothing errors. `psql` shows the rows.
+The gate has never read one. That version had no writer at all before this
+command, so it could not be created without a database console and it could very
+easily not be created at all — which is why creating a tenant without one is not
+something this command can be asked to do.
 
 **Most likely failure — and it is an ugly one.** Skip this step and step 4
 answers **`500 internal`** with an opaque body. The cause is only in the server
@@ -401,6 +463,12 @@ insert or update on table "teams" violates foreign key constraint "teams_tenant_
 
 The API key names a tenant; nothing checks the row exists until a foreign key
 does. If `POST /v1/org` 500s at 2am, this is the first thing to check.
+
+**Second most likely:** `a tenant with this id or slug already exists`. This
+command creates; it does not adopt. If the tenant is already there from an
+earlier run, skip to step 4 — and note that `policy install --tenant` will give
+a tenant that predates this command the active version it is missing, so an old
+deployment is repaired by step 5 rather than by re-running this one.
 
 ### 4. Apply the org chart
 
@@ -437,29 +505,41 @@ Every employee should reach `"lifecycle": "active"`. Until then the gate refuses
 its actions, and an employee the gate refuses everything for is a row, not a
 seat.
 
-### 5. Write the policy layers — **this part is not an HTTP call**
+### 5. Write the role layers — **this part is not an HTTP call**
 
 ```sh
-psql "$DATABASE_URL" -v tenant="'$TENANT'" -f docs/orizn-policy.sql
+for f in docs/orizn-roles/*.json; do
+  agentos-server policy install --tenant $TENANT \
+    --role "$(basename "$f" .json)" "$f"
+done
 ```
 
-Note the doubled quoting: `-v tenant="'$TENANT'"` so the substitution lands as a
-SQL literal.
+The filename is the `role_name`, which is the team slug, which is the role
+pack's name — the one string the top of this document argues should be one
+string.
 
-**There is no endpoint for this, and that is on purpose.** Grep confirms it:
-outside test modules, exactly one function writes a `policy_layers` row —
-`store::policy::install_ceiling`, whose `layer` is the string literal
-`'platform'` inside the SQL text. `store::policy::install`, which *can* write a
-role layer, carries a runtime guard that refuses on any database an operator has
-run `policy install` against; it is fixture support and says so. Two places to
-write a limit is one place to forget to tighten.
+**This used to be `psql`, and it is still not an endpoint.** No route writes a
+`policy_layers` row and none should: `apps/server/src/routes/teams.rs` moves a
+*pointer* at a `role_name` and never a cap, "because two places to write a limit
+is one place to forget to tighten". A route would actually be defensible here —
+these layers belong to a tenant and an API key proves exactly one tenant, and
+the intersection means such a route could not widen anything — but it would make
+that sentence false on the surface an operator reads next, and it would rest on
+"the API key is the operator", which is true only because nothing mints keys.
+`apps/server/src/policy.rs` argues both sides at length.
 
-The file also creates the tenant's **active `policy_versions` row**, which
-nothing else creates either. Role layers hang off that row: the loader's
-predicate is `v.active AND l.layer = 'role' AND v.tenant_id = $1`, so a role
-layer with no active tenant version is invisible.
+**One command per layer, therefore one policy version per layer.** The SQL file
+this replaced was a single transaction: all five layers or none. That is gone,
+and what replaces it is better for the failure that actually happens — a re-run
+is **idempotent** rather than a duplicate-key error, so a loop that died after
+three roles is repaired by running the loop again. Each of the five is separately
+reversible with `policy rollback --tenant $TENANT`, which is what "undo the
+customer-success change" actually means.
 
-**It worked:** `INSERT 0 5`. Then read the layers back:
+**It worked:** five lines saying `installed role layer <name> for tenant … as
+policy version …`. Running the loop twice says `unchanged` five times and writes
+nothing. Then read the layers back — this SQL is a *read*, and a read was never
+the problem:
 
 ```sh
 psql "$DATABASE_URL" -c "select role_name, max_turns_per_day, max_new_contacts_per_day,
@@ -477,17 +557,40 @@ psql "$DATABASE_URL" -c "select role_name, max_turns_per_day, max_new_contacts_p
  sales-development |                30 |                        0 | {email,internal} |
 ```
 
-**Most likely failure:**
+**Most likely failure — and it is the one this whole step exists to prevent:**
 
 ```
-ERROR: duplicate key value violates unique constraint "policy_versions_one_active_idx"
+docs/orizn-roles/growth.json: this document omits spend, allowed_calling_codes,
+denied_domains, …, and an omitted field is not "leave it alone" — the layers
+intersect, so it is DENY.
 ```
 
-You ran it twice. That index permits one active version per tenant, and the file
-is a create rather than an upsert on purpose: silently replacing a company's
-policy version is not something a re-run should do. To change a number, `update`
-the layer — the example is in the file's header — and the gate picks it up on
-the next action, not the next deploy.
+You hand-wrote a layer with only the fields you meant to change. Because the
+layers intersect and there is no inherit marker, everything you left out would
+have been written as *nothing*: no channels, no domains, no spend, no turns. The
+seat would keep answering and would silently have lost the web. Write the whole
+layer — copy what `policy install` printed and edit it.
+
+**Second most likely:**
+
+```
+this role layer is denominated in EUR and this deployment's active policy is
+already in USD: a policy in two currencies cannot be intersected …
+```
+
+`EffectivePolicy::try_new` will not intersect two currencies, so this would have
+refused *every* action the layer touches with `broken_policy` — which reads in
+the logs like a bug in the gate rather than like a typo in a file. It is refused
+before a row is written, in both directions: the ceiling refuses a currency the
+layers below disagree with, and a layer refuses one the ceiling disagrees with.
+
+**Third:** `no tenant … in this database`, naming the uuid and the `new-tenant`
+command that makes one. You skipped step 3, or the uuid in `$TENANT` is not the
+one in your API key.
+
+To change a number, edit the document and install it again — a new version, the
+old one still there, `policy rollback --tenant $TENANT` to undo. The gate picks
+it up on the next action, not the next deploy.
 
 ### 6. Give finance the two rows a spend row does not give it
 
@@ -568,11 +671,60 @@ identity string and the caller composes it, so putting the team's mission in
 front of a new employee is a `format!` at that call site. Until somebody makes
 that call, these five sentences are documentation for humans.
 
-**`POST /v1/org` 500s on a missing tenant row.** Step 3 is the workaround; the
-fix would be a pre-flight check in `apply_org` that answers `400` naming the
-tenant instead of letting a foreign key answer `500` with an opaque body.
+**`POST /v1/org` 500s on a missing tenant row.** Step 3 now creates that row
+with a command instead of a database console, so it is much harder to skip — but
+it is still *possible* to skip, and the symptom is unchanged. The fix would be a
+pre-flight check in `apply_org` that answers `400` naming the tenant instead of
+letting a foreign key answer `500` with an opaque body.
+
+**Five role layers are five policy versions, not one.** Step 5 trades the SQL
+file's "all five or none" for a re-run that is idempotent, which is the better
+trade for the failure that happens — but a loop that dies after three roles does
+leave two functions inheriting the tenant's limits until it is run again, and
+nothing warns you. Re-run the loop; `unchanged` five times is the all-clear.
+
+**`policy rollback --tenant` is a toggle, not a walk.** It moves to the most
+recent version that is not the active one, so rolling back twice returns to
+where you started — the same behaviour as the ceiling's rollback. Undoing three
+changes is not three rollbacks; it is installing the layer you want.
 
 **Nothing here proves the numbers are right.** The test asserts the company
 matches this document. Whether thirty sales turns a day is the right number for
 Orizn is a question that needs a month of running, and the honest answer today is
 that it is the largest number that costs less than a coffee a week.
+
+---
+
+## What stopped being SQL
+
+Three steps of standing this system up were hand-written `psql`, and they were
+the three that decide what every employee may do. Each of them was SQL for the
+same reason: **nothing in the codebase wrote that row.**
+
+| step | was | is |
+|---|---|---|
+| 3. the tenant row | `insert into tenants …` | `agentos-server policy new-tenant orizn Orizn --id $TENANT` |
+| 3. its active `policy_versions` row | a `with version as (insert …)` inside the policy file | the same command — the two rows are one transaction and cannot be separated |
+| 5. the role layers | `psql -v tenant=… -f docs/orizn-policy.sql` | `agentos-server policy install --tenant $TENANT --role <name> <file>`, once per document |
+
+`docs/orizn-policy.sql` is gone. Its five layers are `docs/orizn-roles/*.json`,
+one document per function, each a complete `PolicyLimits` — because an omitted
+field is a denial and the installer refuses a document that has one.
+
+**What is still SQL, and correctly so:**
+
+* the read-back in step 5 and the audit query in step 7. Both *read*. A read
+  cannot silently deny an employee the web, which is the failure this exercise
+  was about.
+* nothing else. There is no write left in this runbook that is not a command.
+
+**What is still not a route, and why.** No endpoint writes a `policy_layers`
+row, before or after this change. The platform ceiling could not be one — it
+belongs to no tenant, and every route derives its tenant from the API key, so a
+platform write authorised by one tenant's key binds every other tenant. The
+tenant, role and employee layers are a genuinely different question: they belong
+to a tenant, and a tenant is exactly what an API key proves, so a route under
+`/v1/policy/…` would be defensible and could not widen anything. It is still not
+what was built, for two reasons that are about this codebase rather than about
+authorisation — `apps/server/src/policy.rs` makes the argument, and
+`apps/server/src/routes/teams.rs` makes the half of it that came first.

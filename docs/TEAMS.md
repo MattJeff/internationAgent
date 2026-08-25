@@ -252,32 +252,62 @@ call $API/v1/teams
 
 The limits live in `policy_layers`, under the `role_name` the team points at, in
 the tenant's **active** `policy_versions` row. There is no endpoint for it, on
-purpose: two places to write a limit is one place to forget to tighten.
+purpose: two places to write a limit is one place to forget to tighten. There is
+a **command**, which runs on the operator's own `DATABASE_URL`:
 
-Today that means SQL (or whatever console owns your policy versions):
-
-```sql
--- Purchasing may spend, and only through the tools it needs.
-INSERT INTO policy_layers
-  (id, version_id, tenant_id, layer, role_name,
-   spend_currency, max_per_transaction_minor, max_per_day_minor, approval_above_minor,
-   allowed_channels, allowed_mcp_tools)
-VALUES
-  (gen_random_uuid(), :active_version, :tenant, 'role', 'purchasing',
-   'USD', 200000, 500000, 100000,
-   '{email,whatsapp}', '{sourcing.rfq_send,sourcing.quote_read}');
-
--- Sales may not spend at all: no spend columns means this layer permits no
--- spending, whatever the tenant allows.
-INSERT INTO policy_layers
-  (id, version_id, tenant_id, layer, role_name, allowed_channels, allowed_mcp_tools)
-VALUES
-  (gen_random_uuid(), :active_version, :tenant, 'role', 'sales',
-   '{email}', '{revenue.contact_create,revenue.opportunity_update}');
+```sh
+agentos-server policy install --tenant $TENANT --role purchasing purchasing.json
 ```
 
-Both numbers are still ceilings, not grants: if the tenant's
-`max_per_day_minor` is `300000`, purchasing gets `300000`.
+`purchasing.json` is a complete layer. Every field, every time — see the warning
+below.
+
+```json
+{
+  "spend": {
+    "max_per_transaction": { "minor": 200000, "currency": "USD" },
+    "max_per_day":         { "minor": 500000, "currency": "USD" },
+    "approval_above":      { "minor": 100000, "currency": "USD" }
+  },
+  "allowed_channels": ["email", "whatsapp"],
+  "allowed_calling_codes": [],
+  "allowed_domains": [],
+  "denied_domains": [],
+  "allowed_mcp_tools": ["sourcing/rfq-send", "sourcing/quote-read"],
+  "allowed_a2a_peers": [],
+  "max_new_contacts_per_day": 15,
+  "max_turns_per_day": 30,
+  "allow_file_upload": false,
+  "allow_credential_change": false,
+  "allow_data_delete": false
+}
+```
+
+A tool is `"server/tool"`, with a slash and slugs on both sides — that is how
+`McpTool` displays and how `store::policy` parses it back. A dot does not parse,
+and a layer with an unparseable tool does not *skip* it: the whole load fails and
+every action for that employee is refused with `broken_policy`.
+
+Sales may not spend at all, which is `"spend": null` — a layer with no spend
+block permits no spending, whatever the tenant allows.
+
+> **Every field, every time.** The layers *intersect*, so there is no "inherit"
+> marker and an omitted field is **deny**, not "leave it alone". A file
+> containing only `{"max_turns_per_day": 30}` looks like an edit and is a total
+> replacement: that role silently loses its channels, its domains, its tools and
+> its spend, and the seat keeps answering. The installer refuses a document that
+> omits a field, naming the ones missing. `[]` and `null` written on purpose are
+> accepted, because "no domains" and "no spend" are things people genuinely mean.
+
+Every number is still a ceiling, not a grant: if the tenant's `max_per_day` is
+`300000`, purchasing gets `300000`. And every install is a **new policy version**
+— re-running the same document says `unchanged` and writes nothing, and
+`agentos-server policy rollback --tenant $TENANT` puts the previous one back.
+
+The tenant and its first policy version come from
+`agentos-server policy new-tenant <slug> <name>`, which writes both in one
+transaction: a tenant with no *active* version has invisible layers, because the
+loader joins on `v.active`.
 
 ## 3. Point a team at a shared role (optional)
 

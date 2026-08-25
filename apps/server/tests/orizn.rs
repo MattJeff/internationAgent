@@ -2,16 +2,24 @@
 //!
 //! The runbook stands a company up in six steps against a real database. This
 //! file runs all six — the real binary, the real migrations, the real
-//! `policy install`, the real `POST /v1/org`, the real SQL — and then asserts
-//! that the company on the other side is the one the document describes.
+//! `policy install`, the real `policy new-tenant`, the real `POST /v1/org` —
+//! and then asserts that the company on the other side is the one the document
+//! describes.
 //!
-//! Three files are the company, and this test reads the *same three files* the
+//! **There is no `psql` left in it, and that is recent.** Three of these steps
+//! used to be hand-written SQL, because no route and no subcommand wrote a
+//! tenant row, a tenant/role/employee `policy_layers` row, or the active
+//! `policy_versions` row the role layers hang off. All three are commands now,
+//! and this file runs them as the operator does.
+//!
+//! The documents are the company, and this test reads the *same documents* the
 //! operator does. Edit `docs/orizn-org.json` and this test changes with it;
-//! edit `docs/orizn-policy.sql` and this test **fails**, because the numbers
-//! are the one thing it keeps its own copy of. That asymmetry is deliberate:
-//! the org chart is a document whose content is its own specification, and the
-//! policy layer is a set of decisions somebody argued for in prose. A test that
-//! re-derived the limits from the SQL would agree with any SQL at all.
+//! edit a file in `docs/orizn-roles/` and this test **fails**, because the
+//! numbers are the one thing it keeps its own copy of. That asymmetry is
+//! deliberate: the org chart is a document whose content is its own
+//! specification, and the policy layer is a set of decisions somebody argued
+//! for in prose. A test that re-derived the limits from the documents would
+//! agree with any documents at all.
 //!
 //! # The two claims that are not "the rows exist"
 //!
@@ -71,8 +79,11 @@ fn docs(file: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// One row of the policy table in `docs/ORIZN.md`, and the whole point of this
-/// file. Changing `docs/orizn-policy.sql` without changing the argument in the
-/// document breaks here.
+/// file. Changing a document in `docs/orizn-roles/` without changing the
+/// argument in `docs/ORIZN.md` breaks here.
+///
+/// The order is the order the layers are installed in, so `role` is also the
+/// basename of the file each one comes from.
 struct Expected {
     /// The team slug, which is also the `role_name` and also the role pack's
     /// name. See the document on why those three are one string.
@@ -272,56 +283,100 @@ impl Orizn {
         panic!("the server never became live");
     }
 
-    /// Step 2: `agentos-server policy install docs/orizn-ceiling.json`, run as
-    /// the operator runs it — the same binary, one argument, `DATABASE_URL` and
-    /// nothing else.
-    fn install_ceiling(&self) {
+    /// One `agentos-server policy …` invocation, run the way the operator runs
+    /// it — the same binary, `DATABASE_URL` and nothing else. Returns stdout.
+    ///
+    /// Every step of the runbook that writes a policy row now goes through
+    /// here. Until these subcommands existed, three of them were `psql`.
+    fn policy(&self, args: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_agentos-server"))
-            .args(["policy", "install"])
-            .arg(docs("orizn-ceiling.json"))
+            .arg("policy")
+            .args(args)
             .env_clear()
             .env("DATABASE_URL", &self.database_url)
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .output()
-            .expect("run policy install");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+            .expect("run agentos-server policy");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(
             output.status.success(),
-            "policy install exited {}: {stdout}{}",
+            "policy {args:?} exited {}: {stdout}{}",
             output.status,
             String::from_utf8_lossy(&output.stderr),
         );
+        stdout
+    }
+
+    /// Step 2: the platform ceiling.
+    fn install_ceiling(&self) {
+        let stdout = self.policy(&["install", &docs("orizn-ceiling.json").display().to_string()]);
         assert!(
             stdout.contains("installed platform ceiling"),
             "the installer has to say what it did: {stdout}"
         );
     }
 
-    /// Step 3: the tenant row, which no route and no subcommand creates.
-    async fn insert_tenant(&self) {
-        let pool = small_pool(&self.database_url).await;
-        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
-            .bind(self.tenant.as_uuid())
-            .bind("orizn")
-            .bind("Orizn")
-            .execute(&pool)
-            .await
-            .expect("insert the tenant the API key speaks for");
-        pool.close().await;
+    /// Step 3: the tenant row **and** the active `policy_versions` row its
+    /// layers hang off — which is the whole reason this is one command. A
+    /// tenant with no active version has invisible layers: the rows exist,
+    /// `psql` shows them, and the loader has never read one.
+    ///
+    /// `--id`, because `AGENTOS_API_KEYS` was written before the server booted
+    /// and the key names this uuid.
+    fn create_tenant(&self) {
+        let stdout = self.policy(&[
+            "new-tenant",
+            "orizn",
+            "Orizn",
+            "--id",
+            &self.tenant.as_uuid().to_string(),
+        ]);
+        assert!(
+            stdout.contains("active policy version"),
+            "the operator has to be told the version exists, because its absence is silent: \
+             {stdout}"
+        );
     }
 
-    /// Step 5: the role layers, from the file the runbook names, with the same
-    /// substitution `psql -v tenant=…` performs.
-    async fn apply_policy(&self) {
-        let path = docs("orizn-policy.sql");
-        let sql = std::fs::read_to_string(&path).expect("read the policy file");
-        let sql = sql.replace(":tenant", &format!("'{}'", self.tenant.as_uuid()));
-        let pool = small_pool(&self.database_url).await;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("apply {}: {e}", path.display()));
-        pool.close().await;
+    /// Step 5: the five role layers, one command each, from the five documents
+    /// the runbook names.
+    ///
+    /// One invocation per layer, and therefore one policy version per layer —
+    /// not one transaction for all five, as the SQL file this replaced was.
+    /// What is lost is "all five or none"; what is gained is that a re-run is
+    /// idempotent rather than a duplicate-key error, so a partial apply is
+    /// repaired by running the loop again. That is the better trade for the
+    /// failure that actually happens.
+    fn install_role_layers(&self) {
+        let tenant = self.tenant.as_uuid().to_string();
+        for expected in EXPECTED {
+            let file = docs(&format!("orizn-roles/{}.json", expected.role));
+            let stdout = self.policy(&[
+                "install",
+                "--tenant",
+                &tenant,
+                "--role",
+                expected.role,
+                &file.display().to_string(),
+            ]);
+            assert!(
+                stdout.contains("installed role layer"),
+                "{}: {stdout}",
+                expected.role
+            );
+        }
+
+        // Re-running the whole set changes nothing and says so, which is what
+        // makes a half-applied company repairable by re-running it.
+        let again = self.policy(&[
+            "install",
+            "--tenant",
+            &tenant,
+            "--role",
+            "finance",
+            &docs("orizn-roles/finance.json").display().to_string(),
+        ]);
+        assert!(again.contains("unchanged"), "{again}");
     }
 
     /// One request. Returns the status and the body parsed as JSON.
@@ -446,7 +501,7 @@ impl Drop for Orizn {
 // Reading the company back
 // ---------------------------------------------------------------------------
 
-/// The columns `docs/orizn-policy.sql` actually writes, in its own order:
+/// The columns `docs/orizn-roles/*.json` actually set, in the store's order:
 /// currency, per-transaction, per-day, approval-above, channels, domains,
 /// contacts, turns. The three allowlists the file leaves empty everywhere are
 /// not read back, because "it stayed `{}`" is asserted by the effective policy
@@ -542,7 +597,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
     assert_eq!(ready["ready"], true, "{ready:#}");
 
     // --- 3, 4. the tenant row, then the org chart ---------------------------
-    server.insert_tenant().await;
+    server.create_tenant();
 
     let document: Value = serde_json::from_str(
         &std::fs::read_to_string(docs("orizn-org.json")).expect("read the org document"),
@@ -631,7 +686,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
     }
 
     // --- 5. the role layers -------------------------------------------------
-    server.apply_policy().await;
+    server.install_role_layers();
 
     let db = Db::connect(&server.database_url).await.expect("connect");
     for expected in EXPECTED {
@@ -783,7 +838,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
 /// which (`INPUT_TOKENS_PER_CALL`) is a measurement from
 /// `crates/eval/src/scoping.rs` and the other of which is the sum of the turn
 /// budgets asserted above. It fails when somebody raises a turn budget in
-/// `docs/orizn-policy.sql` and leaves the cost table in the document saying
+/// `docs/orizn-roles/` and leaves the cost table in the document saying
 /// what the old one cost — which is the drift that actually hurts, because the
 /// number an operator budgets on is the one they do not re-derive.
 #[test]

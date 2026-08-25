@@ -26,6 +26,10 @@
 //! already intersects it with the tenant's. [`set_policy_role`] moves a
 //! *pointer*; there is no endpoint that sets a cap, a channel or an allowlist,
 //! because two places to write a limit is one place to forget to tighten. The
+//! place that *does* write one is `agentos-server policy install --tenant …
+//! --role <name>`, on the operator's own database credential — see
+//! `apps::server::policy` for why a route here would have been defensible on
+//! authorisation grounds and was still not built. The
 //! direct consequence, and the thing to tell an operator once: **a team can only
 //! ever tighten.** The loader takes the minimum of each cap across platform ∧
 //! tenant ∧ role ∧ employee, so a role layer naming a wider number than the

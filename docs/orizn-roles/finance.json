@@ -1,0 +1,30 @@
+{
+  "spend": {
+    "max_per_transaction": {
+      "minor": 50000,
+      "currency": "USD"
+    },
+    "max_per_day": {
+      "minor": 100000,
+      "currency": "USD"
+    },
+    "approval_above": {
+      "minor": 100,
+      "currency": "USD"
+    }
+  },
+  "allowed_channels": [
+    "email",
+    "internal"
+  ],
+  "allowed_calling_codes": [],
+  "allowed_domains": [],
+  "denied_domains": [],
+  "allowed_mcp_tools": [],
+  "allowed_a2a_peers": [],
+  "max_new_contacts_per_day": 5,
+  "max_turns_per_day": 6,
+  "allow_file_upload": false,
+  "allow_credential_change": false,
+  "allow_data_delete": false
+}
