@@ -1,4 +1,4 @@
--- 0016_charter: which role an employee wears, and the objective it was hired
+-- 0018_charter: which role an employee wears, and the objective it was hired
 -- for.
 --
 -- The two role packs (`crates/app/src/rolepack.rs`,

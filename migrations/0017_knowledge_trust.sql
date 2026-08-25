@@ -1,4 +1,4 @@
--- 0016_knowledge_trust: where a knowledge source came from, written down once,
+-- 0017_knowledge_trust: where a knowledge source came from, written down once,
 -- at the only moment anybody knows.
 --
 -- `conversations` and `messages` have carried `trust_label` since 0001. A

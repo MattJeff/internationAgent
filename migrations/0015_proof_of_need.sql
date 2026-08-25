@@ -1,4 +1,4 @@
--- 0013_proof_of_need: every proof-of-need check leaves a row, not only the ones
+-- 0015_proof_of_need: every proof-of-need check leaves a row, not only the ones
 -- that produced evidence.
 --
 -- `crates/app/src/proof_of_need.rs` drives a prospect's own booking flow twice

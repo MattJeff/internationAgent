@@ -1,4 +1,4 @@
--- 0019_initiative: when an employee is allowed to act on its own.
+-- 0020_initiative: when an employee is allowed to act on its own.
 --
 -- Until now a turn happened only because something arrived — an email, an A2A
 -- request, a webhook — and that was the throttle, and a good one: no traffic, no

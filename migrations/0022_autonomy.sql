@@ -1,4 +1,4 @@
--- 0021_autonomy: how much of the work the agents actually did.
+-- 0022_autonomy: how much of the work the agents actually did.
 --
 -- The claim this project will have to defend in public is "the agents did the
 -- work", and the first question anybody asks is "how much did you do

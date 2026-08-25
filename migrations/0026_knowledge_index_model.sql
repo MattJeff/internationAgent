@@ -1,4 +1,4 @@
--- 0023_knowledge_index_model: the vector index names a model this system writes.
+-- 0026_knowledge_index_model: the vector index names a model this system writes.
 --
 -- 0004 created `knowledge_chunks_embedding_hnsw` PARTIAL on
 -- `model = 'text-embedding-3-small'`. Nothing has ever written that string.

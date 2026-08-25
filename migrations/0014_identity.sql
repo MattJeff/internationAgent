@@ -1,4 +1,4 @@
--- 0013_identity: the Ed25519 keypair that makes an employee verifiable to
+-- 0014_identity: the Ed25519 keypair that makes an employee verifiable to
 -- somebody who has never heard of us.
 --
 -- WHY THIS EXISTS. An AI employee sends mail, opens A2A sessions and signs

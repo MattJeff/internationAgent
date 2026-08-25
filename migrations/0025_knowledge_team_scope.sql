@@ -1,4 +1,4 @@
--- 0023_knowledge_team_scope: the middle of "the whole company" and "one agent".
+-- 0025_knowledge_team_scope: the middle of "the whole company" and "one agent".
 --
 -- 0004 gave `knowledge_sources` a nullable `employee_id` and that was the whole
 -- vocabulary: NULL meant every employee of the tenant could retrieve the

@@ -1,4 +1,4 @@
--- 0016_mcp_operator_writes: give the operator a door that is not psql.
+-- 0019_mcp_operator_writes: give the operator a door that is not psql.
 --
 -- 0013_mcp created `mcp_servers` and `mcp_tool_declarations` and then granted
 -- the runtime `select` only, with this reasoning (decision 3): "Operators write
