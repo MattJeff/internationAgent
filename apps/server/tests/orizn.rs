@@ -44,6 +44,8 @@
 //! narrower and nothing else covers it — that the document, the SQL and the
 //! running company agree.
 
+mod common;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::net::TcpListener;
@@ -207,10 +209,11 @@ impl Orizn {
 
         let (base_url, _) = url.rsplit_once('/').expect("DATABASE_URL has a path");
         let admin_url = format!("{base_url}/postgres");
-        let database = format!("orizn_{}", Uuid::now_v7().simple());
+        let database = common::private_name(&url, "orizn");
         let admin = small_pool(&admin_url).await;
         // Interpolated because CREATE DATABASE takes no bind parameters, and
-        // the name is `orizn_` plus the hex of a UUID minted one line above.
+        // the name is `common::private_name`'s — this run's own database name
+        // and two integers, which is also what gets it collected on a ^C.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .execute(&admin)
             .await

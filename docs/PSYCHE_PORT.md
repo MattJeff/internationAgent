@@ -20,16 +20,18 @@ a village simulation, or plainly wrong for a purchasing agent, it says so.
 
 ## What actually shipped
 
-Four modules under `crates/domain/src/psyche/`, and **nothing calls them from
-`crates/app` or `apps/server`.** The only callers anywhere are
-`crates/eval/src/expectation.rs` (an offline harness that is not a dependency of
-the server) and one integration test. `crates/store/src/psyche.rs` likewise has
-no production caller.
+Four modules under `crates/domain/src/psyche/`, all four declared in
+`psyche/mod.rs`, and **the seam exists**: `crates/app/src/psyche.rs` is the
+bridge, `inbound.rs` calls `psyche::observe_reply` on every reply that lands,
+and `vertical.rs` calls `psyche::chase_list` and `psyche::awaiting_reply` on the
+purchasing path. `crates/store/src/psyche.rs` is what those read and write.
 
-So §0's invariant — the psyche never reaches `policy::evaluate` — holds, but it
-holds trivially: **the psyche is library-only today.** It is a fully tested,
-fully deterministic model with no seam into the running system yet. Read the
-rest of this file as the map for building that seam, not as a description of one.
+So §0's invariant — the psyche never reaches `policy::evaluate` — still holds,
+and it no longer holds trivially: it holds because nothing on the gate's path
+asks for a trust score. This section used to say the psyche was library-only
+with no seam into the running system, which was true when it was written. Read
+the rest of this file as the design behind what is there, and check each claim
+against `crates/app/src/psyche.rs` before treating it as a plan.
 
 ### The names, so you are not searching for types that do not exist
 

@@ -38,6 +38,8 @@
 //! the whole company do something. See that test's own header for what it can
 //! and cannot reach.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::TcpListener;
@@ -148,13 +150,15 @@ impl Server {
         // A database of our own, migrated by the server itself on boot.
         let (base_url, _) = url.rsplit_once('/').expect("DATABASE_URL has a path");
         let admin_url = format!("{base_url}/postgres");
-        let database = format!("e2e_{}", Uuid::now_v7().simple());
+        let database = common::private_name(&url, "e2e");
         let admin = sqlx::PgPool::connect(&admin_url)
             .await
             .expect("connect to postgres");
         // `CREATE DATABASE` takes no bind parameters, so the name is
-        // interpolated — and it is `e2e_` plus the hex of a UUID this function
-        // just minted, which is the audit `AssertSqlSafe` asks for.
+        // interpolated — and it is `common::private_name`'s, which is this
+        // run's own database name and two integers. That is the audit
+        // `AssertSqlSafe` asks for, and it is also what makes the database go
+        // away: see that module for what a name of our own choosing cost.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .execute(&admin)
             .await

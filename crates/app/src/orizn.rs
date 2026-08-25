@@ -655,8 +655,9 @@ mod tests {
     ///
     /// Behind `live-orizn` and **not** a runtime `ORIZN_LIVE` check, which is
     /// what this was first written as. `scripts/test.sh` fails the build on a
-    /// printed `SKIP:` — deliberately, because ~34 tests here skip themselves
-    /// without a database and a green run of nothing is the failure mode nobody
+    /// printed `SKIP:` — deliberately, because dozens of fixtures here skip
+    /// themselves without a database (`grep -rn 'SKIP: ' crates apps` for how
+    /// many today) and a green run of nothing is the failure mode nobody
     /// notices — and a test needing `npx` and the open internet cannot satisfy
     /// that guard by being satisfiable. So it is *absent* from a default run
     /// rather than present and quietly passing, which is the same choice

@@ -215,9 +215,10 @@ to a real Postgres and cargo runs each package's test binary in parallel; some
 tests are cross-tenant by nature — the outbox poller reads every tenant's rows,
 which is its job — so two packages sharing one database fail for reasons that
 have nothing to do with the code. The script gives each package its own
-database, and it refuses to finish if any test skipped itself: roughly three
-dozen tests here opt out silently when they cannot reach a database, which makes
-a run green and empty, the one failure mode nobody notices.
+database, and it refuses to finish if any test skipped itself: dozens of
+fixtures here opt out silently when they cannot reach a database
+(`grep -rn 'SKIP: ' crates apps`), which makes a run green and empty, the one
+failure mode nobody notices.
 
 Run one at a time, and do not run `cargo` in another shell while it runs. Both
 share `target/`, cargo serialises on that lock, and a build that loses the race
@@ -237,9 +238,16 @@ Ports are offset (Postgres `5442`, API `8090` if you set `APP_BIND` — the
 built-in default is `8080`) so the stack does not collide with other projects on
 the same machine.
 
-**There is no endpoint that creates a tenant.** `AGENTOS_API_KEYS` names a
-tenant uuid and `employees.tenant_id` has a foreign key to it, so insert that
-row with `psql` before the first hire. `docs/OPERATIONS.md` §1 is the full
+**There is no endpoint that creates a tenant** — deliberately: the credential
+that would authorise the call is the one that names the tenant that does not
+exist yet. There is a *command*, on the operator's own database credentials:
+
+```bash
+agentos-server policy new-tenant acme Acme --id <the uuid in your API key>
+```
+
+Skip it and the first write answers `400 unknown_tenant` naming what is missing,
+rather than the `500` it used to. `docs/OPERATIONS.md` §1.4 is the full
 first-run path.
 
 **And a fresh database has no policy ceiling**, which means the gate denies
@@ -304,14 +312,18 @@ Still fake regardless of any credential, and named as such on every boot: the
 right thing) and the **employee secret vault** (an in-process plaintext map that
 forgets on restart — not the envelope cipher above, which is real).
 
-**The Policy Gate is loaded with `PolicyBook::default()`** — the empty platform
-layer, which grants nothing. An unconfigured gate denying everything is correct
-behaviour for an unconfigured gate, but it means the four-layer loader in
-`agentos_store::policy`, every team's limits and every team budget currently
-have **no reader on the hot path**. The gate reserves against the employee's
-spend caps only; `org::reserve` — the one that takes the team ceiling under a row
-lock — has no production call site. Wiring both is a change in `main.rs` and one
-function, and it is the highest-value change in the repository.
+**The Policy Gate reads the four layers out of Postgres on every decision.**
+`main.rs` builds it as `PolicyGate::new(db)` and `gate.rs` calls
+`store::policy::load(tx, employee_id)` — platform ∧ tenant ∧ role ∧ employee,
+intersected, minimum of each cap — so a team's limits have a reader on the hot
+path and `org::reserve` takes the team ceiling under a row lock on the payment
+path. This paragraph said the opposite for several waves after it stopped being
+true, and it was the most expensive stale sentence in the file: it told every
+reader that the security model was decorative.
+
+What is still true is the consequence of an **unconfigured** gate: with no
+platform ceiling installed it denies everything, which is correct behaviour and
+is what `/readyz`'s `no_platform_policy` is telling you.
 
 Email, telephony, browser and the secret store each ship a shared contract
 suite, and the real adapters now run it — Resend, Twilio and Browserbase each
@@ -330,9 +342,21 @@ API auth stack, so the listener must not be publicly routable — but
 `agentos_llm_tokens_total` reads zero on every deployment, because nothing in
 production calls `metrics::record_llm_usage` yet.
 
-**908 test functions.** `cargo clippy --workspace --all-targets -- -D warnings`
-is clean and CI runs it, the suite, a migration replay against a virgin
-database, and a check that the doctor exits non-zero when nothing is configured.
+**How many tests there are is a command, not a line in this file.**
+
+```bash
+grep -rE '^\s*#\[(tokio::)?test\b' --include='*.rs' crates apps | wc -l
+```
+
+A number here was wrong within a week of being written — it said 908 for long
+enough to be off by a quarter — and nothing in the build could notice, which is
+the same defect as every other stale sentence in this repository. Where a claim
+*can* be checked mechanically, it is: `crates/app/tests/scoped_deletes.rs`,
+`crates/app/tests/migration_headers.rs`.
+
+`cargo clippy --workspace --all-targets -- -D warnings` is clean and CI runs it,
+the suite, a migration replay against a virgin database, and a check that the
+doctor exits non-zero when nothing is configured.
 
 `SPEC.md` is the long-form specification, and it now tags every claim as built,
 **NOT WIRED** (written but with no production call site) or **NOT BUILT** (a

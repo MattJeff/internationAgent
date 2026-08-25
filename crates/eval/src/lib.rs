@@ -1,6 +1,6 @@
 //! Evaluation: does the employee do good work?
 //!
-//! 861 tests in this workspace prove the code is correct. None of them ask
+//! The suite in this workspace proves the code is correct. None of it asks
 //! whether `rank` orders quotes the way a buyer would, whether the psyche
 //! predicts better than the brochure, or how many true findings the
 //! proof-of-need bar throws away. This crate asks those four questions and

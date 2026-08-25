@@ -55,7 +55,7 @@
 //!   a deployment with more than one employee answers 400 rather than guessing.
 //! * **The tenant is derived from the employee, never from the request.** The
 //!   handler resolves employee → tenant, then opens `tenant_tx` for *that*
-//!   tenant, and the RLS policy in `0013_identity.sql` makes every other
+//!   tenant, and the RLS policy in `0014_identity.sql` makes every other
 //!   tenant's rows invisible for the life of the transaction. A caller cannot
 //!   name a tenant, so a caller cannot widen the document.
 //!

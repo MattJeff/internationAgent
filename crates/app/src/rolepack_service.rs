@@ -30,11 +30,11 @@
 //! # Why four packs share one module and one struct
 //!
 //! [`crate::rolepack`] and [`crate::rolepack_sales`] each declare their own
-//! `RolePack` — five fields and eight accessors, written twice. Writing them a
-//! third, fourth, fifth and sixth time is how a codebase ends up with six copies
-//! of one bug, and there is nothing to copy them *for*: the struct is the same
-//! five fields for every role that has ever existed here, and what actually
-//! differs between roles is the values. What differs per role is the
+//! `RolePack`, field for field, written twice. Writing it a third, fourth,
+//! fifth and sixth time is how a codebase ends up with six copies of one bug,
+//! and there is nothing to copy it *for*: the struct is the same for every role
+//! that has ever existed here, and what actually differs between roles is the
+//! values. What differs per role is the
 //! *objective*, and that is why these four keep separate types.
 //!
 //! # What these four have in common, and it is the interesting part
@@ -2005,7 +2005,10 @@ mod tests {
     /// `turn::catalogue` is pack-aware now, so `proposable` is read where it
     /// said it was read: a customer success employee is *never shown* `pay`
     /// rather than being shown it and refused by the gate. This is the table
-    /// over all five packs and both trust labels, in one place, for the same
+    /// over every pack in the workspace and both trust labels — the row count
+    /// is `every_pack().len() + RolePack::all().len()` and the assertion at the
+    /// bottom says so, because the sentence that used to carry the number here
+    /// said five while the table had six — in one place, for the same
     /// reason `no_pack_proposes_a_high_risk_action_it_has_no_business_with` is:
     /// a claim about the workspace has to be checked against the workspace.
     ///

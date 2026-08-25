@@ -93,10 +93,10 @@ fn no_delete_reaches_a_whole_table() {
 ///  WHERE column_name = 'tenant_id' AND is_nullable = 'YES';
 /// ```
 ///
-/// Out of fifty-five tables the answer is `policy_versions` and `policy_layers`
-/// — the platform ceiling, `tenant_id IS NULL`, one row for the whole database.
-/// (The four views the query also returns are views; `information_schema` calls
-/// every view column nullable.) Every other collision in this workspace is a
+/// Out of every table in this schema the answer is two — `policy_versions` and
+/// `policy_layers`, the platform ceiling, `tenant_id IS NULL`, one row for the
+/// whole database. (The query also returns the views; `information_schema`
+/// calls every view column nullable.) Every other collision in this workspace is a
 /// name two tests both chose. This one is a row they cannot help but share.
 ///
 /// `store::policy`'s tests are about that row, and until they took a database of
@@ -135,11 +135,13 @@ fn no_delete_reaches_a_whole_table() {
 /// `CREATE DATABASE`. That is a deliberately low bar, the same one
 /// [`no_delete_reaches_a_whole_table`] sets by accepting any `WHERE` — the point
 /// is not to prove the handle is private, it is to make writing the global row
-/// out of the shared pool something you cannot do without noticing. There are
-/// six hand-rolled private databases in this workspace already
-/// (`crates/store/src/db.rs`, `apps/server/src/loops/mod.rs`,
-/// `crates/app/src/gate.rs`, `apps/server/src/main.rs`, and inline in
-/// `apps/server/tests/{end_to_end,orizn}.rs`); a seventh is twenty lines.
+/// out of the shared pool something you cannot do without noticing. The
+/// workspace already hands them out from four places — `crates/store/src/db.rs`
+/// and `apps/server/src/loops/mod.rs` (`private_db`), `crates/app/src/gate.rs`,
+/// `apps/server/src/main.rs` (`own_database`) — plus
+/// `apps/server/tests/common/mod.rs`, which the three server harnesses share
+/// for the *name*. The next one is twenty lines, and the name has to come from
+/// `DATABASE_URL` or `scripts/test.sh` will never collect it.
 ///
 /// # If this fails on something that is genuinely fine
 ///

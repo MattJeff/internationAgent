@@ -57,8 +57,9 @@
 //!   "requested_by": "…", "required_role": "…" }
 //! ```
 //!
-//! ponytail: envelope-in-jsonb instead of four real columns. Promote them in
-//! `0002_approvals.sql` when someone needs to index or report on them. The one
+//! ponytail: envelope-in-jsonb instead of four real columns. `approvals` is
+//! `0001_core.sql`'s; promote them in a migration of their own when someone
+//! needs to index or report on them. The one
 //! thing lost is the brief's `UNIQUE` on `nonce`; it is not load-bearing here,
 //! because [`redeem`] matches on `id AND nonce` together — a nonce is only ever
 //! usable against the approval it was minted for, so a (vanishingly unlikely)

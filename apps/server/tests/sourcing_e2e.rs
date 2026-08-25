@@ -43,16 +43,18 @@
 //! bridge is written — no way to give an employee a role, and a `quotes` table
 //! that cannot hold two currencies against one RFQ.
 //!
-//! And one that is not a seam but an absence: `crates/domain/src/psyche/mod.rs`
-//! declares `pub mod links;` and nothing else, so `beliefs.rs`,
-//! `expectation.rs` and `forgetting.rs` — 2 679 lines, their own test modules
-//! included — are **not in the build**. `BeliefJournal::why()` cannot be called
-//! from here because it does not exist in the compiled crate. What this test
-//! asserts instead is the durable half of the same claim, through
+//! What this test asserts about the psyche is the **durable** half, through
 //! `store::psyche`: a belief that names the episodes it was founded on, and a
 //! `store::sourcing` reputation that tells the supplier who answered from the
-//! one who did not. Add the three `pub mod` lines and the domain half can be
-//! asserted here too.
+//! one who did not. That is deliberate and no longer a workaround — this line
+//! used to say `crates/domain/src/psyche/mod.rs` declares `pub mod links;` and
+//! nothing else, so `beliefs.rs`, `expectation.rs` and `forgetting.rs` are not
+//! in the build, and it has not been true since all four were declared. The
+//! in-memory half has its own suite next to the code it is about; what an
+//! end-to-end test can add is that the rows survive the round trip, which is
+//! the half a unit test cannot reach.
+
+mod common;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -278,10 +280,11 @@ impl Server {
 
         let (base_url, _) = url.rsplit_once('/').expect("DATABASE_URL has a path");
         let admin_url = format!("{base_url}/postgres");
-        let database = format!("srcg_{}", Uuid::now_v7().simple());
+        let database = common::private_name(&url, "srcg");
         let admin = small_pool(&admin_url).await;
         // Interpolated because CREATE DATABASE takes no bind parameters, and
-        // the name is `srcg_` plus the hex of a UUID minted one line above.
+        // the name is `common::private_name`'s — this run's own database name
+        // and two integers, which is also what gets it collected on a ^C.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .execute(&admin)
             .await

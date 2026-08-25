@@ -20,7 +20,7 @@
 //!
 //! The first is arithmetic, and [`crate::turn`] already wrote it down: a tool
 //! catalogue past roughly seventy entries is a model picking the almost-right
-//! one, and `catalogue` is a fixed-size array precisely so that a fourth entry
+//! one, and `catalogue` is a fixed-size array precisely so that another entry
 //! has to be argued for. Purchasing alone is six stages; sales is six more.
 //! Verticalising them is twelve tool schemas for two roles, and the next two
 //! roles are twelve more.
@@ -43,7 +43,7 @@
 //! pack's plan decides that an RFQ is the next step, and the operation runs as a
 //! sequence of individually-authorised effects. The gate rules on each email,
 //! which is where the money and the blast radius are, and the tool catalogue
-//! stays at three.
+//! does not grow.
 //!
 //! What (ii) gives up is that the *model* cannot ask for a vertical operation.
 //! That is the point. The model does the language — the RFQ's prose, the
@@ -188,9 +188,10 @@ impl CharterError {
 /// given.
 ///
 /// This is the value the whole module turns into work, and it is deliberately a
-/// closed enum rather than a trait. A role is data — three sets, a
-/// [`PolicyLimits`](agentos_domain::policy::PolicyLimits) and a `&'static str`,
-/// see [`crate::rolepack`] — and the packs have no shared supertype because
+/// closed enum rather than a trait. A role is data — a set of proposable
+/// actions, a [`PolicyLimits`](agentos_domain::policy::PolicyLimits) and the
+/// two strings that name and brief it, see [`crate::rolepack`] — and the packs
+/// have no shared supertype because
 /// their objectives and their [`Stage`](crate::rolepack::Stage) sequences are
 /// genuinely different. A trait here would be one method per pack with a
 /// different return type, which is a match written badly.
@@ -293,8 +294,8 @@ impl Charter {
     ///
     /// The `match` below is the join over the two `RolePack` types, and it is
     /// the same match [`Charter::briefing`] already does — the charter is the
-    /// only value in the workspace that knows which of the five roles an
-    /// employee holds, so it is the only place that can answer "what may this
+    /// only value in the workspace that knows which role an employee holds, so
+    /// it is the only place that can answer "what may this
     /// employee propose" without a trait existing purely to be asked. What
     /// crosses into [`SystemPrompt`] is the set, not the pack: `proposable` is
     /// every field of a pack the tool catalogue has any use for.
@@ -1702,8 +1703,33 @@ async fn open_the_round(
 ///
 /// So "we approached a prospect about a finding we could not reproduce" is not a
 /// review item on this path. It is a program that does not compile.
+///
+/// # And a claim that *was* reproducible, once
+///
+/// The second field is the instant the finding is known good as of, and it is
+/// here because the bar has a second half that a type alone could not hold: an
+/// `Approach` is a value, values keep, and [`follow_up`] takes one. A server
+/// runs for weeks. Nothing stopped it re-sending a three-day-old sentence about
+/// a rule that changed on the second day — and the sentence names a date and
+/// says "here is how to see it again", so a prospect who follows the steps and
+/// sees something else has been told, in writing, a thing that is not true
+/// about their own product. That is the one mistake in this job that cannot be
+/// walked back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Approach(crate::revenue::Outreach);
+pub struct Approach {
+    message: crate::revenue::Outreach,
+    /// [`Answer::retrieved_at`](crate::proof_of_need::Answer), copied off the
+    /// evidence, so [`follow_up`] can apply `MAX_TRUTH_AGE` to a claim it is
+    /// about to re-assert.
+    ///
+    /// The authority's instant and not [`Evidence::observed_at`], deliberately:
+    /// `Prober::run` measures the bar from `retrieved_at`, so this is literally
+    /// the predicate the first send passed, re-run. `observed_at` is always the
+    /// later of the two — it is `now` at check time — so measuring from it
+    /// would give a finding built on an answer that was already twenty-three
+    /// hours old another full day, and the bar would silently mean forty-seven.
+    known_good_at: DateTime<Utc>,
+}
 
 impl Approach {
     /// Render the approach from a reproduced finding.
@@ -1726,22 +1752,37 @@ impl Approach {
             .map(|(n, step)| format!("{}. {step}", n + 1))
             .collect();
 
-        Self(crate::revenue::Outreach {
-            subject: format!(
-                "{}: what your entry-requirements step shows for {} → {}",
-                evidence.prospect, evidence.probe.passport, evidence.probe.destination
-            ),
-            body: format!(
-                "{}\n\nHow to see it again:\n{}\n\n{opt_out}",
-                evidence.claim_line(),
-                steps.join("\n"),
-            ),
-        })
+        Self {
+            message: crate::revenue::Outreach {
+                subject: format!(
+                    "{}: what your entry-requirements step shows for {} → {}",
+                    evidence.prospect, evidence.probe.passport, evidence.probe.destination
+                ),
+                body: format!(
+                    "{}\n\nHow to see it again:\n{}\n\n{opt_out}",
+                    evidence.claim_line(),
+                    steps.join("\n"),
+                ),
+            },
+            known_good_at: evidence.authority.retrieved_at,
+        }
     }
 
     /// The message, for [`Seller::touch`](crate::revenue::Seller::touch).
     pub const fn message(&self) -> &crate::revenue::Outreach {
-        &self.0
+        &self.message
+    }
+
+    /// Whether this claim is still inside [`MAX_TRUTH_AGE`] at `now`.
+    ///
+    /// The same predicate `Prober::run` applies before it loads a page, on the
+    /// same field, so "may I say this?" has one answer and one line that
+    /// decides it. The negative branch — a clock that has gone backwards —
+    /// refuses too, for the reason it does over there: an age we cannot compute
+    /// is not an age inside the bar.
+    fn still_true(&self, now: DateTime<Utc>) -> bool {
+        let age = now.signed_duration_since(self.known_good_at);
+        age <= crate::proof_of_need::MAX_TRUTH_AGE && age >= chrono::TimeDelta::zero()
     }
 }
 
@@ -1907,16 +1948,67 @@ pub async fn sell(
 /// rather than going out.
 ///
 /// It takes an [`Approach`], so a follow-up is subject to exactly the same
-/// evidence bar as the first touch.
+/// evidence bar as the first touch — **including the half of it that is a
+/// clock**.
+///
+/// # Why this returns a `Result`
+///
+/// Because the interesting answer is the refusal. An `Approach` is a value and
+/// values keep: this function's whole reason to exist is that the second touch
+/// happens later than the first, and `Sequence::due` meters that spacing in
+/// days. `MAX_TRUTH_AGE` is twenty-four hours. So the ordinary shape of a
+/// follow-up — chase them on Thursday about what you found on Monday — is
+/// exactly the shape of re-asserting a finding whose authority expired on
+/// Tuesday, and nothing here could notice, because [`Approach::new`]
+/// deliberately drops the `Evidence` on the floor.
+///
+/// What that costs is not an embarrassment. The message names a date and then
+/// says *"How to see it again"*, step by step. A prospect who follows those
+/// steps and sees something else has been sent, in writing, a false statement
+/// about their own product — the one mistake in this job that cannot be walked
+/// back, and the reason the evidence bar is a type in the first place.
+///
+/// [`Checked::TruthStale`](crate::proof_of_need::Checked::TruthStale) rather
+/// than a `bool` or a variant of this module's own: it is the same refusal
+/// `Prober::run` makes on the same field, and [`sell`] already renders it as
+/// `Sold::NoFinding(Checked::TruthStale)`. A caller holding a stale approach
+/// has one correct move, and it is the expensive one on purpose — run the probe
+/// again. There is no `force`.
+///
+/// # The alternative, and why not
+///
+/// The other way to close this is `follow_up(&Evidence, …)`, and it looks
+/// stronger: the freshness would come from the same value the claim does, with
+/// nothing copied. It does not survive contact with what an `Evidence` is. It
+/// carries a screenshot, an `Untrusted<String>` of the prospect's page, and a
+/// private seal that exists precisely so nothing outside `proof_of_need` can
+/// construct one — so every caller that wants to chase three people on Thursday
+/// would have to hold megabytes of PNG since Monday, and a `Sequence` loaded out
+/// of `contacts_due_for_follow_up` could never be paired with one at all. A bar
+/// that can only be met by never restarting the process is not a bar. Copying
+/// one `DateTime` off the evidence at construction is what makes the check
+/// available where the send is.
 pub async fn follow_up(
     seller: &Seller,
     sequences: &mut [Sequence],
     approach: &Approach,
     now: DateTime<Utc>,
-) -> Vec<crate::revenue::Contacted> {
-    seller
+) -> Result<Vec<crate::revenue::Contacted>, Checked> {
+    if !approach.still_true(now) {
+        // One low-cardinality label, like `Prober::check`'s. Nobody is touched,
+        // so no `Sequence` advances and the addresses stay due — re-probe and
+        // the campaign picks up where it stopped.
+        tracing::warn!(
+            reason = Checked::TruthStale.code(),
+            recipients = sequences.len(),
+            "follow-up refused: the finding is older than the authority behind it"
+        );
+        return Err(Checked::TruthStale);
+    }
+
+    Ok(seller
         .campaign(sequences, approach.message(), TrustLabel::Untrusted, now)
-        .await
+        .await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3798,6 +3890,106 @@ mod tests {
             !approach.message().body.contains("evaluation"),
             "a string off the MCP wire reached a prospect: {}",
             approach.message().body
+        );
+    }
+
+    /// **A finding stops being sayable at the same moment it stopped being
+    /// checkable.**
+    ///
+    /// The same `Approach`, the same colleagues, twice: inside `MAX_TRUTH_AGE`
+    /// it goes out, and three days later — which is what `next_follow_up_at`
+    /// puts on a contact — it does not. The gap between those two calls is the
+    /// entire bug: `Approach::new` drops the `Evidence`, so before
+    /// `known_good_at` there was nothing left in the value that could tell the
+    /// difference, and the second call sent a dated claim with reproduction
+    /// steps for a rule that may have changed on the second day.
+    ///
+    /// The refusal is asserted to cost nothing as well as to happen: no send,
+    /// and no `Sequence` advanced. A follow-up that burned the touch on its way
+    /// to refusing would make re-probing pointless, because the addresses would
+    /// no longer be due.
+    #[tokio::test]
+    async fn a_follow_up_re_checks_the_clock_the_first_touch_passed() {
+        let Some(db) = db().await else { return };
+        let now = at(2026, 8, 23);
+        let desk = sales_desk(
+            &db,
+            &[&format!("No visa required for this trip. {INJECTION}")],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+
+        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
+        let mut first = Sequence::new(address("head.of.digital@airline.example"));
+        let sold = sell(
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &pack,
+            &sales_objective_value(),
+            Prospect {
+                flow: &flow(),
+                probe: &probe(),
+                sequence: &mut first,
+            },
+            "Reply STOP and I will not write again.",
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+        let Sold::Approached { evidence, .. } = sold else {
+            panic!("a reproducible contradiction should have been sent: {sold:?}");
+        };
+        let approach = Approach::new(&evidence, "Reply STOP and I will not write again.");
+        assert_eq!(desk.email.sent_count(), 1);
+
+        // The rest of the account: the product owner's lead, and whoever
+        // answered last time. Fresh sequences, so nothing but the clock is
+        // deciding.
+        let mut colleagues = [
+            Sequence::new(address("cto@airline.example")),
+            Sequence::new(address("ecom.lead@airline.example")),
+        ];
+
+        let sent = follow_up(&desk.seller, &mut colleagues, &approach, now)
+            .await
+            .expect("the finding is hours old; there is nothing to refuse");
+        assert!(
+            sent.iter().all(Contacted::is_sent),
+            "a fresh finding must still reach the account: {sent:?}"
+        );
+        assert_eq!(desk.email.sent_count(), 3);
+
+        // Thursday, about what we found on Monday. `MAX_TRUTH_AGE` is 24 hours
+        // and `Sequence::due` meters in days, so this is the ordinary shape of
+        // a follow-up, not a corner of one.
+        let mut later = [
+            Sequence::new(address("coo@airline.example")),
+            Sequence::new(address("head.of.product@airline.example")),
+        ];
+        let refused = follow_up(
+            &desk.seller,
+            &mut later,
+            &approach,
+            now + TimeDelta::days(3),
+        )
+        .await
+        .expect_err("a three-day-old claim is a claim nobody re-checked");
+        assert!(
+            matches!(refused, Checked::TruthStale),
+            "the refusal has to be the one `Prober::run` makes, on the same \
+             field, or there are two answers to 'may I say this': {refused:?}"
+        );
+        assert_eq!(
+            desk.email.sent_count(),
+            3,
+            "a stale finding reached a prospect"
+        );
+        assert!(
+            later.iter().all(|s| s.touches().is_empty()),
+            "the refusal spent the touches it refused to make, so re-probing \
+             would find nobody due"
         );
     }
 

@@ -9,8 +9,16 @@
 //! policies in `0001_core.sql` apply.
 //!
 //! The escape hatch is [`Db::admin_tx_bypassing_rls`], named so that it cannot
-//! appear in a diff without someone noticing. Two callers legitimately need it:
-//! migrations, and the outbox poller, which is cross-tenant by nature.
+//! appear in a diff without someone noticing. What legitimately needs it is a
+//! *shape*, not a list: a loop that is cross-tenant by definition — outbox,
+//! inbound, initiative, provisioning, the MCP binder, `/metrics` — a read of
+//! the platform policy row, which belongs to no tenant, and the A2A ingress,
+//! which has to resolve a tenant *from* the request it is authenticating.
+//! `grep -rn admin_tx_bypassing_rls` is the current list; a number here is not,
+//! and the one that used to be here said "two callers: migrations, and the
+//! outbox poller" while there were seventeen — and migrations was never one of
+//! them, because [`Db::migrate`] runs the migrator against the pool and opens
+//! no transaction at all.
 
 use std::ops::{Deref, DerefMut};
 
@@ -25,6 +33,36 @@ const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 /// Postgres SQLSTATE for `deadlock_detected`; retryable on exactly the same
 /// terms as a serialization failure, so it maps to the same variant.
 const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
+/// Postgres SQLSTATE for `foreign_key_violation`. Only one of these is
+/// classified — see [`TENANT_FK_SUFFIX`]; the rest stay [`StoreError::Database`]
+/// because every other foreign key in this schema is checked by the handler
+/// that owns it before the write, and one arriving here is a real bug.
+const SQLSTATE_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// The tail every foreign key pointing at `tenants` carries.
+///
+/// Fifty of them, and Postgres named all fifty: the columns are declared
+/// `tenant_id uuid not null references tenants (id)`, so the default
+/// `<table>_<column>_fkey` applies without exception. Asked of the schema
+/// rather than trusted:
+///
+/// ```sql
+/// SELECT count(*) FROM pg_constraint
+///  WHERE contype = 'f' AND confrelid = 'tenants'::regclass;                       -- 50
+/// SELECT conname FROM pg_constraint
+///  WHERE contype = 'f' AND confrelid = 'tenants'::regclass
+///    AND conname NOT LIKE '%\_tenant\_id\_fkey';                                  -- none
+/// SELECT conname FROM pg_constraint
+///  WHERE contype = 'f' AND confrelid <> 'tenants'::regclass
+///    AND conname LIKE '%\_tenant\_id\_fkey';                                      -- none
+/// ```
+///
+/// The suffix is therefore exactly the set of "this row names a tenant that is
+/// not there", with no false positives to inherit. A migration that names one
+/// of these by hand takes that away, which is what
+/// [`every_tenant_foreign_key_is_named_the_way_this_classifier_expects`](tests::every_tenant_foreign_key_is_named_the_way_this_classifier_expects)
+/// is for.
+const TENANT_FK_SUFFIX: &str = "_tenant_id_fkey";
 
 /// Everything this crate can fail with.
 ///
@@ -53,6 +91,24 @@ pub enum StoreError {
     /// The transaction was aborted by Postgres and may succeed if retried.
     #[error("serialization failure; retry the transaction")]
     Serialization,
+
+    /// **The tenant every row in this transaction belongs to has no row of its
+    /// own.** The string names the table whose foreign key said so.
+    ///
+    /// This is not a caller's mistake and it is not a bug; it is the first-run
+    /// step nobody did. `AGENTOS_API_KEYS` names a tenant uuid, there is no
+    /// endpoint that creates a tenant — deliberately, see `README.md` — and
+    /// until somebody inserts that row by hand every write in the product fails
+    /// on one of fifty foreign keys.
+    ///
+    /// Its own variant because of what it used to cost: the driver error landed
+    /// in [`Self::Database`], came out of the HTTP surface as `500 internal`,
+    /// and the only trace of the actual cause was a `foreign key constraint`
+    /// line in the server log. An operator reading a 500 has no reason to look
+    /// at their `AGENTOS_API_KEYS` — a 500 says *we* broke — so the first hour
+    /// goes on the wrong half of the system.
+    #[error("no tenants row for this transaction's tenant ({0} refused the write)")]
+    UnknownTenant(String),
 
     /// Anything else the driver reported.
     #[error(transparent)]
@@ -86,6 +142,24 @@ impl From<sqlx::Error> for StoreError {
                         .to_owned(),
                 ),
                 SQLSTATE_SERIALIZATION_FAILURE | SQLSTATE_DEADLOCK_DETECTED => Self::Serialization,
+                // Only the tenants key, and only by name. A foreign key on
+                // `employees` or `teams` failing means a handler skipped the
+                // check it owns, and flattening that into the same answer would
+                // tell an operator to go and create a tenant that is already
+                // there.
+                SQLSTATE_FOREIGN_KEY_VIOLATION
+                    if err
+                        .as_database_error()
+                        .and_then(|e| e.constraint())
+                        .is_some_and(|name| name.ends_with(TENANT_FK_SUFFIX)) =>
+                {
+                    Self::UnknownTenant(
+                        err.as_database_error()
+                            .and_then(|e| e.constraint())
+                            .unwrap_or(TENANT_FK_SUFFIX)
+                            .to_owned(),
+                    )
+                }
                 _ => Self::Database(err),
             },
             _ => Self::Database(err),
@@ -98,6 +172,20 @@ impl From<sqlx::migrate::MigrateError> for StoreError {
         Self::Database(sqlx::Error::from(err))
     }
 }
+
+/// Every migration this build carries.
+///
+/// A `static` rather than the macro spelled inline in [`Db::migrate`], so
+/// [`the_compiled_migrator_matches_the_directory`](tests::the_compiled_migrator_matches_the_directory)
+/// is asserting about the object that actually runs and not about a second
+/// expansion that happens to agree. `apps/server`'s `doctor` keeps its own for
+/// the same reason.
+///
+/// Path is relative to this crate's manifest; the migrations live at the
+/// workspace root so every binary in the workspace shares one history. Adding a
+/// file there re-expands this only because `build.rs` says so — read it before
+/// deleting it.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// A handle to the database. Cheap to clone; clones share one pool.
 #[derive(Clone, Debug)]
@@ -124,9 +212,7 @@ impl Db {
     /// tables. Safe to call on every boot; sqlx takes an advisory lock, so
     /// concurrent instances serialise instead of racing.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        // Path is relative to this crate's manifest; the migrations live at the
-        // workspace root so every binary in the workspace shares one history.
-        sqlx::migrate!("../../migrations").run(&self.pool).await?;
+        MIGRATOR.run(&self.pool).await?;
         Ok(())
     }
 
@@ -260,9 +346,12 @@ impl DerefMut for TenantTx<'_> {
 ///
 /// `<the database in DATABASE_URL>_<suffix>`, which is what makes the cleanup in
 /// `scripts/test.sh` work: it drops every database whose name starts with this
-/// run's, so these go with it. A fixed prefix would not be collected, and
-/// `apps/server`'s three copies of this idea (`readyz_*`, `e2e_*`, `orizn_*`)
-/// leak on a ^C for exactly that reason.
+/// run's, so these go with it. A fixed prefix would not be collected — and for a
+/// long time four harnesses in `apps/server` used one (`readyz_*`, `e2e_*`,
+/// `orizn_*`, `srcg_*`), so every interrupted run left a migrated database per
+/// test behind and nothing on the machine ever came for them. They derive from
+/// `DATABASE_URL` now, through `own_database` and `tests/common/mod.rs`. **This
+/// is the rule to copy; the twenty lines below are not the interesting part.**
 ///
 /// # Why a copy
 ///
@@ -346,6 +435,175 @@ mod tests {
         let db = Db::connect(&url).await.expect("connect");
         db.migrate().await.expect("migrate");
         Some(db)
+    }
+
+    /// **A write against a tenant that has no row is not a driver error.**
+    ///
+    /// The whole first-run sequence in one test: `AGENTOS_API_KEYS` names a
+    /// tenant uuid, nobody inserted the row, and the first thing the product
+    /// writes lands on one of fifty foreign keys. That used to arrive as
+    /// [`StoreError::Database`] and leave the HTTP surface as `500 internal`
+    /// with the cause only in the log.
+    #[tokio::test]
+    async fn a_write_for_a_tenant_with_no_row_names_the_tenant_not_the_driver() {
+        let Some(db) = db().await else { return };
+
+        // A tenant id that is real enough to authenticate with and has no row —
+        // which is exactly the state a first install is in.
+        let ghost = TenantId::new_v7(Utc::now());
+        let mut tx = db.tenant_tx(ghost).await.expect("tenant tx");
+        let err = sqlx::query("INSERT INTO teams (id, tenant_id, slug, name) VALUES ($1,$2,$3,$3)")
+            .bind(Uuid::now_v7())
+            .bind(ghost.as_uuid())
+            .bind(format!("ghost-{}", ghost.as_uuid().simple()))
+            .execute(&mut **tx)
+            .await
+            .map(|_| ())
+            .expect_err("a tenant with no row cannot own a team");
+
+        assert!(
+            matches!(StoreError::from(err), StoreError::UnknownTenant(name) if name == "teams_tenant_id_fkey"),
+            "the missing tenant has to be its own variant; as a Database error it renders as a 500"
+        );
+    }
+
+    /// **The classifier above reads constraint names, so the names are part of
+    /// the schema's contract.**
+    ///
+    /// Asked of `pg_constraint`, not of the migrations: a `.sql` file says what
+    /// somebody wrote and this says what Postgres built. The three counts are
+    /// the three ways [`TENANT_FK_SUFFIX`] can stop being exactly the set of
+    /// "this row names a tenant that is not there" — a hand-named key that
+    /// escapes it, a key on another table that accidentally matches it, or the
+    /// table being renamed out from under both.
+    #[tokio::test]
+    async fn every_tenant_foreign_key_is_named_the_way_this_classifier_expects() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+
+        let pattern = format!("%{}", TENANT_FK_SUFFIX.replace('_', "\\_"));
+
+        let missed: Vec<String> = sqlx::query_scalar(
+            "SELECT conname::text FROM pg_constraint \
+              WHERE contype = 'f' AND confrelid = 'tenants'::regclass \
+                AND conname NOT LIKE $1 ORDER BY 1",
+        )
+        .bind(&pattern)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query pg_constraint");
+        assert!(
+            missed.is_empty(),
+            "these foreign keys point at `tenants` and do not end in `{TENANT_FK_SUFFIX}`, \
+             so a missing tenant still comes out of the API as a 500: {missed:?}"
+        );
+
+        let stolen: Vec<String> = sqlx::query_scalar(
+            "SELECT conname::text FROM pg_constraint \
+              WHERE contype = 'f' AND confrelid <> 'tenants'::regclass \
+                AND conname LIKE $1 ORDER BY 1",
+        )
+        .bind(&pattern)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query pg_constraint");
+        assert!(
+            stolen.is_empty(),
+            "these foreign keys end in `{TENANT_FK_SUFFIX}` and point somewhere other than \
+             `tenants`, so breaking one would tell an operator to create a tenant that \
+             already exists: {stolen:?}"
+        );
+
+        // A walk that finds nothing satisfies both assertions above forever.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint \
+              WHERE contype = 'f' AND confrelid = 'tenants'::regclass",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+        assert!(
+            total >= 50,
+            "only {total} foreign keys point at `tenants`; this test is asking the wrong database"
+        );
+
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **The migrator this build carries is the directory on disk.**
+    ///
+    /// # The bug this exists to stop coming back
+    ///
+    /// `sqlx::migrate!` expands to one `include_str!` per file it finds, and
+    /// `include_str!` is the only thing telling cargo to watch anything. A
+    /// *new* file is named by no `include_str!`, so cargo re-expands nothing
+    /// and [`MIGRATOR`] goes on being yesterday's list. Nothing fails at build
+    /// time. What fails is a test three crates away, on a `CHECK` violation or
+    /// a missing relation, and the word "migration" appears nowhere in it.
+    ///
+    /// `crates/store/build.rs` is what makes that impossible, and this is what
+    /// makes deleting `build.rs` — four lines whose purpose is invisible —
+    /// something you find out about here rather than in an afternoon.
+    ///
+    /// So: this test cannot fail while `build.rs` is there, and that is the
+    /// point rather than a defect. Delete `build.rs`, add a migration, run
+    /// `cargo test -p agentos-store`: cargo rebuilds nothing, this binary is
+    /// the stale one, and the assertion below is the only thing in the
+    /// workspace that says so.
+    ///
+    /// It costs a directory walk and no database.
+    #[test]
+    fn the_compiled_migrator_matches_the_directory() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../migrations")
+            .canonicalize()
+            .expect("the migrations directory is two levels above this crate");
+
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read the migrations directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("a .sql file has a UTF-8 stem")
+                    .to_owned()
+            })
+            .collect();
+        on_disk.sort();
+
+        // The version is the numeric prefix and the description is the rest
+        // with underscores turned into spaces — sqlx's own parse, reversed, so
+        // the two lists are comparable as the strings a human recognises.
+        let mut compiled: Vec<String> = MIGRATOR
+            .iter()
+            .map(|m| format!("{:04}_{}", m.version, m.description.replace(' ', "_")))
+            .collect();
+        compiled.sort();
+
+        assert_eq!(
+            compiled,
+            on_disk,
+            "the migrator compiled into this binary is not the {} files in {}. \
+             Almost always this means `crates/store/build.rs` is gone: without its \
+             `rerun-if-changed`, adding a migration re-expands nothing and the \
+             next failure you see will be a constraint violation that never says \
+             the word migration.",
+            on_disk.len(),
+            dir.display()
+        );
+
+        // A walk that finds nothing agrees with a migrator that is empty, and
+        // the two of them would pass this test forever after somebody moves the
+        // directory. A floor, not an equality: adding a migration must not turn
+        // a test red for the wrong reason.
+        assert!(
+            on_disk.len() >= 25,
+            "only {} migrations found in {} — this test walked the wrong directory",
+            on_disk.len(),
+            dir.display()
+        );
     }
 
     /// A tenant plus one employee, committed. Returns the ids.

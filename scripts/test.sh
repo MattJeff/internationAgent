@@ -18,7 +18,7 @@
 # `crates/app/tests/scoped_deletes.rs` enforces. If this suite goes flaky
 # again, that is a bug to find, not a flag to restore.
 #
-# Why the two guards below: ~34 tests in this workspace open with
+# Why the two guards below: dozens of fixtures in this workspace open with
 #
 #     let Ok(url) = std::env::var("DATABASE_URL") else { eprintln!("SKIP: …"); return };
 #
@@ -73,11 +73,16 @@ log=$(mktemp)
 cleanup() {
   rm -f "$log"
   # Asked of pg_database rather than rebuilt from PACKAGES: a package's database
-  # is not the only one its run makes. The loop tests derive `<db>_outbox`,
-  # `<db>_inbound` and `<db>_provisioning` from it, because a cross-tenant
-  # poller cannot be isolated by a tenant filter — see
-  # apps/server/src/loops/mod.rs — and those names are the test code's business,
-  # not this script's.
+  # is not the only one its run makes, and this script deliberately does not
+  # know which. Every private database in the workspace derives its name from
+  # DATABASE_URL and therefore begins with the one below — the loops'
+  # `<db>_outbox` / `_inbound` / `_provisioning` / `_initiative`, the gate's
+  # `<db>_gateceiling`, and the server harnesses' `<db>_e2e_…` / `_orizn_…` /
+  # `_srcg_…` / `_readyz_…` / `_turn_…`. That is the whole contract, and it is
+  # why the pattern is a prefix rather than a list: a harness that invents a
+  # name of its own is a database nothing on the machine will ever collect, and
+  # three of them did exactly that until `apps/server/tests/common/mod.rs`
+  # existed.
   psql_admin -tAc \
     "SELECT datname FROM pg_database \
       WHERE datname LIKE 'ci\_%\_$RUN_ID' OR datname LIKE 'ci\_%\_${RUN_ID}\_%'" 2>/dev/null |
@@ -122,8 +127,8 @@ done
 
 # --- the evaluations ---------------------------------------------------------
 # Outside the loop above, and deliberately: `agentos-eval` opens no connection,
-# so giving it a database would mean applying eighteen migrations to prove a
-# ranking still ranks. Its deterministic suites are pure functions over
+# so giving it a database would mean applying every migration in the tree to
+# prove a ranking still ranks. Its deterministic suites are pure functions over
 # fixtures — a regression in ranking, in the psyche, or in the proof-of-need
 # classification breaks the build here. What is NOT run: the model held-out
 # set, which needs the local `claude` binary and about a minute, and lives

@@ -6,12 +6,19 @@ use agentos_app::vertical::Approach;
 fn pitch_with_nothing_behind_it() -> Approach {
     // `Approach::new` takes an `&Evidence`, and `Evidence` can only be built by
     // `Prober::check` after the prospect's own flow said the same thing twice.
-    // Wrapping a hand-written message is the way round that, so the field is
+    // Wrapping a hand-written message is the way round that, so the fields are
     // private and this is the error.
-    Approach(Outreach {
-        subject: "your booking flow is wrong".to_owned(),
-        body: "trust me".to_owned(),
-    })
+    //
+    // Both fields, deliberately. `known_good_at` is what `follow_up` re-checks
+    // against `MAX_TRUTH_AGE`, so a forgery that could set it would not merely
+    // invent a finding — it would invent one that never expires.
+    Approach {
+        message: Outreach {
+            subject: "your booking flow is wrong".to_owned(),
+            body: "trust me".to_owned(),
+        },
+        known_good_at: chrono::Utc::now(),
+    }
 }
 
 fn main() {

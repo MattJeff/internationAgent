@@ -3,8 +3,11 @@
 //!
 //! A role is deliberately **not** a state machine and **not** a code path.
 //! There is no `impl Role for InternationalBuyer`, no per-role branch in the
-//! turn loop, and no durable workflow row. A role is a value: three sets, a
-//! [`PolicyLimits`], and a `&'static str`. Adding the next role is adding
+//! turn loop, and no durable workflow row. A role is a value: one
+//! `BTreeSet<ActionKind>`, a [`PolicyLimits`], and two `&'static str` — count
+//! them off [`RolePack`] below rather than off this line, which said "three
+//! sets" for as long as it took somebody to fold the other two into
+//! `PolicyLimits`. Adding the next role is adding
 //! another constructor next to [`RolePack::international_buyer`] — if it ever
 //! needs a code path, the code path was missing from the runtime, not from the
 //! role.
@@ -1137,8 +1140,8 @@ mod tests {
     /// gone quiet is not cheaper, it is quieter — and it fails if either half of
     /// the grant is dropped, which is what makes it worth having.
     ///
-    /// The two other packs (`rolepack_service`'s three) are covered by the same
-    /// assertion in that module. Two places, because the two pack types are
+    /// The packs `rolepack_service` declares are covered by the same assertion
+    /// in that module. Two places, because the two pack types are
     /// separate and there is no trait over them; if a third type ever appears,
     /// it needs its own copy of this.
     #[test]

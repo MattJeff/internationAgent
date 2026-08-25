@@ -78,9 +78,10 @@
 //!
 //! Every handler opens a [`Db::tenant_tx`] on [`Principal::tenant_id`] and
 //! writes no `WHERE tenant_id` of its own — `0013_mcp`'s `tenant_isolation`
-//! policies add it, on `USING` and on `WITH CHECK` both. `0016` is what granted
-//! `app_role` the DML to do that; see its header for why the privilege moved out
-//! of `admin_tx_bypassing_rls`.
+//! policies add it, on `USING` and on `WITH CHECK` both.
+//! `0019_mcp_operator_writes.sql` is what granted `app_role` the DML to do
+//! that; see its header for why the privilege moved out of
+//! `admin_tx_bypassing_rls`.
 //!
 //! Every mutation writes an audit row in the same transaction as the write.
 //! These are administrative acts with a real blast radius — binding a URL,
@@ -689,7 +690,7 @@ async fn declare_tool(
 
 /// Keep [`Fleets`] in step with the database, forever.
 ///
-/// Cancelled by the process-wide token, like the other three loops, so SIGTERM
+/// Cancelled by the process-wide token, like every other loop, so SIGTERM
 /// ends it between binds rather than mid-connection. It never returns an error
 /// and it never panics on a bad binding: a tenant whose configuration cannot be
 /// read is logged and retried on the next tick, and a *server* that will not

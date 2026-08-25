@@ -1647,12 +1647,17 @@ mod tests {
     /// Long enough for `ApiKeys::MIN_SECRET_LEN`, and distinct per tenant.
     const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// A key that authenticates perfectly and names a tenant nobody created —
+    /// the state every first install is in until somebody runs the `INSERT`.
+    const SECRET_GHOST: &str = "gggggggggggggggggggggggggggggggg";
 
     struct Harness {
         app: Router,
         db: Db,
         a: TenantId,
         b: TenantId,
+        /// Parsed into the keyring, never inserted into `tenants`.
+        ghost: TenantId,
     }
 
     impl Harness {
@@ -1669,10 +1674,14 @@ mod tests {
 
             let a = new_tenant(&db).await;
             let b = new_tenant(&db).await;
+            // Minted, not inserted. `new_tenant` is what writes the row, and
+            // this one deliberately never gets it.
+            let ghost = TenantId::new_v7(Utc::now());
             let keys = ApiKeys::parse(&format!(
-                "ops-a:{}:{SECRET_A},ops-b:{}:{SECRET_B}",
+                "ops-a:{}:{SECRET_A},ops-b:{}:{SECRET_B},ops-ghost:{}:{SECRET_GHOST}",
                 a.as_uuid(),
-                b.as_uuid()
+                b.as_uuid(),
+                ghost.as_uuid()
             ))
             .expect("keyring");
 
@@ -1681,6 +1690,7 @@ mod tests {
                 db,
                 a,
                 b,
+                ghost,
             })
         }
 
@@ -2630,6 +2640,60 @@ mod tests {
             );
         }
         assert_eq!(h.counts(h.a).await, (0, 0, 0, 0, 0));
+
+        h.teardown().await;
+    }
+
+    /// **The first call on a first install, made one step too early.**
+    ///
+    /// `AGENTOS_API_KEYS` names a tenant uuid; there is no endpoint that
+    /// creates a tenant; `docs/OPERATIONS.md` §1.4 is the `INSERT` an operator
+    /// runs by hand. Skip it and this is what happens — and until
+    /// `StoreError::UnknownTenant` existed, what happened was `500 internal`
+    /// with the cause only in the server's log, on the one call an operator
+    /// makes at 2am on a machine they have not logged into yet.
+    ///
+    /// Driven through `POST /v1/org` because that is the door the module docs
+    /// send an operator to, but nothing here is this route's: the classifier is
+    /// `agentos_store`'s and fires on all fifty foreign keys pointing at
+    /// `tenants`, so `POST /v1/employees` and every other writer answer the
+    /// same way. The second half asserts the part that would otherwise rot —
+    /// that this is still the *first* thing the request hits, before any row is
+    /// written.
+    #[tokio::test]
+    async fn a_key_naming_a_tenant_nobody_created_is_a_400_that_says_so() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, problem) = h.apply(SECRET_GHOST, seven_rows()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a missing tenants row is the operator's to fix, and a 500 tells them \
+             it is ours: {problem}"
+        );
+        assert_eq!(problem["code"], json!("unknown_tenant"), "{problem}");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        for word in ["tenants", "INSERT", "OPERATIONS.md"] {
+            assert!(
+                detail.contains(word),
+                "the refusal has to say what is missing and what to run; \
+                 it does not mention {word:?}: {problem}"
+            );
+        }
+
+        // Nothing was written, and nothing *could* have been: the ghost tenant
+        // has no rows to count, so this asks the one question that a rollback
+        // could get wrong — whether the audit row went in. `counts` runs under
+        // this tenant's RLS, which is the same tenant the failed transaction
+        // used.
+        assert_eq!(
+            h.counts(h.ghost).await,
+            (0, 0, 0, 0, 0),
+            "a chart that could not be written left rows behind"
+        );
+        assert!(h.audit_events(h.ghost).await.is_empty());
 
         h.teardown().await;
     }

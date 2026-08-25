@@ -39,7 +39,7 @@
 //! [`record_attempt`] files one row per proof-of-need check whatever it came to
 //! — evidence, agreement, unreadable, not-reproducible, blocked — so how often
 //! the reproducibility bar suppresses a real finding is a SELECT over
-//! `proof_of_need_suppression` and not an opinion. `0013_proof_of_need.sql`
+//! `proof_of_need_suppression` and not an opinion. `0015_proof_of_need.sql`
 //! carries the rules; `agentos_app::proof_of_need` carries how to read the
 //! number.
 //!
@@ -1270,7 +1270,7 @@ mod tests {
     use chrono::TimeDelta;
 
     /// Every table the seller vertical adds — `0011_revenue.sql` plus
-    /// `0013_proof_of_need.sql`. A table that joins the vertical and not this
+    /// `0015_proof_of_need.sql`. A table that joins the vertical and not this
     /// array is a table whose RLS nobody checked.
     const REVENUE_TABLES: [&str; 7] = [
         "accounts",

@@ -51,7 +51,7 @@
 //! is not true.
 //!
 //! The full derivation, and the reason each `filter` clause is spelled the way
-//! it is, lives in `migrations/0021_autonomy.sql` next to the SQL.
+//! it is, lives in `migrations/0022_autonomy.sql` next to the SQL.
 //!
 //! # What the audit trail cannot distinguish today
 //!
@@ -76,18 +76,15 @@
 //!
 //! # Cost is not here, on purpose
 //!
-//! There is no revenue-over-cost figure and no `cost_minor`. Token counts come
-//! back from the provider (`agentos_providers::llm::Usage`, filled from the
-//! Anthropic response in `llm_anthropic.rs`) and are written to exactly two
-//! places: a process-local counter that explicitly drops the tenant
-//! ([`crate::metrics::record_llm_usage`]) and `tracing` log lines. No table, no
-//! audit row, no column anywhere in `migrations/`. There is no price list in
-//! this codebase either, so even with tokens a euro figure would rest on a
-//! number nobody could trace — and a cost figure nobody can trace is worse than
-//! a missing one. Two things must land before one is possible: a `model_usage
-//! (tenant_id, employee_id, day, input_tokens, output_tokens,
-//! cache_read_tokens)` row written where `finished.usage` is logged today, and
-//! a price table with a source.
+//! There is no revenue-over-cost figure and no `cost_minor`, and only one of
+//! the two reasons for that is still true. The tokens themselves are recorded:
+//! `model_usage_daily` (`0024_model_usage.sql`) carries input, output and
+//! cache-read counts per employee per day, `model_usage::record` writes it
+//! wherever a turn finishes, and `routes::usage` serves it. What is missing is
+//! the other half — **there is no price list in this codebase**, so a euro
+//! figure would rest on a number nobody could trace, and a cost figure nobody
+//! can trace is worse than a missing one. A price table with a source is the
+//! one thing that has to land.
 //!
 //! # The aggregate cannot be written by hand
 //!
@@ -283,7 +280,7 @@ impl Counts {
     /// Integer division, so it truncates downward — 99.9% reads as 99. That is
     /// the direction every ambiguity in this module resolves in.
     ///
-    /// Mirrors `autonomy_pct` in `migrations/0021_autonomy.sql`, which computes
+    /// Mirrors `autonomy_pct` in `migrations/0022_autonomy.sql`, which computes
     /// the same thing for a single day.
     /// `a_one_day_window_agrees_with_the_views_own_ratio` fails if they drift.
     fn autonomy_pct(self) -> Option<i64> {

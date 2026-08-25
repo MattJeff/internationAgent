@@ -153,9 +153,48 @@ impl From<StoreError> for ApiError {
     /// [`StoreError::Serialization`] is a 503 rather than a 500 because it is
     /// the one failure that is *known* to succeed on retry — a client that
     /// retries a 500 is guessing, a client that retries a 503 was told to.
+    ///
+    /// [`StoreError::UnknownTenant`] is the one place this module's first rule
+    /// bends, and on purpose. It is a 400 whose `detail` says what is missing
+    /// and what to run, because the "caller" holding an operator API key *is*
+    /// the person who has to fix it, and the alternatives are all worse:
+    ///
+    /// - **500**, which is what it was, says "we broke" and sends an operator
+    ///   into the server's logs to find one `foreign key constraint` line. Two
+    ///   reviews called this the single most likely mistake to make at 2am on a
+    ///   first install, and it is the mistake the product makes *hardest* to
+    ///   diagnose.
+    /// - **401/403** would be defensible — the credential names something that
+    ///   does not exist — and would be actively harmful: it sends somebody to
+    ///   rotate a secret that is correct.
+    ///
+    /// Nothing server-side is echoed. The detail names `tenants`, which is in
+    /// the README, and the run book; it does not carry the constraint, the
+    /// table or the uuid. The constraint goes on the log line, where the rest
+    /// of this module's detail goes.
     fn from(err: StoreError) -> Self {
         match err {
             StoreError::NotFound => Self::not_found(),
+            StoreError::UnknownTenant(constraint) => {
+                tracing::error!(
+                    %constraint,
+                    "a write named a tenant with no `tenants` row; \
+                     AGENTOS_API_KEYS names a tenant that was never created"
+                );
+                Self::new(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_tenant",
+                    "the tenant this API key names does not exist",
+                )
+                .with_detail(
+                    "This deployment has no `tenants` row for the tenant uuid in the API key \
+                     you presented, so nothing can be written against it. There is no endpoint \
+                     that creates a tenant: insert the row with psql — \
+                     `INSERT INTO tenants (id, slug, name) VALUES ('<the uuid in your key>', \
+                     'acme', 'Acme');` — see docs/OPERATIONS.md §1.4, \
+                     'The tenant you have to create yourself'.",
+                )
+            }
             StoreError::Conflict(what) => {
                 // The constraint name is an internal detail; the operator gets
                 // it, the caller gets the code.

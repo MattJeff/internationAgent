@@ -80,8 +80,8 @@
 //! model's accuracy, not of our plumbing: past roughly seventy tools a model
 //! starts picking the almost-right one, and MCP inventory is exactly the thing
 //! that grows without bound — one ERP server is forty tools nobody at this
-//! company wrote. The collapsed form is what keeps this catalogue at three
-//! entries no matter how many servers a tenant binds, and it keeps the *gate*
+//! company wrote. The collapsed form is what keeps this catalogue the size it
+//! is no matter how many servers a tenant binds, and it keeps the *gate*
 //! at one subject type too: `Action::McpCall { tool }`, one allowlist,
 //! `allowed_mcp_tools`. N schemas would be N names to keep in step with that
 //! allowlist, and a schema whose name has drifted out of the allowlist is a

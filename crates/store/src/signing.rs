@@ -1,4 +1,4 @@
-//! Persistence for employee signing keys: `0013_identity.sql` in Rust.
+//! Persistence for employee signing keys: `0014_identity.sql` in Rust.
 //!
 //! Read the schema comment first; it is the design document. What this module
 //! adds is one rule the SQL cannot state on its own.

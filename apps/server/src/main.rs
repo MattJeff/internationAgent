@@ -1,5 +1,7 @@
-//! One binary: the HTTP control plane plus four tokio loops
-//! (provisioning, outbox, inbound, initiative). No separate worker binaries.
+//! One binary: the HTTP control plane plus the tokio loops spawned in `main` —
+//! the MCP binder, provisioning, outbox, inbound and initiative. No separate
+//! worker binaries. The list is here and the count is not, because the count
+//! was here and said four for as long as the MCP binder has existed.
 //!
 //! # The middleware stack, and why the order is the order
 //!
@@ -110,7 +112,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// applies.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
 
-/// What the three loops get *after* the HTTP surface has drained.
+/// What the loops get *after* the HTTP surface has drained.
 ///
 /// They are cancelled at the same instant as the listener, so this is the tail
 /// of a window they have already been draining in, not a second full one.
@@ -292,7 +294,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         EngineConfig::default(),
     );
 
-    // One token for all four, cancelled by the same signal that stops the
+    // One token for all of them, cancelled by the same signal that stops the
     // listener, so the loops drain *alongside* the HTTP surface rather than
     // after it.
     let cancel = CancellationToken::new();
@@ -383,7 +385,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     .await;
 
     // Belt and braces: `serve` also returns when the listener fails, and a
-    // process that stops serving must not leave three loops running.
+    // process that stops serving must not leave its loops running.
     cancel.cancel();
     drain_loops(loops, LOOP_DRAIN_DEADLINE).await;
 
@@ -889,7 +891,9 @@ impl Agent {
             //
             // `trust_label` and `internal_kind` are new to this read and they
             // are the internal channel's whole discriminant: `internal_kind` is
-            // NOT NULL exactly on `channel = 'internal'` (migration 0025), and
+            // set only on `channel = 'internal'` (`0028_internal_channel.sql`,
+            // whose CHECK is deliberately one-way: an internal row may have a
+            // null kind — a reply is one — but a kind implies the channel), and
             // `trust_label` on such a row is the label of the *colleague's own
             // turn* when it composed the message.
             #[allow(clippy::type_complexity)]
@@ -1941,7 +1945,13 @@ mod tests {
         // refuse. It does, without a fourth check written for it: both of the
         // probe's queries read tables that only the migrations create.
         let (base_url, _) = admin_url.rsplit_once('/').expect("admin url has a path");
-        let empty = format!("readyz_raw_{}", Uuid::now_v7().simple());
+        // `private_name`, not a prefix of its own: this one is created and
+        // dropped inside the test, so it only leaks when the test panics —
+        // which is exactly when a leaked database is least welcome.
+        let empty = private_name(
+            &std::env::var("DATABASE_URL").expect("own_database above returned Some"),
+            "readyz_raw",
+        );
         let admin = sqlx::PgPool::connect(&admin_url).await.expect("postgres");
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {empty}")))
             .execute(&admin)
@@ -2263,6 +2273,100 @@ mod tests {
         database: String,
     }
 
+    /// The name of a database this run is allowed to leave behind: **this
+    /// run's own database name, then a tag, then who and which**.
+    ///
+    /// # The bug this exists to stop coming back
+    ///
+    /// `scripts/test.sh` gives each package a database called
+    /// `ci_<pkg>_<RUN_ID>` and drops, on its way out and on `^C`, everything
+    /// matching `ci\_%\_<RUN_ID>` or `ci\_%\_<RUN_ID>\_%`. A name that starts
+    /// with this run's therefore goes with it; a name that starts with anything
+    /// else is collected by nothing, ever.
+    ///
+    /// This function used to be `format!("{prefix}_{uuid}")`, and so did the
+    /// harnesses in `tests/{end_to_end,orizn,sourcing_e2e}.rs`. Six prefixes —
+    /// `readyz`, `readyz_raw`, `turn`, `terminate`, `policy_seq`, plus `e2e`,
+    /// `orizn` and `srcg` next door — none of them collected. An interrupted
+    /// run left a migrated database per test behind and nothing on the machine
+    /// knew they were garbage. The cluster this was found on had leaked ones
+    /// still sitting in it.
+    ///
+    /// `loops::private_db` and `agentos_app::gate`'s copy always got this
+    /// right; this is the same rule, plus the uniqueness those two do not need.
+    ///
+    /// # A pid and a counter, not a UUID
+    ///
+    /// Uniqueness is still required — three tests call `land_a_message`, which
+    /// takes a `turn` database each, and two of them dropping one name would be
+    /// worse than the leak. But a UUID's 32 hex characters no longer fit:
+    /// Postgres truncates an identifier at 63 bytes *silently*, and
+    /// `ci_agentosserver_<pid>` plus `_readyz_raw_` plus 32 is 66 — created
+    /// under one name and connected to under another, which fails in a way that
+    /// looks nothing like a name that was too long.
+    ///
+    /// The pid separates the test binaries `cargo test` runs in parallel; the
+    /// counter separates tests inside one binary. That is every collision that
+    /// can happen, in eleven characters instead of thirty-two.
+    fn private_name(url: &str, tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        /// Per process, so it only has to be unique against this binary's own
+        /// other tests. `Relaxed` because nothing is ordered against it.
+        static NTH: AtomicU32 = AtomicU32::new(0);
+
+        // `postgres://user:pass@host:port/name`, or the same with `?options`.
+        // Split by hand rather than pull in a URL parser for one path segment —
+        // `loops::private_db` says the same thing about the same two lines.
+        let (_, tail) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+        let base = tail.split_once('?').map_or(tail, |(name, _)| name);
+        format!(
+            "{base}_{tag}_{}_{}",
+            std::process::id(),
+            NTH.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// **A private database is named so that `scripts/test.sh` collects it.**
+    ///
+    /// The script drops `ci\_%\_<RUN_ID>` and `ci\_%\_<RUN_ID>\_%` and nothing
+    /// else, so the assertion is one character wide and it is the whole bug:
+    /// the name has to *start* with the database `DATABASE_URL` names. It takes
+    /// no database of its own — `private_name` is given the URL rather than
+    /// reading it — so it runs in a checkout with no Postgres at all.
+    #[test]
+    fn a_private_database_is_named_after_the_one_this_run_owns() {
+        let url = "postgres://postgres:postgres@localhost:5442/ci_agentosserver_98765";
+        let first = private_name(url, "readyz");
+        let second = private_name(url, "readyz");
+
+        assert!(
+            first.starts_with("ci_agentosserver_98765_"),
+            "a name that does not start with this run's own is collected by \
+             nothing on the machine and leaks on every ^C: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "three tests take a `turn` database at once; two of them sharing a \
+             name is worse than the leak, because the first to finish drops it"
+        );
+        assert!(
+            first.len() <= 63,
+            "Postgres truncates an identifier at 63 bytes without saying so, so \
+             this would be created under one name and connected to under \
+             another: {} bytes, {first}",
+            first.len()
+        );
+
+        // The `?sslmode=…` form, because `DATABASE_URL` carries one in every
+        // deployment that is not a laptop and `rsplit_once('/')` alone would
+        // put the query string in the database name.
+        assert!(
+            private_name(&format!("{url}?sslmode=require"), "turn")
+                .starts_with("ci_agentosserver_98765_turn_"),
+            "the options after `?` are not part of the database's name"
+        );
+    }
+
     /// A migrated database of this test's own, plus what it takes to drop it.
     ///
     /// The real outbox poller is cross-tenant by design, so any test that runs
@@ -2283,11 +2387,11 @@ mod tests {
         };
         let (base_url, _) = url.rsplit_once('/').expect("DATABASE_URL has a path");
         let admin_url = format!("{base_url}/postgres");
-        let database = format!("{prefix}_{}", Uuid::now_v7().simple());
+        let database = private_name(&url, prefix);
         let admin = sqlx::PgPool::connect(&admin_url).await.expect("postgres");
-        // No bind parameters on CREATE DATABASE. The name is a fixed prefix
-        // plus the hex of a UUID minted two lines up, which is the audit
-        // AssertSqlSafe is asking for.
+        // No bind parameters on CREATE DATABASE. The name is `private_name`'s,
+        // which is this run's own database name and two integers, and that is
+        // the audit AssertSqlSafe is asking for.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .execute(&admin)
             .await

@@ -935,24 +935,18 @@ team at a role name nobody has written limits for therefore un-restricts it back
 to the tenant ceiling; it does not lock it out. A missing platform layer is
 fatal (`NoPlatformLayer`).
 
-> **NOT WIRED, and this is the largest gap in the system.**
-> `PolicyGate` reads an **in-memory** `PolicyBook` with only platform, tenant
-> and employee — it folds the employee layer into the role slot and it does
-> **not** call `store::policy::load`. `apps/server/src/main.rs` constructs it as
-> `PolicyGate::new(db, PolicyBook::default())`, the empty platform layer.
+> **WIRED.** `apps/server/src/main.rs` builds the gate as
+> `PolicyGate::new(db)` — there is no `PolicyBook` type left in the workspace —
+> and `crates/app/src/gate.rs` calls `store::policy::load(tx, employee_id)` on
+> every decision, so the four layers above are intersected out of Postgres on
+> the hot path.
 >
-> Two consequences, both real on a stock deployment:
->
-> 1. **Every agent-initiated side effect is denied.** An unconfigured gate
->    denying everything is the correct behaviour for an unconfigured gate, but
->    it is not the same thing as an enforced policy.
-> 2. **The `policy_versions` / `policy_layers` schema, the loader, and every
->    team's limits have no reader on the hot path.** They are read only by
->    `GET /v1/employees/{id}/turns` and by the initiative loop's turn-budget
->    reservation.
->
-> Wiring it is a change in `main.rs` and `PolicyBook::effective`, and nothing
-> else changes.
+> This block said the opposite for several waves after it stopped being true,
+> and it was the most expensive stale claim in this document: a reader deciding
+> whether the security model is real would have concluded it is not. The only
+> thing still true of a **stock** deployment is that a database with no platform
+> layer denies everything — correct behaviour for an unconfigured gate, and what
+> `/readyz`'s `no_platform_policy` exists to say.
 
 LLM output can propose an action; it can never directly execute one.
 
@@ -1003,11 +997,11 @@ narrower lock, so employees on one team queue on the team row instead of
 deadlocking — then the team lock. On refusal the caller must roll back, because
 the employee reservation is already in the transaction.
 
-> **NOT WIRED.** The Policy Gate's payment path calls `spend::reserve`, which
-> takes the employee's headroom only. `org::reserve` has no production call
-> site. **Per-employee caps are enforced today; the team ceiling is stored,
-> read and reported correctly but is not checked on the hot path.** This is
-> also recorded in `docs/TEAMS.md` under "Known gap".
+> **WIRED.** `PolicyGate::reserve` calls `org::reserve`, which is what takes
+> the employee lock and then the team lock; the payment path reaches it from
+> `Action::PaymentCreate`. Both ceilings are enforced on the hot path. This
+> block said "no production call site" after the call site existed, which
+> `docs/TEAMS.md` had already stopped claiming.
 
 ### The turn budget
 
@@ -1268,16 +1262,22 @@ merges.
 | `POST` | `/v1/employees/{id}/terminate` |
 | `GET`, `PUT` | `/v1/employees/{id}/initiative` |
 | `GET` | `/v1/employees/{id}/turns` |
+| `GET` | `/v1/employees/{id}/reports` |
+| `PUT`, `GET` | `/v1/employees/{id}/spend-caps` |
 | `GET` | `/v1/approvals` |
 | `GET` | `/v1/approvals/{id}` |
 | `POST` | `/v1/approvals/{id}/approve` |
 | `POST` | `/v1/approvals/{id}/deny` |
+| `POST` | `/v1/org` |
 | `POST`, `GET` | `/v1/teams` |
 | `POST`, `GET` | `/v1/teams/{team_id}/sections` |
 | `POST`, `GET` | `/v1/teams/{team_id}/members` |
 | `PUT`, `DELETE` | `/v1/teams/{team_id}/members/{employee_id}` |
+| `PUT` | `/v1/teams/{team_id}/mission` |
 | `PUT` | `/v1/teams/{team_id}/policy-role` |
 | `PUT`, `GET` | `/v1/teams/{team_id}/budget` |
+| `GET` | `/v1/autonomy` |
+| `GET` | `/v1/usage` |
 | `GET` | `/v1/inventory/stranded` |
 | `POST` | `/v1/knowledge/documents` |
 | `GET`, `POST` | `/v1/pool/numbers` |
@@ -1287,7 +1287,19 @@ merges.
 | `DELETE` | `/v1/mcp/servers/{server}` |
 | `POST` | `/v1/mcp/servers/{server}/discover` |
 | `PUT` | `/v1/mcp/servers/{server}/tools/{tool}` |
+| `POST` | `/v1/webhooks/{provider}` |
 | `POST` | `/a2a/jsonrpc` |
+
+Outside the API auth stack, and therefore not on a publicly routable listener:
+`GET /livez`, `GET /readyz`, `GET /metrics`, `GET /a2a/agent-card` and
+`GET /.well-known/http-message-signatures-directory`.
+
+Nine of the rows above were missing from this table while the sentence over it
+claimed to be the full surface. Read it out of the code before trusting it:
+
+```bash
+grep -rn '\.route(' apps/server/src --include='*.rs'
+```
 
 **NOT BUILT**, and named because their absence is load-bearing:
 `DELETE /v1/employees/{id}` (termination is `POST .../terminate`, so that a
@@ -1295,12 +1307,14 @@ delete never means two things), `POST /v1/employees/{id}/resume`,
 `GET .../resources`, `GET .../timeline`, `GET .../conversations`,
 `POST .../messages`, `POST .../calls`, `POST .../mcp-bindings` (MCP is
 per-tenant, not per-employee), a tenant endpoint, a knowledge *search* endpoint,
-a dead-letter endpoint, and `/metrics` — see §23.
+a dead-letter endpoint. `/metrics` **is** mounted — see §27, which has said so
+for some time while this list went on calling it absent.
 
-**There is no endpoint that creates a tenant.** `AGENTOS_API_KEYS` names a
-tenant UUID and `employees.tenant_id` has a foreign key to `tenants(id)`; insert
-the row with `psql`. `tenants` is not tenant-scoped and there is no path to it
-from a `tenant_tx`.
+**There is no endpoint that creates a tenant**, and there is a command:
+`agentos-server policy new-tenant`, on the operator's own database credentials.
+`tenants` is not tenant-scoped and there is no path to it from a `tenant_tx`,
+which is the reason there is no route. A write against a tenant whose row is
+missing answers `400 unknown_tenant` and names what to run.
 
 ### Idempotency
 
@@ -1407,7 +1421,7 @@ the database, and rotation is a deploy rather than a migration.
 - No private wallet key in the database — there is no wallet (§13). The Ed25519
   signing key's private half is in the database, sealed under the master key,
   and `update` on that table is revoked.
-- All side effects require the Policy Gate — but see the NOT WIRED note in §14
+- All side effects require the Policy Gate, and §14's loader is wired
   about what the gate is currently loaded with.
 - External content is never trusted as instruction (§22).
 - SSRF protection is real and shared: one `vet_url` / `resolve_and_vet` pair
@@ -1759,9 +1773,16 @@ latency.
 
 ## 28. Testing
 
-**908 test functions** — 476 `#[tokio::test]`, 432 `#[test]` — across
-`crates/app` (252), `crates/domain` (202), `apps/server` (185),
-`crates/providers` (127), `crates/store` (124) and `crates/eval` (18).
+**How many test functions there are is a command, not a line in this file:**
+
+```bash
+grep -rE '^\s*#\[(tokio::)?test\b' --include='*.rs' crates apps | wc -l
+```
+
+The number that used to be here, and its six-way per-crate breakdown, were
+wrong by about a quarter and nothing could notice. That is the same defect this
+document exists to avoid, so the count is a command now and the breakdown is
+gone.
 
 Run `./scripts/test.sh`, **not** `cargo test --workspace`. The integration tests
 talk to a real Postgres and cargo runs each package's test binary in parallel;
@@ -1773,8 +1794,9 @@ database.
 It has two guards, both deliberate:
 
 - It **refuses to start** without `psql` and a reachable Postgres, because
-  roughly three dozen tests opt out silently when they cannot reach a database,
-  which makes a run green and empty — the one failure mode nobody notices.
+  dozens of fixtures opt out silently when they cannot reach a database
+  (`grep -rn 'SKIP: ' crates apps`), which makes a run green and empty — the one
+  failure mode nobody notices.
 - It **refuses to finish** if any test skipped itself, by grepping the
   `--nocapture` log for `SKIP:`.
 
@@ -1788,12 +1810,11 @@ Types of test that exist:
 - **Provider contract suites** — one per trait, shared across implementations,
   asserting reconcile-before-create and idempotent release.
   `SecretStore`'s is the only one run against two implementations.
-  > **The real adapters do not run them.** `TwilioTelephony` has hand-written
-  > tests against a fake HTTP server; `BrowserbaseBrowser` and
-  > `ResendEmailProvider` never invoke the suite, and only `EmailProvider`'s is
-  > `pub` and therefore even callable from another module. The crate-level
-  > promise that every adapter ships with a shared contract suite is true of the
-  > mocks and not of the real adapters.
+  > **The real adapters run them.** `email.rs`, `telephony.rs` and `browser.rs`
+  > each export a `pub async fn contract_suite`, and `email_resend.rs`,
+  > `telephony_twilio.rs` and `browser_browserbase.rs` each invoke it against a
+  > hermetic loopback HTTP server. This block said they did not, while §7, §8
+  > and §12 of this same document said they did.
 - **Chaos** — `FaultMode::FailAfterExternalSuccess` reproduces exactly the
   crash window between a provider's `201 Created` and our own commit; point it
   at a step, run the step twice, assert one `external_id`.
@@ -1866,9 +1887,10 @@ An employee can, today:
 - ✅ be suspended and terminated, with credentials revoked and channels disabled
   before data is deleted
 - ✅ act on its own initiative, under a per-day turn budget
-- ⚠️ have its side effects enforced by policy — the gate is real and unforgeable,
-  but is loaded with an empty policy book (§14), so on a stock deployment the
-  enforcement is *deny everything* rather than *the tenant's limits*
+- ✅ have its side effects enforced by policy — the gate is real and
+  unforgeable and it loads platform ∧ tenant ∧ role ∧ employee out of Postgres
+  on every decision (§14). A database with no platform layer denies everything,
+  which is an unconfigured deployment rather than an unwired one
 
 ---
 
@@ -1876,7 +1898,7 @@ An employee can, today:
 
 1. ✅ Domain + DB + outbox
 2. ✅ Provisioning engine
-3. ✅ Policy Gate + approvals *(loader not wired — §14)*
+3. ✅ Policy Gate + approvals *(loader wired — §14)*
 4. ✅ Email *(Resend, selected by `EMAIL_API_KEY`)*
 5. ⚠️ Knowledge *(text only, hash embedder)*
 6. ✅ MCP
@@ -1895,7 +1917,8 @@ The three things that were not on that list and landed anyway: the **org layer**
 (teams, sections, the tightening-only role slot), the **initiative loop** with
 its per-day turn budget, and **`crates/eval`**.
 
-**The single highest-value next change is wiring `store::policy::load` into
-`PolicyGate`**, because it turns four layers of stored, tested, documented
-policy — including every team budget and every turn budget — from configuration
-into enforcement.
+`store::policy::load` was the entry that stood here longest and it has landed:
+the gate intersects four layers out of Postgres on every decision, so every team
+budget and every turn budget is enforcement rather than configuration. What this
+line should say next is an argument somebody has to make from the ⚠️ and ❌ rows
+above — not a claim inherited from the last person who edited it.

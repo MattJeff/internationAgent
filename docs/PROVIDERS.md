@@ -429,11 +429,13 @@ Half a browser is exactly the state this wiring is arranged against.
 
 No human review is involved. This one is credentials-and-go.
 
-**The shared `BrowserProvider` contract suite is private to `browser.rs` and is
-run against `MockBrowser` only** — `BrowserbaseBrowser` has its own tests against
-a hermetic HTTP server but never invokes the suite. Making a vendor swap
-*provable* rather than hopeful means making that suite `pub` and running it, the
-way `EmailProvider`'s is.
+**The shared `BrowserProvider` contract suite is `pub` and the real client runs
+it** — `browser.rs::contract_suite`, invoked by
+`browser_browserbase.rs::the_real_client_satisfies_the_contract` against a
+hermetic loopback HTTP server, the way `EmailProvider`'s and
+`TelephonyProvider`'s are. That is what makes a vendor swap provable rather than
+hopeful, and this paragraph claimed the opposite of it for a while — see the
+section further down that already described the wiring.
 
 ### Why the trait looks the way it does
 

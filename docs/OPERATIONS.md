@@ -83,9 +83,11 @@ They are written `IF NOT EXISTS` / `DROP`-then-`CREATE` and are replayable.
 **There is no endpoint that creates a tenant, and there cannot be one.** Every
 route derives its tenant from the API key, so the key for a tenant that does not
 exist yet cannot authorise creating it. `AGENTOS_API_KEYS` names a tenant UUID;
-`employees.tenant_id` has a foreign key to `tenants(id)`. If the row is missing,
-`POST /v1/employees` fails on the FK and you will spend twenty minutes wondering
-why. `SPEC.md` §20 is the full route table.
+`employees.tenant_id` has a foreign key to `tenants(id)` — one of fifty that do.
+If the row is missing, the first write answers `400 unknown_tenant` and names
+this section; it used to fail on the FK as `500 internal` with the cause only in
+the server log, which is where the twenty minutes went. `SPEC.md` §20 is the
+route table, and it is not complete.
 
 ```bash
 agentos-server policy new-tenant acme Acme \
@@ -276,7 +278,8 @@ only hid that.
 
 Two guards, both deliberate. It **refuses to start** without `psql` and a
 reachable Postgres, and it **refuses to finish** if any test skipped itself —
-roughly three dozen opt out silently without a database, which makes a run green
+dozens of fixtures opt out silently without a database
+(`grep -rn 'SKIP: ' crates apps` for how many today), which makes a run green
 and empty.
 
 `crates/eval` runs last, outside the per-package database loop, because it opens
@@ -1030,11 +1033,11 @@ until one is installed ([§1.5](#15-the-policy-ceiling-you-have-to-install)).
 `agentos-server policy install` is the only writer of a platform layer outside a
 test fixture.
 
-**There is still no writer for tenant, role or employee layers.** The ceiling
-has a command; the three layers under it are `INSERT`s you write by hand, under
-the team's `role_name` in the tenant's active version — `docs/TEAMS.md` §2 has
-the SQL. Until then every tenant runs on the ceiling itself, because an absent
-layer inherits the one above it.
+**The three layers under the ceiling have a writer too**: `policy install
+--tenant`, with `--role` or `--employee` to go a layer deeper — §1.4b above is
+the worked example, and this paragraph said there was none long after it landed.
+A tenant with no layer of its own still runs on the ceiling itself, because an
+absent layer inherits the one above it, and that part has not changed.
 
 **`AGENTOS_MASTER_KEY` is load-bearing, and this is the second exception.**
 `mocks::adapters(master_key)` threads it into a real `LocalEnvelopeSecretStore`

@@ -58,7 +58,7 @@
 //! jitter.
 //!
 //! The formula itself is `employee_initiative_next_at(from, interval_secs)` in
-//! `0017_initiative.sql` rather than a string in this file. Two callers need it —
+//! `0020_initiative.sql` rather than a string in this file. Two callers need it —
 //! the upsert names the interval as a bind parameter, the claim names it as a
 //! column — and the two ways of having one formula in two statements are a copy
 //! that drifts or an interpolated query that sqlx rejects as dynamic SQL. A
@@ -148,7 +148,7 @@ pub struct Due {
 /// Through [`Cadence::every`], which is the only door — the type has no
 /// `Deserialize` precisely so that a row cannot hand back a one-second cadence
 /// past the constructor that exists to refuse it. The `CHECK` in
-/// `0017_initiative.sql` means this should never fire; if it does, somebody
+/// `0020_initiative.sql` means this should never fire; if it does, somebody
 /// edited the table by hand and the loud error is the point.
 fn cadence_of(interval_secs: i64) -> Result<Cadence, StoreError> {
     let secs = u64::try_from(interval_secs)

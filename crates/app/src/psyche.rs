@@ -21,12 +21,13 @@
 //! | `Dimension::MoqFlexibilityPct` | `quotes` has no MOQ column — see `vertical::answers`, which fills `moq` with `NonZeroU32::MIN` because there is nothing to read | no |
 //! | `Dimension::DefectRatePct` | needs an incoming inspection. There is no inspection anywhere in this product | no |
 //!
-//! The same test applies to `supplier_observations`: `record_observation` has
-//! no production caller either, so `quote_returned` / `quote_missed` is a
-//! reputation nothing feeds today. It is left alone rather than driven from
-//! here — a `quote_missed` row means "we asked and they never answered", which
-//! is a judgement about an RFQ that is still open, and the RFQ does not record
-//! who was asked.
+//! `supplier_observations` is the one that came off this list.
+//! `store::sourcing::close_expired_rounds` writes `quote_returned` /
+//! `quote_missed` as it closes a round, so the reputation view has a feed, and
+//! `vertical::answers` is what drives it on the production path. Nothing is
+//! written from *here*, and that is still right: this module is about the
+//! psyche's expectations, and an observation is the sourcing round's own
+//! record of who answered.
 //!
 //! # The governing invariant
 //!
