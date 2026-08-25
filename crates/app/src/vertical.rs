@@ -51,6 +51,14 @@
 //! the stage. An employee that could choose between forty verticalised tools is
 //! an employee whose job description is a dropdown.
 //!
+//! One thing in this module *is* an `Action` variant —
+//! [`Action::CharterSet`], the delegation in [`delegate`] — and the argument
+//! above is exactly why it is allowed to be. It is 1 × 1 rather than 1 × N, so
+//! there is no ruling covering parts the gate never saw; it decomposes into no
+//! existing action, so composition would mean spelling it as something it is
+//! not; and it adds nothing to the model's catalogue, because nothing turns
+//! model output into one. The full reasoning is on [`delegate`].
+//!
 //! # No vertical operation reaches a provider without a token
 //!
 //! Nothing in this module touches a provider. It calls
@@ -110,8 +118,8 @@
 
 use std::num::NonZeroU32;
 
-use agentos_domain::action::{ActionKind, Channel, EmailAddress};
-use agentos_domain::ids::EmployeeId;
+use agentos_domain::action::{Action, ActionKind, Channel, EmailAddress};
+use agentos_domain::ids::{DecisionId, EmployeeId};
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::sourcing as buying;
 use agentos_domain::untrusted::TrustLabel;
@@ -121,7 +129,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::gate::Principal;
+use crate::gate::{Denied, PolicyGate, Principal};
 use crate::prompt::SystemPrompt;
 use crate::proof_of_need::{Answer, Checked, Evidence, Flow, Probe, ProbeError, Prober};
 use crate::psyche;
@@ -422,6 +430,100 @@ fn strings(raw: Option<&Value>) -> Option<Vec<String>> {
         .iter()
         .map(|entry| entry.as_str().map(str::to_owned))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Delegation
+// ---------------------------------------------------------------------------
+
+/// Why a head could not re-task a subordinate.
+#[derive(Debug, thiserror::Error)]
+pub enum DelegationError {
+    /// The Policy Gate refused. A peer asking, an employee asking about itself,
+    /// a suspended head, a charter asked for by a document — all arrive here,
+    /// each with its own [`Denied::code`] and each with an audit row already
+    /// written.
+    #[error(transparent)]
+    Refused(#[from] Denied),
+
+    /// The ruling stood and the write did not land.
+    #[error(transparent)]
+    Charter(#[from] CharterError),
+}
+
+/// Set a subordinate's charter, as its head.
+///
+/// This is what a reporting line is *for*. The head decides what the person
+/// below it works on this quarter; the loop in `loops::initiative` picks the new
+/// charter up on the next turn, because [`Charter::load`] is read fresh every
+/// time and [`RolePack::plan`](crate::rolepack::RolePack::plan) is pure.
+///
+/// # Why this is an `Action` variant, when this module argues against them
+///
+/// The module header spends a page arguing that a vertical operation should
+/// *compose* existing actions rather than become one, and the reason it gives is
+/// specific: `issue_rfq` is N × [`Action::EmailSend`], so an `Action::IssueRfq`
+/// would be **one ruling covering N things the gate never saw** — N recipients,
+/// N contact-budget decrements, N chances for the suppression list to matter.
+/// The gate would rule once on something whose cost is the sum of parts it was
+/// not shown.
+///
+/// That reason does not apply here, and it is worth saying exactly why rather
+/// than treating the earlier decision as a rule. Delegation is 1 × 1: one head,
+/// one named subordinate, one row. There is no N. The gate sees the whole of it
+/// — the subject is the entire subject — so there is nothing left over to be
+/// re-implemented inside the operation, which is the failure the composition
+/// argument was protecting against. And there is nothing to compose *out of*:
+/// setting a charter is not an email, a payment or a tool call, so "compose
+/// existing actions" would mean expressing it as an action it is not, which is
+/// the one thing [`Action`] variants are documented never to do.
+///
+/// The other half of the argument — the seventy-tool ceiling — is about the
+/// *model's* catalogue, and this adds nothing to it. `crate::turn`'s catalogue
+/// is a fixed-size array of three, no role pack lists
+/// [`ActionKind::CharterSet`] as proposable, and no code path turns model
+/// output into an `Action::CharterSet`. A model cannot ask to re-task a
+/// colleague; a head's own code does, and the gate rules on it.
+///
+/// # What authority is, and what it is not
+///
+/// Authority here is one link of the org chart: `subordinate` must report
+/// **directly** to `head`. The gate reads that from `team_memberships` in the
+/// transaction it rules in — see [`crate::gate`] — so this function does not
+/// pre-check it, and could not usefully: a check here would be a second answer
+/// to a question the gate already answers against fresher data.
+///
+/// One link and not a walk, deliberately. A CEO directs its heads, not the
+/// whole company: an authority that reaches transitively is a principal that
+/// can re-task every employee in the tenant, which is the single most dangerous
+/// thing this design could grow. A CEO that genuinely needs to re-task somebody
+/// four levels down asks the person in between, exactly as it would in a
+/// company — or the operator changes the org chart, which is an audited act.
+///
+/// And authority is never *capability*. Being a head does not widen one number
+/// in the head's own policy: the four layers the gate intersects do not include
+/// the reporting line, and a Head of Sales that acquires the whole engineering
+/// org still cannot call one tool its team's allowlist does not carry. The
+/// tests below assert that against a real policy, not just in the domain.
+pub async fn delegate(
+    gate: &PolicyGate,
+    db: &Db,
+    head: &Principal,
+    subordinate: EmployeeId,
+    charter: &Charter,
+    now: DateTime<Utc>,
+) -> Result<DecisionId, DelegationError> {
+    // The ruling, and the audit row that records it whichever way it goes.
+    let token = gate
+        .authorize(head, Action::CharterSet { subordinate })
+        .await?;
+
+    let unreachable = |err| DelegationError::Charter(CharterError::Unavailable(err));
+    let mut tx = db.tenant_tx(head.tenant_id).await.map_err(unreachable)?;
+    charter.save(&mut tx, subordinate, now).await?;
+    tx.commit().await.map_err(unreachable)?;
+
+    Ok(token.decision_id())
 }
 
 // ---------------------------------------------------------------------------
@@ -1517,9 +1619,9 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    use agentos_domain::action::Domain;
+    use agentos_domain::action::{Domain, McpTool};
     use agentos_domain::ids::TenantId;
-    use agentos_domain::policy::PolicyLimits;
+    use agentos_domain::policy::{DenyReason, PolicyLimits};
     use agentos_domain::sourcing as buying;
     use agentos_domain::untrusted::Untrusted;
     use agentos_providers::browser::{BrowserSession, MockBrowser};
@@ -1768,6 +1870,297 @@ mod tests {
             "corrupt_charter",
             "the metric label is stable"
         );
+    }
+
+    // -- delegation --------------------------------------------------------
+
+    /// A tenant with a team per function, an employee per seat, and the
+    /// reporting lines between them. Returns the principals in the order they
+    /// were asked for.
+    ///
+    /// Written against `store::org` rather than the HTTP surface because this
+    /// module is below it: what is being tested here is the gate's ruling, and
+    /// the fixture it needs is rows.
+    async fn org(db: &Db, seats: &[(&str, &str, Option<usize>)]) -> Vec<Principal> {
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let label = format!("org-{}", tenant.as_uuid().simple());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        let mut people = Vec::with_capacity(seats.len());
+        for (who, _, _) in seats {
+            let id = EmployeeId::new_v7(Utc::now());
+            sqlx::query(
+                "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+                 VALUES ($1, $2, $3, $3, 'active')",
+            )
+            .bind(id.as_uuid())
+            .bind(tenant.as_uuid())
+            .bind(who)
+            .execute(&mut *tx)
+            .await
+            .expect("insert employee");
+            people.push(id);
+        }
+        tx.commit().await.expect("commit seed");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let mut teams: std::collections::BTreeMap<&str, Uuid> = std::collections::BTreeMap::new();
+        for (i, (_, team, _)) in seats.iter().enumerate() {
+            let id = match teams.get(team) {
+                Some(id) => *id,
+                None => {
+                    let slug = agentos_domain::ids::Slug::parse(team).expect("team slug");
+                    let id = agentos_store::org::create_team(&mut tx, &slug, team)
+                        .await
+                        .expect("create team");
+                    teams.insert(team, id);
+                    id
+                }
+            };
+            agentos_store::org::set_member(&mut tx, people[i], id, None)
+                .await
+                .expect("membership");
+        }
+        // Positions second: a manager must already hold a seat.
+        for (i, (who, _, manager)) in seats.iter().enumerate() {
+            agentos_store::org::set_position(
+                &mut tx,
+                people[i],
+                Some(*who),
+                manager.map(|m| people[m]),
+            )
+            .await
+            .expect("position");
+        }
+        tx.commit().await.expect("commit chart");
+
+        people
+            .into_iter()
+            .map(|id| Principal::employee(tenant, id))
+            .collect()
+    }
+
+    fn sales_charter() -> Charter {
+        Charter::Sales {
+            pack: rolepack_sales::RolePack::sales_development(),
+            objective: sales_objective_value(),
+        }
+    }
+
+    /// The wire: a head sets its report's objective, a peer cannot, and nobody
+    /// sets their own.
+    ///
+    /// Every refusal here is the Policy Gate's, arrives with a code, and leaves
+    /// an audit row — the same treatment as an email to a stranger, because it
+    /// is the same shape of thing: one employee acting on another.
+    #[tokio::test]
+    async fn a_head_may_charter_its_report_and_a_peer_may_not() {
+        let Some(db) = db().await else { return };
+        let people = org(
+            &db,
+            &[
+                ("ceo", "direction", None),
+                ("head-of-sales", "sales", Some(0)),
+                ("sdr", "sales", Some(1)),
+                ("head-of-growth", "growth", Some(0)),
+            ],
+        )
+        .await;
+        let (ceo, head, sdr, peer) = (&people[0], &people[1], &people[2], &people[3]);
+        let gate = gate(&db, head, PolicyLimits::default()).await;
+        let now = Utc::now();
+
+        // The head, down its own line: allowed, and the charter is really
+        // there afterwards.
+        let decision = delegate(&gate, &db, head, sdr.employee_id, &sales_charter(), now)
+            .await
+            .expect("a head may charter its report");
+
+        let mut tx = db.tenant_tx(head.tenant_id).await.expect("tx");
+        let written = Charter::load(&mut tx, sdr.employee_id)
+            .await
+            .expect("load")
+            .expect("a charter was written");
+        assert_eq!(written, sales_charter());
+        // ...and the trail names both halves. "Who re-tasked whom" is the only
+        // question anybody asks about a delegation.
+        let (actor, subject): (String, Option<String>) = sqlx::query_as(
+            "SELECT actor, payload ->> 'subject' FROM audit_log \
+              WHERE decision_id = $1 AND action_kind = 'charter_set'",
+        )
+        .bind(decision.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the delegation was not audited");
+        assert_eq!(actor, format!("employee:{}", head.employee_id.as_uuid()));
+        assert_eq!(subject, Some(sdr.employee_id.as_uuid().to_string()));
+        tx.rollback().await.expect("rollback");
+
+        // A peer — another head, same tenant, same seniority, no line between
+        // them — may not. Nor may the CEO reach two levels down: authority is
+        // one link at a time, and a principal that reaches everybody is the
+        // thing this design exists not to build.
+        for (label, who) in [("a peer", peer), ("the skip-level", ceo)] {
+            let refused = delegate(&gate, &db, who, sdr.employee_id, &sales_charter(), now)
+                .await
+                .expect_err("re-tasked somebody it does not manage");
+            assert!(
+                matches!(
+                    refused,
+                    DelegationError::Refused(Denied::Policy(DenyReason::OutsideChainOfCommand))
+                ),
+                "{label}: {refused}"
+            );
+        }
+
+        // And nobody writes their own, however senior. The CEO is the top of
+        // the chart and it is still refused.
+        for who in [ceo, head, sdr] {
+            let refused = delegate(&gate, &db, who, who.employee_id, &sales_charter(), now)
+                .await
+                .expect_err("an employee re-tasked itself");
+            assert!(
+                matches!(
+                    refused,
+                    DelegationError::Refused(Denied::Policy(DenyReason::SelfDirection))
+                ),
+                "{refused}"
+            );
+        }
+
+        // Nothing the refusals touched left a charter behind.
+        let mut tx = db.tenant_tx(head.tenant_id).await.expect("tx");
+        for who in [ceo, head, peer] {
+            assert!(
+                Charter::load(&mut tx, who.employee_id)
+                    .await
+                    .expect("load")
+                    .is_none(),
+                "a refused delegation wrote a charter"
+            );
+        }
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **Seniority grants no capability.** Asserted against a real stored
+    /// policy, layer by layer, not just as a rule in the domain.
+    ///
+    /// Two functions with genuinely different tools — the Head of Sales has a
+    /// CRM, the CTO has a deploy tool — and the Head of Sales is senior to the
+    /// CTO. If a hierarchy could widen anything, this is where it would show.
+    #[tokio::test]
+    async fn a_head_gains_no_capability_from_the_people_below_it() {
+        let Some(db) = db().await else { return };
+        let people = org(
+            &db,
+            &[("head-of-sales", "sales", None), ("cto", "product", None)],
+        )
+        .await;
+        let (head, cto) = (&people[0], &people[1]);
+        let tenant = head.tenant_id;
+
+        let crm = McpTool::new(
+            agentos_domain::ids::Slug::parse("crm").expect("slug"),
+            agentos_domain::ids::Slug::parse("lookup").expect("slug"),
+        );
+        let deploy = McpTool::new(
+            agentos_domain::ids::Slug::parse("repo").expect("slug"),
+            agentos_domain::ids::Slug::parse("deploy").expect("slug"),
+        );
+
+        // The tenant may do both; each function may do one. `create_team` names
+        // the role layer after the team's slug.
+        let both = PolicyLimits {
+            spend: None,
+            allowed_mcp_tools: [crm.clone(), deploy.clone()].into_iter().collect(),
+            max_turns_per_day: 10,
+            ..PolicyLimits::default()
+        };
+        for (role, tools) in [("sales", [crm.clone()]), ("product", [deploy.clone()])] {
+            agentos_store::policy::install(
+                &db,
+                tenant,
+                agentos_store::policy::Scope::Role(role),
+                &PolicyLimits {
+                    allowed_mcp_tools: tools.into_iter().collect(),
+                    ..both.clone()
+                },
+            )
+            .await
+            .expect("install a role layer");
+        }
+        agentos_store::policy::install(&db, tenant, agentos_store::policy::Scope::Tenant, &both)
+            .await
+            .expect("install the tenant layer");
+
+        // Before: the head has its own team's tool and not the other's.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let before = agentos_store::policy::load(&mut tx, head.employee_id, None)
+            .await
+            .expect("load");
+        assert_eq!(before.limits().allowed_mcp_tools, [crm.clone()].into());
+        tx.rollback().await.expect("rollback");
+
+        // Promote: the CTO now reports to the Head of Sales. In a design where
+        // seniority meant reach, this is the line that would hand over the
+        // deploy tool.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        agentos_store::org::set_position(
+            &mut tx,
+            cto.employee_id,
+            Some("CTO / CPO"),
+            Some(head.employee_id),
+        )
+        .await
+        .expect("reporting line");
+        tx.commit().await.expect("commit");
+
+        // After: byte for byte the same policy. Not "still can't deploy" —
+        // *identical*, so a future edit that widens any other field is caught
+        // by the same assertion.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert_eq!(
+            agentos_store::org::reports(&mut tx, head.employee_id)
+                .await
+                .expect("reports"),
+            vec![cto.employee_id],
+            "the fixture did not actually make it a head"
+        );
+        let after = agentos_store::policy::load(&mut tx, head.employee_id, None)
+            .await
+            .expect("load");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            after, before,
+            "having a report changed the head's effective policy"
+        );
+        assert!(
+            !after.limits().allowed_mcp_tools.contains(&deploy),
+            "the Head of Sales acquired the CTO's tools by being senior to it"
+        );
+
+        // And the gate agrees, which is the part that actually stops anything:
+        // the head, now with a report, still cannot call the tool its own team
+        // does not carry.
+        let gate = PolicyGate::new(db.clone());
+        let denied = gate
+            .authorize(head, Action::McpCall { tool: deploy })
+            .await
+            .expect_err("a head called a tool outside its own allowlist");
+        assert_eq!(denied.code(), "tool_not_allowed", "{denied}");
+        // ...while its own tool still works, so the refusal above is about the
+        // allowlist and not about the employee being broken.
+        gate.authorize(head, Action::McpCall { tool: crm })
+            .await
+            .expect("a head may still do its own job");
     }
 
     // -- which stage is due ------------------------------------------------

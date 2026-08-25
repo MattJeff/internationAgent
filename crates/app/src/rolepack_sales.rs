@@ -771,6 +771,11 @@ mod tests {
             ActionKind::A2aSend,
             ActionKind::CredentialChange,
             ActionKind::DataDelete,
+            // A Head of Sales wears this pack and still may not *propose* a
+            // delegation: authority over a colleague comes from the org chart,
+            // never from the role somebody is wearing, and it is exercised by
+            // `vertical::delegate` rather than chosen by a model mid-turn.
+            ActionKind::CharterSet,
         ] {
             assert!(
                 !sales.may_propose(forbidden),

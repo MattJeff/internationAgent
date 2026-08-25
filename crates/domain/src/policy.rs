@@ -352,6 +352,14 @@ pub enum DenyReason {
     TeamDailyLimit,
     /// The secret does not belong to the acting principal.
     CrossTenantSecret,
+    /// An employee tried to write its own charter. Delegation runs *down* a
+    /// reporting line; an employee that can re-task itself has no objective at
+    /// all, it has a suggestion.
+    SelfDirection,
+    /// The subject of the action does not report to the actor. A peer is not a
+    /// subordinate, and neither is somebody two levels down: the org chart
+    /// grants authority one link at a time.
+    OutsideChainOfCommand,
     CredentialChangeNotAllowed,
     DataDeleteNotAllowed,
     /// The action was derived from untrusted input and is too dangerous to run
@@ -379,6 +387,8 @@ impl DenyReason {
             DenyReason::NoTeamBudget => "no_team_budget",
             DenyReason::TeamDailyLimit => "team_daily_limit",
             DenyReason::CrossTenantSecret => "cross_tenant_secret",
+            DenyReason::SelfDirection => "self_direction",
+            DenyReason::OutsideChainOfCommand => "outside_chain_of_command",
             DenyReason::CredentialChangeNotAllowed => "credential_change_not_allowed",
             DenyReason::DataDeleteNotAllowed => "data_delete_not_allowed",
             DenyReason::UntrustedInput => "untrusted_input",
@@ -679,6 +689,41 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
                 },
             }
         }
+
+        // Delegation. Two conditions, and neither of them is a field in
+        // `PolicyLimits` — which is the whole point.
+        //
+        // **Nobody writes their own charter**, however senior. An employee that
+        // can re-task itself has no objective, it has a preference, and the
+        // loop that re-reads the charter every turn would happily follow
+        // whatever the last turn decided it preferred.
+        //
+        // **The subject must report to the actor**, as `ctx.directs_subject`
+        // says — read from the org chart by the host, in the transaction the
+        // ruling is made in. `ActionCtx::new` sets it to `false`, so a context
+        // nobody filled in denies, exactly like an empty policy: this arm has no
+        // path to `Allow` that a caller can take by omission.
+        //
+        // A `may_delegate` bit in `PolicyLimits` was the alternative and it is
+        // the mistake this design exists to avoid: it would make authority over
+        // *people* a thing a policy *layer* grants, and from there "senior"
+        // starts to mean "wider". Seniority narrows whose charter you may write
+        // — a set of employees — and there is nothing in this match, or in this
+        // file, through which it could reach what an employee may *do*. A head's
+        // own limits still gate every action it takes, delegation included.
+        //
+        // The high-risk taint wire applies as usual: `CharterSet` is
+        // [`Risk::High`], so untrusted input cannot reach an `Allow` here at
+        // all.
+        Action::CharterSet { subordinate } => {
+            if *subordinate == ctx.actor.employee_id {
+                return Decision::deny(DenyReason::SelfDirection);
+            }
+            if !ctx.directs_subject {
+                return Decision::deny(DenyReason::OutsideChainOfCommand);
+            }
+            Decision::Allow
+        }
     }
 }
 
@@ -800,6 +845,9 @@ mod tests {
                     id: ConversationId::from_uuid(uuid::Uuid::from_u128(3)),
                 },
             },
+            Action::CharterSet {
+                subordinate: EmployeeId::from_uuid(uuid::Uuid::from_u128(4)),
+            },
         ]
     }
 
@@ -896,6 +944,79 @@ mod tests {
             ..ctx
         };
         assert!(!evaluate(&effective(&permissive()), &action, &tainted).is_allow());
+    }
+
+    /// Delegation: down the line only, never sideways, never at oneself — and
+    /// **holding authority over somebody widens nothing else**.
+    ///
+    /// That last clause is the one to read. `directs_subject` is the only input
+    /// a reporting line contributes to a ruling, and the loop below flips it on
+    /// every other action in the space and asserts the verdict does not move.
+    /// A future edit that reads it anywhere but the `CharterSet` arm — "heads
+    /// may spend more", "heads may email anyone" — turns this red.
+    #[test]
+    fn a_reporting_line_decides_whom_not_what() {
+        let policy = effective(&permissive());
+        let subordinate = EmployeeId::from_uuid(uuid::Uuid::from_u128(7));
+        let charter = Action::CharterSet { subordinate };
+
+        let peer = ctx();
+        assert!(!peer.directs_subject, "the safe default is no authority");
+        let head = ActionCtx {
+            directs_subject: true,
+            ..ctx()
+        };
+
+        // A peer may not re-task a peer, under the most permissive policy this
+        // system can express. No allowlist can grant this; only the org chart.
+        assert_eq!(
+            evaluate(&policy, &charter, &peer),
+            Decision::Deny {
+                reason: DenyReason::OutsideChainOfCommand
+            }
+        );
+        // Its head may.
+        assert_eq!(evaluate(&policy, &charter, &head), Decision::Allow);
+
+        // Nobody writes their own, however senior — and `directs_subject` does
+        // not buy the exemption, which is why the self check comes first.
+        let self_charter = Action::CharterSet {
+            subordinate: actor().employee_id,
+        };
+        for ctx in [&peer, &head] {
+            assert_eq!(
+                evaluate(&policy, &self_charter, ctx),
+                Decision::Deny {
+                    reason: DenyReason::SelfDirection
+                }
+            );
+        }
+
+        // Delegation is high-risk, so a document cannot ask for one.
+        let injected = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            ..head.clone()
+        };
+        assert_eq!(
+            evaluate(&policy, &charter, &injected),
+            Decision::Deny {
+                reason: DenyReason::UntrustedInput
+            }
+        );
+
+        // The property: seniority is not a capability. Every other action in
+        // the space rules exactly the same for a head as for a peer.
+        for action in one_of_every_action() {
+            if matches!(action, Action::CharterSet { .. }) {
+                continue;
+            }
+            assert_eq!(
+                evaluate(&policy, &action, &head),
+                evaluate(&policy, &action, &peer),
+                "{} ruled differently for an employee that has reports",
+                action.kind()
+            );
+        }
     }
 
     #[test]

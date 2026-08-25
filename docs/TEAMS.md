@@ -43,24 +43,20 @@ What follows from that, and it is the sentence to remember:
 > already permits. `denied_domains` is the one field that *unions* — a lower
 > layer can always add a block, never remove one.
 
-> ### Before you configure anything: the loader is not on the hot path
+> ### This is on the hot path
 >
-> `store::policy::load` behaves exactly as described, and it is tested. But
-> **the Policy Gate does not call it.** `apps/server/src/main.rs` builds
-> `PolicyGate::new(db, PolicyBook::default())` — an in-memory book holding the
-> empty platform layer, with the *employee* layer folded into the role slot.
+> `crates/app/src/gate.rs` calls `store::policy::load` **per decision, inside
+> the decision's own transaction** — so what you write into `policy_layers`
+> under a team's `role_name` is what the Policy Gate rules with, and an
+> operator's change takes effect on the next action rather than the next
+> deploy. A deployment with no `platform` layer has no ceiling and the gate
+> refuses everything until one is installed; that is deliberate, and it is the
+> safe direction.
 >
-> So on today's build, everything you write into `policy_layers` is read by
-> exactly two things: `GET /v1/employees/{id}/turns`, and the initiative loop's
-> turn-budget reservation. **The turn budget is genuinely enforced. No other cap
-> in this document is**, because the gate that would enforce it is loaded with a
-> book that grants nothing — which means it denies every agent-initiated side
-> effect regardless of what you configure.
->
-> That is the correct failure direction and it is still not enforcement.
-> Configure the layers anyway: they are the thing that becomes live the moment
-> `main.rs` loads them, and that is a one-function change. See the **Known gap**
-> at the end of this file for the second half of the same problem.
+> (Earlier revisions of this file warned that the gate used an in-memory
+> `PolicyBook` and read none of this. That is no longer true — `gate.rs` reads
+> the four layers, and its payment path reserves through `store::org::reserve`,
+> which is the team budget below.)
 
 Two more consequences that surprise people:
 
@@ -81,7 +77,9 @@ Two more consequences that surprise people:
 | Create a team and its policy *scope* | Set a cap, an allowlist or a threshold |
 | Repoint a team at a different `role_name` | Widen anything, at any layer, ever |
 | Set a team's daily budget, per currency | Give a **section** a policy or a budget |
+| Say what a team is for (its **mission**) | Make a mission mean anything to the gate |
 | Move an employee between teams | Put one employee on two teams |
+| Name a seat and point a reporting line | Give anybody a capability for being senior |
 | Read the budget and today's spend | Delete a budget or a spend bucket (the ledger is append/update only) |
 
 ---
@@ -190,9 +188,8 @@ This is the half that pays for the org layer. Each employee already has its own
 cap (`0003_spend`), but ten employees on one team can each be under their own
 cap and jointly blow the team's budget, and every individual decision looks
 correct in the logs. So the team budget is **reserved** under a row lock, not
-checked — by `store::org::reserve`, which is written and tested and which
-nothing on the payment path currently calls. Read the **Known gap** at the end
-before you rely on the number you are about to set.
+checked — by `store::org::reserve`, which the Policy Gate calls on every
+permitted payment, in the same transaction as its ruling.
 
 ```sh
 # Purchasing: $5,000 a day, across the whole team.
@@ -328,9 +325,123 @@ call $API/v1/teams/$PURCHASING/members
 ```json
 {"members": [
   {"employee_id": "0198e6b0-11c2-…", "employee_slug": "lena",
-   "section_id": "0198e6c1-…", "since": "2026-08-24T09:31:02.774Z"}
+   "section_id": "0198e6c1-…", "title": "Head of Growth",
+   "reports_to": "0198e6b0-0001-…", "since": "2026-08-24T09:31:02.774Z"}
 ]}
 ```
+
+## 7. The org chart: function, head, mission
+
+The table an operator actually draws has three columns, and each is one thing
+here:
+
+| Fonction | Responsable | Mission |
+|---|---|---|
+| Direction | CEO / fondateur | Vision, stratégie, priorités |
+| Produit et technologie | CTO/CPO | Produit, code, infrastructure, sécurité |
+| Growth | Head of Growth | Acquisition, contenu, SEO, publicité |
+| Commercial | Head of Sales | Prospection, démos, contrats |
+| Clients | Customer Success | Support, activation, fidélisation |
+| Opérations | COO | Automatisation, procédures, partenaires |
+| Finance et juridique | CFO externalisé | Comptabilité, trésorerie, conformité |
+
+* **Fonction** is a team — the same team as everywhere else in this document,
+  with the same policy scope and the same budget. "Growth" is a team.
+* **Responsable** is a **position**: a `title` and a `reports_to` on the
+  membership row that employee already has. There is no positions table. One
+  employee, one team, one seat.
+* **Mission** is one string on the team.
+
+### The mission
+
+```sh
+call -X PUT $API/v1/teams/$GROWTH/mission \
+  -d '{"mission": "Acquisition, contenu, SEO, publicité"}'
+```
+
+```json
+{"team_id": "0198e6c1-…", "mission": "Acquisition, contenu, SEO, publicité"}
+```
+
+Idempotent, and it works on a team created a year ago — you do not get to
+restart the company to give it an org chart. It appears on every team read:
+
+```json
+{"teams": [{"id": "…", "slug": "growth", "name": "Growth",
+            "policy_role": "growth",
+            "mission": "Acquisition, contenu, SEO, publicité",
+            "created_at": "…"}]}
+```
+
+At most 240 characters, not blank, and **no control characters** — a mission is
+prose an employee gets told, and a newline is a free line in a system prompt.
+It is parsed on the way in and re-parsed on every read, so a row edited by hand
+into something that would not have been accepted is refused rather than served.
+
+> **A mission is not a limit.** It grants nothing and restricts nothing. Every
+> restriction is still a `policy_layers` row under the team's `role_name`.
+
+### The head
+
+The same `PUT` that moves an employee is the one that seats it:
+
+```sh
+# The CEO: a seat with nobody above it.
+call -X PUT $API/v1/teams/$DIRECTION/members/$FOUNDER \
+  -d '{"title": "CEO / fondateur"}'
+
+# A head, answering to it.
+call -X PUT $API/v1/teams/$GROWTH/members/$LENA \
+  -d "{\"title\": \"Head of Growth\", \"reports_to\": \"$FOUNDER\"}"
+```
+
+```json
+{"team_id": "0198e6c1-…", "employee_id": "0198e6b0-11c2-…",
+ "section_id": null, "title": "Head of Growth",
+ "reports_to": "0198e6b0-0001-…", "from_team_id": null}
+```
+
+`PUT` replaces the **whole seat** — team, section, title and manager together.
+A field you leave out is *cleared*, not kept: an employee that keeps last
+quarter's reporting line after being moved into a new job is the stale half of
+an org chart nobody edited on purpose.
+
+Four refusals, and none of them is a 500:
+
+| | |
+|---|---|
+| `reports_to` names somebody with no seat, or another tenant's employee | `400` |
+| `reports_to` closes a loop — including reporting to yourself | `409 reporting_cycle` |
+| `DELETE` on a head that still has reports | `409 has_reports`, listing them |
+| `POST …/members` for an employee already on a team | `409 already_on_a_team` |
+
+The third is the one worth dwelling on: an org chart that quietly orphans half a
+department is worse than one that refuses to change until you say what happens
+to the people. Re-point or remove the reports first, then remove the head.
+
+### What "senior" means here, and what it does not
+
+> **Seniority decides who may direct whom. It never decides what a principal may
+> do.**
+
+A head's limits are its **team's** limits, intersected exactly like everybody
+else's. `reports_to` is not a policy layer, `store::policy::load` does not join
+it, and there is no field on this API that widens anything. Making the CTO
+report to the Head of Sales does not move one tool, one euro or one domain into
+the Head of Sales' allowlist — asserted directly in
+`crates/app/src/vertical.rs`, against a real stored policy.
+
+What a reporting line does buy is one thing: a head may set the **charter** —
+the standing objective — of the employees that report to it *directly*. That
+goes through the Policy Gate like any other action an employee takes, produces
+an audit row with `action_kind = 'charter_set'` naming both parties, and is
+refused for a peer (`outside_chain_of_command`) or for oneself
+(`self_direction`), however senior. It is not an HTTP endpoint: it is one
+employee acting on another, `app::vertical::delegate`.
+
+Direct reports only, deliberately. A CEO directs its heads, not the whole
+company: an authority that reached transitively would be a principal that can
+re-task every employee in the tenant.
 
 ---
 
@@ -353,7 +464,8 @@ SELECT occurred_at, actor, payload ->> 'event' AS event, payload
 | `team.created` | `POST /v1/teams` |
 | `section.created` | `POST /v1/teams/{id}/sections` |
 | `team.member_added` | `POST /v1/teams/{id}/members` |
-| `team.member_moved` | `PUT /v1/teams/{id}/members/{employee_id}` — carries `from_team_id` |
+| `team.member_moved` | `PUT /v1/teams/{id}/members/{employee_id}` — carries `from_team_id`, `title`, `reports_to` |
+| `team.mission_set` | `PUT /v1/teams/{id}/mission` — carries `from_mission` |
 | `team.member_removed` | `DELETE /v1/teams/{id}/members/{employee_id}` |
 | `team.policy_role_set` | `PUT /v1/teams/{id}/policy-role` — carries `from_policy_role` |
 | `team.budget_set` | `PUT /v1/teams/{id}/budget` — carries `from_daily_total_minor` |
@@ -363,27 +475,18 @@ authorised these. They are an operator's key acting directly.
 
 ## Known gaps
 
-Two, and they are the same gap seen from two sides: the org layer is fully
-built, fully tested, and has no reader in the running binary.
+**Delegation has no HTTP door.** A head setting a subordinate's charter goes
+through the Policy Gate (`app::vertical::delegate`) and is tested end to end,
+but nothing in the running binary calls it yet: the org chart it reads is
+operator configuration, and the act itself is one employee directing another,
+which is not an operator endpoint. Wiring it is a call site in the turn loop,
+not a change to any rule here.
 
-**The team budget is not checked.** It is stored, read and reported correctly,
-and `store::org::reserve` enforces it under a row lock — but the Policy Gate's
-payment path (`crates/app/src/gate.rs`) calls `spend::reserve`, which takes the
-*employee's* headroom only. `org::reserve` has **no non-test call site**. Until
-that call moves, a team's daily budget is configuration nothing on the hot path
-checks. Per-employee caps are enforced; the team ceiling is not.
-
-**The team's limits are not read at all.** The gate uses an in-memory
-`PolicyBook` and never calls `store::policy::load`, so `policy_layers` — the
-`role` layer this whole document points teams at — reaches the gate through no
-path. `main.rs` constructs the book as `PolicyBook::default()`, the empty
-platform layer, which denies everything. The only live readers of the loader are
-`GET /v1/employees/{id}/turns` and the initiative loop's turn budget, which is
-therefore the one limit in this document that genuinely holds today.
-
-Both are fixed in `main.rs` plus `PolicyBook::effective`, and nothing else has
-to change. Until then, read a configured limit here as *the value that will take
-effect*, not as one that is taking effect.
+**A mission is stored, served and never spoken.** `Charter::system_prompt`
+takes the employee's identity string and the caller composes it, so putting the
+team's mission in front of a new employee is a `format!` at that call site
+rather than a change here. Until somebody makes that call, the mission is a
+durable statement an operator can read back and an employee has not been told.
 
 ## Endpoint summary
 
@@ -395,8 +498,9 @@ effect*, not as one that is taking effect.
 | `GET` | `/v1/teams/{team_id}/sections` | the team's sections |
 | `POST` | `/v1/teams/{team_id}/members` | add — `409` if already on a team → `201` |
 | `GET` | `/v1/teams/{team_id}/members` | the roster |
-| `PUT` | `/v1/teams/{team_id}/members/{employee_id}` | move onto this team |
-| `DELETE` | `/v1/teams/{team_id}/members/{employee_id}` | remove → `204` |
+| `PUT` | `/v1/teams/{team_id}/members/{employee_id}` | seat: team, section, title, reporting line |
+| `DELETE` | `/v1/teams/{team_id}/members/{employee_id}` | remove → `204`, `409` if it has reports |
+| `PUT` | `/v1/teams/{team_id}/mission` | say what this function is for |
 | `PUT` | `/v1/teams/{team_id}/policy-role` | repoint at a `role_name` |
 | `PUT` | `/v1/teams/{team_id}/budget` | set the daily total for one currency |
 | `GET` | `/v1/teams/{team_id}/budget?currency=USD` | budget, today's spend, headroom |

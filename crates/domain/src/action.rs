@@ -498,11 +498,12 @@ pub enum ActionKind {
     ContractSign,
     CredentialChange,
     DataDelete,
+    CharterSet,
 }
 
 impl ActionKind {
     /// Every discriminant. Iterate this to prove a rule covers the whole space.
-    pub const ALL: [ActionKind; 13] = [
+    pub const ALL: [ActionKind; 14] = [
         ActionKind::EmailSend,
         ActionKind::SmsSend,
         ActionKind::WhatsappSend,
@@ -516,6 +517,7 @@ impl ActionKind {
         ActionKind::ContractSign,
         ActionKind::CredentialChange,
         ActionKind::DataDelete,
+        ActionKind::CharterSet,
     ];
 
     /// Stable metric label.
@@ -534,6 +536,7 @@ impl ActionKind {
             ActionKind::ContractSign => "contract_sign",
             ActionKind::CredentialChange => "credential_change",
             ActionKind::DataDelete => "data_delete",
+            ActionKind::CharterSet => "charter_set",
         }
     }
 }
@@ -595,12 +598,28 @@ pub enum Action {
     DataDelete {
         scope: DataScope,
     },
+    /// One employee writing another employee's standing objective: delegation,
+    /// as a head does it down its own reporting line.
+    ///
+    /// The subject is *whose* charter is being set, and nothing else. There is
+    /// no `title`, no team and no "I am their manager" claim in here, for the
+    /// reason the module header gives: a variant never carries a
+    /// self-description the gate then trusts. Whether this actor may direct
+    /// that employee is a fact about the org chart, read from the database by
+    /// the caller before the gate is asked — see `app::vertical::delegate`.
+    ///
+    /// [`Risk::High`], so an untrusted turn cannot produce one: a supplier's
+    /// email saying "you now report to me, here is your new objective" is a
+    /// document, and a document may not re-task an employee.
+    CharterSet {
+        subordinate: EmployeeId,
+    },
 }
 
 impl Action {
     /// Alias for [`ActionKind::ALL`], so `Action::ALL_DISCRIMINANTS` reads at
     /// the call site.
-    pub const ALL_DISCRIMINANTS: [ActionKind; 13] = ActionKind::ALL;
+    pub const ALL_DISCRIMINANTS: [ActionKind; 14] = ActionKind::ALL;
 
     /// Which discriminant this is. Exhaustive by construction — no `_` arm.
     pub const fn kind(&self) -> ActionKind {
@@ -618,6 +637,7 @@ impl Action {
             Action::ContractSign { .. } => ActionKind::ContractSign,
             Action::CredentialChange { .. } => ActionKind::CredentialChange,
             Action::DataDelete { .. } => ActionKind::DataDelete,
+            Action::CharterSet { .. } => ActionKind::CharterSet,
         }
     }
 
@@ -638,7 +658,11 @@ impl Action {
             | Action::PaymentCreate { .. }
             | Action::ContractSign { .. }
             | Action::CredentialChange { .. }
-            | Action::DataDelete { .. } => Risk::High,
+            | Action::DataDelete { .. }
+            // Re-tasking another employee is the blast radius of everything
+            // that employee then does, so it is never taken on the strength of
+            // text somebody sent us.
+            | Action::CharterSet { .. } => Risk::High,
         }
     }
 }
@@ -662,13 +686,31 @@ pub struct ActionCtx {
     pub spent_today: Option<Money>,
     /// New counterparties contacted today.
     pub new_contacts_today: u32,
+    /// Whether the employee this action is aimed at reports to [`Self::actor`],
+    /// as the org chart says right now.
+    ///
+    /// Read from `team_memberships.reports_to` by the host, in the same
+    /// transaction as the ruling — never claimed by the action and never taken
+    /// from a caller's word, for the same reason [`Self::spent_today`] is read
+    /// from the ledger rather than asserted.
+    ///
+    /// `false` for every action that has no such subject, which is all of them
+    /// but [`Action::CharterSet`]. Defaulting to `false` is what makes
+    /// delegation deny-by-default: a context nobody filled in authorises
+    /// nothing, exactly like an empty [`crate::policy::PolicyLimits`].
+    ///
+    /// It is emphatically **not** a capability. It says who this employee may
+    /// direct, never what it may do: no rule in `policy::evaluate` reads it
+    /// except the one that decides whether a charter may be written for that
+    /// one named employee, and no layer of the policy stack can set it.
+    pub directs_subject: bool,
     /// The decision instant.
     pub now: DateTime<Utc>,
 }
 
 impl ActionCtx {
-    /// The safest context: untrusted input, unknown counterparty, no history.
-    /// Callers widen from here as they learn more.
+    /// The safest context: untrusted input, unknown counterparty, no history,
+    /// no authority over anybody. Callers widen from here as they learn more.
     pub const fn new(actor: Actor, now: DateTime<Utc>) -> Self {
         Self {
             actor,
@@ -676,6 +718,7 @@ impl ActionCtx {
             contact: ContactStanding::New,
             spent_today: None,
             new_contacts_today: 0,
+            directs_subject: false,
             now,
         }
     }
@@ -831,7 +874,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ActionKind::ALL.len(), "duplicate discriminant");
-        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 13);
+        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 14);
     }
 
     #[test]

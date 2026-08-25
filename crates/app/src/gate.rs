@@ -23,9 +23,10 @@
 //!    policy is read. A suspension implemented as "remove its permissions"
 //!    leaves behind exactly the permissions nobody remembered to remove.
 //! 2. **Context from real state.** The policy itself, spend already reserved
-//!    today, contacts first reached today, the trust label of the input that
-//!    produced the action — read from the database inside the same
-//!    transaction, never taken from the caller and never from model output.
+//!    today, contacts first reached today, who this employee answers to on the
+//!    org chart, the trust label of the input that produced the action — read
+//!    from the database inside the same transaction, never taken from the
+//!    caller and never from model output.
 //!    The policy is [`agentos_store::policy::load`]: platform ∧ tenant ∧ role ∧
 //!    employee, four rows, one indexed query, read *here* rather than handed to
 //!    the gate at construction. Inside the transaction because the ruling and
@@ -45,6 +46,29 @@
 //!    [`agentos_store::org::reserve`], which is where a per-team budget stops
 //!    being a number somebody wrote down. Checking a cap without consuming it
 //!    is what lets an agent turn one refused payment into ten accepted ones.
+//!
+//! # Seniority is context, never policy
+//!
+//! One action has an employee as its subject: [`Action::CharterSet`], a head
+//! setting a subordinate's objective. The fact that makes it legal — *does this
+//! employee report to that one* — is read here, from `team_memberships`, and
+//! travels in [`ActionCtx::directs_subject`] alongside the ledger and the
+//! contact book. It is context, not policy, and the distinction is the safety
+//! property:
+//!
+//! * the policy is `platform ∧ tenant ∧ role ∧ employee`, four rows, and
+//!   [`agentos_store::policy::load`] does not join the reporting line — so
+//!   acquiring a report cannot change one number in an `EffectivePolicy`;
+//! * the reporting line is consulted by exactly one arm of
+//!   [`agentos_domain::policy::evaluate`], the one that decides whether *this
+//!   named employee's* charter may be written, and by nothing else;
+//! * a head's own limits still gate everything a head does. Being senior to the
+//!   Head of Sales does not hand the CTO's tools to anybody, because there is
+//!   no code path from a manager's id to a tool allowlist.
+//!
+//! So "senior" here means *may direct these people*, and can never come to mean
+//! *may do more things*. `crates/domain/src/policy.rs` asserts it directly, and
+//! `crates/app/src/vertical.rs` asserts it end to end against a real policy.
 //!
 //! # Trust
 //!
@@ -561,12 +585,28 @@ impl PolicyGate {
             }
             _ => None,
         };
+        // The org chart, for the one action that has an employee as its
+        // subject. Read here — from `team_memberships.reports_to`, in this
+        // transaction — for the same reason the ledger is: an authority the
+        // caller asserts is an authority the caller can invent. Every other
+        // action leaves it `false`, which is what `ActionCtx::new` means by the
+        // safest context.
+        let directs_subject = match action {
+            Action::CharterSet { subordinate } => {
+                org::manager_of(tx, *subordinate)
+                    .await
+                    .map_err(Denied::Unavailable)?
+                    == Some(principal.employee_id)
+            }
+            _ => false,
+        };
         let ctx = ActionCtx {
             actor: principal.action_actor(),
             trust,
             contact,
             spent_today,
             new_contacts_today,
+            directs_subject,
             now,
         };
 
@@ -866,7 +906,13 @@ fn counterparty(action: &Action) -> Option<String> {
         | Action::PaymentCreate { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
-        | Action::DataDelete { .. } => None,
+        | Action::DataDelete { .. }
+        // A subordinate is not a counterparty. It goes in the payload under its
+        // own key (see `audit_event`) and deliberately not under this one: this
+        // is what the cold-outreach budget counts, and a head that re-tasks its
+        // team must not spend the day's allowance of strangers on its own
+        // colleagues.
+        | Action::CharterSet { .. } => None,
     }
 }
 
@@ -890,6 +936,15 @@ fn audit_event(
     let mut payload = extra;
     if let Some(who) = counterparty(action) {
         payload.insert(COUNTERPARTY_KEY.to_owned(), json!(who));
+    }
+    // "Who re-tasked whom" is the only question anybody asks about a
+    // delegation, and the actor half of it is already the row's `actor` and
+    // `employee_id`. Without this key the other half is nowhere.
+    if let Action::CharterSet { subordinate } = action {
+        payload.insert(
+            "subject".to_owned(),
+            json!(subordinate.as_uuid().to_string()),
+        );
     }
 
     let decision = match outcome {

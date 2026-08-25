@@ -700,6 +700,12 @@ mod tests {
             ActionKind::A2aSend,
             ActionKind::CredentialChange,
             ActionKind::DataDelete,
+            // Re-tasking a colleague is not buying anything. A pack is a job,
+            // and no job in this workspace includes "decide what somebody else
+            // works on" — that authority comes from the org chart, one
+            // reporting line at a time, and is exercised by
+            // `vertical::delegate` rather than proposed by a model.
+            ActionKind::CharterSet,
         ] {
             assert!(
                 !buyer.may_propose(forbidden),
