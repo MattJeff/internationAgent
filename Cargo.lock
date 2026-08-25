@@ -150,10 +150,13 @@ dependencies = [
  "agentos-domain",
  "agentos-providers",
  "agentos-store",
+ "async-trait",
  "chrono",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

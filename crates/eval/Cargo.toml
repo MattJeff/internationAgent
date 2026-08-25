@@ -23,3 +23,24 @@ serde_json.workspace = true
 sha2.workspace = true
 # Only the `--live` path is async; the deterministic suites are plain functions.
 tokio.workspace = true
+
+# --- `--dry-run` only, and optional for exactly that reason -------------------
+# The dry run wires a real `Turn` to a real database, which needs the four
+# crates above plus the pieces below. None of them is reachable from the
+# deterministic suites, so a default build does not compile one of them.
+async-trait = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[features]
+# `--dry-run`: Orizn stood up in a real database, working against the real
+# model through the local `claude` CLI.
+#
+# A feature and not a runtime skip, for the reason `crates/app`'s identically
+# named feature gives: `scripts/test.sh` fails the build when anything prints
+# `SKIP:`, because ~34 tests in this workspace skip themselves without a
+# database and a green run of nothing is the failure nobody notices. This needs
+# a database *and* a logged-in `claude` binary *and* about ten minutes, so it
+# opts out of the default build entirely — the code is *absent* rather than
+# present and quietly doing nothing.
+live-orizn = ["dep:async-trait", "dep:tokio-util", "dep:uuid"]

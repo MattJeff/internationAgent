@@ -254,7 +254,19 @@ fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 5] {
             PAY,
             ActionKind::PaymentCreate,
             Risk::High,
-            "Pay a supplier. Money only moves once, so say what it is for.",
+            // The second sentence is a correction, not a flourish. It said only
+            // the first, and `agentos_eval::dryrun` caught a finance employee
+            // declining a correctly-approved settlement in as many words: "there
+            // is no approval step available to me here — the `pay` tool moves
+            // money directly". That is false of every deployment: any amount at
+            // or above `approval_above` is `Decision::RequireApproval`, and
+            // Orizn sets that to one dollar, so *every* payment it makes comes
+            // back as `denied (pending_approval)` with the money still in the
+            // account. A description that understates what a tool does is a
+            // tool an employee talks itself out of using.
+            "Pay a supplier. Money only moves once, so say what it is for. At or above your \
+             approval threshold this does not move the money: it puts the payment to a person \
+             and answers `pending_approval`.",
             json!({
                 "type": "object",
                 "properties": {

@@ -63,6 +63,11 @@
 //! They print differently and they are counted separately. Nothing here
 //! promotes the second into the first.
 
+/// Orizn stood up for real, working against the real model. Behind a feature,
+/// because it needs a database and a logged-in `claude` binary; see its own
+/// module docs and `crates/eval/Cargo.toml`.
+#[cfg(feature = "live-orizn")]
+pub mod dryrun;
 pub mod expectation;
 pub mod ranking;
 pub mod scoping;

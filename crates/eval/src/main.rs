@@ -4,6 +4,9 @@
 //! cargo run -p agentos-eval                     the deterministic suites (also `cargo test`)
 //! cargo run -p agentos-eval -- --live           …plus the model held-out set, ~1 minute
 //! cargo run -p agentos-eval -- --live --model X  a different model
+//!
+//! DATABASE_URL=… cargo run -p agentos-eval --features live-orizn -- --dry-run [passes]
+//!                                               Orizn stood up for real and worked, ~10 min
 //! ```
 //!
 //! The deterministic half is the same code CI runs as a test, so this binary
@@ -26,6 +29,20 @@ async fn main() {
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
         .map_or(DEFAULT_MODEL, String::as_str);
+
+    // The dry run is not a suite and does not print one: it stands a company up
+    // and works it, which is its own report. Nothing below it applies.
+    #[cfg(feature = "live-orizn")]
+    if args.iter().any(|a| a == "--dry-run") {
+        let passes = args
+            .iter()
+            .position(|a| a == "--dry-run")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1);
+        agentos_eval::dryrun::run(model, passes).await;
+        return;
+    }
 
     let surfaces = deterministic();
     print!("{}", render(&surfaces));

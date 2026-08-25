@@ -19,20 +19,47 @@
 //! * **One turn, no history reuse.** Every call is a fresh `claude -p`; the
 //!   conversation is re-rendered as text each time.
 //!
-//! # Two things it deliberately does
+//! # What it deliberately does
 //!
 //! The prompt goes in on **stdin**, never argv. A prompt is attacker-influenced
 //! text (a customer email is in there); as an argument, one starting with `--`
 //! is a flag, and there is no shell string to quote wrong because we spawn the
 //! program directly with [`tokio::process::Command`].
 //!
-//! The CLI's own tools are **disabled** with an empty `--allowed-tools`. Left
-//! on, the CLI would read files and run bash on the host as a side effect of
-//! what is supposed to be a pure text completion — the employee's tool policy
-//! lives in the agent runtime, not in a subprocess we cannot see.
-//!
 //! Everything is bounded by [`CliLlm::DEFAULT_TIMEOUT`] and the child is killed
 //! on drop, so a wedged CLI costs one turn, not a worker forever.
+//!
+//! # `--allowed-tools ""` does **not** disable the CLI's own tools
+//!
+//! This module used to claim it did, and `agentos_eval::dryrun` measured the
+//! claim against `claude` 2.1.231 on 2026-08-26. It is false, twice over:
+//!
+//! * The session's `system`/`init` event listed **122 tools and 18 MCP
+//!   servers**. `--allowed-tools` is an auto-approve list, not a registration
+//!   list, so an empty one approves nothing and *withholds* nothing.
+//! * Asked to read a file, the CLI called `Read` and returned the file's
+//!   contents, with `permission_denials: []`. Naming the built-ins in
+//!   `--disallowed-tools` does not close it either — the model reached for
+//!   `ToolSearch` instead, and enumerating a moving list of 122 names is not a
+//!   fix.
+//!
+//! So this adapter runs the prompt — which contains a counterparty's text —
+//! through an agent that has file and shell tools on the operator's host. That
+//! is why this backend is for a workstation and never for a deployment, and it
+//! is a second reason on top of the lossiness above.
+//!
+//! **It is also the most common way a turn dies.** When the CLI's own agent
+//! loop calls one of those tools, `--max-turns 1` ends the session as
+//! `subtype: error_max_turns`, `is_error: true`, **exit 1** — so this adapter
+//! reports `cli_failed`, `Turn::run` raises `TurnError::Llm`, and the whole
+//! employee turn is lost with no reply. The dry run saw it on 2 of 9 turns.
+//!
+//! Closing it properly is an interface change, not a flag: `--system-prompt`
+//! for [`LlmRequest::system`] (which would also stop the employee arguing with
+//! Claude Code's own identity — see the dry run's transcripts), plus
+//! `--strict-mcp-config` and `--setting-sources`, which together move the
+//! `--live` numbers and need the digests in `agentos_eval::toolchoice`
+//! re-pinned.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -93,8 +120,10 @@ impl CliLlm {
             .arg("-p")
             .args(["--output-format", "json"])
             .args(["--model", model])
-            // Empty allow-list: no Read, no Bash, no Edit. A text completion
-            // must not touch the host filesystem.
+            // Intended as "no Read, no Bash, no Edit". It is not: see this
+            // module's header — an empty allow-list approves nothing and
+            // withholds nothing, and the CLI reads files anyway. Kept because
+            // removing it would change nothing except the record of intent.
             .args(["--allowed-tools", ""])
             .args(["--max-turns", "1"])
             .stdin(Stdio::piped())
@@ -431,7 +460,11 @@ mod tests {
             !argv.contains("dangerously"),
             "prompt text leaked into argv: {argv}"
         );
-        // And the CLI's own tools are switched off.
+        // And the flag is on argv. That is *all* this asserts: it is a check on
+        // this process, not on the CLI's behaviour, and against `claude`
+        // 2.1.231 the CLI ignores it — 122 tools stay live and `Read` runs.
+        // See this module's header. Nothing in this file can prove otherwise
+        // without the real binary, which is `agentos_eval::dryrun`'s job.
         assert!(argv.contains("--allowed-tools\n\n"), "{argv}");
     }
 
