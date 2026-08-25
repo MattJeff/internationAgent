@@ -242,6 +242,12 @@ tenant uuid and `employees.tenant_id` has a foreign key to it, so insert that
 row with `psql` before the first hire. `docs/OPERATIONS.md` §1 is the full
 first-run path.
 
+**And a fresh database has no policy ceiling**, which means the gate denies
+every action and `/readyz` answers 503 `no_platform_policy`. One command, after
+the first boot: `agentos-server policy install`. It writes the platform layer
+with the operator's own database credentials — there is no API key that could
+authorise it, because the ceiling belongs to no tenant.
+
 ## Running it without paying anyone
 
 `AGENTOS_ALLOW_MOCKS=1` plus the `claude` CLI backend runs the whole thing end

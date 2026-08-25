@@ -95,16 +95,95 @@ VALUES ('00000000-0000-0000-0000-000000000001', 'acme', 'Acme');
 Run it as the connecting role (`psql "$DATABASE_URL"`), not through the app —
 `tenants` is not tenant-scoped and there is no path to it from a `tenant_tx`.
 
-### 1.5 Boot and check
+### 1.5 The policy ceiling you have to install
+
+**This is the step that decides whether the deployment does anything at all.**
+
+The Policy Gate reads its limits out of `policy_layers` on every decision and
+takes the strictest of four layers — platform ∧ tenant ∧ role ∧ employee. The
+top one, the **platform ceiling** (`tenant_id IS NULL`), is the only layer with
+nothing above it to inherit from, so its absence is not "unrestricted", it is
+"no policy". With no ceiling `store::policy::load` answers `NoPlatformLayer` and
+**every action for every tenant is denied** with `no_platform_policy`: no email
+leaves, no payment is proposed, no employee takes a turn.
+
+A fresh database has no ceiling. Install one:
+
+```bash
+agentos-server policy install
+# or, from the repo: cargo run -p agentos-server -- policy install
+```
+
+It reads `DATABASE_URL` and nothing else. That is deliberate and it is the whole
+authorisation story: the platform layer belongs to no tenant, every route in this
+server derives its tenant from the API key, and a platform-wide write authorised
+by one tenant's key would be a privilege escalation with a JSON body. The
+operator's proof of authority here is the database credential — so this is a
+subcommand and not an endpoint. The argument in full is in
+`apps/server/src/policy.rs`.
+
+It needs the schema, so run it **after** the first boot (which migrates — §1.3);
+if you run it first it tells you so. No restart afterwards: the gate reads the
+ceiling per decision, so `/readyz` goes green on the next probe.
+
+**The default ceiling, and why each number.** It is a *ceiling* — the widest
+anything in this deployment may be — and not a recommendation. It is also, until
+somebody writes a tenant layer, the effective policy of every tenant, because an
+absent layer inherits the one above it.
+
+| | default | why |
+|---|---|---|
+| per transaction | **$500** | one unattended payment, the size of a routine invoice or a renewal: useful, and recoverable when it is wrong |
+| approval threshold | **$100** | the "nobody looks" line — at or above it a human presses the button |
+| per day | **$2 000** | the structuring guard, four transactions wide |
+| channels | **email, internal, web** | email is what the product is for, internal never leaves the process, web is the console. SMS/WhatsApp/voice reach a phone (two of them have no adapter in this build); A2A talks to somebody else's agent. Per-deployment decisions, not defaults |
+| calling codes | **none** | follows from the above: a country list under no phone channel grants nothing |
+| domains, MCP tools, A2A peers | **none — i.e. denied** | there is no wildcard domain to write (a `Domain` needs two labels and matches by label suffix) and no universal tool or peer. Naming them is a deployment's own decision, and this is the surface where a model is reading attacker-controlled text |
+| new contacts/day | **50** | a working day of deliberate first contacts, well under what gets a sending domain blocklisted |
+| turns/day | **200** | the only limit on an employee that never spends money: ~one wake every seven minutes, above any human-paced workload, and a bound on what a wedged initiative loop costs overnight |
+| uploads, credential changes, data deletion | **off** | an upload is the exfiltration primitive; a credential change rotates a secret the deployment depends on; deleting a conversation is the one flag that makes erasing customer data unattended |
+
+**To widen it** — and only the operator can — save the JSON the command printed,
+edit it, and install that:
+
+```bash
+agentos-server policy install ceiling.json
+```
+
+Everything below the ceiling can only narrow it. A tenant, team or employee layer
+naming a bigger number does not get a bigger number; it gets the ceiling's. That
+is `EffectivePolicy::try_new`, which takes the minimum of every cap and the
+intersection of every allowlist, and there is no read path that skips it.
+
+**It is idempotent and versioned.** Installing the same ceiling twice does not
+create a second version — the second run prints `unchanged` and writes nothing,
+so a deploy script can run it every time. Anything different becomes a new
+active version, and the old one stays in `policy_versions`:
+
+```bash
+agentos-server policy rollback     # the previous ceiling is active again
+```
+
+Rollback is a pointer flip, so it restores exactly what was there — nothing is
+edited in place and nothing is deleted. Rolling back the *first* ceiling is
+refused: it would leave the deployment denying everything, which is not an undo.
+
+Limits for one tenant, team or employee are still SQL — see `docs/TEAMS.md` §2.
+The ceiling is the part that had no path at all.
+
+### 1.6 Boot and check
 
 ```bash
 cargo run -p agentos-server
 ```
 
-The first lines on stdout are JSON. Two of them matter:
+The first lines on stdout are JSON. Three of them matter:
 
 * `RUNNING WITH MOCK ADAPTERS — these providers do nothing real.` — expected
   here, and a bug anywhere you care about.
+* `NO PLATFORM POLICY LAYER: …` — on the very first boot, before §1.5. The
+  process starts anyway (a crash loop would leave you nothing to read) and
+  refuses every action until you install a ceiling.
 * `listening` with the bind address.
 
 Then, from another shell:
@@ -114,6 +193,7 @@ KEY=0123456789abcdef0123456789abcdef
 
 curl -s localhost:8090/livez                      # -> ok
 curl -s localhost:8090/readyz                     # -> {"ready":true,"outbox_lag_secs":0}
+# ...but 503 {"error":"no_platform_policy"} until §1.5 has been run.
 curl -s -H "Authorization: Bearer $KEY" localhost:8090/v1/whoami
 # -> {"tenant_id":"00000000-...-0001","actor":"ops"}
 
@@ -153,7 +233,7 @@ The four `health` values, and what each is derived from:
 An optional step deliberately turned off (`disabled`) does not degrade anything;
 one that is `failed`, `pending` or `pending_external` does.
 
-### 1.6 The test suite
+### 1.7 The test suite
 
 ```bash
 docker compose up -d
@@ -475,13 +555,22 @@ or
 
 ```json
 503 {"error":"database","message":"this replica is not ready"}
+503 {"error":"no_platform_policy","message":"this replica is not ready"}
 503 {"error":"outbox_lag","message":"this replica is not ready"}
 ```
 
-Two questions in one round trip:
+Three questions, one round trip each:
 
-1. **Can we get a connection?** `database` if not.
-2. **Is the outbox draining?** `outbox_lag` if the oldest *due, unpublished,
+1. **Can we get a connection, against a migrated schema?** `database` if not.
+   Not a separate migration check: both queries below read tables that only the
+   migrations create, so an un-migrated database answers `42P01` and this
+   refuses.
+2. **Is there a platform policy ceiling?** `no_platform_policy` if not — the
+   gate is fail-closed, so a replica without one serves 200s and refuses every
+   piece of work, which is the shape of outage nobody pages on. The fix is
+   §1.5, and the reason string is the gate's own deny code, so the probe and the
+   metric say the same word.
+3. **Is the outbox draining?** `outbox_lag` if the oldest *due, unpublished,
    still-retryable* event is more than **300s** old (`MAX_OUTBOX_LAG_SECS`).
 
 A wedged outbox means side effects are being accepted and not performed, which
@@ -501,6 +590,7 @@ Reading it:
 | symptom | what it means |
 |---|---|
 | `livez` 200, `readyz` 503 `database` | Postgres is unreachable or the pool is exhausted. Do not restart the pod; fix the database. |
+| `livez` 200, `readyz` 503 `no_platform_policy` | No policy ceiling: this replica would deny every action. Run `agentos-server policy install` ([§1.5](#15-the-policy-ceiling-you-have-to-install)). No restart needed. |
 | `livez` 200, `readyz` 503 `outbox_lag` | The poller is behind or wedged. Check for a handler that is failing every time — look at `last_error` on the oldest unpublished row. |
 | `readyz` 200 with a big `outbox_lag_secs` | A backlog that is draining. Watch the number, not the status. |
 | `livez` not answering | The runtime is blocked or the process is gone. This one is a restart. |
@@ -907,12 +997,19 @@ state for an otherwise online employee.
 ingest at the other end of the queue, so an SMS reply to an employee's number is
 not delivered anywhere. Outbound SMS is real; inbound is not.
 
-**The Policy Gate is loaded with `PolicyBook::default()`, which grants nothing.**
-An unconfigured gate denies everything — the correct behaviour for an
-unconfigured gate, and it means that on a stock deployment **every
-agent-initiated side effect is denied.** The `policy_versions` / `policy_layers`
-schema from `0006_policy.sql` and the loader in `agentos_store::policy` exist,
-are tested, and have **no caller**. Wiring them is a change in `main.rs`.
+**The Policy Gate reads its limits from Postgres, and an empty database grants
+nothing.** The gate loads `policy_layers` per decision, so a cap an operator
+changes takes effect on the next action rather than the next deploy — and a
+deployment with no platform ceiling denies **every** agent-initiated side effect
+until one is installed ([§1.5](#15-the-policy-ceiling-you-have-to-install)).
+`agentos-server policy install` is the only writer of a platform layer outside a
+test fixture.
+
+**There is still no writer for tenant, role or employee layers.** The ceiling
+has a command; the three layers under it are `INSERT`s you write by hand, under
+the team's `role_name` in the tenant's active version — `docs/TEAMS.md` §2 has
+the SQL. Until then every tenant runs on the ceiling itself, because an absent
+layer inherits the one above it.
 
 **`AGENTOS_MASTER_KEY` is load-bearing, and this is the second exception.**
 `mocks::adapters(master_key)` threads it into a real `LocalEnvelopeSecretStore`

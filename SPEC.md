@@ -1038,9 +1038,14 @@ action is needed to restart it.
 `max_turns_per_day`, `turns_remaining` and `exhausted`. An unknown or foreign id
 is **404, not 403**.
 
-**NOT BUILT:** any writer API for `policy_layers`. Limits and turn budgets are
-written by SQL today — see `docs/TEAMS.md` §2. There is no env var for the turn
-budget and no per-tenant timezone; the day is UTC, shared with the spend ledger.
+**PARTLY BUILT:** the *platform ceiling* has a writer —
+`agentos-server policy install`, which installs a documented default, is
+idempotent, and rolls back (`apps/server/src/policy.rs`; `docs/OPERATIONS.md`
+§1.5). It is a subcommand rather than a route because the platform layer belongs
+to no tenant and every route here derives its tenant from the API key. Tenant,
+role and employee limits are still SQL — see `docs/TEAMS.md` §2. There is no env
+var for the turn budget and no per-tenant timezone; the day is UTC, shared with
+the spend ledger.
 
 ---
 

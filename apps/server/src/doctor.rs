@@ -773,6 +773,39 @@ async fn postgres(url: &str) -> Report {
         },
     );
 
+    // The one check that can be green on every other line and still mean
+    // "this deployment refuses to do anything": with no platform ceiling the
+    // gate denies every action for every tenant, and a doctor that says
+    // "Nothing is missing" to that is the exact failure this tool exists to
+    // prevent.
+    //
+    // The predicate is `store::policy`'s own, verbatim, because a diagnostic
+    // that can disagree with the loader it reports on is worse than no
+    // diagnostic. Skipped rather than guessed when the query fails: on an
+    // un-migrated database the table does not exist, and the migrations line
+    // above already says so.
+    if let Ok(installed) = sqlx::query_scalar::<_, bool>(agentos_store::policy::CEILING_EXISTS_SQL)
+        .fetch_one(&pool)
+        .await
+    {
+        report.push(
+            "policy ceiling",
+            if installed {
+                Status::Ok
+            } else {
+                Status::Missing
+            },
+            if installed {
+                "an active platform layer exists; the gate has a ceiling to enforce"
+            } else {
+                "none — the gate is fail-closed, so EVERY action is denied with \
+                 `no_platform_policy` and /readyz reports not-ready. Install one with \
+                 `agentos-server policy install` (DATABASE_URL and nothing else; no restart \
+                 needed afterwards)."
+            },
+        );
+    }
+
     // The whole reason PENDING EXTERNAL exists: a number waiting on a Twilio
     // regulatory bundle is a wait, and an operator told it is a failure goes
     // looking for a bug that is not there.

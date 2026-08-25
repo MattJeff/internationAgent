@@ -33,6 +33,7 @@ mod doctor;
 mod error; // U30
 mod loops; // U35 U36 U37
 mod metrics;
+mod policy;
 mod routes; // U31 U32 U33 U34
 
 use std::collections::HashMap;
@@ -148,12 +149,17 @@ enum BootError {
 }
 
 fn main() -> ExitCode {
-    // `doctor` answers "what do I still need to make this work?" without booting
-    // a server, so it runs before anything that could fail on a missing var —
-    // otherwise the diagnostic tool would need the configuration it exists to
-    // diagnose.
-    if std::env::args().nth(1).as_deref() == Some("doctor") {
-        return doctor::main();
+    // Both subcommands run before `Config::from_env`, and for the same reason:
+    // `doctor` answers "what do I still need to make this work?" and `policy`
+    // installs the one thing it cannot answer for, so neither may require the
+    // configuration it exists to fix. `policy` reads `DATABASE_URL` itself and
+    // nothing else — see that module for why the ceiling is a subcommand and
+    // not a route.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("doctor") => return doctor::main(),
+        Some("policy") => return policy::main(&args[1..]),
+        _ => {}
     }
 
     match run() {
@@ -211,26 +217,26 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // rows in Postgres, so `Config::parse` could not have known.
     //
     // **Warned, not refused, and the two are different levers.** A refusal here
-    // crash-loops a fresh install: there is no route that writes `policy_layers`
-    // yet, so the ceiling arrives out of band, and a pod in CrashLoopBackOff
-    // spends most of its life not running while the operator is trying to read
-    // why. `/readyz` refuses instead, which is what readiness is *for* — the
-    // process stays up and keeps saying what is wrong on a schedule, and the
+    // crash-loops a fresh install: the ceiling is installed out of band, by an
+    // operator running a command against this database, and a pod in
+    // CrashLoopBackOff spends most of its life not running while they are trying
+    // to read why. `/readyz` refuses instead, which is what readiness is *for* —
+    // the process stays up and keeps saying what is wrong on a schedule, and the
     // replica never joins a load balancer while every action it would take is
     // denied. Loud here, closed there, is the only combination where "a fresh
     // install has to be able to start" and "a server that denies everything
     // must not look healthy" are both true.
     if !agentos_store::policy::platform_ceiling_installed(&db).await? {
-        // Names the rows rather than an API, because there is no API: nothing
-        // in this workspace writes `policy_layers` outside fixtures, so the
-        // operator's only path is SQL and a warning that says "install one"
-        // without saying what one *is* sends them to read four modules.
+        // Names the command, not the rows. It used to name the rows because
+        // there was nothing else to name; a warning that says "install one"
+        // without saying *how* is a warning that sends an operator to read four
+        // modules and then write SQL by hand.
         tracing::warn!(
             "NO PLATFORM POLICY LAYER: the gate is fail-closed, so every action this \
              deployment takes will be denied with `no_platform_policy`, and /readyz \
-             will report not-ready, until there is an active `policy_versions` row \
-             with `tenant_id IS NULL` carrying a `platform` row in `policy_layers`. \
-             See crates/store/src/policy.rs."
+             will report not-ready, until a ceiling is installed. Run: \
+             `agentos-server policy install` (it takes DATABASE_URL and nothing else, \
+             and needs no restart afterwards)."
         );
     }
 
@@ -1805,8 +1811,15 @@ mod tests {
     /// its own test: `own_database` migrates, and both of `/readyz`'s queries
     /// read tables that only migrations create, so an un-migrated database
     /// cannot reach the `ready: true` branch at all.
+    ///
+    /// The rest of it is the whole first-run sequence, end to end and in order,
+    /// because that sequence is the thing that was broken: empty database →
+    /// 503 and a gate that will not produce a policy at all → the operator runs
+    /// `agentos-server policy install` → 200, and the same action is now a
+    /// decision about money. Then the same story backwards: a ceiling that was
+    /// a mistake, and a rollback that undoes it without a database console.
     #[tokio::test]
-    async fn readyz_refuses_until_a_platform_policy_ceiling_is_installed() {
+    async fn readyz_refuses_until_the_operator_installs_a_ceiling_and_follows_the_rollback() {
         let Some((db, admin_url, database)) = own_database("readyz").await else {
             return;
         };
@@ -1865,11 +1878,10 @@ mod tests {
             "the probe has to name the reason, in the gate's own word: {body}"
         );
 
-        // The ceiling, written the one way anything in this workspace writes
-        // one. The tenant layer's own limits are irrelevant here; `install`
-        // maintains the platform row as a side effect, and that row is the
-        // whole subject.
+        // A tenant that has written no policy of its own — which is every
+        // tenant on a fresh install, since nothing writes a tenant layer either.
         let tenant = TenantId::new_v7(Utc::now());
+        let employee = EmployeeId::new_v7(Utc::now());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
             .bind(tenant.as_uuid())
@@ -1878,18 +1890,113 @@ mod tests {
             .await
             .expect("insert tenant");
         tx.commit().await.expect("commit the tenant");
-        agentos_store::policy::install(
-            &db,
-            tenant,
-            agentos_store::policy::Scope::Tenant,
-            &agentos_domain::policy::PolicyLimits::default(),
-        )
-        .await
-        .expect("install a ceiling");
+
+        // $45, which is under the default ceiling's approval threshold, and
+        // trusted — so nothing but the ceiling itself decides the answer.
+        let rule_on = async |db: &Db| {
+            let ctx = agentos_domain::action::ActionCtx {
+                trust: agentos_domain::untrusted::TrustLabel::Trusted,
+                ..agentos_domain::action::ActionCtx::new(
+                    agentos_domain::action::Actor::new(tenant, employee),
+                    Utc::now(),
+                )
+            };
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let loaded = agentos_store::policy::load(&mut tx, employee, None).await;
+            tx.rollback().await.expect("rollback");
+            loaded.map(|policy| {
+                let pay = |minor| agentos_domain::action::Action::PaymentCreate {
+                    amount: agentos_domain::money::Money::new(
+                        minor,
+                        agentos_domain::money::Currency::Usd,
+                    )
+                    .expect("non-zero"),
+                };
+                (
+                    agentos_domain::policy::evaluate(&policy, &pay(4_500), &ctx),
+                    agentos_domain::policy::evaluate(&policy, &pay(15_000), &ctx),
+                )
+            })
+        };
+
+        // Before the ceiling: not a denial with a reason, a refusal to assemble
+        // a policy at all. Every action in the deployment ends here.
+        assert!(
+            matches!(
+                rule_on(&db).await,
+                Err(agentos_store::policy::PolicyLoadError::NoPlatformLayer)
+            ),
+            "an empty deployment must have no policy, not a permissive one"
+        );
+
+        // The install, through the same function `agentos-server policy install`
+        // calls, with the same default. No fixture.
+        let ceiling = agentos_store::policy::default_ceiling();
+        let good = agentos_store::policy::install_ceiling(&db, &ceiling, "default ceiling")
+            .await
+            .expect("install the ceiling");
 
         let (status, body) = probe(db.clone()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("\"ready\":true"), "{body}");
+
+        // Ready is not the claim; this is. The same action that could not even
+        // be ruled on a moment ago is now a decision about money, and the
+        // default ceiling's $100 threshold is the thing deciding it.
+        let (small, large) = rule_on(&db).await.expect("a policy exists now");
+        assert_eq!(small, agentos_domain::policy::Decision::Allow);
+        assert!(
+            matches!(
+                large,
+                agentos_domain::policy::Decision::RequireApproval {
+                    reason: agentos_domain::policy::ApprovalReason::PaymentAboveThreshold,
+                    ..
+                }
+            ),
+            "the ceiling's approval threshold has to be the live one: {large:?}"
+        );
+
+        // The mistake an operator makes at 16:00 on a Friday: a ceiling with no
+        // spend policy at all. It is still a ceiling, so the replica stays
+        // ready — and every payment is refused for the reason that names the
+        // remedy.
+        let mut wrong = ceiling.clone();
+        wrong.spend = None;
+        agentos_store::policy::install_ceiling(&db, &wrong, "no spending")
+            .await
+            .expect("install the wrong one");
+        let (status, body) = probe(db.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            rule_on(&db).await.expect("still a policy").0,
+            agentos_domain::policy::Decision::Deny {
+                reason: agentos_domain::policy::DenyReason::NoSpendPolicy
+            }
+        );
+
+        // The undo, with no psql.
+        assert_eq!(
+            agentos_store::policy::rollback_ceiling(&db)
+                .await
+                .expect("roll back"),
+            good.version()
+        );
+        let (status, body) = probe(db.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            rule_on(&db).await.expect("a policy").0,
+            agentos_domain::policy::Decision::Allow,
+            "the rollback has to restore the ceiling that worked"
+        );
+
+        // The bad version is still there, inactive — a rollback is a pointer
+        // flip, not a delete, so rolling back again returns to it rather than
+        // failing. (Rolling back into *nothing* is the case that is refused,
+        // and it is asserted where it can be set up: `store::policy`'s tests.)
+        assert!(
+            agentos_store::policy::rollback_ceiling(&db).await.is_ok(),
+            "the superseded version is history, not garbage"
+        );
 
         drop_database(db, admin_url, database).await;
     }

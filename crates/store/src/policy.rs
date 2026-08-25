@@ -33,10 +33,23 @@
 //! is a policy where the approval step can never fire, and the safe reading of
 //! it is not "approve nothing", it is "this configuration is wrong, refuse to
 //! run on it".
+//!
+//! # Getting a ceiling into an empty database
+//!
+//! [`install_ceiling`] writes one, [`default_ceiling`] is the one worth
+//! shipping, and [`rollback_ceiling`] undoes it. They are driven by
+//! `agentos-server policy install`, which is the whole operator story: without a
+//! platform layer [`load`] answers [`PolicyLoadError::NoPlatformLayer`] and the
+//! deployment denies every action, and until that command existed the only way
+//! to fix it was hand-written SQL.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
+
+use sqlx::Postgres;
+use sqlx::postgres::PgArguments;
+use sqlx::query::Query;
 
 use agentos_domain::action::{CallingCode, Domain, McpTool};
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
@@ -310,6 +323,23 @@ pub async fn max_turns_per_day(
         .collect())
 }
 
+/// "Is there an active platform ceiling?", as one statement returning one bool.
+///
+/// The predicate is the `platform` arm of [`SELECT_ACTIVE_LAYERS`] verbatim,
+/// because a probe that can disagree with the loader it reports on is worse
+/// than no probe.
+///
+/// Public because two callers ask it against two different pools:
+/// [`platform_ceiling_installed`] holds a [`Db`], and `agentos-server doctor`
+/// holds a one-connection diagnostic pool it deliberately will not swap for a
+/// real one. One spelling, two callers — the argument against a second copy of
+/// this predicate does not stop at the crate boundary.
+pub const CEILING_EXISTS_SQL: &str = "\
+    SELECT EXISTS ( \
+      SELECT 1 FROM policy_layers l \
+        JOIN policy_versions v ON v.id = l.version_id \
+       WHERE v.active AND l.layer = 'platform' AND v.tenant_id IS NULL)";
+
 /// Is there an active platform ceiling at all?
 ///
 /// [`load`] asks this per decision and answers [`PolicyLoadError::NoPlatformLayer`]
@@ -319,23 +349,14 @@ pub async fn max_turns_per_day(
 /// `/readyz` can say "this replica will deny every action" *before* anybody
 /// discovers it the other way.
 ///
-/// Deliberately not a second definition of the ceiling: the predicate is the
-/// `platform` arm of [`SELECT_ACTIVE_LAYERS`] verbatim, because a probe that can
-/// disagree with the loader it reports on is worse than no probe.
-///
 /// Admin transaction for the same reason the ceiling row is `tenant_id IS NULL`:
 /// it belongs to no tenant, and there is no tenant to open a transaction as when
 /// the caller is a boot sequence or a health probe.
 pub async fn platform_ceiling_installed(db: &Db) -> Result<bool, StoreError> {
     let mut tx = db.admin_tx_bypassing_rls().await?;
-    let installed: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-           SELECT 1 FROM policy_layers l \
-             JOIN policy_versions v ON v.id = l.version_id \
-            WHERE v.active AND l.layer = 'platform' AND v.tenant_id IS NULL)",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let installed: bool = sqlx::query_scalar(CEILING_EXISTS_SQL)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.rollback().await?;
     Ok(installed)
 }
@@ -374,6 +395,294 @@ pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), Sto
 }
 
 // ---------------------------------------------------------------------------
+// The ceiling
+// ---------------------------------------------------------------------------
+
+/// The default platform ceiling: the widest anything in a fresh deployment may
+/// be, **not** a recommendation of what any employee should be allowed.
+///
+/// Every number here is an upper bound that four layers then narrow. It exists
+/// because the alternative is an operator inventing a turn budget and a spend
+/// cap out of nothing on day one, and the failure mode of a guessed ceiling is
+/// silent — a number too big does not break anything until it does.
+///
+/// It is also, on a fresh install, the *effective* policy of every tenant:
+/// [`load`] inherits a missing layer from the layer above, so until a tenant
+/// writes limits of its own the ceiling is the whole answer. So these are
+/// chosen to be defensible as a policy, not merely as a bound.
+///
+/// * **USD, $500 per transaction.** One payment an employee may make with no
+///   human in the loop is bounded by the size of a routine supplier invoice or
+///   a software renewal — useful, and recoverable when it is wrong.
+/// * **$100 approval threshold.** [`agentos_domain::policy::evaluate`] compares
+///   `amount >= approval_above`, so this is the "nobody looks" line: below it an
+///   employee spends alone, at or above it a human presses the button. $100 is
+///   the amount a business writes off without an investigation.
+/// * **$2 000 per day.** The structuring guard, four transactions wide: the
+///   worst day is a number a company can absorb and an auditor can see.
+/// * **Email, internal and web only.** Email is the channel the product exists
+///   for; internal never leaves the process; web is the operator console. SMS,
+///   WhatsApp and voice reach a phone — the most regulated surface and the one
+///   with no undo — and A2A hands an employee a conversation with somebody
+///   else's agent. Those are per-deployment decisions, not defaults. (Two of
+///   them have no adapter in this build at all: a ceiling that permits what
+///   cannot happen is a ceiling that lies.)
+/// * **No calling codes**, which follows: an allowlist of countries with no
+///   phone channel above it grants nothing, and pretending otherwise invites
+///   somebody to "fix" the country list and wonder why calls still refuse.
+/// * **No domains, no MCP tools, no A2A peers — empty, and empty means
+///   denied.** There is no wildcard [`Domain`] to write here even if we wanted
+///   one ([`Domain::parse`] demands two labels and matching is a label suffix),
+///   and there is no universal tool or peer: those names are specific to a
+///   deployment. Empty is the only honest ceiling, and it fails closed for the
+///   surface where a model is reading attacker-controlled text.
+/// * **50 new contacts per employee per day.** The cold-outreach budget: a
+///   working day of deliberate first contacts, far under the volume that gets a
+///   sending domain blocklisted, and low enough that an employee stuck in a
+///   loop stops before a spam filter notices it.
+/// * **200 turns per day.** The only limit on an employee that never spends
+///   anything: roughly one wake every seven minutes around the clock, which is
+///   above any human-paced workload and bounds what a wedged initiative loop
+///   can cost overnight. Zero — [`PolicyLimits::default`] — would mean no
+///   employee may ever act on its own.
+/// * **Uploads, credential changes and data deletion off.** An upload is the
+///   exfiltration primitive and needs a domain allowlist that is empty anyway;
+///   a credential change rotates a secret the deployment depends on; and
+///   deleting one conversation is the one flag that makes erasing customer data
+///   an *unattended* action. None of the three has a good reason to be on
+///   before somebody asks for it.
+pub fn default_ceiling() -> PolicyLimits {
+    // Infallible: `Money::new` rejects zero only, and none of these is zero.
+    let usd = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
+    let spend = SpendLimits::try_new(usd(50_000), usd(200_000), usd(10_000))
+        .expect("10_000 <= 50_000 <= 200_000");
+
+    PolicyLimits {
+        spend: Some(spend),
+        allowed_channels: [Channel::Email, Channel::Internal, Channel::Web].into(),
+        allowed_calling_codes: BTreeSet::new(),
+        allowed_domains: BTreeSet::new(),
+        denied_domains: BTreeSet::new(),
+        allowed_mcp_tools: BTreeSet::new(),
+        allowed_a2a_peers: BTreeSet::new(),
+        max_new_contacts_per_day: 50,
+        max_turns_per_day: 200,
+        allow_file_upload: false,
+        allow_credential_change: false,
+        allow_data_delete: false,
+    }
+}
+
+/// What [`install_ceiling`] did, and to which version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installed {
+    /// A new active platform version. The previous one is still there, inactive
+    /// — that is what [`rollback_ceiling`] flips back to.
+    Version(Uuid),
+    /// The active ceiling already said exactly this, down to the last cap, so
+    /// nothing was written. Re-running the install is not a new version.
+    Unchanged(Uuid),
+}
+
+impl Installed {
+    /// The version that is active either way.
+    pub const fn version(self) -> Uuid {
+        match self {
+            Installed::Version(id) | Installed::Unchanged(id) => id,
+        }
+    }
+}
+
+/// Install `limits` as the deployment's platform ceiling: a new active
+/// `policy_versions` row with `tenant_id IS NULL` and one `platform` layer.
+///
+/// This is **the operator path**, and the only writer of a platform layer
+/// outside a fixture. It runs from `agentos-server policy install`, on the
+/// operator's own database credentials — see that module for why it is a
+/// subcommand and not a route.
+///
+/// # It cannot widen a tenant's policy, and that is structural
+///
+/// Two independent reasons, either of which would be enough:
+///
+/// 1. **It can only write the top of the intersection.** The statement below
+///    hard-codes `layer = 'platform'` and `tenant_id = NULL`; there is no scope
+///    parameter and no way to spell one. The row it writes is the *first*
+///    argument to [`EffectivePolicy::try_new`], which takes the minimum of every
+///    cap and the intersection of every allowlist — so a tenant, role or
+///    employee layer naming a smaller number still wins, whatever is written
+///    here. [`load`] is the only reader and there is no path around that call.
+///    Widening one tenant means writing *that tenant's* layer, which this
+///    function cannot address.
+/// 2. **A tenant cannot invoke it.** It takes a [`Db`] and opens an admin
+///    transaction, so its authorisation is possession of the database
+///    credential. No API key, no tenant, no HTTP.
+///
+/// The honest exception, stated because it is the thing that surprises people:
+/// a tenant that has written **no** layer of its own inherits the ceiling
+/// ([`load`] substitutes the layer above rather than `PolicyLimits::default`,
+/// which would grant nothing). So on a fresh install a wider ceiling *is* a
+/// wider effective policy — not because this overrode a tenant's limit, but
+/// because that tenant never expressed one. That is why [`default_ceiling`]
+/// is chosen to be safe as a policy and not merely as a bound.
+///
+/// # Idempotent, and versioned rather than edited
+///
+/// The active ceiling is read back and compared as a [`PolicyLimits`]; an
+/// identical one is [`Installed::Unchanged`] and writes nothing. Anything else
+/// deactivates the current version and inserts a new one, so the previous
+/// ceiling survives intact as rows and [`rollback_ceiling`] is a pointer flip.
+/// Nothing is edited in place — the same reason `0006_policy.sql` revokes
+/// DELETE.
+///
+/// Unlike [`install`], it does **not** union into a shared ceiling row. Union
+/// is right for a fixture that needs a ceiling wide enough not to bind; it is
+/// wrong for an operator, because a ceiling that only ever gets wider cannot be
+/// tightened and has no history.
+///
+/// Two operators installing different ceilings at the same instant: one wins
+/// and the other gets [`StoreError::Conflict`] from
+/// `policy_versions_one_active_idx`, which is the correct answer to "which of
+/// these two is the ceiling".
+pub async fn install_ceiling(
+    db: &Db,
+    limits: &PolicyLimits,
+    label: &str,
+) -> Result<Installed, StoreError> {
+    let columns = Columns::from(limits);
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    // The currency guard, before anything is written. A ceiling denominated
+    // differently from the layers under it is not a tighter policy or a looser
+    // one — `EffectivePolicy::try_new` refuses to intersect it at all, so every
+    // action in the deployment is refused with `broken_policy`, which reads
+    // like a bug in the gate rather than like a typo in an install command.
+    if let Some(currency) = columns.currency.as_deref() {
+        let clash: Option<String> = sqlx::query_scalar(
+            "SELECT spend_currency FROM policy_layers \
+              WHERE layer <> 'platform' AND spend_currency IS NOT NULL \
+                AND spend_currency <> $1 LIMIT 1",
+        )
+        .bind(currency)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(clash) = clash {
+            return Err(StoreError::conflict(format!(
+                "this ceiling is denominated in {currency} and there are already policy layers in \
+                 {clash}: a policy in two currencies cannot be intersected, and installing this \
+                 would refuse every action those layers apply to"
+            )));
+        }
+    }
+
+    let active: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM policy_versions WHERE tenant_id IS NULL AND active")
+            .fetch_optional(&mut *tx)
+            .await?;
+
+    // `SELECT *` rather than the column list [`SELECT_ACTIVE_LAYERS`] spells
+    // out: this runs once per install, and a second copy of that list is a
+    // second thing to update the day a limit is added. `FromRow` reads the
+    // columns it needs by name and ignores the rest.
+    if let Some(version) = active {
+        let row: Option<LayerRow> = sqlx::query_as(
+            "SELECT * FROM policy_layers WHERE version_id = $1 AND layer = 'platform'",
+        )
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A ceiling that does not parse is not "different", it is broken — and
+        // replacing it is exactly the repair, so it falls through to the write.
+        if let Some(Ok((_, current))) = row.map(LayerRow::into_limits)
+            && current == *limits
+        {
+            tx.rollback().await?;
+            return Ok(Installed::Unchanged(version));
+        }
+    }
+
+    // Deactivate then activate, never one statement: the partial unique index
+    // that keeps "one active version" true is not deferrable, so a statement
+    // that both clears and sets can trip over itself. Same argument as
+    // [`activate`], which is the tenant-scoped half of this.
+    sqlx::query("UPDATE policy_versions SET active = false WHERE tenant_id IS NULL AND active")
+        .execute(&mut *tx)
+        .await?;
+
+    let version = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO policy_versions (id, tenant_id, label, author, active) \
+         VALUES ($1, NULL, $2, 'operator', true)",
+    )
+    .bind(version)
+    .bind(label)
+    .execute(&mut *tx)
+    .await?;
+
+    let insert = columns.bind_to(
+        sqlx::query(
+            "INSERT INTO policy_layers \
+               (id, version_id, tenant_id, layer, role_name, employee_id, \
+                spend_currency, max_per_transaction_minor, max_per_day_minor, \
+                approval_above_minor, allowed_channels, allowed_calling_codes, \
+                allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
+                max_new_contacts_per_day, max_turns_per_day, \
+                allow_file_upload, allow_credential_change, allow_data_delete) \
+             VALUES ($1, $2, NULL, 'platform', NULL, NULL, \
+                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(version),
+    );
+    insert.execute(&mut *tx).await?;
+
+    tx.commit().await?;
+    Ok(Installed::Version(version))
+}
+
+/// Make the previous platform ceiling active again — the undo for
+/// [`install_ceiling`].
+///
+/// Returns the version that is now active. The bad version is not deleted; it
+/// becomes the thing a second rollback would come back to, and the history is
+/// the audit trail `0006_policy.sql` revokes DELETE to protect.
+///
+/// **It will not roll back to nothing.** A version with no `platform` layer is
+/// skipped, and a deployment with no earlier ceiling gets
+/// [`StoreError::NotFound`] rather than a successful call that leaves
+/// `policy::load` answering [`PolicyLoadError::NoPlatformLayer`] for every
+/// tenant. "Undo the first ceiling you ever installed" is a request to deny
+/// every action in the deployment, and it is never what the operator typing it
+/// at 3am means.
+pub async fn rollback_ceiling(db: &Db) -> Result<Uuid, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    let previous: Option<Uuid> = sqlx::query_scalar(
+        "SELECT v.id FROM policy_versions v \
+          WHERE v.tenant_id IS NULL AND NOT v.active \
+            AND EXISTS (SELECT 1 FROM policy_layers l \
+                         WHERE l.version_id = v.id AND l.layer = 'platform') \
+          ORDER BY v.created_at DESC, v.id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(previous) = previous else {
+        return Err(StoreError::NotFound);
+    };
+
+    sqlx::query("UPDATE policy_versions SET active = false WHERE tenant_id IS NULL AND active")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE policy_versions SET active = true WHERE id = $1")
+        .bind(previous)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(previous)
+}
+
+// ---------------------------------------------------------------------------
 // Writing a layer
 // ---------------------------------------------------------------------------
 
@@ -392,6 +701,109 @@ pub enum Scope<'a> {
     Employee(EmployeeId),
 }
 
+/// One `policy_layers` row's limit columns, owned and in bind order.
+///
+/// Both writers in this module go through it — [`install`] and
+/// [`install_ceiling`] — so there is one mapping from [`PolicyLimits`] to
+/// columns rather than two. The day a limit is added, the writer that forgot it
+/// would be the one that silently stores a column default, and a column default
+/// here means "no channels, no turns, no budget": a policy nobody wrote.
+///
+/// It is the inverse of [`LayerRow`], which is the same list in the other
+/// direction.
+struct Columns {
+    currency: Option<String>,
+    per_txn: Option<i64>,
+    per_day: Option<i64>,
+    approval: Option<i64>,
+    channels: Vec<String>,
+    calling_codes: Vec<i32>,
+    allowed_domains: Vec<String>,
+    denied_domains: Vec<String>,
+    mcp_tools: Vec<String>,
+    a2a_peers: Vec<String>,
+    contacts: i32,
+    turns: i32,
+    file_upload: bool,
+    credential_change: bool,
+    data_delete: bool,
+}
+
+impl Columns {
+    fn from(limits: &PolicyLimits) -> Self {
+        // Saturating rather than failing: every cap here is smaller than
+        // i64::MAX by eleven orders of magnitude in practice, and a saturated
+        // *ceiling* is wider, never narrower, so it cannot silently tighten a
+        // limit either.
+        let minor = |m: Money| i64::try_from(m.minor()).unwrap_or(i64::MAX);
+        let (currency, per_txn, per_day, approval) =
+            limits.spend.map_or((None, None, None, None), |s| {
+                (
+                    Some(s.currency().code().to_owned()),
+                    Some(minor(s.max_per_transaction())),
+                    Some(minor(s.max_per_day())),
+                    Some(minor(s.approval_above())),
+                )
+            });
+        let strings =
+            |set: &BTreeSet<Domain>| set.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        Self {
+            currency,
+            per_txn,
+            per_day,
+            approval,
+            channels: limits
+                .allowed_channels
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect(),
+            calling_codes: limits
+                .allowed_calling_codes
+                .iter()
+                .map(|c| i32::from(c.as_u16()))
+                .collect(),
+            allowed_domains: strings(&limits.allowed_domains),
+            denied_domains: strings(&limits.denied_domains),
+            mcp_tools: limits
+                .allowed_mcp_tools
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            a2a_peers: strings(&limits.allowed_a2a_peers),
+            contacts: i32::try_from(limits.max_new_contacts_per_day).unwrap_or(i32::MAX),
+            turns: i32::try_from(limits.max_turns_per_day).unwrap_or(i32::MAX),
+            file_upload: limits.allow_file_upload,
+            credential_change: limits.allow_credential_change,
+            data_delete: limits.allow_data_delete,
+        }
+    }
+
+    /// Append all fifteen, in declaration order. Consumes `self` because sqlx
+    /// encodes on `bind`, so nothing here has to outlive the call.
+    fn bind_to<'q>(
+        self,
+        query: Query<'q, Postgres, PgArguments>,
+    ) -> Query<'q, Postgres, PgArguments> {
+        query
+            .bind(self.currency)
+            .bind(self.per_txn)
+            .bind(self.per_day)
+            .bind(self.approval)
+            .bind(self.channels)
+            .bind(self.calling_codes)
+            .bind(self.allowed_domains)
+            .bind(self.denied_domains)
+            .bind(self.mcp_tools)
+            .bind(self.a2a_peers)
+            .bind(self.contacts)
+            .bind(self.turns)
+            .bind(self.file_upload)
+            .bind(self.credential_change)
+            .bind(self.data_delete)
+    }
+}
+
 /// The one platform ceiling [`install`] maintains. Fixed ids, because the
 /// active platform version is a global singleton: concurrent callers have to
 /// upsert the *same* row rather than race to be the one active version.
@@ -401,13 +813,19 @@ const CEILING_LAYER: Uuid = Uuid::from_u128(0x0006_0000_0000_7000_8000_0000_0000
 /// Write `limits` as one layer of `tenant_id`'s active policy version, under a
 /// platform ceiling wide enough not to bind.
 ///
-/// **This is fixture and bootstrap support, not an operator API.** There is no
-/// route that writes `policy_layers` yet; when one lands it will write a *new*
-/// version and activate it, because that is what makes a policy change
-/// reversible, and this replaces a layer of the active one in place. What it is
-/// for is the thing every test that touches [`crate::db::Db`] now needs: a
-/// deployment with a policy in it, because the gate reads the stored one and
+/// **This is fixture and bootstrap support, not an operator API.** The operator
+/// path for the ceiling is [`install_ceiling`], which writes a *new* version and
+/// activates it — that is what makes a policy change reversible, and this
+/// replaces a layer of the active one in place. What this is for is the thing
+/// every test that touches [`crate::db::Db`] needs: a deployment with a policy
+/// in it, because the gate reads the stored one and
 /// [`PolicyLoadError::NoPlatformLayer`] refuses everything.
+///
+/// The two do not mix in one deployment, and only one of them belongs in a real
+/// one: the DELETE below removes every platform version that is not the fixture
+/// singleton, so calling this on a database an operator has installed a ceiling
+/// into throws that ceiling and its history away. Nothing outside `#[cfg(test)]`
+/// calls it.
 ///
 /// # Why the ceiling is widened rather than written
 ///
@@ -435,21 +853,6 @@ pub async fn install(
         Scope::Role(name) => (PolicyLayer::Role, Some(name), None),
         Scope::Employee(id) => (PolicyLayer::Employee, None, Some(id.as_uuid())),
     };
-
-    // Saturating rather than failing: every cap here is smaller than i64::MAX by
-    // eleven orders of magnitude in practice, and a saturated *ceiling* is
-    // wider, never narrower, so it cannot silently tighten a limit either.
-    let minor = |m: Money| i64::try_from(m.minor()).unwrap_or(i64::MAX);
-    let (currency, per_txn, per_day, approval) =
-        limits.spend.map_or((None, None, None, None), |s| {
-            (
-                Some(s.currency().code().to_owned()),
-                Some(minor(s.max_per_transaction())),
-                Some(minor(s.max_per_day())),
-                Some(minor(s.approval_above())),
-            )
-        });
-    let strings = |set: &BTreeSet<Domain>| set.iter().map(ToString::to_string).collect::<Vec<_>>();
 
     let mut tx = db.admin_tx_bypassing_rls().await?;
 
@@ -508,7 +911,7 @@ pub async fn install(
 
     // Both rows in one statement, sharing one set of binds: the ceiling widens
     // on conflict, the scope row is a fresh id and simply inserts.
-    sqlx::query(
+    let statement = sqlx::query(
         "INSERT INTO policy_layers \
            (id, version_id, tenant_id, layer, role_name, employee_id, \
             spend_currency, max_per_transaction_minor, max_per_day_minor, \
@@ -541,50 +944,21 @@ pub async fn install(
            allow_credential_change = \
              policy_layers.allow_credential_change OR excluded.allow_credential_change, \
            allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete",
-    )
-    .bind(CEILING_LAYER)
-    .bind(CEILING_VERSION)
-    .bind(Uuid::now_v7())
-    .bind(version)
-    .bind(tenant_id.as_uuid())
-    .bind(layer.as_str())
-    .bind(role_name)
-    .bind(employee_id)
-    .bind(currency)
-    .bind(per_txn)
-    .bind(per_day)
-    .bind(approval)
-    .bind(
-        limits
-            .allowed_channels
-            .iter()
-            .map(|c| c.as_str().to_owned())
-            .collect::<Vec<_>>(),
-    )
-    .bind(
-        limits
-            .allowed_calling_codes
-            .iter()
-            .map(|c| i32::from(c.as_u16()))
-            .collect::<Vec<_>>(),
-    )
-    .bind(strings(&limits.allowed_domains))
-    .bind(strings(&limits.denied_domains))
-    .bind(
-        limits
-            .allowed_mcp_tools
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-    )
-    .bind(strings(&limits.allowed_a2a_peers))
-    .bind(i32::try_from(limits.max_new_contacts_per_day).unwrap_or(i32::MAX))
-    .bind(i32::try_from(limits.max_turns_per_day).unwrap_or(i32::MAX))
-    .bind(limits.allow_file_upload)
-    .bind(limits.allow_credential_change)
-    .bind(limits.allow_data_delete)
-    .execute(&mut *tx)
-    .await?;
+    );
+    // $9..=$23 are the fifteen limit columns, in `Columns` declaration order —
+    // the same order and the same mapping `install_ceiling` writes them with.
+    let insert = Columns::from(limits).bind_to(
+        statement
+            .bind(CEILING_LAYER)
+            .bind(CEILING_VERSION)
+            .bind(Uuid::now_v7())
+            .bind(version)
+            .bind(tenant_id.as_uuid())
+            .bind(layer.as_str())
+            .bind(role_name)
+            .bind(employee_id),
+    );
+    insert.execute(&mut *tx).await?;
 
     // One deployment, one ceiling, therefore one spend currency — that is the
     // schema and the loader, not this function: layers in two currencies cannot
@@ -1379,6 +1753,257 @@ pub(crate) mod tests {
             .await
             .expect_err("no ceiling, no policy");
         assert!(matches!(err, PolicyLoadError::NoPlatformLayer), "{err:?}");
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    // -- the operator's ceiling -------------------------------------------
+
+    /// Wipe every platform version and hold the lock, so a ceiling test starts
+    /// from the state a fresh install is in: nothing.
+    async fn no_ceiling(db: &Db) -> MutexGuard<'static, ()> {
+        let guard = PLATFORM.lock().await;
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM policy_versions WHERE tenant_id IS NULL")
+            .execute(&mut *tx)
+            .await
+            .expect("clear platform versions");
+        tx.commit().await.expect("commit");
+        guard
+    }
+
+    async fn active_ceilings(db: &Db) -> i64 {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let count = sqlx::query_scalar(
+            "SELECT count(*) FROM policy_versions WHERE tenant_id IS NULL AND active",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// Installing is a write; installing the *same thing* is not. A deploy
+    /// script that runs this on every rollout must not leave a version per
+    /// rollout — and it must certainly not leave two rows fighting over which
+    /// one is the active ceiling.
+    #[tokio::test]
+    async fn installing_the_same_ceiling_twice_leaves_exactly_one_active_version() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+
+        let ceiling = default_ceiling();
+        let first = install_ceiling(&db, &ceiling, "default ceiling")
+            .await
+            .expect("install");
+        assert!(matches!(first, Installed::Version(_)), "{first:?}");
+        assert!(platform_ceiling_installed(&db).await.expect("probe"));
+
+        let again = install_ceiling(&db, &ceiling, "default ceiling")
+            .await
+            .expect("install again");
+        assert_eq!(
+            again,
+            Installed::Unchanged(first.version()),
+            "the same ceiling must not become a second version"
+        );
+        assert_eq!(active_ceilings(&db).await, 1);
+
+        // And it round-trips: what the loader reads back is what was installed,
+        // which is also what makes the comparison above meaningful rather than
+        // an accident of two identical `Default`s.
+        let (tenant, employee) = seed(&db, "idempotent").await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let loaded = load(&mut tx, employee, None).await.expect("load");
+        assert_eq!(loaded.limits(), &ceiling);
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// The property the whole design rests on, asserted against the thing an
+    /// operator actually runs: a ceiling installed from outside a tenant cannot
+    /// make that tenant's policy wider than the tenant's own layer says.
+    #[tokio::test]
+    async fn an_operator_ceiling_cannot_widen_a_tenants_own_layer() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        let (tenant, employee) = seed(&db, "no-widen").await;
+
+        // The tenant's own layer, written first and never touched again.
+        let mut narrow = default_ceiling();
+        narrow.spend = Some(
+            SpendLimits::try_new(
+                Money::new(1_000, Currency::Usd).expect("money"),
+                Money::new(4_000, Currency::Usd).expect("money"),
+                Money::new(500, Currency::Usd).expect("money"),
+            )
+            .expect("coherent"),
+        );
+        narrow.max_turns_per_day = 3;
+        narrow.max_new_contacts_per_day = 2;
+        narrow.allowed_channels = [Channel::Email].into();
+        install(&db, tenant, Scope::Tenant, &narrow)
+            .await
+            .expect("the tenant's layer");
+
+        // Now an absurdly permissive ceiling, installed the operator way.
+        let mut permissive = default_ceiling();
+        permissive.spend = Some(
+            SpendLimits::try_new(
+                Money::new(9_000_000, Currency::Usd).expect("money"),
+                Money::new(9_000_000, Currency::Usd).expect("money"),
+                Money::new(9_000_000, Currency::Usd).expect("money"),
+            )
+            .expect("coherent"),
+        );
+        permissive.max_turns_per_day = 10_000;
+        permissive.max_new_contacts_per_day = 10_000;
+        permissive.allowed_channels = Channel::ALL.into();
+        permissive.allow_file_upload = true;
+        permissive.allow_data_delete = true;
+        install_ceiling(&db, &permissive, "far too wide")
+            .await
+            .expect("install");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let policy = load(&mut tx, employee, None).await.expect("load");
+        assert_eq!(
+            caps(&policy),
+            (1_000, 4_000, 500),
+            "the tenant's own caps must survive a permissive ceiling"
+        );
+        assert_eq!(policy.limits().max_turns_per_day, 3);
+        assert_eq!(policy.limits().max_new_contacts_per_day, 2);
+        assert_eq!(policy.limits().allowed_channels, [Channel::Email].into());
+        // Flags are an AND, so a ceiling cannot switch one on either.
+        assert!(!policy.limits().allow_file_upload);
+        assert!(!policy.limits().allow_data_delete);
+        // The batch reader agrees, which is the other place the answer is read.
+        assert_eq!(
+            max_turns_per_day(&mut tx, &[employee])
+                .await
+                .expect("batch"),
+            vec![(employee, 3)]
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// A bad ceiling has to be undoable without a database console — and the
+    /// undo has to be a pointer flip, so the ceiling it restores is byte for
+    /// byte the one that was there before.
+    #[tokio::test]
+    async fn rolling_back_the_ceiling_restores_the_previous_one() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        let (tenant, employee) = seed(&db, "ceiling-rollback").await;
+
+        let good = default_ceiling();
+        let first = install_ceiling(&db, &good, "default ceiling")
+            .await
+            .expect("install");
+
+        // The mistake: a ceiling that stops every employee in the deployment.
+        let mut bad = good.clone();
+        bad.max_turns_per_day = 0;
+        bad.spend = None;
+        let second = install_ceiling(&db, &bad, "oops")
+            .await
+            .expect("install the bad one");
+        assert_ne!(second.version(), first.version());
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let broken = load(&mut tx, employee, None).await.expect("load");
+        assert_eq!(broken.limits().max_turns_per_day, 0);
+        assert!(broken.limits().spend.is_none());
+        tx.rollback().await.expect("rollback");
+
+        let restored = rollback_ceiling(&db).await.expect("roll back");
+        assert_eq!(restored, first.version());
+        assert_eq!(active_ceilings(&db).await, 1);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let policy = load(&mut tx, employee, None).await.expect("load");
+        assert_eq!(policy.limits(), &good, "a rollback is not a re-derivation");
+        tx.rollback().await.expect("rollback");
+
+        // Rolling back again returns to the bad one — the history is a stack,
+        // not a one-way trip, and nothing was deleted.
+        assert_eq!(
+            rollback_ceiling(&db).await.expect("roll back"),
+            second.version()
+        );
+        assert_eq!(
+            rollback_ceiling(&db).await.expect("roll back"),
+            first.version()
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// Undoing the only ceiling there has ever been is a request to deny every
+    /// action in the deployment. It is refused, and the ceiling stays up.
+    #[tokio::test]
+    async fn the_first_ceiling_cannot_be_rolled_back_into_nothing() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+
+        assert!(
+            matches!(rollback_ceiling(&db).await, Err(StoreError::NotFound)),
+            "nothing to roll back to, on an empty database"
+        );
+
+        install_ceiling(&db, &default_ceiling(), "default ceiling")
+            .await
+            .expect("install");
+        assert!(matches!(
+            rollback_ceiling(&db).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            platform_ceiling_installed(&db).await.expect("probe"),
+            "a refused rollback must leave the ceiling exactly where it was"
+        );
+    }
+
+    /// A ceiling in the wrong currency is not a tighter or looser policy: it is
+    /// a policy `load` refuses to intersect at all, i.e. a deployment where
+    /// every action fails with `broken_policy`. Caught at install time, where
+    /// the operator can still read the message.
+    #[tokio::test]
+    async fn a_ceiling_that_clashes_with_an_existing_currency_is_refused() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        let (tenant, employee) = seed(&db, "currency-clash").await;
+
+        let mut euros = default_ceiling();
+        euros.spend = Some(
+            SpendLimits::try_new(
+                Money::new(10_000, Currency::Eur).expect("money"),
+                Money::new(40_000, Currency::Eur).expect("money"),
+                Money::new(5_000, Currency::Eur).expect("money"),
+            )
+            .expect("coherent"),
+        );
+        install(&db, tenant, Scope::Tenant, &euros)
+            .await
+            .expect("a euro tenant");
+
+        let err = install_ceiling(&db, &default_ceiling(), "dollars")
+            .await
+            .expect_err("USD over EUR layers");
+        assert!(
+            matches!(&err, StoreError::Conflict(message) if message.contains("EUR")),
+            "{err:?}"
+        );
+
+        // And the euro deployment still loads, because nothing was written.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        load(&mut tx, employee, None).await.expect("load");
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;
