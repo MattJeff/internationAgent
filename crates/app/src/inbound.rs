@@ -3426,7 +3426,11 @@ mod tests {
         let stranger = hire(&db, tenant, "carla").await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        // Same team: yes, for every errand.
+        // One team **and** one reporting line — `company` seats Bruno under
+        // Lena — so every errand passes, each for its own reason. Which reason
+        // belongs to which errand is
+        // `an_order_follows_the_reporting_line_and_a_question_follows_either`;
+        // this test is about reach, and everything below is a refusal.
         for errand in Errand::ALL {
             assert!(
                 may_message(&mut tx, lena, bruno, errand)
