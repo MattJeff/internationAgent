@@ -16,14 +16,31 @@
 //! five recall slots. Past that it did not move again, because
 //! [`RECALL_LIMIT`] is a constant with no company in it.
 //!
-//! **It is not flat any more**, and the reason is the section below rather than
-//! anything about the corpus: the prefix now names the tenant's MCP inventory,
-//! which is per tenant and scoped by nothing. The context goes 4188 → 4639 →
-//! 4863 tokens at 2, 10 and 50 employees, and every token of that growth is the
-//! inventory. The colleague roster, added in the same change, contributes 137 →
-//! 191 → 191 — it saturates with the employee's own team and then stops, which
-//! is what it was designed to do and what
+//! **It sloped for one revision, and the slope has been scoped away.** When the
+//! prefix began naming the tenant's MCP inventory the context went 4188 → 4639 →
+//! 4863 tokens at 2, 10 and 50 employees, and every token of that growth was the
+//! inventory: per tenant, filtered by risk and by nothing else. It now reads
+//! **4188 → 4611 → 4611**, because
+//! [`agentos_app::prompt::SystemPrompt::with_mcp_tools`] takes the employee's
+//! [`EffectivePolicy`] and names the tools `allowed_mcp_tools` lets it call —
+//! 105 → 105 → 105 tokens of prefix, against 105 → 133 → 357 for the same
+//! inventory named to everybody. The colleague roster contributes 137 → 191 →
+//! 191: it saturates with the employee's own team and then stops, which is what
+//! it was designed to do and what
 //! `the_roster_costs_the_same_in_a_company_of_fifty_as_in_one_of_ten` gates on.
+//!
+//! **No new mechanism came out of that.** The scope is not "the role" and not
+//! "the team" as a thing this file invented: it is
+//! [`PolicyLimits::allowed_mcp_tools`], intersected across platform ∧ tenant ∧
+//! role ∧ employee, which the gate already enforces on every `McpCall` — and
+//! whose `role` layer *is* the employee's team (`domain::org::Team::limits`,
+//! capped at `Team::MAX_TOOLS_PER_EMPLOYEE`). Naming what is callable was
+//! already the correct rule and was simply unwired. What is left sloping is the
+//! deployment where an operator writes one tenant-wide allowlist and no team
+//! layer: the row `…the same inventory with no policy scope` prices exactly
+//! that, and there the slope is honest — those employees really may call all of
+//! it, and a prefix that hid it would be hiding a capability rather than saving
+//! a token.
 //!
 //! The tool catalogue is still five entries no matter how many MCP servers a
 //! tenant binds, which is the collapsed `call_mcp_tool` doing its job — fewer
@@ -56,23 +73,29 @@
 //! **Both are wired now**, and the prediction was half right, which is the
 //! interesting half:
 //!
-//! * The **MCP inventory** is per *tenant*, filtered by [`Risk`] and by nothing
-//!   else. It slopes, exactly as predicted and by roughly the predicted amount:
-//!   the `Inventory::Unscoped` row below is the same measurement it always was,
-//!   and it is now a measurement of production. Every employee pays for every
-//!   server the company binds, on every turn.
-//! * The **colleague roster** does not, and that was the design constraint it
+//! * The **MCP inventory** is per *tenant*, so it sloped exactly as predicted
+//!   and by roughly the predicted amount. What made it stop is not a second
+//!   scoping mechanism but the rule the gate was already applying to the calls
+//!   themselves: an employee is told about the tools its policy lets it call,
+//!   asked through `policy::evaluate_mcp_call` rather than restated. The
+//!   `Inventory::McpUnscoped` row below is the same measurement it always was,
+//!   kept as the counterfactual — every employee paying for every server the
+//!   company binds, on every turn.
+//! * The **colleague roster** never did, and that was the design constraint it
 //!   was built under. It is the employee's manager, its direct reports and its
 //!   team-mates — `inbound::colleagues`, ruled on by `inbound::may_message` — so
 //!   it is bounded by the team and not by the payroll. `Inventory::Unscoped`
 //!   below is the counterfactual: the same roster with no join to
 //!   `team_memberships`, which is what a company-wide list would have cost.
 //!
-//! The gap between those two rows is the whole argument for scoping, stated in
-//! tokens, and it is the argument the *corpus* row could never make — because
-//! retrieval is a fixed top-k and a fixed top-k cannot slope, while a list of
-//! names is linear in what it lists. Scoping saves nothing on documents and
-//! everything here.
+//! The gap between each of those rows and its counterfactual is the whole
+//! argument for scoping, stated in tokens, and it is the argument the *corpus*
+//! row could never make — because retrieval is a fixed top-k and a fixed top-k
+//! cannot slope, while a list of names is linear in what it lists. Scoping saves
+//! nothing on documents and everything here. Both lists arrived at the same
+//! bound the same way, too: by asking the rule that already decides whether the
+//! thing may be reached, instead of writing a second rule about what may be
+//! named.
 //!
 //! [`agentos_app::prompt::SystemPrompt::with_credential`] is still called by
 //! nobody, and deliberately: no tool in `turn::catalogue` takes a credential,
@@ -83,12 +106,13 @@
 //! # Assertions are on shape, numbers are on the page
 //!
 //! Nothing here asserts "under 4,312 tokens". A reworded briefing would break
-//! such a test and teach nobody anything. What is asserted is that the *roster*
-//! does not move with company size while an unscoped one does, that an untrusted
-//! turn is offered strictly fewer tools, and that the corpus scoping saves less
-//! than one passage. What is **characterised** rather than asserted is
-//! everything the MCP inventory moved: the total, and the per-employee daily
-//! cost, which is no longer one number.
+//! such a test and teach nobody anything. What is asserted is that neither list
+//! in the prefix moves with company size while its unscoped twin does — for the
+//! inventory as a *byte-identical prefix* across 2, 10 and 50 employees, which
+//! is the strongest form the claim takes — that an untrusted turn is offered
+//! strictly fewer tools, and that the corpus scoping saves less than one
+//! passage. What is **characterised** rather than asserted is the total, which
+//! still steps once between two employees and ten, and both counterfactuals.
 //!
 //! Every figure printed is an estimate with a stated error bound; every property
 //! asserted is a comparison between two contexts weighed by the same estimator,
@@ -104,6 +128,7 @@ use agentos_app::vertical::Charter;
 use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::money::{Currency, Money};
+use agentos_domain::policy::{EffectivePolicy, PolicyLimits};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{Content, LlmRequest, Message};
 
@@ -402,6 +427,50 @@ impl Company {
             .collect()
     }
 
+    /// **The allowlist, scoped the way the policy stack scopes it.** Team
+    /// zero's server, because employee zero is on team zero.
+    ///
+    /// This is not a new mechanism invented for the measurement: an employee's
+    /// `role` policy layer is its *team* (`domain::org::Team::limits`), and a
+    /// team's `allowed_mcp_tools` is capped at `Team::MAX_TOOLS_PER_EMPLOYEE`.
+    /// So the shape here — one team's server, whatever the tenant has bound —
+    /// is what an operator writing a team layer produces, and the reason the
+    /// row it feeds is flat is the same reason the roster's is: there is no
+    /// `self.employees` in it.
+    ///
+    /// One `PolicyLimits` in all four positions because intersecting a layer
+    /// with itself is a no-op, and the shape of the stack is `store::policy`'s
+    /// claim rather than this file's.
+    fn allowlist(self) -> EffectivePolicy {
+        self.policy(
+            self.inventory()
+                .into_iter()
+                .map(|(tool, _)| tool)
+                .filter(|tool| tool.server.as_str() == "team-0-erp"),
+        )
+    }
+
+    /// The same allowlist with the team layer taken out: everything the tenant
+    /// has bound, granted to everybody.
+    ///
+    /// The counterfactual, and it is also the *literal* previous behaviour of
+    /// this prefix — before `with_mcp_tools` consulted a policy, every employee
+    /// was told about every bound tool whether it could call it or not. The row
+    /// it feeds is therefore the same measurement the `Inventory::Unscoped` row
+    /// used to be, kept so the saving has a number rather than a claim.
+    fn tenant_wide(self) -> EffectivePolicy {
+        self.policy(self.inventory().into_iter().map(|(tool, _)| tool))
+    }
+
+    fn policy(self, tools: impl IntoIterator<Item = McpTool>) -> EffectivePolicy {
+        let limits = PolicyLimits {
+            allowed_mcp_tools: tools.into_iter().collect(),
+            ..Default::default()
+        };
+        EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+            .expect("four identical layers, and no spend limits to reconcile")
+    }
+
     /// What the tenant's MCP fleet holds: one server per team, three tools
     /// each, the last of them destructive so the taint filter has something to
     /// take away.
@@ -446,18 +515,29 @@ pub enum Inventory {
     /// Neither: the prefix before either feature was wired. Kept as the
     /// baseline, because "what did this cost us" needs a before.
     Bare,
-    /// **What production does now.** The tenant's whole bound MCP inventory,
-    /// filtered by risk and by nothing else, plus this employee's own roster —
-    /// manager, direct reports, team-mates, and nobody else.
+    /// **What production does now.** The MCP tools this employee's policy lets
+    /// it call, filtered by risk on top of that, plus its own roster — manager,
+    /// direct reports, team-mates, and nobody else. Both lists are scoped by
+    /// the same thing the runtime rules with, one by `policy::evaluate_mcp_call`
+    /// and the other by `inbound::may_message`.
     Named,
     /// The counterfactual the roster was built to avoid: the same prefix with
     /// every employee in the tenant named instead of one team's worth. Nothing
     /// builds this; it is here so the saving has a number rather than a claim.
     Unscoped,
     /// The inventory without the roster. Not a shape anything ships — it exists
-    /// so the two new terms can be told apart, because "the prefix grew" is not
-    /// a finding until you can say *which* of them grew.
+    /// so the two terms can be told apart, because "the prefix grew" is not a
+    /// finding until you can say *which* of them grew.
     McpOnly,
+    /// The counterfactual for the *other* list: every tool the tenant has bound,
+    /// named to an employee that may call three of them, and no roster.
+    ///
+    /// This is what the prefix did before `with_mcp_tools` took a policy, so the
+    /// row it feeds is both the counterfactual and the changelog. It is also
+    /// what an operator gets today by writing one tenant-wide allowlist and no
+    /// team layer — in which case the slope is real and correct, because those
+    /// employees really may call all of it.
+    McpUnscoped,
 }
 
 /// The counterparty's message. One real supplier email, because the turn's
@@ -497,15 +577,21 @@ pub fn assemble(company: Company, reach: Reach, inventory: Inventory) -> LlmRequ
         // both call, in the order they call them.
         Inventory::Named => charter
             .system_prompt(IDENTITY)
-            .with_mcp_tools(company.inventory())
+            .with_mcp_tools(&company.allowlist(), company.inventory())
             .with_colleagues(company.roster()),
         Inventory::Unscoped => charter
             .system_prompt(IDENTITY)
-            .with_mcp_tools(company.inventory())
+            .with_mcp_tools(&company.allowlist(), company.inventory())
             .with_colleagues(company.payroll()),
         Inventory::McpOnly => charter
             .system_prompt(IDENTITY)
-            .with_mcp_tools(company.inventory()),
+            .with_mcp_tools(&company.allowlist(), company.inventory()),
+        // The whole tenant's inventory, which is what a prefix built without
+        // the policy named — the argument of `with_mcp_tools` is the only
+        // difference between this and the row above it.
+        Inventory::McpUnscoped => charter
+            .system_prompt(IDENTITY)
+            .with_mcp_tools(&company.tenant_wide(), company.inventory()),
     };
 
     let inbound = Untrusted::new(INBOUND.to_owned());
@@ -619,7 +705,10 @@ pub fn evaluate() -> Surface {
             ),
             Truth::Characterises,
         )
-        .note("no longer flat: rows 3 and 4 say which half moved and which did not"),
+        .note(
+            "flat again above ten: the rows below say which terms saturate on their own \
+               and which one had to be scoped",
+        ),
     );
 
     // The prefix before either builder was wired. Not a row of its own — the
@@ -660,25 +749,60 @@ pub fn evaluate() -> Surface {
         .note("scoping can COST tokens: the sign is set by whose prose is longer, not by scope"),
     );
 
-    // --- 3. the term that slopes: the tenant's MCP inventory ----------------
-    // Wired now, and it does what this file said it would. Per tenant, filtered
-    // by risk and by nothing else — not by team, not by role — so every employee
-    // pays for every server the company has bound, on every turn, forever.
+    // --- 3. the term that used to slope: the tenant's MCP inventory ---------
+    // **The row this change was made to be able to print.** The inventory is
+    // still per tenant; what the prefix names out of it is what this employee's
+    // policy lets it call — `allowed_mcp_tools`, intersected across the four
+    // layers, asked through the same `policy::evaluate_mcp_call` the gate rules
+    // with. That set is the employee's team's, so it has no company size in it,
+    // exactly like the roster below.
     let mcp = at(Inventory::McpOnly);
     let last = SIZES.len() - 1;
+    let inventory_cost = |weighed: &[Weighed], i: usize| weighed[i].system - bare[i].system;
+    let bounded = inventory_cost(&mcp, last) == inventory_cost(&mcp, last - 1);
     rows.push(
         Row::ok(
             "…of which the MCP inventory",
             format!(
-                "{} → {} tok of prefix as 2 staff become 50 (+{})",
-                mcp[0].system - bare[0].system,
-                mcp[last].system - bare[last].system,
-                (mcp[last].system - bare[last].system) - (mcp[0].system - bare[0].system),
+                "{} tok of prefix as 2 staff become 50 (+{})",
+                SIZES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| inventory_cost(&mcp, i).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+                inventory_cost(&mcp, last) - inventory_cost(&mcp, 0),
             ),
-            Truth::Characterises,
+            Truth::Correct,
         )
-        .note("O(servers bound), and nothing scopes it — the honest place to look next"),
+        .gated(bounded)
+        .note(
+            "O(what this employee may call), not O(servers bound): `allowed_mcp_tools`, \
+               which the gate already rules with. The row below is the same list unscoped",
+        ),
     );
+
+    // --- 3d. what the unscoped version cost ---------------------------------
+    // The same inventory named to everybody, which is what this prefix did
+    // before `with_mcp_tools` asked the gate. Characterised rather than gated:
+    // it is a counterfactual, and it is also what an operator still gets by
+    // writing one tenant-wide allowlist and no team layer — in which case the
+    // slope is honest, because those employees really may call all of it.
+    let everything = at(Inventory::McpUnscoped);
+    rows.push(Row::ok(
+        "…the same inventory with no policy scope",
+        format!(
+            "{} tok — +{} on every prefix at 50 staff, and linear in servers bound",
+            SIZES
+                .iter()
+                .enumerate()
+                .map(|(i, _)| inventory_cost(&everything, i).to_string())
+                .collect::<Vec<_>>()
+                .join(" → "),
+            inventory_cost(&everything, last) - inventory_cost(&mcp, last),
+        ),
+        Truth::Characterises,
+    ));
 
     // --- 3b. the term that does not: the colleague roster -------------------
     // **The row this feature was built to be able to print.** It saturates
@@ -765,24 +889,26 @@ pub fn evaluate() -> Surface {
     );
 
     // --- 5. the number an operator asks for ----------------------------------
-    // It used to be independent of company size. It is not any more, and the
-    // reason is row 3 and not row 3b: the marginal employee now carries the
-    // whole tenant's MCP inventory in every prefix. Printed at both ends rather
-    // than gated on their being equal, because they are not.
+    // One number again. It stopped being one when the prefix started naming the
+    // tenant's whole inventory, and it is one again for the same reason the
+    // roster never broke it: both lists are now scoped by the rule the runtime
+    // enforces, so neither has the payroll in it. Measured from ten, where the
+    // recall has already saturated.
     let day = per_day(biggest);
     let at_ten = per_day(Company { employees: 10 });
     rows.push(
         Row::ok(
             "one more employee costs, per day",
             format!(
-                "{at_ten} tok at 10 staff → {day} at 50, at {} turns",
+                "{day} tok at 10 staff and at 50, at {} turns",
                 RolePack::international_buyer().limits().max_turns_per_day
             ),
-            Truth::Characterises,
+            Truth::Correct,
         )
+        .gated(day == at_ten)
         .note(
-            "a floor: one model call per reserved turn, and a run may make ten. The gap \
-               between the two is the MCP inventory; the roster contributes none of it",
+            "a floor: one model call per reserved turn, and a run may make ten. What \
+               makes it flat is that neither list in the prefix is a function of headcount",
         ),
     );
 
@@ -797,6 +923,13 @@ pub fn evaluate() -> Surface {
              TURN_BRIEF, the initiative loop's, and `knowledge::RECALLED_BRIEF` — two private \
              consts in a binary crate and one private to `app`. The floor above is short by \
              them, and all three are constants, which cannot slope",
+            "whether a real tenant's allowlist is team-shaped. The fixture grants one team's \
+             server in the role layer, which is the shape `domain::org::Team` produces and \
+             caps; an operator who writes one tenant-wide layer instead gets the row above \
+             it, honestly, because those employees really may call all of it. Nothing in \
+             this workspace writes `allowed_mcp_tools` — `store::policy::default_ceiling` \
+             grants none — so which of the two a deployment gets is an operator's decision \
+             and not a measurement",
             "the roster's SHAPE, only its size. Whether an employee is told about the right \
              colleagues is `inbound::colleagues`' own claim and it needs Postgres — \
              `a_roster_is_the_line_and_the_team_and_stops_two_links_away` owns it. This file \
@@ -935,23 +1068,70 @@ mod tests {
         assert_eq!(scoped.system, unscoped.system);
     }
 
-    /// The one company-wide input there is. It slopes, it is filtered by risk
-    /// alone, and every employee in the tenant pays for all of it.
+    /// **The assertion this task exists for**, and it is a property rather
+    /// than a number: a tenant that binds nine more servers does not enlarge the
+    /// prefix of an employee that may not call them. Not "grows slowly" —
+    /// byte-identical, at 2, 10 and 50 employees.
+    ///
+    /// `McpOnly`, so the roster is not in the comparison and what is left is the
+    /// inventory alone. The fixture binds one server per team, so the tenant's
+    /// inventory really is ten times bigger at fifty employees than at two —
+    /// asserted below, or this compares two prefixes that were the same anyway.
     #[test]
-    fn the_mcp_inventory_is_the_term_that_grows_with_the_company() {
+    fn the_prefix_does_not_grow_when_the_tenant_binds_servers_this_employee_cannot_use() {
+        let prefix = |employees: usize| {
+            assemble(Company { employees }, Reach::Team, Inventory::McpOnly).system
+        };
+        let smallest = prefix(SIZES[0]);
+        for &employees in &SIZES[1..] {
+            assert_eq!(
+                smallest,
+                prefix(employees),
+                "{employees} employees' worth of bound servers changed a prefix that may \
+                 reach one team's"
+            );
+        }
+
+        // The fixture is not vacuous in either direction: the tenant's
+        // inventory grows tenfold across that range, and the employee's own
+        // allowlist does not move at all.
+        let inventory = |employees: usize| Company { employees }.inventory().len();
+        assert_eq!(inventory(SIZES[SIZES.len() - 1]), inventory(SIZES[0]) * 10);
+        // And what the prefix names is what the gate would allow — the same
+        // question `with_mcp_tools` asks, asked here about the whole inventory
+        // of the biggest company, in both directions.
+        let company = Company { employees: 50 };
+        let allowlist = company.allowlist();
+        for (tool, risk) in company.inventory() {
+            let named = smallest.contains(&tool.to_string());
+            let callable = agentos_domain::policy::evaluate_mcp_call(&allowlist, &tool).is_allow();
+            // The taint filter comes first and this turn is untrusted, so a
+            // high-risk tool is absent whatever the policy says — the policy
+            // narrows on top of that filter and never widens it.
+            assert_eq!(
+                named,
+                callable && !risk.is_high(),
+                "{tool} is named={named} but callable={callable} at risk {risk:?}"
+            );
+        }
+    }
+
+    /// The counterfactual, and the reason the row above is worth printing: the
+    /// same prefix built without the policy *does* slope, so the flat line is
+    /// the scoping's doing and not the fixture's.
+    #[test]
+    fn the_unscoped_inventory_still_grows_with_the_company() {
+        let unscoped = |employees: usize| {
+            weigh(&assemble(
+                Company { employees },
+                Reach::Team,
+                Inventory::McpUnscoped,
+            ))
+        };
         // Ten and fifty, not two and fifty: at ten the recall has already
         // saturated, so anything that moves from here is the prefix and only
         // the prefix.
-        let small = weigh(&assemble(
-            Company { employees: 10 },
-            Reach::Team,
-            Inventory::Named,
-        ));
-        let large = weigh(&assemble(
-            Company { employees: 50 },
-            Reach::Team,
-            Inventory::Named,
-        ));
+        let (small, large) = (unscoped(10), unscoped(50));
         assert!(
             large.system > small.system,
             "naming the tenant's whole inventory did not cost more in a bigger tenant, \
@@ -1038,23 +1218,27 @@ mod tests {
         );
     }
 
-    /// What an operator asks, and the answer changed: it is no longer one
-    /// number. The marginal employee carries the whole tenant's MCP inventory in
-    /// every prefix, so a company that binds more servers pays more per
-    /// employee — and that is a finding about `with_mcp_tools`, not a failure.
+    /// What an operator asks, and the answer is one number again.
     ///
-    /// The half that *is* still bounded is the half this task was about, and it
-    /// is asserted directly above.
+    /// It stopped being one when the prefix began naming the tenant's whole
+    /// inventory. Both lists in the prefix are now scoped by the rule the
+    /// runtime enforces — `evaluate_mcp_call` for the tools,
+    /// `inbound::may_message` for the people — so neither has the payroll in it
+    /// and the marginal employee costs the same in a company of fifty as in one
+    /// of ten.
+    ///
+    /// If this fails, some list in the prefix has become a function of headcount
+    /// again, and the company's token bill has gone quadratic in it.
     #[test]
-    fn the_marginal_cost_of_one_more_employee_now_depends_on_the_tenants_bindings() {
+    fn the_marginal_cost_of_one_more_employee_does_not_depend_on_the_payroll() {
         let ten = per_day(Company { employees: 10 });
         let fifty = per_day(Company { employees: 50 });
         assert!(ten > 0);
-        assert!(
-            fifty > ten,
-            "if these are equal again, something stopped naming the tenant's inventory \
-             in the prefix and the employee is back to guessing server names"
-        );
+        assert_eq!(ten, fifty);
+        // And the employee is still told about the tools it can reach, or this
+        // is flat because the feature was removed rather than scoped.
+        let request = assemble(Company { employees: 50 }, Reach::Team, Inventory::Named);
+        assert!(request.system.contains("team-0-erp/record-lookup-0"));
     }
 
     /// A turn that has read a supplier's email and five documents is untrusted,

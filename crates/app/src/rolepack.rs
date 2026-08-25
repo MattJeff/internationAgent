@@ -43,6 +43,15 @@
 //! EffectivePolicy::try_new(&platform, &tenant, &role, &employee)?;
 //! ```
 //!
+//! That field is now what the employee is *told* about as well as what it may
+//! call: [`SystemPrompt::with_mcp_tools`] names the tools the intersected
+//! allowlist permits and no others. So a provisioner that writes one tenant-wide
+//! list has given every employee the whole inventory in its cached prefix, and
+//! one written per team has given each employee its team's — the difference is
+//! priced in `agentos_eval::scoping`. Empty here remains the right default: a
+//! pack cannot know a tenant's servers, and an empty allowlist denies rather
+//! than opens.
+//!
 //! # The briefing is a cache key
 //!
 //! [`RolePack::briefing`] is a `&'static str`. Not a template, not a builder,

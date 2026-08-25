@@ -147,6 +147,7 @@ use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
 use agentos_domain::ids::Slug;
+use agentos_domain::policy::EffectivePolicy;
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
@@ -191,6 +192,15 @@ pub struct Assignment {
     /// in the same transaction as the charter, because it belongs to the same
     /// cached prefix and there is no reason to open a second one.
     pub colleagues: Vec<(Slug, Relation)>,
+    /// Which of the tenant's MCP tools this employee may call — the other list
+    /// in that same prefix, read in the same transaction for the same reason.
+    ///
+    /// It is the whole [`EffectivePolicy`], not a set of names, because
+    /// `SystemPrompt::with_mcp_tools` asks `policy::evaluate_mcp_call` rather
+    /// than reading an allowlist: one rule, and the prompt is a reader of it.
+    /// `None` is a policy that would not load, which names nothing — see
+    /// [`assignment_for`].
+    pub policy: Option<EffectivePolicy>,
 }
 
 /// What the loop decided about one due employee. The `String`s are ours: a
@@ -517,7 +527,27 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         let colleagues = inbound::colleagues(&mut tx, due.employee_id)
             .await
             .map_err(|err| Outcome::Failed(format!("could not read the colleagues: {err}")))?;
-        Ok((employee.employee, charter, colleagues))
+        // And the allowlist the prefix names the tenant's MCP tools from.
+        // `None` for the role, exactly as `reserve_a_turn` and the gate pass it:
+        // the role layer resolves through the employee's team when it has one.
+        //
+        // A policy that will not load is not a reason to abandon the turn here —
+        // `reserve_a_turn` is about to load it again and will refuse the turn
+        // outright if it is broken, and the gate refuses every action after
+        // that. What it means for the prefix is that this employee may call no
+        // MCP tool, so it is told about none.
+        let policy = match policy_store::load(&mut tx, due.employee_id, None).await {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                tracing::warn!(
+                    employee_id = %due.employee_id.as_uuid(),
+                    error = %err,
+                    "no usable policy for this employee; its prefix names no mcp tools"
+                );
+                None
+            }
+        };
+        Ok((employee.employee, charter, colleagues, policy))
     }
     .await;
 
@@ -525,7 +555,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
     // is awaited rather than dropped so a pooled connection is handed back
     // deliberately.
     let _ = tx.rollback().await;
-    let (employee, charter, colleagues) = read?;
+    let (employee, charter, colleagues, policy) = read?;
 
     let Some(charter) = charter else {
         return Ok(None);
@@ -544,6 +574,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         address: employee.address().to_string(),
         charter,
         colleagues,
+        policy,
     }))
 }
 
@@ -589,6 +620,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         address,
         charter,
         colleagues,
+        policy,
     } = assignment;
     let role = charter.role();
 
@@ -619,19 +651,24 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // docs on why this is not a branch that skips the turn.
     let done = vertical_step(&agent, &effects, &principal, &charter, &address).await;
 
+    // Same prefix as `Agent::on_turn`, down to the order of the builders and to
+    // the policy the inventory is narrowed by: an employee that wakes itself
+    // must be told exactly what an employee woken by a stranger is told, or
+    // "same authority either way" is only true of the gate and not of what the
+    // model knows to ask for.
+    let prompt = charter.system_prompt(&identity);
+    let prompt = match &policy {
+        Some(policy) => prompt.with_mcp_tools(policy, fleet.inventory()),
+        None => prompt,
+    }
+    .with_colleagues(colleagues);
+
     let turn = Turn::new(
         agent.llm,
         agent.gate,
         effects,
         principal,
-        // Same prefix as `Agent::on_turn`, down to the order of the builders:
-        // an employee that wakes itself must be told exactly what an employee
-        // woken by a stranger is told, or "same authority either way" is only
-        // true of the gate and not of what the model knows to ask for.
-        charter
-            .system_prompt(&identity)
-            .with_mcp_tools(fleet.inventory())
-            .with_colleagues(colleagues),
+        prompt,
         agent.model,
         address,
     );
@@ -1065,14 +1102,45 @@ pub(crate) mod tests {
         let asks = seed_due(&db, tenant, "asks", Some(vague())).await;
         let bare = seed_due(&db, tenant, "bare", None).await;
 
+        // One MCP tool, granted the way an operator grants one. The prefix names
+        // the tools this employee's *policy* allows, so an assignment that
+        // carried no policy would silently name none — and this fixture is the
+        // only thing that would notice.
+        let slug = |s: &str| agentos_domain::ids::Slug::parse(s).expect("slug");
+        let granted = agentos_domain::action::McpTool::new(slug("erp"), slug("lookup"));
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                max_turns_per_day: 100,
+                allowed_mcp_tools: [granted.clone()].into_iter().collect(),
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the tenant layer");
+
         let started = Arc::new(AtomicUsize::new(0));
         let counter = started.clone();
         let take = move |assignment: Assignment| {
             let counter = counter.clone();
+            let granted = granted.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(assignment.charter.role(), "international-buyer");
                 assert!(assignment.identity.starts_with("You are "));
+                // The employee's own allowlist reached the assignment, so
+                // `take_turn` has something to narrow the tenant's inventory
+                // with. Asked through the gate's rule rather than by reading
+                // the set, which is how `with_mcp_tools` will ask it.
+                assert!(
+                    assignment.policy.as_ref().is_some_and(|policy| {
+                        agentos_domain::policy::evaluate_mcp_call(policy, &granted).is_allow()
+                    }),
+                    "the assignment carries no usable policy, so this employee's prefix \
+                     would name no mcp tool however many its tenant has bound"
+                );
                 if assignment.due.employee_id == fails {
                     return Err("turn_failed".to_owned());
                 }

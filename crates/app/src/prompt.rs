@@ -39,7 +39,7 @@
 //! and nothing else tells the model which ones exist — so it guesses, and the
 //! gate denies the guess.
 //!
-//! Two things are load-bearing about how that list is built:
+//! Three things are load-bearing about how that list is built:
 //!
 //! 1. **It is filtered by the turn's trust label**, through
 //!    [`crate::turn::visible`] — the same predicate that filters the tool
@@ -49,7 +49,18 @@
 //!    is no cache-friendly way to name a capability to one turn and hide it
 //!    from the next without the prefix differing between them, and hiding it
 //!    is worth more than the tokens.
-//! 2. **Only names an operator wrote go in.** [`crate::mcp::Fleet::inventory`]
+//! 2. **It is filtered by the employee's own policy**, through
+//!    [`agentos_domain::policy::evaluate_mcp_call`] — the same rule the gate
+//!    applies to every `McpCall`. [`crate::mcp::Fleet::inventory`] is per
+//!    *tenant*: without this, an employee was told about every server the
+//!    company had bound, so the cached prefix grew with the company's
+//!    integrations and every employee paid for all of them on every turn.
+//!    `allowed_mcp_tools` is intersected across platform ∧ tenant ∧ role ∧
+//!    employee, and the `role` layer is the employee's *team*
+//!    (`domain::org::Team`), so this is the same team-shaped bound the roster
+//!    below has, taken from the mechanism that was already there rather than
+//!    from a second one built beside it.
+//! 3. **Only names an operator wrote go in.** [`crate::mcp::Fleet::inventory`]
 //!    drops undeclared tools and never yields a server's own description, so
 //!    the only strings that reach the prefix from an MCP server are ones a
 //!    human put in `mcp_tool_declarations` — which keeps the rule at the top of
@@ -92,6 +103,7 @@ use std::collections::BTreeSet;
 
 use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::{SecretRef, Slug};
+use agentos_domain::policy::{EffectivePolicy, evaluate_mcp_call};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{LlmRequest, Message};
 
@@ -338,18 +350,69 @@ impl SystemPrompt {
         self
     }
 
-    /// Tell the model that one MCP tool exists.
+    /// Tell the model that one MCP tool exists — and only the ones this
+    /// employee may actually call.
     ///
-    /// Feed this from [`crate::mcp::Fleet::inventory`]; `risk` is what decides
-    /// whether an untrusted turn is told at all. The list is sorted here rather
-    /// than trusted to arrive sorted, because the rendered prefix has to be
-    /// byte-identical between turns and a caller that varies the order has
-    /// varied the cache key.
+    /// Feed `inventory` from [`crate::mcp::Fleet::inventory`], which is the
+    /// *tenant's*: every declared tool on every server an operator bound, for
+    /// everybody. `policy` is what makes it this employee's, and it is an
+    /// argument rather than a filter the caller applies for three reasons.
+    ///
+    /// **It is the rule that already exists.** `PolicyLimits::allowed_mcp_tools`
+    /// is intersected across platform ∧ tenant ∧ role ∧ employee and the gate
+    /// checks it on every [`Action::McpCall`](agentos_domain::action::Action).
+    /// An employee told about a tool it may not call spends a turn finding that
+    /// out and cannot tell the denial from a name it spelled wrong; a tool it may
+    /// call and was never told about is unreachable, because `call_mcp_tool`
+    /// takes the server and the tool as free strings. So "name what is callable"
+    /// is not a new scope — it is the gate's own answer, read where the prefix is
+    /// built. It is read by *asking*
+    /// [`evaluate_mcp_call`](agentos_domain::policy::evaluate_mcp_call) rather
+    /// than by re-reading the allowlist, for the reason
+    /// [`crate::inbound::colleagues`] asks `may_message`: one rule, two callers.
+    ///
+    /// **It is the term that made the bill grow with the payroll.** The
+    /// inventory is per tenant and was scoped by nothing, so every employee paid
+    /// for every server the company had bound, on every turn, forever —
+    /// `agentos_eval::scoping` put the number on it. The allowlist is per
+    /// employee, and where a team writes one it is the team's:
+    /// `domain::org::Team`'s `role` layer *is* `allowed_mcp_tools`, capped at
+    /// `Team::MAX_TOOLS_PER_EMPLOYEE`. That is the same O(team) bound that keeps
+    /// the roster from sloping, obtained from the same place — a team is a policy
+    /// role, and there is no second scoping mechanism here.
+    ///
+    /// **A caller cannot get it wrong.** Taking the policy in the signature is
+    /// what makes an unscoped prefix unexpressible, exactly as [`Self::request`]
+    /// taking only a [`TrustLabel`] makes a prefix and a schema set at different
+    /// trust levels unexpressible. The alternative — every call site filtering
+    /// `fleet.inventory()` before handing it over — is the same rule written
+    /// once per call site, and this task exists because that kind of copy rots.
+    ///
+    /// The taint filter is untouched and still runs last, in [`Self::render`]:
+    /// `risk` is what decides whether an untrusted turn is told at all. The two
+    /// narrowings compose as an intersection whichever way round they run, and
+    /// they are split because they change at different cadences — the policy when
+    /// an operator edits a layer, the trust label mid-run. Applying the policy
+    /// here means it is applied once per prompt rather than once per render;
+    /// applying the risk there is the only way an inventory built before the turn
+    /// took a tool result can still be filtered by what the turn has since read.
+    ///
+    /// The list is sorted here rather than trusted to arrive sorted, because the
+    /// rendered prefix has to be byte-identical between turns and a caller that
+    /// varies the order has varied the cache key. The policy does not vary
+    /// between turns either, so it does not move the breakpoint: an operator
+    /// changing a layer invalidates a prefix on the same cadence as an operator
+    /// binding a server, which is days rather than turns.
     #[must_use]
-    pub fn with_mcp_tools(mut self, inventory: impl IntoIterator<Item = (McpTool, Risk)>) -> Self {
+    pub fn with_mcp_tools(
+        mut self,
+        policy: &EffectivePolicy,
+        inventory: impl IntoIterator<Item = (McpTool, Risk)>,
+    ) -> Self {
         self.mcp.extend(
             inventory
                 .into_iter()
+                .filter(|(tool, _)| evaluate_mcp_call(policy, tool).is_allow())
                 .map(|(tool, risk)| (tool.to_string(), risk)),
         );
         // By name: `server/tool` is unique in the inventory, so this is a total
@@ -837,15 +900,37 @@ Kind regards, Accounts Payable";
     // -- the MCP inventory -------------------------------------------------
 
     fn tool(name: &str) -> McpTool {
+        on("erp", name)
+    }
+
+    fn on(server: &str, name: &str) -> McpTool {
         McpTool::new(
-            Slug::parse("erp").expect("slug"),
+            Slug::parse(server).expect("slug"),
             Slug::parse(name).expect("slug"),
         )
+    }
+
+    /// A policy that allows exactly these tools and nothing else.
+    ///
+    /// One `PolicyLimits` in all four positions, because intersecting a layer
+    /// with itself is a no-op — the shape of the stack is `store::policy`'s
+    /// claim and not this file's, and what these tests need is one effective
+    /// allowlist that a `SystemPrompt` can be built against.
+    fn allowing(tools: impl IntoIterator<Item = McpTool>) -> EffectivePolicy {
+        let limits = agentos_domain::policy::PolicyLimits {
+            allowed_mcp_tools: tools.into_iter().collect(),
+            ..Default::default()
+        };
+        EffectivePolicy::try_new(&limits, &limits, &limits, &limits).expect("coherent layers")
     }
 
     /// A buyer's floor, because the assertions below are about the taint filter
     /// and a bare prompt is `UNCHARTERED` — which would remove `pay` for the
     /// wrong reason and make the trusted half of the claim untestable.
+    ///
+    /// The policy allows both tools, so what the taint filter takes away is the
+    /// only thing missing from this prefix — the two narrowings are separable
+    /// only if one of them is off.
     fn erp() -> SystemPrompt {
         SystemPrompt::new("You are Lena.")
             .with_proposable(
@@ -853,10 +938,81 @@ Kind regards, Accounts Payable";
                     .proposable()
                     .clone(),
             )
-            .with_mcp_tools([
-                (tool("drop-table"), Risk::High),
-                (tool("lookup"), Risk::Low),
-            ])
+            .with_mcp_tools(
+                &allowing([tool("drop-table"), tool("lookup")]),
+                [
+                    (tool("drop-table"), Risk::High),
+                    (tool("lookup"), Risk::Low),
+                ],
+            )
+    }
+
+    /// **The claim the policy argument exists for**, in both directions at once.
+    ///
+    /// A tenant with three tools bound and an employee the policy lets reach
+    /// one of them: the prefix names that one, does not name the other two, and
+    /// the difference is the gate's own ruling rather than a rule restated here
+    /// — which is why the assertion loops over the whole inventory asking
+    /// `evaluate_mcp_call`, instead of listing the expected names.
+    #[test]
+    fn the_prefix_names_the_tools_this_employee_may_call_and_no_others() {
+        let inventory = [
+            (tool("lookup"), Risk::Low),
+            (tool("write-note"), Risk::Low),
+            (on("crm", "log-call"), Risk::Low),
+        ];
+        let policy = allowing([tool("lookup")]);
+        let rendered = SystemPrompt::new("You are Lena.")
+            .with_mcp_tools(&policy, inventory.clone())
+            .render(TrustLabel::Trusted);
+
+        for (tool, _) in inventory {
+            assert_eq!(
+                rendered.contains(&tool.to_string()),
+                evaluate_mcp_call(&policy, &tool).is_allow(),
+                "what the prefix names and what the gate allows disagree about {tool}: {rendered}"
+            );
+        }
+        // And the fixture is not vacuous in either direction.
+        assert!(rendered.contains("erp/lookup"));
+        assert!(!rendered.contains("crm/log-call"));
+    }
+
+    /// **The property this change exists for.** A tenant that binds fifty more
+    /// servers does not enlarge the prefix of an employee that may not use them
+    /// — not "grows slowly", byte-identical.
+    ///
+    /// Asserted as an equality between two prefixes rather than as a token
+    /// count, because a reworded heading must not fail this and a count would
+    /// have to be updated when one is. `agentos_eval::scoping` weighs the same
+    /// property in tokens, at 2, 10 and 50 employees.
+    #[test]
+    fn binding_a_server_this_employee_cannot_reach_does_not_change_its_prefix() {
+        let policy = allowing([tool("lookup")]);
+        let alone = SystemPrompt::new("You are Lena.")
+            .with_mcp_tools(&policy, [(tool("lookup"), Risk::Low)])
+            .render(TrustLabel::Trusted);
+
+        for servers in [1, 10, 50] {
+            let inventory = (0..servers).flat_map(|n| {
+                [
+                    (on(&format!("erp-{n}"), "lookup"), Risk::Low),
+                    (on(&format!("erp-{n}"), "drop-table"), Risk::High),
+                ]
+            });
+            let crowded = SystemPrompt::new("You are Lena.")
+                .with_mcp_tools(
+                    &policy,
+                    inventory
+                        .chain([(tool("lookup"), Risk::Low)])
+                        .collect::<Vec<_>>(),
+                )
+                .render(TrustLabel::Trusted);
+            assert_eq!(
+                alone, crowded,
+                "{servers} servers this employee cannot call changed its prefix"
+            );
+        }
     }
 
     /// **The claim this unit exists for.** An untrusted turn is not told that
@@ -910,13 +1066,27 @@ Kind regards, Accounts Payable";
                 .contains("connected systems")
         );
 
-        // Same for a turn whose entire inventory is filtered away.
-        let all_high =
-            SystemPrompt::new("You are Lena.").with_mcp_tools([(tool("drop-table"), Risk::High)]);
+        // Same for a turn whose entire inventory is filtered away — by the
+        // taint filter here, and by the policy in the case below it.
+        let all_high = SystemPrompt::new("You are Lena.").with_mcp_tools(
+            &allowing([tool("drop-table")]),
+            [(tool("drop-table"), Risk::High)],
+        );
         assert_eq!(
             all_high.render(TrustLabel::Untrusted),
             bare.render(TrustLabel::Untrusted)
         );
+
+        // An employee whose policy names no tool at all is the deny-by-default
+        // case — an empty `allowed_mcp_tools` is nobody having written a rule —
+        // and it renders the prefix of an employee with nothing bound, at every
+        // trust level. It is also every employee in a deployment whose operator
+        // has installed the default ceiling, which grants no MCP tools.
+        let ungranted = SystemPrompt::new("You are Lena.")
+            .with_mcp_tools(&allowing([]), [(tool("lookup"), Risk::Low)]);
+        for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
+            assert_eq!(ungranted.render(trust), bare.render(trust));
+        }
     }
 
     // -- the colleague roster ----------------------------------------------
@@ -1024,14 +1194,20 @@ Kind regards, Accounts Payable";
 
     #[test]
     fn the_inventory_is_ordered_so_the_prefix_stays_a_cache_key() {
-        let one = SystemPrompt::new("b")
-            .with_mcp_tools([(tool("lookup"), Risk::Low), (tool("write-note"), Risk::Low)]);
-        let other = SystemPrompt::new("b").with_mcp_tools([
-            (tool("write-note"), Risk::Low),
-            (tool("lookup"), Risk::Low),
-            // The same tool twice is one line, not two.
-            (tool("lookup"), Risk::Low),
-        ]);
+        let policy = allowing([tool("lookup"), tool("write-note")]);
+        let one = SystemPrompt::new("b").with_mcp_tools(
+            &policy,
+            [(tool("lookup"), Risk::Low), (tool("write-note"), Risk::Low)],
+        );
+        let other = SystemPrompt::new("b").with_mcp_tools(
+            &policy,
+            [
+                (tool("write-note"), Risk::Low),
+                (tool("lookup"), Risk::Low),
+                // The same tool twice is one line, not two.
+                (tool("lookup"), Risk::Low),
+            ],
+        );
         assert_eq!(
             one.render(TrustLabel::Trusted),
             other.render(TrustLabel::Trusted)

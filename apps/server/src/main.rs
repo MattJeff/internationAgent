@@ -950,14 +950,35 @@ impl Agent {
             let roster = inbound::colleagues(tx, employee_id)
                 .await
                 .map_err(|err| format!("could not read this employee's colleagues: {err}"))?;
-            let prompt = charter
-                .as_ref()
-                .map_or_else(
-                    || SystemPrompt::new(identity.clone()),
-                    |charter| charter.system_prompt(&identity),
-                )
-                .with_mcp_tools(fleet.inventory())
-                .with_colleagues(roster);
+            // The other half of the same idea, for the tenant's bindings. The
+            // fleet is per *tenant*, so `with_mcp_tools` is handed the policy
+            // this employee's calls will actually be ruled against — the same
+            // `store::policy::load` the gate runs per action, in this same
+            // transaction, so the prefix and the ruling cannot be built from
+            // two different versions of the allowlist.
+            //
+            // A policy that will not load names nothing. It is not a reason to
+            // fail the turn: the gate loads it again per action and refuses
+            // every one with `broken_policy`, audited, which is the operator's
+            // signal — and an employee whose policy is unreadable can call no
+            // MCP tool, so a prefix that named some would be inviting it to
+            // spend its turns finding that out.
+            let prompt = charter.as_ref().map_or_else(
+                || SystemPrompt::new(identity.clone()),
+                |charter| charter.system_prompt(&identity),
+            );
+            let prompt = match agentos_store::policy::load(tx, employee_id, None).await {
+                Ok(policy) => prompt.with_mcp_tools(&policy, fleet.inventory()),
+                Err(err) => {
+                    tracing::warn!(
+                        employee_id = %employee_id.as_uuid(),
+                        error = %err,
+                        "no usable policy for this employee; its prefix names no mcp tools"
+                    );
+                    prompt
+                }
+            }
+            .with_colleagues(roster);
 
             // The counterparty wrote all four of these — who it is from
             // included — so they travel together inside one frame rather than

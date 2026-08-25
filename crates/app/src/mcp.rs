@@ -76,6 +76,12 @@
 //!   [`SystemPrompt::render`](crate::prompt::SystemPrompt::render), on the same
 //!   axis and through the same predicate as the tool schemas —
 //!   [`crate::turn::visible`].
+//! * **Narrowed to what the employee may call**, by
+//!   [`SystemPrompt::with_mcp_tools`](crate::prompt::SystemPrompt::with_mcp_tools),
+//!   through the policy allowlist the gate rules with. This is a *tenant's*
+//!   inventory: an employee is one seat in it, and telling every seat about
+//!   every server is both a token bill that grows with the company's
+//!   integrations and an invitation to spend turns being denied.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -996,6 +1002,14 @@ impl Fleet {
     /// [`SystemPrompt::render`](crate::prompt::SystemPrompt::render) does it,
     /// per turn, through [`crate::turn::visible`].
     ///
+    /// **Nor by policy**, and for the opposite reason: a fleet is one *tenant's*
+    /// bindings and has no employee in it, so it has nothing to narrow with.
+    /// [`SystemPrompt::with_mcp_tools`](crate::prompt::SystemPrompt::with_mcp_tools)
+    /// takes the employee's `EffectivePolicy` and is where "this tenant has
+    /// bound it" becomes "this employee may call it". Callers that want the
+    /// tenant-wide answer — an operator's binding page counting what it just
+    /// configured — are asking this function the right question.
+    ///
     /// Undeclared tools are absent: see this module's docs for why an operator
     /// has to have written the string before it reaches a system prompt.
     pub fn inventory(&self) -> Vec<(McpTool, Risk)> {
@@ -1306,6 +1320,23 @@ mod tests {
 
     fn call(name: &str) -> McpTool {
         McpTool::new(erp(), slug(name))
+    }
+
+    /// A stored policy that allows exactly these tools.
+    ///
+    /// `SystemPrompt::with_mcp_tools` takes one because the prefix names what
+    /// the gate would allow; here it is set to the whole fixture inventory, so
+    /// what the assertions below vary is the *declaration* and never the
+    /// allowlist.
+    fn may_call(
+        tools: impl IntoIterator<Item = McpTool>,
+    ) -> agentos_domain::policy::EffectivePolicy {
+        let limits = agentos_domain::policy::PolicyLimits {
+            allowed_mcp_tools: tools.into_iter().collect(),
+            ..Default::default()
+        };
+        agentos_domain::policy::EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+            .expect("coherent layers")
     }
 
     fn declared() -> BTreeMap<Slug, Declaration> {
@@ -1710,7 +1741,7 @@ mod tests {
         assert_eq!(vetted.inventory(), vec![(call("lookup"), Risk::Low)]);
         assert!(
             SystemPrompt::new("You are Lena.")
-                .with_mcp_tools(vetted.inventory())
+                .with_mcp_tools(&may_call([call("lookup")]), vetted.inventory())
                 .render(TrustLabel::Untrusted)
                 .contains("erp/lookup")
         );
@@ -1737,10 +1768,12 @@ mod tests {
         // 1. The class the operator granted does not travel with the name.
         assert_eq!(stale.inventory(), vec![(call("lookup"), Risk::High)]);
 
-        // 2. So a turn that has read a stranger's text is not told it exists.
+        // 2. So a turn that has read a stranger's text is not told it exists —
+        //    and the policy still allows it by name, which is the point: the
+        //    class did the hiding, not the allowlist.
         assert!(
             !SystemPrompt::new("You are Lena.")
-                .with_mcp_tools(stale.inventory())
+                .with_mcp_tools(&may_call([call("lookup")]), stale.inventory())
                 .render(TrustLabel::Untrusted)
                 .contains("erp/lookup"),
             "an exposed turn was told about a tool nobody vetted"

@@ -479,6 +479,43 @@ const fn no_match(list_is_empty: bool, specific: DenyReason) -> DenyReason {
     }
 }
 
+/// **The MCP allowlist rule**, written once because two callers ask it.
+///
+/// [`evaluate`]'s [`Action::McpCall`] arm is a call to this function, and so is
+/// [`evaluate_mcp_call`] — the one `app::prompt` uses to decide which tools an
+/// employee is *told* about. Two spellings of one membership test is the copy
+/// that drifts, and it drifts in both of the ways that cost something: a tool
+/// named in the prefix that the gate refuses burns a turn on a denial the model
+/// cannot learn from, and a tool the gate would allow that the prefix never
+/// names is a capability nobody can reach.
+fn mcp_rules(allowed: &BTreeSet<McpTool>, tool: &McpTool) -> Decision {
+    if allowed.contains(tool) {
+        Decision::Allow
+    } else {
+        Decision::deny(no_match(allowed.is_empty(), DenyReason::ToolNotAllowed))
+    }
+}
+
+/// Whether this policy permits calling one MCP tool, with no [`ActionCtx`] to
+/// assemble.
+///
+/// The same ruling [`evaluate`] gives an [`Action::McpCall`], minus the taint
+/// wire — which cannot fire for this action anyway: `Action::McpCall` is `Low`
+/// on the domain's risk axis, because the blast radius of an MCP call is a
+/// property of the *tool* rather than of the verb, and that lives in
+/// `app::mcp::RiskClass` where the operator declared it. So there is no context
+/// this answer depends on: it is the intersected allowlist and nothing else,
+/// which is what makes it safe to ask once when a prompt is built rather than
+/// once per action.
+///
+/// It exists so the system prompt can name exactly the tools the gate will
+/// allow. Asking here rather than reading [`PolicyLimits::allowed_mcp_tools`] at
+/// the call site is the choice `app::inbound::colleagues` already makes about
+/// `may_message`: the rule has one home, and the prompt is a reader of it.
+pub fn evaluate_mcp_call(policy: &EffectivePolicy, tool: &McpTool) -> Decision {
+    mcp_rules(&policy.limits().allowed_mcp_tools, tool)
+}
+
 fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) -> Decision {
     // Exhaustive destructure, no `..`. Add a field to PolicyLimits and this
     // line stops compiling until the new field is consulted below.
@@ -595,16 +632,7 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
         }
 
-        Action::McpCall { tool } => {
-            if allowed_mcp_tools.contains(tool) {
-                Decision::Allow
-            } else {
-                Decision::deny(no_match(
-                    allowed_mcp_tools.is_empty(),
-                    DenyReason::ToolNotAllowed,
-                ))
-            }
-        }
+        Action::McpCall { tool } => mcp_rules(allowed_mcp_tools, tool),
 
         Action::A2aSend { peer } => {
             if blocked(peer) {
@@ -1563,6 +1591,54 @@ mod tests {
         assert_eq!(
             ApprovalReason::ContractSignature.code(),
             "contract_signature"
+        );
+    }
+
+    /// **The prompt and the gate ask one question.** `app::prompt` names the
+    /// tools an employee may call by calling [`evaluate_mcp_call`]; the gate
+    /// rules on the call itself through [`evaluate`]. If those two ever answer
+    /// differently, an employee is either being invited to spend a turn on a
+    /// denial or holding a capability nobody told it about.
+    #[test]
+    fn naming_a_tool_and_ruling_on_it_are_the_same_rule() {
+        let granted = McpTool::new(slug("erp"), slug("lookup"));
+        let withheld = McpTool::new(slug("erp"), slug("drop-table"));
+        let policy = effective(&permissive());
+        let silent = effective(&PolicyLimits {
+            allowed_mcp_tools: BTreeSet::new(),
+            ..permissive()
+        });
+
+        for policy in [&policy, &silent] {
+            for tool in [&granted, &withheld] {
+                assert_eq!(
+                    evaluate_mcp_call(policy, tool),
+                    evaluate(
+                        policy,
+                        &Action::McpCall { tool: tool.clone() },
+                        &ActionCtx {
+                            // Both labels, because the prompt asks this once
+                            // when it is built and the turn's label moves under
+                            // it. An MCP call is Low, so neither answer may
+                            // depend on the trust wire.
+                            trust: TrustLabel::Untrusted,
+                            ..ctx()
+                        }
+                    ),
+                    "{tool} was ruled on differently by the two callers"
+                );
+            }
+        }
+
+        assert!(evaluate_mcp_call(&policy, &granted).is_allow());
+        assert!(!evaluate_mcp_call(&policy, &withheld).is_allow());
+        // An empty allowlist is nobody having written a rule, not a list this
+        // tool failed to be on — the same distinction the gate reports.
+        assert_eq!(
+            evaluate_mcp_call(&silent, &granted),
+            Decision::Deny {
+                reason: DenyReason::NoRule
+            }
         );
     }
 

@@ -49,6 +49,7 @@ use agentos_app::prompt::{SystemPrompt, render_fenced};
 use agentos_app::rolepack::RolePack;
 use agentos_domain::action::{McpTool, Risk};
 use agentos_domain::ids::Slug;
+use agentos_domain::policy::{EffectivePolicy, PolicyLimits};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{Content, Llm, Message};
 use agentos_providers::llm_cli::CliLlm;
@@ -85,18 +86,29 @@ pub const UNTRUSTED_PROMPT: &str = "c8cbf12b7f31388c";
 /// difference this fixture measures now that `tools_for` is pack-aware.
 fn prompt() -> SystemPrompt {
     let slug = |s: &str| Slug::parse(s).expect("fixture slug");
+    let inventory = [
+        (
+            McpTool::new(slug("customs"), slug("tariff-lookup")),
+            Risk::Low,
+        ),
+        (
+            McpTool::new(slug("banking"), slug("wire-transfer")),
+            Risk::High,
+        ),
+    ];
+    // The employee's policy allows both, so the only thing that removes one is
+    // the taint filter — which is what the two pinned digests differ by, and
+    // what this fixture is for. An allowlist narrower than the inventory would
+    // measure the scoping instead, and that is `scoping`'s row.
+    let limits = PolicyLimits {
+        allowed_mcp_tools: inventory.iter().map(|(tool, _)| tool.clone()).collect(),
+        ..Default::default()
+    };
+    let policy = EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+        .expect("a fixture policy with no spend limits to reconcile");
     RolePack::international_buyer()
         .system_prompt()
-        .with_mcp_tools([
-            (
-                McpTool::new(slug("customs"), slug("tariff-lookup")),
-                Risk::Low,
-            ),
-            (
-                McpTool::new(slug("banking"), slug("wire-transfer")),
-                Risk::High,
-            ),
-        ])
+        .with_mcp_tools(&policy, inventory)
 }
 
 /// The tool names this employee is offered at this trust level — the schemas

@@ -79,8 +79,10 @@
 //! `{"server": "string", "tool": "string"}` and the model had to guess, so it
 //! guessed, and `allowed_mcp_tools` denied the guess — a real MCP integration
 //! looked like a broken one. [`crate::mcp::Fleet::inventory`] produces the list
-//! of names and `SystemPrompt` renders it into the prefix, trust-filtered. One
-//! schema, a named inventory.
+//! of names and `SystemPrompt` renders it into the prefix, trust-filtered and
+//! narrowed to the entries of `allowed_mcp_tools` this employee holds — so the
+//! names it is given are the names the gate will accept, which is the whole
+//! point of giving it names. One schema, a named inventory.
 //!
 //! The one thing the collapsed form gives up is per-tool argument validation:
 //! `arguments` is an open object, and a wrong shape is found by the MCP server
