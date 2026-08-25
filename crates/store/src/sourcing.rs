@@ -1786,9 +1786,24 @@ mod tests {
         .execute(&mut **tx)
         .await
         .expect_err("the view must not be writable");
-        assert!(
-            format!("{err}").contains("view"),
-            "expected a view-is-not-updatable error, got: {err}"
+        // SQLSTATE, not the sentence. `contains("view")` passed here for a year
+        // and then failed the first time this ran against a server whose
+        // `lc_messages` is not English — "ne peut pas insérer dans la vue" is
+        // the *same refusal*, correctly given, reported as a test failure.
+        // `55000` is object_not_in_prerequisite_state, which is what Postgres
+        // raises for a write to a view with no INSTEAD OF trigger behind it,
+        // and it is never translated. (Not `0A000`: that is what the class of
+        // error *sounds* like, and asserting it fails against a real server —
+        // which is how this line was arrived at.) The same argument, at more
+        // length, is in `audit.rs`.
+        let sqlstate = err
+            .as_database_error()
+            .and_then(|e| e.code())
+            .unwrap_or_default()
+            .into_owned();
+        assert_eq!(
+            sqlstate, "55000",
+            "expected the write to the view to be refused with 55000, got: {err}"
         );
         tx.rollback().await.expect("rollback");
 
