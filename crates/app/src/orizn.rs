@@ -651,21 +651,26 @@ mod tests {
     /// `orizn-visa-mcp` is a stdio server, so the transport is somebody else's
     /// decision and this test holds the seam below it — [`read_answer`] against
     /// bytes the real server produced *now*, which is where schema drift shows
-    /// up. Skipped unless `ORIZN_LIVE` is set, because it spends one of the
-    /// keyless plan's ten daily checks and needs the network.
+    /// up.
+    ///
+    /// Behind `live-orizn` and **not** a runtime `ORIZN_LIVE` check, which is
+    /// what this was first written as. `scripts/test.sh` fails the build on a
+    /// printed `SKIP:` — deliberately, because ~34 tests here skip themselves
+    /// without a database and a green run of nothing is the failure mode nobody
+    /// notices — and a test needing `npx` and the open internet cannot satisfy
+    /// that guard by being satisfiable. So it is *absent* from a default run
+    /// rather than present and quietly passing, which is the same choice
+    /// `tests/orizn.rs` made independently. One repository, one convention.
+    /// It also spends one of the keyless plan's ten daily checks.
     ///
     /// `USA` → `FRA` is the pair, and it is chosen for being dull: United
     /// States nationals have entered the Schengen area without a visa for short
     /// stays since before Schengen had that name, and the change that is coming
     /// (ETIAS) is an authorisation rather than a visa. If this assertion ever
     /// fails it is a bug in the mapping or the surface, not news about France.
+    #[cfg(feature = "live-orizn")]
     #[tokio::test]
     async fn the_live_server_answers_a_pair_we_can_check_by_hand() {
-        if std::env::var("ORIZN_LIVE").is_err() {
-            eprintln!("SKIP: ORIZN_LIVE is unset; this test calls the real Orizn MCP server");
-            return;
-        }
-
         let result = live::quick_visa_check("USA", "FRA").await;
         let answer = read_answer(&result, Utc::now()).expect("the live server answered");
 
@@ -692,6 +697,7 @@ mod tests {
     /// Enough MCP over stdio to ask one question. Test-only, and deliberately
     /// not a transport: it exists so the live assertion above has real bytes to
     /// stand on while `crates/app/src/mcp.rs` cannot reach a stdio server.
+    #[cfg(feature = "live-orizn")]
     mod live {
         use agentos_domain::untrusted::Untrusted;
         use serde_json::{Value, json};
