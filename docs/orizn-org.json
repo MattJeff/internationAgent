@@ -1,0 +1,44 @@
+{
+  "domain": "agents.orizn.com",
+  "rows": [
+    {
+      "team": "direction",
+      "name": "Direction",
+      "mission": "Decide what Orizn sells, to whom and on what terms. The root of the org chart and the approver of record: this seat wears no role pack and takes no turns.",
+      "head": "founder",
+      "title": "CEO / founder"
+    },
+    {
+      "team": "sales-development",
+      "name": "Commercial",
+      "mission": "Find a verifiable entry-requirement defect in a prospect's own booking flow, reproduce it, and hand the qualified account to a human. No prices, no terms, no signatures.",
+      "head": "sdr",
+      "title": "Sales Development",
+      "reports_to": "founder"
+    },
+    {
+      "team": "customer-success",
+      "name": "Clients",
+      "mission": "Answer the carriers, platforms and travel teams that write in, reproduce what they report against our own data, and escalate anything touching money, credentials or deletion.",
+      "head": "support",
+      "title": "Customer Success",
+      "reports_to": "founder"
+    },
+    {
+      "team": "growth",
+      "name": "Growth",
+      "mission": "Study how buyers search for entry-requirement data, read what competitors publish about coverage, and hand drafts to a colleague. Nothing this seat writes reaches the public.",
+      "head": "acquisition",
+      "title": "Head of Growth",
+      "reports_to": "founder"
+    },
+    {
+      "team": "finance",
+      "name": "Finance",
+      "mission": "Keep the books, reconcile the accounts, prepare approved supplier invoices for payment and prepare the filings. Every payment goes to a person before it moves.",
+      "head": "books",
+      "title": "Finance",
+      "reports_to": "founder"
+    }
+  ]
+}

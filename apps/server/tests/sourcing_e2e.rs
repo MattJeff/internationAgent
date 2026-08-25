@@ -246,6 +246,25 @@ struct Server {
     log: PathBuf,
     database_url: String,
     tenant: TenantId,
+    /// Set by [`Server::stop`]. [`Drop`] does nothing when the orderly path ran.
+    reaped: bool,
+}
+
+/// **A failing test must not leave a server running.** The same argument, at
+/// length, is on the `Drop` in `end_to_end.rs`: `stop` is skipped by the panic
+/// that an assertion failure *is*, and the child left behind holds a pipe the
+/// runner is waiting on. SIGKILL rather than SIGTERM because this path asserts
+/// nothing and runs while a panic unwinds; the database is left to
+/// `scripts/test.sh`, because a panic inside `Drop` during unwinding aborts the
+/// process and would replace a readable failure with `SIGABRT`.
+impl Drop for Server {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Server {
@@ -299,7 +318,13 @@ impl Server {
         command
             .env_clear()
             .stdout(Stdio::from(File::create(&log).expect("log file")))
-            .stderr(Stdio::inherit());
+            // Both streams to the file. `inherit()` hands the child the test
+            // runner's own stderr, so a server that outlives a panicking test
+            // holds that pipe open and `cargo test` waits on it instead of
+            // printing the failure — ten minutes of nothing, measured.
+            .stderr(Stdio::from(
+                File::create(log.with_extension("err")).expect("log file"),
+            ));
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
@@ -316,6 +341,7 @@ impl Server {
             log,
             database_url,
             tenant,
+            reaped: false,
         };
         // The server migrates on boot, so `/livez` answering is also the
         // signal that the schema exists — which is why the tenant the API key
@@ -440,6 +466,8 @@ impl Server {
 
         let logs = std::fs::read_to_string(&self.log).unwrap_or_default();
         let _ = std::fs::remove_file(&self.log);
+        let _ = std::fs::remove_file(self.log.with_extension("err"));
+        self.reaped = true;
         logs
     }
 
