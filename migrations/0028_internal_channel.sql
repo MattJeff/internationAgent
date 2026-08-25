@@ -1,4 +1,4 @@
--- 0025_internal_channel: employees can talk to each other.
+-- 0028_internal_channel: employees can talk to each other.
 --
 -- Every channel before this one points outward. An employee could email a
 -- supplier, text a customer and call a warehouse, and could not say one word to

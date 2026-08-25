@@ -5,7 +5,7 @@
 //! [`super::autonomy`] answers "how much of the work did the agents do". This
 //! answers the question that always follows it — "and what did that cost" — and
 //! the two are deliberately the same shape over the same window, because the
-//! only interesting reading is the pair. `migrations/0023_model_usage.sql` and
+//! only interesting reading is the pair. `migrations/0024_model_usage.sql` and
 //! [`agentos_store::model_usage`] carry the argument for the table; this is the
 //! operator's way in, and until it existed the answer lived in log lines and a
 //! process-local counter that drops the tenant.

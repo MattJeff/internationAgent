@@ -1,4 +1,4 @@
--- 0023_model_usage: what the models actually cost, in tokens, per employee.
+-- 0024_model_usage: what the models actually cost, in tokens, per employee.
 --
 -- Until this file the single largest operating cost of this system was
 -- invisible. `Usage` comes back real from the provider

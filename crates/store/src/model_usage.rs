@@ -4,7 +4,7 @@
 //! [`crate::spend`], turns through [`crate::turns`], and every effect leaves an
 //! audit row. Model tokens — the single largest operating cost of this system —
 //! went to a process-local counter that drops the tenant and to two `tracing`
-//! lines, and nowhere else. `migrations/0023_model_usage.sql` is the table and
+//! lines, and nowhere else. `migrations/0024_model_usage.sql` is the table and
 //! the argument; this module is the only thing that writes it.
 //!
 //! # Where the write happens is the whole design

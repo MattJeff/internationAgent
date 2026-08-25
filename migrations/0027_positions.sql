@@ -1,4 +1,4 @@
--- 0025_positions: what a team is for, and who answers to whom.
+-- 0027_positions: what a team is for, and who answers to whom.
 --
 -- 0012_org gave a tenant teams and sections. What it could not express is the
 -- org chart an operator actually draws:
