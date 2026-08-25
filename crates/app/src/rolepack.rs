@@ -1111,18 +1111,17 @@ mod tests {
     /// it needs its own copy of this.
     #[test]
     fn every_role_can_reach_a_colleague() {
+        let sales = crate::rolepack_sales::RolePack::sales_development();
         for (name, may_propose, limits) in [
-            ("buyer", buyer().may_propose(ActionKind::InternalSend), {
-                let l = buyer().limits().clone();
-                l
-            }),
+            (
+                "buyer",
+                buyer().may_propose(ActionKind::InternalSend),
+                buyer().limits().clone(),
+            ),
             (
                 "sales",
-                crate::rolepack_sales::RolePack::sales_development()
-                    .may_propose(ActionKind::InternalSend),
-                crate::rolepack_sales::RolePack::sales_development()
-                    .limits()
-                    .clone(),
+                sales.may_propose(ActionKind::InternalSend),
+                sales.limits().clone(),
             ),
         ] {
             assert!(
