@@ -1001,10 +1001,33 @@ mod tests {
         .expect("insert the employee");
         tx.commit().await.expect("commit");
 
+        // And a seat pointing at the role layer this test is about to write.
+        // Not decoration: a role layer reaches an employee through
+        // `team_policy` and through nothing else, so an employee with no seat
+        // sees no role layer at all and the assertions below would be reading
+        // the tenant's numbers while claiming to read the role's. This used to
+        // be bought by passing the role name to `load`, an argument that has
+        // since been deleted because no production caller ever passed one.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let desk = agentos_store::org::create_team(
+            &mut tx,
+            &agentos_domain::ids::Slug::parse("sdr").expect("slug"),
+            "SDR",
+        )
+        .await
+        .expect("create the team");
+        agentos_store::org::set_member(&mut tx, employee, desk, None)
+            .await
+            .expect("seat the employee");
+        agentos_store::org::set_policy_role(&mut tx, desk, "sales-development")
+            .await
+            .expect("point the team at the role layer");
+        tx.commit().await.expect("commit the seat");
+
         // --- 4, 5, 6. the three layers no route and no command used to write -
         let ruling = async |db: &Db, action: &Action| {
             let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-            let loaded = policy::load(&mut tx, employee, Some("sales-development")).await;
+            let loaded = policy::load(&mut tx, employee).await;
             tx.rollback().await.expect("rollback");
             loaded.map(|effective| (evaluate(&effective, action, &ctx), effective))
         };

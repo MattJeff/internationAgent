@@ -114,19 +114,17 @@ async fn get(
         return Err(ApiError::not_found());
     }
 
-    let policy = policy::load(&mut tx, employee_id, None)
-        .await
-        .map_err(|err| {
-            // The detail stays server-side, as everywhere else on this surface:
-            // the caller gets a code, the operator gets the layer and the row.
-            tracing::error!(
-                employee_id = %id,
-                error = %err,
-                "the stored policy could not be loaded, so this employee's turn \
-                 budget cannot be stated"
-            );
-            ApiError::internal()
-        })?;
+    let policy = policy::load(&mut tx, employee_id).await.map_err(|err| {
+        // The detail stays server-side, as everywhere else on this surface:
+        // the caller gets a code, the operator gets the layer and the row.
+        tracing::error!(
+            employee_id = %id,
+            error = %err,
+            "the stored policy could not be loaded, so this employee's turn \
+             budget cannot be stated"
+        );
+        ApiError::internal()
+    })?;
     let turns_taken = turns::taken_today(&mut tx, employee_id, day).await?;
     tx.rollback().await?;
 

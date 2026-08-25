@@ -57,12 +57,13 @@
 //!
 //! **Three of them may not change anything at all.** Growth and Entry
 //! Requirements have three proposable kinds each and the same three, which is
-//! as narrow as a pack gets here — but only one pack in the workspace also caps
-//! [`RiskClass`] at [`RiskClass::Read`], and that is
-//! [`RolePack::entry_requirements`]. Every other pack reasons that reading a
-//! record and writing a note back are one job; for the employee whose reading
-//! material *is* the product's own rows, a write tool is the correction it is
-//! supposed to hand to a person. The argument is on the pack.
+//! as narrow as a pack gets here. Entry Requirements used to be narrower still
+//! on an axis of its own — a `max_tool_risk` of `RiskClass::Read` where every
+//! other pack said `Write` — because the employee whose reading material *is*
+//! the product's own rows must hand a correction to a person rather than make
+//! it. Nothing enforced that field; it is deleted, and the rule it stated now
+//! lives where the gate can see it, in the allowlist. The argument is on
+//! [`RolePack::entry_requirements`] and in [`crate::rolepack`]'s module docs.
 //!
 //! # Where `proposable` is read
 //!
@@ -107,7 +108,6 @@ use agentos_domain::action::{ActionKind, Channel};
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{PolicyLimits, SpendLimits};
 
-use crate::mcp::RiskClass;
 use crate::prompt::SystemPrompt;
 use crate::rolepack::CountryCode;
 
@@ -452,7 +452,6 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
-    max_tool_risk: RiskClass,
     limits: PolicyLimits,
 }
 
@@ -514,11 +513,6 @@ impl RolePack {
             ]
             .into_iter()
             .collect(),
-
-            // Read the account, write the ticket note. Never `Destructive` —
-            // and since an undeclared tool is classed `Destructive`, this
-            // ceiling is also what keeps a newly discovered tool out.
-            max_tool_risk: RiskClass::Write,
 
             limits: PolicyLimits {
                 // Support buys nothing and refunds nothing. `None` is the layer
@@ -617,13 +611,6 @@ impl RolePack {
             ]
             .into_iter()
             .collect(),
-
-            // Reading analytics and search data, and writing an annotation or a
-            // draft back into a CMS. Never `Destructive`: nothing in growth
-            // work is worth an irreversible tool, and an undeclared tool is
-            // bound `Destructive`, so this ceiling is what keeps a newly
-            // discovered one out.
-            max_tool_risk: RiskClass::Write,
 
             limits: PolicyLimits {
                 // No advertising spend, no tooling spend, nothing. See the
@@ -732,12 +719,6 @@ impl RolePack {
             .into_iter()
             .collect(),
 
-            // Read a statement, post a journal entry. Never `Destructive`: a
-            // reversing entry is how accounting undoes things, and an
-            // undeclared tool is bound `Destructive`, so this ceiling keeps a
-            // newly discovered one out.
-            max_tool_risk: RiskClass::Write,
-
             limits: PolicyLimits {
                 // See the note on this constructor. One dollar is the
                 // threshold; the two caps above it bound the size of a single
@@ -788,33 +769,45 @@ impl RolePack {
 
     /// Entry requirements: the employee that maintains the product itself.
     ///
-    /// # The narrowest pack in the workspace, and the only one with a `Read`
-    /// ceiling
+    /// # The narrowest pack in the workspace, and where "read only" now lives
     ///
     /// Growth held the "narrowest" title on [`RolePack::proposable`] and still
-    /// shares it — the two sets are the same three kinds — but this pack is
-    /// narrower on the axis growth is not: [`RiskClass::Read`].
+    /// shares it — the two sets are the same three kinds. This pack used to be
+    /// narrower on an axis growth is not, and the reasoning still stands even
+    /// though the mechanism has moved: every other pack here treats reading an
+    /// account and writing a note back as the same job, and that inverts for
+    /// this one. The thing this employee reads and the thing it would write are
+    /// *the same rows*: Orizn's own entry-requirement data. A `Write`-class
+    /// tool on that server is "set this pair to visa-free", which is precisely
+    /// the act the entire briefing exists to move to a human.
     ///
-    /// Every other pack here is `Write`, on the reasoning that reading an
-    /// account and writing a note back are the same job. That reasoning
-    /// inverts for this one. The thing this employee reads and the thing it
-    /// would write are *the same rows*: Orizn's own entry-requirement data. A
-    /// `Write`-class tool on that server is "set this pair to visa-free", which
-    /// is precisely the act the entire briefing exists to move to a human. The
-    /// ceiling is what makes "you propose, you do not change" a property of the
-    /// deployment rather than a sentence the model is asked to remember, and it
-    /// holds even for a tenant whose operator declares a write tool and forgets
-    /// which role is going to reach it.
+    /// **That used to be a `max_tool_risk: RiskClass::Read` field here, and the
+    /// comment on it claimed the ceiling "holds even for a tenant whose
+    /// operator declares a write tool and forgets which role is going to reach
+    /// it".** It held nothing: no code in the workspace ever compared a tool's
+    /// class against a pack's ceiling, so the sentence described a property that
+    /// had never once been checked. The field is deleted rather than wired,
+    /// because wiring it needed the acting pack at a point that has never had
+    /// one and `RiskClass` in a crate that deliberately does not know it — see
+    /// [`crate::rolepack`]'s module docs for the whole argument.
     ///
-    /// It costs nothing today. The real server's whole surface is reads —
-    /// `check_visa_requirement`, `quick_visa_check`, `compare_destinations`,
-    /// `check_transit_visa`, `get_coverage_stats`, `get_recent_changes`, all
-    /// six of them look things up and change nothing; `crates/app/tests/orizn.rs`
-    /// records that surface and re-checks it against the live server. So the
-    /// ceiling refuses nothing this job needs, and refuses the one thing it must
-    /// not do. It also keeps doing what every pack's ceiling does: an undeclared
-    /// tool is bound `Destructive`, so a tool the server grows overnight stays
-    /// out.
+    /// What replaces it is not weaker, it is the same rule one layer down: the
+    /// role layer's `allowed_mcp_tools` names this employee's read tools and no
+    /// others, and the gate refuses anything else with
+    /// `DenyReason::ToolNotAllowed`. `domain::org::Team` is the shipped shape
+    /// for writing exactly that. It also survives the case the old comment was
+    /// really worried about, and by a route that runs: a tool the server grows
+    /// overnight is undeclared, an undeclared tool is absent from
+    /// `mcp::Fleet::inventory`, absent from any allowlist, and bound
+    /// `Destructive` — which `mcp::McpServer::verdict` refuses before dispatch.
+    ///
+    /// It costs nothing today either way. The real server's whole surface is
+    /// reads — `check_visa_requirement`, `quick_visa_check`,
+    /// `compare_destinations`, `check_transit_visa`, `get_coverage_stats`,
+    /// `get_recent_changes`, all six look things up and change nothing;
+    /// `crates/app/tests/orizn.rs` records that surface, re-checks it against
+    /// the live server, and asserts that a write tool on the visa database is
+    /// refused by name.
     ///
     /// # `DataDelete`, which is the exclusion this role is about
     ///
@@ -883,11 +876,6 @@ impl RolePack {
             ]
             .into_iter()
             .collect(),
-
-            // The ceiling argued at length above: `Read`, alone in this
-            // workspace, because the data this employee reads is the data it
-            // must not write.
-            max_tool_risk: RiskClass::Read,
 
             limits: PolicyLimits {
                 // Nothing to buy. See the `PaymentCreate` note above; the
@@ -991,16 +979,6 @@ impl RolePack {
     /// denies, and which therefore stops here or nowhere.
     pub fn may_propose(&self, kind: ActionKind) -> bool {
         self.proposable.contains(&kind)
-    }
-
-    /// The worst MCP tool class this role may reach.
-    pub const fn max_tool_risk(&self) -> RiskClass {
-        self.max_tool_risk
-    }
-
-    /// Whether a tool bound at `class` is within this role's ceiling.
-    pub fn may_call_tool(&self, class: RiskClass) -> bool {
-        class <= self.max_tool_risk
     }
 
     /// The role layer for [`EffectivePolicy::try_new`](agentos_domain::policy::EffectivePolicy::try_new).
@@ -2339,47 +2317,20 @@ mod tests {
         );
     }
 
-    // -- the MCP ceiling ---------------------------------------------------
+    // -- the MCP allowlist --------------------------------------------------
 
-    /// **The ceilings, as a table**, because they are no longer all the same.
+    /// **No pack grants a tool by itself**, for any of the four.
     ///
-    /// Three of these packs read a record and write a note back, which is one
-    /// job and `RiskClass::Write`. `entry-requirements` is the exception and the
-    /// exception is the point: the rows it reads are the rows it must not write,
-    /// so a write-class tool on the visa server is exactly the correction the
-    /// briefing sends to a person. Asserting the ceiling rather than deriving it
-    /// means widening it to `Write` — the obvious thing to do the day somebody
-    /// wants this employee to "just fix the small ones" — is a failing test and
-    /// not a one-word edit.
+    /// This used to also assert a `max_tool_risk` ceiling per pack — `Write`
+    /// for three, `Read` for `entry-requirements` — and that half is gone with
+    /// the field, which nothing ever consulted. What is left is the half that
+    /// was always the live one: the tool set is tenant inventory, a pack stays
+    /// silent about it, and silence in a layer is a denial. Widen
+    /// `allowed_mcp_tools` here and this goes red, which is the same guard the
+    /// ceiling was supposed to be, on the mechanism that actually runs.
     #[test]
-    fn a_destructive_mcp_tool_is_above_every_ceiling_here() {
+    fn no_pack_here_grants_an_mcp_tool_by_itself() {
         for pack in RolePack::all() {
-            let ceiling = if pack.name() == ENTRY_REQUIREMENTS {
-                RiskClass::Read
-            } else {
-                RiskClass::Write
-            };
-            assert_eq!(
-                pack.max_tool_risk(),
-                ceiling,
-                "{}'s mcp ceiling moved",
-                pack.name()
-            );
-            assert!(pack.may_call_tool(RiskClass::Read));
-            assert_eq!(
-                pack.may_call_tool(RiskClass::Write),
-                ceiling == RiskClass::Write,
-                "{} disagrees with its own ceiling about write tools",
-                pack.name()
-            );
-            assert!(
-                !pack.may_call_tool(RiskClass::Destructive),
-                "an undeclared tool is bound Destructive; {} must not reach it",
-                pack.name()
-            );
-
-            // The tool *set* is tenant inventory, so the role grants none by
-            // itself — deny by default, like every other unconfigured field.
             assert!(pack.limits().allowed_mcp_tools.is_empty());
             assert_eq!(
                 evaluate(

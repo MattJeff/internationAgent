@@ -701,7 +701,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
         // layer is the team membership and its `team_policy` pointer, exactly
         // as it will at decision time.
         let mut tx = db.tenant_tx(server.tenant).await.expect("tenant tx");
-        let effective = policy::load(&mut tx, employee, None)
+        let effective = policy::load(&mut tx, employee)
             .await
             .unwrap_or_else(|e| panic!("{role}: load: {e}"));
         tx.rollback().await.expect("rollback");

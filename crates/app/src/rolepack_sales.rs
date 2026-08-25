@@ -39,7 +39,6 @@ use std::fmt;
 use agentos_domain::action::{ActionKind, CallingCode, Channel};
 use agentos_domain::policy::PolicyLimits;
 
-use crate::mcp::RiskClass;
 use crate::prompt::SystemPrompt;
 use crate::rolepack::CountryCode;
 
@@ -146,7 +145,6 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
-    max_tool_risk: RiskClass,
     limits: PolicyLimits,
 }
 
@@ -193,13 +191,6 @@ impl RolePack {
             ]
             .into_iter()
             .collect(),
-
-            // Read a prospect's page and the visa rule, write the finding and
-            // the suppression entry back to our own systems. Never
-            // `Destructive` — and since an undeclared tool is classed
-            // `Destructive`, this ceiling is also what keeps a newly discovered
-            // tool out.
-            max_tool_risk: RiskClass::Write,
 
             limits: PolicyLimits {
                 // A sales employee buys nothing. `None` is the layer saying it
@@ -315,16 +306,6 @@ impl RolePack {
     /// denies, and which therefore stops here or nowhere.
     pub fn may_propose(&self, kind: ActionKind) -> bool {
         self.proposable.contains(&kind)
-    }
-
-    /// The worst MCP tool class this role may reach.
-    pub const fn max_tool_risk(&self) -> RiskClass {
-        self.max_tool_risk
-    }
-
-    /// Whether a tool bound at `class` is within this role's ceiling.
-    pub fn may_call_tool(&self, class: RiskClass) -> bool {
-        class <= self.max_tool_risk
     }
 
     /// The role layer for [`EffectivePolicy::try_new`](agentos_domain::policy::EffectivePolicy::try_new).
@@ -926,16 +907,13 @@ mod tests {
         );
     }
 
+    /// A sales employee grants no MCP tool by itself.
+    ///
+    /// The `max_tool_risk` assertions that used to open this test went with the
+    /// field — nothing consulted it. The allowlist below is the live rule.
     #[test]
-    fn a_destructive_mcp_tool_is_above_the_sales_ceiling() {
+    fn sales_grants_no_mcp_tool_by_itself() {
         let sales = sales();
-        assert!(sales.may_call_tool(RiskClass::Read));
-        assert!(sales.may_call_tool(RiskClass::Write));
-        assert!(
-            !sales.may_call_tool(RiskClass::Destructive),
-            "an undeclared tool is bound Destructive; a sales employee must not reach it"
-        );
-
         assert!(sales.limits().allowed_mcp_tools.is_empty());
         assert_eq!(
             evaluate(

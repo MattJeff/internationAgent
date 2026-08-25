@@ -1756,7 +1756,7 @@ pub async fn send(
     // Against the *recipient's* policy, because it is the recipient's day being
     // spent — read through the same four-layer intersection as every other
     // limit, so a team can only ever tighten it.
-    let policy = policy_store::load(tx, recipient, None)
+    let policy = policy_store::load(tx, recipient)
         .await
         .map_err(|err| match err {
             PolicyLoadError::Store(err) => InternalError::Store(err),

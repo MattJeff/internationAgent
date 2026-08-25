@@ -181,14 +181,28 @@ impl From<sqlx::Error> for PolicyLoadError {
 /// RLS already confines the tenant rows; the predicates are written out anyway
 /// so the statement says what it means when read on its own.
 ///
-/// The `coalesce` on the role layer is the org layer plugging in (0012_org):
-/// an employee that belongs to a team takes that team's role name, and the
-/// `role` argument is the fallback for an employee on no team. It is a
-/// sub-select rather than a second query because this runs on the hot path of
-/// every gate decision, and `team_memberships`' primary key is
-/// `(tenant_id, employee_id)`, so it is one index lookup. That key is also what
-/// makes the sub-select single-valued: an employee is on at most one team, so
-/// there is never a coin-flip between two teams' limits.
+/// The sub-select on the role layer is the org layer plugging in (0012_org):
+/// an employee's role name is the one its team's limits are written under, and
+/// there is no other way to get one. It is a sub-select rather than a second
+/// query because this runs on the hot path of every gate decision, and
+/// `team_memberships`' primary key is `(tenant_id, employee_id)`, so it is one
+/// index lookup. That key is also what makes the sub-select single-valued: an
+/// employee is on at most one team, so there is never a coin-flip between two
+/// teams' limits. An employee on no team gets NULL, `l.role_name = NULL` is
+/// NULL, and the arm selects nothing — an absent role layer, which inherits the
+/// tenant's.
+///
+/// There used to be a `coalesce(…, $2)` here and a `role: Option<&str>` on
+/// [`load`], so a caller with no team could name a role layer itself. Every
+/// caller passed `None` — [`crate::org`]'s `role_name` is the only producer of
+/// the string, and it only ever has one for an employee that is on a team — so
+/// the fallback had no live path, while [`max_turns_per_day`] below, which
+/// claims to be the same rule, never had the parameter at all. Two statements
+/// that agree only because one of their branches is unreachable are one wired
+/// caller away from disagreeing, and the disagreement is the expensive
+/// direction: a dashboard reporting a turn budget the gate does not enforce.
+/// Deleting the parameter is what makes the two genuinely one rule; a caller
+/// that wants an employee under a role layer puts it on a team.
 const SELECT_ACTIVE_LAYERS: &str = "\
     SELECT l.id, l.layer, l.spend_currency, l.max_per_transaction_minor, \
            l.max_per_day_minor, l.approval_above_minor, l.allowed_channels, \
@@ -201,38 +215,41 @@ const SELECT_ACTIVE_LAYERS: &str = "\
     WHERE v.active AND ( \
           (l.layer = 'platform' AND v.tenant_id IS NULL) \
        OR (l.layer = 'tenant'   AND v.tenant_id = $1) \
-       OR (l.layer = 'role'     AND v.tenant_id = $1 AND l.role_name = coalesce(( \
+       OR (l.layer = 'role'     AND v.tenant_id = $1 AND l.role_name = ( \
               SELECT tp.role_name FROM team_memberships m \
                 JOIN team_policy tp \
                   ON tp.tenant_id = m.tenant_id AND tp.team_id = m.team_id \
-               WHERE m.tenant_id = $1 AND m.employee_id = $3), $2)) \
-       OR (l.layer = 'employee' AND v.tenant_id = $1 AND l.employee_id = $3))";
+               WHERE m.tenant_id = $1 AND m.employee_id = $2)) \
+       OR (l.layer = 'employee' AND v.tenant_id = $1 AND l.employee_id = $2))";
 
 /// Load and intersect the policy for one employee.
 ///
-/// The role layer is the employee's **team**, when it has one: `store::org`
+/// The role layer is the employee's **team**, and only ever that: `store::org`
 /// records which role name a team's limits are written under, and the statement
-/// above resolves it in the same round trip. `role` is the fallback for an
-/// employee on no team — there is no role model in the domain, so the caller
-/// names it. Either way an unmatched role is simply an absent layer, which
-/// inherits the tenant's; a team that nobody wrote limits for does not become a
-/// team that may do nothing.
+/// above resolves it in the same round trip. An employee on no team, or on a
+/// team nobody wrote limits for, has no role layer, which inherits the
+/// tenant's — it does not become an employee that may do nothing.
+///
+/// There is deliberately no `role` parameter. The team is the only producer of
+/// a role name in this workspace, so a parameter could only ever restate what
+/// the org chart already answers, and a second answer to one question is the
+/// one that goes stale — see [`SELECT_ACTIVE_LAYERS`] for the version of this
+/// that shipped and what it cost. `app::gate` makes the same argument from the
+/// other end: there is no role on a `Principal` to pass.
 ///
 /// A team layer can therefore only ever *tighten*: it goes through
 /// [`EffectivePolicy::try_new`] like every other layer, which takes the minimum
 /// of each cap, so a team naming a bigger number than its tenant gets the
 /// tenant's.
 ///
-/// The tenant is not a parameter: it comes from `tx`, which is the only thing
-/// row-level security honours anyway.
+/// The tenant is not a parameter either: it comes from `tx`, which is the only
+/// thing row-level security honours anyway.
 pub async fn load(
     tx: &mut TenantTx<'_>,
     employee_id: EmployeeId,
-    role: Option<&str>,
 ) -> Result<EffectivePolicy, PolicyLoadError> {
     let rows: Vec<LayerRow> = sqlx::query_as(SELECT_ACTIVE_LAYERS)
         .bind(tx.tenant_id().as_uuid())
-        .bind(role)
         .bind(employee_id.as_uuid())
         .fetch_all(&mut ***tx)
         .await?;
@@ -267,6 +284,21 @@ pub async fn load(
 /// than in the caller because the layer predicate below is [`SELECT_ACTIVE_LAYERS`]
 /// with the role sub-select flattened into a join — two spellings of one rule,
 /// and they belong in one file where a reader can see both at once.
+///
+/// **The two spellings really are one rule now, and were not always.**
+/// `SELECT_ACTIVE_LAYERS` used to resolve the role layer as
+/// `coalesce((SELECT tp.role_name …), $2)` against a caller-supplied role, and
+/// the join below has never had a `$2` to fall back to. The divergence was
+/// unreachable only because every caller passed `None` — a property of today's
+/// call sites, not of the two statements. Wire one `Some` and a manager's
+/// dashboard reports a *higher* turn budget than the gate enforces, silently,
+/// in the permissive direction. So the fallback was deleted rather than copied
+/// down here: a single-valued sub-select and a `LEFT JOIN` on the same primary
+/// key are the same predicate, which makes the flattening a rewrite of one rule
+/// instead of a paraphrase of a similar one.
+/// `the_batch_turn_budget_is_what_the_loader_would_have_said` holds them
+/// together: it puts a role layer in the stack, a team pointing at it, and an
+/// employee on no team, then asks both statements about all three.
 ///
 /// **`min` really is the intersection, for this column.**
 /// [`EffectivePolicy::try_new`] takes the minimum of every cap, and an absent
@@ -1759,7 +1791,7 @@ pub(crate) mod tests {
         admin.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let policy = load(&mut tx, employee, None).await.expect("load");
+        let policy = load(&mut tx, employee).await.expect("load");
         assert_eq!(caps(&policy), (10_000, 40_000, 5_000));
         assert_eq!(policy.limits().max_new_contacts_per_day, 7);
         tx.rollback().await.expect("rollback");
@@ -1792,7 +1824,7 @@ pub(crate) mod tests {
         admin.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let policy = load(&mut tx, employee, None).await.expect("load");
+        let policy = load(&mut tx, employee).await.expect("load");
         assert_eq!(
             caps(&policy),
             (50_000, 200_000, 50_000),
@@ -1850,8 +1882,9 @@ pub(crate) mod tests {
         admin.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        // No employee layer and no role layer: both inherit the tenant's.
-        let policy = load(&mut tx, employee, Some("sales")).await.expect("load");
+        // No employee layer and no role layer — this employee is on no team, so
+        // there is no role name to resolve at all: both inherit the tenant's.
+        let policy = load(&mut tx, employee).await.expect("load");
         assert_eq!(caps(&policy), (20_000, 60_000, 10_000));
         assert_eq!(policy.limits().max_new_contacts_per_day, 5);
         tx.rollback().await.expect("rollback");
@@ -1899,15 +1932,35 @@ pub(crate) mod tests {
         }
         admin.commit().await.expect("commit");
 
+        // The role layer reaches this employee the only way one can: through the
+        // team whose `team_policy.role_name` it is written under. Before the
+        // `role` argument was deleted this test named `"sales"` directly, which
+        // exercised a fallback no caller used; putting the employee on the team
+        // exercises the arm the gate actually runs.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let policy = load(&mut tx, employee, Some("sales")).await.expect("load");
+        let sales = crate::org::create_team(&mut tx, &Slug::parse("sales").expect("slug"), "Sales")
+            .await
+            .expect("create sales");
+        crate::org::set_member(&mut tx, employee, sales, None)
+            .await
+            .expect("member");
+
+        let policy = load(&mut tx, employee).await.expect("load");
         // Minimum of each cap taken independently across all four layers.
         assert_eq!(caps(&policy), (15_000, 80_000, 2_000));
         assert_eq!(policy.limits().max_new_contacts_per_day, 20);
 
         // A role nobody wrote a layer for is an absent layer, not a wider one.
-        let unknown_role = load(&mut tx, employee, Some("legal")).await.expect("load");
+        // The caps cannot see the difference here — the employee layer is under
+        // the role layer on all three — so this asserts on contacts, where the
+        // role's 20 is the only thing between the tenant's 50 and the
+        // employee's 30.
+        crate::org::set_policy_role(&mut tx, sales, "legal")
+            .await
+            .expect("repoint");
+        let unknown_role = load(&mut tx, employee).await.expect("load");
         assert_eq!(caps(&unknown_role), (15_000, 80_000, 2_000));
+        assert_eq!(unknown_role.limits().max_new_contacts_per_day, 30);
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;
@@ -1938,7 +1991,7 @@ pub(crate) mod tests {
         admin.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let err = load(&mut tx, employee, None)
+        let err = load(&mut tx, employee)
             .await
             .expect_err("an incoherent layer must not load");
         assert!(
@@ -1986,7 +2039,7 @@ pub(crate) mod tests {
         admin.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let err = load(&mut tx, employee, None).await.expect_err("no rate");
+        let err = load(&mut tx, employee).await.expect_err("no rate");
         assert!(
             matches!(
                 err,
@@ -2031,7 +2084,7 @@ pub(crate) mod tests {
         // B has no layers of its own, so it inherits the platform ceiling —
         // NOT A's much narrower one.
         let mut tx = db.tenant_tx(b).await.expect("tenant tx");
-        let policy = load(&mut tx, b_employee, None).await.expect("load");
+        let policy = load(&mut tx, b_employee).await.expect("load");
         assert_eq!(caps(&policy), (50_000, 200_000, 50_000));
 
         // And A's rows are not merely unselected, they are invisible: asked for
@@ -2060,7 +2113,7 @@ pub(crate) mod tests {
 
         // A still sees its own.
         let mut tx = db.tenant_tx(a).await.expect("tenant tx");
-        let policy = load(&mut tx, a_employee, None).await.expect("load");
+        let policy = load(&mut tx, a_employee).await.expect("load");
         assert_eq!(caps(&policy), (1_000, 2_000, 1_000));
         tx.rollback().await.expect("rollback");
 
@@ -2108,19 +2161,19 @@ pub(crate) mod tests {
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         assert_eq!(
-            caps(&load(&mut tx, employee, None).await.expect("load")),
+            caps(&load(&mut tx, employee).await.expect("load")),
             (30_000, 90_000, 30_000)
         );
 
         activate(&mut tx, v2).await.expect("activate v2");
         assert_eq!(
-            caps(&load(&mut tx, employee, None).await.expect("load")),
+            caps(&load(&mut tx, employee).await.expect("load")),
             (100, 200, 100)
         );
 
         // Roll back. The old version was never edited, so this is a pointer flip.
         activate(&mut tx, v1).await.expect("activate v1");
-        let restored = load(&mut tx, employee, None).await.expect("load");
+        let restored = load(&mut tx, employee).await.expect("load");
         assert_eq!(caps(&restored), (30_000, 90_000, 30_000));
         assert_eq!(restored.limits().max_new_contacts_per_day, 40);
 
@@ -2145,7 +2198,7 @@ pub(crate) mod tests {
 
         let (tenant, employee) = seed(&db, "no-platform").await;
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let err = load(&mut tx, employee, None)
+        let err = load(&mut tx, employee)
             .await
             .expect_err("no ceiling, no policy");
         assert!(matches!(err, PolicyLoadError::NoPlatformLayer), "{err:?}");
@@ -2266,7 +2319,7 @@ pub(crate) mod tests {
         // an accident of two identical `Default`s.
         let (tenant, employee) = seed(&db, "idempotent").await;
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let loaded = load(&mut tx, employee, None).await.expect("load");
+        let loaded = load(&mut tx, employee).await.expect("load");
         assert_eq!(loaded.limits(), &ceiling);
         tx.rollback().await.expect("rollback");
 
@@ -2319,7 +2372,7 @@ pub(crate) mod tests {
             .expect("install");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let policy = load(&mut tx, employee, None).await.expect("load");
+        let policy = load(&mut tx, employee).await.expect("load");
         assert_eq!(
             caps(&policy),
             (1_000, 4_000, 500),
@@ -2367,7 +2420,7 @@ pub(crate) mod tests {
         assert_ne!(second.version(), first.version());
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let broken = load(&mut tx, employee, None).await.expect("load");
+        let broken = load(&mut tx, employee).await.expect("load");
         assert_eq!(broken.limits().max_turns_per_day, 0);
         assert!(broken.limits().spend.is_none());
         tx.rollback().await.expect("rollback");
@@ -2377,7 +2430,7 @@ pub(crate) mod tests {
         assert_eq!(active_ceilings(&db).await, 1);
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let policy = load(&mut tx, employee, None).await.expect("load");
+        let policy = load(&mut tx, employee).await.expect("load");
         assert_eq!(policy.limits(), &good, "a rollback is not a re-derivation");
         tx.rollback().await.expect("rollback");
 
@@ -2453,7 +2506,7 @@ pub(crate) mod tests {
 
         // And the euro deployment still loads, because nothing was written.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        load(&mut tx, employee, None).await.expect("load");
+        load(&mut tx, employee).await.expect("load");
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;
@@ -2548,7 +2601,7 @@ pub(crate) mod tests {
                 .collect();
 
         for (who, expected) in [(solo, 120u32), (teamed, 40), (tightened, 12)] {
-            let loaded = load(&mut tx, who, None)
+            let loaded = load(&mut tx, who)
                 .await
                 .expect("load")
                 .limits()
@@ -2696,7 +2749,7 @@ pub(crate) mod tests {
             .expect("a wider layer is written, not refused");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let effective = load(&mut tx, employee, None).await.expect("load");
+        let effective = load(&mut tx, employee).await.expect("load");
         tx.rollback().await.expect("rollback");
 
         let ceiling = tight_ceiling();
@@ -2764,8 +2817,22 @@ pub(crate) mod tests {
 
         // And the tenant layer written before the role layer is still in force,
         // which is the carry-forward doing its job.
+        //
+        // The seat is what makes the role layer visible at all — a role reaches
+        // an employee through `team_policy` and nowhere else, so the
+        // `max_turns_per_day` assertion below is reading the role layer only
+        // because this employee sits on a team pointed at it.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let effective = load(&mut tx, employee, Some("sales")).await.expect("load");
+        let sales = crate::org::create_team(&mut tx, &Slug::parse("sales").expect("slug"), "Sales")
+            .await
+            .expect("create sales");
+        crate::org::set_member(&mut tx, employee, sales, None)
+            .await
+            .expect("member");
+        crate::org::set_policy_role(&mut tx, sales, "sales")
+            .await
+            .expect("point the team at the role layer");
+        let effective = load(&mut tx, employee).await.expect("load");
         tx.rollback().await.expect("rollback");
         assert_eq!(effective.limits().max_new_contacts_per_day, 5);
         assert_eq!(effective.limits().max_turns_per_day, 10);
@@ -2799,7 +2866,7 @@ pub(crate) mod tests {
         };
         let rule = async |db: &Db| {
             let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-            let effective = load(&mut tx, employee, None).await.expect("load");
+            let effective = load(&mut tx, employee).await.expect("load");
             tx.rollback().await.expect("rollback");
             (evaluate(&effective, &email, &ctx), effective)
         };
@@ -2898,8 +2965,26 @@ pub(crate) mod tests {
 
         // And nothing was written: the deployment still loads, which is the
         // whole point of refusing before the insert rather than after.
+        //
+        // The employee goes on a team pointing at `finance` first, and that is
+        // load-bearing rather than tidy: a role layer reaches an employee only
+        // through `team_policy`, so an employee on no team cannot see one. This
+        // assertion would pass on an employee with no seat *even if the EUR
+        // layer had been written*, which is a test that proves nothing. Seated,
+        // a written EUR layer would clash with the USD ceiling and `load` would
+        // refuse — so the `expect` below is the real check.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        load(&mut tx, employee, Some("finance"))
+        let finance =
+            crate::org::create_team(&mut tx, &Slug::parse("finance").expect("slug"), "Finance")
+                .await
+                .expect("create finance");
+        crate::org::set_member(&mut tx, employee, finance, None)
+            .await
+            .expect("member");
+        crate::org::set_policy_role(&mut tx, finance, "finance")
+            .await
+            .expect("point the team at the role layer");
+        load(&mut tx, employee)
             .await
             .expect("the policy still assembles");
         tx.rollback().await.expect("rollback");
@@ -2948,7 +3033,7 @@ pub(crate) mod tests {
         // The proof that it matters: the layer is *visible*, which it would not
         // have been under a version nobody activated.
         let mut tx = db.tenant_tx(legacy).await.expect("tenant tx");
-        let effective = load(&mut tx, employee, None).await.expect("load");
+        let effective = load(&mut tx, employee).await.expect("load");
         tx.rollback().await.expect("rollback");
         assert_eq!(effective.limits().max_turns_per_day, 7);
 

@@ -2639,7 +2639,7 @@ mod tests {
 
         // Before: the head has its own team's tool and not the other's.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let before = agentos_store::policy::load(&mut tx, head.employee_id, None)
+        let before = agentos_store::policy::load(&mut tx, head.employee_id)
             .await
             .expect("load");
         assert_eq!(before.limits().allowed_mcp_tools, [crm.clone()].into());
@@ -2670,7 +2670,7 @@ mod tests {
             vec![cto.employee_id],
             "the fixture did not actually make it a head"
         );
-        let after = agentos_store::policy::load(&mut tx, head.employee_id, None)
+        let after = agentos_store::policy::load(&mut tx, head.employee_id)
             .await
             .expect("load");
         tx.rollback().await.expect("rollback");

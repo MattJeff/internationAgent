@@ -13,15 +13,21 @@
 //!
 //! The offline tests below check the parts of that fixture that do not need the
 //! server: that every name survives the fold into a policy handle, that no two
-//! collapse onto the same one, and that the whole surface fits under the
-//! entry-requirements pack's ceiling. The one live test checks the part that
-//! does — that the fixture still describes the server, and that a real question
-//! gets a real answer.
+//! collapse onto the same one, and that an employee granted this surface is
+//! granted a *read* of it — the allowlist refuses a write tool on the visa
+//! database, which is the property `RolePack::entry_requirements` exists for.
+//! The one live test checks the part that does — that the fixture still
+//! describes the server, and that a real question gets a real answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use agentos_app::mcp::RiskClass;
 use agentos_app::rolepack_service::RolePack;
+use agentos_domain::action::McpTool;
+use agentos_domain::ids::Slug;
+use agentos_domain::policy::{
+    Decision, DenyReason, EffectivePolicy, PolicyLimits, evaluate_mcp_call,
+};
 
 /// One tool on the real server, as captured.
 struct OriznTool {
@@ -29,8 +35,9 @@ struct OriznTool {
     /// spelling, which is what `mcp_tool_declarations.tool` holds.
     wire: &'static str,
     /// The class an operator should declare it at, which for this server is
-    /// `Read` for all six. See the assertion in
-    /// `the_whole_surface_fits_under_the_entry_requirements_ceiling`.
+    /// `Read` for all six. It is what goes in `mcp_tool_declarations.risk`, and
+    /// `a_write_tool_on_the_visa_database_is_not_in_this_employees_allowlist`
+    /// is what notices if a seventh tool arrives classed anything else.
     risk: RiskClass,
     /// `inputSchema.required`, in the schema's own order.
     required: &'static [&'static str],
@@ -69,8 +76,10 @@ struct OriznTool {
 /// Not a default and not a shrug: all six only look things up. Five answer
 /// questions about a passport/destination pair or a country, and the sixth
 /// reports the size of the database. There is no tool on this server that
-/// writes a rule, and that is the fact `RolePack::entry_requirements`'s
-/// `RiskClass::Read` ceiling costs nothing to enforce.
+/// writes a rule, and that is the fact that lets this employee be granted the
+/// whole server without being granted a way to change it. The packs used to
+/// state that as a `RiskClass::Read` ceiling of their own; nothing read it, and
+/// the allowlist that the gate does read says the same thing.
 const ORIZN_TOOLS: [OriznTool; 6] = [
     OriznTool {
         wire: "check_visa_requirement",
@@ -142,30 +151,68 @@ fn every_orizn_tool_has_its_own_policy_handle() {
     assert_eq!(handles.len(), ORIZN_TOOLS.len());
 }
 
-/// The pack's ceiling admits the whole server, so the ceiling is not a
-/// restriction this employee has to be given an exception to.
+/// **"You propose, you do not change", as the gate actually enforces it.**
 ///
-/// The interesting half is the converse, asserted here too: `Read` is *strictly*
-/// what this surface needs, so a tool that arrives classed `Write` — a
-/// hypothetical `update_visa_requirement` — is refused by the pack rather than
-/// by anybody remembering to leave it out of `allowed_mcp_tools`.
+/// This assertion used to be `pack.may_call_tool(RiskClass::Write) == false`,
+/// against a `max_tool_risk` ceiling on the pack. The ceiling was declared by
+/// every pack, documented at length, and consulted by nothing outside this
+/// test — so the sentence it used to carry ("refused by the pack rather than by
+/// anybody remembering to leave it out of `allowed_mcp_tools`") had it exactly
+/// backwards: leaving it out of `allowed_mcp_tools` was the only thing refusing
+/// anything. The field is gone and this is the same claim, made against the
+/// four-layer allowlist that always was the enforcement.
+///
+/// A provisioner grants this employee the six read tools by the struct update
+/// `rolepack`'s module docs describe. `update_visa_requirement` is the
+/// hypothetical write tool — the correction this briefing exists to route to a
+/// person — and it is denied by name, with the reason the gate would give.
+/// Add it to the allowlist below and this test goes red, which is what the
+/// ceiling was supposed to do and never did.
 #[test]
-fn the_whole_surface_fits_under_the_entry_requirements_ceiling() {
-    let pack = RolePack::entry_requirements();
-    assert_eq!(pack.max_tool_risk(), RiskClass::Read);
-    for tool in &ORIZN_TOOLS {
+fn a_write_tool_on_the_visa_database_is_not_in_this_employees_allowlist() {
+    let orizn = Slug::parse("orizn").expect("slug");
+    let read_tools: BTreeSet<McpTool> = ORIZN_TOOLS
+        .iter()
+        .map(|tool| {
+            // The fixture's own classes are the operator's declaration, and the
+            // surface is `Read` end to end — so "the read tools" and "the whole
+            // server" are the same set today. That is a fact about this server,
+            // not a licence: the filter is what keeps it true if one grows.
+            assert_eq!(
+                tool.risk,
+                RiskClass::Read,
+                "{} is not a read tool",
+                tool.wire
+            );
+            McpTool::new(
+                orizn.clone(),
+                Slug::parse(&handle(tool.wire)).expect("handle"),
+            )
+        })
+        .collect();
+
+    let role = PolicyLimits {
+        allowed_mcp_tools: read_tools.clone(),
+        ..RolePack::entry_requirements().limits().clone()
+    };
+    let policy = EffectivePolicy::try_new(&role, &role, &role, &role)
+        .expect("the entry-requirements defaults are coherent");
+
+    for tool in &read_tools {
         assert!(
-            pack.may_call_tool(tool.risk),
-            "{} is classed {:?} and the pack cannot reach it",
-            tool.wire,
-            tool.risk
+            evaluate_mcp_call(&policy, tool).is_allow(),
+            "{tool} is on the server and in the allowlist; it must be callable"
         );
     }
-    assert!(
-        !pack.may_call_tool(RiskClass::Write),
+
+    let write = McpTool::new(orizn, Slug::parse("update-visa-requirement").expect("slug"));
+    assert_eq!(
+        evaluate_mcp_call(&policy, &write),
+        Decision::Deny {
+            reason: DenyReason::ToolNotAllowed
+        },
         "a write tool on the visa database is the correction this role must propose, not make"
     );
-    assert!(!pack.may_call_tool(RiskClass::Destructive));
 }
 
 /// Every tool that takes a passport takes it under that name.

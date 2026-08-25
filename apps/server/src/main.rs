@@ -967,7 +967,7 @@ impl Agent {
                 || SystemPrompt::new(identity.clone()),
                 |charter| charter.system_prompt(&identity),
             );
-            let prompt = match agentos_store::policy::load(tx, employee_id, None).await {
+            let prompt = match agentos_store::policy::load(tx, employee_id).await {
                 Ok(policy) => prompt.with_mcp_tools(&policy, fleet.inventory()),
                 Err(err) => {
                     tracing::warn!(
@@ -1955,7 +1955,7 @@ mod tests {
                 )
             };
             let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-            let loaded = agentos_store::policy::load(&mut tx, employee, None).await;
+            let loaded = agentos_store::policy::load(&mut tx, employee).await;
             tx.rollback().await.expect("rollback");
             loaded.map(|policy| {
                 let pay = |minor| agentos_domain::action::Action::PaymentCreate {

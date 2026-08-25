@@ -548,14 +548,15 @@ impl PolicyGate {
         //    transaction — so the rule below and the reservation after it are
         //    the same policy even if an operator changes one between them.
         //
-        //    `None` for the role: `store::policy::load` resolves the role layer
-        //    through the employee's team when it has one, and this argument is
-        //    the fallback for an employee on no team. There is no role on a
-        //    `Principal` and inventing one here would be a second way to answer
-        //    a question the org chart already answers. Same call, same
-        //    argument, same reasoning as the turn-budget reservation in
-        //    `loops::initiative`.
-        let policy = match policy_store::load(tx, principal.employee_id, None).await {
+        //    No role to pass: `store::policy::load` resolves the role layer
+        //    through the employee's team, full stop. It used to take a fallback
+        //    role for an employee on no team, and this call site passed `None`
+        //    because there is no role on a `Principal` and inventing one here
+        //    would be a second way to answer a question the org chart already
+        //    answers. Every other call site said `None` for the same reason, so
+        //    the argument went. Same call, same reasoning as the turn-budget
+        //    reservation in `loops::initiative`.
+        let policy = match policy_store::load(tx, principal.employee_id).await {
             Ok(policy) => policy,
             // A database that cannot answer is not a verdict — same treatment
             // as any other read here, and the transaction is dropped unaudited.

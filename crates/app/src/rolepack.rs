@@ -9,7 +9,7 @@
 //! needs a code path, the code path was missing from the runtime, not from the
 //! role.
 //!
-//! # The three things a pack decides
+//! # The two things a pack decides
 //!
 //! 1. **Which [`ActionKind`]s it may even propose.** Upstream of the gate, not
 //!    instead of it: [`PolicyGate::authorize`](crate::gate::PolicyGate) is
@@ -19,11 +19,45 @@
 //!    against — after the trust filter and never instead of it — so the model
 //!    is never offered a tool its role has no business asking for. Two
 //!    independent refusals, and the load-bearing one is the gate.
-//! 2. **Which MCP [`RiskClass`] it may reach.** A ceiling, compared with
-//!    [`Ord`], so "stricter" is not a comparison anyone has to get the right
-//!    way round.
-//! 3. **Its default policy layer.** Spend caps, the calling codes it may dial,
+//! 2. **Its default policy layer.** Spend caps, the calling codes it may dial,
 //!    the sourcing marketplaces it may read, and its cold-outreach budget.
+//!
+//! # There was a third, and it was never enforced
+//!
+//! Every pack used to carry a `max_tool_risk: RiskClass` — "a ceiling, compared
+//! with [`Ord`], so 'stricter' is not a comparison anyone has to get the right
+//! way round" — with `may_call_tool` next to it. Nothing ever called either
+//! outside a test. It is deleted rather than wired, and the argument is not
+//! that the property was worthless but that three live mechanisms already hold
+//! it, all of them keyed on the tool rather than on the role:
+//!
+//! * `mcp::Fleet::inventory` omits any tool no operator declared, so an
+//!   undeclared one never reaches a system prompt;
+//! * `allowed_mcp_tools`, intersected across the four layers, is what the gate
+//!   rules on — a tool nobody allowlisted is `DenyReason::ToolNotAllowed`;
+//! * `mcp::McpServer::verdict` refuses a `Destructive` tool before dispatch and
+//!   classes every undeclared tool `Destructive`, so it needs a human even if
+//!   the first two are misconfigured.
+//!
+//! The comment that used to sit on each declaration said the ceiling "is also
+//! what keeps a newly discovered tool out". It was not; those three are, and
+//! crediting a dead field for their work is how the next reader designs on top
+//! of a property nothing holds.
+//!
+//! What the ceiling *alone* could have said is "this role reads but does not
+//! write" — `Destructive` was already covered, so the whole of its unique
+//! reach was `Read` vs `Write`, and exactly one pack wanted it
+//! ([`rolepack_service::RolePack::entry_requirements`](crate::rolepack_service::RolePack::entry_requirements)).
+//! Enforcing that needed the acting pack at a point that has never had one —
+//! there is no role on a `Principal`, `agentos_domain` deliberately does not
+//! know `RiskClass` at all, and `Fleet::inventory` publishes tools as
+//! `domain::policy::Risk`, where `Read` and `Write` are the same value. Three
+//! layers would have had to widen for one role. That role expresses the same
+//! rule through the mechanism above instead: its team's `allowed_mcp_tools`
+//! names the read tools and no others, which the gate already enforces and
+//! `domain::org::Team` already caps. The classes were an operator's word in
+//! `mcp_tool_declarations` either way, so nothing was gained by asking them
+//! twice.
 //!
 //! # The role layer is a layer, not a policy
 //!
@@ -79,7 +113,6 @@ use agentos_domain::action::{ActionKind, CallingCode, Channel, Domain};
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{PolicyLimits, SpendLimits};
 
-use crate::mcp::RiskClass;
 use crate::prompt::SystemPrompt;
 
 // ---------------------------------------------------------------------------
@@ -184,7 +217,6 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
-    max_tool_risk: RiskClass,
     limits: PolicyLimits,
 }
 
@@ -232,12 +264,6 @@ impl RolePack {
             ]
             .into_iter()
             .collect(),
-
-            // Read a catalogue, write a note on a supplier record. Never
-            // `Destructive` — a buyer has no reason to reach an irreversible
-            // tool, and an undeclared tool is classed `Destructive`, so this
-            // ceiling is also what keeps a newly discovered tool out.
-            max_tool_risk: RiskClass::Write,
 
             limits: PolicyLimits {
                 // Samples, deposits and tooling charges. A single order above
@@ -378,16 +404,6 @@ impl RolePack {
     /// everything that gets proposed.
     pub fn may_propose(&self, kind: ActionKind) -> bool {
         self.proposable.contains(&kind)
-    }
-
-    /// The worst MCP tool class this role may reach.
-    pub const fn max_tool_risk(&self) -> RiskClass {
-        self.max_tool_risk
-    }
-
-    /// Whether a tool bound at `class` is within this role's ceiling.
-    pub fn may_call_tool(&self, class: RiskClass) -> bool {
-        class <= self.max_tool_risk
     }
 
     /// The role layer for [`EffectivePolicy::try_new`](agentos_domain::policy::EffectivePolicy::try_new).
@@ -814,16 +830,14 @@ mod tests {
         }
     }
 
+    /// The buyer grants no MCP tool by itself.
+    ///
+    /// This used to open with three `may_call_tool` assertions about a
+    /// `max_tool_risk` ceiling nothing consulted; they went with the field. The
+    /// allowlist half below is the one that was ever enforced.
     #[test]
-    fn a_destructive_mcp_tool_is_above_the_buyers_ceiling() {
+    fn the_buyer_grants_no_mcp_tool_by_itself() {
         let buyer = buyer();
-        assert!(buyer.may_call_tool(RiskClass::Read));
-        assert!(buyer.may_call_tool(RiskClass::Write));
-        assert!(
-            !buyer.may_call_tool(RiskClass::Destructive),
-            "an undeclared tool is bound Destructive; the buyer must not reach it"
-        );
-
         // The tool *set* is tenant inventory, so the role grants none by
         // itself — deny by default, same as every other unconfigured field.
         assert!(buyer.limits().allowed_mcp_tools.is_empty());

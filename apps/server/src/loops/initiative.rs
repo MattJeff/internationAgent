@@ -492,7 +492,7 @@ async fn reserve_a_turn(db: &Db, due: &Due, now: DateTime<Utc>) -> Result<(), St
     // when it has one, and falls back to this argument when it does not. An
     // employee on no team inherits its tenant's limits, which is the same
     // answer the gate gives for every other action.
-    let policy = policy_store::load(&mut tx, due.employee_id, None)
+    let policy = policy_store::load(&mut tx, due.employee_id)
         .await
         .map_err(|err| format!("could not load the policy: {err}"))?;
 
@@ -537,7 +537,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         // outright if it is broken, and the gate refuses every action after
         // that. What it means for the prefix is that this employee may call no
         // MCP tool, so it is told about none.
-        let policy = match policy_store::load(&mut tx, due.employee_id, None).await {
+        let policy = match policy_store::load(&mut tx, due.employee_id).await {
             Ok(policy) => Some(policy),
             Err(err) => {
                 tracing::warn!(

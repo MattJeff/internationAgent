@@ -932,7 +932,7 @@ mod tests {
         set_member(&mut tx, employee, team, None)
             .await
             .expect("set member");
-        let policy = policy::load(&mut tx, employee, None).await.expect("load");
+        let policy = policy::load(&mut tx, employee).await.expect("load");
         tx.rollback().await.expect("rollback");
 
         assert_eq!(
@@ -986,9 +986,7 @@ mod tests {
             .expect("seller");
 
         // The buyer's team layer bites...
-        let buyer_policy = policy::load(&mut tx, buyer, None)
-            .await
-            .expect("load buyer");
+        let buyer_policy = policy::load(&mut tx, buyer).await.expect("load buyer");
         assert_eq!(caps(&buyer_policy), (5_000, 15_000, 2_000));
         // ...on the turn budget as much as on the money. A team that decides
         // its members should wake less often is a team that can say so.
@@ -997,21 +995,22 @@ mod tests {
         // ...and it does not follow the employee onto another team: sales has
         // no layer of its own, so the seller is back to the tenant's numbers.
         // Two teams under one tenant, not colliding — the whole point.
-        let seller_policy = policy::load(&mut tx, seller, None)
-            .await
-            .expect("load seller");
+        let seller_policy = policy::load(&mut tx, seller).await.expect("load seller");
         assert_eq!(caps(&seller_policy), (20_000, 60_000, 10_000));
         assert_eq!(
             seller_policy.limits().max_turns_per_day,
             TENANT_TURNS as u32
         );
 
-        // A `role` argument must not override the team the employee is on:
-        // otherwise a caller could name the wider team and get its limits.
-        let spoofed = policy::load(&mut tx, buyer, Some("sales"))
-            .await
-            .expect("load spoofed");
-        assert_eq!(caps(&spoofed), (5_000, 15_000, 2_000));
+        // There used to be a spoofing check here: `load(.., buyer, Some("sales"))`
+        // had to still return purchasing's caps, because a caller that could
+        // name a role could name the *wider* team's and get its limits. The
+        // `role` argument is gone — every caller passed `None`, and the one
+        // fallback branch it had was dead — so naming a role is now unspellable
+        // rather than merely refused, and the assertion that it is refused
+        // cannot be written. `policy::load` argues the deletion; this note is
+        // the record that the property it protected did not lapse, it stopped
+        // being expressible.
         tx.rollback().await.expect("rollback");
 
         // Now the greedy team: every number bigger than the tenant's.
@@ -1024,9 +1023,7 @@ mod tests {
         .await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let greedy = policy::load(&mut tx, buyer, None)
-            .await
-            .expect("load greedy");
+        let greedy = policy::load(&mut tx, buyer).await.expect("load greedy");
         tx.rollback().await.expect("rollback");
         assert_eq!(
             caps(&greedy),
