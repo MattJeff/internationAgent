@@ -39,17 +39,37 @@
 //! `Debug` that prints `[redacted]`. The plaintext leaves the vault only inside
 //! the adapter, on the way into the DOM field, and the model that decided
 //! "type the password here" never sees the password.
+//!
+//! # Why [`BrowserOutcome::Text`] is already [`Untrusted`]
+//!
+//! It is the only outcome that carries somebody else's *words*, and the caller
+//! that wants them — `app::proof_of_need` — wants them precisely because it is
+//! hunting for something quotable in them. Wrapping at the adapter, next to
+//! `email::parse_inbound` and `telephony::inbound_sms`, means there is no
+//! moment anywhere in the process when a page's text is a bare `String` that
+//! somebody could concatenate. A screenshot is bytes and a navigation is a URL
+//! we asked for; this one is a stranger talking.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
+use agentos_domain::untrusted::Untrusted;
 use async_trait::async_trait;
 use chrono::Utc;
 use url::Url;
 
 use crate::{EnsureCtx, FaultMode, ProviderBinding, ProviderError, Provisioned, Secret};
+
+/// The selector matched nothing in the live document.
+///
+/// Trait vocabulary rather than a detail of one adapter: [`BrowserStep::Click`],
+/// [`BrowserStep::Type`] and [`BrowserStep::Text`] all name an element that may
+/// not be there, and every adapter has to answer that the same way. It is a
+/// [`ProviderError::Terminal`] code because a retry cannot conjure the element
+/// — the selector is ours and it is wrong.
+pub const NO_SUCH_ELEMENT: &str = "no_such_element";
 
 // ---------------------------------------------------------------------------
 // Session
@@ -107,6 +127,20 @@ pub enum BrowserStep<'a> {
         /// The credential.
         secret: &'a Secret,
     },
+    /// Read the visible text of the first match of a CSS selector.
+    ///
+    /// The one step that brings the page's own words back, so it is the one
+    /// step whose outcome is [`Untrusted`].
+    ///
+    /// **A selector that matches nothing is
+    /// `Err(Terminal { code: NO_SUCH_ELEMENT })`, never `Ok(Text(""))`.** The
+    /// two are different facts — "their page says nothing here" versus "we
+    /// pointed at the wrong element" — and only the first of them is anything
+    /// to tell a prospect about. Collapsing them into an empty string is how a
+    /// broken selector becomes a sentence claiming somebody's checkout is
+    /// silent about visas; an `Err` cannot be mistaken for an answer because a
+    /// caller cannot get past it without saying so.
+    Text(&'a str),
     /// Capture the viewport as a PNG.
     Screenshot,
 }
@@ -120,6 +154,12 @@ pub enum BrowserOutcome {
     Done,
     /// PNG bytes.
     Screenshot(Vec<u8>),
+    /// The visible text of the element a [`BrowserStep::Text`] named, exactly
+    /// as it read — and wrapped, because it is a stranger's writing on a
+    /// stranger's page. An empty string here means the element is there and
+    /// says nothing; a selector that found no element does not come back at
+    /// all. See the module docs.
+    Text(Untrusted<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +209,21 @@ struct MockState {
     contexts: BTreeMap<String, String>,
     created: u32,
     log: Vec<String>,
+    /// selector -> what successive reads of it find. A selector that is not a
+    /// key is an element that is not on the page, which is the whole point:
+    /// "unscripted" and "scripted as empty" have to be two different pages
+    /// here, or a test cannot tell the two facts apart either.
+    page: BTreeMap<String, (Vec<String>, usize)>,
+}
+
+impl MockState {
+    /// The next text `sel` reads as, or `None` when nothing matches it.
+    fn read(&mut self, sel: &str) -> Option<String> {
+        let (texts, reads) = self.page.get_mut(sel)?;
+        let text = texts[(*reads).min(texts.len() - 1)].clone();
+        *reads += 1;
+        Some(text)
+    }
 }
 
 /// In-memory [`BrowserProvider`]. Records every step so a test can assert on
@@ -187,6 +242,25 @@ impl MockBrowser {
     /// Point a fault at a specific window; see [`FaultMode`].
     pub fn set_fault(&self, fault: FaultMode) {
         self.lock().fault = fault;
+    }
+
+    /// Put an element on the page: what successive [`BrowserStep::Text`] reads
+    /// of `sel` find, in order, with the last entry repeating forever.
+    ///
+    /// A sequence rather than one string because the interesting question about
+    /// a page is whether it says the same thing twice — `app::proof_of_need`
+    /// loads every flow two times and throws away anything that does not
+    /// reproduce, so `["a", "b"]` is how a flaky widget is spelled.
+    ///
+    /// Anything never passed here has no element, and reads as
+    /// [`NO_SUCH_ELEMENT`].
+    pub fn set_text(&self, sel: &str, texts: &[&str]) {
+        let texts: Vec<String> = texts.iter().map(|text| (*text).to_owned()).collect();
+        assert!(
+            !texts.is_empty(),
+            "an element with no text still reads as \"\""
+        );
+        self.lock().page.insert(sel.to_owned(), (texts, 0));
     }
 
     /// Every step this mock was asked to run, oldest first.
@@ -269,6 +343,19 @@ impl BrowserProvider for MockBrowser {
                     format!("{ctx} fill {sel} {}", Secret::REDACTED),
                     BrowserOutcome::Done,
                 )
+            }
+            BrowserStep::Text(sel) => {
+                let found = state.read(sel);
+                // Logged whichever it was: an attempted read is a read, and a
+                // test asserting "the panel was never touched" wants to see the
+                // one that found nothing too.
+                state.log.push(format!("{ctx} text {sel}"));
+                state.fault.check_after()?;
+                return found
+                    .map(|text| BrowserOutcome::Text(Untrusted::new(text)))
+                    .ok_or(ProviderError::Terminal {
+                        code: NO_SUCH_ELEMENT,
+                    });
             }
             BrowserStep::Screenshot => (
                 format!("{ctx} screenshot"),
@@ -503,6 +590,51 @@ mod tests {
         assert!(log.contains("#password"), "{log}");
         // Visible text is not a secret and stays greppable.
         assert!(log.contains("ada@example.com"), "{log}");
+    }
+
+    /// The distinction the whole proof-of-need vertical rests on: an element
+    /// that is there and empty is an answer, an element that is not there is
+    /// not. They must not be the same value, and they are not even the same
+    /// `Result`.
+    #[tokio::test]
+    async fn an_empty_panel_reads_as_text_and_a_missing_one_does_not_read_at_all() {
+        let p = MockBrowser::new();
+        let provisioned = p
+            .ensure_context(&ctx(EmployeeId::new_v7(Utc::now())))
+            .await
+            .unwrap();
+        let s = session(&provisioned);
+        p.set_text("#visa-info", &["No visa required.", ""]);
+
+        // Scripted in order, last entry forever — the two runs a check makes.
+        let read = async || match p.act(&s, BrowserStep::Text("#visa-info")).await {
+            Ok(BrowserOutcome::Text(text)) => Ok(text.into_inner_for_rendering()),
+            Ok(other) => panic!("a text read answered {other:?}"),
+            Err(err) => Err(err),
+        };
+        assert_eq!(read().await.unwrap(), "No visa required.");
+        assert_eq!(read().await.unwrap(), "", "the panel is there and silent");
+        assert_eq!(read().await.unwrap(), "");
+
+        // And the element nobody put on the page: a fact about our selector,
+        // not a page that said nothing.
+        let err = p
+            .act(&s, BrowserStep::Text("#not-there"))
+            .await
+            .expect_err("nothing matches it");
+        assert_eq!(err.code(), NO_SUCH_ELEMENT);
+        assert!(!err.is_retryable(), "the selector will still be wrong");
+
+        // Both attempts are on the log, so "never read" stays assertable.
+        assert_eq!(
+            p.log(),
+            [
+                "ctx-1 text #visa-info",
+                "ctx-1 text #visa-info",
+                "ctx-1 text #visa-info",
+                "ctx-1 text #not-there",
+            ]
+        );
     }
 
     #[tokio::test]
