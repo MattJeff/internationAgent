@@ -178,11 +178,18 @@ impl RolePack {
             // and destination as parameters. A check that genuinely needs a
             // form submitted on somebody else's production system is a human's
             // call, not a widened allowlist.
+            // `InternalSend` for the reason the buyer pack gives at length: the
+            // internal channel shipped complete and unreachable, because a role
+            // layer that omits `Channel::Internal` intersects it away for every
+            // employee wearing the pack. A seller that has just been told a
+            // prospect is in procurement needs to hand that to whoever owns the
+            // account, and handing it over is `Handover` on this channel.
             proposable: [
                 ActionKind::EmailSend,
                 ActionKind::CallPlace,
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
+                ActionKind::InternalSend,
             ]
             .into_iter()
             .collect(),
@@ -207,7 +214,12 @@ impl RolePack {
                 // over either. `Web` is the operator console — inbound only,
                 // never gated as an outbound channel — so granting it here
                 // would permit nothing.
-                allowed_channels: [Channel::Email, Channel::Voice].into_iter().collect(),
+                // `Internal` is not outbound and is not a fourth way to intrude
+                // on a stranger: it reaches a colleague of this tenant and
+                // spends one of their turns. See the note above `proposable`.
+                allowed_channels: [Channel::Email, Channel::Voice, Channel::Internal]
+                    .into_iter()
+                    .collect(),
 
                 // Where the carriers, platforms and travel programmes we sell
                 // to are headquartered. E.164 is a prefix code, so these match
@@ -751,6 +763,7 @@ mod tests {
             ActionKind::CallPlace,
             ActionKind::BrowserRead,
             ActionKind::McpCall,
+            ActionKind::InternalSend,
         ]
         .into_iter()
         .collect();

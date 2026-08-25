@@ -276,13 +276,32 @@ pub fn evaluate() -> Surface {
         .collect();
     // Pinned by name, not by count, and deliberately so: a check that only
     // counted would pass a catalogue in which `pay` had been swapped for
-    // something else high-risk. `message_colleague` is on both lists — the
+    // something else high-risk. Both internal tools are on both lists — the
     // internal channel is Low-risk, because an employee that has just read
     // something hostile is the one that most needs to be able to say so, and
     // what keeps that safe is the trust label its message carries rather than
     // the tool being withheld. See `app::inbound`'s module docs.
-    let wired = trusted == ["send_email", "call_mcp_tool", "pay", "message_colleague"]
-        && untrusted == ["send_email", "call_mcp_tool", "message_colleague"];
+    //
+    // `brief_direct_reports` sits beside `message_colleague` for the same
+    // reason and adds no authority: the gate rules once per report on the same
+    // `InternalSend` the single-recipient tool proposes, so a briefing is
+    // exactly the N rulings N calls would have made. What it adds is that the
+    // model need not know the names — which it is never told.
+    let wired = trusted
+        == [
+            "send_email",
+            "call_mcp_tool",
+            "pay",
+            "message_colleague",
+            "brief_direct_reports",
+        ]
+        && untrusted
+            == [
+                "send_email",
+                "call_mcp_tool",
+                "message_colleague",
+                "brief_direct_reports",
+            ];
     rows.push(
         Row::ok(
             "untrusted turns are not shown `pay`",

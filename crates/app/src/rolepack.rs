@@ -200,6 +200,15 @@ impl RolePack {
             // lets it post there. Until the domain grows a separate write
             // list, "a buyer reads catalogues and does not fill in forms" is
             // enforced here and nowhere else.
+            //
+            // `InternalSend` is the one entry here that does not leave the
+            // company, and leaving it out was a real bug rather than a
+            // judgement: the internal channel, the org chart and the briefing
+            // shipped complete and tested, and no buyer could reach any of them
+            // — the role layer intersected `Channel::Internal` away, so the
+            // gate refused every message with `ChannelNotAllowed`. A buyer that
+            // cannot tell its head a supplier has gone silent is not cheaper,
+            // it is quieter.
             proposable: [
                 ActionKind::EmailSend,
                 ActionKind::WhatsappSend,
@@ -208,6 +217,7 @@ impl RolePack {
                 ActionKind::McpCall,
                 ActionKind::PaymentCreate,
                 ActionKind::ContractSign,
+                ActionKind::InternalSend,
             ]
             .into_iter()
             .collect(),
@@ -233,9 +243,22 @@ impl RolePack {
 
                 // SMS is absent on purpose: it is the cheapest way to spam a
                 // stranger and WhatsApp covers the same suppliers.
-                allowed_channels: [Channel::Email, Channel::Whatsapp, Channel::Voice]
-                    .into_iter()
-                    .collect(),
+                //
+                // `Internal` is not an outbound channel and does not belong in
+                // the same sentence as the three above: it reaches a colleague,
+                // spends one of *their* turns, and never touches the
+                // cold-outreach budget. It is here because the loader
+                // intersects this set with every other layer, so a channel this
+                // pack omits is a channel no buyer has — see the note on
+                // `proposable`.
+                allowed_channels: [
+                    Channel::Email,
+                    Channel::Whatsapp,
+                    Channel::Voice,
+                    Channel::Internal,
+                ]
+                .into_iter()
+                .collect(),
 
                 // The manufacturing markets this role exists to source from,
                 // plus the home markets a buyer calls a forwarder or a
@@ -681,6 +704,7 @@ mod tests {
             ActionKind::McpCall,
             ActionKind::PaymentCreate,
             ActionKind::ContractSign,
+            ActionKind::InternalSend,
         ]
         .into_iter()
         .collect();
@@ -1060,6 +1084,67 @@ mod tests {
         assert_eq!(CountryCode::parse("Cn").expect("cn").to_string(), "CN");
         for bad in ["", "d", "deu", "germany", "d1", "  "] {
             assert!(CountryCode::parse(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// **Every employee can talk to its colleagues, whatever job it holds.**
+    ///
+    /// This is the test that was missing, and its absence cost a whole feature.
+    /// The internal channel, the org chart, the reporting-line rule and the
+    /// briefing all shipped complete, tested and *unreachable*: neither
+    /// production pack listed `InternalSend` in `proposable`, and neither
+    /// granted `Channel::Internal`, so `EffectivePolicy` intersected the channel
+    /// away and the gate refused every internal message with
+    /// `ChannelNotAllowed`. Every unit test passed the whole time. They were
+    /// testing the mechanism; nothing was testing that anybody could get to it.
+    ///
+    /// The partition tests above cannot catch this and are not meant to: they
+    /// assert an allowlist against a written-down set, so an action missing from
+    /// *both* sides agrees with itself. This one asserts a claim about the
+    /// product instead — an employee that cannot tell its head a supplier has
+    /// gone quiet is not cheaper, it is quieter — and it fails if either half of
+    /// the grant is dropped, which is what makes it worth having.
+    ///
+    /// The two other packs (`rolepack_service`'s three) are covered by the same
+    /// assertion in that module. Two places, because the two pack types are
+    /// separate and there is no trait over them; if a third type ever appears,
+    /// it needs its own copy of this.
+    #[test]
+    fn every_role_can_reach_a_colleague() {
+        for (name, may_propose, limits) in [
+            ("buyer", buyer().may_propose(ActionKind::InternalSend), {
+                let l = buyer().limits().clone();
+                l
+            }),
+            (
+                "sales",
+                crate::rolepack_sales::RolePack::sales_development()
+                    .may_propose(ActionKind::InternalSend),
+                crate::rolepack_sales::RolePack::sales_development()
+                    .limits()
+                    .clone(),
+            ),
+        ] {
+            assert!(
+                may_propose,
+                "{name} may not even propose an internal message"
+            );
+
+            // The layer, not just the allowlist: both halves have to be granted
+            // or the gate refuses what the pack was willing to propose.
+            let policy = EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+                .expect("the pack's defaults are coherent");
+            let decision = evaluate(
+                &policy,
+                &Action::InternalSend {
+                    to: Slug::parse("colleague").expect("slug"),
+                },
+                &ctx(),
+            );
+            assert!(
+                matches!(decision, Decision::Allow),
+                "{name} proposes an internal message its own layer refuses: {decision:?}"
+            );
         }
     }
 }
