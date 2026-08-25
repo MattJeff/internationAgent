@@ -224,6 +224,108 @@ impl DerefMut for TenantTx<'_> {
     }
 }
 
+/// A database of this test module's own, created on first use and migrated.
+///
+/// # What it is for
+///
+/// Almost every test in this crate isolates itself by minting a fresh
+/// `TenantId`, and RLS makes the rest of the database invisible. That works
+/// because every row in this schema belongs to a tenant — with exactly one
+/// exception, which the schema itself will tell you:
+///
+/// ```sql
+/// SELECT table_name FROM information_schema.columns
+///  WHERE column_name = 'tenant_id' AND is_nullable = 'YES';
+/// ```
+///
+/// `policy_versions` and `policy_layers`. The platform ceiling is
+/// `tenant_id IS NULL`, which is one row for the whole database, and there is
+/// nothing for a `WHERE tenant_id = $1` to hang off. A test that writes it
+/// writes it for every test in every package running beside it, and `cargo
+/// test --workspace` runs one process per package against one `DATABASE_URL`.
+///
+/// So a test whose subject *is* that row takes a database. See
+/// [`crate::policy::tests`] for the three failures this was costing.
+///
+/// # A fresh handle every call, deliberately
+///
+/// Caching the [`Db`] in a `static` is the obvious optimisation and it does not
+/// work: `#[tokio::test]` builds and drops a runtime per test, and a pooled
+/// connection belongs to the reactor that opened it. The second test to use a
+/// cached pool waits on connections whose runtime is gone and fails with
+/// `PoolTimedOut`, nowhere near the cause. Connecting is one round trip and the
+/// migrations are a no-op after the first test.
+///
+/// # Naming
+///
+/// `<the database in DATABASE_URL>_<suffix>`, which is what makes the cleanup in
+/// `scripts/test.sh` work: it drops every database whose name starts with this
+/// run's, so these go with it. A fixed prefix would not be collected, and
+/// `apps/server`'s three copies of this idea (`readyz_*`, `e2e_*`, `orizn_*`)
+/// leak on a ^C for exactly that reason.
+///
+/// # Why a copy
+///
+/// `apps/server/src/loops/mod.rs` and `crates/app/src/gate.rs` have the same
+/// twenty lines, for the same row. Sharing them would mean exporting this from
+/// `agentos-store` behind a feature, and cargo unifies the features a
+/// dev-dependency turns on with the ones the ordinary dependency gets — so
+/// `CREATE DATABASE` would ship in the release binary to save a copy in a test.
+/// Not worth it.
+#[cfg(test)]
+pub(crate) async fn private_db(suffix: &str) -> Option<Db> {
+    use sqlx::Connection as _;
+
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        // Named after the caller, because this line is what `scripts/test.sh`'s
+        // second guard prints when a run reports success and skipped instead:
+        // `sort -u` over one generic message cannot say which module opted out.
+        eprintln!("SKIP: DATABASE_URL is unset; the {suffix} tests need a real Postgres");
+        return None;
+    };
+
+    // `postgres://user:pass@host:port/name`, or the same with `?options`. Split
+    // by hand rather than pull in a URL parser for one path segment.
+    let (host_part, tail) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+    let (base, options) = tail.split_once('?').map_or((tail, ""), |(b, o)| (b, o));
+    let name = format!("{base}_{suffix}");
+    let mine = if options.is_empty() {
+        format!("{host_part}/{name}")
+    } else {
+        format!("{host_part}/{name}?{options}")
+    };
+
+    // Connect first and create only if that fails, so the ordinary path — every
+    // call after the first — is one connection and no DDL.
+    let db = match Db::connect(&mine).await {
+        Ok(db) => db,
+        Err(_) => {
+            // CREATE DATABASE cannot run inside a transaction block, and `Db`
+            // only hands out transactions — deliberately — so this is the one
+            // place in the crate that opens a bare connection. It is also why
+            // the statement is formatted rather than bound: Postgres takes no
+            // parameters in DDL. `AssertSqlSafe` asks for an audit, and the
+            // audit is that `name` is DATABASE_URL's own database name with a
+            // literal suffix.
+            let mut admin = sqlx::PgConnection::connect(&url)
+                .await
+                .expect("connect to the database DATABASE_URL names");
+            // Ignored: two tests reaching here together is a race one of them
+            // loses with `duplicate_database`, and losing it is fine — the
+            // connect below is the real check.
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+                .execute(&mut admin)
+                .await;
+            admin.close().await.expect("close");
+            Db::connect(&mine).await.expect("connect")
+        }
+    };
+
+    // Idempotent: after the first test this is a read of `_sqlx_migrations`.
+    db.migrate().await.expect("migrate");
+    Some(db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

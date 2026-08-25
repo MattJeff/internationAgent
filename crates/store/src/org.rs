@@ -654,14 +654,19 @@ mod tests {
         "team_spend_buckets",
     ];
 
+    /// The **same private database** `store::policy`'s tests use, and for its
+    /// reason rather than a reason of this module's own: two tests below call
+    /// [`policy::tests::platform`], which replaces the platform layer — one row
+    /// for the whole database, `tenant_id IS NULL`, no tenant filter possible.
+    /// See `policy::tests::db` for what that was costing the app and server
+    /// suites, and [`crate::db::private_db`] for the mechanism.
+    ///
+    /// One database rather than two: `policy::tests::platform` returns the
+    /// `PLATFORM` guard, so these tests and that module's are already
+    /// serialised against each other in this process. Splitting them would buy
+    /// nothing and cost a second migration run.
     async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the org layer needs a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+        crate::db::private_db("storepolicy").await
     }
 
     async fn seed_tenant(db: &Db, label: &str) -> TenantId {

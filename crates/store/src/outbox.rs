@@ -438,14 +438,29 @@ mod tests {
     /// to `outbox_events` takes this first and they go one at a time.
     static OUTBOX_LOCK: Mutex<()> = Mutex::const_new(());
 
+    /// This module's own database. [`crate::db::private_db`] is the mechanism.
+    ///
+    /// [`OUTBOX_LOCK`] and [`clear_outbox`] below are what this module used to
+    /// rely on instead, and the argument they rest on — everyone else's events
+    /// are stamped `Utc::now()`, [`claim`] only takes rows whose `available_at`
+    /// has passed, so at [`T0`] somebody else's event is not merely irrelevant,
+    /// it is unclaimable — is true, and it covers [`claim`] exactly.
+    ///
+    /// It does not cover [`dead_letters`], which has no time predicate at all:
+    /// `published_at IS NULL AND attempt_count >= MAX_ATTEMPTS`, every tenant,
+    /// any age. That is correct — an operator alerts on the whole queue — and it
+    /// means `a_permanently_failing_handler_backs_off_then_dead_letters`'
+    /// `assert_eq!(dead.len(), 1)` is an assertion about the **whole database**.
+    /// It found three: the inbound loop's tests were running on the shared
+    /// database and ticking their poller to exhaustion, which is what a dead
+    /// letter is. That loop now takes its own database too, but the assertion
+    /// was one exhausted event away from breaking again from any direction, and
+    /// a test that owns a global claim needs to own the database it claims from.
+    ///
+    /// The lock and the scoped clear stay: the tests in *this* module still run
+    /// in parallel against this one database.
     async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; outbox tests need a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+        crate::db::private_db("storeoutbox").await
     }
 
     fn at(secs: i64) -> DateTime<Utc> {

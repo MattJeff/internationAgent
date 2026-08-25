@@ -373,14 +373,29 @@ mod tests {
 
     const SENDER: &str = "Accounts <AP@Supplier.example>";
 
+    /// This module's own database — see [`private_db`](crate::loops::private_db),
+    /// which is the answer for all four loops and which the other three already
+    /// take.
+    ///
+    /// This one was left on the suite's database, and the bill was not paid
+    /// here. These tests tick a poller until its notices exhaust their
+    /// attempts, which is the point of two of them — and an exhausted,
+    /// unpublished event is a **dead letter**, which
+    /// `agentos_store::outbox::dead_letters` reads across every tenant, because
+    /// alerting on your own tenant's dead letters is not a thing an operator
+    /// does.
+    /// `store::outbox`'s `a_permanently_failing_handler_backs_off_then_dead_letters`
+    /// asserts there is exactly one in the queue and found three, in a package
+    /// that had never heard of the inbound loop.
+    ///
+    /// The `DELETE FROM outbox_events WHERE aggregate_type = $1` in [`seed`]
+    /// below is the other half of why: it has a `WHERE`, so
+    /// `crates/app/tests/scoped_deletes.rs` passes it, and it still reaches
+    /// every tenant's notices. On a database of our own that is exactly what we
+    /// mean; on a shared one it was deleting rows out from under whoever else
+    /// was mid-assertion.
     async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the inbound loop needs a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+        crate::loops::private_db("inbound").await
     }
 
     /// A tenant with one employee, and a clean slate of inbound notices so a

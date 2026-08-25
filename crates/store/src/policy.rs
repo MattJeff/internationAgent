@@ -1596,16 +1596,53 @@ pub(crate) mod tests {
     /// ponytail: a mutex, not a per-test schema. The serialised section is
     /// milliseconds of SQL; if this file ever grows enough tests for that to
     /// matter, give each test its own database instead.
+    ///
+    /// It is necessary and it is not sufficient — see [`db`], which is where the
+    /// other half of the answer lives. A `tokio::sync::Mutex` is per-process,
+    /// and `cargo test` runs one process per package.
     static PLATFORM: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    /// **This module's own database**, shared with `store::org`'s tests and
+    /// nobody else. [`crate::db::private_db`] explains the mechanism.
+    ///
+    /// # The bug this exists to stop coming back
+    ///
+    /// These tests are about the platform layer, which is `tenant_id IS NULL`
+    /// and therefore *one row for the whole database*: [`platform`] replaces it,
+    /// [`no_ceiling`] deletes it, and the six ceiling tests below install one
+    /// the way an operator does. There is no `WHERE tenant_id = $1` that could
+    /// scope any of that, because the row belongs to no tenant.
+    ///
+    /// On the suite's shared database that cost three failures, all one bug:
+    ///
+    /// - **`cargo test -p agentos-app --lib` first, then this module:** five of
+    ///   the six ceiling tests died on `install_ceiling`'s currency guard, which
+    ///   asks whether *any* layer in the database disagrees with the ceiling's
+    ///   currency — and `agentos-app`'s fixtures leave EUR tenant layers behind.
+    ///   The sixth,
+    ///   [`a_ceiling_that_clashes_with_an_existing_currency_is_refused`], was
+    ///   worse than red: it went **green off somebody else's EUR layer**,
+    ///   proving nothing about the one it seeds itself.
+    /// - **This module first, then `agentos-app`:** 103 of 350 tests red. The
+    ///   ceiling tests leave an operator ceiling installed on purpose — that is
+    ///   the assertion in
+    ///   [`the_first_ceiling_cannot_be_rolled_back_into_nothing`] — and
+    ///   [`install`] refuses, correctly, to run its fixture DELETE over one.
+    /// - **This module first, then `agentos-server`:** 41 red, same guard, same
+    ///   leftover row.
+    ///
+    /// The guard is right in all three cases; the isolation was what was
+    /// missing. `crates/app/tests/scoped_deletes.rs` is what stops it returning.
+    ///
+    /// # Why the helper and not the tests
+    ///
+    /// Isolating the six tests that write the row today fixes six tests. Every
+    /// test in this module is one edit away from writing it — [`platform`] is
+    /// the module's ordinary fixture — so the database is attached to the
+    /// helper they all already call, and a test written next week inherits it
+    /// without anybody remembering this.
     async fn db() -> Option<Db> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the policy loader needs a real Postgres");
-            return None;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
-        Some(db)
+        crate::db::private_db("storepolicy").await
     }
 
     /// What a test wants written into one `policy_layers` row. Everything the
