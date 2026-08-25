@@ -60,12 +60,6 @@ const MAX_LIMIT: i64 = 200;
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before this handler.
-///
-/// ponytail: `allow(dead_code)` because this unit owns `routes/inventory.rs`
-/// and one `pub mod` line, and `main.rs` — where every other router is merged —
-/// belongs to another unit. Delete the attribute in the same commit that adds
-/// `.merge(routes::inventory::router(db.clone()))` to `api_router`; until then
-/// the tests below are the only caller and everything here would read as dead.
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/inventory/stranded", get_route(list_stranded))

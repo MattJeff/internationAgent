@@ -324,9 +324,11 @@ Never built: voice (no STT, no TTS, no gateway — `Channel::Voice` is a policy
 channel and nothing more), payments (the port refuses with `not_configured`
 rather than returning a plausible id somebody will one day believe), the Meta
 WhatsApp adapter (so `whatsapp` fails `no_whatsapp_sender` on every deployment
-and `degraded` is the healthy steady state), a served DID document, key
-rotation, and a mounted `/metrics` — the exporter is written and `app()` does
-not merge it.
+and `degraded` is the healthy steady state), a served DID document, and key
+rotation. `/metrics` *is* mounted — beside `/livez` and `/readyz`, outside the
+API auth stack, so the listener must not be publicly routable — but
+`agentos_llm_tokens_total` reads zero on every deployment, because nothing in
+production calls `metrics::record_llm_usage` yet.
 
 **908 test functions.** `cargo clippy --workspace --all-targets -- -D warnings`
 is clean and CI runs it, the suite, a migration replay against a virgin

@@ -130,14 +130,8 @@ const DEFAULT_WINDOW_DAYS: i64 = 30;
 /// `day` predicate is an expression and cannot use the trail's index.
 const MAX_WINDOW_DAYS: i64 = 366;
 
-/// This unit's routes.
-///
-/// ponytail: `allow(dead_code)` for the same reason [`super::inventory`] and
-/// [`super::turns`] carried it — this unit owns `routes/autonomy.rs` and one
-/// `pub mod` line, and `main.rs`, where every router is merged, belongs to
-/// another unit. Delete the attribute in the same commit that adds
-/// `.merge(routes::autonomy::router(db.clone()))` to `app`; until then the
-/// tests below are the only caller.
+/// This unit's routes. Merged into the API router by `main.rs`, so it inherits
+/// auth, the rate limit and the idempotency layer from `with_api_stack`.
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/autonomy", get_route(get))

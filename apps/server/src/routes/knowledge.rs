@@ -69,12 +69,6 @@ use crate::error::ApiError;
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before this handler, and
 /// the 1 MB body cap comes from `with_outer_stack` outside that.
-///
-/// ponytail: `allow(dead_code)` because this unit owns `routes/knowledge.rs`
-/// and one `pub mod` line, and `main.rs` — where every other router is merged —
-/// belongs to another unit. Delete the attribute in the same commit that adds
-/// `.merge(routes::knowledge::router(db.clone()))` to `api_router`; until then
-/// the tests below are the only caller and everything here would read as dead.
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/knowledge/documents", post(create_document))

@@ -75,7 +75,7 @@ pub const EMBEDDING_DIM: usize = 1536;
 /// writes carries — `app::knowledge::model_name` returns *this constant* rather
 /// than a second spelling of it.
 ///
-/// That indirection is the fix for a real bug and not tidiness. Until 0023 the
+/// That indirection is the fix for a real bug and not tidiness. Until 0026 the
 /// index predicate named `text-embedding-3-small` and nothing but this file's
 /// own tests ever wrote that string, so the index served no query in production
 /// and every retrieval was a sequential scan — while the test that EXPLAINs the
@@ -84,7 +84,7 @@ pub const EMBEDDING_DIM: usize = 1536;
 /// that invisible; there is now one, and the same test guards it.
 ///
 /// Anything else stores and searches fine, it just falls back to a sequential
-/// scan until someone adds a partial index for it — see `0023`, which argues
+/// scan until someone adds a partial index for it — see `0026`, which argues
 /// why a second model is a migration rather than a config change.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "mock-sha256-1536";
 
@@ -307,7 +307,7 @@ const fn trust_str(label: TrustLabel) -> &'static str {
 /// Record an ingested source.
 ///
 /// A [`Scope::Team`] naming another tenant's team is refused by the composite
-/// foreign key 0023 adds, not by a check here: the tenant is half the key, so
+/// foreign key 0025 adds, not by a check here: the tenant is half the key, so
 /// there is no version of "forgot the tenant predicate" that gets through.
 pub async fn insert_source(tx: &mut TenantTx<'_>, source: &NewSource) -> Result<(), StoreError> {
     let (employee_id, team_id) = source.scope.columns();

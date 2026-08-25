@@ -271,7 +271,7 @@ pub enum KnowledgeError {
 /// [`DEFAULT_EMBEDDING_MODEL`](agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL),
 /// referenced rather than re-spelled: the store owns the partial HNSW index and
 /// therefore owns the name, and a second spelling here is precisely what let
-/// the index predicate and the stamped model drift apart until `0023`.
+/// the index predicate and the stamped model drift apart until `0026`.
 pub const fn model_name(embedder: Embedder) -> &'static str {
     match embedder {
         // `mock-sha256-1536`, deliberately not a real vendor model name — see
@@ -1289,7 +1289,7 @@ mod tests {
     /// labelled `text-embedding-3-small` are the silent mixing this column
     /// exists to prevent. And the name it *does* use has to be the one the
     /// partial HNSW index is built on, or every retrieval is a sequential scan.
-    /// Before `0023` the second claim was false while a test asserting the
+    /// Before `0026` the second claim was false while a test asserting the
     /// first one passed, because the two names lived in two crates.
     #[test]
     fn the_mock_is_not_labelled_as_a_real_model_and_is_the_model_the_index_covers() {

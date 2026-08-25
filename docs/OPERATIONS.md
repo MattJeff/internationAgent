@@ -742,8 +742,9 @@ ORDER  BY r.updated_at;
 ```
 
 This is **the operator's list**: "go and cancel these by hand". It is a list and
-not a counter because a number tells nobody what to cancel. (A gauge would need
-`/metrics`, which is written and not mounted — see §9.)
+not a counter because a number tells nobody what to cancel. (`/metrics` is
+mounted and could carry a gauge, but a gauge would still not say what to
+cancel — see §9.)
 
 Log lines to alert on:
 
@@ -1056,11 +1057,19 @@ stranded-resource endpoint (§6) and a knowledge *ingest* endpoint
 (`POST /v1/knowledge/documents`) — but no knowledge *search* endpoint; retrieval
 happens inside a turn.
 
-**`/metrics` is written and not mounted.** `apps/server/src/metrics.rs` builds a
-Prometheus router with six families and `app()` never merges it, so the route
-does not exist and the counters are never incremented. Wiring it is one line.
-Until then the operational reads are `/readyz`, `/v1/inventory/stranded` and
-SQL.
+**`/metrics` is mounted, and unauthenticated by design.** `apps/server/src/metrics.rs`
+builds a Prometheus router with six families and `app()` merges it beside
+`/livez` and `/readyz`, outside the API auth stack — a scraper holds no tenant
+credential, and every number it exposes is a cross-tenant aggregate.
+**So the listener must not be publicly routable**: restrict `/metrics`,
+`/livez` and `/readyz` to the scrape network at the ingress, which is the only
+tier that can see a client address. `/metrics` tells a stranger the
+deny-reason mix and the depth of the approval queue.
+
+One family is not real: `agentos_llm_tokens_total` reads zero everywhere,
+because `metrics::record_llm_usage` has no production caller yet. The other
+five carry live numbers. The complementary operational reads remain `/readyz`,
+`/v1/inventory/stranded` and SQL.
 
 **Company knowledge is plaintext and Markdown only, on a hash embedder.** No URL
 fetching, no PDF parsing, no file upload, no malware or content-type validation.

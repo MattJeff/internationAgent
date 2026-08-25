@@ -57,12 +57,6 @@ use crate::error::ApiError;
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before this handler.
-///
-/// ponytail: `allow(dead_code)` for the same reason `routes::inventory` carries
-/// it — this unit owns `routes/turns.rs` and one `pub mod` line, and `main.rs`,
-/// where every router is merged, belongs to another unit. Delete the attribute
-/// in the same commit that adds `.merge(routes::turns::router(db.clone()))` to
-/// `app`; until then the tests below are the only caller.
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/employees/{id}/turns", get_route(get))

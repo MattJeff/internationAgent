@@ -639,7 +639,7 @@ tools — see §14.
 
 A retrieved document is untrusted data, never executable instruction.
 
-The HNSW index is **partial on the model**, and `0023_knowledge_index_model.sql`
+The HNSW index is **partial on the model**, and `0026_knowledge_index_model.sql`
 is the migration that made the predicate name the model this system writes
 (`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing ever
 wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on 20 000
@@ -1718,20 +1718,31 @@ in the payload under `TRACEPARENT_KEY`.
 
 Logs are JSON on stdout via `tracing-subscriber`, filtered by `RUST_LOG`.
 
-> **`/metrics` is written and NOT WIRED.** `apps/server/src/metrics.rs` builds a
-> Prometheus text-exposition router with six families —
-> `agentos_policy_denials_total{code}`, `agentos_provisioning_steps_total{step,result}`,
+> **`/metrics` is mounted, and one of its six families is a lie.**
+> `apps/server/src/metrics.rs` builds a Prometheus text-exposition router with
+> six families — `agentos_policy_denials_total{code}`,
+> `agentos_provisioning_steps_total{step,result}`,
 > `agentos_llm_tokens_total{kind}`, `agentos_approvals_pending`,
-> `agentos_outbox_lag_seconds`, `agentos_outbox_dead_letters` — and `app()` does
-> not merge it. The counters are never incremented either. Its design is sound
-> and worth keeping: every label value is a `&'static str` from a closed match,
-> so cardinality is bounded by construction and a tenant id can never become a
-> label; every family emits `# HELP`/`# TYPE` even at zero samples; and the DB
-> gauges are omitted rather than 500ing when Postgres is unreachable.
+> `agentos_outbox_lag_seconds`, `agentos_outbox_dead_letters`. `app()` merges it
+> beside `/livez` and `/readyz` and deliberately *outside* `with_api_stack`,
+> because a scraper holds no tenant credential — see the argument at
+> `apps/server/src/main.rs`. **The listener must therefore not be publicly
+> routable**: the ingress is what restricts `/metrics`, `/livez` and `/readyz`
+> to the scrape network.
+>
+> Five of the six carry real numbers: the two denial/provisioning counters have
+> live call sites (`error.rs`, `routes/a2a.rs`, `loops/provisioning.rs`) and the
+> three gauges are read from Postgres at scrape time.
+> `agentos_llm_tokens_total` reads zero on every deployment —
+> `metrics::record_llm_usage` still has no production caller, and says so.
+>
+> The design is sound: every label value is a `&'static str` from a closed
+> match, so cardinality is bounded by construction and a tenant id can never
+> become a label; every family emits `# HELP`/`# TYPE` even at zero samples; and
+> the DB gauges are omitted rather than 500ing when Postgres is unreachable.
 
-Until it is mounted, the operational reads are `GET /readyz` (which reports
-`outbox_lag_secs`), `GET /v1/inventory/stranded`, and SQL — see
-`docs/OPERATIONS.md` §5 and §6.
+The other operational reads are `GET /readyz` (which reports `outbox_lag_secs`),
+`GET /v1/inventory/stranded`, and SQL — see `docs/OPERATIONS.md` §5 and §6.
 
 `/readyz` deliberately does **not** count a dead letter as lag: its
 `available_at` is permanently in the past, so counting it would make the number

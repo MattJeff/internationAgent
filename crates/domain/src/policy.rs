@@ -829,17 +829,16 @@ mod tests {
 
     /// The most permissive policy this system can express: everything the
     /// operator could switch on, switched on.
+    ///
+    /// `Channel::ALL` and not a hand-written list, because a hand-written one
+    /// stopped being permissive the moment a seventh channel was added and
+    /// nobody noticed: this fixture listed four of seven, so `InternalSend`
+    /// was denied under "the most permissive policy" and every arm of the
+    /// evaluator that needs `Channel::Internal` went untested. Ask the enum.
     fn permissive() -> PolicyLimits {
         PolicyLimits {
             spend: Some(SpendLimits::try_new(usd(50_000), usd(200_000), usd(50_000)).unwrap()),
-            allowed_channels: [
-                Channel::Email,
-                Channel::Sms,
-                Channel::Whatsapp,
-                Channel::Voice,
-            ]
-            .into_iter()
-            .collect(),
+            allowed_channels: Channel::ALL.into_iter().collect(),
             allowed_calling_codes: [CallingCode::new(1).unwrap(), CallingCode::new(86).unwrap()]
                 .into_iter()
                 .collect(),
@@ -968,6 +967,49 @@ mod tests {
                     );
                 }
                 Decision::Allow => panic!("{kind} was allowed under an empty policy"),
+            }
+        }
+    }
+
+    /// The mirror of the test above, and the half that was missing.
+    ///
+    /// "An empty policy allows nothing" only proves the gate can say no. Without
+    /// this, an arm that says no *unconditionally* is indistinguishable from a
+    /// correct one — which is exactly what happened: `permissive()` listed four
+    /// of `Channel`'s seven variants, so `InternalSend` was denied under the
+    /// most permissive policy this system can express, and forcing that arm to
+    /// `Deny` outright left all 209 domain tests green. The internal channel had
+    /// already shipped unreachable once for the same reason, one layer down.
+    ///
+    /// Deny is the only outcome ruled out. `ContractSign` and `CredentialChange`
+    /// escalate however wide the policy is opened, which is the point of both.
+    #[test]
+    fn the_permissive_policy_denies_nothing_at_all() {
+        let policy = effective(&permissive());
+        // The favourable context: trusted input, a known counterparty, and
+        // authority over the one action that has a subject.
+        let ctx = ActionCtx {
+            directs_subject: true,
+            ..ctx()
+        };
+
+        for action in one_of_every_action() {
+            let kind = action.kind();
+            let decision = evaluate(&policy, &action, &ctx);
+            assert!(
+                !matches!(decision, Decision::Deny { .. }),
+                "{kind} was DENIED under the most permissive policy this system \
+                 can express: {decision:?} — either the fixture no longer grants \
+                 everything an operator could switch on, or this arm cannot be \
+                 reached at all"
+            );
+            if matches!(
+                kind,
+                ActionKind::ContractSign | ActionKind::CredentialChange
+            ) {
+                assert!(matches!(decision, Decision::RequireApproval { .. }));
+            } else {
+                assert!(decision.is_allow(), "{kind} did not reach Allow");
             }
         }
     }
@@ -1561,6 +1603,16 @@ mod tests {
         );
     }
 
+    /// Every variant, and the list drifted once already: it carried seventeen
+    /// of twenty-one, so `SelfDirection` could have returned `"no_rule"` and
+    /// this test still passed. A duplicate code collapses two alert conditions
+    /// into one series, which is the whole reason `code()` exists.
+    ///
+    /// ponytail: still a hand-written list. `code()`'s own match is exhaustive,
+    /// so a *new* variant cannot go label-less; what this catches is two
+    /// variants sharing a label, and catching that needs an enumeration. A
+    /// `DenyReason::ALL` next to `ActionKind::ALL` would read better and would
+    /// not be more total — a fixed-length array does not force itself to grow.
     #[test]
     fn reason_codes_are_stable_and_unique() {
         let reasons = [
@@ -1577,7 +1629,11 @@ mod tests {
             DenyReason::CurrencyMismatch,
             DenyReason::PerTransactionLimit,
             DenyReason::DailyLimit,
+            DenyReason::NoTeamBudget,
+            DenyReason::TeamDailyLimit,
             DenyReason::CrossTenantSecret,
+            DenyReason::SelfDirection,
+            DenyReason::OutsideChainOfCommand,
             DenyReason::CredentialChangeNotAllowed,
             DenyReason::DataDeleteNotAllowed,
             DenyReason::UntrustedInput,
