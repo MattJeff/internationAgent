@@ -137,10 +137,12 @@
 //! budget is not a boundary if any employee can ask any other to spend.
 //!
 //! Whether an **order** specifically is legitimate — "may X direct Y" — is a
-//! question about reporting lines, which do not exist in this schema yet and
-//! which this unit did not invent. [`may_message`] is the seam: when they do,
-//! its `Errand::Order` arm gains the reporting-line check and nothing else in
-//! this file moves.
+//! question about reporting lines, and since `0027_positions` they exist:
+//! [`may_message`] answers it from `team_memberships.reports_to`, one link and
+//! never a walk. An order rides the line and nothing else; a question and a
+//! handover ride the team *or* the line either way. The line crosses teams on
+//! purpose — a head answers to the CEO from a different team — which is why the
+//! two are alternatives and not a conjunction.
 //!
 //! ## What an internal message costs
 //!
@@ -1313,27 +1315,49 @@ impl InternalError {
     }
 }
 
-/// **The seam the hierarchy plugs into.** Whether `from` may address `to` at
-/// all.
+/// **The seam the hierarchy plugs into**, now plugged in. Whether `from` may
+/// address `to` at all, and the answer differs by errand.
 ///
-/// Today's rule, and it is the narrowest one this schema can express: the two
-/// employees are on the **same team** and both are `active`. No team means no
-/// colleagues — deny by default, exactly like an employee whose policy nobody
-/// wrote.
+/// Two relations exist, and they are not the same shape:
 ///
-/// It is not "same tenant". An employee that may message anyone in the tenant
-/// is a lateral channel around every boundary the org layer exists to draw: a
-/// per-team spend budget means nothing if any employee can ask any other to
-/// spend it. (Cross-*tenant* is not a rule here at all — row-level security
-/// makes another tenant's employees invisible, so `to` simply does not resolve.)
+/// * **The team** — a set. Everyone on it can talk to everyone else on it. This
+///   is the lateral relation, and it is what a question and a handover ride on.
+/// * **The reporting line** — a directed edge, `team_memberships.reports_to`.
+///   This is the vertical relation, and an *order* rides on nothing else.
 ///
-/// # What is deliberately not decided here
+/// It is not "same tenant" in either case. An employee that may message anyone
+/// in the tenant is a lateral channel around every boundary the org layer
+/// exists to draw: a per-team spend budget means nothing if any employee can
+/// ask any other to spend it. (Cross-*tenant* is not a rule here at all —
+/// row-level security makes another tenant's employees invisible, so `to`
+/// simply does not resolve.) Both employees must be `active`, and an employee
+/// with no seat at all can message nobody: deny by default, exactly like an
+/// employee whose policy nobody wrote.
 ///
-/// Whether an [`Errand::Order`] is *legitimate* — "may X direct Y" — is a
-/// question about reporting lines, and there are none in this schema. This unit
-/// did not invent an answer. When positions and reporting lines exist, the
-/// `Errand::Order` arm below is the one line that changes: same team **and** on
-/// the line. Nothing else in this file has an opinion about direction.
+/// # Why an order is not "same team **and** on the line"
+///
+/// That is what this function's own comment asked for before positions
+/// existed, and merging the two made it wrong. **A reporting line crosses
+/// teams, and that is the point of having one.** In the org chart this system
+/// is built to express, the CEO sits on `Direction` and the Head of Growth
+/// sits on `Growth`, answering to it — so conjoining the two relations would
+/// have meant a head could not be given an order by the only person above it,
+/// while a peer sitting beside it could. The line alone is both stricter where
+/// it matters (a peer directs nobody) and correct where the team test failed.
+///
+/// It is one link and never a walk, matching
+/// [`agentos_store::org::manager_of`] and the gate's `directs_subject`: a CEO
+/// does not thereby direct every employee in the company. Authority descends a
+/// step at a time or it is not a chain of command.
+///
+/// A question and a handover take the line **in either direction** as well as
+/// the team, because a report asking its manager something is the ordinary
+/// case and a manager one team over is still its manager.
+///
+/// [`Errand::Answer`] is authorised by the **question**, which `answerable`
+/// checks: this exact question, put to this exact employee, by this exact
+/// colleague. That is stricter than either relation above and survives a
+/// re-org, so an outstanding question can always be closed.
 pub async fn may_message(
     tx: &mut TenantTx<'_>,
     from: EmployeeId,
@@ -1347,31 +1371,62 @@ pub async fn may_message(
     }
 
     match errand {
-        // An answer is authorised by the **question**, which is a stricter and
-        // more specific fact than team membership: `answerable` requires that
-        // this exact question was put to this exact employee by this exact
-        // colleague. Checking the team as well would only add a way for an
-        // answer to become impossible after a re-org, turning an outstanding
-        // question into one that can never be closed.
+        // Authorised by the question, not by the org chart. See the doc above.
         Errand::Answer => Ok(true),
-        Errand::Order | Errand::Question | Errand::Handover => {
-            let same_team: bool = sqlx::query_scalar(
-                "SELECT count(*) = 2 \
-                   FROM employees e \
-                   JOIN team_memberships m ON m.employee_id = e.id \
-                  WHERE e.id = ANY($1::uuid[]) \
-                    AND e.lifecycle = 'active' \
-                    AND m.team_id = ( \
-                        SELECT team_id FROM team_memberships WHERE employee_id = $2)",
-            )
-            .bind(vec![from.as_uuid(), to.as_uuid()])
-            .bind(from.as_uuid())
-            .fetch_one(&mut ***tx)
-            .await
-            .map_err(StoreError::from)?;
-            Ok(same_team)
-        }
+        // Down the line, one link, and nothing else.
+        Errand::Order => directs(tx, from, to).await,
+        // The team, or the line either way up.
+        Errand::Question | Errand::Handover => Ok(same_team(tx, from, to).await?
+            || directs(tx, from, to).await?
+            || directs(tx, to, from).await?),
     }
+}
+
+/// Both on one team, both active. The lateral relation.
+async fn same_team(
+    tx: &mut TenantTx<'_>,
+    from: EmployeeId,
+    to: EmployeeId,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar(
+        "SELECT count(*) = 2 \
+           FROM employees e \
+           JOIN team_memberships m ON m.employee_id = e.id \
+          WHERE e.id = ANY($1::uuid[]) \
+            AND e.lifecycle = 'active' \
+            AND m.team_id = ( \
+                SELECT team_id FROM team_memberships WHERE employee_id = $2)",
+    )
+    .bind(vec![from.as_uuid(), to.as_uuid()])
+    .bind(from.as_uuid())
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)
+}
+
+/// Whether `manager` is the seat `report` answers to **directly**, both active.
+///
+/// The same one-link question [`agentos_store::org::manager_of`] answers for
+/// the gate, asked as an `EXISTS` because the caller only wants the boolean.
+/// No recursion: see the doc on [`may_message`] for why a walk would be the
+/// wrong relation.
+async fn directs(
+    tx: &mut TenantTx<'_>,
+    manager: EmployeeId,
+    report: EmployeeId,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM team_memberships m \
+             JOIN employees r ON r.id = m.employee_id AND r.lifecycle = 'active' \
+             JOIN employees g ON g.id = m.reports_to AND g.lifecycle = 'active' \
+            WHERE m.employee_id = $2 AND m.reports_to = $1)",
+    )
+    .bind(manager.as_uuid())
+    .bind(report.as_uuid())
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)
 }
 
 /// Narrow an [`InboundError`] from the two helpers this path shares with the
@@ -2737,6 +2792,16 @@ mod tests {
                 .await
                 .expect("join team");
         }
+        // Lena is the head of the desk and Bruno answers to her. Every test
+        // below that has Lena *order* Bruno needs this line to exist, which is
+        // the point: an order with no reporting line under it is refused, and a
+        // fixture that let one through would be testing nothing.
+        agentos_store::org::set_position(&mut tx, lena, Some("Head of desk"), None)
+            .await
+            .expect("seat lena");
+        agentos_store::org::set_position(&mut tx, bruno, Some("Buyer"), Some(lena))
+            .await
+            .expect("seat bruno under lena");
         tx.commit().await.expect("commit the org chart");
 
         allow_internal(db, tenant, turns).await;
@@ -2878,6 +2943,110 @@ mod tests {
             delivered.message_id,
         );
         assert_eq!(context.trust(), TrustLabel::Trusted);
+    }
+
+    /// **The org chart an operator actually draws, and the two questions it
+    /// asks that a team test gets wrong in both directions.**
+    ///
+    /// `docs/TEAMS.md` builds this: the CEO sits on `Direction`, the Head of
+    /// Growth sits on `Growth` and answers to it. So the reporting line and the
+    /// team disagree, deliberately, and each errand has to pick the right one:
+    ///
+    /// * The CEO orders its head **across teams** — allowed, because the line is
+    ///   what an order rides. A "same team **and** on the line" rule would have
+    ///   refused the one order in the chart that is unambiguously legitimate.
+    /// * A peer orders a peer **on its own team** — refused, because sharing a
+    ///   desk directs nobody. A "same team" rule would have allowed it.
+    /// * The head asks the CEO a question **across teams** — allowed: the line
+    ///   goes both ways for a question, and a report that cannot ask upward is
+    ///   not in a company.
+    /// * The head orders the CEO **up the line** — refused. The edge is
+    ///   directed.
+    #[tokio::test]
+    async fn an_order_follows_the_reporting_line_and_a_question_follows_either() {
+        let Some(db) = db().await else { return };
+        let (tenant, ceo) = seed(&db).await;
+        let head = hire(&db, tenant, "head-of-growth").await;
+        let peer = hire(&db, tenant, "growth-marketer").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let direction = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("direction").unwrap(),
+            "Direction",
+        )
+        .await
+        .expect("team");
+        let growth =
+            agentos_store::org::create_team(&mut tx, &Slug::parse("growth").unwrap(), "Growth")
+                .await
+                .expect("team");
+        agentos_store::org::set_member(&mut tx, ceo, direction, None)
+            .await
+            .expect("seat");
+        for who in [head, peer] {
+            agentos_store::org::set_member(&mut tx, who, growth, None)
+                .await
+                .expect("seat");
+        }
+        agentos_store::org::set_position(&mut tx, ceo, Some("CEO / fondateur"), None)
+            .await
+            .expect("ceo");
+        // Both on Growth. Only one of them answers to the CEO.
+        agentos_store::org::set_position(&mut tx, head, Some("Head of Growth"), Some(ceo))
+            .await
+            .expect("head");
+        agentos_store::org::set_position(&mut tx, peer, Some("Growth marketer"), Some(head))
+            .await
+            .expect("peer");
+
+        let may = async |from, to, errand| {
+            let mut inner = db.tenant_tx(tenant).await.expect("tx");
+            let answer = may_message(&mut inner, from, to, errand)
+                .await
+                .expect("the org chart is readable");
+            inner.rollback().await.expect("rollback");
+            answer
+        };
+        tx.commit().await.expect("commit the org chart");
+
+        // Down the line, across two teams.
+        assert!(
+            may(ceo, head, Errand::Order).await,
+            "the CEO directs its head"
+        );
+        // Same team, no line between them: the peer answers to the head, not to
+        // the other way round, and the head is not the peer's colleague-with-
+        // authority just by sharing a desk.
+        assert!(
+            !may(peer, head, Errand::Order).await,
+            "a report does not order the head it answers to"
+        );
+        assert!(
+            !may(head, ceo, Errand::Order).await,
+            "the line is directed; nobody orders upward"
+        );
+        // Upward and downward questions, across teams.
+        assert!(
+            may(head, ceo, Errand::Question).await,
+            "a head may ask the CEO"
+        );
+        assert!(may(ceo, head, Errand::Question).await, "and be asked back");
+        // The lateral relation still stands on its own for a question.
+        assert!(
+            may(peer, head, Errand::Question).await,
+            "one team is enough to ask"
+        );
+        // And no relation at all is still nothing: the CEO shares no team with
+        // the peer and does not directly direct it — one link, never a walk.
+        assert!(
+            !may(ceo, peer, Errand::Order).await,
+            "authority descends one step at a time"
+        );
+        assert!(
+            !may(ceo, peer, Errand::Question).await,
+            "two steps away is not a colleague"
+        );
     }
 
     /// **The laundering attempt, at the row.**
