@@ -31,11 +31,16 @@
 //! Resend domains have no free-form metadata field to stamp
 //! [`EnsureCtx::tag`] into, so the reconcile key is the domain name itself —
 //! which is fine, because a name is unique per account by construction. The
-//! consequence: one adapter owns one sending domain, so
-//! [`crate::email::contract_suite`]'s "distinct steps must not collapse onto
-//! one resource" assertion does not hold here and this adapter is deliberately
-//! not run against that suite. Everything else in the contract does hold and is
-//! tested below.
+//! consequence: one adapter owns one sending domain, and every employee sits on
+//! it.
+//!
+//! That is the one place this adapter differs from
+//! [`crate::email::contract_suite`]'s default expectation, and it is a
+//! parameter rather than an exemption: the suite runs here as
+//! [`crate::email::IdentityScope::AccountWide`], which flips "distinct keys
+//! must not collapse onto one resource" into "distinct keys must collapse onto
+//! *the* resource" and checks everything else unchanged, against the hermetic
+//! server below.
 
 use agentos_domain::ids::IdempotencyKey;
 use async_trait::async_trait;
@@ -411,6 +416,8 @@ mod tests {
         /// `"GET /domains"`, in the order the adapter asked.
         seen: Vec<String>,
         domains: Vec<Value>,
+        /// `Idempotency-Key` -> the id the first send under it was given.
+        sent: std::collections::BTreeMap<String, String>,
         next: u64,
         /// When set, every route answers with this status instead.
         force_status: Option<u16>,
@@ -469,15 +476,23 @@ mod tests {
     async fn serve(mut stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<FakeState>>) {
         let mut buffer = Vec::new();
         loop {
-            let Some((line, body)) = read_request(&mut stream, &mut buffer).await else {
+            let Some((line, headers, body)) = read_request(&mut stream, &mut buffer).await else {
                 return;
             };
+            let idempotency_key = headers
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("idempotency-key")
+                        .then(|| value.trim().to_owned())
+                })
+                .unwrap_or_default();
             let (status, payload, content_type) = {
                 let mut state = state.lock().expect("not poisoned");
                 state.seen.push(line.clone());
                 match state.force_status {
                     Some(code) => (code, b"{}".to_vec(), "application/json"),
-                    None => route(&line, &body, addr, &mut state),
+                    None => route(&line, &idempotency_key, &body, addr, &mut state),
                 }
             };
 
@@ -499,6 +514,7 @@ mod tests {
 
     fn route(
         line: &str,
+        idempotency_key: &str,
         body: &[u8],
         addr: SocketAddr,
         state: &mut FakeState,
@@ -525,7 +541,21 @@ mod tests {
                 state.domains.push(json!({ "id": id, "name": name }));
                 json(json!({ "id": id, "name": name }))
             }
-            "POST /emails" => json(json!({ "id": "email_sent_0001" })),
+            // Resend's own de-duplication, modelled: the same key gets the
+            // first message's id back and nothing is sent again. Without this
+            // the fake would accept an adapter that dropped the header.
+            "POST /emails" => {
+                let id = match state.sent.get(idempotency_key) {
+                    Some(already) => already.clone(),
+                    None => {
+                        state.next += 1;
+                        let id = format!("email_sent_{:04}", state.next);
+                        state.sent.insert(idempotency_key.to_owned(), id.clone());
+                        id
+                    }
+                };
+                json(json!({ "id": id }))
+            }
             "GET /emails/email_2" => json(json!({
                 "object": "email",
                 "id": "email_2",
@@ -561,11 +591,16 @@ mod tests {
         }
     }
 
-    /// One HTTP/1.1 request: its `METHOD /path` line and its body.
+    /// One HTTP/1.1 request: its `METHOD /path` line, its header block and its
+    /// body.
+    ///
+    /// The headers come back whole because `Idempotency-Key` is part of the
+    /// contract the adapter is being held to — a fake that answers the same id
+    /// to every POST would let a broken de-duplication pass.
     async fn read_request(
         stream: &mut TcpStream,
         buffer: &mut Vec<u8>,
-    ) -> Option<(String, Vec<u8>)> {
+    ) -> Option<(String, String, Vec<u8>)> {
         loop {
             if let Some(head) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&buffer[..head]).into_owned();
@@ -588,7 +623,7 @@ mod tests {
                         .unwrap_or_default();
                     let body = buffer[start..start + length].to_vec();
                     buffer.drain(..start + length);
-                    return Some((line, body));
+                    return Some((line, headers, body));
                 }
             }
             let mut chunk = [0_u8; 4096];
@@ -926,6 +961,39 @@ mod tests {
             Err(ProviderError::Terminal {
                 code: "bad_attachment_url"
             })
+        );
+    }
+
+    /// The real client against the shared contract — the thing that makes
+    /// swapping a vendor provable rather than hopeful.
+    ///
+    /// [`IdentityScope::AccountWide`] because Resend genuinely reconciles every
+    /// employee onto one sending domain (see this module's header). That one
+    /// difference used to keep the adapter out of the suite entirely, which
+    /// bought a documented exception at the price of testing nothing.
+    #[tokio::test]
+    async fn the_real_client_satisfies_the_contract() {
+        let fake = FakeResend::start().await;
+        crate::email::contract_suite(&fake.provider(), crate::email::IdentityScope::AccountWide)
+            .await;
+
+        // One domain for three ensures, checked on the socket rather than taken
+        // from the adapter's word.
+        assert_eq!(fake.domain_count(), 1);
+
+        // All three sends *do* reach the wire, and that is correct: this
+        // adapter does not keep a de-duplication map, it sends Resend's own
+        // `Idempotency-Key` and lets the provider collapse the replay. The
+        // suite's "same key, same id" assertion is what proves the header is
+        // really being sent — drop it and the fake keys every send on the empty
+        // string, and the *next* assertion, "distinct keys, distinct ids",
+        // fails instead. Either way a broken header is caught.
+        assert_eq!(
+            fake.seen()
+                .iter()
+                .filter(|line| *line == "POST /emails")
+                .count(),
+            3,
         );
     }
 }

@@ -47,7 +47,7 @@
 //! when somebody needs to debug what an employee can see — it is ten lines and
 //! the store already does the work.
 
-use agentos_app::knowledge::{Document, Embedder, Format, KnowledgeError, ingest};
+use agentos_app::knowledge::{Document, Embedder, Format, KnowledgeError, Scope, ingest};
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::untrusted::TrustLabel;
 use agentos_store::db::{Db, StoreError, TenantTx};
@@ -91,10 +91,20 @@ pub fn router(db: Db) -> Router {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewDocument {
-    /// Scope the document to one employee. Absent makes it tenant-wide, which
-    /// is the common case: a handbook belongs to the company.
+    /// Scope the document to one employee. Absent and with no `team_id` makes
+    /// it company-wide, which is the right default for a handbook and the wrong
+    /// one for a sprint board.
     #[serde(default)]
     employee_id: Option<Uuid>,
+    /// Scope the document to one team, by `teams.id`. Its members retrieve it;
+    /// a sibling team does not.
+    ///
+    /// Two optional fields rather than one tagged object because that is what
+    /// the three-way choice looks like on the wire, and sending both is a 400 —
+    /// see [`scope_of`]. Absent from an old client's body means company-wide,
+    /// which is exactly what that client used to get.
+    #[serde(default)]
+    team_id: Option<Uuid>,
     /// Where it came from, for citation.
     #[serde(default)]
     uri: Option<String>,
@@ -128,18 +138,10 @@ async fn create_document(
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
 
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-
-    // An employee id from another tenant is invisible to RLS and answers 404,
-    // never 403 — the same rule as `routes::employees`, and here it also stops
-    // a document being filed against a scope no query in this tenant will ever
-    // ask for, which would store it and make it permanently unretrievable.
-    let employee_id = match body.employee_id {
-        Some(id) => Some(EmployeeId::from_uuid(known_employee(&mut tx, id).await?)),
-        None => None,
-    };
+    let scope = scope_of(&mut tx, &body).await?;
 
     let document = Document {
-        employee_id,
+        scope,
         uri: body.uri.as_deref(),
         title: body.title.as_deref(),
         format: body.format,
@@ -164,6 +166,10 @@ async fn create_document(
         source_id = %ingested.source_id,
         chunks = ingested.chunks,
         reused = ingested.reused,
+        // Who can retrieve it, in the log line that records it arriving. The
+        // dedupe path returns an existing source and does not re-scope it, so
+        // this says what was *asked for*; the row is the answer either way.
+        scope = ?scope,
         "document ingested as untrusted"
     );
 
@@ -187,12 +193,41 @@ async fn create_document(
         .into_response())
 }
 
-/// This tenant's employee with that id, or [`ApiError::not_found`].
+/// Turn the body's two optional ids into the one scope the document gets.
 ///
-/// Under RLS, so "belongs to somebody else" and "does not exist" are the same
-/// answer, deliberately.
-async fn known_employee(tx: &mut TenantTx<'_>, id: Uuid) -> Result<Uuid, ApiError> {
-    sqlx::query_scalar("SELECT id FROM employees WHERE id = $1")
+/// Three answers and a refusal. Both ids set is a 400 rather than a precedence
+/// rule, because a precedence rule is a silent decision about who can read a
+/// document — a caller that meant one of them should be told which one it did
+/// not get.
+///
+/// Either id belonging to another tenant is a 404, never a 403: invisible under
+/// RLS is the same answer as absent, the same rule as `routes::employees`. It is
+/// load-bearing beyond tidiness here, because the scope is a retrieval key. A
+/// document filed against a team or an employee this tenant does not have is a
+/// document no query in this tenant ever asks for — stored, billed for, and
+/// permanently unretrievable.
+async fn scope_of(tx: &mut TenantTx<'_>, body: &NewDocument) -> Result<Scope, ApiError> {
+    match (body.employee_id, body.team_id) {
+        (None, None) => Ok(Scope::Company),
+        (Some(employee), None) => Ok(Scope::Employee(EmployeeId::from_uuid(
+            known(tx, "SELECT id FROM employees WHERE id = $1", employee).await?,
+        ))),
+        (None, Some(team)) => Ok(Scope::Team(
+            known(tx, "SELECT id FROM teams WHERE id = $1", team).await?,
+        )),
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "employee_id and team_id: a document belongs to the company, to one team, \
+             or to one employee — pick one",
+        )),
+    }
+}
+
+/// `id`, if this tenant has a row with it. [`ApiError::not_found`] otherwise.
+///
+/// `sql` is one of two string literals in the match above and never comes from
+/// input; there is nothing here for a caller to steer.
+async fn known(tx: &mut TenantTx<'_>, sql: &'static str, id: Uuid) -> Result<Uuid, ApiError> {
+    sqlx::query_scalar(sql)
         .bind(id)
         .fetch_optional(&mut ***tx)
         .await
@@ -372,6 +407,20 @@ mod tests {
         id
     }
 
+    async fn team(db: &Db, tenant: TenantId, slug: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query("INSERT INTO teams (id, tenant_id, slug, name) VALUES ($1, $2, $3, $3)")
+            .bind(id)
+            .bind(tenant.as_uuid())
+            .bind(slug)
+            .execute(&mut **tx)
+            .await
+            .expect("insert team");
+        tx.commit().await.expect("commit");
+        id
+    }
+
     fn handbook(whose: &str) -> Value {
         json!({
             "title": "Handbook",
@@ -507,6 +556,99 @@ mod tests {
         body["employee_id"] = json!(theirs.to_string());
         let (status, _) = h.post(body, Some(SECRET_B)).await;
         assert_eq!(status, StatusCode::CREATED);
+
+        h.teardown().await;
+    }
+
+    // -- scope --------------------------------------------------------------
+
+    /// The three-way choice on the wire: absent is the company, `team_id` is a
+    /// team, `employee_id` is one employee, and both together is a refusal
+    /// rather than a precedence rule nobody would have guessed.
+    #[tokio::test]
+    async fn a_document_belongs_to_the_company_a_team_or_an_employee_and_says_which() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let engineering = team(&h.db, h.a, "engineering").await;
+        let mut body = handbook("alpha");
+        body["team_id"] = json!(engineering.to_string());
+
+        let (status, created) = h.post(body, Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+
+        // The columns, because the columns are what retrieval reads.
+        let source_id: Uuid = created["source_id"]
+            .as_str()
+            .expect("source_id")
+            .parse()
+            .expect("uuid");
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let scope: (Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT employee_id, team_id FROM knowledge_sources WHERE id = $1")
+                .bind(source_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the scope");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(scope, (None, Some(engineering)));
+
+        // Both ids is a 400 and writes nothing.
+        let mut both = handbook("alpha two");
+        both["team_id"] = json!(engineering.to_string());
+        both["employee_id"] = json!(employee(&h.db, h.a, "ada").await.to_string());
+        let (status, problem) = h.post(both, Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["code"], "bad_request");
+
+        h.teardown().await;
+    }
+
+    /// A team id from another tenant is a 404 for the same reason an employee
+    /// id from another tenant is: a document filed against a scope no query in
+    /// this tenant ever passes is stored, billed for, and unretrievable.
+    #[tokio::test]
+    async fn a_team_id_from_another_tenant_is_a_404() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let theirs = team(&h.db, h.b, "engineering").await;
+        let mut body = handbook("alpha");
+        body["team_id"] = json!(theirs.to_string());
+
+        let (status, problem) = h.post(body, Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(problem["code"], "not_found");
+        assert!(h.recalled(h.a, SKU).await.is_empty(), "a row was written");
+
+        h.teardown().await;
+    }
+
+    /// The same bytes under two scopes are two documents. The route's half of
+    /// the dedupe-laundering fix: a 201 rather than a 200-with-`reused`, so a
+    /// caller filing a team copy of the handbook is told it filed something.
+    #[tokio::test]
+    async fn the_same_bytes_under_a_different_scope_are_created_not_reused() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let engineering = team(&h.db, h.a, "engineering").await;
+        let (status, company) = h.post(handbook("alpha"), Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let mut scoped = handbook("alpha");
+        scoped["team_id"] = json!(engineering.to_string());
+        let (status, team_copy) = h.post(scoped, Some(SECRET_A)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the team copy was deduped into the company row: {team_copy}"
+        );
+        assert_eq!(team_copy["reused"], json!(false));
+        assert_ne!(team_copy["source_id"], company["source_id"]);
 
         h.teardown().await;
     }

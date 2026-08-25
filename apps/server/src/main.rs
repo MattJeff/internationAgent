@@ -208,11 +208,17 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // every action until somebody installs one, loudly, rather than falling
     // back to a permissive default nobody wrote.
     let gate = PolicyGate::new(db.clone());
-    let ports = Arc::new(agentos_app::mocks::ports());
+
+    // The credentials decide which of these are real clients and which are the
+    // in-memory fakes, per adapter — `config.rs` did the reading, this is the
+    // one place that acts on it. Both calls take the same `Credentials`, so the
+    // provisioner cannot buy a number from Twilio that the effects path then
+    // texts from a mock.
+    let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
     let engine = ProvisioningEngine::new(
         db.clone(),
-        agentos_app::mocks::adapters(&config.master_key),
+        agentos_app::mocks::adapters_for(&config.master_key, &config.credentials),
         EngineConfig::default(),
     );
 
@@ -426,7 +432,10 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
     let health = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
-        .with_state(db.clone())
+        .with_state(Health {
+            db: db.clone(),
+            mocks: config.mock_adapters.clone().into(),
+        })
         .merge(metrics::router(db));
 
     with_outer_stack(health.merge(public).merge(api))
@@ -1200,17 +1209,36 @@ async fn livez() -> &'static str {
     "ok"
 }
 
+/// What the health probes are built from.
+///
+/// `mocks` is here rather than in a log line alone because of where an operator
+/// actually looks. "The employee replied but the customer never got the mail"
+/// is debugged at 3am against a running pod, and the boot log that said
+/// `email=MOCK` scrolled away three deploys ago. `/readyz` is the one surface
+/// that answers, on demand, what this replica's adapters are.
+#[derive(Clone)]
+struct Health {
+    db: Db,
+    /// Exactly [`Config::mock_adapters`], no second opinion.
+    mocks: Arc<[&'static str]>,
+}
+
 /// Readiness: this replica can usefully take traffic *right now*.
 ///
 /// Two questions, both answerable in one round trip: can we get a connection,
 /// and is the outbox draining? A wedged outbox means side effects are being
 /// accepted and not performed, which is worse than refusing the request.
-async fn readyz(State(db): State<Db>) -> Response {
+///
+/// A mock adapter is deliberately **not** one of them. A development box has to
+/// be able to come up, so `mock_adapters` is reported and never fails the
+/// probe — an always-present field, empty on a fully real deployment, so an
+/// operator can diff two replicas rather than infer from a silence.
+async fn readyz(State(health): State<Health>) -> Response {
     // The poller's own definition of "behind", not a second copy of it that
     // could disagree with the loop it is reporting on. Cross-tenant by nature:
     // the backlog is not any one tenant's, and `lag_secs` opens the admin
     // transaction that says so.
-    let lag = match loops::outbox::lag_secs(&db).await {
+    let lag = match loops::outbox::lag_secs(&health.db).await {
         Ok(lag) => lag,
         Err(err) => {
             tracing::warn!(error = %err, "not ready: could not measure the outbox");
@@ -1225,7 +1253,11 @@ async fn readyz(State(db): State<Db>) -> Response {
 
     (
         StatusCode::OK,
-        Json(json!({"ready": true, "outbox_lag_secs": lag})),
+        Json(json!({
+            "ready": true,
+            "outbox_lag_secs": lag,
+            "mock_adapters": &*health.mocks,
+        })),
     )
         .into_response()
 }
@@ -2364,6 +2396,9 @@ mod tests {
             api_keys: ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
                 .expect("keyring"),
             mock_adapters: Vec::new(),
+            // Every adapter a mock, which is what this test's engine is built
+            // with anyway.
+            credentials: agentos_app::mocks::Credentials::default(),
             // No provider callbacks registered, so no webhook handlers. The
             // termination entry does not depend on any of it.
             webhooks: Vec::new(),

@@ -212,25 +212,62 @@ That is deliberate.
 | `AGENTOS_ALLOW_MOCKS` | unset (false) | `1` / `true` / `yes` permits mock adapters. Anything else, plus any mock, is `refusing to start`. |
 | `AGENTOS_API_KEYS` | empty | **Every request is answered 401.** The server warns about this at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
 | `AGENTOS_WEBHOOK_SECRETS` | empty | **Every `/v1/webhooks/{provider}` is a 404 and no inbound message can ever arrive.** The server warns about this too. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). |
-| `EMAIL_API_KEY` | — | See below. |
-| `TELEPHONY_API_KEY` | — | See below. |
-| `BROWSER_API_KEY` | — | See below. |
-| `EMBEDDER_API_KEY` | — | See below. |
+| `EMAIL_API_KEY` | — | Unset runs `MockEmailProvider`. Set to the `re_…` key, it **builds the real Resend client**. |
+| `TELEPHONY_API_KEY` | — | Unset runs `MockTelephony`. Set to `ACxxxx:auth_token` — Twilio authenticates with both halves together — it **builds the real Twilio client**. Half of it is a boot failure. |
+| `BROWSER_API_KEY` | — | Unset runs `MockBrowser`. Set to `project-id:api-key`, it **builds the real Browserbase client with a live CDP driver**. Half of it is a boot failure. |
 
-The last four are **not in `.env.example`** — that file is out of date on this
-point. They are the `PROVIDER_CREDENTIALS` table in `config.rs`. Each one being
-unset marks its adapter as a mock, and any mock forces `AGENTOS_ALLOW_MOCKS=1`.
+These are the `PROVIDER_CREDENTIALS` table in `config.rs`. Each is read once,
+and that one read both decides the guard and builds the client — they cannot
+disagree. Selection is **per adapter**: one set and two unset is a normal
+deployment, not an error.
 
-Setting them does **not** wire in a real adapter. It only silences the boot
-guard. See [§9](#what-is-not-real-yet). Do not set them expecting behaviour to
-change.
+The email adapter also needs the `whsec_…` signing secret and takes it from the
+`email` entry of `AGENTOS_WEBHOOK_SECRETS`, and its sending domain from
+`AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
+
+There is deliberately **no `EMBEDDER_API_KEY`**. It used to be a row here and
+was the guard's own version of the failure the guard exists to prevent:
+exporting any string turned the alarm off while `Embedder` still had one variant
+and it was still a SHA-256 hash. The embedder and the employee secret vault are
+named as permanent mocks in the boot line instead.
+
+### What a boot says about its adapters
+
+Every boot, real or not, logs one line:
+
+```
+adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic
+          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+```
+
+`/readyz` publishes the same thing as `mock_adapters`, so the question survives
+the log rotation:
+
+```json
+{"ready": true, "outbox_lag_secs": 0, "mock_adapters": ["telephony"]}
+```
 
 ### What the boot refusal looks like
 
 ```
-agentos-server: refusing to start: refusing to start: email, browser would run as
-mocks (set EMAIL_API_KEY, BROWSER_API_KEY to use the real thing, or
-AGENTOS_ALLOW_MOCKS=1 if this is a development box)
+agentos-server: refusing to start: email, browser would run as mocks and do
+nothing real, and nobody said that was acceptable (set EMAIL_API_KEY,
+BROWSER_API_KEY for the real thing, or AGENTOS_ALLOW_MOCKS=1 to accept exactly
+these). Adapters would be: email=MOCK telephony=twilio browser=MOCK
+llm=anthropic embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+```
+
+The inventory is in the refusal as well as in a successful boot, because the
+boot that does *not* happen is the one you most need it for: it shows that the
+Twilio integration you landed last week is fine and the browser variable has a
+typo in it.
+
+Half a compound credential stops the boot by name instead:
+
+```
+agentos-server: refusing to start: TELEPHONY_API_KEY is not usable: must be
+`ACxxxxxxxx:auth_token — console.twilio.com shows both`, and both halves are
+required
 ```
 
 The config `Debug` rendering is hand-written and redacts `DATABASE_URL`,
@@ -846,17 +883,29 @@ signed ones are refused, and an unreachable key directory is a downgrade.
 Read this before you trust anything above it. The repository's own commits are
 candid about these; the docs match.
 
-**The server always runs mock provider adapters.** `main.rs` calls
-`agentos_app::mocks::ports()` and `agentos_app::mocks::adapters()`
-unconditionally. Real Resend and Twilio adapters exist in `agentos-providers`
-and are tested, but nothing constructs them. Setting `EMAIL_API_KEY` or
-`TELEPHONY_API_KEY` silences the boot guard and changes **no behaviour**. See
-`docs/PROVIDERS.md`.
+**The provider adapters are real when their credential is set**, and the mock
+when it is not — per adapter, decided in `config.rs` and built in
+`mocks::adapters_for` / `mocks::ports_for`. What a fully credentialed
+deployment still does *not* do is listed below; see `docs/PROVIDERS.md` for the
+per-vendor detail.
 
-**The model is the exception.** `AGENTOS_LLM=anthropic` with a real key really
-does call `POST https://api.anthropic.com/v1/messages`. `cli` really does shell
-out to a local `claude`. Those two are the only live external calls this binary
-makes.
+**The embedder is a SHA-256 hash and no credential changes that.** Retrieval
+runs, returns results, and the results are not semantically related to the
+query: "cat" and "kitten" are as unrelated as "cat" and "diesel". Use it to
+test plumbing.
+
+**The employee secret vault is an in-process plaintext map** that forgets on
+restart. The envelope cipher that seals employee signing keys is real and is a
+different thing.
+
+**WhatsApp has no adapter at all**, so the `whatsapp` step fails
+`no_whatsapp_sender` on every deployment and `degraded` is the healthy steady
+state for an otherwise online employee.
+
+**Twilio's inbound signature scheme is implemented and not reachable.**
+`/v1/webhooks/{provider}` speaks the Svix scheme only, and there is no telephony
+ingest at the other end of the queue, so an SMS reply to an employee's number is
+not delivered anywhere. Outbound SMS is real; inbound is not.
 
 **The Policy Gate is loaded with `PolicyBook::default()`, which grants nothing.**
 An unconfigured gate denies everything — the correct behaviour for an

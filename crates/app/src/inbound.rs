@@ -80,6 +80,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::psyche;
+
 // The server crate deliberately does not depend on `agentos-providers`: the
 // binary must not be able to reach a provider except through this crate's gated
 // facade. Webhook signature verification is the one thing the HTTP layer needs
@@ -885,12 +887,70 @@ pub async fn land(
     )
     .await?;
 
+    // **Where the psyche observes.** This is the only place in the codebase
+    // where both timestamps that make a reply latency are in hand: our message
+    // and theirs, on one thread, on one channel. It sits on the insert path for
+    // the same reason the audit row does — a redelivery is one message arriving
+    // twice, and `psyche_episodes` is append-only, so counting deliveries would
+    // teach the agent that a flaky webhook is a fast supplier.
+    //
+    // Called whether or not there is a latency to measure: the fact that they
+    // spoke at all is what takes them off the chase list, and a supplier
+    // answering an RFQ is exactly the case with no message of ours on the
+    // thread to measure against.
+    //
+    // Advisory, all of it: what comes back is read by
+    // `vertical::purchasing_turn` to decide whom to chase, and by nothing that
+    // authorises anything. See `crate::psyche`.
+    if message.direction == Direction::Inbound {
+        let ours = preceded_by_our_message(tx, message.conversation_id, message_id).await?;
+        psyche::observe_reply(
+            tx,
+            message.employee_id,
+            &contact_of(&message.from),
+            message.conversation_id,
+            message.channel.as_str(),
+            ours,
+            message.received_at,
+        )
+        .await?;
+    }
+
     Ok(Landed {
         message_id,
         conversation_id: message.conversation_id,
         turn_event_id,
         duplicate: false,
     })
+}
+
+/// When we last wrote on this thread, if the message before `message_id` was
+/// ours.
+///
+/// Strict on purpose, and the strictness is what makes the observation honest.
+/// A reply latency is *our message, then their answer*. Two of their messages in
+/// a row would otherwise both be measured against the same outbound one, and the
+/// second would record a wait that nobody was waiting.
+async fn preceded_by_our_message(
+    tx: &mut TenantTx<'_>,
+    conversation_id: ConversationId,
+    message_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, InboundError> {
+    let previous: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT direction, received_at FROM messages \
+          WHERE conversation_id = $1 AND id <> $2 \
+          ORDER BY received_at DESC, id DESC \
+          LIMIT 1",
+    )
+    .bind(conversation_id.as_uuid())
+    .bind(message_id)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    Ok(previous
+        .filter(|(direction, _)| direction == direction_str(Direction::Outbound))
+        .map(|(_, sent_at)| sent_at))
 }
 
 /// The message this key already landed as, if it did — with its turn re-read

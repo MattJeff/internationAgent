@@ -716,6 +716,35 @@ mod tests {
         BrowserbaseBrowser::session_for(EmployeeId::new_v7(at(T0)), context)
     }
 
+    // -- the shared contract -------------------------------------------------
+
+    /// The real client held to the same assertions the mock passes.
+    ///
+    /// Hermetic: a loopback fake Browserbase plus [`RecordingCdp`], so no
+    /// browser starts and no session is billed. The CDP driver is supplied
+    /// because `act` without one is `Terminal { code: "no_cdp_driver" }` — a
+    /// contract run against half an adapter proves half a contract.
+    #[tokio::test]
+    async fn the_real_client_satisfies_the_contract() {
+        let fake = FakeBrowserbase::start().await;
+        let client = fake
+            .client()
+            .with_cdp(Arc::new(RecordingCdp::default()) as Arc<dyn CdpDriver>);
+
+        crate::browser::contract_suite(&client).await;
+
+        let state = fake.state();
+        assert_eq!(state.creates, 1, "reconcile bought a second context");
+        assert!(
+            state.contexts.is_empty(),
+            "the contract releases what it made"
+        );
+        // Every `act` opens its own session and gives it back; the contract
+        // drives one step.
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.released, state.sessions);
+    }
+
     // -- reconcile before create ---------------------------------------------
 
     #[tokio::test]

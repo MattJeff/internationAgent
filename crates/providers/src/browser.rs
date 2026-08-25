@@ -44,8 +44,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use agentos_domain::ids::EmployeeId;
+use agentos_domain::ids::{EmployeeId, Slug, TenantId};
 use async_trait::async_trait;
+use chrono::Utc;
 use url::Url;
 
 use crate::{EnsureCtx, FaultMode, ProviderBinding, ProviderError, Provisioned, Secret};
@@ -292,11 +293,79 @@ impl BrowserProvider for MockBrowser {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Contract suite
+// ---------------------------------------------------------------------------
+
+/// Every [`BrowserProvider`] must satisfy this. Panics on the first violation.
+///
+/// `pub`, and that is the point of it — the comment above it used to say "call
+/// it from the real adapter's tests too", and nothing could, because it was
+/// private to this module's `mod tests`. [`crate::browser_browserbase`] now
+/// runs it against a hermetic HTTP server and a recording CDP driver.
+///
+/// Pure and idempotent paths only: ensure, ensure again, honour a persisted
+/// binding, drive one step, and give the context back three times over. The
+/// crash-window case needs fault injection and stays in this module's tests.
+pub async fn contract_suite<P: BrowserProvider + ?Sized>(p: &P) {
+    let c = EnsureCtx::new(
+        TenantId::new_v7(Utc::now()),
+        EmployeeId::new_v7(Utc::now()),
+        Slug::parse("ada").expect("valid slug"),
+        "browser",
+    );
+    let session = |provisioned: &Provisioned| BrowserSession {
+        employee_id: EmployeeId::new_v7(Utc::now()),
+        binding: provisioned.binding(),
+        // `None`: a hosted provider persists login state its own way, and a
+        // self-hosted one is told where by the caller. Neither is this suite's
+        // business — see the trait's docs on why the field exists at all.
+        user_data_dir: None,
+    };
+
+    let first = p.ensure_context(&c).await.expect("first ensure");
+    // Same ctx, next attempt: one context, same id.
+    let second = p
+        .ensure_context(&c.clone().retry())
+        .await
+        .expect("second ensure");
+    assert_eq!(
+        first, second,
+        "ensure must reconcile on the tag, not create a second context"
+    );
+
+    // And the binding a previous run persisted is honoured as-is.
+    let third = p
+        .ensure_context(&c.clone().with_existing(first.binding()))
+        .await
+        .expect("persisted ensure");
+    assert_eq!(third.external_id, first.external_id);
+
+    // A session can be driven.
+    let url = Url::parse("https://portal.example.com/login").expect("valid url");
+    assert_eq!(
+        p.act(&session(&first), BrowserStep::Goto(&url))
+            .await
+            .expect("navigate"),
+        BrowserOutcome::Navigated(url)
+    );
+
+    // And it can be given back — twice, and for a context that was never
+    // there. All three are the same desired state, so all three succeed.
+    p.release(&first.binding()).await.expect("release");
+    p.release(&first.binding())
+        .await
+        .expect("releasing twice is the same desired state");
+    p.release(&ProviderBinding {
+        provider: first.provider.to_owned(),
+        external_id: "ctx-never-existed".to_owned(),
+    })
+    .await
+    .expect("releasing what the provider no longer has is success");
+}
+
 #[cfg(test)]
 mod tests {
-    use agentos_domain::ids::{Slug, TenantId};
-    use chrono::Utc;
-
     use super::*;
 
     fn ctx(employee_id: EmployeeId) -> EnsureCtx {
@@ -316,50 +385,19 @@ mod tests {
         }
     }
 
-    /// The contract every `BrowserProvider` must satisfy. Call it from the real
-    /// adapter's tests too — that is the whole point of writing it once.
-    async fn verify_contract<P: BrowserProvider>(p: &P) {
-        let c = ctx(EmployeeId::new_v7(Utc::now()));
-
-        let first = p.ensure_context(&c).await.unwrap();
-        // Same ctx, next attempt: one context, same id.
-        let second = p.ensure_context(&c.clone().retry()).await.unwrap();
-        assert_eq!(first, second);
-
-        // And the binding a previous run persisted is honoured as-is.
-        let third = p
-            .ensure_context(&c.clone().with_existing(first.binding()))
-            .await
-            .unwrap();
-        assert_eq!(third.external_id, first.external_id);
-
-        // A session can be driven.
-        let url = Url::parse("https://portal.example.com/login").unwrap();
-        assert_eq!(
-            p.act(&session(&first), BrowserStep::Goto(&url))
-                .await
-                .unwrap(),
-            BrowserOutcome::Navigated(url)
-        );
-
-        // And it can be given back — twice, and for a context that was never
-        // there. Both are the same desired state, so both succeed.
-        p.release(&first.binding()).await.unwrap();
-        p.release(&first.binding()).await.unwrap();
-        p.release(&ProviderBinding {
-            provider: first.provider.to_owned(),
-            external_id: "ctx-never-existed".to_owned(),
-        })
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn mock_satisfies_the_contract() {
         let p = MockBrowser::new();
-        verify_contract(&p).await;
+        contract_suite(&p).await;
         assert_eq!(p.created(), 1);
         assert_eq!(p.context_count(), 0, "the contract releases what it made");
+    }
+
+    #[tokio::test]
+    async fn the_mock_satisfies_the_contract_behind_a_dyn_reference() {
+        // The trait has to stay object-safe: `Ports` holds a `dyn`.
+        let p: &dyn BrowserProvider = &MockBrowser::new();
+        contract_suite(p).await;
     }
 
     /// Releasing is what a termination does, and it has to actually free the

@@ -113,6 +113,7 @@ use uuid::Uuid;
 use crate::gate::Principal;
 use crate::prompt::SystemPrompt;
 use crate::proof_of_need::{Answer, Checked, Evidence, Flow, Probe, ProbeError, Prober};
+use crate::psyche;
 use crate::revenue::{Seller, Sequence};
 use crate::rolepack::{self, CountryCode};
 use crate::rolepack_sales::{self, Segment};
@@ -822,6 +823,16 @@ pub struct Ran {
     /// this is exactly what [`crate::sourcing::Recipients`] has two vectors to
     /// prevent.
     pub unreachable: Vec<Unreached>,
+    /// The chase list, already rendered — one line per counterparty this
+    /// employee is waiting on, and whether the wait is long **for them**.
+    ///
+    /// This is the psyche's one production read. Rendered at construction
+    /// rather than carried as a [`crate::psyche::Standing`] because it is
+    /// display, and because it needs the same `now` the round was read at —
+    /// see [`crate::psyche::Standing::chase_line`], which builds every line out
+    /// of an address, two floats and a closed enum, so `note` stays ours by
+    /// construction.
+    pub waiting: Vec<String>,
 }
 
 impl Ran {
@@ -922,6 +933,21 @@ impl Ran {
                 counts.join(", "),
             ));
         }
+
+        // The psyche, and the only thing it decides. Every other branch above
+        // tells the employee not to chase anybody who has not had time to
+        // answer; this is the part that knows how much time that is, per
+        // counterparty, out of what they have actually done.
+        if !self.waiting.is_empty() {
+            note.push_str(&format!(
+                "\n\nYou are waiting on {} counterparty(ies). What each of them usually does, from \
+                 your own record of them — not a rule, and not a deadline anybody agreed:\n{}\n\n\
+                 Chase only the ones marked worth a chaser. A contact with no rhythm on record is \
+                 not slow, it is unmeasured, and chasing there teaches them we cannot count.",
+                self.waiting.len(),
+                self.waiting.join("\n"),
+            ));
+        }
         note
     }
 }
@@ -937,9 +963,11 @@ impl Ran {
 /// human or a supplier reads after this point. See the module docs on why the
 /// role pack decides the stage.
 ///
-/// # Three transactions, and none of them spans a provider call
+/// # Transactions, and none of them spans a provider call
 ///
-/// Read, send, record. The read is rolled back before an address is contacted,
+/// Read, send, record — and the record half is two, because the `rfqs` row must
+/// commit whether or not the advisory "we are waiting on them" rows do. See
+/// [`open_the_round`]. The read is rolled back before an address is contacted,
 /// because [`Buyer::issue_rfq`](crate::sourcing::Buyer::issue_rfq) is N emails
 /// over the internet and a pooled connection held across them is a connection
 /// held across somebody else's SMTP timeout — the same rule
@@ -978,10 +1006,23 @@ pub async fn purchasing_turn(
         return Ok(Ran {
             bought: Bought::Clarify(clarification(&pack.plan(objective))),
             unreachable: Vec::new(),
+            waiting: Vec::new(),
         });
     };
 
     let read = Material::read(&mut tx, principal.employee_id, objective, currency, now).await;
+    // **Where the psyche is read.** In the material's own transaction, which is
+    // rolled back below: this is a read of what the employee already knows and
+    // it writes nothing. A store that cannot answer costs the note its chase
+    // list, not the turn — the round is the point, and an employee that cannot
+    // remember who owes it a reply can still send and compare.
+    let waiting = match psyche::chase_list(&mut tx, principal.employee_id, now).await {
+        Ok(standing) => standing.iter().map(|s| s.chase_line(now)).collect(),
+        Err(err) => {
+            tracing::warn!(error = %err, "the chase list could not be read; the note goes without it");
+            Vec::new()
+        }
+    };
     // Read-only, so the rollback is bookkeeping rather than a decision — but it
     // is awaited so the pooled connection goes back deliberately.
     let _ = tx.rollback().await;
@@ -1013,12 +1054,18 @@ pub async fn purchasing_turn(
     if let Bought::Asked { outcomes, .. } = &bought
         && outcomes.iter().any(sourcing::Contacted::is_sent)
     {
-        open_the_round(db, principal, objective, currency, reference, now).await?;
+        let asked: Vec<String> = outcomes
+            .iter()
+            .filter(|outcome| outcome.is_sent())
+            .map(|outcome| outcome.to().to_string())
+            .collect();
+        open_the_round(db, principal, objective, currency, reference, &asked, now).await?;
     }
 
     Ok(Ran {
         bought,
         unreachable: material.unreachable,
+        waiting,
     })
 }
 
@@ -1072,17 +1119,30 @@ fn rfq_letter(objective: &rolepack::Objective, reference: Uuid) -> sourcing::Out
     }
 }
 
-/// Write down that the round is running.
+/// Write down that the round is running, and that we are waiting on the
+/// suppliers it went to.
 ///
-/// The only durable thing a purchasing turn produces, and it is durable because
-/// it is the only fact the material cannot recompute: quotes hang off this row
-/// by foreign key, and [`due`] reads its absence as "nobody has been asked".
+/// The `rfqs` row is the only durable thing a purchasing turn produces that the
+/// material cannot recompute: quotes hang off it by foreign key, and [`due`]
+/// reads its absence as "nobody has been asked".
+///
+/// `asked` is the second such fact and it has nowhere else to live. `rfqs` does
+/// not record who received the letter, and an outbound RFQ writes no `messages`
+/// row, so without this the employee has no way to know it is owed an answer at
+/// all — which is what makes the chase list in [`Ran::note`] possible. Nothing
+/// about trust is claimed by writing it; see [`crate::psyche`].
+///
+/// A failure to record the wait is logged and swallowed. The RFQ went out, the
+/// round is open, and losing the transaction over an advisory row would leave
+/// the employee asking the same suppliers again next cadence — the exact failure
+/// the ordering above was chosen to avoid.
 async fn open_the_round(
     db: &Db,
     principal: &Principal,
     objective: &rolepack::Objective,
     currency: Currency,
     reference: Uuid,
+    asked: &[String],
     now: DateTime<Utc>,
 ) -> Result<(), sourcing_store::SourcingError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
@@ -1119,6 +1179,27 @@ async fn open_the_round(
     if let Err(err) = result {
         let _ = tx.rollback().await;
         return Err(err);
+    }
+    tx.commit().await?;
+
+    // A transaction of its own, and that is the whole reason it is separate: a
+    // failed statement aborts a Postgres transaction outright, so "log it and
+    // carry on" is not something a caller can do to a write that shares one.
+    // The `rfqs` row is the fact the round cannot recompute and it is already
+    // committed; the waits are advisory.
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    for supplier in asked {
+        if let Err(err) =
+            psyche::awaiting_reply(&mut tx, principal.employee_id, supplier, now).await
+        {
+            tracing::warn!(
+                error = %err,
+                "the RFQ went out and the wait was not recorded; this supplier will not appear on \
+                 the chase list"
+            );
+            let _ = tx.rollback().await;
+            return Ok(());
+        }
     }
     tx.commit().await.map_err(Into::into)
 }
@@ -2446,5 +2527,45 @@ mod tests {
             "{sold:?}"
         );
         assert_eq!(desk.email.sent_count(), 0);
+    }
+
+    /// The psyche's one production read, in the note the employee actually gets.
+    ///
+    /// The branch above it tells the employee not to chase anybody who has not
+    /// had time to answer; this is the part that says how much time that is, and
+    /// it is the counterparty's own record rather than a constant. A turn with
+    /// nobody owed an answer must not gain a paragraph about it.
+    #[test]
+    fn the_note_carries_the_chase_list_and_only_when_there_is_one() {
+        let quiet = Ran {
+            bought: Bought::Model(rolepack::Stage::Discover),
+            unreachable: Vec::new(),
+            waiting: Vec::new(),
+        };
+        assert!(
+            !quiet.note().contains("waiting on"),
+            "a turn with nobody owed an answer grew a chase list: {}",
+            quiet.note()
+        );
+
+        let owed = Ran {
+            waiting: vec![
+                "  ap@prompt-forge.example — 24h of silence, they usually answer in about 2h \
+                 — 16h past that. Worth a chaser."
+                    .to_owned(),
+                "  ap@slow-mill.example — 24h of silence, they usually answer in about 70h \
+                 — still inside it. Leave them alone."
+                    .to_owned(),
+            ],
+            ..quiet
+        };
+        let note = owed.note();
+        assert!(note.contains("waiting on 2 counterparty(ies)"), "{note}");
+        assert!(note.contains("Worth a chaser"), "{note}");
+        assert!(note.contains("Leave them alone"), "{note}");
+        assert!(
+            note.contains("not slow, it is unmeasured"),
+            "the note has to say what an absent record means: {note}"
+        );
     }
 }

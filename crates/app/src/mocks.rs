@@ -10,8 +10,13 @@
 //!
 //! [`adapters`] and [`ports`] are in memory and forget on restart. Nothing they
 //! hand out should be reachable in a deployment that has its provider
-//! credentials set: `config.rs` refuses to boot with mock adapters unless an
-//! operator says out loud that this is a development box.
+//! credentials set: [`adapters_for`] and [`ports_for`] take a [`Credentials`]
+//! and build the **real** client for every field that is `Some`, and
+//! `config.rs` refuses to boot with the mock behind any field that is `None`
+//! unless an operator says out loud that this is a development box.
+//!
+//! The selection is per adapter and never all-or-nothing: a deployment with a
+//! Resend key and no Twilio account is the normal case, not an error.
 //!
 //! ponytail: the ports with nothing behind them here — payments always, MCP
 //! until a tenant is in hand — *refuse* rather than pretend. A fake that
@@ -34,18 +39,23 @@
 //! `config.rs` treats anything but `anthropic` as a mock adapter and refuses to
 //! boot without `AGENTOS_ALLOW_MOCKS`.
 
+use std::fmt;
 use std::sync::Arc;
 
 use agentos_domain::action::McpTool;
 use agentos_domain::ids::IdempotencyKey;
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::Untrusted;
-use agentos_providers::browser::MockBrowser;
-use agentos_providers::email::{MockEmailProvider, ProviderMessageId};
+use agentos_providers::browser::{BrowserProvider, MockBrowser};
+use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
+use agentos_providers::cdp::CdpWebsocket;
+use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
+use agentos_providers::email_resend::ResendEmailProvider;
 use agentos_providers::llm_anthropic::{AnthropicLlm, DEFAULT_MODEL};
 use agentos_providers::llm_cli::CliLlm;
 use agentos_providers::secrets::MemorySecretStore;
-use agentos_providers::telephony::MockTelephony;
+use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
+use agentos_providers::telephony_twilio::TwilioTelephony;
 use agentos_providers::{ProviderError, Secret};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -67,6 +77,117 @@ pub use agentos_providers::llm::{Llm, LlmResponse, ScriptedLlm, Usage};
 /// secret that stops a development box from booting.
 const MOCK_TELEPHONY_TOKEN: &str = "mock-telephony-auth-token";
 
+// ---------------------------------------------------------------------------
+// Which adapter is real
+// ---------------------------------------------------------------------------
+
+/// The credentials the real adapters need. A field that is `None` runs on the
+/// mock beside it.
+///
+/// One field per adapter, and each one is **all or nothing**: an adapter
+/// holding half of what it needs is the deployment that believes it is sending
+/// mail and is not, so the caller that reads the environment (`config.rs`)
+/// refuses to boot rather than hand a half-built credential down here. What
+/// arrives is already whole.
+///
+/// [`Credentials::default`] is every mock, which is exactly what [`ports`] and
+/// [`adapters`] hand out.
+#[derive(Default)]
+pub struct Credentials {
+    /// Resend. `None` is [`MockEmailProvider`].
+    pub email: Option<EmailCredentials>,
+    /// Twilio. `None` is [`MockTelephony`].
+    pub telephony: Option<TelephonyCredentials>,
+    /// Browserbase. `None` is [`MockBrowser`].
+    pub browser: Option<BrowserCredentials>,
+}
+
+/// What [`ResendEmailProvider::new`] takes.
+pub struct EmailCredentials {
+    /// The `re_…` API key.
+    pub api_key: String,
+    /// The `whsec_…` webhook signing secret — a *different* value from the API
+    /// key. May be empty: today the webhook route verifies deliveries against
+    /// its own per-tenant registry and never calls the adapter's
+    /// `verify_webhook`, so this is a belt with no braces on it yet.
+    pub webhook_secret: String,
+    /// The one sending domain this adapter owns, i.e. `AGENT_EMAIL_DOMAIN`.
+    pub domain: String,
+}
+
+/// What [`TwilioTelephony::new`] takes. Twilio authenticates with both halves
+/// together — the SID is the HTTP basic *username* — so neither is optional.
+pub struct TelephonyCredentials {
+    /// The `AC…` account SID.
+    pub account_sid: String,
+    /// The auth token.
+    pub auth_token: String,
+}
+
+/// What [`BrowserbaseBrowser::new`] takes. The API key alone is not enough:
+/// contexts and sessions are both created inside a project.
+pub struct BrowserCredentials {
+    /// The project every context is created in.
+    pub project_id: String,
+    /// The `bb_…` API key.
+    pub api_key: String,
+}
+
+// A derived Debug would print three live credentials into whatever log line
+// someone dumps the configuration to. Same reason `Config` writes its own.
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("email", &self.email.is_some())
+            .field("telephony", &self.telephony.is_some())
+            .field("browser", &self.browser.is_some())
+            .finish()
+    }
+}
+
+/// The mailbox: Resend when there is a key, the in-memory fake when there is
+/// not.
+fn email_provider(credentials: &Credentials) -> Arc<dyn EmailProvider> {
+    match &credentials.email {
+        Some(email) => Arc::new(ResendEmailProvider::new(
+            Secret::new(email.api_key.clone()),
+            Secret::new(email.webhook_secret.clone()),
+            email.domain.clone(),
+        )),
+        None => Arc::new(MockEmailProvider::new()),
+    }
+}
+
+/// Numbers and messages: Twilio when there is an account, the fake when there
+/// is not.
+fn telephony_provider(credentials: &Credentials) -> Arc<dyn TelephonyProvider> {
+    match &credentials.telephony {
+        Some(telephony) => Arc::new(TwilioTelephony::new(
+            telephony.account_sid.clone(),
+            &telephony.auth_token,
+        )),
+        None => Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
+    }
+}
+
+/// The browser: Browserbase when there is a project, the fake when there is
+/// not.
+///
+/// The real one is always given a [`CdpWebsocket`], and that is not optional
+/// dressing: without a driver `BrowserProvider::act` is
+/// `Terminal { code: "no_cdp_driver" }`, so a deployment would provision real
+/// browser contexts and then fail every step that used one. Half a browser is
+/// the failure this whole module is arranged against.
+fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
+    match &credentials.browser {
+        Some(browser) => Arc::new(
+            BrowserbaseBrowser::new(browser.project_id.clone(), &browser.api_key)
+                .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
+        ),
+        None => Arc::new(MockBrowser::new()),
+    }
+}
+
 /// The adapters [`ProvisioningEngine`](crate::provisioning::ProvisioningEngine)
 /// needs. The four providers are fake; the envelope cipher is **not**.
 ///
@@ -81,10 +202,19 @@ const MOCK_TELEPHONY_TOKEN: &str = "mock-telephony-auth-token";
 /// The vault (`secrets`) is still a plaintext map, and that is still fine: it
 /// holds a provisioning canary and nothing else in a mock deployment.
 pub fn adapters(master_key: &str) -> Adapters {
+    adapters_for(master_key, &Credentials::default())
+}
+
+/// The adapters this deployment's credentials actually select.
+///
+/// Real client per `Some` field, mock per `None`. Every other field is what
+/// [`adapters`] always gave: `secrets` is still a plaintext map, and `envelope`
+/// is still real crypto over the deployment's own master key.
+pub fn adapters_for(master_key: &str, credentials: &Credentials) -> Adapters {
     Adapters {
-        email: Arc::new(MockEmailProvider::new()),
-        telephony: Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
-        browser: Arc::new(MockBrowser::new()),
+        email: email_provider(credentials),
+        telephony: telephony_provider(credentials),
+        browser: browser_provider(credentials),
         secrets: Arc::new(MemorySecretStore::new()),
         envelope: crate::identity::envelope(master_key),
     }
@@ -98,10 +228,25 @@ pub fn adapters(master_key: &str) -> Adapters {
 /// only be fetched back by *this* process's mock. That is a property of running
 /// on fakes, not a bug to design around.
 pub fn ports() -> Ports {
+    ports_for(&Credentials::default())
+}
+
+/// The ports this deployment's credentials actually select.
+///
+/// Real client per `Some` field, mock per `None`. `mcp` and `payments` have no
+/// credential to select on and still refuse: see this module's header for why
+/// refusing beats a plausible fake.
+///
+/// ponytail: these are separate instances from [`adapters_for`]'s, not shared
+/// ones. The two structs want different field sets, the HTTP clients are
+/// stateless, and the only per-instance state in any real adapter is Twilio's
+/// send de-duplication map — which lives on this side, because `Adapters` never
+/// sends anything. Share them the day a third caller needs the same instance.
+pub fn ports_for(credentials: &Credentials) -> Ports {
     Ports {
-        email: Arc::new(MockEmailProvider::new()),
-        telephony: Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
-        browser: Arc::new(MockBrowser::new()),
+        email: email_provider(credentials),
+        telephony: telephony_provider(credentials),
+        browser: browser_provider(credentials),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
     }
@@ -294,6 +439,179 @@ mod tests {
         // A field left out is a `ProvisioningEngine` that panics on the step
         // that needed it; the constructor exists so that is a compile error.
         let _ = adapters("mocks-test-master-key");
+    }
+
+    // -- credentials select adapters ---------------------------------------
+
+    /// The `whsec_…` only the real email adapter is built with, and it is
+    /// deliberately not [`MockEmailProvider::TEST_SECRET`].
+    const LIVE_WEBHOOK_SECRET: &str = "whsec_bm90LXRoZS1tb2Nrcy1zZWNyZXQ=";
+    /// The Twilio auth token only the real telephony adapter is built with.
+    const LIVE_AUTH_TOKEN: &str = "not-the-mocks-auth-token";
+
+    fn live() -> Credentials {
+        Credentials {
+            email: Some(EmailCredentials {
+                api_key: "re_live_key".to_owned(),
+                webhook_secret: LIVE_WEBHOOK_SECRET.to_owned(),
+                domain: "agents.example.com".to_owned(),
+            }),
+            telephony: Some(TelephonyCredentials {
+                account_sid: "ACtest".to_owned(),
+                auth_token: LIVE_AUTH_TOKEN.to_owned(),
+            }),
+            browser: Some(BrowserCredentials {
+                project_id: "proj_test".to_owned(),
+                api_key: "bb_live_key".to_owned(),
+            }),
+        }
+    }
+
+    /// The claim this whole unit exists to make true: a credential does not
+    /// merely satisfy a boot guard, it selects the client that talks to the
+    /// provider — and its absence selects the fake.
+    ///
+    /// Every assertion below runs in-process. Each adapter is identified by a
+    /// path through its own trait that reaches no socket: a signature verified
+    /// against a secret only one of the two was built with, and a persisted
+    /// binding that both short-circuit on but name differently. Nothing here
+    /// sends, buys or browses anything.
+    #[tokio::test]
+    async fn a_credential_selects_the_real_adapter_and_its_absence_the_mock() {
+        use agentos_providers::browser::MOCK_PROVIDER;
+        use agentos_providers::email::{WebhookHeaders, sign_webhook};
+        use agentos_providers::telephony::{
+            TWILIO_SIGNATURE_HEADER, WebhookBody, sign_twilio_signature,
+        };
+        use agentos_providers::{EnsureCtx, ProviderBinding};
+
+        let real = ports_for(&live());
+        let mock = ports();
+
+        // -- email: signed with a secret only Resend was handed -------------
+        let body = br#"{"type":"email.received"}"#;
+        let timestamp = Utc::now().timestamp().to_string();
+        let headers = WebhookHeaders {
+            signature: sign_webhook(&Secret::new(LIVE_WEBHOOK_SECRET), "msg_1", &timestamp, body),
+            id: "msg_1".to_owned(),
+            timestamp,
+        };
+        real.email
+            .verify_webhook(body, &headers)
+            .expect("the real adapter holds this deployment's signing secret");
+        assert!(
+            mock.email.verify_webhook(body, &headers).is_err(),
+            "the mock verified a signature it was never given the secret for, \
+             so this test cannot tell the two apart"
+        );
+
+        // -- telephony: same idea, Twilio's scheme --------------------------
+        let url = "https://agents.example.com/v1/webhooks/telephony";
+        let form = b"Body=hello&From=%2B14158675309";
+        let signature = sign_twilio_signature(
+            &Secret::new(LIVE_AUTH_TOKEN),
+            url,
+            WebhookBody::Form(form.as_slice()),
+        )
+        .expect("form bodies always sign");
+        let headers = vec![(TWILIO_SIGNATURE_HEADER.to_owned(), signature)];
+        real.telephony
+            .verify_webhook(url, WebhookBody::Form(form.as_slice()), &headers)
+            .expect("the real adapter holds this account's auth token");
+        assert!(
+            mock.telephony
+                .verify_webhook(url, WebhookBody::Form(form.as_slice()), &headers)
+                .is_err(),
+            "the mock verified a callback signed with somebody else's token"
+        );
+
+        // -- browser: the one path both take without a round trip -----------
+        // A binding a previous run persisted short-circuits `ensure_context` in
+        // both implementations, and each names itself in the answer.
+        let ctx = EnsureCtx::new(
+            agentos_domain::ids::TenantId::new_v7(Utc::now()),
+            agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
+            agentos_domain::ids::Slug::parse("ada").expect("valid slug"),
+            "browser",
+        )
+        .with_existing(ProviderBinding {
+            provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
+            external_id: "ctx_persisted".to_owned(),
+        });
+        assert_eq!(
+            real.browser
+                .ensure_context(&ctx)
+                .await
+                .expect("persisted binding")
+                .provider,
+            agentos_providers::browser_browserbase::PROVIDER,
+        );
+        assert_eq!(
+            mock.browser
+                .ensure_context(&ctx)
+                .await
+                .expect("persisted binding")
+                .provider,
+            MOCK_PROVIDER,
+        );
+    }
+
+    /// Per adapter, not all-or-nothing: the normal deployment has one vendor
+    /// integrated and the next one still on a fake.
+    #[tokio::test]
+    async fn one_credential_selects_one_adapter_and_leaves_the_others_alone() {
+        use agentos_providers::browser::MOCK_PROVIDER;
+        use agentos_providers::{EnsureCtx, ProviderBinding};
+
+        let ports = ports_for(&Credentials {
+            browser: live().browser,
+            ..Credentials::default()
+        });
+        let ctx = EnsureCtx::new(
+            agentos_domain::ids::TenantId::new_v7(Utc::now()),
+            agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
+            agentos_domain::ids::Slug::parse("ada").expect("valid slug"),
+            "browser",
+        )
+        .with_existing(ProviderBinding {
+            provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
+            external_id: "ctx_persisted".to_owned(),
+        });
+
+        assert_eq!(
+            ports
+                .browser
+                .ensure_context(&ctx)
+                .await
+                .expect("persisted binding")
+                .provider,
+            agentos_providers::browser_browserbase::PROVIDER,
+        );
+        assert_ne!(
+            agentos_providers::browser_browserbase::PROVIDER,
+            MOCK_PROVIDER,
+            "the two adapters have to be distinguishable for any of this to mean anything"
+        );
+
+        // And email, with no credential, is still the fake: a body signed with
+        // the deployment's own secret does not verify, because no adapter here
+        // was ever given it.
+        let body = br#"{"type":"email.received"}"#;
+        let timestamp = Utc::now().timestamp().to_string();
+        let headers = agentos_providers::email::WebhookHeaders {
+            signature: agentos_providers::email::sign_webhook(
+                &Secret::new(LIVE_WEBHOOK_SECRET),
+                "msg_1",
+                &timestamp,
+                body,
+            ),
+            id: "msg_1".to_owned(),
+            timestamp,
+        };
+        assert!(
+            ports.email.verify_webhook(body, &headers).is_err(),
+            "email had no credential and must still be the mock"
+        );
     }
 
     // -- the model ---------------------------------------------------------

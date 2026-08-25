@@ -360,6 +360,10 @@ pub fn evaluate() -> Surface {
             "whether Dimension::scale() is calibrated for any actual trade (3.0 days, 200 bps \
              are guesses in the source, and the report inherits them)",
             "beliefs.rs, forgetting.rs, links.rs — the rest of the psyche is untouched here",
+            "the dimension that is actually wired in production. `app::psyche` observes \
+             ResponseLatencyHours out of `inbound::land`, and every series above is LeadTimeDays \
+             or PriceDeltaBps — neither of which has an observed source in this codebase. The \
+             archetypes exercise the accumulator, not the feed",
         ],
     }
 }

@@ -678,12 +678,36 @@ impl EmailProvider for MockEmailProvider {
 // Contract suite
 // ---------------------------------------------------------------------------
 
+/// What one adapter's `ensure_identity` mints.
+///
+/// The one place the two real email providers in the world genuinely differ,
+/// and it is not a bug in either of them:
+///
+/// * [`IdentityScope::PerKey`] — a resource per idempotency key, which is what
+///   every other `ensure` in this crate does and what the mock models.
+/// * [`IdentityScope::AccountWide`] — every key reconciles onto **one**
+///   resource. Resend is this: its domains carry no free-form metadata field to
+///   stamp a tag into, so the reconcile key is the domain *name*, one adapter
+///   owns one sending domain, and every employee sits on it.
+///
+/// Encoding it as a parameter is what lets the real adapter run the other 90%
+/// of the contract. The alternative — the one this replaces — was
+/// `ResendEmailProvider` running none of it, on the grounds of one assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityScope {
+    /// Distinct keys must not collapse onto one resource.
+    PerKey,
+    /// Distinct keys must collapse onto one resource, deliberately.
+    AccountWide,
+}
+
 /// Every [`EmailProvider`] must pass this. Panics on the first violation.
 ///
 /// It takes a *healthy* provider and only exercises pure and idempotent paths,
-/// so it can run against a live sandbox adapter as well as the mock. The
-/// crash-window case needs fault injection and lives in this module's tests.
-pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P) {
+/// so it can run against a hermetic HTTP server or a live sandbox adapter as
+/// well as the mock. The crash-window case needs fault injection and lives in
+/// this module's tests.
+pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentityScope) {
     let now = Utc::now();
     let tenant_id = TenantId::new_v7(now);
     let employee_id = EmployeeId::new_v7(now);
@@ -701,13 +725,23 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P) {
         "ensure must reconcile on the tag, not create a second resource"
     );
     assert_eq!(first.provider, second.provider);
-    // A different step is a different resource, or the tag is being ignored.
+    // A different step is a different resource — unless this adapter owns one
+    // account-wide resource, in which case it must be the *same* one and not a
+    // second domain nobody meant to buy. Both are checked; the only thing that
+    // is never acceptable is an adapter that does whichever happened to fall
+    // out of the code.
     let other = EnsureCtx::new(tenant_id, employee_id, ctx.slug.clone(), "email_alt");
     let other = p.ensure_identity(&other).await.expect("other ensure");
-    assert_ne!(
-        first.external_id, other.external_id,
-        "distinct idempotency keys must not collapse onto one resource"
-    );
+    match scope {
+        IdentityScope::PerKey => assert_ne!(
+            first.external_id, other.external_id,
+            "distinct idempotency keys must not collapse onto one resource"
+        ),
+        IdentityScope::AccountWide => assert_eq!(
+            first.external_id, other.external_id,
+            "an account-wide identity must reconcile, not create a second one"
+        ),
+    }
 
     // -- a timeout is Retryable and never Terminal -------------------------
     // The shared classifier is the contract; an adapter that re-classifies per
@@ -862,14 +896,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_mock_satisfies_the_contract() {
-        contract_suite(&MockEmailProvider::new()).await;
+        contract_suite(&MockEmailProvider::new(), IdentityScope::PerKey).await;
     }
 
     #[tokio::test]
     async fn the_mock_satisfies_the_contract_behind_a_dyn_reference() {
         // The trait has to stay object-safe: the engine holds a `dyn`.
         let p: &dyn EmailProvider = &MockEmailProvider::new();
-        contract_suite(p).await;
+        contract_suite(p, IdentityScope::PerKey).await;
     }
 
     #[test]

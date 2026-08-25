@@ -34,12 +34,27 @@
 //! whole reason to prefer it over a weighted sum of a cosine distance and a
 //! rank score that share no units.
 //!
+//! **4. A document is the company's, a team's, or one employee's.** That is
+//! [`Scope`], stamped at ingest, and the retrieval predicate is the whole of the
+//! access control: company-wide rows, plus rows belonging to the team this
+//! employee is on *right now*, plus rows filed against this employee. The team a
+//! search is entitled to is read from `team_memberships` inside the query rather
+//! than passed in by the caller, which buys two things a bound parameter would
+//! not. An employee moved between teams loses the old team's documents on its
+//! next retrieval, with nothing to re-ingest and no cache to invalidate. And an
+//! employee on **no** team gets a NULL out of that subquery, so `c.team_id =
+//! NULL` is NULL, so every team row is filtered out — being on no team is the
+//! narrowest scope there is rather than the widest, which is the direction a
+//! missing row has to fail in.
+//!
 //! Retrieved text comes back as [`Untrusted<String>`]: it is a stranger's PDF,
 //! and it is on its way into a prompt. Each [`Hit`] carries its `source_id` so
 //! the caller can cite it. That wrapper is unconditional and is not read off a
 //! column — see [`NewSource::trust`], which records where a source came from for
 //! the audit trail, and `crates/app/src/knowledge.rs` for why no per-source
-//! label may ever be allowed to remove the wrapper.
+//! label may ever be allowed to remove the wrapper. [`Scope`] does not touch it:
+//! a document from your own team is still a document somebody may have emailed
+//! in, and it is still *selected* by a query a counterparty wrote.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -66,37 +81,139 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 /// differ by 2x and one leg cannot dominate the fusion on its own.
 const RRF_K: f64 = 60.0;
 
+/// The retrieval ACL, once, with the employee parameter spelled `$n`.
+///
+/// Company-wide, plus its own team's, plus its own — and nothing else: not its
+/// manager's, not a sibling team's. The employee id is the *only* thing a caller
+/// supplies; the team comes out of `team_memberships`, under RLS, at query time.
+/// Three things fall out of writing it this way:
+///
+/// * A caller cannot name a team it is not on. There is no team parameter.
+/// * An employee moved between teams sees the new team's documents on its next
+///   retrieval and the old team's on none.
+/// * An employee on no team gets NULL from the subquery, and `c.team_id = NULL`
+///   is NULL rather than true, so it sees company-wide and its own only. The
+///   absent membership fails closed without a line of code saying so.
+///
+/// `$n IS NULL` still means "everything this tenant has" — what
+/// [`Search::employee_id`]`= None` has always meant, unchanged and still bounded
+/// by row-level security.
+///
+/// The subquery is uncorrelated (`$n` is a parameter, not a column), so Postgres
+/// runs it once as an InitPlan and the rest is a constant filter — the same
+/// shape as the `employee_id` comparison beside it, and no join on either leg.
+///
+/// **Neither leg changes index.** Checked on `EXPLAIN`, because "it is only a
+/// filter" is the kind of claim that is true until the planner disagrees: the
+/// vector leg is still `Index Scan using knowledge_chunks_embedding_hnsw` with
+/// the team test added to the same `Filter:` line the employee test was already
+/// on, and the text leg still reaches `knowledge_chunks_tsv_gin` by bitmap scan
+/// whenever the term is selective enough to be worth it — a common term
+/// sequential-scans with this predicate and sequential-scanned without it too.
+/// The membership lookup shows up once, as `InitPlan 1`, above the scan rather
+/// than inside it.
+///
+/// A macro because the two legs number their parameters differently and this is
+/// an ACL: written twice it is fixed once, and the copy nobody edited is the one
+/// that decides what a query returns.
+macro_rules! entitled {
+    ($employee:literal) => {
+        concat!(
+            "(",
+            $employee,
+            "::uuid IS NULL ",
+            " OR ((c.employee_id IS NULL OR c.employee_id = ",
+            $employee,
+            ")",
+            "     AND (c.team_id IS NULL",
+            "          OR c.team_id = (SELECT m.team_id FROM team_memberships m",
+            "                           WHERE m.employee_id = ",
+            $employee,
+            "))))"
+        )
+    };
+}
+
 /// Vector leg. Shared with the test that proves the iterative-scan setting is
 /// what fills the limit, which is why it is a `const` and not inline.
-const VECTOR_SQL: &str = "\
-    SELECT c.id, c.source_id, c.ordinal, c.content, \
-           (1 - (c.embedding <=> $1))::float8 AS score \
-    FROM knowledge_chunks c \
-    WHERE c.model = $2 \
-      AND c.embedding IS NOT NULL \
-      AND ($3::uuid IS NULL OR c.employee_id IS NULL OR c.employee_id = $3) \
-    ORDER BY c.embedding <=> $1 \
-    LIMIT $4";
+const VECTOR_SQL: &str = concat!(
+    "SELECT c.id, c.source_id, c.ordinal, c.content, ",
+    "       (1 - (c.embedding <=> $1))::float8 AS score ",
+    "FROM knowledge_chunks c ",
+    "WHERE c.model = $2 ",
+    "  AND c.embedding IS NOT NULL ",
+    "  AND ",
+    entitled!("$3"),
+    " ORDER BY c.embedding <=> $1 ",
+    "LIMIT $4"
+);
 
 /// Full-text leg. `websearch_to_tsquery` because the input is whatever a person
 /// typed into a box; it never raises a syntax error on stray punctuation, which
 /// `to_tsquery` very much does.
-const TEXT_SQL: &str = "\
-    SELECT c.id, c.source_id, c.ordinal, c.content, \
-           ts_rank_cd(c.tsv, q)::float8 AS score \
-    FROM knowledge_chunks c, websearch_to_tsquery('english', $1) q \
-    WHERE c.tsv @@ q \
-      AND ($2::uuid IS NULL OR c.employee_id IS NULL OR c.employee_id = $2) \
-    ORDER BY score DESC, c.id \
-    LIMIT $3";
+const TEXT_SQL: &str = concat!(
+    "SELECT c.id, c.source_id, c.ordinal, c.content, ",
+    "       ts_rank_cd(c.tsv, q)::float8 AS score ",
+    "FROM knowledge_chunks c, websearch_to_tsquery('english', $1) q ",
+    "WHERE c.tsv @@ q ",
+    "  AND ",
+    entitled!("$2"),
+    " ORDER BY score DESC, c.id ",
+    "LIMIT $3"
+);
+
+/// Who a document is for. **Stamped at ingest, and there are exactly three.**
+///
+/// The whole company, one team, or one employee — a closed enum rather than two
+/// nullable fields, because "filed against a team *and* an employee" is a
+/// question no retrieval asks and a state no caller should be able to build. The
+/// database says the same thing with `knowledge_sources_one_scope`; this is the
+/// half that says it before the round trip.
+///
+/// Provenance is recorded at ingest for the reason
+/// `crates/app/src/knowledge.rs` gives at length: by retrieval time, on some
+/// other day, nothing left in the row remembers where the bytes came from or who
+/// they were for. Scope is the same kind of fact and is written the same way.
+///
+/// What it is **not** is a trust decision. A document scoped to your own team is
+/// still third-party text and still arrives [`Untrusted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// Every employee of the tenant retrieves it. The handbook.
+    #[default]
+    Company,
+    /// One team's, by `teams.id`. Its members retrieve it and nobody else —
+    /// not a sibling team, not a manager, and not the same employee tomorrow if
+    /// it has been moved off the team by then.
+    Team(Uuid),
+    /// One employee's own. Narrower than its team, and unaffected by moving it.
+    Employee(EmployeeId),
+}
+
+impl Scope {
+    /// `(employee_id, team_id)`, the two columns this is stored as.
+    ///
+    /// Public only because the dedupe key in `agentos_app::knowledge` has to
+    /// compare against the same two columns this writes, and two hand-written
+    /// copies of that mapping is one copy that can disagree about which column
+    /// a team goes in. Nothing else should need it: everything above this
+    /// module says [`Scope`] and cannot say anything else.
+    pub const fn columns(self) -> (Option<Uuid>, Option<Uuid>) {
+        match self {
+            Scope::Company => (None, None),
+            Scope::Team(team) => (None, Some(team)),
+            Scope::Employee(employee) => (Some(employee.as_uuid()), None),
+        }
+    }
+}
 
 /// A thing that was ingested: a URL, an upload, a price list, a CRM export.
 #[derive(Debug, Clone)]
 pub struct NewSource {
     /// App-minted UUIDv7.
     pub id: Uuid,
-    /// `None` means tenant-wide: every employee of the tenant can retrieve it.
-    pub employee_id: Option<EmployeeId>,
+    /// Who may retrieve it: the company, one team, or one employee.
+    pub scope: Scope,
     /// `url`, `pdf`, `catalog`, `policy`, ... — free text, the ingest pipeline
     /// owns the vocabulary.
     pub kind: String,
@@ -137,8 +254,11 @@ pub struct Search<'a> {
     pub text: &'a str,
     /// Must match the `model` the chunks were embedded with.
     pub model: &'a str,
-    /// Restrict to this employee's sources plus the tenant-wide ones. `None`
-    /// searches everything the tenant has.
+    /// **Who is asking**, and the whole of the retrieval ACL: this employee's
+    /// own sources, plus the ones scoped to the team it is on at this instant,
+    /// plus the tenant-wide ones. There is deliberately no team parameter beside
+    /// it — see the `entitled!` predicate. `None` searches everything the tenant
+    /// has, which is the operator-side mode and not something a turn passes.
     pub employee_id: Option<EmployeeId>,
     /// Rows wanted. The legs each fetch this many before fusion.
     pub limit: i64,
@@ -173,15 +293,21 @@ const fn trust_str(label: TrustLabel) -> &'static str {
 }
 
 /// Record an ingested source.
+///
+/// A [`Scope::Team`] naming another tenant's team is refused by the composite
+/// foreign key 0023 adds, not by a check here: the tenant is half the key, so
+/// there is no version of "forgot the tenant predicate" that gets through.
 pub async fn insert_source(tx: &mut TenantTx<'_>, source: &NewSource) -> Result<(), StoreError> {
+    let (employee_id, team_id) = source.scope.columns();
     sqlx::query(
         "INSERT INTO knowledge_sources \
-             (id, tenant_id, employee_id, kind, uri, title, checksum, trust_label) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, tenant_id, employee_id, team_id, kind, uri, title, checksum, trust_label) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(source.id)
     .bind(tx.tenant_id().as_uuid())
-    .bind(source.employee_id.map(|e| e.as_uuid()))
+    .bind(employee_id)
+    .bind(team_id)
     .bind(&source.kind)
     .bind(&source.uri)
     .bind(&source.title)
@@ -194,10 +320,12 @@ pub async fn insert_source(tx: &mut TenantTx<'_>, source: &NewSource) -> Result<
 
 /// Store chunks of `source_id`, all embedded with `model`.
 ///
-/// `employee_id` is copied from the source by the INSERT itself, so a chunk can
-/// never end up more widely visible than the document it came from. The same
-/// `SELECT ... FROM knowledge_sources` is what makes an unknown or
-/// other-tenant source id a [`StoreError::NotFound`] rather than an orphan row.
+/// **Both scope columns are copied from the source by the INSERT itself**, so a
+/// chunk can never end up more widely visible than the document it came from —
+/// and a caller cannot widen one by supplying it, because there is no parameter
+/// to supply. The same `SELECT ... FROM knowledge_sources` is what makes an
+/// unknown or other-tenant source id a [`StoreError::NotFound`] rather than an
+/// orphan row.
 ///
 // ponytail: one INSERT per chunk. A document is tens of chunks and this runs
 // once per ingest, not per request; if a 10k-chunk PDF ever shows up, this
@@ -211,8 +339,9 @@ pub async fn insert_chunks(
     for chunk in chunks {
         let done = sqlx::query(
             "INSERT INTO knowledge_chunks \
-                 (id, tenant_id, source_id, employee_id, ordinal, content, embedding, model) \
-             SELECT $1, $2, s.id, s.employee_id, $3, $4, $5, $6 \
+                 (id, tenant_id, source_id, employee_id, team_id, ordinal, content, \
+                  embedding, model) \
+             SELECT $1, $2, s.id, s.employee_id, s.team_id, $3, $4, $5, $6 \
              FROM knowledge_sources s WHERE s.id = $7",
         )
         .bind(chunk.id)
@@ -514,7 +643,7 @@ mod tests {
             &mut tx,
             &NewSource {
                 id: source,
-                employee_id: None,
+                scope: Scope::Company,
                 kind: "policy".to_owned(),
                 uri: Some("https://example.test/handbook.pdf".to_owned()),
                 title: Some("Handbook".to_owned()),

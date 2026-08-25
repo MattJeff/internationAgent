@@ -732,6 +732,30 @@ mod tests {
         }
     }
 
+    // -- the shared contract -------------------------------------------------
+
+    /// The real client held to the same assertions the mock passes.
+    ///
+    /// Hermetic: a loopback fake Twilio. No account, no number bought, no
+    /// message sent, no money. Until this existed the contract suite proved
+    /// something about `MockTelephony` and nothing about the adapter a
+    /// deployment actually runs — which is the difference between a vendor swap
+    /// that is provable and one that is hopeful.
+    #[tokio::test]
+    async fn the_real_client_satisfies_the_contract() {
+        let twilio = FakeTwilio::start().await;
+        crate::telephony::contract_suite(&twilio.client()).await;
+
+        let state = twilio.state();
+        // Two numbers bought, one given back — the same arithmetic the mock's
+        // run asserts, here checked on the wire.
+        assert_eq!(state.purchases, 2);
+        assert_eq!(state.numbers.len(), 1);
+        // Three sends, one of them a replay of a key already used: the replay
+        // must never have reached Twilio.
+        assert_eq!(state.messages, 2, "the replayed send was sent again");
+    }
+
     // -- reconcile before create -------------------------------------------
 
     #[tokio::test]

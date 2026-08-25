@@ -219,16 +219,42 @@ Provider identifiers are stored in `employee_resources`; secrets are not.
 ### The wiring, which is the thing most likely to surprise you
 
 **`apps/server/src/main.rs` builds its adapters with
-`agentos_app::mocks::adapters()` and `agentos_app::mocks::ports()`,
-unconditionally.** `ResendEmailProvider::new`, `TwilioTelephony::new` and
-`BrowserbaseBrowser::new` appear only inside `crates/providers`' own `#[cfg(test)]`
-modules. Nothing else in the workspace constructs them.
+`agentos_app::mocks::adapters_for(&config.master_key, &config.credentials)` and
+`agentos_app::mocks::ports_for(&config.credentials)`.** The credential decides:
+`Some` builds the real client, `None` builds the mock beside it, **per
+adapter**. A deployment with a Resend key and no Twilio account runs real email
+and a fake phone, which is the normal state of an integration, not an error.
 
-So: **email, telephony and browser are NOT WIRED.** `EMAIL_API_KEY`,
-`TELEPHONY_API_KEY`, `BROWSER_API_KEY` and `EMBEDDER_API_KEY` do exactly one
-thing — satisfy the boot guard in `apps/server/src/config.rs`, which otherwise
-refuses to start rather than run a mock silently. Setting them changes no
-behaviour.
+| Variable | Shape | Selects |
+|---|---|---|
+| `EMAIL_API_KEY` | `re_…` | `ResendEmailProvider` |
+| `TELEPHONY_API_KEY` | `ACxxxx:auth_token` | `TwilioTelephony` |
+| `BROWSER_API_KEY` | `project-id:api-key` | `BrowserbaseBrowser` + `CdpWebsocket` |
+
+Two of them are compound because the adapter behind them takes two values, and
+they are one variable each for the same reason the keyring is: half a
+credential set in one place and half forgotten in another is the failure this
+whole section is about. **Half of one is a named boot failure**, never a mock
+and never a client that 401s at 3am.
+
+The email adapter also needs the `whsec_…` signing secret, and takes it from the
+`email` entry of `AGENTOS_WEBHOOK_SECRETS` — where an operator has already
+pasted it — rather than from a fourth variable holding the same string.
+
+`EMBEDDER_API_KEY` **is no longer read at all.** It used to gate the boot guard
+while selecting nothing, because `Embedder` has one variant and it is a SHA-256
+hash; a credential that cannot change what runs must not be able to quiet an
+alarm. The embedder and the secret vault are named as permanent mocks in the
+boot summary instead.
+
+Every boot logs one line naming what is behind every port, and `/readyz`
+publishes the same inventory as `mock_adapters` for as long as the replica is
+up:
+
+```
+adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
+          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+```
 
 The **model is the exception**: `mocks::llm` selects `AnthropicLlm`, `CliLlm` or
 the scripted mock from `AGENTOS_LLM`, and the first two make real calls. They
@@ -297,8 +323,10 @@ migration.
 `ResendEmailProvider` (`crates/providers/src/email_resend.rs`) implements the
 full `EmailProvider` contract — sending domain, outbound send, inbound webhook
 verification, message retrieval and attachment retrieval. It is tested against a
-hermetic HTTP server. **NOT WIRED** — the `email` step provisions against
-`MockEmailProvider` today.
+hermetic HTTP server, including against the shared `email::contract_suite`.
+**WIRED** — set `EMAIL_API_KEY` and the `email` step provisions against Resend;
+leave it unset and it provisions against `MockEmailProvider`, which the boot
+guard refuses unless `AGENTOS_ALLOW_MOCKS=1`.
 
 Four provider facts are encoded in the adapter and are the reason the inbound
 loop looks the way it does:
@@ -332,7 +360,9 @@ and stored before any LLM processing. See §17.
 ## 5. Phone / SMS, and the pool
 
 `TwilioTelephony` (`crates/providers/src/telephony_twilio.rs`) buys an E.164
-number, binds its webhook, sends SMS and WhatsApp, and releases. **NOT WIRED.**
+number, binds its webhook, sends SMS and WhatsApp, and releases. **WIRED** —
+`TELEPHONY_API_KEY=ACxxxx:auth_token` selects it, and it is run against the
+shared `telephony::contract_suite` on a hermetic HTTP server.
 
 `ready` only after acquisition and webhook binding; `pending_external` while a
 regulatory bundle is under human review, carrying the bundle sid in `poll_ref`
@@ -471,8 +501,12 @@ So a session is a unit of infrastructure, not a free object:
 `BrowserbaseBrowser` (`crates/providers/src/browser_browserbase.rs`) creates a
 context and a session over the Browserbase API and then drives the session over
 CDP through `CdpWebsocket` (`crates/providers/src/cdp.rs`): `goto`, `fill`,
-`screenshot`, `expect_hit`, `evaluate`. **NOT WIRED** — the `browser` step
-provisions against `MockBrowser`.
+`screenshot`, `expect_hit`, `evaluate`. **WIRED** —
+`BROWSER_API_KEY=project-id:api-key` selects it, and the CDP driver is attached
+with it rather than optionally: without one, `act` is
+`Terminal { code: "no_cdp_driver" }`, so a deployment would provision real
+browser contexts and fail every step that used them. It is run against the
+shared `browser::contract_suite` on a hermetic HTTP server.
 
 Never place a plaintext password in an LLM prompt. `BrowserStep::Fill` takes a
 `&Secret`, not a `String`, so the plaintext leaves the vault only inside the
@@ -1776,13 +1810,15 @@ An employee can, today:
 - ✅ be created once with an idempotency key
 - ✅ obtain a stable identity and address, with a real Ed25519 key published as
   a JWKS
-- ⚠️ send and receive email — the pipeline is complete end to end, on a mock
-  provider. The real adapter is written and **NOT WIRED**.
-- ⚠️ obtain a phone number or expose a correct pending-compliance state — same
-  status; the pool and the routing rules are real, the vendor call is not wired
+- ✅ send and receive email — the pipeline is complete end to end and
+  `EMAIL_API_KEY` selects the real Resend client
+- ✅ obtain a phone number or expose a correct pending-compliance state —
+  `TELEPHONY_API_KEY` selects the real Twilio client; the pool and the routing
+  rules were already real
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
 - ❌ place or receive voice calls — **NOT BUILT**
-- ⚠️ use a persistent browser identity — adapter written, **NOT WIRED**
+- ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
+  Browserbase client with a live CDP driver
 - ✅ store and retrieve secrets without LLM exposure, envelope-encrypted, with
   every read audited
 - ⚠️ answer from company knowledge — real hybrid retrieval, on a hash embedder
@@ -1807,12 +1843,12 @@ An employee can, today:
 1. ✅ Domain + DB + outbox
 2. ✅ Provisioning engine
 3. ✅ Policy Gate + approvals *(loader not wired — §14)*
-4. ⚠️ Email *(adapter written, not wired)*
+4. ✅ Email *(Resend, selected by `EMAIL_API_KEY`)*
 5. ⚠️ Knowledge *(text only, hash embedder)*
 6. ✅ MCP
 7. ✅ A2A
-8. ⚠️ Browser *(adapter written, not wired)*
-9. ⚠️ Phone *(adapter written, not wired; pool built)* / ❌ voice
+8. ✅ Browser *(Browserbase + CDP, selected by `BROWSER_API_KEY`)*
+9. ✅ Phone *(Twilio, selected by `TELEPHONY_API_KEY`; pool built)* / ❌ voice
 10. ❌ WhatsApp
 11. ❌ Wallet + x402
 12. ❌ MPP

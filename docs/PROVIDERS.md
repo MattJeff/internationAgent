@@ -8,52 +8,72 @@ code shortens.
 
 ## Read this first
 
-**Only one provider is wired into the running server today: Anthropic.**
+**The credential selects the adapter.** `apps/server/src/main.rs` builds its
+adapters with `mocks::adapters_for(&config.master_key, &config.credentials)` and
+`mocks::ports_for(&config.credentials)`. A credential that is present builds the
+real client; absent builds the mock beside it, and the boot guard refuses a mock
+nobody accepted, naming which one.
 
-`apps/server/src/main.rs` builds its adapters with
-`agentos_app::mocks::ports()` and `agentos_app::mocks::adapters()`,
-unconditionally. Real Resend, Twilio and Browserbase clients exist in
-`agentos-providers`, are complete, and are tested against hermetic HTTP servers —
-but `ResendEmailProvider::new`, `TwilioTelephony::new` and
-`BrowserbaseBrowser::new` appear only inside that crate's own test modules.
-Nothing else constructs them. Only the model is chosen at runtime, by
-`AGENTOS_LLM`.
+Selection is **per adapter**. A deployment with a Resend key and no Twilio
+account runs real email and a fake phone. That is the normal state of an
+integration, not an error.
 
-One thing in `mocks::adapters()` is **not** a mock: the envelope cipher.
+| Provider | Adapter | Credential | Shape |
+|---|---|---|---|
+| **Anthropic** | `llm_anthropic.rs` | `ANTHROPIC_API_KEY` + `AGENTOS_LLM=anthropic` | — |
+| local `claude` CLI | `llm_cli.rs` | none — `AGENTOS_LLM=cli` | — |
+| **Resend** | `email_resend.rs` | `EMAIL_API_KEY` | `re_…` |
+| **Twilio** | `telephony_twilio.rs` | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` |
+| **Browserbase** | `browser_browserbase.rs` + `cdp.rs` | `BROWSER_API_KEY` | `project-id:api-key` |
+| Meta WhatsApp | none at all | — | — |
+| embedder | mock only, permanently — a SHA-256 hash | none, and none possible | — |
+| secret vault | mock only — an in-process plaintext map | — | — |
+| MCP | none — refuses | — | — |
+| payments | none — refuses | — | — |
+
+Two of the three are compound because the adapter behind them takes two values,
+and they are one variable each for the same reason the keyring is. **Half of one
+is a named boot failure** — an adapter holding half a credential is the
+deployment that believes it is sending mail and is not.
+
+The email adapter's third input, the `whsec_…` signing secret, comes from the
+`email` entry of `AGENTOS_WEBHOOK_SECRETS`, where you have already pasted it.
+Its sending domain is `AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
+
+`EMBEDDER_API_KEY` is **no longer read**. It used to satisfy the boot guard
+while selecting nothing, because `Embedder` has one variant and it is a hash. A
+credential that cannot change what runs must not be able to quiet an alarm.
+
+Two things are real whatever the credentials say. The **envelope cipher**:
 `AGENTOS_MASTER_KEY` is threaded into a real `LocalEnvelopeSecretStore`, because
 `Step::Identity` mints a real Ed25519 keypair and seals its private half into a
-database column. A mock provider that invents a phone number costs nothing; a
-mock cipher costs an identity.
+database column — a mock provider that invents a phone number costs nothing, a
+mock cipher costs an identity. And the **model**, chosen by `AGENTOS_LLM`.
 
-So `EMAIL_API_KEY`, `TELEPHONY_API_KEY`, `BROWSER_API_KEY` and
-`EMBEDDER_API_KEY` do exactly one thing: they satisfy the boot guard in
-`config.rs`, which otherwise refuses to start rather than run a mock silently.
-Setting them changes **no behaviour**. Do not set them expecting email to be
-sent.
+Two are permanently fake, and are named on every boot so a line with no `MOCK`
+in it cannot be manufactured by omission: the **embedder** above, and the
+**employee secret vault**, which is a plaintext in-process map that forgets on
+restart (not the envelope cipher — that one is real).
 
-| Provider | Adapter exists | Wired into the server | Credential |
-|---|---|---|---|
-| **Anthropic** | yes — `llm_anthropic.rs` | **yes** | `ANTHROPIC_API_KEY` + `AGENTOS_LLM=anthropic` |
-| local `claude` CLI | yes — `llm_cli.rs` | **yes** | none — `AGENTOS_LLM=cli` |
-| **Resend** | yes — `email_resend.rs` | no | `EMAIL_API_KEY` gates the boot guard only |
-| **Twilio** | yes — `telephony_twilio.rs` | no | `TELEPHONY_API_KEY` gates the boot guard only |
-| **Browserbase** | yes — `browser_browserbase.rs` + `cdp.rs` | no | `BROWSER_API_KEY` gates the boot guard only |
-| Meta WhatsApp | no adapter at all | no | — |
-| embedder | mock only (a SHA-256 hash) | n/a | `EMBEDDER_API_KEY` gates the boot guard only |
-| MCP | none — refuses | n/a | — |
-| payments | none — refuses | n/a | — |
+Every boot logs one line naming what is behind every port, and `/readyz` carries
+the same inventory as `mock_adapters` for as long as the replica is up:
 
-Wiring a real adapter in is a change to `crates/app/src/mocks.rs` (which is the
-only file that may name a concrete provider type — the binary must not depend on
+```
+adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
+          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+```
+
+Adding a new provider is a change to `crates/app/src/mocks.rs` (the only file
+that may name a concrete provider type — the binary must not depend on
 `agentos-providers`, and that absence is what makes the capability token
-unforgeable).
+unforgeable), plus a row in `PROVIDER_CREDENTIALS` in `config.rs`. Forgetting
+the second is a compile error, not a provider that ships as a mock.
 
 ---
 
 ## Anthropic — the model the employee reasons with
 
-**What it is for.** The only live external call this binary makes today. Every
-inbound message becomes an agent turn: the model reads the message, may ask for
+**What it is for.** Every inbound message becomes an agent turn: the model reads the message, may ask for
 tools, and writes the reply that is recorded on the conversation.
 
 **Status: real, wired, in use.**
@@ -136,8 +156,9 @@ reply is a mock that ends up in a demo and then in a thread with a real supplier
 **What it is for.** The employee's mailbox: the sending domain (provisioning
 step `email`), outbound mail, and inbound mail via webhook.
 
-**Status: real adapter written and tested; not constructed by the server.** The
-`email` step provisions against `MockEmailProvider` today.
+**Status: real, and selected by `EMAIL_API_KEY`.** With it set the `email` step
+provisions against Resend; without it, against `MockEmailProvider`, which the
+boot guard refuses unless `AGENTOS_ALLOW_MOCKS=1`.
 
 ### The account and the credentials — *two* of them
 
@@ -156,13 +177,13 @@ step `email`), outbound mail, and inbound mail via webhook.
 
 Where each goes:
 
-| Credential | Goes into | Today |
+| Credential | Goes into | What it does |
 |---|---|---|
-| `re_…` API key | `EMAIL_API_KEY` | boot guard only; the adapter is not built |
-| `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…` | **live** — this one is genuinely used |
-| the sending domain | `AGENT_EMAIL_DOMAIN` | live |
+| `re_…` API key | `EMAIL_API_KEY` | **builds the adapter** — set it and mail is really sent |
+| `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…` | verifies inbound deliveries, **and** is handed to the adapter as its own webhook secret — one paste, not two |
+| the sending domain | `AGENT_EMAIL_DOMAIN` | the one domain this adapter owns |
 
-The webhook half really works even with the mock adapter: the route verifies the
+The webhook half works even with the mock adapter: the route verifies the
 signature against the configured secret and stores the raw bytes. The path
 segment (`email`) is the `{provider}` in `/v1/webhooks/{provider}` and must match
 the label in `AGENTOS_WEBHOOK_SECRETS`. An unregistered provider is a **404**,
@@ -195,12 +216,12 @@ sits on it. `release` therefore returns
 binding on a domain that is still very much alive, and not a transient failure,
 which would make **every** termination end in the dead-letter queue.
 
-Operationally, once this adapter is wired: terminating an employee will leave its
+Operationally, with `EMAIL_API_KEY` set: terminating an employee leaves its
 `email` resource row bound, with `release_not_supported` in `last_error`,
-permanently and by design. It will appear in the stranded-resources query
+permanently and by design. It appears in the stranded-resources query
 (`docs/OPERATIONS.md` §6) and it is the one entry there you should expect to see
-and ignore — nothing per employee is being billed for it. On today's
-`MockEmailProvider` the release simply succeeds, so you will not see it yet.
+and ignore — nothing per employee is being billed for it. Without the key, on
+`MockEmailProvider`, the release simply succeeds and you will not see it.
 
 ### Signature verification
 
@@ -221,7 +242,7 @@ falls back to its literal bytes, so pasting the wrong shape gives you a working
 **What it is for.** Provisioning step `phone`: buying an E.164 number and binding
 its webhook. Also SMS and WhatsApp sends.
 
-**Status: real adapter written and tested; not constructed by the server.**
+**Status: real, and selected by `TELEPHONY_API_KEY`.**
 
 ### The account and the credential
 
@@ -230,9 +251,12 @@ its webhook. Also SMS and WhatsApp sends.
    Token**. That is the whole credential: the API is HTTP basic auth
    (`AccountSid:AuthToken`) with form-encoded bodies and JSON responses. There is
    no maintained Rust Twilio SDK and there does not need to be.
-3. Today, put the auth token in `TELEPHONY_API_KEY` to satisfy the boot guard.
-   When the adapter is wired, `TwilioTelephony::new(account_sid, auth_token)` is
-   the constructor and the SID needs a home of its own.
+3. Put **both** in `TELEPHONY_API_KEY`, colon separated:
+   `TELEPHONY_API_KEY=ACxxxxxxxx:your_auth_token`. That is what
+   `TwilioTelephony::new(account_sid, auth_token)` is built from. One variable
+   rather than two because half a credential set here and half forgotten there
+   is an adapter that 401s on its first purchase; the boot refuses a value with
+   no colon in it, by name.
 
 Twilio's inbound webhook signature is a **different scheme** — HMAC-SHA1 over the
 callback URL plus sorted form parameters. It is implemented
@@ -375,7 +399,7 @@ deadline exists.
 browser context per employee, so it can stay logged into a supplier portal
 between tasks.
 
-**Status: real adapter written and tested; not constructed by the server.**
+**Status: real, and selected by `BROWSER_API_KEY`.**
 `BrowserbaseBrowser` (`crates/providers/src/browser_browserbase.rs`) implements
 `BrowserProvider` against `https://api.browserbase.com` — `POST /v1/contexts`
 then `POST /v1/sessions` — and then drives the session over **CDP** through our
@@ -387,8 +411,10 @@ JSON-RPC over a websocket and Browserbase launches Chrome for us, so a websocket
 client is all that is needed — `chromiumoxide` would bring a whole browser model
 we never drive.
 
-The `browser` provisioning step still runs against `MockBrowser`, because
-`main.rs` builds `mocks::adapters()`.
+The CDP driver is attached whenever the real adapter is built, not optionally:
+without one, `act` is `Terminal { code: "no_cdp_driver" }`, so a deployment
+would provision real browser contexts and then fail every step that used them.
+Half a browser is exactly the state this wiring is arranged against.
 
 ### The account
 
@@ -396,8 +422,10 @@ The `browser` provisioning step still runs against `MockBrowser`, because
 2. **Settings** → copy the **API key** and the **Project ID**. Both are needed;
    `BrowserbaseBrowser::new(project_id, api_key)` takes both, and the API key
    alone is not enough.
-3. Today: `BROWSER_API_KEY` for the boot guard. There is nowhere for the project
-   id to go until the adapter is wired.
+3. Put **both** in `BROWSER_API_KEY`, colon separated:
+   `BROWSER_API_KEY=<project-id>:<api-key>`. The key alone is not enough —
+   contexts and sessions are both created inside a project — so a value with no
+   colon in it is a boot failure, by name.
 
 No human review is involved. This one is credentials-and-go.
 
@@ -458,8 +486,11 @@ Postgres type and are not the same space; mixing them returns nonsense rather
 than an error. Labelling hash vectors as a real model would be exactly that
 silent mixing.
 
-`EMBEDDER_API_KEY` gates the boot guard. There is no real embedder adapter to
-give it to.
+There is **no `EMBEDDER_API_KEY`**. There used to be, and it gated the boot
+guard: exporting any string at all turned a MOCK verdict green while this hash
+kept running. A credential that cannot change what runs must not be able to
+quiet an alarm, so it was deleted and the embedder is named as a permanent mock
+in the boot summary and in `agentos-server doctor` instead.
 
 ---
 
@@ -480,15 +511,27 @@ seeing `not_configured`, the system is working.
 
 If you wire one of the above in, or write a new one, these are not optional.
 
-There is a shared contract suite per trait in `agentos-providers` — but be clear
-about what it currently proves. **Every suite runs against the mock; none of
-them runs against the real adapter.** `SecretStore`'s is the only one exercised
-by two implementations. `EmailProvider`'s is the only one that is `pub` and
-therefore even callable from another module; `TelephonyProvider`'s and
-`BrowserProvider`'s are private to their own `mod tests`. The real adapters have
-their own hand-written tests against hermetic HTTP servers, which is good but is
-not the same guarantee. Making a vendor swap provable means running the suite
-against both.
+There is a shared contract suite per trait in `agentos-providers`, and **every
+one of them now runs against both the mock and the real adapter** — Resend,
+Twilio and Browserbase each against a hermetic loopback HTTP server, with no
+account, no network and nothing sent. `EmailProvider`'s, `TelephonyProvider`'s
+and `BrowserProvider`'s are all `pub` for that reason; the last two used to be
+private to their own `mod tests`, which meant the only implementation they could
+prove anything about was the mock.
+
+One parameter carries the only legitimate difference between two real email
+adapters: `email::contract_suite` takes an `IdentityScope`, and Resend runs as
+`AccountWide` because its sending domain genuinely is one resource for the whole
+account rather than one per employee. Everything else in the contract is checked
+unchanged. A documented exemption tests nothing; a parameter tests the other
+ninety percent.
+
+There is no suite for `Llm`, and there should not be. What the other traits pin
+is a *resource lifecycle* — reconcile before create, idempotent send, tolerant
+release — and a model has none of it: no resource, no external id, no release.
+What does differ between model backends (tool-call encoding, cache accounting,
+refusal handling) is per-vendor by nature and is covered by each adapter's own
+tests. A suite there would assert that text goes in and text comes out.
 
 ### Reconcile before create
 

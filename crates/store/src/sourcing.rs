@@ -24,6 +24,14 @@
 //! them being reliable. [`reputation`] returns `None` for a supplier with no
 //! observations, because "no data" is an answer and `0%` is a different one.
 //!
+//! The responsiveness half of that evidence — `quote_returned` and
+//! `quote_missed` — has exactly one writer, [`close_expired_rounds`], and it
+//! writes both at the same moment for the same reason: an RFQ round is the only
+//! event that produces a signal for every supplier it touched, and it produces
+//! it when the round ends rather than when an answer lands. Recording the
+//! answers as they arrive and the silences separately would be two clocks, and
+//! the silences would be the clock nobody wound.
+//!
 //! ponytail: ids are plain [`Uuid`] here rather than domain newtypes. The
 //! sourcing id types live in the domain crate's own unit; when they land, these
 //! signatures take them and nothing else changes. Writes for
@@ -406,6 +414,188 @@ pub async fn open_rfq(
         currency: currency.parse::<Currency>()?,
         incoterm,
     }))
+}
+
+/// Write down which suppliers an RFQ actually went to.
+///
+/// **The one fact about a round that cannot be recomputed later.**
+/// [`find_suppliers`] is a live query — a supplier added, deactivated,
+/// re-categorised or newly suppressed after the letter went out changes its
+/// answer — so "who did we ask" either gets written at the moment of asking or
+/// it is gone. It was never written, and that is the whole reason
+/// `quote_missed` had no writer: [`close_expired_rounds`] subtracts the answers
+/// from the recipients, and with no recipients there is nothing to subtract
+/// from.
+///
+/// # Why `negotiations` and not a table of its own
+///
+/// Because that table already *is* this fact. `unique (tenant_id, rfq_id,
+/// supplier_id)` is one row per supplier per RFQ; `reply_due_at` is, in the
+/// migration's own words, "when the party we are waiting on owes us an answer";
+/// and `negotiations_awaiting_reply_idx` is a partial index on exactly that
+/// predicate. A negotiation needs no quote to exist — `quote_id` is nullable
+/// and `round_count` defaults to zero — because being owed a first answer is
+/// the state the row starts in. A new `rfq_recipients` table would have been
+/// the same three columns, a second RLS block and a second set of grants.
+///
+/// # Matching addresses back to suppliers
+///
+/// The caller holds `EmailAddress`es, because everything from
+/// `app::sourcing::recipients` down through `shortlist` is keyed by address.
+/// [`EmailAddress`](agentos_domain::action::EmailAddress) lower-cases what it
+/// parses and `supplier_contacts.email` is free text, so the join is on
+/// `lower(email)` — the same folding [`supplier_contacts`] already uses for its
+/// suppression check.
+///
+/// `DISTINCT`, because one supplier with two contact rows on the same address
+/// was still asked once. Two *different* suppliers sharing an address were both
+/// asked by the one letter, and both get a row: that is what happened.
+pub async fn record_rfq_recipients(
+    tx: &mut TenantTx<'_>,
+    rfq_id: Uuid,
+    employee_id: Option<EmployeeId>,
+    addresses: &[String],
+    reply_due_at: DateTime<Utc>,
+) -> Result<usize, SourcingError> {
+    let folded: Vec<String> = addresses
+        .iter()
+        .map(|address| address.to_ascii_lowercase())
+        .collect();
+
+    let supplier_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT c.supplier_id \
+           FROM supplier_contacts c \
+          WHERE c.active AND lower(c.email) = ANY($1)",
+    )
+    .bind(&folded)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    for supplier_id in &supplier_ids {
+        open_negotiation(
+            tx,
+            Uuid::now_v7(),
+            rfq_id,
+            *supplier_id,
+            None,
+            employee_id,
+            reply_due_at,
+        )
+        .await?;
+    }
+    Ok(supplier_ids.len())
+}
+
+/// What closing one round came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedRound {
+    /// The round that ended.
+    pub rfq_id: Uuid,
+    /// Recipients who answered it, at any point before it was swept.
+    pub quotes_returned: usize,
+    /// Recipients who never did.
+    pub quotes_missed: usize,
+}
+
+/// End every round of `employee_id`'s that is past its own deadline, and file
+/// the responsiveness evidence for it.
+///
+/// # When is a round over
+///
+/// At `rfqs.closes_at`, which the schema has always carried and nothing has
+/// ever read. Not at the first answer, not when a human orders, not after some
+/// count of cadences: the RFQ told the supplier when quoting shut, and that
+/// sentence is the only deadline both sides agreed on.
+///
+/// **Silence is measured when the round is swept, not at the deadline.** A
+/// supplier who answers on day 9 of an 8-day window has answered; recording
+/// them as silent would be exactly the wrong number the evidence log exists to
+/// prevent, and the reputation that is supposed to say "asking them buys no
+/// quote" would say it about a firm that quoted. So the question this asks per
+/// recipient is `EXISTS (a quote from them on this RFQ)` and never
+/// `received_at <= closes_at`. Their answer was late, which is a thing about
+/// this round; it is not silence, which is a thing about the supplier.
+///
+/// # Idempotence
+///
+/// The state flip is first and is the guard: `state = 'open'` is in the
+/// `WHERE`, so a second pass over the same round updates no rows, returns no
+/// ids and writes no observations. Both statements are the caller's one
+/// transaction, so a crash between them files nothing and leaves the round
+/// open for the next cadence. Concurrent turns for one employee serialise on
+/// the `rfqs` row lock and the loser re-evaluates the qual and finds `closed`.
+///
+/// A round with no `closes_at` is never swept. "No deadline" is not "over".
+///
+/// # This is also what un-strands the employee
+///
+/// `app::vertical` reads an open `rfqs` row as "we have asked and are waiting",
+/// and nothing ever cleared it — so an employee whose RFQ nobody answered
+/// waited for that answer forever, every cadence, with no way back to
+/// `Stage::Rfq`. Closing the round is what returns them to a fresh one, which
+/// is why this runs at the top of a purchasing turn rather than in a sweep of
+/// its own.
+///
+// ponytail: the round's `negotiations` rows keep whatever state they have.
+// Nothing reads `negotiations_awaiting_reply` yet; the unit that builds the
+// stalled-negotiation sweep gets to decide there whether a supplier who
+// answered is `awaiting_buyer` or the thread is `abandoned`, and inventing that
+// answer here to satisfy a reader that does not exist is a guess in a state
+// column.
+pub async fn close_expired_rounds(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<Vec<ClosedRound>, SourcingError> {
+    let closed: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE rfqs \
+            SET state = 'closed', updated_at = now() \
+          WHERE employee_id = $1 \
+            AND state = 'open' \
+            AND closes_at IS NOT NULL \
+            AND closes_at <= $2 \
+      RETURNING id",
+    )
+    .bind(employee_id.as_uuid())
+    .bind(now)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    let mut rounds = Vec::with_capacity(closed.len());
+    for rfq_id in closed {
+        // One row per recipient, saying whether anything ever came back. The
+        // set is `negotiations`, not `quotes`: a supplier who never answered
+        // has no quote row to be found by, which is the whole difficulty.
+        let recipients: Vec<(Uuid, bool)> = sqlx::query_as(
+            "SELECT n.supplier_id, \
+                    EXISTS (SELECT 1 FROM quotes q \
+                             WHERE q.rfq_id = n.rfq_id AND q.supplier_id = n.supplier_id) \
+               FROM negotiations n \
+              WHERE n.rfq_id = $1 \
+              ORDER BY n.supplier_id",
+        )
+        .bind(rfq_id)
+        .fetch_all(&mut ***tx)
+        .await?;
+
+        let mut round = ClosedRound {
+            rfq_id,
+            quotes_returned: 0,
+            quotes_missed: 0,
+        };
+        for (supplier_id, answered) in recipients {
+            let observation = if answered {
+                round.quotes_returned += 1;
+                Observation::QuoteReturned { rfq_id }
+            } else {
+                round.quotes_missed += 1;
+                Observation::QuoteMissed { rfq_id }
+            };
+            record_observation(tx, Uuid::now_v7(), supplier_id, observation, now).await?;
+        }
+        rounds.push(round);
+    }
+    Ok(rounds)
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,6 +2156,214 @@ mod tests {
         assert_eq!(total, usd(250 * 400 + 9_000 + 1_000));
         tx.rollback().await.expect("rollback");
 
+        drop_tenant(&db, tenant).await;
+    }
+
+    // -- closing a round ---------------------------------------------------
+
+    /// One supplier, reachable, on this tenant.
+    async fn seed_supplier(tx: &mut TenantTx<'_>, name: &str, email: &str) -> Uuid {
+        let supplier = Uuid::now_v7();
+        insert_supplier(
+            tx,
+            supplier,
+            &NewSupplier {
+                legal_name: name,
+                country: "DE",
+                categories: &["fasteners".to_owned()],
+                website: None,
+            },
+        )
+        .await
+        .expect("supplier");
+
+        sqlx::query(
+            "INSERT INTO supplier_contacts (id, tenant_id, supplier_id, full_name, email, is_primary) \
+             VALUES ($1, $2, $3, 'Sales', $4, true)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tx.tenant_id().as_uuid())
+        .bind(supplier)
+        .bind(email)
+        .execute(&mut ***tx)
+        .await
+        .expect("contact");
+        supplier
+    }
+
+    /// `(quotes_returned, quotes_missed)` for one supplier, out of the view.
+    async fn responsiveness(tx: &mut TenantTx<'_>, supplier: Uuid) -> (i64, i64) {
+        reputation(tx, supplier)
+            .await
+            .expect("reputation")
+            .map_or((0, 0), |rep| (rep.quotes_returned, rep.quotes_missed))
+    }
+
+    /// **The observation `quote_missed` had no writer for.**
+    ///
+    /// Three suppliers are asked. One answers inside the window, one answers
+    /// after it — day 9 of an 8-day round — and one never answers at all. The
+    /// round closes and files exactly three observations: two `quote_returned`
+    /// and one `quote_missed`. The late answer is an answer, because the thing
+    /// the reputation is asked is "does writing to them buy a quote", and it
+    /// bought one.
+    ///
+    /// Then the pass runs twice more and files nothing, because a reputation
+    /// that decays for a bookkeeping reason is worse than no reputation.
+    #[tokio::test]
+    async fn a_closing_round_files_one_observation_per_recipient_and_never_twice() {
+        let Some(db) = db().await else { return };
+        let now = at(1_800_000_000);
+        let tenant = seed_tenant(&db, "sourcing-close").await;
+
+        let employee = EmployeeId::new_v7(Utc::now());
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'Lena', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("insert employee");
+        admin.commit().await.expect("commit employee");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let prompt = seed_supplier(&mut tx, "Prompt Works", "sales@prompt.example").await;
+        let late = seed_supplier(&mut tx, "Late Works", "sales@late.example").await;
+        let silent = seed_supplier(&mut tx, "Quiet Works", "sales@quiet.example").await;
+
+        let rfq = Uuid::now_v7();
+        let closes_at = now + TimeDelta::days(8);
+        insert_rfq(
+            &mut tx,
+            rfq,
+            &NewRfq {
+                employee_id: Some(employee),
+                title: "M6 bolts, 10k",
+                product_category: "fasteners",
+                quantity: 10_000,
+                unit: "pcs",
+                incoterm: Some("DDP"),
+                destination_country: "DE",
+                currency: Currency::Usd,
+                target_unit_price: Some(usd(12)),
+                closes_at: Some(closes_at),
+            },
+        )
+        .await
+        .expect("rfq");
+
+        // Who was asked. The middle address is upper-cased on purpose:
+        // `EmailAddress` folds what it parses and the contact column is free
+        // text, so the join has to fold too or a supplier silently drops out of
+        // its own round.
+        let asked = record_rfq_recipients(
+            &mut tx,
+            rfq,
+            Some(employee),
+            &[
+                "sales@prompt.example".to_owned(),
+                "SALES@LATE.EXAMPLE".to_owned(),
+                "sales@quiet.example".to_owned(),
+            ],
+            closes_at,
+        )
+        .await
+        .expect("recipients");
+        assert_eq!(asked, 3, "every address matched a supplier");
+
+        for (supplier, received_at) in [
+            (prompt, now + TimeDelta::days(2)),
+            (late, closes_at + TimeDelta::days(1)),
+        ] {
+            let quote = Uuid::now_v7();
+            insert_quote(
+                &mut tx,
+                quote,
+                &NewQuote {
+                    rfq_id: rfq,
+                    supplier_id: supplier,
+                    unit_price: usd(11),
+                    quantity: 10_000,
+                    freight: None,
+                    duties: None,
+                    other_fees: None,
+                    lead_time_days: Some(21),
+                    incoterm: Some("DDP"),
+                    valid_until: closes_at + TimeDelta::days(30),
+                },
+            )
+            .await
+            .expect("quote");
+            // `received_at` defaults to now(); pin it so "late" is a fact in
+            // the row and not a fact about when this test ran.
+            sqlx::query("UPDATE quotes SET received_at = $2 WHERE id = $1")
+                .bind(quote)
+                .bind(received_at)
+                .execute(&mut **tx)
+                .await
+                .expect("backdate");
+        }
+
+        // A round that is still open is not over, whatever else is true.
+        assert!(
+            close_expired_rounds(&mut tx, employee, now + TimeDelta::days(3))
+                .await
+                .expect("sweep")
+                .is_empty(),
+            "a round swept before its own deadline"
+        );
+        for supplier in [prompt, late, silent] {
+            assert_eq!(responsiveness(&mut tx, supplier).await, (0, 0));
+        }
+
+        // Past the deadline: the round ends and the evidence is filed.
+        let closed = close_expired_rounds(&mut tx, employee, closes_at + TimeDelta::days(2))
+            .await
+            .expect("sweep");
+        assert_eq!(
+            closed,
+            vec![ClosedRound {
+                rfq_id: rfq,
+                quotes_returned: 2,
+                quotes_missed: 1,
+            }]
+        );
+        assert_eq!(responsiveness(&mut tx, prompt).await, (1, 0));
+        assert_eq!(
+            responsiveness(&mut tx, late).await,
+            (1, 0),
+            "answering after the window is answering; only silence is silence"
+        );
+        assert_eq!(responsiveness(&mut tx, silent).await, (0, 1));
+
+        let state: String = sqlx::query_scalar("SELECT state FROM rfqs WHERE id = $1")
+            .bind(rfq)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("state");
+        assert_eq!(state, "closed", "the open row is what strands the employee");
+
+        // Twice more, at two different instants. A round closes once.
+        for extra in [3, 40] {
+            assert!(
+                close_expired_rounds(&mut tx, employee, closes_at + TimeDelta::days(extra))
+                    .await
+                    .expect("sweep")
+                    .is_empty()
+            );
+        }
+        assert_eq!(responsiveness(&mut tx, prompt).await, (1, 0));
+        assert_eq!(responsiveness(&mut tx, late).await, (1, 0));
+        assert_eq!(
+            responsiveness(&mut tx, silent).await,
+            (0, 1),
+            "the pass ran three times and this supplier missed one round"
+        );
+
+        tx.rollback().await.expect("rollback");
         drop_tenant(&db, tenant).await;
     }
 }

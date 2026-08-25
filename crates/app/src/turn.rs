@@ -1427,7 +1427,7 @@ mod tests {
             &mut tx,
             crate::knowledge::Embedder::Mock,
             &crate::knowledge::Document {
-                employee_id: None,
+                scope: crate::knowledge::Scope::Company,
                 uri: Some("https://example.test/handbook.md"),
                 title: Some("Handbook"),
                 format: crate::knowledge::Format::Markdown,

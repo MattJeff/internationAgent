@@ -74,6 +74,51 @@
 //! module unwraps is the *query*, through `expose_for_parsing`, which is a
 //! parse into a `tsquery` and an embedding input rather than a render.
 //!
+//! # Who a document is for, and why that is a cost control
+//!
+//! [`Scope`]: the company, one team, or one employee. Before it there were two
+//! states — tenant-wide or one employee's own — and a company is nothing but the
+//! middle. A developer knows its tickets, its sprint and its releases; it knows
+//! nothing about the sales strategy, and sales knows nothing about the backlog.
+//!
+//! The reason to fix it is arithmetic before it is access control. Every
+//! retrieved chunk is context and every turn pays for the context it carries, so
+//! an employee retrieving against the tenant-wide corpus spends part of every
+//! turn on documents that were never going to answer its question — and answers
+//! worse for it, because [`RECALL_LIMIT`] is five slots and the irrelevant
+//! documents are competing for them.
+//!
+//! **What that is worth is measured rather than asserted**, in
+//! `scoping_pays_for_itself_and_here_is_the_number`, and the honest headline is
+//! smaller than the pitch. Retrieval is a *fixed top-k*, so it is a fixed token
+//! budget: an employee whose own scope holds five or more matching chunks
+//! retrieves five chunks of much the same length either way, and the saving in
+//! bytes is zero. The token bill only falls when the employee's own scope holds
+//! **fewer** matches than the top-k — the measurement's corpus is 23 chunks of
+//! which the employee's team owns 2, and there the retrieval comes back with 3
+//! chunks instead of 5, about 40% fewer bytes. Read that as the shape of the
+//! saving rather than as a rate: it is bounded by `RECALL_LIMIT` and it shrinks
+//! to nothing as a team's own corpus grows.
+//!
+//! What scoping buys *unconditionally* is the composition of those five slots.
+//! In the same measurement every one of the unscoped hits that came from another
+//! team is gone, which is worth more than the tokens: a slot holding the sales
+//! strategy is a slot not holding the answer, and [`RECALL_LIMIT`] is five.
+//!
+//! Scope is stamped at ingest, like [`Document::trust`] and for the same reason.
+//! What is **not** stamped is the reader's side: which team an employee is on is
+//! read out of `team_memberships` by the query itself, every time, so moving an
+//! employee between teams changes what it retrieves on the next turn and an
+//! employee on no team sees company-wide documents and its own — not everything.
+//! The predicate is in `agentos_store::knowledge`.
+//!
+//! None of this touches the trust argument above. A document scoped to your own
+//! team is still a document somebody may have emailed in, and reason 2 —
+//! *selection* — does not care whose document it is: the counterparty still
+//! chooses which of them the model reads. Scoping narrows the set an attacker
+//! can steer within. It does not make anything in that set trusted, and there is
+//! still exactly one rendering path.
+//!
 //! # The model is part of the row
 //!
 //! A `vector(1536)` from one embedder and a `vector(1536)` from another are the
@@ -110,7 +155,7 @@ use uuid::Uuid;
 
 use crate::turn::Context;
 
-pub use agentos_store::knowledge::Hit;
+pub use agentos_store::knowledge::{Hit, Scope};
 
 // The server crate deliberately does not depend on `agentos-providers` — see
 // `crates/app/src/inbound.rs`, which re-exports `Secret` for the same reason.
@@ -160,8 +205,10 @@ impl Format {
 /// A document to ingest.
 #[derive(Debug, Clone)]
 pub struct Document<'a> {
-    /// `None` makes it tenant-wide; otherwise only this employee retrieves it.
-    pub employee_id: Option<EmployeeId>,
+    /// **Who it is for**: the company, one team, or one employee. Recorded now,
+    /// at ingest, for the same reason [`Self::trust`] is — see the scope section
+    /// of the module docs.
+    pub scope: Scope,
     /// Where it came from, for citation.
     pub uri: Option<&'a str>,
     /// Human label.
@@ -247,7 +294,7 @@ pub async fn ingest(
 
     let checksum = checksum(&text);
     let model = model_name(embedder);
-    if let Some(source_id) = already_ingested(tx, &checksum, model, doc.trust).await? {
+    if let Some(source_id) = already_ingested(tx, &checksum, model, doc.trust, doc.scope).await? {
         return Ok(Ingested {
             source_id,
             chunks: 0,
@@ -263,7 +310,7 @@ pub async fn ingest(
         tx,
         &NewSource {
             id: source_id,
-            employee_id: doc.employee_id,
+            scope: doc.scope,
             kind: doc.format.kind().to_owned(),
             uri: doc.uri.map(str::to_owned),
             title: doc.title.map(str::to_owned),
@@ -303,6 +350,10 @@ pub async fn ingest(
 /// because it is being *parsed* into a query — a caller holding an
 /// `Untrusted<String>` passes `expose_for_parsing()`, and what comes back is
 /// untrusted regardless of what went in.
+///
+/// `employee_id` is the whole scope: company-wide documents, its team's, and its
+/// own. `None` is the operator-side "everything this tenant has" — a turn never
+/// passes it.
 pub async fn retrieve(
     tx: &mut TenantTx<'_>,
     embedder: Embedder,
@@ -404,17 +455,20 @@ pub struct Recall<'a> {
     /// thing: **choosing which of this tenant's own documents enter the model's
     /// context**, out of the set this employee could already retrieve. It does
     /// not buy another tenant's documents (row-level security, in SQL, not
-    /// here), another employee's private ones (the `employee_id` filter), any
-    /// write at all, or having the retrieved text read as an instruction (it is
-    /// fenced). The bound on the damage is that the model was going to read a
-    /// document either way; the attacker only gets to nudge which one.
+    /// here), another employee's private ones, a sibling team's (both the
+    /// `entitled!` predicate), any write at all, or having the retrieved text
+    /// read as an instruction (it is fenced). The bound on the damage is that the
+    /// model was going to read a document either way; the attacker only gets to
+    /// nudge which one — and [`Scope`] is what shrank the set it may nudge
+    /// within from the whole company down to this employee's own work.
     ///
     /// Truncated to [`MAX_QUERY_CHARS`] and exposed with `expose_for_parsing`,
     /// which is what that exit is for: this is a parse into a `tsquery` and an
     /// embedding input, not a render into a prompt.
     pub question: &'a Untrusted<String>,
-    /// Restrict to this employee's own sources plus the tenant-wide ones.
-    /// `None` searches everything the tenant has.
+    /// Who is asking: this employee's own sources, its team's, and the
+    /// tenant-wide ones. `None` searches everything the tenant has, which a turn
+    /// should not pass — it is the widest scope and the most expensive one.
     pub employee_id: Option<EmployeeId>,
     /// Top-k. See [`RECALL_LIMIT`].
     pub limit: i64,
@@ -580,8 +634,8 @@ pub async fn recall(
     }
 }
 
-/// The source holding this exact text under this exact model *and* this exact
-/// provenance, if any.
+/// The source holding this exact text under this exact model, this exact
+/// provenance *and* this exact scope, if any.
 ///
 /// The `EXISTS` is the model check: a source whose chunks were embedded by a
 /// different backend does not satisfy a request for this one.
@@ -592,16 +646,34 @@ pub async fn recall(
 /// path the moment a trusted ingest route exists, in either direction. Two
 /// provenances for the same bytes are two sources, which costs a duplicate
 /// document nobody has and closes a hole somebody would otherwise find.
+///
+/// **The scope columns are there for exactly that argument, one scope up, and it
+/// is not hypothetical.** Sales files the handbook company-wide; purchasing
+/// files the same bytes scoped to purchasing and is handed the company-wide row
+/// back with `reused: true` — it believes it filed a team document and it filed
+/// nothing. In the other order it is worse: purchasing scopes it to purchasing,
+/// sales files it company-wide, gets a 200, and cannot retrieve the document it
+/// just uploaded because the row it was given belongs to a team sales is not on.
+/// `IS NOT DISTINCT FROM` rather than `=` because both columns are usually NULL
+/// and `NULL = NULL` is not true, which would make company-wide documents dedupe
+/// against nothing and re-ingest forever.
 async fn already_ingested(
     tx: &mut TenantTx<'_>,
     checksum: &str,
     model: &str,
     trust: TrustLabel,
+    scope: Scope,
 ) -> Result<Option<Uuid>, StoreError> {
+    // The same mapping `insert_source` writes with, borrowed rather than
+    // repeated: a dedupe key that disagreed with the writer about which column
+    // a team lands in would match nothing and re-ingest every document forever.
+    let (employee_id, team_id) = scope.columns();
     sqlx::query_scalar(
         "SELECT s.id FROM knowledge_sources s \
           WHERE s.checksum = $1 \
             AND s.trust_label = $3 \
+            AND s.employee_id IS NOT DISTINCT FROM $4::uuid \
+            AND s.team_id IS NOT DISTINCT FROM $5::uuid \
             AND EXISTS (SELECT 1 FROM knowledge_chunks c \
                          WHERE c.source_id = s.id AND c.model = $2) \
           ORDER BY s.created_at \
@@ -614,6 +686,8 @@ async fn already_ingested(
     } else {
         "trusted"
     })
+    .bind(employee_id)
+    .bind(team_id)
     .fetch_optional(&mut ***tx)
     .await
     .map_err(Into::into)
@@ -852,7 +926,7 @@ mod tests {
 
     fn document(text: &str) -> Document<'_> {
         Document {
-            employee_id: None,
+            scope: Scope::Company,
             uri: Some("https://example.test/handbook.md"),
             title: Some("Handbook"),
             format: Format::Markdown,
@@ -869,6 +943,165 @@ mod tests {
             .expect("ingest");
         tx.commit().await.expect("commit");
         ingested
+    }
+
+    // -- the org the scope tests need --------------------------------------
+
+    /// One tenant, two teams, three employees. The third is on **no** team,
+    /// which is the case a scope test that only ever looks at team members
+    /// would never cover — and it is the one that has to fail closed.
+    struct Org {
+        tenant: TenantId,
+        engineering: Uuid,
+        sales: Uuid,
+        /// On `engineering`.
+        dev: EmployeeId,
+        /// On `sales`.
+        rep: EmployeeId,
+        /// On nothing.
+        contractor: EmployeeId,
+    }
+
+    async fn add_employee(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+        let id = Uuid::now_v7();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(slug)
+        .execute(&mut **tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit");
+        EmployeeId::from_uuid(id)
+    }
+
+    async fn add_team(db: &Db, tenant: TenantId, slug: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query("INSERT INTO teams (id, tenant_id, slug, name) VALUES ($1, $2, $3, $3)")
+            .bind(id)
+            .bind(tenant.as_uuid())
+            .bind(slug)
+            .execute(&mut **tx)
+            .await
+            .expect("insert team");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    /// Move `employee` onto `team`, whether or not it was on one before —
+    /// `team_memberships` allows exactly one row per employee, so a transfer is
+    /// an upsert rather than a second row.
+    async fn put_on_team(db: &Db, tenant: TenantId, employee: EmployeeId, team: Uuid) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO team_memberships (tenant_id, employee_id, team_id) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, employee_id) DO UPDATE SET team_id = excluded.team_id",
+        )
+        .bind(tenant.as_uuid())
+        .bind(employee.as_uuid())
+        .bind(team)
+        .execute(&mut **tx)
+        .await
+        .expect("insert membership");
+        tx.commit().await.expect("commit");
+    }
+
+    async fn org(db: &Db) -> Org {
+        let tenant = create_tenant(db).await;
+        let engineering = add_team(db, tenant, "engineering").await;
+        let sales = add_team(db, tenant, "sales").await;
+        let dev = add_employee(db, tenant, "dev").await;
+        let rep = add_employee(db, tenant, "rep").await;
+        let contractor = add_employee(db, tenant, "contractor").await;
+        put_on_team(db, tenant, dev, engineering).await;
+        put_on_team(db, tenant, rep, sales).await;
+        Org {
+            tenant,
+            engineering,
+            sales,
+            dev,
+            rep,
+            contractor,
+        }
+    }
+
+    /// One short document, tagged so a retrieval can be asserted on by name.
+    ///
+    /// Every note carries `pallets`, so one query is a candidate for all of
+    /// them and the only thing deciding what comes back is the scope predicate.
+    fn note(tag: &str) -> String {
+        format!("{tag}: damaged pallets are handled by this procedure, which is on file.")
+    }
+
+    /// File `text` under `scope` and commit.
+    async fn file(db: &Db, tenant: TenantId, scope: Scope, text: &str) -> Ingested {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let ingested = ingest(
+            &mut tx,
+            Embedder::Mock,
+            &Document {
+                scope,
+                ..document(text)
+            },
+        )
+        .await
+        .expect("ingest");
+        tx.commit().await.expect("commit");
+        ingested
+    }
+
+    /// Everything `who` can retrieve, by tag, sorted.
+    ///
+    /// The limit is far larger than the corpus on purpose: what comes back is
+    /// then decided by the scope predicate and not by top-k, so a failure reads
+    /// as "saw the wrong document" rather than "ranked it eleventh".
+    async fn visible(db: &Db, tenant: TenantId, who: Option<EmployeeId>) -> Vec<String> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", who, 100)
+            .await
+            .expect("retrieve");
+        tx.rollback().await.expect("rollback");
+
+        let mut tags: Vec<String> = hits.iter().map(tag_of).collect();
+        tags.sort();
+        tags
+    }
+
+    /// The tag [`note`] put at the front of a chunk.
+    fn tag_of(hit: &Hit) -> String {
+        hit.content
+            .expose_for_parsing()
+            .split(':')
+            .next()
+            .expect("split yields at least one piece")
+            .to_owned()
+    }
+
+    /// One retrieval at the top-k a turn actually spends, as
+    /// `(chunks, bytes, chunks belonging to another team)`. The unit of the
+    /// cost claim: bytes are what a turn pays for.
+    async fn measure(db: &Db, tenant: TenantId, who: Option<EmployeeId>) -> (usize, usize, usize) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", who, RECALL_LIMIT)
+            .await
+            .expect("retrieve");
+        tx.rollback().await.expect("rollback");
+
+        let bytes = hits
+            .iter()
+            .map(|hit| hit.content.expose_for_parsing().len())
+            .sum();
+        let foreign = hits
+            .iter()
+            .filter(|hit| tag_of(hit).starts_with("sales"))
+            .count();
+        (hits.len(), bytes, foreign)
     }
 
     /// Whether a turn at this trust level is offered the payment tool.
@@ -1247,5 +1480,325 @@ mod tests {
         assert_eq!(labels, vec!["trusted".to_owned(), "untrusted".to_owned()]);
 
         drop_tenant(&db, tenant).await;
+    }
+
+    // -- scope -------------------------------------------------------------
+
+    /// **The dedupe-laundering fix, and the reason this unit is not just a
+    /// `WHERE` clause.**
+    ///
+    /// Ingest deduplicates on a content checksum, so before the scope columns
+    /// joined the key the *same bytes* filed twice under two scopes took the
+    /// first row's scope and the second caller was handed `reused: true` for a
+    /// document it never filed. Both directions were wrong and one of them
+    /// widens: a team's document filed company-wide first stays company-wide,
+    /// and — worse for whoever is debugging it — a company-wide document filed
+    /// after a team copy comes back scoped to a team the uploader is not on, so
+    /// the uploader gets a 200 and then cannot retrieve what it just uploaded.
+    ///
+    /// The same argument the trust label already won in
+    /// `provenance_is_part_of_what_makes_a_document_the_same_document`, one
+    /// scope up, and fixed the same way: the scope is part of the key.
+    #[tokio::test]
+    async fn re_ingesting_the_same_bytes_under_a_different_scope_does_not_inherit_the_first_scope()
+    {
+        let Some(db) = db().await else { return };
+        let org = org(&db).await;
+
+        // One document, byte-for-byte, filed three times under three scopes.
+        let text = note("handbook");
+        let company = file(&db, org.tenant, Scope::Company, &text).await;
+        let team = file(&db, org.tenant, Scope::Team(org.engineering), &text).await;
+        let own = file(&db, org.tenant, Scope::Employee(org.dev), &text).await;
+
+        assert!(
+            !company.reused,
+            "the first filing of a document is not a reuse"
+        );
+        assert!(
+            !team.reused,
+            "the team copy was deduped into the company row"
+        );
+        assert!(
+            !own.reused,
+            "the employee copy was deduped into an earlier row"
+        );
+        assert_ne!(team.source_id, company.source_id);
+        assert_ne!(own.source_id, company.source_id);
+        assert_ne!(own.source_id, team.source_id);
+
+        // Same bytes *and* same scope is still the same document. Widening the
+        // key must not have turned dedupe into "never dedupe".
+        let again = file(&db, org.tenant, Scope::Company, &text).await;
+        assert!(again.reused, "an identical re-ingest stopped deduping");
+        assert_eq!(again.source_id, company.source_id);
+
+        // The rows, not the return value: what each caller asked for is what got
+        // written, in the columns Friday's retrieval reads. Ordered by `id`,
+        // which is a UUIDv7 minted in ingest order.
+        let mut tx = db.tenant_tx(org.tenant).await.expect("tenant tx");
+        let scopes: Vec<(Option<Uuid>, Option<Uuid>)> =
+            sqlx::query_as("SELECT employee_id, team_id FROM knowledge_sources ORDER BY id")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("read scopes");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            scopes,
+            vec![
+                (None, None),
+                (None, Some(org.engineering)),
+                (Some(org.dev.as_uuid()), None),
+            ],
+            "three scopes were asked for and these are the rows that exist"
+        );
+
+        // And the behaviour that laundering would have destroyed: the sales rep
+        // sees the company copy and nothing else, which is only true because
+        // the engineering copy is a row of its own.
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.rep)).await,
+            vec!["handbook".to_owned()]
+        );
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.dev)).await,
+            vec![
+                "handbook".to_owned(),
+                "handbook".to_owned(),
+                "handbook".to_owned()
+            ],
+            "the developer should see the company, team and own copies"
+        );
+
+        drop_tenant(&db, org.tenant).await;
+    }
+
+    /// Company-wide, its own team's, its own — and nothing else. In particular
+    /// not the sibling team's and not another employee's.
+    #[tokio::test]
+    async fn an_employee_retrieves_the_company_its_own_team_and_itself_and_nothing_else() {
+        let Some(db) = db().await else { return };
+        let org = org(&db).await;
+
+        for (scope, tag) in [
+            (Scope::Company, "company"),
+            (Scope::Team(org.engineering), "engineering"),
+            (Scope::Team(org.sales), "sales"),
+            (Scope::Employee(org.dev), "dev-only"),
+            (Scope::Employee(org.rep), "rep-only"),
+        ] {
+            file(&db, org.tenant, scope, &note(tag)).await;
+        }
+
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.dev)).await,
+            vec![
+                "company".to_owned(),
+                "dev-only".to_owned(),
+                "engineering".to_owned()
+            ]
+        );
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.rep)).await,
+            vec![
+                "company".to_owned(),
+                "rep-only".to_owned(),
+                "sales".to_owned()
+            ]
+        );
+
+        // `None` is the operator-side mode and still means everything the
+        // tenant has — unchanged by this unit, and asserted so that a future
+        // edit to the predicate cannot quietly narrow it into a turn's default.
+        assert_eq!(visible(&db, org.tenant, None).await.len(), 5);
+
+        // Scoping is not trust. A document filed to your own team is still
+        // something somebody may have emailed in, and the type is the
+        // assertion: this stops compiling the day a scoped chunk comes back as
+        // a bare String.
+        let mut tx = db.tenant_tx(org.tenant).await.expect("tenant tx");
+        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", Some(org.dev), 100)
+            .await
+            .expect("retrieve");
+        tx.rollback().await.expect("rollback");
+        for hit in &hits {
+            let content: &Untrusted<String> = &hit.content;
+            assert!(
+                content.taint().is_untrusted(),
+                "a scoped chunk lost its taint"
+            );
+        }
+
+        drop_tenant(&db, org.tenant).await;
+    }
+
+    /// **An employee on no team is the narrowest scope, not the widest.**
+    ///
+    /// The failure this rules out is the one a missing row usually causes: an
+    /// absent membership making the team predicate vacuous and handing a
+    /// contractor every team's documents. It fails closed because
+    /// `c.team_id = NULL` is NULL rather than true, which is a property of the
+    /// SQL rather than of a branch somebody remembered to write.
+    #[tokio::test]
+    async fn an_employee_on_no_team_gets_the_company_and_its_own_and_no_teams() {
+        let Some(db) = db().await else { return };
+        let org = org(&db).await;
+
+        for (scope, tag) in [
+            (Scope::Company, "company"),
+            (Scope::Team(org.engineering), "engineering"),
+            (Scope::Team(org.sales), "sales"),
+            (Scope::Employee(org.contractor), "contractor-only"),
+        ] {
+            file(&db, org.tenant, scope, &note(tag)).await;
+        }
+
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.contractor)).await,
+            vec!["company".to_owned(), "contractor-only".to_owned()],
+            "an employee on no team saw a team's documents"
+        );
+
+        drop_tenant(&db, org.tenant).await;
+    }
+
+    /// Moving an employee changes what it retrieves on the **next** retrieval,
+    /// with nothing to re-ingest and no cache to invalidate.
+    ///
+    /// This is what a scope resolved at write time would get wrong: the
+    /// documents were filed before the transfer and not touched by it, so a
+    /// membership copied onto the row at ingest would still say purchasing.
+    #[tokio::test]
+    async fn moving_an_employee_between_teams_changes_the_next_retrieval() {
+        let Some(db) = db().await else { return };
+        let org = org(&db).await;
+
+        for (scope, tag) in [
+            (Scope::Company, "company"),
+            (Scope::Team(org.engineering), "engineering"),
+            (Scope::Team(org.sales), "sales"),
+        ] {
+            file(&db, org.tenant, scope, &note(tag)).await;
+        }
+
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.dev)).await,
+            vec!["company".to_owned(), "engineering".to_owned()]
+        );
+
+        // The only thing that changes. No ingest, no re-scope, no invalidation.
+        put_on_team(&db, org.tenant, org.dev, org.sales).await;
+
+        assert_eq!(
+            visible(&db, org.tenant, Some(org.dev)).await,
+            vec!["company".to_owned(), "sales".to_owned()],
+            "the transferred employee kept its old team's documents"
+        );
+
+        drop_tenant(&db, org.tenant).await;
+    }
+
+    /// Scope narrows within a tenant; it never widens across one. Two orgs with
+    /// the same team names and the same words, so a leak looks like a hit.
+    #[tokio::test]
+    async fn a_scoped_document_never_crosses_a_tenant_boundary() {
+        let Some(db) = db().await else { return };
+        let alpha = org(&db).await;
+        let beta = org(&db).await;
+
+        file(
+            &db,
+            alpha.tenant,
+            Scope::Team(alpha.engineering),
+            &note("alpha"),
+        )
+        .await;
+        file(
+            &db,
+            beta.tenant,
+            Scope::Team(beta.engineering),
+            &note("beta"),
+        )
+        .await;
+
+        assert_eq!(
+            visible(&db, alpha.tenant, Some(alpha.dev)).await,
+            vec!["alpha".to_owned()]
+        );
+        assert_eq!(
+            visible(&db, beta.tenant, Some(beta.dev)).await,
+            vec!["beta".to_owned()]
+        );
+
+        drop_tenant(&db, alpha.tenant).await;
+        drop_tenant(&db, beta.tenant).await;
+    }
+
+    /// **What scoping actually saves, measured rather than asserted.**
+    ///
+    /// The corpus is the shape the claim is about: a handful of documents this
+    /// employee's team owns, and a pile belonging to other teams. Both
+    /// retrievals are the same query at the same top-k; the only difference is
+    /// whether the documents are filed to their teams or — as they had to be
+    /// before this unit, there being nowhere else to put them — company-wide.
+    ///
+    /// The numbers it prints are the honest ones and the headline is smaller
+    /// than the pitch: see the note at the end of this function.
+    #[tokio::test]
+    async fn scoping_pays_for_itself_and_here_is_the_number() {
+        let Some(db) = db().await else { return };
+        let org = org(&db).await;
+
+        // 1 company-wide + 2 the developer's team owns + 20 other teams'.
+        file(&db, org.tenant, Scope::Company, &note("company")).await;
+        for i in 0..2 {
+            file(
+                &db,
+                org.tenant,
+                Scope::Team(org.engineering),
+                &note(&format!("engineering-{i}")),
+            )
+            .await;
+        }
+        for i in 0..20 {
+            file(
+                &db,
+                org.tenant,
+                Scope::Team(org.sales),
+                &note(&format!("sales-{i}")),
+            )
+            .await;
+        }
+
+        // Unscoped is the pre-unit world: every document company-wide, so the
+        // employee retrieves against all 23.
+        let (wide_chunks, wide_bytes, wide_foreign) = measure(&db, org.tenant, None).await;
+        let (narrow_chunks, narrow_bytes, narrow_foreign) =
+            measure(&db, org.tenant, Some(org.dev)).await;
+
+        eprintln!(
+            "scope measurement (corpus 23 chunks, 20 of them another team's, top-k {RECALL_LIMIT}):\n  \
+             unscoped: {wide_chunks} chunks, {wide_bytes} bytes, {wide_foreign} from another team\n  \
+             scoped:   {narrow_chunks} chunks, {narrow_bytes} bytes, {narrow_foreign} from another team"
+        );
+
+        // The claim that holds unconditionally: none of the employee's context
+        // is another team's document.
+        assert_eq!(narrow_foreign, 0, "a sibling team's document was retrieved");
+        assert!(
+            wide_foreign > 0,
+            "the corpus does not reproduce the problem: nothing foreign was retrieved unscoped"
+        );
+
+        // The claim about the bill, which is real here and *only* because the
+        // developer's own corpus (3 chunks) is smaller than the top-k. Had
+        // engineering owned five documents of its own, both runs would return
+        // five chunks of near-identical length and the saving would be zero —
+        // a fixed top-k is a fixed token budget. What scoping reliably buys is
+        // the composition of those slots, not their number.
+        assert!(narrow_chunks < wide_chunks);
+        assert!(narrow_bytes < wide_bytes);
+
+        drop_tenant(&db, org.tenant).await;
     }
 }

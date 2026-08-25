@@ -216,22 +216,47 @@ explicitly, so nothing reaches production on a fake.
 
 ## Status — read this before you promise anything
 
-**The binary always runs mock provider adapters.** `main.rs` calls
-`agentos_app::mocks::adapters()` and `mocks::ports()` unconditionally.
-`ResendEmailProvider::new`, `TwilioTelephony::new` and `BrowserbaseBrowser::new`
-appear only inside `crates/providers`' own test modules. So `EMAIL_API_KEY`,
-`TELEPHONY_API_KEY`, `BROWSER_API_KEY` and `EMBEDDER_API_KEY` do exactly one
-thing: satisfy the boot guard. Setting them changes **no behaviour**.
+**The credential selects the adapter, per adapter.** `main.rs` calls
+`mocks::adapters_for(&config.master_key, &config.credentials)` and
+`mocks::ports_for(&config.credentials)`: `EMAIL_API_KEY` builds a real
+`ResendEmailProvider`, `TELEPHONY_API_KEY=ACxxxx:auth_token` a real
+`TwilioTelephony`, `BROWSER_API_KEY=project-id:api-key` a real
+`BrowserbaseBrowser` with a live CDP driver. Unset means the mock beside it, and
+the boot guard refuses a mock nobody accepted, naming which one. A deployment
+with a Resend key and no Twilio account is the normal case, not an error — and
+every boot logs one line saying which is which:
 
-Two exceptions, both real:
+```
+adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
+          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+```
+
+`/readyz` publishes the same inventory as `mock_adapters`, because "the mail
+never arrived" is debugged against a running replica long after that log line
+scrolled away.
+
+Half a compound credential is a **named boot failure**, never a silent mock:
+an adapter holding half of what it needs is the deployment that believes it is
+sending mail and is not.
+
+`EMBEDDER_API_KEY` is **no longer read**. It used to satisfy the boot guard
+while selecting nothing — `Embedder` has one variant and it is a SHA-256 hash —
+and a credential that cannot change what runs must not be able to quiet an
+alarm.
+
+Real regardless of any credential:
 
 * **The model.** `AGENTOS_LLM=anthropic` with a key really calls
-  `api.anthropic.com`; `cli` really shells out to a local `claude`. Those are
-  the only live external calls this binary makes.
+  `api.anthropic.com`; `cli` really shells out to a local `claude`.
 * **The envelope cipher.** `AGENTOS_MASTER_KEY` is threaded into a real
   `LocalEnvelopeSecretStore` even in mock mode, because `Step::Identity` mints a
   real Ed25519 key and seals it into a database column. A mock provider that
   invents a phone number costs nothing; a mock cipher costs an identity.
+
+Still fake regardless of any credential, and named as such on every boot: the
+**embedder** (a SHA-256 hash, so retrieval returns something and it is not the
+right thing) and the **employee secret vault** (an in-process plaintext map that
+forgets on restart — not the envelope cipher above, which is real).
 
 **The Policy Gate is loaded with `PolicyBook::default()`** — the empty platform
 layer, which grants nothing. An unconfigured gate denying everything is correct
@@ -242,11 +267,12 @@ spend caps only; `org::reserve` — the one that takes the team ceiling under a 
 lock — has no production call site. Wiring both is a change in `main.rs` and one
 function, and it is the highest-value change in the repository.
 
-Adapters that exist, are tested, and are not wired: Resend (email), Twilio
-(telephony, including the regulatory-bundle `pending_external` protocol),
-Browserbase plus our own CDP driver behind one trait. Email, telephony, browser
-and the secret store each ship a shared contract suite; the real adapters do not
-run it, only the mocks do.
+Email, telephony, browser and the secret store each ship a shared contract
+suite, and the real adapters now run it — Resend, Twilio and Browserbase each
+against a hermetic loopback HTTP server, no account and no network. That is what
+makes a vendor swap provable rather than hopeful. Resend runs it as
+`IdentityScope::AccountWide`, because its sending domain genuinely is one
+resource for the whole account rather than one per employee.
 
 Never built: voice (no STT, no TTS, no gateway — `Channel::Voice` is a policy
 channel and nothing more), payments (the port refuses with `not_configured`

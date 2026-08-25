@@ -66,7 +66,7 @@ const PROBE_SECS: u32 = 10;
 /// with the boot guard. It only carries the human half: where an operator gets
 /// the credential, and what a free authenticated GET against that provider
 /// looks like.
-const PROVIDERS: [(&str, &str, &str); 4] = [
+const PROVIDERS: [(&str, &str, &str); 3] = [
     ("email", "EMAIL_API_KEY", "resend.com -> API Keys"),
     (
         "telephony",
@@ -76,10 +76,26 @@ const PROVIDERS: [(&str, &str, &str); 4] = [
     (
         "browser",
         "BROWSER_API_KEY",
-        "your browser automation vendor",
+        "browserbase.com -> Settings, as `project-id:api-key`",
     ),
-    ("embedder", "EMBEDDER_API_KEY", "your embedding vendor"),
 ];
+
+/// The adapter no credential can make real, and what runs instead.
+///
+/// `EMBEDDER_API_KEY` used to be a row in [`PROVIDERS`], which meant exporting
+/// any string at all turned a MOCK verdict green while `Embedder` still had one
+/// variant and it was still a SHA-256 hash. A check that can be satisfied
+/// without changing what runs is worse than no check.
+///
+/// It keeps a line of its own, unlike the plaintext secret vault (which is
+/// named only in [`Config::adapter_summary`]), because retrieval *answering
+/// with the wrong documents* is a thing an operator will otherwise debug for a
+/// day.
+const PERMANENT_MOCK: (&str, &str) = (
+    "embedder",
+    "MOCK — a SHA-256 hash (`mock-sha256-1536`), not semantics: retrieval returns something and \
+     it is not the right thing. This build ships no real embedder, so no credential changes it.",
+);
 
 /// Every migration this binary carries, so "are the migrations applied?" is
 /// answered against the build rather than against a directory listing that may
@@ -326,13 +342,20 @@ pub fn inspect(get: &dyn Fn(&str) -> Option<String>) -> Report {
         },
     );
 
+    // The same one-line inventory the server logs at boot, on whichever verdict
+    // applies. It rides along rather than taking a line of its own because it
+    // is not a thing that can be *missing*: on a box with nothing set it would
+    // be a green check on a page of red ones, which is the reading this tool
+    // exists to prevent.
+    let adapters = config.adapter_summary();
     if refuses_to_boot {
         report.push(
             "boot",
             Status::Missing,
             format!(
                 "the server would REFUSE to start: {} would run as mocks. Set the credentials \
-                 named below, or AGENTOS_ALLOW_MOCKS=1 if this is a development box.",
+                 named below, or AGENTOS_ALLOW_MOCKS=1 if this is a development box. \
+                 Adapters would be: {adapters}",
                 config.mock_adapters.join(", ")
             ),
         );
@@ -340,14 +363,16 @@ pub fn inspect(get: &dyn Fn(&str) -> Option<String>) -> Report {
         report.push(
             "boot",
             Status::Ok,
-            "the server would start — with AGENTOS_ALLOW_MOCKS=1, which must not be set in any \
-             environment that matters",
+            format!(
+                "the server would start — with AGENTOS_ALLOW_MOCKS=1, which must not be set in \
+                 any environment that matters. Adapters: {adapters}"
+            ),
         );
     } else {
         report.push(
             "boot",
             Status::Ok,
-            "the server would start on real adapters",
+            format!("the server would start. Adapters: {adapters}"),
         );
     }
 
@@ -399,7 +424,6 @@ fn providers(
     get: &dyn Fn(&str) -> Option<String>,
     report: &mut Report,
 ) {
-    let mut any_real = false;
     for (adapter, var, source) in PROVIDERS {
         let mocked = config.mock_adapters.contains(&adapter);
         if mocked && blessed {
@@ -418,25 +442,16 @@ fn providers(
                 format!("{var} is not set — {source}"),
             );
         } else {
-            any_real = true;
             let (status, detail) = credential(adapter, var, get);
             report.push(adapter, status, format!("REAL — {var} is set; {detail}"));
         }
     }
 
-    // The truth an operator who has configured a real credential cannot get
-    // any other way, and the reason a green report is not yet the same as a
-    // working deployment. Only shown to them: on a box with nothing set it
-    // would be noise on top of a page of real answers.
-    if any_real {
-        report.push(
-            "wiring",
-            Status::Ok,
-            "NOTE: this build still constructs the in-memory adapters \
-             (agentos_app::mocks::ports) whatever the credentials above say. They gate boot and \
-             are verified live here; no code reads them yet.",
-        );
-    }
+    // Always, not only when something else is mocked. A report whose every
+    // other line is REAL would otherwise read as "all of this is live", and
+    // this port permanently is not.
+    let (adapter, detail) = PERMANENT_MOCK;
+    report.push(adapter, Status::Ok, detail);
 }
 
 /// A live check that costs nothing and changes nothing: one authenticated GET
@@ -497,13 +512,20 @@ fn credential(
                 ),
             }
         }
-        // Real adapters for these two exist nowhere in the workspace, so there
-        // is no endpoint to authenticate against and nothing a live check
-        // could tell anyone.
+        // Browserbase's only free authenticated GET is a project listing, and
+        // it is per-project rather than per-account: a wrong project id with a
+        // right key looks the same as the reverse. Reporting "not verified" is
+        // better than teaching an operator to rotate a key that was fine.
+        //
+        // ponytail: add the probe the day someone is actually burned by a bad
+        // browser credential — the adapter's first `ensure_context` says so
+        // clearly enough, and unlike email or telephony it costs nothing to
+        // discover late.
         _ => (
             Status::Ok,
-            "no live check: this build ships no real adapter for it, so the mock runs regardless"
-                .to_owned(),
+            format!(
+                "not verified here: {var} is checked by the first provisioning step that uses it"
+            ),
         ),
     }
 }
@@ -804,6 +826,16 @@ mod tests {
 
         assert!(!report.checks.is_empty());
         for check in &report.checks {
+            // One exemption, and it is the honest one: `Status::Missing` means
+            // "the operator has to set or fix something", and there is nothing
+            // to set for the embedder — this build ships no real one, so no
+            // environment can make its line green or red. Reporting it as
+            // missing would send somebody looking for a variable that does not
+            // exist. It still says MOCK, which is the part that matters.
+            if check.name == PERMANENT_MOCK.0 {
+                assert!(check.detail.contains("MOCK"), "{:?}", check.detail);
+                continue;
+            }
             assert_eq!(
                 check.status,
                 Status::Missing,

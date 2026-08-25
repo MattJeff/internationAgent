@@ -566,6 +566,28 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     assert_eq!(status, 200, "the replica is not ready: {ready:#}");
     assert_eq!(ready["ready"], true);
 
+    // -- and readiness says what is not real --------------------------------
+    //
+    // "The employee replied but the customer never got the mail" is debugged
+    // against a running replica, long after the boot log that said so scrolled
+    // away. This server runs entirely on mocks, so the probe has to name every
+    // one of them rather than answer a bare `ready: true`.
+    let mocked = ready["mock_adapters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/readyz must publish its adapter inventory: {ready:#}"));
+    for adapter in ["email", "telephony", "browser"] {
+        assert!(
+            mocked.iter().any(|name| name == adapter),
+            "{adapter} is a mock here and /readyz did not say so: {ready:#}"
+        );
+    }
+    assert!(
+        mocked
+            .iter()
+            .any(|name| name.as_str().is_some_and(|name| name.starts_with("llm"))),
+        "the model is a mock here too: {ready:#}"
+    );
+
     // -- SIGTERM stops the process, loops and all ---------------------------
     //
     // Each loop reporting that it drained is proof of both halves at once: it

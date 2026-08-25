@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use agentos_domain::action::E164;
-use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
+use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, TenantId};
 use agentos_domain::message::{Attachment, CanonicalMessage, Channel, Direction, ProviderRef};
 use agentos_domain::untrusted::Untrusted;
 use async_trait::async_trait;
@@ -311,7 +311,43 @@ pub fn verify_twilio_signature(
         .decode(provided.1.trim())
         .map_err(|_| SigError::NotBase64)?;
 
-    let signed = match body {
+    let expected = hmac_sha1(
+        auth_token.expose_for_transport().as_bytes(),
+        signing_string(url, body)?.as_bytes(),
+    );
+    if ct_eq(&expected, &provided) {
+        Ok(())
+    } else {
+        Err(SigError::Mismatch)
+    }
+}
+
+/// Produce the header [`verify_twilio_signature`] accepts.
+///
+/// The mirror image of the verifier, sharing its [`signing_string`] so the two
+/// cannot drift apart — which is the only way a signer is worth having.
+///
+/// This is a **test and fixture** tool: the real signatures are made by Twilio.
+/// It exists so that "is a real Twilio adapter behind this port, or the mock?"
+/// can be answered in-process, against a token only one of them was built with,
+/// without a callback from anybody.
+pub fn sign_twilio_signature(
+    auth_token: &Secret,
+    url: &str,
+    body: WebhookBody<'_>,
+) -> Result<String, SigError> {
+    Ok(BASE64.encode(hmac_sha1(
+        auth_token.expose_for_transport().as_bytes(),
+        signing_string(url, body)?.as_bytes(),
+    )))
+}
+
+/// The bytes Twilio's scheme actually MACs: the URL, then every form parameter
+/// sorted by name and concatenated as `name || value` — or, for JSON, the URL
+/// alone, whose `bodySHA256` is what ties the signature to the payload and is
+/// therefore checked here.
+fn signing_string(url: &str, body: WebhookBody<'_>) -> Result<String, SigError> {
+    Ok(match body {
         WebhookBody::Form(raw) => {
             let mut params: Vec<(String, String)> = url::form_urlencoded::parse(raw)
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -335,17 +371,7 @@ pub fn verify_twilio_signature(
             }
             url.to_owned()
         }
-    };
-
-    let expected = hmac_sha1(
-        auth_token.expose_for_transport().as_bytes(),
-        signed.as_bytes(),
-    );
-    if ct_eq(&expected, &provided) {
-        Ok(())
-    } else {
-        Err(SigError::Mismatch)
-    }
+    })
 }
 
 /// Length-checked, data-independent comparison. A byte-by-byte `==` on a MAC
@@ -709,10 +735,104 @@ impl TelephonyProvider for MockTelephony {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Contract suite
+// ---------------------------------------------------------------------------
+
+/// The instant the suite's identifiers are minted at, so a failure names the
+/// same ids twice in a row.
+const CONTRACT_T0: i64 = 1_700_000_000;
+
+/// Every [`TelephonyProvider`] must pass this. Panics on the first violation.
+///
+/// `pub`, and that is the point of it. It used to be private to this module's
+/// own tests, which meant the only implementation it could prove anything about
+/// was the mock — and a contract one adapter satisfies is a vendor swap nobody
+/// can check. [`crate::telephony_twilio`] now runs it against a hermetic HTTP
+/// server, so "the real client honours the same contract" is a test result
+/// rather than a hope.
+///
+/// Pure and idempotent paths only: it buys two numbers, sends three messages
+/// and gives one number back, all against whatever the caller points it at. The
+/// crash-window case needs fault injection and stays in this module's tests.
+pub async fn contract_suite<P: TelephonyProvider + ?Sized>(provider: &P) {
+    let now = DateTime::from_timestamp(CONTRACT_T0, 0).expect("valid timestamp");
+    let tenant_id = TenantId::new_v7(now);
+    let slug = Slug::parse("lena").expect("valid slug");
+    let ctx = EnsureCtx::new(tenant_id, EmployeeId::new_v7(now), slug.clone(), "phone");
+    let us = Region::new("us");
+
+    // -- ensure twice => ONE number, SAME external id ----------------------
+    let first = provider
+        .ensure_number(&ctx, &us)
+        .await
+        .expect("first ensure");
+    let second = provider
+        .ensure_number(&ctx.clone().retry(), &us)
+        .await
+        .expect("second ensure");
+    assert_eq!(
+        first, second,
+        "ensure must reconcile on the tag, not buy a second number"
+    );
+    assert_eq!(first.provider, PROVIDER);
+    assert!(!first.external_id.is_empty());
+
+    // A different employee is a different number, or the tag is being ignored
+    // and two people are sharing a phone.
+    let other = EnsureCtx::new(tenant_id, EmployeeId::new_v7(now), slug, "phone");
+    assert_ne!(
+        provider
+            .ensure_number(&other, &us)
+            .await
+            .expect("other ensure"),
+        first,
+        "two employees must not share one number"
+    );
+
+    // -- send is idempotent on the key -------------------------------------
+    let sms = OutboundSms {
+        from: E164::parse("+15005550006").expect("valid e164"),
+        to: E164::parse("+14158675309").expect("valid e164"),
+        body: "your order shipped".to_owned(),
+    };
+    let employee_id = EmployeeId::new_v7(now);
+    let key = IdempotencyKey::for_step(employee_id, "send:1");
+    let sent = provider.send_sms(&key, &sms).await.expect("first send");
+    assert_eq!(
+        provider.send_sms(&key, &sms).await.expect("replayed send"),
+        sent,
+        "the same idempotency key must return the same message id, not text twice"
+    );
+    assert_ne!(
+        provider
+            .send_sms(&IdempotencyKey::for_step(employee_id, "send:2"), &sms)
+            .await
+            .expect("distinct send"),
+        sent,
+        "distinct keys must produce distinct messages"
+    );
+
+    // -- release is idempotent and tolerant of an already-gone number ------
+    // All three are the same desired state, so all three succeed. `DELETE` is
+    // what actually stops the monthly charge, and an adapter that reported a
+    // failure here would strand the binding on a number still being billed.
+    provider.release(&first.binding()).await.expect("release");
+    provider
+        .release(&first.binding())
+        .await
+        .expect("releasing twice is the same desired state");
+    provider
+        .release(&ProviderBinding {
+            provider: PROVIDER.to_owned(),
+            external_id: "PN-never-bought".to_owned(),
+        })
+        .await
+        .expect("releasing what the provider no longer has is success");
+}
+
 #[cfg(test)]
 mod tests {
-    use agentos_domain::ids::Slug;
-
     use super::*;
 
     const TOKEN: &str = "tok3n-abc";
@@ -740,65 +860,10 @@ mod tests {
         IdempotencyKey::for_step(EmployeeId::new_v7(at(T0)), name)
     }
 
-    fn sms() -> OutboundSms {
-        OutboundSms {
-            from: E164::parse("+15005550006").unwrap(),
-            to: E164::parse("+14158675309").unwrap(),
-            body: "your order shipped".to_owned(),
-        }
-    }
-
     // -- the contract suite ------------------------------------------------
     //
-    // ponytail: generic over the trait but kept in `cfg(test)`. Promote it to
-    // a `pub mod contract` the day a second (real) adapter needs to run it.
-
-    /// Every telephony adapter must satisfy this.
-    async fn contract_suite<P: TelephonyProvider>(provider: &P) {
-        let ctx = ctx();
-        let us = Region::new("us");
-
-        // ensure_number is idempotent: same ctx, same number, both times.
-        let first = provider.ensure_number(&ctx, &us).await.unwrap();
-        let second = provider
-            .ensure_number(&ctx.clone().retry(), &us)
-            .await
-            .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.provider, PROVIDER);
-        assert!(!first.external_id.is_empty());
-
-        // A different step buys a different number.
-        let other = EnsureCtx::new(
-            ctx.tenant_id,
-            EmployeeId::new_v7(at(T0 + 1)),
-            ctx.slug.clone(),
-            "phone",
-        );
-        assert_ne!(
-            provider.ensure_number(&other, &us).await.unwrap(),
-            first,
-            "two employees must not share one number"
-        );
-
-        // Sends de-duplicate on the key, and differ across keys.
-        let k = key("send:1");
-        let id = provider.send_sms(&k, &sms()).await.unwrap();
-        assert_eq!(provider.send_sms(&k, &sms()).await.unwrap(), id);
-        assert_ne!(provider.send_sms(&key("send:2"), &sms()).await.unwrap(), id);
-
-        // Release gives the number back, twice over, and does not mind one it
-        // has never heard of: all three are the same desired state.
-        provider.release(&first.binding()).await.unwrap();
-        provider.release(&first.binding()).await.unwrap();
-        provider
-            .release(&ProviderBinding {
-                provider: PROVIDER.to_owned(),
-                external_id: "PN-never-bought".to_owned(),
-            })
-            .await
-            .unwrap();
-    }
+    // Lives at module level now, and is `pub`: `telephony_twilio` runs the same
+    // assertions against a hermetic fake Twilio.
 
     #[tokio::test]
     async fn mock_satisfies_the_contract() {
@@ -806,6 +871,35 @@ mod tests {
         contract_suite(&mock).await;
         // Two numbers were bought and exactly one of them was given back.
         assert_eq!(mock.number_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_mock_satisfies_the_contract_behind_a_dyn_reference() {
+        // The trait has to stay object-safe: `Ports` holds a `dyn`.
+        let provider: &dyn TelephonyProvider = &mock();
+        contract_suite(provider).await;
+    }
+
+    /// The signer is only worth having if it agrees with the verifier, and only
+    /// safe to have if it does not turn a wrong token into a valid signature.
+    #[tokio::test]
+    async fn the_signer_and_the_verifier_agree_and_a_wrong_token_does_not() {
+        let url = "https://agents.example.com/v1/webhooks/telephony";
+        let body = b"Body=hello&From=%2B14158675309";
+        let signature =
+            sign_twilio_signature(&Secret::new(TOKEN), url, WebhookBody::Form(body.as_slice()))
+                .expect("form bodies always sign");
+        let headers = vec![(TWILIO_SIGNATURE_HEADER.to_owned(), signature)];
+
+        mock()
+            .verify_webhook(url, WebhookBody::Form(body.as_slice()), &headers)
+            .expect("the token it was built with");
+        assert_eq!(
+            MockTelephony::new(at(T0), "some-other-token")
+                .verify_webhook(url, WebhookBody::Form(body.as_slice()), &headers)
+                .expect_err("a different token must not verify"),
+            SigError::Mismatch
+        );
     }
 
     /// The termination path: a released number stops existing at the provider,
