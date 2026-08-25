@@ -25,6 +25,93 @@
 //! module uses `call_tool_once` and treats "another round required" as a
 //! refusal. One authorization, one round trip.
 //!
+//! # There is one transport, it is HTTP, and there will not be a second
+//!
+//! MCP defines two transports. This module implements one of them, and the
+//! omission is a decision rather than a gap, so it is argued here — the day
+//! somebody wants to talk to a stdio server, this is the paragraph they have to
+//! beat.
+//!
+//! **What was asked for.** Every MCP server people actually ship is a stdio
+//! server: a command, spawned as a child process, JSON-RPC over its pipes. The
+//! real Orizn visa server is `npx -y orizn-visa-mcp`, and it is the exact case
+//! this product exists to serve. Adding
+//! `rmcp::transport::TokioChildProcess` next to
+//! [`StreamableHttpClientTransport`] is about fifteen lines.
+//!
+//! **Why those fifteen lines are not here.** A binding is a row in
+//! `mcp_servers`, written through `apps/server/src/routes/mcp.rs` by anyone
+//! holding a tenant API key (migration 0019). A stdio transport turns that row's
+//! payload from a URL into a **command line**, and the two are not variations on
+//! a theme:
+//!
+//! * A URL is checked by `resolve_and_vet`. There is a real, closed, checkable
+//!   property — "does this resolve somewhere globally routable" — and
+//!   `placement` is that property, written down. A command has no analogous
+//!   property. `sh`, `node -e`, `python -c` and `/proc/self/exe` are all
+//!   "a program", and an allowlist of permitted programs *is* the configuration,
+//!   which makes the tenant-supplied command redundant.
+//! * A URL reaches a process somebody else runs. A spawned command runs **as the
+//!   server**, in the server's process tree, with the server's environment —
+//!   which holds `DATABASE_URL`, the AES key `crate::secrets` decrypts every
+//!   tenant's credentials with, and every provider token in the deployment. The
+//!   SSRF defence above exists to stop an agent reading the cloud metadata
+//!   endpoint; a child process does not need the metadata endpoint, because it
+//!   already has `/proc/self/environ`.
+//! * None of the machinery below would notice. [`RiskClass`] classes what a tool
+//!   *does on the server side*, and `allowed_mcp_tools` names tools by handle.
+//!   Both reason about calls. A hostile binding does its work at spawn time,
+//!   before any tool is called, and every control in this file rules on calls.
+//!   Fail-closed on tool classification is not fail-closed on process creation.
+//!
+//! So the honest containment for a tenant-configurable stdio transport is a
+//! sandbox: a per-tenant container, a scrubbed environment, a read-only root, a
+//! seccomp profile, and a resource limit — a piece of infrastructure larger than
+//! this crate, and one whose absence would be invisible until the day it
+//! mattered. The rule this module already follows is that a control it cannot
+//! state is a control it does not have, and it cannot state that one.
+//!
+//! **The two shapes that were rejected, and why HTTP-only beat them.**
+//!
+//! *Stdio in the product, contained.* Rejected on the paragraph above: the
+//! containment is unbuilt, and shipping the transport first and the sandbox
+//! later means shipping remote code execution behind a `CHECK` constraint. The
+//! containment is the feature; the transport is the easy part.
+//!
+//! *An operator-level stdio bridge — a command named in the deployment's config
+//! rather than in a tenant's row.* This is the closest call, and it is genuinely
+//! safer: the operator already chooses the binary the server runs. But it buys
+//! that safety by asserting the operator is trusted, which is the same assertion
+//! HTTP-only makes with **no new code, no second configuration surface, and no
+//! second class of binding** for `Fleet` to route between. It would also fork
+//! this file's one clean sentence — *a binding is a URL, checked at bind time* —
+//! into two sentences with different security properties, and the second one
+//! would be the one nobody re-reads. An operator who wants a local stdio server
+//! can already have one, by running it and pointing a `private` binding at it,
+//! which is what [`Reach::Private`] is for and is why it exists.
+//!
+//! **What the operator therefore has to run.** One process per stdio server, in
+//! front of it, speaking Streamable HTTP. Off the shelf, and the command is
+//! exactly this:
+//!
+//! ```text
+//! npx -y supergateway --stdio "npx -y orizn-visa-mcp" \
+//!     --outputTransport streamableHttp --port 8931 --streamableHttpPath /mcp
+//! ```
+//!
+//! and then a binding at `http://127.0.0.1:8931/mcp` with `reach = 'private'`.
+//! That is a sidecar — the case [`Reach::Private`] was written for — and it is
+//! how `crates/app/tests/orizn.rs` reaches the real server, with the same
+//! command and no test-only path through this module. Writing our own proxy
+//! instead would be re-implementing a JSON-RPC pipe pump in order to avoid
+//! depending on one.
+//!
+//! The containment moves with the process: the bridge runs where the operator
+//! puts it, under whatever the operator's platform gives it, and this server
+//! keeps talking to a socket. That is the whole argument — not that stdio is
+//! bad, but that *spawning* is a different privilege from *dialling*, and this
+//! process should only ever do the second one.
+//!
 //! # Risk classes are declared, not discovered
 //!
 //! Every discovered tool gets a [`RiskClass`]. It comes from the operator's
@@ -514,12 +601,34 @@ impl McpServer {
         let client = serve_client_with_lifecycle_and_ct(
             info,
             transport,
-            // Sessionless, per MCP 2026-07-28: no `initialize`, no session id,
-            // the protocol version travels on every request. ponytail: switch
-            // this to `Auto` the day a server that predates the revision has
-            // to be supported — it is the same one literal.
-            ClientLifecycleMode::Discover {
+            // `Auto`, not `Discover`. The note that used to sit here said to
+            // switch it "the day a server that predates the revision has to be
+            // supported — it is the same one literal", and that day arrived the
+            // first time this client was pointed at a server somebody else
+            // wrote. `Discover` is sessionless — no `initialize`, no session id,
+            // the protocol version on every request — and `rmcp` is explicit
+            // that it "does not fall back; a legacy server is an error". Every
+            // MCP server in the wild today is that error: the reference SDKs
+            // answer `server/discover` with `-32601 Method not found`, and the
+            // real Orizn server (2025-06-18) is one of them, so `Discover` made
+            // `bind` a function that could not bind anything a tenant owns.
+            //
+            // `Auto` probes with `server/discover` first and falls back to the
+            // legacy `initialize` handshake on a correlated JSON-RPC error or
+            // after ten seconds of silence. It costs one extra round trip at
+            // bind time — which happens once, in a background loop, never on a
+            // turn — and it buys the entire installed base.
+            //
+            // `legacy_version` is `V_2025_06_18` rather than `None` (which would
+            // leave `ClientInfo`'s own `LATEST`, currently 2025-11-25) because
+            // the fallback is for servers that are *behind*, and a fallback that
+            // opens by naming a revision older servers reject is a fallback that
+            // fails on the servers it exists for. 2025-06-18 is the oldest
+            // revision that still carries the tool-annotation fields
+            // `RiskClass::from_hints` reads.
+            ClientLifecycleMode::Auto {
                 preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_06_18),
             },
             ct,
         )

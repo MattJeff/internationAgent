@@ -288,12 +288,13 @@ pub(crate) fn plan_of(charter: &Charter) -> Result<Vec<(&'static str, String)>, 
                     .collect()),
             }
         }
-        // The three packs in `rolepack_service` share one `Task` and one
+        // The four packs in `rolepack_service` share one `Task` and one
         // `Stage`, so they share one arm each and one helper — the branch above
         // is written twice because the two older packs have neither in common.
         Charter::Support { objective } => service_plan(objective.plan()),
         Charter::Growth { objective } => service_plan(objective.plan()),
         Charter::Finance { objective } => service_plan(objective.plan()),
+        Charter::EntryRequirements { objective } => service_plan(objective.plan()),
     }
 }
 

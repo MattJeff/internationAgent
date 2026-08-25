@@ -36,5 +36,19 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+[features]
+# `tests/orizn.rs`'s one live test: it starts a stdio→HTTP MCP bridge in front of
+# the real `orizn-visa-mcp` server and dials it through `mcp::McpServer::bind`.
+#
+# A feature and not a runtime skip, and the difference is `scripts/test.sh`. That
+# script fails the build when a test prints `SKIP:` — because ~34 tests in this
+# workspace skip themselves without a database and a green run of nothing is the
+# one failure mode nobody notices. A test that needs `npx` and the open internet
+# cannot satisfy that guard by being satisfiable, so it opts out of the default
+# build entirely: `#[cfg(feature = "live-orizn")]` means the test is *absent*
+# from a normal run rather than present and quietly passing. Run it with
+# `cargo test -p agentos-app --features live-orizn`.
+live-orizn = []
+
 [dev-dependencies]
 trybuild.workspace = true

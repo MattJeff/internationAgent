@@ -830,7 +830,7 @@ Kind regards, Accounts Payable";
             );
             all
         };
-        assert_eq!(briefings.len(), 5, "a pack was added without landing here");
+        assert_eq!(briefings.len(), 6, "a pack was added without landing here");
 
         for (role, briefing) in briefings {
             let prompt = SystemPrompt::new(briefing).with_credential(&secret_ref("smtp-password"));

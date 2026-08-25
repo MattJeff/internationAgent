@@ -175,6 +175,20 @@ enum ObjectiveBody {
         #[serde(default)]
         obligations: Vec<String>,
     },
+    #[serde(rename = "entry-requirements")]
+    EntryRequirements {
+        #[serde(default)]
+        destinations: String,
+        #[serde(default)]
+        passports: Vec<String>,
+        /// How stale a rule may get before it is due, in days. `u32` and not
+        /// `Option<u32>` to match `Support::first_response_hours`: zero is the
+        /// value that means nobody said, and it is a `Gap` rather than a 400,
+        /// because an operator who has not picked a freshness bar gets the
+        /// question back and not a rejection.
+        #[serde(default)]
+        max_age_days: u32,
+    },
 }
 
 /// Minor units and an ISO-4217 code — the shape `Money` serialises as, so what
@@ -248,6 +262,22 @@ impl ObjectiveBody {
                     period,
                     currency: parse_currency(currency)?,
                     obligations,
+                },
+            }),
+            // No `country()` on either field, unlike every other objective with
+            // a place in it: `Corridors` is prose by construction, because the
+            // visa tools take ISO-3166 alpha-3 and `CountryCode` is alpha-2, and
+            // because "the Schengen area" is a real answer to "which
+            // destinations". The argument is on the type.
+            ObjectiveBody::EntryRequirements {
+                destinations,
+                passports,
+                max_age_days,
+            } => Ok(Charter::EntryRequirements {
+                objective: rolepack_service::Corridors {
+                    destinations,
+                    passports,
+                    max_age_days,
                 },
             }),
         }

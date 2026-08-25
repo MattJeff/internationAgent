@@ -180,7 +180,7 @@ impl CharterError {
 /// genuinely different. A trait here would be one method per pack with a
 /// different return type, which is a match written badly.
 ///
-/// # Why only two of the five variants carry their pack
+/// # Why only two of the six variants carry their pack
 ///
 /// [`Charter::Purchasing`] and [`Charter::Sales`] hold a
 /// [`RolePack`](crate::rolepack::RolePack) because their plans *read* it — the
@@ -189,7 +189,7 @@ impl CharterError {
 /// that has narrowed the limits hands the narrowed pack back and the plan
 /// speaks about what that employee may really do.
 ///
-/// The three in [`crate::rolepack_service`] share one `RolePack` type between
+/// The four in [`crate::rolepack_service`] share one `RolePack` type between
 /// them and their plans read nothing off it, so carrying one would buy nothing
 /// and cost the invariant that matters here: with a shared type, a variant
 /// holding a pack is a variant that can hold the *wrong* pack, and
@@ -228,6 +228,11 @@ pub enum Charter {
         /// The period, its currency, and what has to be settled or filed.
         objective: rolepack_service::Books,
     },
+    /// Keeping the entry-requirement data right — the product's own upkeep.
+    EntryRequirements {
+        /// Which corridors this seat owns, and how stale a rule may get.
+        objective: rolepack_service::Corridors,
+    },
 }
 
 impl Charter {
@@ -244,6 +249,7 @@ impl Charter {
             Charter::Support { .. } => rolepack_service::CUSTOMER_SUCCESS,
             Charter::Growth { .. } => rolepack_service::GROWTH,
             Charter::Finance { .. } => rolepack_service::FINANCE,
+            Charter::EntryRequirements { .. } => rolepack_service::ENTRY_REQUIREMENTS,
         }
     }
 
@@ -255,6 +261,9 @@ impl Charter {
             Charter::Support { .. } => rolepack_service::RolePack::customer_success().briefing(),
             Charter::Growth { .. } => rolepack_service::RolePack::growth().briefing(),
             Charter::Finance { .. } => rolepack_service::RolePack::finance().briefing(),
+            Charter::EntryRequirements { .. } => {
+                rolepack_service::RolePack::entry_requirements().briefing()
+            }
         }
     }
 
@@ -287,6 +296,9 @@ impl Charter {
                 .clone(),
             Charter::Growth { .. } => rolepack_service::RolePack::growth().proposable().clone(),
             Charter::Finance { .. } => rolepack_service::RolePack::finance().proposable().clone(),
+            Charter::EntryRequirements { .. } => rolepack_service::RolePack::entry_requirements()
+                .proposable()
+                .clone(),
         };
         SystemPrompt::new(format!("{identity}\n\n{}", self.briefing())).with_proposable(proposable)
     }
@@ -312,6 +324,7 @@ impl Charter {
             Charter::Support { objective } => steps_of(&objective.plan()),
             Charter::Growth { objective } => steps_of(&objective.plan()),
             Charter::Finance { objective } => steps_of(&objective.plan()),
+            Charter::EntryRequirements { objective } => steps_of(&objective.plan()),
         };
         format!(
             "Your standing objective, as a plan. Work it in order; a stage you cannot finish is \
@@ -406,6 +419,9 @@ impl Charter {
             rolepack_service::FINANCE => Ok(Charter::Finance {
                 objective: books_objective(objective)?,
             }),
+            rolepack_service::ENTRY_REQUIREMENTS => Ok(Charter::EntryRequirements {
+                objective: corridors_objective(objective)?,
+            }),
             _ => Err(CharterError::Corrupt("role")),
         }
     }
@@ -445,6 +461,11 @@ impl Charter {
                 // this back and nothing else.
                 "currency": objective.currency.map(Currency::code),
                 "obligations": objective.obligations,
+            }),
+            Charter::EntryRequirements { objective } => json!({
+                "destinations": objective.destinations,
+                "passports": objective.passports,
+                "max_age_days": objective.max_age_days,
             }),
         }
     }
@@ -607,6 +628,32 @@ fn books_objective(raw: &Value) -> Result<rolepack_service::Books, CharterError>
     })
 }
 
+/// An entry-requirements objective, re-parsed rather than deserialised. Same
+/// reasoning as [`buying_objective`].
+///
+/// `max_age_days` goes through `u32::try_from` for the reason
+/// [`buying_objective`]'s `quantity` does: a column holding `4294967296` is a
+/// freshness bar that silently wraps, and a `Corrupt("max_age_days")` naming
+/// the field is what an operator can act on. There is no [`CountryCode`] here
+/// and that is deliberate — see [`rolepack_service::Corridors`], whose fields
+/// are prose because the tools downstream take alpha-3 and an operator's
+/// "the Schengen area" is not a country at all.
+fn corridors_objective(raw: &Value) -> Result<rolepack_service::Corridors, CharterError> {
+    Ok(rolepack_service::Corridors {
+        destinations: raw
+            .get("destinations")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("destinations"))?
+            .to_owned(),
+        passports: strings(raw.get("passports")).ok_or(CharterError::Corrupt("passports"))?,
+        max_age_days: raw
+            .get("max_age_days")
+            .and_then(Value::as_u64)
+            .and_then(|days| u32::try_from(days).ok())
+            .ok_or(CharterError::Corrupt("max_age_days"))?,
+    })
+}
+
 /// A JSON string, or an absent one. `None` is the corruption: a key that is
 /// present and is not a string.
 fn optional_string(raw: Option<&Value>) -> Option<Option<String>> {
@@ -618,8 +665,8 @@ fn optional_string(raw: Option<&Value>) -> Option<Option<String>> {
 
 /// A plan, rendered as the lines [`Charter::brief`] joins.
 ///
-/// The three packs in [`crate::rolepack_service`] share one `Task` type, so
-/// they share this instead of three identical closures.
+/// The four packs in [`crate::rolepack_service`] share one `Task` type, so
+/// they share this instead of four identical closures.
 fn steps_of(plan: &[rolepack_service::Task]) -> Vec<String> {
     plan.iter()
         .map(|task| format!("{}: {}", task.stage, task.instruction))
@@ -1980,6 +2027,13 @@ mod tests {
                     obligations: vec!["supplier invoices".to_owned()],
                 },
             },
+            Charter::EntryRequirements {
+                objective: rolepack_service::Corridors {
+                    destinations: "the Schengen area".to_owned(),
+                    passports: vec!["IND".to_owned(), "NGA".to_owned()],
+                    max_age_days: 90,
+                },
+            },
         ]
     }
 
@@ -2176,6 +2230,7 @@ mod tests {
                 "customer-success",
                 "growth",
                 "finance",
+                "entry-requirements",
             ]
         );
 
@@ -2188,6 +2243,12 @@ mod tests {
             "Customer-Success",
             "customer-success ",
             "cfo",
+            // The near misses for the newest name, in the three spellings
+            // somebody would actually type: the singular, the underscore, and
+            // the job title rather than the role handle.
+            "entry-requirement",
+            "entry_requirements",
+            "visa-data",
         ] {
             assert!(
                 matches!(
