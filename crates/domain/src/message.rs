@@ -38,17 +38,27 @@ pub enum Channel {
     A2a,
     /// The human operator console.
     Web,
+    /// One of *our* employees to another, inside one tenant.
+    ///
+    /// The odd one out: nothing leaves the process, there is no provider and
+    /// there is no counterparty. It is a `Channel` anyway because a message on
+    /// it is a `messages` row like any other and because a policy has to be
+    /// able to allow or deny it — `allowed_channels` is the knob, and an
+    /// employee whose policy does not list this one cannot talk to a colleague
+    /// at all. Deny by default, like every other channel.
+    Internal,
 }
 
 impl Channel {
     /// Every channel, so a new variant cannot slip past the tests.
-    pub const ALL: [Channel; 6] = [
+    pub const ALL: [Channel; 7] = [
         Channel::Email,
         Channel::Sms,
         Channel::Whatsapp,
         Channel::Voice,
         Channel::A2a,
         Channel::Web,
+        Channel::Internal,
     ];
 
     /// Stable wire name, identical to the serde representation.
@@ -60,6 +70,7 @@ impl Channel {
             Channel::Voice => "voice",
             Channel::A2a => "a2a",
             Channel::Web => "web",
+            Channel::Internal => "internal",
         }
     }
 }

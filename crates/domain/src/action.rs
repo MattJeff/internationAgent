@@ -499,11 +499,12 @@ pub enum ActionKind {
     CredentialChange,
     DataDelete,
     CharterSet,
+    InternalSend,
 }
 
 impl ActionKind {
     /// Every discriminant. Iterate this to prove a rule covers the whole space.
-    pub const ALL: [ActionKind; 14] = [
+    pub const ALL: [ActionKind; 15] = [
         ActionKind::EmailSend,
         ActionKind::SmsSend,
         ActionKind::WhatsappSend,
@@ -518,6 +519,7 @@ impl ActionKind {
         ActionKind::CredentialChange,
         ActionKind::DataDelete,
         ActionKind::CharterSet,
+        ActionKind::InternalSend,
     ];
 
     /// Stable metric label.
@@ -537,6 +539,7 @@ impl ActionKind {
             ActionKind::CredentialChange => "credential_change",
             ActionKind::DataDelete => "data_delete",
             ActionKind::CharterSet => "charter_set",
+            ActionKind::InternalSend => "internal_send",
         }
     }
 }
@@ -614,12 +617,36 @@ pub enum Action {
     CharterSet {
         subordinate: EmployeeId,
     },
+
+    /// Say something to a colleague: the one **inward** action.
+    ///
+    /// Every other variant above leaves the company, `CharterSet` excepted.
+    /// This one does not leave
+    /// the process — it writes a `messages` row for another employee of the
+    /// same tenant and wakes it. It is an [`Action`] anyway because the gate is
+    /// the only thing that may mint the right to perform an effect, and waking
+    /// a colleague is an effect: it spends that colleague's daily turn budget.
+    ///
+    /// `to` is the colleague's [`Slug`] rather than an
+    /// [`EmployeeId`](crate::ids::EmployeeId), for the same reason
+    /// [`Action::EmailSend`] carries an address rather than a resolved
+    /// contact: a slug is unique per tenant and the tenant is the transaction
+    /// the ruling runs in, so resolution belongs to the executor and not to
+    /// the rule.
+    ///
+    /// It deliberately carries **no `kind` field**. Whether an *order*
+    /// specifically is legitimate — "may X direct Y" — is the org chart's
+    /// question, and the org chart is not something an `Action` can hold. See
+    /// `app::inbound::may_message`, which is the seam.
+    InternalSend {
+        to: Slug,
+    },
 }
 
 impl Action {
     /// Alias for [`ActionKind::ALL`], so `Action::ALL_DISCRIMINANTS` reads at
     /// the call site.
-    pub const ALL_DISCRIMINANTS: [ActionKind; 14] = ActionKind::ALL;
+    pub const ALL_DISCRIMINANTS: [ActionKind; 15] = ActionKind::ALL;
 
     /// Which discriminant this is. Exhaustive by construction — no `_` arm.
     pub const fn kind(&self) -> ActionKind {
@@ -638,6 +665,7 @@ impl Action {
             Action::CredentialChange { .. } => ActionKind::CredentialChange,
             Action::DataDelete { .. } => ActionKind::DataDelete,
             Action::CharterSet { .. } => ActionKind::CharterSet,
+            Action::InternalSend { .. } => ActionKind::InternalSend,
         }
     }
 
@@ -652,7 +680,26 @@ impl Action {
             | Action::BrowserRead { .. }
             | Action::BrowserWrite { .. }
             | Action::McpCall { .. }
-            | Action::A2aSend { .. } => Risk::Low,
+            | Action::A2aSend { .. }
+            // Low, and this is the one entry here worth arguing.
+            //
+            // `High` would read as the cautious choice and it is the wrong
+            // one: `evaluate` refuses a high-risk action derived from
+            // untrusted input, so a `High` internal message would mean an
+            // employee that has just read a supplier's email cannot answer the
+            // question its manager asked it — which is the feature. It would
+            // also disappear from the tool catalogue for exactly the turns
+            // that most need to say "I have been asked to do something odd".
+            //
+            // What makes `Low` safe is that the danger of an internal message
+            // is not in the *sending*, it is in what the message counts as at
+            // the *receiver*. That is handled where it belongs: the message is
+            // stored with the sending turn's own trust label, and an untrusted
+            // one arrives at the recipient fenced, as data. Blocking the send
+            // would protect nothing that is not already protected there, and
+            // would break the only channel by which a tainted employee can
+            // report what happened to it.
+            | Action::InternalSend { .. } => Risk::Low,
 
             Action::FileUpload { .. }
             | Action::PaymentCreate { .. }
@@ -874,7 +921,21 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ActionKind::ALL.len(), "duplicate discriminant");
-        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 14);
+        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 15);
+    }
+
+    /// Thirteen of the fifteen actions leave the company. The two that do not
+    /// are `CharterSet` and this one, the internal channel, and it is
+    /// deliberately `Low`: see the paragraph on
+    /// [`Action::risk`].
+    #[test]
+    fn talking_to_a_colleague_is_low_risk_and_has_no_counterparty() {
+        let internal = Action::InternalSend {
+            to: Slug::parse("bruno").unwrap(),
+        };
+        assert_eq!(internal.kind(), ActionKind::InternalSend);
+        assert_eq!(internal.risk(), Risk::Low);
+        assert_eq!(internal.kind().as_str(), "internal_send");
     }
 
     #[test]

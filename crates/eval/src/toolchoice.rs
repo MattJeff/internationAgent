@@ -274,8 +274,15 @@ pub fn evaluate() -> Surface {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    let wired = trusted == ["send_email", "call_mcp_tool", "pay"]
-        && untrusted == ["send_email", "call_mcp_tool"];
+    // Pinned by name, not by count, and deliberately so: a check that only
+    // counted would pass a catalogue in which `pay` had been swapped for
+    // something else high-risk. `message_colleague` is on both lists — the
+    // internal channel is Low-risk, because an employee that has just read
+    // something hostile is the one that most needs to be able to say so, and
+    // what keeps that safe is the trust label its message carries rather than
+    // the tool being withheld. See `app::inbound`'s module docs.
+    let wired = trusted == ["send_email", "call_mcp_tool", "pay", "message_colleague"]
+        && untrusted == ["send_email", "call_mcp_tool", "message_colleague"];
     rows.push(
         Row::ok(
             "untrusted turns are not shown `pay`",

@@ -4,7 +4,7 @@
 //! violated and both of which are now enforced by the compiler:
 //!
 //! 1. **No default-open fallthrough.** [`evaluate`] matches every [`Action`]
-//!    variant by name. There is no `_` arm, so the day a fourteenth action is
+//!    variant by name. There is no `_` arm, so the day a sixteenth action is
 //!    added the build breaks instead of the action being silently permitted.
 //!    The old code ended in `_ => PolicyDecision::Allow`, which is how
 //!    "sign this contract" became a thing an employee could do unsupervised.
@@ -724,6 +724,35 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
             Decision::Allow
         }
+
+        // The channel allowlist and **nothing else**, deliberately not through
+        // `channel_rules`.
+        //
+        // `channel_rules` also charges the cold-outreach budget, and a
+        // colleague is not a counterparty: an employee that has already
+        // emailed its twenty new suppliers today must still be able to answer
+        // the question its manager asked it. Routing this through the same
+        // helper would spend a budget meant for strangers on an internal
+        // conversation, and would make "who may I still write to today"
+        // depend on how much the company talked to itself. The other half of
+        // that promise is in `app::gate`, where `counterparty()` returns
+        // `None` for this action so an internal message never *enlarges* the
+        // budget either.
+        //
+        // Who specifically may be written to is not decided here. This
+        // evaluator is pure and an org chart is a table; `app::inbound::send`
+        // resolves the recipient and asks `may_message`, in the transaction
+        // that does the write.
+        Action::InternalSend { .. } => {
+            if allowed_channels.contains(&Channel::Internal) {
+                Decision::Allow
+            } else {
+                Decision::deny(no_match(
+                    allowed_channels.is_empty(),
+                    DenyReason::ChannelNotAllowed,
+                ))
+            }
+        }
     }
 }
 
@@ -848,6 +877,7 @@ mod tests {
             Action::CharterSet {
                 subordinate: EmployeeId::from_uuid(uuid::Uuid::from_u128(4)),
             },
+            Action::InternalSend { to: slug("bruno") },
         ]
     }
 

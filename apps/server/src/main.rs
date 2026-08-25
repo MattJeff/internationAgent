@@ -44,7 +44,9 @@ use std::time::{Duration, Instant};
 
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
-use agentos_app::inbound::{BlobStore, InMemoryBlobs, Secret, record_raw_email_notice};
+use agentos_app::inbound::{
+    self, BlobStore, Errand, InMemoryBlobs, Secret, Thread, record_raw_email_notice,
+};
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::prompt::SystemPrompt;
@@ -808,19 +810,46 @@ impl Agent {
             let message_id = uuid_field(event, "message_id").ok_or("this turn names no message")?;
 
             // The message that woke us, and the thread it is on. Every column
-            // here except `channel` is the counterparty's own text, so it goes
-            // straight into the frame below and nowhere else.
-            let (channel, sender, subject, body): (String, String, Option<String>, String) =
-                sqlx::query_as(
-                    "SELECT c.channel, m.sender, m.subject, m.body \
-                       FROM messages m JOIN conversations c ON c.id = m.conversation_id \
-                      WHERE m.id = $1 AND m.conversation_id = $2",
-                )
-                .bind(message_id)
-                .bind(conversation_id.as_uuid())
-                .fetch_one(&mut ***tx)
-                .await
-                .map_err(|err| format!("could not read the message this turn is about: {err}"))?;
+            // here except `channel`, `trust_label` and `internal_kind` is the
+            // writer's own text, so it goes straight into the frame below and
+            // nowhere else.
+            //
+            // `trust_label` and `internal_kind` are new to this read and they
+            // are the internal channel's whole discriminant: `internal_kind` is
+            // NOT NULL exactly on `channel = 'internal'` (migration 0025), and
+            // `trust_label` on such a row is the label of the *colleague's own
+            // turn* when it composed the message.
+            #[allow(clippy::type_complexity)]
+            let (channel, sender, subject, body, trust_label, internal_kind): (
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT c.channel, m.sender, m.subject, m.body, m.trust_label, m.internal_kind \
+                   FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+                  WHERE m.id = $1 AND m.conversation_id = $2",
+            )
+            .bind(message_id)
+            .bind(conversation_id.as_uuid())
+            .fetch_one(&mut ***tx)
+            .await
+            .map_err(|err| format!("could not read the message this turn is about: {err}"))?;
+
+            // `None` for every message from outside, which is every message
+            // this handler had before the internal channel existed — so the
+            // path below it is untouched.
+            let errand = internal_kind.as_deref().and_then(Errand::parse);
+            // Fails closed: anything that is not the exact word `trusted` is
+            // treated as third-party content. A column that has been widened,
+            // corrupted or written by a future version costs one turn its
+            // high-risk tools rather than laundering a taint.
+            let composed_by = match trust_label.as_str() {
+                "trusted" => agentos_domain::untrusted::TrustLabel::Trusted,
+                _ => agentos_domain::untrusted::TrustLabel::Untrusted,
+            };
 
             let employee = employee_store::load(tx, employee_id)
                 .await
@@ -858,22 +887,14 @@ impl Agent {
                 subject.clone().unwrap_or_default()
             ));
 
-            // The same text is also the retrieval query, and that is a
-            // deliberate choice with a paragraph behind it in
-            // `agentos_app::knowledge::Recall::question`. Two things about this
-            // call are load-bearing here: it takes a connection of its own
-            // rather than `tx`, because a retrieval that times out has its
-            // future dropped and that must not happen to the transaction which
-            // still has to record the reply; and it cannot fail, so there is no
-            // `?` on this line and a database having a bad minute costs the
-            // employee its documents rather than the customer an answer.
-            let recalled = knowledge::recall(
-                &self.db,
-                Embedder::default(),
-                event.tenant_id,
-                &knowledge::Recall::new(&inbound, Some(employee_id)),
-            )
-            .await;
+            // Questions this employee asked a colleague and never got an answer
+            // to, as one sentence built from a slug and a date — see
+            // `inbound::Outstanding` for why the question's own text is
+            // deliberately not in it. This is what stops an unanswered question
+            // becoming a thing nobody is waiting for.
+            let outstanding = inbound::outstanding_note(tx, employee_id)
+                .await
+                .map_err(|err| format!("could not read this employee's open questions: {err}"))?;
 
             let principal = ActingAs::employee(event.tenant_id, employee_id);
             // The one port that is per-tenant. An unbound tenant gets an empty
@@ -892,7 +913,13 @@ impl Agent {
                 prompt,
                 self.model,
                 employee.address().to_string(),
-            );
+            )
+            // What the employee may answer or hand over: this thread and no
+            // other. It comes off the event, so the model has no id to swap.
+            .on_thread(Thread {
+                conversation_id,
+                message_id,
+            });
 
             // Three things reach the model, and the order is the argument.
             //
@@ -914,8 +941,58 @@ impl Agent {
             if let Some(charter) = &charter {
                 context = context.with_task(charter.brief());
             }
-            let context = recalled
-                .into_context(context.with_untrusted(&inbound, &format!("message-{message_id}")));
+            if let Some(note) = outstanding {
+                context = context.with_task(note);
+            }
+
+            // The fourth thing, and the only one that is not a message from
+            // outside: a colleague.
+            //
+            // `inbound::into_context` owns the decision — instruction or quoted
+            // material — and makes it from `composed_by`, the trust label the
+            // *sending* turn had. This handler deliberately does not have an
+            // opinion: putting the branch here would be a second place for
+            // "internal traffic is trusted, it came from our own employee" to
+            // be written, and that sentence is precisely the laundering bug.
+            //
+            // No knowledge recall on this path. The recall query is the text
+            // that arrived, and retrieving the company's documents against a
+            // colleague's order is neither what the store is for nor free —
+            // and on the untrusted branch it would let a relayed injection
+            // choose which documents get pulled into the turn.
+            let context = match errand {
+                Some(errand) => inbound::into_context(
+                    context,
+                    &sender,
+                    errand,
+                    Untrusted::new(body.clone()),
+                    composed_by,
+                    message_id,
+                ),
+                None => {
+                    // The same text is also the retrieval query, and that is a
+                    // deliberate choice with a paragraph behind it in
+                    // `agentos_app::knowledge::Recall::question`. Two things
+                    // about this call are load-bearing here: it takes a
+                    // connection of its own rather than `tx`, because a
+                    // retrieval that times out has its future dropped and that
+                    // must not happen to the transaction which still has to
+                    // record the reply; and it cannot fail, so there is no `?`
+                    // on this line and a database having a bad minute costs the
+                    // employee its documents rather than the customer an
+                    // answer.
+                    let recalled = knowledge::recall(
+                        &self.db,
+                        Embedder::default(),
+                        event.tenant_id,
+                        &knowledge::Recall::new(&inbound, Some(employee_id)),
+                    )
+                    .await;
+                    recalled.into_context(
+                        context.with_untrusted(&inbound, &format!("message-{message_id}")),
+                    )
+                }
+            };
 
             let cancel = self.cancel.child_token();
             let deadline = tokio::spawn({

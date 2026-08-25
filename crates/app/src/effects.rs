@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::IdempotencyKey;
+use agentos_domain::ids::{IdempotencyKey, Slug};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
@@ -62,6 +62,7 @@ use chrono::Utc;
 use serde_json::{Map, Value, json};
 
 use crate::gate::{Authorizable, Authorized, Principal};
+use crate::inbound::{self, Delivered, Errand, InternalError, Thread};
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -174,6 +175,18 @@ subject!(
     /// its own.
     A2aSend { peer: Domain } => A2aSend
 );
+subject!(
+    /// Say something to a colleague, by short name.
+    ///
+    /// The only inward subject, and the only one whose trust flavour is read
+    /// back out again: [`Effects::send_internal`] asks the token whether it is
+    /// an `InternalSend` or an `Untrusted<InternalSend>` and stores the answer
+    /// on the message. That is the whole anti-laundering mechanism, and it
+    /// works because the two are different types the entire way through the
+    /// gate — there is nothing for a caller to declare and nothing for a model
+    /// to say.
+    InternalSend { to: Slug } => InternalSend
+);
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -253,6 +266,24 @@ impl RenderedWhatsapp {
     }
 }
 
+/// What one employee is saying to another. The recipient is on the token.
+///
+/// There is no trust field, and there must not be one: the message's label
+/// comes off the *type* of the token — see [`Effects::send_internal`] — so
+/// nothing on the way to a colleague's inbox can be told a lie about where the
+/// words came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalNote {
+    /// Order, question, answer or handover.
+    pub errand: Errand,
+    /// What to say.
+    pub body: String,
+    /// The thread the sending turn is on, when it is on one. Required by
+    /// [`Errand::Answer`] and [`Errand::Handover`], which are both *about* it;
+    /// ignored by the other two.
+    pub thread: Option<Thread>,
+}
+
 /// Where the money goes and what it is for. The amount is on the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInstruction {
@@ -312,9 +343,12 @@ pub trait PaymentProvider: Send + Sync {
 
 /// Why an authorised effect did not happen.
 ///
-/// Note what this enum does *not* have: a variant for "not allowed". By the
-/// time anything here runs the gate has already ruled; a refusal is a
-/// [`crate::gate::Denied`] and never reaches this module.
+/// Note what this enum does *not* have: a variant for "the policy says no". By
+/// the time anything here runs the gate has already ruled; a policy refusal is
+/// a [`crate::gate::Denied`] and never reaches this module.
+///
+/// [`EffectError::Refused`] is not that. It is the *world* saying no to an
+/// action the policy permits — see its own note.
 #[derive(Debug, thiserror::Error)]
 pub enum EffectError {
     /// The provider refused, failed, or is waiting on someone external.
@@ -326,6 +360,24 @@ pub enum EffectError {
     /// `portal.example.com`; this navigation goes somewhere else.
     #[error("step leaves the authorized domain {0}")]
     OutOfScope(Domain),
+
+    /// The effect was authorised and could still not be performed, because
+    /// something read at write time said no.
+    ///
+    /// Only [`Effects::send_internal`] produces one today, and the three
+    /// reasons it does are all facts about the *recipient*: there is no such
+    /// colleague on this employee's team, the thread being answered or handed
+    /// over is not this employee's, or the colleague has no turns left in its
+    /// day. None of the three is expressible as an [`Action`] — an `Action`
+    /// carries a parsed subject and no org chart and no ledger — so the gate
+    /// cannot rule on them, and pushing them into it would mean a second
+    /// transaction between the check and the write for a team membership or a
+    /// turn budget to change in.
+    ///
+    /// The payload is a closed code, because it is handed back to a model as a
+    /// failed tool result and it is what teaches it to stop asking.
+    #[error("refused: {0}")]
+    Refused(&'static str),
 
     /// The effect could not be recorded, so it is reported as failed. The audit
     /// row and the effect are one unit: an unrecorded effect is worse than a
@@ -340,6 +392,7 @@ impl EffectError {
         match self {
             EffectError::Provider(err) => err.code(),
             EffectError::OutOfScope(_) => "out_of_scope",
+            EffectError::Refused(code) => code,
             EffectError::Unavailable(_) => "unavailable",
         }
     }
@@ -539,6 +592,104 @@ impl Effects {
             "provider_message_id": paid.as_ref().ok().map(ProviderMessageId::as_str),
         }));
         self.record(&ok, detail, paid).await
+    }
+
+    /// Say something to the colleague named on the token, and wake them.
+    ///
+    /// # Where the message's trust label comes from
+    ///
+    /// `ok.action().trust()`, and nowhere else. `A` is either `InternalSend` —
+    /// which [`Authorizable`] answers `Trusted` for, because such a value is
+    /// only ever built by our own code from our own configuration — or
+    /// `Untrusted<InternalSend>`, which answers `Untrusted`. `Turn::perform`
+    /// picks between the two from the turn's own live label, in a macro that
+    /// cannot pick the wrong one, and there is no third way to obtain a token.
+    ///
+    /// So the label stored on the message is not a claim the sender makes about
+    /// itself. It is the same type-level provenance that keeps a supplier's PDF
+    /// away from the payment tool, followed one hop further: an employee that
+    /// read a hostile email and then messaged a colleague relays its taint with
+    /// it, and the colleague receives data rather than an order. Read
+    /// `crate::inbound`'s module docs for the argument in full.
+    ///
+    /// # Not a provider
+    ///
+    /// The "provider" here is our own database, so unlike an email this effect
+    /// is transactional: the recipient's reserved turn, the message row and the
+    /// wake-up commit together or not at all. The audit row still goes through
+    /// [`Effects::record`] in a second transaction, like every other effect —
+    /// what it records is that the attempt happened, which is true either way.
+    pub async fn send_internal<A: Subject<Of = InternalSend>>(
+        &self,
+        ok: Authorized<A>,
+        note: &InternalNote,
+    ) -> Result<Delivered, EffectError> {
+        let to = ok.action().subject().to.clone();
+        let trust = ok.action().trust();
+        let key = self.key_for(&ok);
+
+        let delivered = self.deliver(&to, note, trust, &key).await;
+        let detail = Some(json!({
+            "to": to.as_str(),
+            "internal_kind": note.errand.as_str(),
+            // The label the colleague will receive it at, on the record.
+            "trust_label": match trust {
+                TrustLabel::Trusted => "trusted",
+                TrustLabel::Untrusted => "untrusted",
+            },
+            "message_id": delivered.as_ref().ok().map(|d: &Delivered| d.message_id),
+        }));
+        self.record(&ok, detail, delivered).await
+    }
+
+    /// The transactional half of [`Effects::send_internal`].
+    ///
+    /// Split out so the token, the trust label and the audit row stay in one
+    /// readable method while the transaction has a scope of its own — and so
+    /// that every error path rolls back rather than leaving a reserved turn
+    /// behind for a message that was refused.
+    async fn deliver(
+        &self,
+        to: &Slug,
+        note: &InternalNote,
+        trust: TrustLabel,
+        key: &IdempotencyKey,
+    ) -> Result<Delivered, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+
+        let sent = inbound::send(
+            &mut tx,
+            self.principal.employee_id,
+            to,
+            note.errand,
+            &note.body,
+            trust,
+            note.thread,
+            key,
+            Utc::now(),
+        )
+        .await;
+
+        match sent {
+            Ok(delivered) => {
+                tx.commit().await.map_err(EffectError::Unavailable)?;
+                Ok(delivered)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(match err {
+                    InternalError::Store(err) => EffectError::Unavailable(err),
+                    // Unreachable colleague, unanswerable question, somebody
+                    // else's thread, a colleague out of turns. All four are the
+                    // world saying no to something the policy allows.
+                    refused => EffectError::Refused(refused.code()),
+                })
+            }
+        }
     }
 
     /// The de-duplication token for one authorised effect.

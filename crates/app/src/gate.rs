@@ -892,6 +892,11 @@ impl PolicyGate {
 
 /// Who an action addresses, as a stable string. `None` for actions that have
 /// no counterparty — a payment is not a contact.
+///
+/// This function *is* the cold-outreach budget: [`PolicyGate::contacts`]
+/// aggregates the trail on the [`COUNTERPARTY_KEY`] it writes, so anything
+/// returning `Some` here spends `max_new_contacts_per_day` the first time it is
+/// allowed, and is measured against it forever after.
 fn counterparty(action: &Action) -> Option<String> {
     match action {
         Action::EmailSend { to } => Some(to.to_string()),
@@ -899,6 +904,16 @@ fn counterparty(action: &Action) -> Option<String> {
             Some(to.as_str().to_owned())
         }
         Action::A2aSend { peer } => Some(peer.as_str().to_owned()),
+        // `InternalSend` is `None` on purpose, and it is the one entry here
+        // that had a plausible-looking wrong answer. A colleague is not a
+        // counterparty: writing its slug under this key would make the first
+        // message to each colleague consume one of the day's cold contacts, so
+        // an employee that had spoken to twenty suppliers could no longer ask
+        // its manager a question — and, worse, the budget an operator sized for
+        // strangers would silently be shared with the org chart. An inbound
+        // message deliberately does not use this key either
+        // (`inbound::land` files the sender under `from`); this is the same
+        // rule read the other way round.
         Action::BrowserRead { .. }
         | Action::BrowserWrite { .. }
         | Action::FileUpload { .. }
@@ -913,6 +928,7 @@ fn counterparty(action: &Action) -> Option<String> {
         // team must not spend the day's allowance of strangers on its own
         // colleagues.
         | Action::CharterSet { .. } => None,
+        | Action::InternalSend { .. } => None,
     }
 }
 
@@ -2068,6 +2084,62 @@ mod tests {
                 }
             }),
             None
+        );
+        // A colleague is not a counterparty. If this were `Some`, the first
+        // message to each colleague would spend one of the day's cold contacts,
+        // and an employee that had talked to twenty suppliers could no longer
+        // ask its own manager a question.
+        assert_eq!(
+            counterparty(&Action::InternalSend {
+                to: Slug::parse("bruno").expect("slug")
+            }),
+            None
+        );
+    }
+
+    /// The other half of that promise: the internal channel is judged on the
+    /// channel allowlist alone, so an employee whose cold-outreach budget is
+    /// spent can still talk to its team.
+    #[test]
+    fn an_exhausted_contact_budget_does_not_silence_the_internal_channel() {
+        let limits = PolicyLimits {
+            allowed_channels: BTreeSet::from([Channel::Email, Channel::Internal]),
+            max_new_contacts_per_day: 1,
+            ..PolicyLimits::default()
+        };
+        let policy =
+            agentos_domain::policy::EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+                .expect("coherent");
+        let spent = ActionCtx {
+            trust: TrustLabel::Trusted,
+            contact: ContactStanding::New,
+            new_contacts_today: 50,
+            ..ActionCtx::new(
+                Actor::new(
+                    TenantId::from_uuid(Uuid::nil()),
+                    EmployeeId::from_uuid(Uuid::nil()),
+                ),
+                Utc::now(),
+            )
+        };
+
+        // A stranger: refused, which is the budget doing its job.
+        assert!(matches!(
+            agentos_domain::policy::evaluate(&policy, &email("new@example.com"), &spent),
+            agentos_domain::policy::Decision::Deny {
+                reason: DenyReason::ContactBudgetExhausted
+            }
+        ));
+        // A colleague: allowed.
+        assert!(
+            agentos_domain::policy::evaluate(
+                &policy,
+                &Action::InternalSend {
+                    to: Slug::parse("bruno").expect("slug")
+                },
+                &spent,
+            )
+            .is_allow()
         );
     }
 }
