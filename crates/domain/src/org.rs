@@ -59,7 +59,7 @@
 //!
 //! # Seniority is not a capability, and cannot become one
 //!
-//! The org chart grew a reporting line in `0025_positions`, and that is the one
+//! The org chart grew a reporting line in `0027_positions`, and that is the one
 //! place a hierarchy could have gone wrong: "senior" quietly meaning "more
 //! permissions". It cannot here, and the reason is structural rather than
 //! careful.

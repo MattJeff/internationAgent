@@ -1242,7 +1242,7 @@ const MAX_OUTSTANDING: i64 = 20;
 /// What one employee is doing to another.
 ///
 /// Four kinds, one row, one delivery path — the argument for that is in
-/// `migrations/0025_internal_channel.sql`, which is where the columns are.
+/// `migrations/0028_internal_channel.sql`, which is where the columns are.
 /// What they genuinely differ in:
 ///
 /// * [`Errand::Order`] **creates work** and expects nothing back.
