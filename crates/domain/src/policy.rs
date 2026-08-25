@@ -52,7 +52,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::action::{
-    Action, ActionCtx, CallingCode, Channel, ContactStanding, DataScope, Domain, E164, McpTool,
+    Action, ActionCtx, ActionKind, CallingCode, Channel, ContactStanding, DataScope, Domain, E164,
+    McpTool,
 };
 use crate::money::{Currency, Money};
 
@@ -514,6 +515,124 @@ fn mcp_rules(allowed: &BTreeSet<McpTool>, tool: &McpTool) -> Decision {
 /// `may_message`: the rule has one home, and the prompt is a reader of it.
 pub fn evaluate_mcp_call(policy: &EffectivePolicy, tool: &McpTool) -> Decision {
     mcp_rules(&policy.limits().allowed_mcp_tools, tool)
+}
+
+/// Does this policy deny **every** action of this kind, whatever its payload
+/// and whatever context it is ruled in?
+///
+/// The only question about an [`ActionKind`] that has an answer. [`evaluate`]
+/// rules on an [`Action`], and it must: whether a payment is allowed depends on
+/// its amount, whether an email is allowed depends on who it is to and how many
+/// strangers were written to today. So "would an `EmailSend` be allowed?" is
+/// not a question — but "is there *no* `EmailSend` this policy would allow?"
+/// is, and it is the one a tool catalogue needs. It exists so `app::turn`'s
+/// `tools_for` can withhold a schema whose every invocation is a spent turn,
+/// for the reason `app::prompt`'s `with_mcp_tools` already withholds an MCP
+/// name: an employee told about a tool it may not call spends a turn finding
+/// that out and cannot tell the denial from an argument it spelled wrong.
+///
+/// # It is deliberately an under-approximation
+///
+/// `false` means "not provably always denied", never "allowed". Getting this
+/// wrong towards `true` is far worse than the bug it fixes: a withheld tool the
+/// employee could have used makes it fail at its job silently, with no denial
+/// and no audit row to explain it, whereas an offered tool the gate refuses
+/// costs one turn and writes a row saying so. So every arm below asks only
+/// about the payload-independent half of its rule — the empty allowlist, the
+/// flag that is off — and leaves everything that depends on an amount, a
+/// domain, a number or an [`ActionCtx`] to [`evaluate`]. An allowlist that is
+/// non-empty but happens to contain nothing reachable reads as "not always
+/// denied" here, and the gate refuses the call: the conservative direction,
+/// taken on purpose.
+///
+/// # Why it lives here and not in the caller
+///
+/// The same reason [`evaluate_mcp_call`] does. This is a claim *about*
+/// [`evaluate`], and a claim about the evaluator restated in another crate is a
+/// claim that drifts the first time an arm below it changes. The match is
+/// exhaustive over [`ActionKind`] with no `_` arm and destructures
+/// [`PolicyLimits`] with no `..`, exactly as `evaluate_rules` does, so a new
+/// action or a new limit stops the build here too — and
+/// `the_prediction_never_disagrees_with_the_evaluator` is what keeps the two in
+/// step in the meantime.
+pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
+    // Exhaustive destructure, no `..`, for `evaluate_rules`' reason: a limit
+    // added to `PolicyLimits` has to be considered here as well, and a compile
+    // error is the only reliable way to make somebody consider it.
+    let PolicyLimits {
+        spend,
+        allowed_channels,
+        allowed_calling_codes,
+        allowed_domains,
+        // Not read, and it cannot be: a denylist entry blocks the hosts beneath
+        // it and says nothing about the rest of the web, so it never makes a
+        // whole kind unreachable. `evaluate` applies it per action, where the
+        // host is known.
+        denied_domains: _,
+        allowed_mcp_tools,
+        allowed_a2a_peers,
+        // Per-action budgets and a per-day turn ceiling: both are counters in
+        // an `ActionCtx` or in the store rather than facts about the policy, so
+        // neither can answer "every action of this kind". An exhausted contact
+        // budget denies today's *new* counterparties and not the known ones.
+        max_new_contacts_per_day: _,
+        max_turns_per_day: _,
+        allow_file_upload,
+        allow_credential_change,
+        allow_data_delete,
+    } = policy.limits();
+
+    let closed = |channel: Channel| !allowed_channels.contains(&channel);
+
+    // One arm per `ActionKind`, each naming the `DenyReason` it is predicting —
+    // the reason `evaluate` gives for a specimen that trips nothing else first.
+    // `no_match` turns an empty allowlist into `NoRule` there, so several of
+    // these predict `NoRule` rather than the specific code.
+    match kind {
+        // ChannelNotAllowed / NoRule. The recipient's domain and the
+        // cold-outreach budget are the payload-dependent half and are not asked.
+        ActionKind::EmailSend => closed(Channel::Email),
+        // ChannelNotAllowed / NoRule, then CallingCodeNotAllowed / NoRule. An
+        // empty calling-code list matches no number that exists.
+        ActionKind::SmsSend => closed(Channel::Sms) || allowed_calling_codes.is_empty(),
+        ActionKind::WhatsappSend => closed(Channel::Whatsapp) || allowed_calling_codes.is_empty(),
+        ActionKind::CallPlace => closed(Channel::Voice) || allowed_calling_codes.is_empty(),
+        // DomainNotAllowed / NoRule. An empty allowlist is within nothing.
+        ActionKind::BrowserRead | ActionKind::BrowserWrite => allowed_domains.is_empty(),
+        // The same, then FileUploadNotAllowed: an upload has to clear the
+        // domain rules *and* the flag, so either half closing shuts the kind.
+        ActionKind::FileUpload => allowed_domains.is_empty() || !*allow_file_upload,
+        // ToolNotAllowed / NoRule — `mcp_rules`, which `evaluate_mcp_call` is
+        // the other reader of.
+        ActionKind::McpCall => allowed_mcp_tools.is_empty(),
+        // PeerNotAllowed / NoRule.
+        ActionKind::A2aSend => allowed_a2a_peers.is_empty(),
+        // NoSpendPolicy. Note what this does *not* claim: caps of zero-ish size
+        // are still a spend policy, and the amount decides — that is
+        // `PerTransactionLimit`'s job and it is per action.
+        ActionKind::PaymentCreate => spend.is_none(),
+        // Never denied by policy: signing escalates to a human under every
+        // policy this system can express, empty included, so there is no
+        // `DenyReason` to predict and withholding the tool would withhold the
+        // approval path with it.
+        ActionKind::ContractSign => false,
+        // CredentialChangeNotAllowed. `CrossTenantSecret` fires first for a
+        // secret belonging to somebody else, which is payload-dependent and a
+        // deny either way.
+        ActionKind::CredentialChange => !*allow_credential_change,
+        // DataDeleteNotAllowed.
+        ActionKind::DataDelete => !*allow_data_delete,
+        // Never denied by policy either, and for the sharper reason: delegation
+        // is decided by the org chart in `ActionCtx`, and there is no field in
+        // `PolicyLimits` this arm reads. A policy cannot answer for it, so it
+        // must not pretend to.
+        ActionKind::CharterSet => false,
+        // ChannelNotAllowed / NoRule. This is the one that matters for
+        // `turn::UNCHARTERED`: an employee with no charter keeps the internal
+        // channel exactly as long as its policy lists `Channel::Internal`, and
+        // the shipped ceiling does.
+        ActionKind::InternalSend => closed(Channel::Internal),
+    }
 }
 
 fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) -> Decision {
@@ -1696,6 +1815,392 @@ mod tests {
                 reason: DenyReason::NoRule
             }
         );
+    }
+
+    // -- always_denies -----------------------------------------------------
+
+    /// The shape of a fresh deployment: `store::policy::default_ceiling` and no
+    /// tenant layer, restated here because the domain cannot depend on the
+    /// store. Email, the internal channel and the console; no calling codes, no
+    /// browsing allowlist, no MCP tools, every dangerous flag off.
+    ///
+    /// If the shipped ceiling ever changes, this fixture does not follow it
+    /// automatically — and it does not need to. What it is here to be is *a*
+    /// realistic middle policy between `default()` and `permissive()`, i.e. one
+    /// where some kinds are unreachable and others are not, so the matrix below
+    /// is not two extremes.
+    fn ceiling() -> PolicyLimits {
+        PolicyLimits {
+            spend: Some(SpendLimits::try_new(usd(50_000), usd(200_000), usd(10_000)).unwrap()),
+            allowed_channels: [Channel::Email, Channel::Internal, Channel::Web]
+                .into_iter()
+                .collect(),
+            max_new_contacts_per_day: 50,
+            max_turns_per_day: 200,
+            ..PolicyLimits::default()
+        }
+    }
+
+    /// The policies the prediction is checked against: the two extremes, the
+    /// shipped ceiling, and `permissive()` with one grant knocked out at a
+    /// time — because a predicate that reads the wrong field is only visible
+    /// when exactly one field moves.
+    fn policy_matrix() -> Vec<(&'static str, EffectivePolicy)> {
+        let one_off = [
+            (
+                "no channels",
+                PolicyLimits {
+                    allowed_channels: BTreeSet::new(),
+                    ..permissive()
+                },
+            ),
+            (
+                "no calling codes",
+                PolicyLimits {
+                    allowed_calling_codes: BTreeSet::new(),
+                    ..permissive()
+                },
+            ),
+            (
+                "no domains",
+                PolicyLimits {
+                    allowed_domains: BTreeSet::new(),
+                    ..permissive()
+                },
+            ),
+            (
+                "everything denylisted",
+                PolicyLimits {
+                    denied_domains: [domain("example.com"), domain("partner.example.com")]
+                        .into_iter()
+                        .collect(),
+                    ..permissive()
+                },
+            ),
+            (
+                "no mcp tools",
+                PolicyLimits {
+                    allowed_mcp_tools: BTreeSet::new(),
+                    ..permissive()
+                },
+            ),
+            (
+                "no a2a peers",
+                PolicyLimits {
+                    allowed_a2a_peers: BTreeSet::new(),
+                    ..permissive()
+                },
+            ),
+            (
+                "no spend",
+                PolicyLimits {
+                    spend: None,
+                    ..permissive()
+                },
+            ),
+            (
+                "a spend policy of almost nothing",
+                PolicyLimits {
+                    spend: Some(SpendLimits::try_new(usd(1), usd(1), usd(1)).unwrap()),
+                    ..permissive()
+                },
+            ),
+            (
+                "no contact budget",
+                PolicyLimits {
+                    max_new_contacts_per_day: 0,
+                    ..permissive()
+                },
+            ),
+            (
+                "flags off",
+                PolicyLimits {
+                    allow_file_upload: false,
+                    allow_credential_change: false,
+                    allow_data_delete: false,
+                    ..permissive()
+                },
+            ),
+        ];
+
+        [("empty", PolicyLimits::default()), ("ceiling", ceiling())]
+            .into_iter()
+            .chain(one_off)
+            .chain([("permissive", permissive())])
+            .map(|(label, limits)| (label, effective(&limits)))
+            .collect()
+    }
+
+    /// Every context the evaluator can be given, over the axes it actually
+    /// reads. A prediction that holds for a trusted turn and fails for a
+    /// tainted one would be a prediction that hides a tool from the turns most
+    /// in need of it.
+    fn ctx_matrix() -> Vec<ActionCtx> {
+        let mut out = Vec::new();
+        for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
+            for contact in [ContactStanding::Known, ContactStanding::New] {
+                for (new_today, spent) in [(0, None), (1_000, Some(usd(199_999)))] {
+                    for directs_subject in [false, true] {
+                        out.push(ActionCtx {
+                            trust,
+                            contact,
+                            new_contacts_today: new_today,
+                            spent_today: spent,
+                            directs_subject,
+                            ..ActionCtx::new(actor(), at(1_700_000_000))
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Several payloads per kind where the payload is what the gate rules on,
+    /// so "denies every action of this kind" is checked against more than one
+    /// specimen. `one_of_every_action` is the pinned-to-`ActionKind::ALL` half;
+    /// these are the variations that would expose a prediction reading a field
+    /// the payload can escape.
+    fn every_action_and_then_some() -> Vec<Action> {
+        let mut out = one_of_every_action();
+        out.extend([
+            Action::EmailSend {
+                to: EmailAddress::parse("stranger@elsewhere.test").unwrap(),
+            },
+            Action::SmsSend {
+                to: E164::parse("+15550000000").unwrap(),
+            },
+            Action::WhatsappSend {
+                to: E164::parse("+79991234567").unwrap(),
+            },
+            Action::CallPlace {
+                to: E164::parse("+15550000000").unwrap(),
+            },
+            Action::BrowserRead {
+                domain: domain("shop.example.com"),
+            },
+            Action::BrowserWrite {
+                domain: domain("elsewhere.test"),
+            },
+            Action::FileUpload {
+                domain: domain("shop.example.com"),
+            },
+            Action::McpCall {
+                tool: McpTool::new(slug("erp"), slug("drop-table")),
+            },
+            Action::A2aSend {
+                peer: domain("elsewhere.test"),
+            },
+            Action::PaymentCreate { amount: usd(1) },
+            Action::PaymentCreate {
+                amount: usd(49_999),
+            },
+            Action::ContractSign {
+                title: "nda".into(),
+            },
+            Action::CredentialChange {
+                secret: SecretRef::new(
+                    TenantId::from_uuid(uuid::Uuid::from_u128(99)),
+                    actor().employee_id,
+                    "smtp_password",
+                )
+                .unwrap(),
+            },
+            Action::DataDelete {
+                scope: DataScope::AllForEmployee {
+                    id: actor().employee_id,
+                },
+            },
+            Action::CharterSet {
+                subordinate: actor().employee_id,
+            },
+            Action::InternalSend { to: slug("anja") },
+        ]);
+        out
+    }
+
+    /// **The prediction and the evaluator agree**, which is the whole licence
+    /// [`always_denies`] has to be consulted anywhere.
+    ///
+    /// One implication, asserted over every kind, a range of policies, several
+    /// payloads each and every context axis the gate reads: if the predicate
+    /// says a kind is unreachable, `evaluate` denies — outright, never
+    /// `RequireApproval`, because an escalation is a path to the effect and a
+    /// withheld tool would close it.
+    ///
+    /// Read the contrapositive and this is also the conservative direction:
+    /// anything the gate does *not* deny forces the predicate to `false`, so a
+    /// tool that is sometimes usable cannot be withheld. It iterates
+    /// `ActionKind::ALL` rather than the specimen list, so a sixteenth action
+    /// cannot be added without somebody deciding what this predicate says about
+    /// it.
+    #[test]
+    fn the_prediction_never_disagrees_with_the_evaluator() {
+        let actions = every_action_and_then_some();
+        let contexts = ctx_matrix();
+
+        for kind in ActionKind::ALL {
+            let specimens: Vec<&Action> = actions.iter().filter(|a| a.kind() == kind).collect();
+            assert!(
+                !specimens.is_empty(),
+                "{kind} has no specimen action to check the prediction against"
+            );
+
+            for (label, policy) in &policy_matrix() {
+                if !always_denies(policy, kind) {
+                    continue;
+                }
+                for action in &specimens {
+                    for ctx in &contexts {
+                        let decision = evaluate(policy, action, ctx);
+                        assert!(
+                            matches!(decision, Decision::Deny { .. }),
+                            "always_denies said the {label} policy refuses every {kind}, \
+                             but the gate answered {decision:?} for {action:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other half, stated positively so it cannot pass vacuously: the
+    /// predicate has to actually *fire* on the policies where it should, and
+    /// stay quiet on the one where nothing is out of reach.
+    ///
+    /// The empty policy is the interesting column. Every kind is unreachable
+    /// under it except the two that are not decided by `PolicyLimits` at all —
+    /// signing, which escalates to a human under every policy, and delegation,
+    /// which the org chart decides. A predicate that returned `true` for those
+    /// would withhold a tool no policy edit could ever restore.
+    #[test]
+    fn an_empty_policy_puts_every_kind_but_two_out_of_reach() {
+        let empty = effective(&PolicyLimits::default());
+        let open = effective(&permissive());
+
+        for kind in ActionKind::ALL {
+            let decided_elsewhere =
+                matches!(kind, ActionKind::ContractSign | ActionKind::CharterSet);
+            assert_eq!(
+                always_denies(&empty, kind),
+                !decided_elsewhere,
+                "{kind} under a policy that grants nothing"
+            );
+            assert!(
+                !always_denies(&open, kind),
+                "{kind} was withheld under the most permissive policy this system can express"
+            );
+        }
+    }
+
+    /// **A tool that is sometimes allowed is never withheld.** The direction
+    /// that costs more to get wrong: a hidden tool is an employee failing its
+    /// job with no denial and no audit row to explain it.
+    ///
+    /// Each case below is a policy under which the *specimen* action is denied
+    /// and some other action of the same kind is not. The predicate must answer
+    /// `false` for all of them — "mostly denied" is not "always denied", and the
+    /// gate is what tells the difference, per action, on the record.
+    #[test]
+    fn a_kind_that_is_sometimes_allowed_is_never_withheld() {
+        let ctx = ctx();
+
+        // A budget of one cent: nearly every payment is refused and one is not.
+        let almost_broke = effective(&PolicyLimits {
+            spend: Some(SpendLimits::try_new(usd(1), usd(1), usd(1)).unwrap()),
+            ..permissive()
+        });
+        assert!(!always_denies(&almost_broke, ActionKind::PaymentCreate));
+        assert!(
+            !evaluate(
+                &almost_broke,
+                &Action::PaymentCreate {
+                    amount: usd(50_000)
+                },
+                &ctx
+            )
+            .is_allow()
+        );
+
+        // One country. Every other number on earth is denied; that is fifteen
+        // arms of the phone tree, not the whole kind.
+        let china_only = effective(&PolicyLimits {
+            allowed_calling_codes: [CallingCode::new(86).unwrap()].into_iter().collect(),
+            ..permissive()
+        });
+        for kind in [
+            ActionKind::SmsSend,
+            ActionKind::WhatsappSend,
+            ActionKind::CallPlace,
+        ] {
+            assert!(!always_denies(&china_only, kind));
+        }
+        assert!(
+            !evaluate(
+                &china_only,
+                &Action::SmsSend {
+                    to: E164::parse("+79991234567").unwrap()
+                },
+                &ctx
+            )
+            .is_allow()
+        );
+
+        // A denylist that happens to cover every host the allowlist names. The
+        // kind really is unreachable and the predicate still says `false`,
+        // which is the under-approximation working as designed: the gate
+        // refuses each host by name, on the record, and nobody is left
+        // wondering why the browser tool vanished.
+        let walled = effective(&PolicyLimits {
+            denied_domains: [domain("example.com")].into_iter().collect(),
+            ..permissive()
+        });
+        assert!(!always_denies(&walled, ActionKind::BrowserRead));
+        assert_eq!(
+            evaluate(
+                &walled,
+                &Action::BrowserRead {
+                    domain: domain("example.com")
+                },
+                &ctx
+            ),
+            Decision::Deny {
+                reason: DenyReason::DomainDenied
+            }
+        );
+
+        // The cold-outreach budget is a counter, not a grant: an employee that
+        // has written to its fifty strangers today can still answer the ones it
+        // knows, so email is not out of reach.
+        let no_new_contacts = effective(&PolicyLimits {
+            max_new_contacts_per_day: 0,
+            ..permissive()
+        });
+        assert!(!always_denies(&no_new_contacts, ActionKind::EmailSend));
+    }
+
+    /// The kind the reported bug was about, both directions, at the policy a
+    /// fresh deployment actually has.
+    ///
+    /// The shipped ceiling grants no MCP tools, so `call_mcp_tool` is a schema
+    /// whose every invocation returns `deny/no_rule` — and one grant later it
+    /// is not. The internal channel is the control: `turn::UNCHARTERED` leans on
+    /// it and it survives the same ceiling.
+    #[test]
+    fn the_shipped_ceiling_puts_mcp_out_of_reach_until_a_tool_is_granted() {
+        let fresh = effective(&ceiling());
+        assert!(always_denies(&fresh, ActionKind::McpCall));
+        assert!(!always_denies(&fresh, ActionKind::EmailSend));
+        assert!(!always_denies(&fresh, ActionKind::InternalSend));
+        assert!(!always_denies(&fresh, ActionKind::PaymentCreate));
+
+        let granted = effective(&PolicyLimits {
+            allowed_mcp_tools: [McpTool::new(slug("erp"), slug("lookup"))]
+                .into_iter()
+                .collect(),
+            ..ceiling()
+        });
+        assert!(!always_denies(&granted, ActionKind::McpCall));
     }
 
     #[test]

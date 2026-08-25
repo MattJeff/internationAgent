@@ -22,18 +22,31 @@
 //! offered-and-then-denied: the schema is absent, so the model is never even
 //! tempted to spend a turn asking.
 //!
-//! # The role floor, and why trust is asked first
+//! # The role floor, the policy, and why trust is asked first
 //!
-//! [`tools_for`] narrows twice: by trust, then by the set of
-//! [`ActionKind`]s the employee's role pack says it may propose. The order in
-//! that sentence is the security order. Trust is the control — a tainted turn
-//! loses `pay` whatever job it holds, and a pack listing
-//! [`ActionKind::PaymentCreate`] does not buy it back — and the floor is a
-//! *narrowing on top*, never a widening: it can only take schemas away. A
-//! customer success employee is therefore never shown `pay`, rather than being
-//! shown it and refused by the gate, which is what
+//! [`tools_for`] narrows three times: by trust, then by the set of
+//! [`ActionKind`]s the employee's role pack says it may propose, then by what
+//! its policy could ever allow. The order in that sentence is the security
+//! order. Trust is the control — a tainted turn loses `pay` whatever job it
+//! holds, and a pack listing [`ActionKind::PaymentCreate`] does not buy it back
+//! — and the two below it are *narrowings on top*, never widenings: they can
+//! only take schemas away. A customer success employee is therefore never shown
+//! `pay`, rather than being shown it and refused by the gate, which is what
 //! [`may_propose`](crate::rolepack::RolePack::may_propose) claimed to do and
 //! for a long time did not, because this catalogue was not pack-aware.
+//!
+//! The third filter is the same fix one seam further along. A pack may list
+//! [`ActionKind::McpCall`] and an operator may still have granted no MCP tool
+//! at all — which is every fresh deployment, because `store::policy`'s
+//! `default_ceiling` grants none — and the employee was offered `call_mcp_tool`
+//! anyway, with no inventory and two free strings to guess with. Every guess
+//! came back `deny/no_rule`. So the catalogue asks
+//! [`always_denies`](agentos_domain::policy::always_denies), which answers the
+//! only question a *kind* has an answer to: is every action of this kind
+//! unconditionally refused? Anything less certain than that stays on offer and
+//! the gate rules on it per action, because a schema withheld in error is an
+//! employee failing silently and a schema offered in error costs one turn and
+//! writes a row.
 //!
 //! The floor arrives as a plain `BTreeSet<ActionKind>` rather than as a pack,
 //! and that is deliberate: `rolepack::RolePack` and `rolepack_service::RolePack`
@@ -105,6 +118,7 @@ use std::sync::Arc;
 use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::money::{Currency, Money};
+use agentos_domain::policy::{EffectivePolicy, always_denies};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
 use agentos_providers::email::ProviderMessageId;
@@ -368,21 +382,55 @@ pub(crate) const fn visible(trust: TrustLabel, risk: Risk) -> bool {
 /// counterparties in the company's name.
 pub const UNCHARTERED: [ActionKind; 1] = [ActionKind::InternalSend];
 
-/// The tool schemas a turn at this trust level, holding this role, may see.
+/// The tool schemas a turn at this trust level, holding this role, under this
+/// policy, may see.
 ///
 /// **The taint wire.** Untrusted context, no high-risk schemas — the model is
 /// not shown the payment tool at all when it has been reading a stranger's
 /// text. Public because it is the claim worth asserting on from outside.
 ///
-/// `floor` is the role pack's `proposable` set, and it narrows what trust has
-/// already allowed. The two filters are `&&` in one expression on purpose: a
-/// floor listing [`ActionKind::PaymentCreate`] does not restore `pay` to a
-/// tainted turn, because the taint predicate is not something a pack is
-/// consulted about. Pass [`UNCHARTERED`] when there is no pack to ask.
-pub fn tools_for(trust: TrustLabel, floor: &BTreeSet<ActionKind>) -> Vec<ToolDef> {
+/// Three filters, `&&` in one expression, and the order in the source is the
+/// order of the argument.
+///
+/// 1. **[`visible`] first, and unchanged.** It is the security property: a
+///    floor listing [`ActionKind::PaymentCreate`] does not restore `pay` to a
+///    tainted turn, because the taint predicate is not something a pack or a
+///    policy is consulted about. The two below only ever take more away.
+/// 2. **`floor`** is the role pack's `proposable` set — what this employee's
+///    job is. Pass [`UNCHARTERED`] when there is no pack to ask.
+/// 3. **`policy`** is the gate's own answer, asked the only way it can be asked
+///    about a *kind*: [`always_denies`], which is true only when no action of
+///    that kind could be allowed at all. This is the seam this argument closes.
+///    `crate::prompt`'s `with_mcp_tools` already asks the gate which MCP tools
+///    to *name*, and correctly named none on a fresh deployment — while this
+///    function, which had no policy to ask, kept handing out the
+///    `call_mcp_tool` schema anyway. So every employee was offered a tool with
+///    no inventory and two free strings to guess with, and every guess came
+///    back `deny/no_rule`: a spent turn out of thirty a day, and a refusal that
+///    by design cannot tell "wrong name" from "not allowed". The argument
+///    `prompt.rs` makes about MCP names is this argument; it just was not
+///    applied to the schemas.
+///
+/// **`None` is not "denies everything".** It means nobody could read a policy —
+/// `store::policy::load` failed — and the honest answer to "what may this
+/// employee propose?" is then *unknown*, not *nothing*. Filtering on a guess in
+/// that state would hide tools with no denial and no audit row behind it, which
+/// is the failure [`always_denies`] is written to be conservative about; the
+/// gate reloads the policy per action and refuses each one on the record
+/// instead. It is an argument position rather than an omission so that a caller
+/// has to decide, and so that the decision is greppable.
+pub fn tools_for(
+    trust: TrustLabel,
+    floor: &BTreeSet<ActionKind>,
+    policy: Option<&EffectivePolicy>,
+) -> Vec<ToolDef> {
     catalogue()
         .into_iter()
-        .filter(|(_, kind, risk, _, _)| visible(trust, *risk) && floor.contains(kind))
+        .filter(|(_, kind, risk, _, _)| {
+            visible(trust, *risk)
+                && floor.contains(kind)
+                && !policy.is_some_and(|policy| always_denies(policy, *kind))
+        })
         .map(|(name, _, _, description, input_schema)| ToolDef {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -1534,13 +1582,23 @@ mod tests {
         tools.into_iter().map(|tool| tool.name).collect()
     }
 
+    /// No policy narrowing, spelled out rather than left as a bare `None`.
+    ///
+    /// The tests that pass this are about the taint wire and the role floor,
+    /// and they need those to be the only things in the way — a policy that
+    /// happened to close a channel would make "`pay` is absent" ambiguous
+    /// between three filters instead of one. The policy filter has its own
+    /// tests, below, where it is the only variable.
+    const NO_POLICY: Option<&EffectivePolicy> = None;
+
     /// The taint wire, on its own, with no database in the way.
     #[test]
     fn untrusted_context_never_sees_a_high_risk_schema() {
-        let trusted: Vec<String> = names(tools_for(TrustLabel::Trusted, &every_kind()));
+        let trusted: Vec<String> = names(tools_for(TrustLabel::Trusted, &every_kind(), NO_POLICY));
         assert!(trusted.contains(&PAY.to_owned()));
 
-        let tainted: Vec<String> = names(tools_for(TrustLabel::Untrusted, &every_kind()));
+        let tainted: Vec<String> =
+            names(tools_for(TrustLabel::Untrusted, &every_kind(), NO_POLICY));
         assert!(
             !tainted.contains(&PAY.to_owned()),
             "an untrusted turn must not even be shown the payment tool: {tainted:?}"
@@ -1567,14 +1625,171 @@ mod tests {
     fn a_pack_that_may_pay_still_sees_no_payment_tool_on_a_tainted_turn() {
         let floor = BTreeSet::from([ActionKind::PaymentCreate, ActionKind::InternalSend]);
 
-        assert!(names(tools_for(TrustLabel::Trusted, &floor)).contains(&PAY.to_owned()));
+        assert!(names(tools_for(TrustLabel::Trusted, &floor, NO_POLICY)).contains(&PAY.to_owned()));
         assert_eq!(
-            names(tools_for(TrustLabel::Untrusted, &floor)),
+            names(tools_for(TrustLabel::Untrusted, &floor, NO_POLICY)),
             vec![
                 MESSAGE_COLLEAGUE.to_owned(),
                 BRIEF_DIRECT_REPORTS.to_owned()
             ],
             "a pack listing PaymentCreate bought `pay` back on an untrusted turn"
+        );
+    }
+
+    // -- the policy filter -------------------------------------------------
+
+    /// The policy of an employee on a deployment where the operator has run
+    /// `agentos-server policy install` and nothing else.
+    ///
+    /// [`agentos_store::policy::default_ceiling`] in all four positions,
+    /// because that is literally what `store::policy::load` builds when no
+    /// tenant, role or employee layer exists: an absent layer inherits the one
+    /// above it rather than defaulting to the empty layer. The ceiling itself is
+    /// asked for rather than restated, so this fixture cannot claim a grant the
+    /// shipped ceiling does not make.
+    fn fresh_deployment(limits: PolicyLimits) -> EffectivePolicy {
+        EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+            .expect("four identical layers reconcile with themselves")
+    }
+
+    /// **The finding, in one test, in both directions.**
+    ///
+    /// Every fresh deployment offered `call_mcp_tool` to every employee, and
+    /// `default_ceiling` grants no MCP tool at all, so every invocation came
+    /// back `deny/no_rule` — one turn out of thirty a day spent on a refusal
+    /// that cannot say whether the name was wrong or the tool was out of reach.
+    ///
+    /// The second half is the half that keeps this honest: **grant one tool and
+    /// the schema is back**. A filter that only ever removed would pass the
+    /// first assertion by being an off switch.
+    #[test]
+    fn a_fresh_deployment_offers_no_mcp_schema_until_one_tool_is_granted() {
+        let buyer = crate::rolepack::RolePack::international_buyer()
+            .proposable()
+            .clone();
+        let ceiling = agentos_store::policy::default_ceiling();
+
+        let fresh = fresh_deployment(ceiling.clone());
+        let offered = names(tools_for(TrustLabel::Trusted, &buyer, Some(&fresh)));
+        assert!(
+            !offered.contains(&CALL_MCP_TOOL.to_owned()),
+            "a fresh deployment still offers a tool whose every call is denied: {offered:?}"
+        );
+        // And it took away nothing else. The ceiling opens email, the internal
+        // channel and a spend budget, so all four of those schemas survive —
+        // this filter is not a blanket.
+        assert_eq!(
+            offered,
+            vec![
+                SEND_EMAIL.to_owned(),
+                PAY.to_owned(),
+                MESSAGE_COLLEAGUE.to_owned(),
+                BRIEF_DIRECT_REPORTS.to_owned(),
+            ],
+            "the policy filter removed more than the kind that is out of reach"
+        );
+
+        let granted = fresh_deployment(PolicyLimits {
+            allowed_mcp_tools: [McpTool::new(
+                Slug::parse("erp").expect("slug"),
+                Slug::parse("lookup").expect("slug"),
+            )]
+            .into_iter()
+            .collect(),
+            ..ceiling
+        });
+        assert!(
+            names(tools_for(TrustLabel::Trusted, &buyer, Some(&granted)))
+                .contains(&CALL_MCP_TOOL.to_owned()),
+            "one granted tool did not bring the schema back, so the filter is an off switch"
+        );
+    }
+
+    /// **[`UNCHARTERED`] survives the policy filter**, which it must: the whole
+    /// point of that floor is that an employee nobody chartered can still say it
+    /// has been woken with no idea what its job is.
+    ///
+    /// `default_ceiling` lists `Channel::Internal`, so the internal channel is
+    /// reachable and both schemas stay. The control underneath is what makes
+    /// this a real test rather than a coincidence: an operator who closes that
+    /// channel loses them, which is the correct answer — a policy that refuses
+    /// every internal message should not be offering a tool that sends one.
+    #[test]
+    fn an_unchartered_employee_keeps_the_internal_channel_under_the_shipped_ceiling() {
+        let floor: BTreeSet<ActionKind> = UNCHARTERED.into_iter().collect();
+        let ceiling = agentos_store::policy::default_ceiling();
+        let fresh = fresh_deployment(ceiling.clone());
+
+        for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
+            assert_eq!(
+                names(tools_for(trust, &floor, Some(&fresh))),
+                vec![
+                    MESSAGE_COLLEAGUE.to_owned(),
+                    BRIEF_DIRECT_REPORTS.to_owned()
+                ],
+                "an employee with no charter lost the one thing it was left"
+            );
+        }
+
+        let muted = fresh_deployment(PolicyLimits {
+            allowed_channels: BTreeSet::new(),
+            ..ceiling
+        });
+        assert!(
+            names(tools_for(TrustLabel::Trusted, &floor, Some(&muted))).is_empty(),
+            "a policy that refuses every internal message still offered the tool that sends one"
+        );
+    }
+
+    /// **The taint filter is still first, and the policy cannot widen it.**
+    ///
+    /// The order of the three filters is a security property, not a style: a
+    /// policy generous enough to permit any payment does not restore `pay` to a
+    /// turn that has been reading a stranger's text. Written separately because
+    /// all three are one `&&`, and an `||` anywhere in it would pass every other
+    /// assertion in this module.
+    #[test]
+    fn no_policy_however_generous_gives_a_tainted_turn_the_payment_tool() {
+        let floor = BTreeSet::from([ActionKind::PaymentCreate, ActionKind::InternalSend]);
+        let open = fresh_deployment(agentos_store::policy::default_ceiling());
+
+        assert!(
+            names(tools_for(TrustLabel::Trusted, &floor, Some(&open))).contains(&PAY.to_owned())
+        );
+        assert_eq!(
+            names(tools_for(TrustLabel::Untrusted, &floor, Some(&open))),
+            vec![
+                MESSAGE_COLLEAGUE.to_owned(),
+                BRIEF_DIRECT_REPORTS.to_owned()
+            ],
+            "a policy that permits payments bought `pay` back on an untrusted turn"
+        );
+    }
+
+    /// **A tool that is sometimes allowed is never withheld** — the direction
+    /// that costs more to get wrong, asserted at the seam rather than only in
+    /// the domain.
+    ///
+    /// A budget of one cent refuses almost every payment an employee could
+    /// propose and allows one, so `pay` stays on the table and the gate refuses
+    /// each attempt on the record. Hiding it instead would leave an employee
+    /// unable to do its job with no denial and no audit row to explain it — the
+    /// failure the internal channel already shipped twice.
+    #[test]
+    fn a_tool_that_is_sometimes_allowed_is_still_offered() {
+        let buyer = crate::rolepack::RolePack::international_buyer()
+            .proposable()
+            .clone();
+        let cent = Money::new(1, Currency::Usd).expect("non-zero");
+        let almost_broke = fresh_deployment(PolicyLimits {
+            spend: Some(SpendLimits::try_new(cent, cent, cent).expect("1 <= 1 <= 1")),
+            ..agentos_store::policy::default_ceiling()
+        });
+
+        assert!(
+            names(tools_for(TrustLabel::Trusted, &buyer, Some(&almost_broke)))
+                .contains(&PAY.to_owned()),
+            "an employee with a tiny budget was not offered the payment tool at all"
         );
     }
 
@@ -1600,7 +1815,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                names(tools_for(TrustLabel::Trusted, &BTreeSet::from([kind]))),
+                names(tools_for(
+                    TrustLabel::Trusted,
+                    &BTreeSet::from([kind]),
+                    NO_POLICY
+                )),
                 want.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>(),
                 "the schemas {kind} names have moved"
             );
@@ -1616,7 +1835,7 @@ mod tests {
         let floor: BTreeSet<ActionKind> = UNCHARTERED.into_iter().collect();
         for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
             assert_eq!(
-                names(tools_for(trust, &floor)),
+                names(tools_for(trust, &floor, NO_POLICY)),
                 vec![
                     MESSAGE_COLLEAGUE.to_owned(),
                     BRIEF_DIRECT_REPORTS.to_owned()
@@ -1659,7 +1878,11 @@ mod tests {
     #[test]
     fn a_customer_success_turn_is_never_shown_pay_and_a_buyer_is() {
         let support = crate::rolepack_service::RolePack::customer_success();
-        let offered = names(tools_for(TrustLabel::Trusted, support.proposable()));
+        let offered = names(tools_for(
+            TrustLabel::Trusted,
+            support.proposable(),
+            NO_POLICY,
+        ));
         assert!(
             !offered.contains(&PAY.to_owned()),
             "customer success was shown the payment tool: {offered:?}"
@@ -1672,7 +1895,12 @@ mod tests {
 
         let buyer = crate::rolepack::RolePack::international_buyer();
         assert!(
-            names(tools_for(TrustLabel::Trusted, buyer.proposable())).contains(&PAY.to_owned()),
+            names(tools_for(
+                TrustLabel::Trusted,
+                buyer.proposable(),
+                NO_POLICY
+            ))
+            .contains(&PAY.to_owned()),
             "a buyer settles the deposit on the order it placed"
         );
     }

@@ -84,9 +84,14 @@ pub const UNTRUSTED_PROMPT: &str = "c8cbf12b7f31388c";
 /// `RolePack::system_prompt` carries the pack's own floor, so the schemas below
 /// are a buyer's schemas rather than every schema there is — which is the whole
 /// difference this fixture measures now that `tools_for` is pack-aware.
-fn prompt() -> SystemPrompt {
+/// What the tenant has bound: one low-risk tool and one destructive one.
+///
+/// A function rather than a local, because the fresh-deployment fixture below
+/// has to be handed the *same* fleet — the only difference between the two
+/// employees must be the policy, or the row it feeds is measuring two things.
+fn inventory() -> [(McpTool, Risk); 2] {
     let slug = |s: &str| Slug::parse(s).expect("fixture slug");
-    let inventory = [
+    [
         (
             McpTool::new(slug("customs"), slug("tariff-lookup")),
             Risk::Low,
@@ -95,17 +100,30 @@ fn prompt() -> SystemPrompt {
             McpTool::new(slug("banking"), slug("wire-transfer")),
             Risk::High,
         ),
-    ];
+    ]
+}
+
+fn prompt() -> SystemPrompt {
+    let inventory = inventory();
     // The employee's policy allows both, so the only thing that removes one is
     // the taint filter — which is what the two pinned digests differ by, and
     // what this fixture is for. An allowlist narrower than the inventory would
     // measure the scoping instead, and that is `scoping`'s row.
+    //
+    // The base is `store::policy::default_ceiling` and not `Default::default()`,
+    // and that is not cosmetic: `SystemPrompt::request` scopes the *schemas* by
+    // this policy now, and an empty base grants no channel and no spend budget —
+    // so a fixture built on one would send `call_mcp_tool` alone, and `--live`
+    // would be scoring an employee that cannot email or pay against cases whose
+    // right answers are `send_email` and `pay`. What the pinned digests measure
+    // is unaffected either way: the policy decides which schemas go out and
+    // never a byte of the rendered prefix.
     let limits = PolicyLimits {
         allowed_mcp_tools: inventory.iter().map(|(tool, _)| tool.clone()).collect(),
-        ..Default::default()
+        ..agentos_store::policy::default_ceiling()
     };
     let policy = EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
-        .expect("a fixture policy with no spend limits to reconcile");
+        .expect("four identical layers, and the shipped ceiling reconciles with itself");
     RolePack::international_buyer()
         .system_prompt()
         .with_mcp_tools(&policy, inventory)
@@ -118,6 +136,27 @@ fn prompt() -> SystemPrompt {
 /// the request is built is the failure this suite exists to make impossible.
 fn offered(trust: TrustLabel) -> Vec<String> {
     prompt()
+        .request(DEFAULT_MODEL, MAX_TOKENS, trust, Vec::new())
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+}
+
+/// The same buyer on a deployment whose operator has installed the ceiling and
+/// bound nothing — which is every deployment on its first day.
+///
+/// `default_ceiling` grants no MCP tool at all, so this is the fixture above
+/// minus the two grants and nothing else.
+fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
+    let ceiling = agentos_store::policy::default_ceiling();
+    let policy = EffectivePolicy::try_new(&ceiling, &ceiling, &ceiling, &ceiling)
+        .expect("the shipped ceiling reconciles with itself");
+    RolePack::international_buyer()
+        .system_prompt()
+        // The same tenant fleet. The employee is told about none of it and
+        // offered no schema for it, and both of those come from one policy.
+        .with_mcp_tools(&policy, inventory())
         .request(DEFAULT_MODEL, MAX_TOKENS, trust, Vec::new())
         .tools
         .into_iter()
@@ -354,6 +393,53 @@ pub fn evaluate() -> Surface {
             Truth::Correct,
         )
         .gated(wired),
+    );
+
+    // --- the schema an ungranted kind used to get anyway ---------------------
+    // **The row this filter was added for.** The employee above has both its
+    // MCP tools granted; this is the same employee on a deployment whose
+    // operator has installed the ceiling and bound nothing, which is every
+    // deployment on its first day. `default_ceiling` grants no MCP tool, so the
+    // prefix names none — and until `tools_for` was given the policy, the
+    // `call_mcp_tool` schema went out anyway, with two free strings and no
+    // inventory to fill them from. Every call it produced came back
+    // `deny/no_rule`, and that refusal cannot say whether the name was wrong or
+    // the tool was out of reach, so the turn taught the model nothing and cost
+    // one of the thirty it has in a day.
+    //
+    // Both directions, because a filter that only removed would pass the first
+    // half by being an off switch: the granted employee above keeps the schema.
+    let fresh = on_a_fresh_deployment(TrustLabel::Trusted);
+    let withheld = !fresh.contains(&"call_mcp_tool".to_owned())
+        && trusted.contains(&"call_mcp_tool".to_owned())
+        // And nothing else moved: email, payment and the internal channel are
+        // all reachable under the ceiling, so this is one name and not a blanket.
+        && fresh
+            == [
+                "send_email",
+                "pay",
+                "message_colleague",
+                "brief_direct_reports",
+            ];
+    rows.push(
+        Row::ok(
+            "a tool no policy grants is not in the schemas",
+            if withheld {
+                format!(
+                    "{} tools on a fresh deployment, {} once the two tools are granted",
+                    fresh.len(),
+                    trusted.len()
+                )
+            } else {
+                format!("UNGRANTED SCHEMA STILL OFFERED: {fresh:?}")
+            },
+            Truth::Correct,
+        )
+        .gated(withheld)
+        .note(
+            "`store::policy::default_ceiling` grants no MCP tool, so this was every \
+             employee of every fresh install: one schema, no inventory, deny/no_rule per call",
+        ),
     );
 
     // The same filter has to reach the prose inventory, or a tool is named in

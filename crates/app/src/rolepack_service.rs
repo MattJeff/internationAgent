@@ -2115,7 +2115,9 @@ mod tests {
                 (TrustLabel::Trusted, trusted),
                 (TrustLabel::Untrusted, untrusted),
             ] {
-                let offered: Vec<String> = crate::turn::tools_for(trust, &proposable)
+                // No policy narrowing: this table is the *packs'* floors, and
+                // a policy in the way would be measuring a deployment instead.
+                let offered: Vec<String> = crate::turn::tools_for(trust, &proposable, None)
                     .into_iter()
                     .map(|tool| tool.name)
                     .collect();
@@ -2136,6 +2138,69 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, table.len(), "a pack was added without a row");
+    }
+
+    /// **What every one of those packs actually gets on a fresh deployment**,
+    /// which is not what the table above says and was the whole finding.
+    ///
+    /// A pack's `proposable` set says what the *role* is for; the policy says
+    /// what the *deployment* has granted. `store::policy::default_ceiling` grants
+    /// no MCP tool at all, so `call_mcp_tool` was a schema every employee of
+    /// every fresh install was offered and every call of which came back
+    /// `deny/no_rule`. The table above is therefore the offered list *before*
+    /// the policy is asked, and this is the same list after: identical minus
+    /// that one name, for every pack and both labels.
+    ///
+    /// Derived from the table rather than pinned beside it on purpose — a second
+    /// hand-written list of the same names is the copy that drifts, and what is
+    /// worth pinning here is the *difference*, which is one name.
+    #[test]
+    fn a_fresh_deployment_takes_call_mcp_tool_off_every_pack_and_a_grant_puts_it_back() {
+        let ceiling = agentos_store::policy::default_ceiling();
+        let policy = |limits: &PolicyLimits| {
+            EffectivePolicy::try_new(limits, limits, limits, limits).expect("identical layers")
+        };
+        let fresh = policy(&ceiling);
+        // The same ceiling with one tool granted, which is what an operator's
+        // `policy install --tenant …` writes the moment a server is bound.
+        let granted = policy(&PolicyLimits {
+            allowed_mcp_tools: [McpTool::new(
+                Slug::parse("erp").expect("slug"),
+                Slug::parse("lookup").expect("slug"),
+            )]
+            .into_iter()
+            .collect(),
+            ..ceiling.clone()
+        });
+
+        let offered = |trust, floor: &BTreeSet<ActionKind>, under| -> Vec<String> {
+            crate::turn::tools_for(trust, floor, under)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        };
+
+        for (name, proposable) in every_pack() {
+            for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
+                let unfiltered = offered(trust, &proposable, None);
+                let on_a_fresh_install = offered(trust, &proposable, Some(&fresh));
+
+                assert_eq!(
+                    on_a_fresh_install,
+                    unfiltered
+                        .iter()
+                        .filter(|tool| *tool != "call_mcp_tool")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "{name} at {trust:?} on a fresh deployment"
+                );
+                // Not vacuous in either direction: every pack proposes McpCall,
+                // so every pack loses exactly one schema and keeps the rest.
+                assert!(unfiltered.contains(&"call_mcp_tool".to_owned()));
+                assert_eq!(on_a_fresh_install.len(), unfiltered.len() - 1);
+                assert_eq!(offered(trust, &proposable, Some(&granted)), unfiltered);
+            }
+        }
     }
 
     // -- customer success --------------------------------------------------

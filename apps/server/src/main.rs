@@ -963,6 +963,15 @@ impl Agent {
             // signal — and an employee whose policy is unreadable can call no
             // MCP tool, so a prefix that named some would be inviting it to
             // spend its turns finding that out.
+            //
+            // The same policy is what narrows the *schemas*, through
+            // `SystemPrompt::request` and `turn::tools_for` — so this `Err` arm
+            // also leaves the tool catalogue unnarrowed, and that is the right
+            // way round. A policy nobody could read is not a policy that grants
+            // nothing; withholding tools on the strength of a failed read would
+            // leave an employee unable to do its job with no denial and no audit
+            // row to explain it, whereas offering them costs one turn per
+            // attempt and writes one row per attempt. Loud beats silent.
             let prompt = charter.as_ref().map_or_else(
                 || SystemPrompt::new(identity.clone()),
                 |charter| charter.system_prompt(&identity),
@@ -973,7 +982,8 @@ impl Agent {
                     tracing::warn!(
                         employee_id = %employee_id.as_uuid(),
                         error = %err,
-                        "no usable policy for this employee; its prefix names no mcp tools"
+                        "no usable policy for this employee; its prefix names no mcp tools \
+                         and its tool schemas are not narrowed by one"
                     );
                     prompt
                 }

@@ -1398,17 +1398,31 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
          the strangers"
     );
 
-    // **Its role's floor, not the catalogue.** The catalogue is five tools and
-    // this turn is offered three. Both absences are the floor alone and nothing
-    // else: the order came from a `Authorized<InternalSend>` rather than an
-    // `Untrusted<…>`, so the turn is **trusted** and `turn::visible` is not
-    // filtering anything out of it. `pay` is missing because the Growth pack
-    // does not propose `PaymentCreate`, and `send_email` because it does not
-    // propose `EmailSend` — which is the whole of what a role pack is.
+    // **Its role's floor and its deployment's policy, not the catalogue.** The
+    // catalogue is five tools and this turn is offered two. None of the three
+    // absences is the taint filter: the order arrived as an
+    // `Authorized<InternalSend>` rather than an `Untrusted<…>`, so the turn is
+    // **trusted** and `turn::visible` is not taking anything away.
+    //
+    // Two of them are the floor. `pay` is missing because the Growth pack does
+    // not propose `PaymentCreate` and `send_email` because it does not propose
+    // `EmailSend` — which is the whole of what a role pack is.
+    //
+    // The third is the **policy**, and it is the one this test started reporting
+    // when `tools_for` was given one. Growth *does* propose `McpCall`, and this
+    // deployment installed `store::policy::default_ceiling` and nothing else —
+    // which grants no MCP tool, exactly as every fresh install does until an
+    // operator binds a server and writes a layer. So the gate would refuse every
+    // `call_mcp_tool` this employee could make, with `deny/no_rule`, and the
+    // schema is not sent. Before the policy filter existed it was sent anyway:
+    // one tool, no inventory, two free strings to guess with, and a refusal that
+    // cannot say whether the name was wrong or the tool was out of reach. This
+    // assertion is the end-to-end proof, on a real server against a real
+    // database, that the guess is no longer on offer.
     let (_, tools) = prompt
         .split_once("\n## tools\n")
         .expect("a request carrying tool schemas renders the contract");
-    for offered in ["message_colleague", "brief_direct_reports", "call_mcp_tool"] {
+    for offered in ["message_colleague", "brief_direct_reports"] {
         assert!(
             tools.contains(&format!("\n- name: {offered}\n")),
             "the Growth pack proposes {offered} and the turn was not offered it:\n{tools}"
@@ -1421,6 +1435,11 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
              anyway — the catalogue is going out whole:\n{tools}"
         );
     }
+    assert!(
+        !tools.contains("\n- name: call_mcp_tool\n"),
+        "this deployment grants no MCP tool, so every `call_mcp_tool` is denied \
+         `no_rule` — offering the schema spends a turn to learn nothing:\n{tools}"
+    );
 
     // And the turn answered with a tool call, so the whole inward chain ran
     // inside the binary: model -> gate -> `Effects::send_internal` ->

@@ -965,15 +965,19 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     //     `tools_for` narrows by trust and then by the role pack's `proposable`
     //     set, and a floor that omitted `PaymentCreate` would make the second
     //     assertion pass without the taint wire doing anything.
+    //     No policy narrowing (`None`): the claim being made here is the taint
+    //     wire's alone, and `tools_for`'s third filter would make `pay`'s
+    //     absence ambiguous between the label and this tenant's spend policy.
+    //     What the agent loop below actually sends is narrowed by all three.
     let floor = RolePack::international_buyer().proposable().clone();
     assert!(
-        tools_for(TrustLabel::Trusted, &floor)
+        tools_for(TrustLabel::Trusted, &floor, None)
             .iter()
             .any(|t| t.name == "pay"),
         "the payment tool exists at all, and a buyer may propose one"
     );
     assert!(
-        !tools_for(TrustLabel::Untrusted, &floor)
+        !tools_for(TrustLabel::Untrusted, &floor, None)
             .iter()
             .any(|t| t.name == "pay"),
         "a turn that has read a supplier's email must not be offered the payment tool"

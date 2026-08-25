@@ -66,6 +66,17 @@
 //!    human put in `mcp_tool_declarations` — which keeps the rule at the top of
 //!    this file true: a counterparty does not write the system prompt.
 //!
+//! The policy handed to [`SystemPrompt::with_mcp_tools`] is **kept**, because
+//! the same question decides the other list this type controls. Naming zero MCP
+//! tools while [`SystemPrompt::request`] still hands out the `call_mcp_tool`
+//! schema is not half a fix, it is the bug in its most expensive form: the model
+//! gets a tool with no inventory and two free strings, guesses, and burns a turn
+//! on a refusal it cannot learn from. So `request` asks
+//! [`agentos_domain::policy::always_denies`] — the *kind*-shaped question, true
+//! only when no action of that kind could ever be allowed — and drops the schema
+//! when the answer is yes. Point 1's filter still runs on top of it and still
+//! runs last.
+//!
 //! # Colleagues are named, and only the ones that can be reached
 //!
 //! [`SystemPrompt::with_colleagues`] is the same fix as the MCP inventory,
@@ -301,6 +312,22 @@ pub struct SystemPrompt {
     /// prefix, so two employees of different roles still share every cached
     /// token their briefings share.
     floor: BTreeSet<ActionKind>,
+    /// This employee's own policy, kept because the schemas are scoped by it
+    /// exactly as the inventory above is.
+    ///
+    /// [`Self::with_mcp_tools`] is where it arrives, and that is not it doing
+    /// two jobs: it is one policy scoping the two lists this type controls —
+    /// which MCP tools are *named*, and which action schemas are *offered*.
+    /// Splitting it into a second builder taking the same argument would make
+    /// "called one and forgot the other" expressible, and the forgotten one
+    /// would be silent.
+    ///
+    /// `None` is nobody having been able to read a policy, not a policy that
+    /// grants nothing — see [`tools_for`], which is where the difference is
+    /// argued. Not rendered, like the floor: it changes which schemas go out and
+    /// never a byte of the prefix, so two employees of different policies still
+    /// share every cached token their briefings share.
+    policy: Option<EffectivePolicy>,
     /// Who this employee may message, and why. Rendered for the same reason the
     /// inventory is; the [`Relation`] stays typed, because it is what the line
     /// is worded from.
@@ -324,6 +351,7 @@ impl SystemPrompt {
             credentials: Vec::new(),
             mcp: Vec::new(),
             floor: UNCHARTERED.into_iter().collect(),
+            policy: None,
             colleagues: Vec::new(),
         }
     }
@@ -351,7 +379,9 @@ impl SystemPrompt {
     }
 
     /// Tell the model that one MCP tool exists — and only the ones this
-    /// employee may actually call.
+    /// employee may actually call. **This is also where the prompt is told the
+    /// employee's policy**, which scopes the action schemas too: see the
+    /// `policy` field and [`Self::request`].
     ///
     /// Feed `inventory` from [`crate::mcp::Fleet::inventory`], which is the
     /// *tenant's*: every declared tool on every server an operator bound, for
@@ -409,6 +439,12 @@ impl SystemPrompt {
         policy: &EffectivePolicy,
         inventory: impl IntoIterator<Item = (McpTool, Risk)>,
     ) -> Self {
+        // Kept, not just read. The gate's answer about *this* employee is what
+        // `request` needs to stop offering a schema whose every invocation is a
+        // denial, and this is the one call site that has it. The clone is one
+        // per prompt, i.e. one per employee per configuration change, against a
+        // prefix that is rebuilt on the same cadence.
+        self.policy = Some(policy.clone());
         self.mcp.extend(
             inventory
                 .into_iter()
@@ -620,10 +656,17 @@ impl SystemPrompt {
     /// named in the prefix but filtered out of the schemas — or the reverse —
     /// is not expressible from here.
     ///
-    /// The role floor is not a knob either, for the same reason: it is read off
-    /// this value, so the schemas a turn is offered are the ones its employee's
-    /// pack allows and there is no argument position in which to pass somebody
-    /// else's.
+    /// The role floor is not a knob either, and neither is the policy, for the
+    /// same reason: both are read off this value, so the schemas a turn is
+    /// offered are the ones its own employee's pack and its own employee's
+    /// policy allow, and there is no argument position in which to pass
+    /// somebody else's.
+    ///
+    /// The policy is the third filter and the newest. Without it this function
+    /// handed out `call_mcp_tool` to every employee of every fresh deployment
+    /// while [`Self::render`] — asking the same gate one field away — correctly
+    /// named no tools: one schema, no inventory, two free strings, and a
+    /// `deny/no_rule` for every guess.
     pub fn request(
         &self,
         model: &str,
@@ -634,8 +677,11 @@ impl SystemPrompt {
         history
             .into_iter()
             .fold(
-                LlmRequest::new(model, self.render(trust), max_tokens)
-                    .with_tools(tools_for(trust, &self.floor)),
+                LlmRequest::new(model, self.render(trust), max_tokens).with_tools(tools_for(
+                    trust,
+                    &self.floor,
+                    self.policy.as_ref(),
+                )),
                 LlmRequest::with_message,
             )
             .cache_here()
@@ -910,16 +956,24 @@ Kind regards, Accounts Payable";
         )
     }
 
-    /// A policy that allows exactly these tools and nothing else.
+    /// A shipped deployment whose operator has granted exactly these MCP tools.
     ///
     /// One `PolicyLimits` in all four positions, because intersecting a layer
     /// with itself is a no-op — the shape of the stack is `store::policy`'s
     /// claim and not this file's, and what these tests need is one effective
     /// allowlist that a `SystemPrompt` can be built against.
+    ///
+    /// The base is [`agentos_store::policy::default_ceiling`] and not
+    /// `Default::default()`, and the difference is load-bearing now that
+    /// [`SystemPrompt::request`] scopes the *schemas* by this policy too. An
+    /// empty base grants no channel and no budget, so a prompt built on one is
+    /// offered neither `send_email` nor `pay` — and every assertion below about
+    /// what the taint filter takes away would pass without the taint filter
+    /// doing anything.
     fn allowing(tools: impl IntoIterator<Item = McpTool>) -> EffectivePolicy {
         let limits = agentos_domain::policy::PolicyLimits {
             allowed_mcp_tools: tools.into_iter().collect(),
-            ..Default::default()
+            ..agentos_store::policy::default_ceiling()
         };
         EffectivePolicy::try_new(&limits, &limits, &limits, &limits).expect("coherent layers")
     }

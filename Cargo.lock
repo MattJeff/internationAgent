@@ -149,6 +149,7 @@ dependencies = [
  "agentos-app",
  "agentos-domain",
  "agentos-providers",
+ "agentos-store",
  "chrono",
  "serde_json",
  "sha2 0.10.9",

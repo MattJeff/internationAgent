@@ -1119,6 +1119,9 @@ mod tests {
         tools_for(
             trust,
             crate::rolepack::RolePack::international_buyer().proposable(),
+            // No policy narrowing: a `false` here must be the retrieved
+            // passage's taint and never a policy that closed the channel.
+            None,
         )
         .iter()
         .any(|tool| tool.name == PAY)

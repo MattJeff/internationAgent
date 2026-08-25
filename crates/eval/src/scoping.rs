@@ -462,13 +462,21 @@ impl Company {
         self.policy(self.inventory().into_iter().map(|(tool, _)| tool))
     }
 
+    /// The shipped ceiling plus these MCP tools.
+    ///
+    /// `store::policy::default_ceiling` and not `Default::default()`, because
+    /// `turn::tools_for` is scoped by this policy now as well as by trust and
+    /// the role floor: an empty base grants no channel and no budget, so the
+    /// weighed employee would be offered neither `send_email` nor `pay` and
+    /// every schema figure in this file would be measuring a deployment nobody
+    /// runs. The allowlist is still the only field this fixture varies.
     fn policy(self, tools: impl IntoIterator<Item = McpTool>) -> EffectivePolicy {
         let limits = PolicyLimits {
             allowed_mcp_tools: tools.into_iter().collect(),
-            ..Default::default()
+            ..agentos_store::policy::default_ceiling()
         };
         EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
-            .expect("four identical layers, and no spend limits to reconcile")
+            .expect("four identical layers, and the shipped ceiling reconciles with itself")
     }
 
     /// What the tenant's MCP fleet holds: one server per team, three tools
@@ -865,23 +873,28 @@ pub fn evaluate() -> Surface {
     );
 
     // --- 4. what taint filtering costs ---------------------------------------
+    // Under the weighed employee's own policy — the same `allowlist()` that
+    // `assemble` hands `with_mcp_tools`. `tools_for` is scoped by the policy as
+    // well as by trust and the role floor now, so counting with `None` here
+    // would price a schema list the request never sends.
+    let granted = biggest.allowlist();
+    let offered = |trust| tools_for(trust, &floor(), Some(&granted));
     let schema = |trust| -> usize {
-        tools_for(trust, &floor())
+        offered(trust)
             .iter()
             .map(|tool| tokens(&serde_json::to_string(tool).unwrap_or_default()))
             .sum()
     };
     let (trusted, untrusted) = (schema(TrustLabel::Trusted), schema(TrustLabel::Untrusted));
     let narrower = untrusted < trusted
-        && tools_for(TrustLabel::Untrusted, &floor()).len()
-            < tools_for(TrustLabel::Trusted, &floor()).len();
+        && offered(TrustLabel::Untrusted).len() < offered(TrustLabel::Trusted).len();
     rows.push(
         Row::ok(
             "an untrusted turn is offered less schema",
             format!(
                 "{untrusted} vs {trusted} tok ({} tools vs {})",
-                tools_for(TrustLabel::Untrusted, &floor()).len(),
-                tools_for(TrustLabel::Trusted, &floor()).len(),
+                offered(TrustLabel::Untrusted).len(),
+                offered(TrustLabel::Trusted).len(),
             ),
             Truth::Correct,
         )
@@ -978,8 +991,12 @@ mod tests {
     /// misreport the whole content-aware rule exists to avoid.
     #[test]
     fn json_costs_more_per_character_than_prose_does() {
-        let schemas =
-            serde_json::to_string(&tools_for(TrustLabel::Trusted, &floor())).expect("json");
+        let schemas = serde_json::to_string(&tools_for(
+            TrustLabel::Trusted,
+            &floor(),
+            Some(&Company { employees: 10 }.allowlist()),
+        ))
+        .expect("json");
         let json = schemas.chars().count() as f64 / tokens(&schemas) as f64;
         let prose = passage(0, 0).chars().count() as f64 / tokens(&passage(0, 0)) as f64;
         assert!(json < prose, "{json:.2} vs {prose:.2} chars/token");
@@ -1148,16 +1165,18 @@ mod tests {
     /// but small — the point of the row is the strict inequality, not the size.
     #[test]
     fn an_untrusted_turn_is_offered_strictly_fewer_tools_and_fewer_tokens() {
+        // The weighed employee's own policy, as `assemble` gives it — the third
+        // filter `tools_for` applies, and the one that would make this count a
+        // schema list nobody is sent if it were left out.
+        let granted = Company { employees: 10 }.allowlist();
+        let offered = |trust| tools_for(trust, &floor(), Some(&granted));
         let schema = |trust| -> usize {
-            tools_for(trust, &floor())
+            offered(trust)
                 .iter()
                 .map(|tool| tokens(&serde_json::to_string(tool).expect("json")))
                 .sum()
         };
-        assert!(
-            tools_for(TrustLabel::Untrusted, &floor()).len()
-                < tools_for(TrustLabel::Trusted, &floor()).len()
-        );
+        assert!(offered(TrustLabel::Untrusted).len() < offered(TrustLabel::Trusted).len());
         assert!(schema(TrustLabel::Untrusted) < schema(TrustLabel::Trusted));
     }
 
@@ -1245,10 +1264,13 @@ mod tests {
     /// or the schemas measured above are the wrong ones.
     #[test]
     fn the_assembled_turn_is_untrusted_the_way_a_real_one_is() {
-        let request = assemble(Company { employees: 10 }, Reach::Team, Inventory::Named);
+        let company = Company { employees: 10 };
+        let request = assemble(company, Reach::Team, Inventory::Named);
         assert_eq!(
             request.tools.len(),
-            tools_for(TrustLabel::Untrusted, &floor()).len()
+            tools_for(TrustLabel::Untrusted, &floor(), Some(&company.allowlist())).len(),
+            "the request and this recomposition disagree, which means one of them is \
+             filtering by something the other does not"
         );
         assert!(!request.tools.iter().any(|tool| tool.name == "pay"));
         // The roster survives the taint, and it has to: `message_colleague` is

@@ -657,6 +657,13 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // must be told exactly what an employee woken by a stranger is told, or
     // "same authority either way" is only true of the gate and not of what the
     // model knows to ask for.
+    //
+    // That now covers the tool schemas too — `SystemPrompt::request` narrows
+    // them by this same policy through `turn::tools_for` — which makes the
+    // sameness stronger and the `None` arm more load-bearing. `None` is a policy
+    // that would not load, and it leaves the catalogue unnarrowed on purpose:
+    // see the matching arm in `main.rs`, which argues why a failed read must not
+    // read as a grant of nothing.
     let prompt = charter.system_prompt(&identity);
     let prompt = match &policy {
         Some(policy) => prompt.with_mcp_tools(policy, fleet.inventory()),

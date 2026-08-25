@@ -3452,6 +3452,9 @@ mod tests {
         let offered: Vec<String> = crate::turn::tools_for(
             context.trust(),
             crate::rolepack::RolePack::international_buyer().proposable(),
+            // No policy narrowing: the claim here is the taint wire's, and a
+            // policy in the way would make `pay`'s absence ambiguous.
+            None,
         )
         .into_iter()
         .map(|tool| tool.name)
@@ -4220,6 +4223,9 @@ mod tests {
         let offered: Vec<String> = crate::turn::tools_for(
             context.trust(),
             crate::rolepack::RolePack::international_buyer().proposable(),
+            // No policy narrowing: the claim here is the taint wire's, and a
+            // policy in the way would make `pay`'s absence ambiguous.
+            None,
         )
         .into_iter()
         .map(|tool| tool.name)

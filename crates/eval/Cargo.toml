@@ -11,6 +11,11 @@ publish = false
 agentos-domain.workspace = true
 agentos-app.workspace = true
 agentos-providers.workspace = true
+# For `policy::default_ceiling` alone: the fixtures here are policies an
+# operator actually has, and a restated copy of the shipped ceiling in a crate
+# whose job is measurement would be a number measured against a deployment
+# nobody runs. Already in the graph via agentos-app.
+agentos-store.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 # One digest of the rendered system prompt, so a prompt edit invalidates the
