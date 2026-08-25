@@ -12,6 +12,7 @@ pub mod inbound; // U29
 pub mod knowledge; // U26
 pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
+pub mod orizn; // wave 4 — the authoritative half of proof_of_need
 pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23

@@ -115,6 +115,12 @@
 //! [`MAX_TRUTH_AGE`] is refused before a single page is loaded
 //! ([`Checked::TruthStale`]).
 //!
+//! [`crate::orizn`] is what builds one in the running system: a gated
+//! [`Action::McpCall`] against Orizn's own MCP surface, whose result stays
+//! [`Untrusted`] and reaches this module as four enum variants and a date.
+//! [`Answer::retrieved_at`] carries the argument about *whose* clock
+//! [`MAX_TRUTH_AGE`] is measured against, and it is not ours.
+//!
 //! # What the page says is [`Untrusted`], always
 //!
 //! The panel text is the *subject* of the investigation. It is never an
@@ -479,9 +485,24 @@ pub struct Probe {
 pub struct Answer {
     /// What is actually required.
     pub requirement: Claim,
-    /// Which source said so — e.g. `orizn:requirements/v1`.
+    /// Which source said so — e.g. `orizn:quick_visa_check/v1`.
+    ///
+    /// **Ours, never the source's own words.** This is the one field of an
+    /// `Answer` that [`Evidence::claim_line`] interpolates into the sentence a
+    /// human sends, so a value taken off a tool result would be a writable slot
+    /// in our outbound mail. [`crate::orizn::SOURCE`] is a constant for exactly
+    /// that reason.
     pub source: String,
-    /// When we asked it.
+    /// The instant this answer is known good as of — and therefore the one
+    /// [`MAX_TRUTH_AGE`] is measured from.
+    ///
+    /// Not simply "when we asked". A source that answers instantly out of a
+    /// snapshot it last checked in the spring has told us something old very
+    /// quickly, and stamping the call time here would make [`MAX_TRUTH_AGE`]
+    /// unfalsifiable — every answer a second old, forever, on a fact about our
+    /// own clock. So a caller whose source dates its own data puts the **earlier**
+    /// of the two here; see [`crate::orizn::read_answer`], which is the only
+    /// thing in the running system that builds one.
     pub retrieved_at: DateTime<Utc>,
     /// When the current rule took effect, when the source knows.
     ///
