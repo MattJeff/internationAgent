@@ -1418,6 +1418,123 @@ pub(crate) mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// **A provider that answers nothing but errors, run to the end of the
+    /// day.**
+    ///
+    /// Three claims this module makes in prose and nothing here asserted, in one
+    /// pass through the real loop:
+    ///
+    /// * **The daily turn budget is what bounds it.** Nothing else can: there is
+    ///   no retry inside `Turn::run`, no attempt counter on this path — the
+    ///   schedule is not a queue and `record_outcome` is bookkeeping — and every
+    ///   other ceiling in the system is on money or on tool calls *inside* one
+    ///   turn, which a turn that never reaches a tool never touches. With a
+    ///   budget of two, a model that is down all afternoon costs two calls and
+    ///   then nothing.
+    /// * **The slot is burned by the failure, and there is no way to get it
+    ///   back.** `store::turns` has no release verb precisely so that "fail
+    ///   late, release, retry, forever" is unspellable, and this is the shape
+    ///   that would ride it. `turns_taken` must move on a turn that failed
+    ///   exactly as it moves on one that worked.
+    /// * **The failed turn is billed.** `Failed` carries `usage` and `turns` so
+    ///   that [`take_turn`] can write them, and a call that reported no tokens
+    ///   is recorded **unmetered rather than free** — `Consumed::reported`'s one
+    ///   judgement, asserted here at the seam it exists for. A crash-looping
+    ///   employee is the case where the calls are most real and the record is
+    ///   most likely to be empty.
+    ///
+    /// `ScriptedLlm::new(vec![])` is the provider: an exhausted script refuses
+    /// every call with a terminal error, which is what a bad API key or a
+    /// provider outage looks like from inside `Turn::run` — and it needs no
+    /// `ProviderError` in scope, which this crate deliberately cannot name.
+    #[tokio::test]
+    async fn a_provider_that_fails_forever_is_bounded_by_the_day_and_billed_for_it() {
+        use agentos_app::gate::PolicyGate;
+        use agentos_app::mocks::ScriptedLlm;
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        // Two turns a day, so the bound is reachable inside a test.
+        turn_budget(&db, tenant, 2).await;
+        let employee = seed_due(&db, tenant, "downstream", Some(workable())).await;
+
+        let cancel = CancellationToken::new();
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(ScriptedLlm::new(Vec::new())),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: crate::routes::mcp::Fleets::new().0,
+            model: "claude-opus-5",
+            cancel: cancel.clone(),
+        };
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        let day = Utc::now().date_naive();
+        // Four cadences, two hours apart, **anchored to this UTC midnight**.
+        // The clock has to advance past each reschedule or the employee is not
+        // due again — the cadence here is hourly — and it has to stay inside one
+        // UTC day or the budget resets underneath the test, which is the bug
+        // that a bare `Utc::now() + hours(n)` walks into for anyone running the
+        // suite after 16:00 UTC. `take_turn` books the ledger against
+        // `Utc::now()` rather than the tick's clock, so both have to be today.
+        let midnight = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+        for round in 1..=4 {
+            let now = midnight + chrono::TimeDelta::hours(round * 2);
+            assert_eq!(
+                tick(&db, &take, &cancel, now).await.expect("tick"),
+                1,
+                "round {round}: the employee must still be claimed"
+            );
+        }
+
+        let (outcome, detail, claims) = outcome_of(&db, tenant, employee).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let spent = turns::taken_today(&mut tx, employee, day)
+            .await
+            .expect("taken today");
+        let billed = model_usage::on_day(&mut tx, employee, day)
+            .await
+            .expect("ledger");
+        tx.rollback().await.expect("rollback");
+
+        // Claimed every round — the schedule keeps offering it, which is why
+        // the budget has to be the thing that says no.
+        assert_eq!(claims, 4, "the schedule stopped offering the employee");
+        // ...and the last two rounds never reached the model.
+        assert_eq!(
+            outcome, "over_budget",
+            "a spent budget must refuse rather than call the model again"
+        );
+        assert!(
+            detail.unwrap_or_default().contains("used up"),
+            "the operator is not told which ceiling stopped it"
+        );
+
+        // Two turns granted, two burned, none handed back by failing.
+        assert_eq!(
+            spent, 2,
+            "a failed turn either did not cost its slot or the slot came back"
+        );
+
+        // And both of them are on the bill, as calls nobody metered rather than
+        // as calls that cost nothing.
+        assert_eq!(billed.calls, 2, "a failed turn was not billed: {billed:?}");
+        assert_eq!(billed.calls_unmetered, 2);
+        assert_eq!(billed.tokens_measured(), 0);
+        assert!(
+            !billed.is_complete(),
+            "two calls of unknown cost read as a complete bill"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
     /// The gaps question is the role pack's, not this loop's, and it is the same
     /// answer the route shows the operator.
     #[test]

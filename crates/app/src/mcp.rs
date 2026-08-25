@@ -205,6 +205,26 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// can ask, and we can ask why.
 const ALLOWED_SCHEMES: [&str; 2] = ["http", "https"];
 
+/// How long one tool call may take before it is abandoned.
+///
+/// **This is the only bound on it.** Nothing between here and `Turn::run`
+/// applies a clock to an effect: the turn's `CancellationToken` races the model
+/// call and not the tool call, and `apps/server`'s `TURN_DEADLINE` fires that
+/// token — so a tool call that never returns is a turn that never returns and,
+/// on the inbound path, an outbox handler's transaction that is never
+/// committed or rolled back.
+///
+/// Half of `TURN_DEADLINE`'s 120 seconds, which is the number this has to fit
+/// inside: a call allowed to run to the deadline leaves the turn no time to do
+/// anything with the answer, and a turn is allowed several calls.
+///
+/// ponytail: one constant, not per-server config, and the ceiling is that a
+/// genuinely slow tool — a long ERP report — is cut off at a number nobody
+/// chose for it. The upgrade is a column on `mcp_servers` read at bind time and
+/// carried on `McpServer`, the day an operator has one that needs it. Two
+/// numbers that can disagree is worse than one that is occasionally short.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Risk
 // ---------------------------------------------------------------------------
@@ -441,6 +461,21 @@ pub enum McpError {
     #[error("could not connect to the mcp server: {0}")]
     Connect(String),
 
+    /// The server took the request and did not answer inside
+    /// [`CALL_TIMEOUT`].
+    ///
+    /// Its own variant rather than a [`Self::Connect`] with a different string,
+    /// because the two are different sentences at 3am: `connect_failed` says the
+    /// server is unreachable and `timed_out` says it is reachable and slow, and
+    /// the second one is the operator's problem to take up with whoever runs it.
+    #[error("{tool} did not answer within {secs}s")]
+    TimedOut {
+        /// Which call gave up.
+        tool: McpTool,
+        /// The ceiling it hit.
+        secs: u64,
+    },
+
     /// The server was reached and the exchange failed.
     #[error(transparent)]
     Transport(#[from] ServiceError),
@@ -458,6 +493,7 @@ impl McpError {
             McpError::Refused(_) => "refused",
             McpError::MoreRoundsRequired(_) => "more_rounds_required",
             McpError::Connect(_) => "connect_failed",
+            McpError::TimedOut { .. } => "timed_out",
             McpError::Transport(_) => "transport",
         }
     }
@@ -718,7 +754,30 @@ impl McpServer {
         // `call_tool_once`, never `call_tool`: the latter answers the server's
         // follow-up rounds by itself, which would be extra dispatches the gate
         // never ruled on.
-        match self.client.call_tool_once(params).await? {
+        // **Bounded, because nothing above this is.** `Turn::run` races the
+        // *model* call against its `CancellationToken` and nothing races the
+        // effect, so a tool call that never returns is a turn that never
+        // returns — and on the inbound path that turn is inside the outbox
+        // handler's tenant transaction, so the wedge is an open Postgres
+        // transaction and a pooled connection held for as long as the server
+        // stays quiet, while the outbox lease expires underneath it and a second
+        // poller re-runs the same turn. `main.rs`'s `TURN_DEADLINE` cannot reach
+        // in here; only a timeout on the call itself can.
+        //
+        // `rmcp`'s `StreamableHttpClientTransport::from_uri` builds its own HTTP
+        // client and this crate cannot name `reqwest` to configure one, which is
+        // why the bound is here rather than on the socket.
+        let called =
+            match tokio::time::timeout(CALL_TIMEOUT, self.client.call_tool_once(params)).await {
+                Ok(called) => called?,
+                Err(_) => {
+                    return Err(McpError::TimedOut {
+                        tool: tool.clone(),
+                        secs: CALL_TIMEOUT.as_secs(),
+                    });
+                }
+            };
+        match called {
             CallToolResponse::Complete(result) => Ok(Untrusted::new(result)),
             // `InputRequired`, `Task`, and whatever `#[non_exhaustive]` adds
             // next all mean the same thing here: this is not a finished
@@ -1190,7 +1249,9 @@ fn declaration(row: &ConfigRow) -> Option<(Slug, Declaration)> {
 /// spends its whole budget being told no.
 fn as_provider_error(err: &McpError) -> ProviderError {
     match err {
-        McpError::Connect(_) | McpError::Transport(_) => ProviderError::timeout(),
+        McpError::Connect(_) | McpError::TimedOut { .. } | McpError::Transport(_) => {
+            ProviderError::timeout()
+        }
         other => ProviderError::Terminal { code: other.code() },
     }
 }
@@ -1281,6 +1342,18 @@ mod tests {
 
     impl FakeMcp {
         async fn start(pages: Vec<Vec<Tool>>) -> Self {
+            Self::start_with(pages, false).await
+        }
+
+        /// The same server, except that it accepts a `tools/call` and never
+        /// answers it — the shape [`CALL_TIMEOUT`] exists for. It still binds,
+        /// still lists its tools, and still records the method, so everything
+        /// before the call is the ordinary path.
+        async fn start_swallowing_calls(pages: Vec<Vec<Tool>>) -> Self {
+            Self::start_with(pages, true).await
+        }
+
+        async fn start_with(pages: Vec<Vec<Tool>>, swallow_calls: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr: SocketAddr = listener.local_addr().expect("addr");
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1291,7 +1364,9 @@ mod tests {
                 while let Ok((stream, _)) = listener.accept().await {
                     let seen = Arc::clone(&accepted);
                     let pages = Arc::clone(&pages);
-                    tokio::spawn(async move { serve_connection(stream, seen, pages).await });
+                    tokio::spawn(async move {
+                        serve_connection(stream, seen, pages, swallow_calls).await;
+                    });
                 }
             });
 
@@ -1316,6 +1391,7 @@ mod tests {
         mut stream: TcpStream,
         seen: Arc<Mutex<Vec<String>>>,
         pages: Arc<Vec<Vec<Tool>>>,
+        swallow_calls: bool,
     ) {
         let mut buffer = Vec::new();
         loop {
@@ -1327,6 +1403,12 @@ mod tests {
             };
             let method = request["method"].as_str().unwrap_or_default().to_owned();
             seen.lock().expect("not poisoned").push(method.clone());
+
+            // Took the request, will not answer. The socket stays open, so this
+            // is the failure a connect timeout cannot see.
+            if swallow_calls && method == "tools/call" {
+                std::future::pending::<()>().await;
+            }
 
             let response = match request.get("id") {
                 // A notification: nothing to answer.
@@ -1783,6 +1865,75 @@ mod tests {
             ));
         }
         assert_eq!(server.count("tools/call"), 0);
+    }
+
+    /// **A server that takes the request and goes quiet gives up on its own.**
+    ///
+    /// Nothing above this call bounds it. `Turn::attempt` races the *model* call
+    /// against its `CancellationToken` and nothing races an effect, so
+    /// `apps/server`'s `TURN_DEADLINE` fires a token that is only read at the
+    /// next checkpoint — which a call that never returns never reaches. On the
+    /// inbound path that turn is inside the outbox handler's tenant
+    /// transaction, so the wedge is an open Postgres transaction held for as
+    /// long as somebody else's server stays quiet.
+    ///
+    /// The socket stays open and the request was accepted, which is why a
+    /// connect timeout would not have caught this and why `rmcp`'s transport —
+    /// which builds its own HTTP client with reqwest's default of *no* request
+    /// timeout — does not either.
+    ///
+    /// The sixty seconds run on a virtual clock: tokio advances it once every
+    /// task is parked, which they are the moment the fake server swallows the
+    /// call. The pause is taken **after** the bind and not by
+    /// `#[tokio::test(start_paused)]`, because `ClientLifecycleMode::Auto`
+    /// falls back to the legacy `initialize` handshake after ten seconds of
+    /// silence — on a paused clock those ten seconds pass during the handshake
+    /// and the bind itself fails. Without the timeout this test hangs rather
+    /// than failing, so it carries a guard of its own.
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_abandoned_rather_than_waited_for() {
+        let server = FakeMcp::start_swallowing_calls(two_pages()).await;
+        let bound = Arc::new(bound(&server).await);
+        let tool = McpTool::new(erp(), slug("lookup"));
+
+        // Dispatched on a real clock, so the request genuinely goes out. The
+        // virtual clock is taken only once the server has the request in hand:
+        // paused first, tokio advances the moment every task parks — which is
+        // before the reactor has flushed the socket — and the call would time
+        // out without anything ever having been sent, which is not the failure
+        // under test.
+        let call = tokio::spawn({
+            let (bound, tool) = (Arc::clone(&bound), tool.clone());
+            async move { bound.call(&tool, None).await }
+        });
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while server.count("tools/call") == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "the request never reached the server");
+
+        tokio::time::pause();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(600), call)
+            .await
+            .expect("the call never gave up at all")
+            .expect("the call panicked")
+            .expect_err("a server that never answers must not be waited on forever");
+
+        // The diagnosis is "slow", not "unreachable" — the request landed, and
+        // the assertion above is what says so.
+        assert!(
+            matches!(&err, McpError::TimedOut { tool: t, secs } if *t == tool && *secs == CALL_TIMEOUT.as_secs()),
+            "{err}"
+        );
+        assert_eq!(err.code(), "timed_out");
+        assert_eq!(server.count("tools/call"), 1, "it was sent more than once");
+
+        // And it reaches the effect layer as retryable, like every other
+        // "the network was unlucky" — a quiet server is not a reason to stop
+        // asking, unlike a refusal.
+        assert!(as_provider_error(&err).is_retryable(), "{err}");
     }
 
     #[tokio::test]

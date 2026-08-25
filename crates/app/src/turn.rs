@@ -1484,6 +1484,17 @@ mod tests {
     /// The wiring, minus the seeding — so a second employee of an existing
     /// company can be given a turn of its own without a second tenant.
     fn wire(db: &Db, principal: &Principal, llm: Arc<dyn Llm>, mcp_says: &'static str) -> Harness {
+        wire_with_mcp(db, principal, llm, Arc::new(StubMcp(mcp_says)))
+    }
+
+    /// [`wire`] with the MCP port handed in, for the tests whose subject is a
+    /// server that misbehaves rather than one that answers.
+    fn wire_with_mcp(
+        db: &Db,
+        principal: &Principal,
+        llm: Arc<dyn Llm>,
+        mcp: Arc<dyn McpCaller>,
+    ) -> Harness {
         let principal = principal.clone();
         let payments = Arc::new(MockPayments::default());
         let email = Arc::new(MockEmailProvider::new());
@@ -1491,7 +1502,7 @@ mod tests {
             email: email.clone(),
             telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
             browser: Arc::new(MockBrowser::new()),
-            mcp: Arc::new(StubMcp(mcp_says)),
+            mcp,
             payments: payments.clone(),
         });
         let effects = Effects::new(db.clone(), ports, principal.clone());
@@ -2769,5 +2780,250 @@ mod tests {
         };
         assert!(*is_error);
         assert!(content.contains("no such tool"), "{content}");
+    }
+
+    // -- the bill on the way out -------------------------------------------
+
+    /// **[`Failed`] carries the bill, and nothing asserted that it does.**
+    ///
+    /// This is the whole reason the struct exists — "every exit from
+    /// [`Turn::run`] carries the bill, whether or not it carries an answer" —
+    /// and both call sites downstream (`Agent::on_turn` and
+    /// `loops::initiative::take_turn`) write `failed.usage` and `failed.turns`
+    /// straight into `store::model_usage`, guarded by `if failed.turns > 0`. A
+    /// run that reported zero would therefore write no row at all, which is the
+    /// silent-loss-reads-as-free failure the ledger exists to end.
+    ///
+    /// All four exits, because `spent` is threaded through `attempt` by `&mut`
+    /// and *any* of the four `?`s could have dropped it before `run` reads it:
+    ///
+    /// 1. a provider that fails forever, which is `TurnError::Llm`;
+    /// 2. a model that never stops, which is `Budget::Turns`;
+    /// 3. a cancellation, which is `Budget::Deadline`;
+    /// 4. and the token ceiling itself, which is the one where reporting the
+    ///    usage back is not optional — it is the number that tripped it.
+    ///
+    /// Each is asserted against the tokens the script actually named, not
+    /// against "more than zero": a bill that is real but wrong is the same lie
+    /// one order of magnitude smaller.
+    #[tokio::test]
+    async fn every_way_a_turn_can_fail_still_reports_what_it_spent() {
+        let Some(db) = db().await else { return };
+        // Every scripted turn below costs 120 tokens: 100 in, 20 out.
+        const PER_TURN: u64 = 120;
+        let generous = Budgets {
+            max_turns: 1_000,
+            max_tool_calls: 1_000,
+            max_tokens: u64::MAX,
+        };
+
+        // 1. A provider that fails forever. Two calls land, the third is a 500,
+        //    and the turn stops there — there is no retry inside the loop, so
+        //    the attempt budget that bounds this is the outbox's, one level up.
+        let dying = Arc::new(ScriptedLlm::looping(vec![
+            Ok(email_call("toolu_1", "supplier@example.com")),
+            Ok(email_call("toolu_2", "supplier@example.com")),
+            Err(ProviderError::from_status(500, None)),
+        ]));
+        let h = harness(&db, dying.clone(), "{}").await;
+        let failed = h
+            .turn
+            .with_budgets(generous)
+            .run(
+                Context::new().with_task("chase it"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a provider that answers 500 ends the run");
+        assert!(matches!(failed.error, TurnError::Llm(_)));
+        assert_eq!(dying.calls(), 3, "it stopped at the failure, not before it");
+        // Three round trips were counted — the third one happened and failed —
+        // and two of them were paid for.
+        assert_eq!(failed.turns, 3);
+        assert_eq!(
+            failed.usage.total(),
+            2 * PER_TURN,
+            "the tokens the two answered calls really cost were dropped"
+        );
+        assert_eq!(failed.usage.input_tokens, 200);
+        assert_eq!(failed.usage.output_tokens, 40);
+
+        // 2. A model that never stops, cut off by the turn budget.
+        let forever = Arc::new(ScriptedLlm::looping(vec![Ok(email_call(
+            "toolu_1",
+            "supplier@example.com",
+        ))]));
+        let h = harness(&db, forever, "{}").await;
+        let failed = h
+            .turn
+            .with_budgets(Budgets {
+                max_turns: 3,
+                ..generous
+            })
+            .run(Context::new(), &CancellationToken::new())
+            .await
+            .expect_err("a looping model is stopped");
+        assert!(matches!(
+            failed.error,
+            TurnError::BudgetExceeded(Budget::Turns)
+        ));
+        assert_eq!(failed.turns, 3);
+        assert_eq!(failed.usage.total(), 3 * PER_TURN);
+
+        // 3. The token ceiling. Two turns fit under 300, the third takes it
+        //    over, and the reported bill is what tripped it.
+        let forever = Arc::new(ScriptedLlm::looping(vec![Ok(email_call(
+            "toolu_1",
+            "supplier@example.com",
+        ))]));
+        let h = harness(&db, forever, "{}").await;
+        let failed = h
+            .turn
+            .with_budgets(Budgets {
+                max_tokens: 300,
+                ..generous
+            })
+            .run(Context::new(), &CancellationToken::new())
+            .await
+            .expect_err("the token ceiling stops it");
+        assert!(matches!(
+            failed.error,
+            TurnError::BudgetExceeded(Budget::Tokens)
+        ));
+        assert_eq!(failed.usage.total(), 3 * PER_TURN);
+        assert!(
+            failed.usage.total() >= 300,
+            "the reported bill is under the ceiling it tripped"
+        );
+
+        // 4. A deadline that fires after two turns' worth of work. The calls
+        //    happened and were paid for; the cancellation does not unspend
+        //    them.
+        struct CancelAfter {
+            inner: ScriptedLlm,
+            cancel: CancellationToken,
+            after: usize,
+        }
+
+        #[async_trait]
+        impl Llm for CancelAfter {
+            async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, ProviderError> {
+                let response = self.inner.complete(req).await;
+                if self.inner.calls() >= self.after {
+                    self.cancel.cancel();
+                }
+                response
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let llm = Arc::new(CancelAfter {
+            inner: ScriptedLlm::looping(vec![Ok(email_call("toolu_1", "supplier@example.com"))]),
+            cancel: cancel.clone(),
+            after: 2,
+        });
+        let h = harness(&db, llm, "{}").await;
+        let failed = h
+            .turn
+            .with_budgets(generous)
+            .run(Context::new(), &cancel)
+            .await
+            .expect_err("the deadline stops it");
+        assert!(matches!(
+            failed.error,
+            TurnError::BudgetExceeded(Budget::Deadline)
+        ));
+        assert_eq!(failed.turns, 2);
+        assert_eq!(
+            failed.usage.total(),
+            2 * PER_TURN,
+            "a cancelled run reported none of the tokens it had already spent"
+        );
+    }
+
+    // -- what the deadline cannot reach ------------------------------------
+
+    /// **The turn deadline does not bound a turn.**
+    ///
+    /// `apps/server/src/main.rs` calls `TURN_DEADLINE` "wall clock one agent
+    /// turn gets before it is cancelled", and hedges it with "past this the turn
+    /// is cancelled between effects (never inside one)". The hedge is the whole
+    /// sentence: [`Budgets::check`] and the `tokio::select!` in [`Turn::attempt`]
+    /// race the **model** call against the token, and nothing races the effect.
+    /// So a tool call that never returns is a turn that never returns, whatever
+    /// the deadline says.
+    ///
+    /// It is not covered one layer down either. `crate::mcp::McpServer::call`
+    /// reaches `rmcp`'s `call_tool_once` over a `StreamableHttpClientTransport`
+    /// built by `from_uri`, which owns its own HTTP client; there is no
+    /// `tokio::time::timeout` on that path and no request timeout configured on
+    /// it — so "each provider caps its own request", in the same doc comment, is
+    /// not true of this one.
+    ///
+    /// What it costs is one level further out again: `Agent::on_turn` runs
+    /// inside the outbox handler's tenant transaction, so a wedged tool call
+    /// holds an open Postgres transaction *and* a pooled connection for as long
+    /// as the server does not answer, while the outbox lease expires underneath
+    /// it and a second poller re-runs the same turn.
+    ///
+    /// Asserted as a timeout rather than as a hang, so this test finishes: the
+    /// cancellation is fired before the run even starts and the turn still does
+    /// not come back. A version of the loop that raced the effect against
+    /// `cancel` would return `Budget::Deadline` immediately and turn this
+    /// `is_err` into `is_ok`, which is what makes this a live assertion rather
+    /// than a description.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_call_that_never_returns_outlives_the_cancellation() {
+        let Some(db) = db().await else { return };
+
+        /// The MCP server that accepted the request and went quiet. There is no
+        /// timeout anywhere between here and `Turn::run`.
+        struct HangingMcp(Arc<tokio::sync::Notify>);
+
+        #[async_trait]
+        impl McpCaller for HangingMcp {
+            async fn call(
+                &self,
+                _tool: &McpTool,
+                _arguments: &Value,
+            ) -> Result<Untrusted<Value>, ProviderError> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let principal = seed(&db).await;
+        let h = wire_with_mcp(
+            &db,
+            &principal,
+            Arc::new(ScriptedLlm::responses(vec![mcp_call("toolu_1"), done()])),
+            Arc::new(HangingMcp(entered.clone())),
+        );
+
+        // Cancelled before the first model call, which is the strongest form of
+        // the claim: the turn is over budget on every checkpoint it has, and it
+        // still gets stuck. The first checkpoint is *before* the model call, so
+        // firing it up front would stop the run at turn zero — fire it only once
+        // the call is in flight.
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn({
+            let (turn, cancel) = (h.turn.clone(), cancel.clone());
+            async move {
+                turn.run(Context::new().with_task("look up PO-4471"), &cancel)
+                    .await
+                    .map(|finished| finished.reply)
+                    .map_err(|failed| failed.error.code())
+            }
+        });
+        entered.notified().await;
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+        assert!(
+            outcome.is_err(),
+            "the turn came back, so something now bounds an in-flight effect: {:?}",
+            outcome.map(|joined| joined.expect("the turn panicked"))
+        );
     }
 }

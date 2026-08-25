@@ -124,13 +124,40 @@ const LOOP_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// Beyond it the poller is wedged and this replica should stop taking work.
 const MAX_OUTBOX_LAG_SECS: i64 = 300;
 
-/// Wall clock one agent turn gets before it is cancelled.
+/// Wall clock after which one agent turn is cancelled **at its next
+/// checkpoint**.
 ///
-/// [`agentos_app::turn::Budgets`] caps turns, tool calls and tokens, and each
-/// provider caps its own request — but ten turns of a slow model is twenty
-/// minutes, and the outbox worker that is holding the lease is the thing that
-/// pays for them. Past this the turn is cancelled between effects (never inside
-/// one) and the event is retried on the outbox's own backoff.
+/// [`agentos_app::turn::Budgets`] caps turns, tool calls and tokens — but ten
+/// turns of a slow model is twenty minutes, and the outbox worker that is
+/// holding the lease is the thing that pays for them. Past this the turn is
+/// cancelled between effects (never inside one) and the event is retried on the
+/// outbox's own backoff.
+///
+/// # It is not a bound on the turn, and the difference is where the outages are
+///
+/// This used to read "wall clock one agent turn *gets*", which is a sentence
+/// about elapsed time and is not what the token does. `Turn::attempt` races the
+/// **model** call against the token in a `tokio::select!` and checks
+/// `Budgets::check` before each model call and each tool call; nothing races an
+/// **effect**. So the token firing does not interrupt an in-flight provider
+/// call — it is read at the next checkpoint, and a provider that never answers
+/// never reaches one.
+///
+/// That is the correct design rather than a gap: racing the effect would drop
+/// the future of a call that may already have sent the email, which is a worse
+/// failure than waiting. `agentos_app::turn`'s
+/// `a_tool_call_that_never_returns_outlives_the_cancellation` pins the
+/// behaviour, and it fails the moment somebody adds that race.
+///
+/// What follows is that **the real bound on a turn is each provider's own
+/// request timeout**, and the old sentence claiming every provider has one was
+/// prose. `llm_anthropic`, `browser_browserbase` and `cdp` do;
+/// `agentos_app::mcp::CALL_TIMEOUT` now does. `email_resend` and
+/// `telephony_twilio` both build a bare `reqwest::Client::new()`, which has no
+/// request timeout, so a hung Resend or Twilio is still a turn that does not
+/// end — and on this path that is the outbox handler's tenant transaction held
+/// open while the lease expires and a second poller re-runs the turn. One
+/// `Client::builder().timeout(..)` each closes it.
 const TURN_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Why the process could not start or could not keep running.

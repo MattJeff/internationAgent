@@ -52,3 +52,10 @@ live-orizn = []
 
 [dev-dependencies]
 trybuild.workspace = true
+# `test-util` only, and only here: `mcp::CALL_TIMEOUT` is sixty seconds, and the
+# test that a quiet server is abandoned rather than waited on has to run those
+# sixty seconds on a virtual clock or not at all. tokio's `full` does not include
+# it, and tokio says not to enable it in a production build — a dev-dependency is
+# how it stays out of one, since dev-dependencies are not compiled for
+# `cargo build`.
+tokio = { workspace = true, features = ["test-util"] }

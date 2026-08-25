@@ -46,6 +46,25 @@ use crate::telephony::{
 };
 use crate::{EnsureCtx, ProviderBinding, ProviderError, Provisioned, Secret};
 
+/// Hard ceiling on one request to Twilio, connect included.
+///
+/// `reqwest::Client::new()` has **no request timeout**, and until this constant
+/// existed neither did this adapter. That is not a latency preference, it is
+/// what bounds a turn: `Turn::attempt` races the *model* call against its
+/// cancellation token and nothing races an effect, so a provider that never
+/// answers is a turn that never ends. On the inbound path that turn runs inside
+/// the outbox handler's tenant transaction — so the wedge is an open Postgres
+/// transaction and a pooled connection held indefinitely, while the lease
+/// expires and a second poller re-runs the same turn.
+///
+/// 60 seconds, and generous on purpose: this is a backstop against a hung
+/// socket, not a service-level objective. A vendor that is merely slow should
+/// still succeed; one that has stopped answering should stop costing us a
+/// connection. `agentos_app::mcp::CALL_TIMEOUT` makes the same argument at the
+/// same value, and `peer_keys::FETCH_TIMEOUT` is two seconds because a key
+/// directory is on a request path and this is not.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Twilio's public API root.
 pub const API_ROOT: &str = "https://api.twilio.com";
 
@@ -88,7 +107,13 @@ impl TwilioTelephony {
     /// A client for one Twilio account.
     pub fn new(account_sid: impl Into<String>, auth_token: &str) -> Self {
         Self {
-            http: Client::new(),
+            // Built rather than `new()`: see `REQUEST_TIMEOUT`. `build` fails
+            // only if the TLS backend cannot be initialised, at which point
+            // nothing else in this process works either.
+            http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base: API_ROOT.to_owned(),
             account_sid: account_sid.into(),
             auth_token: Secret::new(auth_token),

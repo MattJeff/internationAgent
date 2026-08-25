@@ -48,6 +48,25 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+/// Hard ceiling on one request to Resend, connect included.
+///
+/// `reqwest::Client::new()` has **no request timeout**, and until this constant
+/// existed neither did this adapter. That is not a latency preference, it is
+/// what bounds a turn: `Turn::attempt` races the *model* call against its
+/// cancellation token and nothing races an effect, so a provider that never
+/// answers is a turn that never ends. On the inbound path that turn runs inside
+/// the outbox handler's tenant transaction — so the wedge is an open Postgres
+/// transaction and a pooled connection held indefinitely, while the lease
+/// expires and a second poller re-runs the same turn.
+///
+/// 60 seconds, and generous on purpose: this is a backstop against a hung
+/// socket, not a service-level objective. A vendor that is merely slow should
+/// still succeed; one that has stopped answering should stop costing us a
+/// connection. `agentos_app::mcp::CALL_TIMEOUT` makes the same argument at the
+/// same value, and `peer_keys::FETCH_TIMEOUT` is two seconds because a key
+/// directory is on a request path and this is not.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 use crate::email::{
     EmailProvider, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
     WebhookHeaders, verify_signature,
@@ -83,7 +102,13 @@ impl ResendEmailProvider {
     /// webhook page, not the API key.
     pub fn new(api_key: Secret, webhook_secret: Secret, domain: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Built rather than `new()`: see `REQUEST_TIMEOUT`. `build` fails
+            // only if the TLS backend cannot be initialised, at which point
+            // nothing else in this process works either.
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: API_BASE.to_owned(),
             api_key,
             webhook_secret,

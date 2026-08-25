@@ -54,18 +54,39 @@
 //! incremented where `spent.usage.add(response.usage)` already is — not a
 //! change here, which would still only see the sum.
 //!
+//! # A turn that did not finish is recorded — this section used to say it was
+//! not
+//!
+//! It said: "`Turn::run` returns `TurnError` ... and drops `Spent` with it, so
+//! the model calls that run already made are invisible here", called it the
+//! largest remaining hole, and said closing it meant carrying `Usage` out of
+//! `TurnError`. **That was fixed and this paragraph was not.** `Turn::run`
+//! returns `Result<Finished, app::turn::Failed>`, and `Failed` carries `usage`
+//! and `turns` beside the error — a wrapper rather than a field on the enum,
+//! which is why the public `TurnError` never had to change. Both callers write
+//! it: `Agent::on_turn` and `loops::initiative::take_turn` each open a
+//! transaction of their own on the failure path, guarded by `failed.turns > 0`,
+//! and call [`record`] with [`Consumed::reported`]. A run whose calls all failed
+//! before reporting anything therefore lands here as `calls_unmetered`, which is
+//! the right answer rather than an absent row.
+//!
+//! `loops::initiative::a_provider_that_fails_forever_is_bounded_by_the_day_and_billed_for_it`
+//! is that path asserted end to end, and it is worth keeping a paragraph
+//! because it is the case this table exists for: a model that is down all
+//! afternoon costs an employee its whole daily turn budget and every one of
+//! those turns is on the bill.
+//!
 //! # What this ledger still cannot see
 //!
-//! **A turn that did not finish records nothing.** `Turn::run` returns
-//! `TurnError` on a blown budget, a deadline or an unreachable store, and drops
-//! `Spent` with it — so the model calls that run already made are invisible
-//! here, and their absence reads as zero. This is the same lie one level up, and
-//! it is the largest remaining hole: a crash-looping employee is exactly the
-//! scenario the turn budget exists for, and it is the scenario whose tokens this
-//! table misses. Closing it means carrying `Usage` out of `TurnError`, which is
-//! a public enum matched in several crates. [`crate::turns::taken_today`] is the
-//! honest cross-check in the meantime: a turn is reserved *before* the model is
-//! called, so `turns_taken` counts the runs this table does not.
+//! **A turn that was reserved and never counted, on the inbound path.** The
+//! old text offered [`crate::turns::taken_today`] as the cross-check — "a turn
+//! is reserved before the model is called, so `turns_taken` counts the runs this
+//! table does not" — and that is only true of the initiative loop.
+//! `Agent::on_turn` reserves no turn at all: the arrival of the message is the
+//! throttle, which `crate::turns` argues for in its own module docs. So
+//! `turns_taken` and `calls` count different populations and neither bounds the
+//! other. The number to trust for "what did this employee cost today" is this
+//! table, and [`Consumed::is_complete`] is what says whether to trust it.
 //!
 //! **Cache writes are inside `input_tokens`.** `llm_anthropic.rs` folds
 //! `cache_creation_input_tokens` in on the way through and `Usage` has no field

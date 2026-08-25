@@ -252,9 +252,13 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 ///
 /// The obvious spelling of the selection is
 /// `WHERE employee_id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)`, which is
-/// what [`crate::outbox::claim_except`] uses and what every queue-in-Postgres
-/// article shows. **It did not respect the `LIMIT` here, and only when a second
-/// poller was running.**
+/// what every queue-in-Postgres article shows. **It did not respect the `LIMIT`
+/// here, and only when a second poller was running.**
+///
+/// This paragraph used to say [`crate::outbox::claim_except`] was still spelled
+/// that way. It is not, and neither is `loops::inbound::claim_notices`: all
+/// three claims in this workspace take the materialised form now, and each has a
+/// two-poller test that asserts the bound rather than only the disjointness.
 ///
 /// A non-correlated `IN (SELECT …)` may be planned as a subplan that is
 /// re-executed per candidate outer row. On its own that is harmless, because

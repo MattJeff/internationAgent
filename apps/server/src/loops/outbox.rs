@@ -324,6 +324,11 @@ mod tests {
 
     const EVENT: &str = "employee.provisioned";
 
+    /// The follow-on effect the handler in
+    /// [`a_poller_killed_mid_handler_loses_the_row_and_not_the_work`] enqueues
+    /// before it dies. Its own event type, so counting it is a scoped read.
+    const KILLED_EVENT: &str = "employee.killed-mid-handler";
+
     /// An empty outbox, held exclusively until the returned guard is dropped.
     ///
     /// The guard comes back with the handle rather than being taken separately,
@@ -588,6 +593,152 @@ mod tests {
             last_error.unwrap_or_default().contains("no handler"),
             "the reason must say what is missing"
         );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The crash window, killed for real.**
+    ///
+    /// This module's whole argument for committing the claim before the handler
+    /// runs is that "a poller that dies mid-handler hands the row back without a
+    /// reaper" — the lease is `available_at`, and it expires by itself. Nothing
+    /// asserted it. Every failure test above returns `Err` from a handler that
+    /// ran to completion, which exercises `mark_failed` and not the case where
+    /// the process is simply gone.
+    ///
+    /// So the tick is aborted while the handler is awaiting, and three separate
+    /// things are checked, because the module claims all three:
+    ///
+    /// * **Nothing is lost.** The row is still there, unpublished, and claimable
+    ///   again once the backoff it was leased under expires.
+    /// * **Nothing half-lands.** `mark_done` runs inside the handler's own
+    ///   tenant transaction — "the effect's bookkeeping and its state change
+    ///   commit together or not at all" — so the row this handler wrote before
+    ///   dying must not be in the database.
+    /// * **The attempt was burned at claim time, not at failure time.** That is
+    ///   what stops a poison event that kills its worker from retrying forever,
+    ///   and it is the one property a killed worker can prove and a returning
+    ///   handler cannot: nobody called `mark_failed` here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_poller_killed_mid_handler_loses_the_row_and_not_the_work() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let tenant = seed_tenant(&db).await;
+        let now = Utc::now();
+        let id = enqueue(&db, tenant, 1, now).await;
+
+        // Writes something inside the handler's transaction, says so, and then
+        // never comes back — the pod killed between the provider accepting the
+        // work and the COMMIT.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handlers = Handlers::default().on(EVENT, {
+            let entered = entered.clone();
+            Arc::new(move |event: &OutboxEvent, tx: &mut TenantTx<'_>| {
+                let entered = entered.clone();
+                let aggregate = event.aggregate_id;
+                Box::pin(async move {
+                    // A side effect of the handler's own, in the handler's own
+                    // transaction: the follow-on event a real handler enqueues.
+                    let mut effect = NewEvent::new("employee", aggregate, KILLED_EVENT);
+                    effect.dedupe_key = Some("killed-mid-handler".to_owned());
+                    outbox::enqueue(tx, &effect, Utc::now())
+                        .await
+                        .expect("the handler's own write");
+                    entered.notify_one();
+                    std::future::pending().await
+                })
+            })
+        });
+
+        let killed = tokio::spawn({
+            let (db, handlers) = (db.clone(), handlers.clone());
+            async move { tick(&db, &handlers, now).await }
+        });
+        entered.notified().await;
+        killed.abort();
+        let _ = killed.await;
+        // **An aborted task is a weaker kill than a dead pod, and the gap has to
+        // be closed before anything is asserted.** A `kill -9` closes the socket
+        // and Postgres rolls the transaction back at once; dropping the future
+        // only hands the connection back to sqlx's pool, which issues the
+        // `ROLLBACK` on a background task — so for a moment the handler's
+        // uncommitted insert is still there, holding a row lock, and the
+        // `DELETE FROM tenants` at the end of this test blocks on it. Waiting
+        // for the session to leave `idle in transaction` is the in-process
+        // stand-in for the socket closing.
+        let idle = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+                let stuck: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity \
+                      WHERE datname = current_database() \
+                        AND state = 'idle in transaction' \
+                        AND pid <> pg_backend_pid()",
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count");
+                tx.rollback().await.expect("rollback");
+                if stuck == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            idle.is_ok(),
+            "the dead worker's transaction never rolled back"
+        );
+
+        // The claim committed on its own, so the attempt is spent and the lease
+        // is in the future — whatever the handler did or did not do.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let (attempts, error, published_at, available): (
+            i32,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        ) = sqlx::query_as(
+            "SELECT attempt_count, last_error, published_at, available_at \
+               FROM outbox_events WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the event is still there");
+        // Nothing wrote a reason, because nothing was alive to write one.
+        let orphaned: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM outbox_events WHERE event_type = $1")
+                .bind(KILLED_EVENT)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(attempts, 1, "the attempt must be burned at claim time");
+        assert_eq!(error, None, "nobody was alive to call mark_failed");
+        assert!(published_at.is_none(), "a dead handler did not publish");
+        assert!(available > now, "the claim did not lease the row forward");
+        assert_eq!(
+            orphaned, 0,
+            "the dead handler's write survived its own transaction"
+        );
+
+        // And once the lease expires the row comes back to whoever asks, with
+        // no reaper having run and no operator having touched anything.
+        let seen: Seen = Arc::default();
+        let recovered = Handlers::default().on(EVENT, recorder(&seen));
+        assert_eq!(
+            tick(&db, &recovered, now + TimeDelta::hours(2))
+                .await
+                .expect("tick"),
+            1,
+            "the row never came back to the pool"
+        );
+        assert_eq!(ids(&seen), vec![id]);
+        assert!(published(&db, id).await, "the retry did not finish it");
 
         drop_tenant(&db, tenant).await;
     }

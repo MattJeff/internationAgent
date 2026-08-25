@@ -290,20 +290,36 @@ async fn park(conn: &mut PgConnection, id: Uuid, why: &str) -> Result<(), StoreE
 /// pollers take disjoint rows, `attempt_count + 1` at *claim* time so a worker
 /// killed mid-ingest still burns an attempt, and `available_at` pushed out by an
 /// exponential backoff with jitter — the lease, which expires on its own.
+///
+/// # `WITH … AS MATERIALIZED`, and why the obvious spelling is not enough
+///
+/// This selection used to be `WHERE e.id IN (SELECT … FOR UPDATE SKIP LOCKED
+/// LIMIT $n)`, which is the spelling every queue-in-Postgres article shows and
+/// the one [`agentos_store::initiative::claim_due`] documents at length **as a
+/// bug it hit in production**: a non-correlated `IN (SELECT …)` may be planned
+/// with the subquery on the inner side of a nested loop, re-executed per outer
+/// row, and each re-execution runs `ORDER BY … SKIP LOCKED LIMIT n` afresh over
+/// whichever rows the *other* poller holds locked at that moment. The claims
+/// stay disjoint — `SKIP LOCKED` is fine — but the `UPDATE` touches the union of
+/// those sets rather than `$n` rows, and the bound is gone. That loop's
+/// two-poller test caught it claiming 13 and then 16 against a limit of 10, and
+/// `EXPLAIN` on this statement's own text produces the same nested-loop plan on
+/// this schema. A poller that leases 24 notices when it asked for 8 has stopped
+/// bounding the batch it holds leases across, and this module's `BATCH` is 8
+/// precisely because one notice is a body fetch plus every attachment.
+///
+/// A CTE is evaluated exactly once whatever else is happening on the table.
+/// `MATERIALIZED` is stated rather than relied on: PostgreSQL 12 began inlining
+/// CTEs referenced once, and an inlined one is a subquery again. Both sibling
+/// claims — [`agentos_store::outbox::claim_except`] and `claim_due` — are
+/// spelled this way, and this one was the last that was not.
 async fn claim_notices(
     conn: &mut PgConnection,
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
     let rows = sqlx::query(
-        "UPDATE outbox_events AS e \
-         SET attempt_count = e.attempt_count + 1, \
-             available_at = $1::timestamptz \
-                 + least(interval '1 second' \
-                         * power(2::double precision, e.attempt_count::double precision), \
-                         interval '1 hour') \
-                   * (0.5 + random()) \
-         WHERE e.id IN ( \
+        "WITH due AS MATERIALIZED ( \
              SELECT id FROM outbox_events \
              WHERE aggregate_type = $4::text \
                AND published_at IS NULL \
@@ -312,6 +328,14 @@ async fn claim_notices(
              ORDER BY available_at, id \
              FOR UPDATE SKIP LOCKED \
              LIMIT $3::bigint) \
+         UPDATE outbox_events AS e \
+         SET attempt_count = e.attempt_count + 1, \
+             available_at = $1::timestamptz \
+                 + least(interval '1 second' \
+                         * power(2::double precision, e.attempt_count::double precision), \
+                         interval '1 hour') \
+                   * (0.5 + random()) \
+         WHERE e.id IN (SELECT id FROM due) \
          RETURNING e.id, e.tenant_id, e.aggregate_type, e.aggregate_id, e.event_type, \
                    e.payload, e.attempt_count, e.available_at, e.last_error",
     )
@@ -774,6 +798,111 @@ mod tests {
             .expect("turn id");
         tx.commit().await.expect("commit read");
         assert_eq!(still, first_turn);
+    }
+
+    // -- concurrency --------------------------------------------------------
+
+    /// **Two pollers, and the bound is the thing under test.**
+    ///
+    /// [`claim_notices`]' docstring says every part of its predicate is
+    /// load-bearing and names `FOR UPDATE SKIP LOCKED` first. `SKIP LOCKED` is
+    /// not what this asserts, because `SKIP LOCKED` was never the part that
+    /// broke: `agentos_store::initiative::claim_due` documents the same query
+    /// shape claiming 13 and then 16 employees against a limit of 10, with the
+    /// two claims **disjoint** throughout. A non-correlated
+    /// `WHERE id IN (SELECT … ORDER BY … FOR UPDATE SKIP LOCKED LIMIT $n)` may
+    /// be planned as a subplan that is re-executed per outer row, and each
+    /// re-execution steps over whatever the *other* poller holds locked right
+    /// then — so the `UPDATE` touches the union of those sets rather than `$n`
+    /// rows. `agentos_store::outbox::claim_except` and
+    /// `agentos_store::initiative::claim_due` both spell the selection
+    /// `WITH due AS MATERIALIZED (…)` for exactly this; **this one did not**,
+    /// which is what this test was written against and what
+    /// [`claim_notices`] now does too.
+    ///
+    /// The bound is what a notice claim can least afford to lose. `BATCH` is 8
+    /// because one notice is a body fetch plus every attachment, and the module
+    /// says so in as many words: "a lease held longer than the backoff is a row
+    /// two workers both think they own". A poller that leases 24 has silently
+    /// stopped bounding the batch it will hold leases across — which is
+    /// precisely what this asserts and what widening the `LIMIT` by three makes
+    /// it report.
+    ///
+    /// Two pollers claim *repeatedly and unsynchronised*, which is the only
+    /// arrangement that reaches it. One barrier-synchronised claim each cannot:
+    /// the inner subquery only returns a different set when the other session's
+    /// lock set changes **between two re-executions of the same statement**, so
+    /// the other poller has to be taking and releasing locks throughout, which
+    /// is what a running loop does and what a single held claim does not. That
+    /// is why this is a race with a deadline rather than two barriers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_pollers_each_claim_no_more_than_their_batch() {
+        let Some(db) = db().await else { return };
+        let _guard = INBOUND_LOCK.lock().await;
+        let (tenant, employee) = seed(&db).await;
+
+        // Far more than the two pollers can drain in the window, so a claim that
+        // comes back short is a bound and not an empty queue.
+        const NOTICES: usize = 600;
+        const LIMIT: i64 = BATCH;
+        let now = Utc::now();
+        for n in 0..NOTICES {
+            let id = format!("email_bound_{n}");
+            deliver_webhook(&db, tenant, employee, &id, notice_payload(&id, now), now).await;
+        }
+
+        /// Claim in a tight loop until `deadline`, and report the largest batch
+        /// any one statement came back with.
+        async fn hammer(db: Db, now: DateTime<Utc>, deadline: tokio::time::Instant) -> usize {
+            let mut worst = 0;
+            while tokio::time::Instant::now() < deadline {
+                let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+                // **The plan is forced, and forcing it is the honest half of
+                // this test.** Postgres 17 costs this statement into a
+                // `Hash Semi Join` on the row counts these tests leave behind,
+                // and a hashed subquery runs once — so the bound holds today for
+                // a reason that is not in the SQL. `SET LOCAL
+                // enable_hashjoin/mergejoin/hashagg = off` makes the planner
+                // pick the other legal plan for the *same statement*: a
+                // `Nested Loop Semi Join` with the `LIMIT`-ed, `SKIP LOCKED`
+                // subquery on the **inner** side, re-executed per outer row.
+                // `EXPLAIN` on the unmodified production text produces exactly
+                // that plan on this schema, so nothing here is a test-only
+                // query — the planner may choose it on its own the first time
+                // the statistics move. A `WITH … AS MATERIALIZED` selection is
+                // bounded under every plan, which is why all three claims are
+                // now spelled that way and why these knobs stay: they keep the
+                // guard honest if somebody ever unspells one.
+                for guc in [
+                    "SET LOCAL enable_hashjoin = off",
+                    "SET LOCAL enable_mergejoin = off",
+                    "SET LOCAL enable_hashagg = off",
+                ] {
+                    sqlx::query(guc).execute(&mut *tx).await.expect("plan knob");
+                }
+                let got = claim_notices(&mut tx, LIMIT, now).await.expect("claim");
+                tx.commit().await.expect("commit");
+                worst = worst.max(got.len());
+                if got.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            worst
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let a = tokio::spawn(hammer(db.clone(), now, deadline));
+        let b = tokio::spawn(hammer(db.clone(), now, deadline));
+        let (a, b) = (a.await.expect("poller a"), b.await.expect("poller b"));
+
+        // Neither was starved, so the assertion below is about the LIMIT and
+        // not about an empty queue.
+        assert!(a > 0 && b > 0, "a poller never claimed anything: {a}, {b}");
+        assert!(
+            a as i64 <= LIMIT && b as i64 <= LIMIT,
+            "a claim leased more than its batch: {a} and {b} against a limit of {LIMIT}"
+        );
     }
 
     // -- shutdown -----------------------------------------------------------
