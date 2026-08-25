@@ -1126,6 +1126,23 @@ mod tests {
                 .await
                 .expect("join the team");
         }
+        // `of` heads the desk and the new colleague answers to it. The tests
+        // that use this fixture have `of` *order* the colleague, and an order
+        // rides the reporting line rather than the team — see
+        // `inbound::may_message`. Without this, the order is refused and the
+        // trust assertions downstream would pass for the wrong reason: nothing
+        // arrives, so nothing can be laundered.
+        agentos_store::org::set_position(&mut tx, of.employee_id, Some("Head of desk"), None)
+            .await
+            .expect("seat the head");
+        agentos_store::org::set_position(
+            &mut tx,
+            employee,
+            Some("Colleague"),
+            Some(of.employee_id),
+        )
+        .await
+        .expect("seat the colleague under it");
         tx.commit().await.expect("commit the org chart");
 
         Principal::employee(of.tenant_id, employee)

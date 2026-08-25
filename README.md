@@ -93,6 +93,46 @@ and the sales budget. A section is an org chart and carries no policy at all. A
 team also caps how many tools a member carries into its context at 32, well
 under the point where a catalogue starts making a model worse.
 
+**An org chart, and it is three columns, not three mechanisms.** The table an
+operator draws — *Fonction · Responsable · Mission* — is a team, a seat and a
+string. A **position** is a `title` and a `reports_to` on the membership row the
+employee already has, so there is no positions table that could disagree with
+the memberships table the policy loader reads on every decision. The CEO is the
+seat whose `reports_to` is `NULL`; nothing about it is a special case. Cycles are
+impossible in the database rather than in one Rust function — a trigger walks up
+from the proposed manager and refuses if it arrives back where it started — and
+removing a head who still has reports **fails loudly** instead of quietly
+orphaning a department. A **mission** is prose an employee gets told: at most 240
+characters, no control characters, re-parsed on every read, and it grants nothing.
+Every restriction is still a `policy_layers` row. You can draw all of this on a
+company that has been running for a year; there is no rebuild.
+
+**Employees talk to each other, and the channel has a shape.** `InternalSend` is
+the one action that does not leave the company, and it is an `Action` anyway,
+because waking a colleague spends that colleague's turn budget and only the gate
+may mint the right to spend one. An internal message costs one of the
+**recipient's** `max_turns_per_day`, reserved by the sender — which is what makes
+two employees unable to spin each other forever. It never touches the
+cold-outreach budget: a colleague is not a stranger, and a team that talked to
+itself all morning must still be able to answer its manager.
+
+Who may say what to whom follows the two relations an org has, and they are not
+the same shape. An **order** rides the reporting line, one link, downward only —
+never the team, because a line crosses teams on purpose: the CEO sits on
+*Direction* and the Head of Growth on *Growth*. A **question** or a **handover**
+rides the team *or* the line either way. An **answer** is authorised by the
+question itself, so a re-org can never strand an outstanding one. And a tainted
+turn cannot launder a stranger's instruction into a colleague's order — one hop
+does not upgrade trust.
+
+**A new employee does not read the company.** It gets its charter, its team's
+mission, the tickets and threads it owns, and the messages addressed to it.
+Nothing else. Knowledge is scoped to the team that captured it — the scope is
+part of the dedupe key, so a document cannot launder itself into a wider
+audience by arriving twice — and the tool schemas an untrusted turn is shown are
+filtered by taint, so it cannot so much as *see* the payment tool. A developer
+knowing the sales strategy is a token bill, and it is also a blast radius.
+
 **An employee acts on its own.** The initiative loop claims employees whose
 cadence is due — between 5 minutes and 30 days, jittered, rescheduled at *claim*
 time so a crash mid-turn is not a hot loop — and starts a turn from the
