@@ -823,9 +823,13 @@ const CEILING_LAYER: Uuid = Uuid::from_u128(0x0006_0000_0000_7000_8000_0000_0000
 ///
 /// The two do not mix in one deployment, and only one of them belongs in a real
 /// one: the DELETE below removes every platform version that is not the fixture
-/// singleton, so calling this on a database an operator has installed a ceiling
-/// into throws that ceiling and its history away. Nothing outside `#[cfg(test)]`
-/// calls it.
+/// singleton. Pointed at a database an operator has installed a ceiling into,
+/// that would throw the ceiling and its whole history away — so this **refuses**
+/// instead, naming the versions it would have destroyed. It cannot be
+/// `#[cfg(test)]`: the test suites of three other crates call it, and that
+/// attribute only covers this crate's own test build. A guard that fails loudly
+/// is what is available, and it is what a fixture pointed at production
+/// deserves.
 ///
 /// # Why the ceiling is widened rather than written
 ///
@@ -855,6 +859,33 @@ pub async fn install(
     };
 
     let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    // Refuse rather than destroy. The DELETE below removes every platform
+    // version that is not the fixture singleton, and until this guard existed
+    // that included an operator's ceiling **and its whole history** — silently,
+    // from a function whose name says "install". `install_ceiling` mints a
+    // fresh id per version, so any platform version that is not
+    // `CEILING_VERSION` is an operator's, and the only honest thing to do with
+    // one is stop.
+    //
+    // A check-then-delete race is not a hazard here in the way it looks: this
+    // runs in an admin transaction, and `policy_versions_one_active_idx` means
+    // a concurrent `install_ceiling` serialises against it. The failure this
+    // guards is not concurrency, it is a fixture pointed at a real database.
+    let operators: Vec<String> = sqlx::query_scalar(
+        "SELECT label FROM policy_versions WHERE tenant_id IS NULL AND id <> $1",
+    )
+    .bind(CEILING_VERSION)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !operators.is_empty() {
+        return Err(StoreError::conflict(format!(
+            "this database has an operator-installed platform ceiling ({}) and \
+             `policy::install` is fixture support that would delete it and its history. \
+             Use `install_ceiling` to change a ceiling, or point this at a scratch database",
+            operators.join(", ")
+        )));
+    }
 
     // The ceiling. Anything else claiming to be the active platform version is
     // a leftover from a fixture that wrote one by hand; there is one ceiling.
@@ -1783,6 +1814,60 @@ pub(crate) mod tests {
         .expect("count");
         tx.rollback().await.expect("rollback");
         count
+    }
+
+    /// **A fixture pointed at production refuses instead of erasing it.**
+    ///
+    /// [`install`] is fixture support and its DELETE removes every platform
+    /// version that is not the fixture singleton. Until the guard it now
+    /// carries, that included an operator's ceiling *and its entire history* —
+    /// silently, from a function called `install`, leaving a deployment that
+    /// denies every action and no version to roll back to.
+    ///
+    /// The two writers cannot be separated by `#[cfg(test)]`, because three
+    /// other crates' test suites call this one. So the separation is a refusal,
+    /// and this is the test that it is a refusal rather than a comment: install
+    /// a real ceiling the way an operator does, then call the fixture and assert
+    /// the ceiling is **still there** afterwards. Asserting only on the error
+    /// would pass a guard that returned `Err` after deleting.
+    ///
+    /// The tenant is `seed`ed and not invented, and that is the whole test.
+    /// `install` writes a tenant version after the DELETE, so a `TenantId` that
+    /// names no row fails the foreign key, rolls the admin transaction back and
+    /// puts the ceiling *back* — which would make the assertion below pass with
+    /// the guard removed. A real tenant lets the DELETE commit, so the guard is
+    /// the only thing standing between this fixture and an erased ceiling. That
+    /// is not a hypothetical: this test was written the vacuous way first.
+    #[tokio::test]
+    async fn a_fixture_refuses_to_delete_an_operators_ceiling() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+
+        let (tenant, _) = seed(&db, "fixture-vs-operator").await;
+        let installed = install_ceiling(&db, &default_ceiling(), "the operator's ceiling")
+            .await
+            .expect("install");
+        let version = installed.version();
+
+        let refused = install(&db, tenant, Scope::Tenant, &PolicyLimits::default())
+            .await
+            .expect_err("the fixture must refuse a database with an operator ceiling in it");
+        assert!(
+            refused.to_string().contains("the operator's ceiling"),
+            "the refusal must name what it would have destroyed, got: {refused}"
+        );
+
+        // The point of the test: nothing was destroyed on the way out.
+        assert_eq!(active_ceilings(&db).await, 1);
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let still: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM policy_versions WHERE tenant_id IS NULL AND active")
+                .fetch_optional(&mut *tx)
+                .await
+                .expect("read back");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(still, Some(version), "the operator's version is gone");
+        drop_tenant(&db, tenant).await;
     }
 
     /// Installing is a write; installing the *same thing* is not. A deploy
