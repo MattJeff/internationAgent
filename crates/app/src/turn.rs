@@ -130,6 +130,16 @@ const PAY: &str = "pay";
 const MESSAGE_COLLEAGUE: &str = "message_colleague";
 const BRIEF_DIRECT_REPORTS: &str = "brief_direct_reports";
 
+/// The blast radius of talking to a colleague, named once because two things
+/// filter on it: this catalogue, and the roster
+/// [`SystemPrompt::render`](crate::prompt::SystemPrompt::render) puts in the
+/// prefix. A tool named to a turn that may not call it is the leak [`visible`]
+/// exists to make unrepresentable, and it would be reintroduced the moment
+/// these two carried the risk separately.
+///
+/// `Low`, and it must be — the argument is on the catalogue entry below.
+pub(crate) const COLLEAGUE_RISK: Risk = Risk::Low;
+
 /// Every tool an employee may be offered, with the action the gate will rule on
 /// and the blast radius of the effect behind it.
 ///
@@ -164,25 +174,33 @@ const BRIEF_DIRECT_REPORTS: &str = "brief_direct_reports";
 /// # Why [`BRIEF_DIRECT_REPORTS`] is the fifth and not a loop over the fourth
 ///
 /// The bar for a new row here is that the model cannot already express the
-/// thing, and a briefing clears it for one reason: **the model does not know
-/// who its reports are.** [`MESSAGE_COLLEAGUE`] takes a slug, and the only
-/// things a turn is told about the company are its own identity line, its
-/// charter's briefing and the MCP inventory — nowhere in
-/// [`SystemPrompt`](crate::prompt::SystemPrompt) is there a reporting line. So
-/// "just call `message_colleague` five times" means five guesses at slugs, and
-/// a wrong guess returns `unreachable_colleague`, which `inbound::InternalError`
-/// deliberately makes indistinguishable from "not on your team" precisely so
-/// the org chart cannot be enumerated by asking. The alternative — an operator
-/// listing the reports in the charter's briefing — is a second copy of
+/// thing, and when this row was written a briefing cleared it outright: the
+/// model did not know who its reports *were*. [`MESSAGE_COLLEAGUE`] takes a
+/// slug, and nowhere in [`SystemPrompt`](crate::prompt::SystemPrompt) was there
+/// a reporting line — so "just call `message_colleague` five times" meant five
+/// guesses, and a wrong guess returns `unreachable_colleague`, which
+/// `inbound::InternalError` deliberately makes indistinguishable from "not on
+/// your team" precisely so the org chart cannot be enumerated by asking.
+///
+/// **That half is no longer true**, and saying so is the honest thing to do
+/// about a justification the code has outgrown:
+/// [`SystemPrompt::with_colleagues`](crate::prompt::SystemPrompt::with_colleagues)
+/// now names the reports in the prefix, from the org chart, so the addresses are
+/// known. What survives is the smaller claim, and it is still enough to keep the
+/// row: one call instead of five, which is four round trips of a ten-turn budget
+/// and four chances to give a line four different versions of one instruction.
+/// The alternative that stays rejected is the same one as before — an operator
+/// listing the reports in the charter's briefing is a second copy of
 /// `team_memberships` maintained by hand, and therefore a copy that goes wrong
 /// the first time somebody is hired.
 ///
 /// This tool reads the audience out of the org chart, server side, one link
-/// down. That is the whole of what it adds: the gate still rules once per
-/// report (see [`Effects::brief`](crate::effects::Effects::brief)), so a
-/// briefing buys the model no authority that five `message_colleague` calls
-/// would not have bought it — only the five addresses it could not have known
-/// and the four round trips it would have spent guessing.
+/// down. The gate still rules once per report (see
+/// [`Effects::brief`](crate::effects::Effects::brief)), so a briefing buys the
+/// model no authority that five `message_colleague` calls would not have bought
+/// it — and the two audiences come from the same table read the same way, so a
+/// report named in the prefix and a report reached by a briefing cannot be
+/// different sets.
 fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 5] {
     [
         (
@@ -245,7 +263,7 @@ fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 5] {
             // sent carries this turn's own trust label to the recipient, so a
             // tainted turn's message arrives as data and not as an order. See
             // `crate::inbound`'s module docs.
-            Risk::Low,
+            COLLEAGUE_RISK,
             "Message a colleague at this company. `order` asks them to do \
              something, `question` asks them something and waits for an answer, \
              `answer` answers the question you were just asked, and `handover` \
@@ -260,7 +278,16 @@ fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 5] {
                 "properties": {
                     "to": {
                         "type": "string",
-                        "description": "The colleague's short name, e.g. \"bruno\"."
+                        // Not "e.g. \"bruno\"". An example where the model needed
+                        // an inventory is what made it guess, and a wrong guess
+                        // is a spent turn that teaches it nothing — the refusal
+                        // cannot say whether the name was wrong or out of reach.
+                        // The inventory is in the prefix now; this points at it.
+                        "description": "A colleague's short name, copied exactly \
+                                        from the list under \"Colleagues you can \
+                                        reach\" in your brief. Nobody else is \
+                                        reachable, and there is no directory to \
+                                        search."
                     },
                     "kind": {
                         "type": "string",

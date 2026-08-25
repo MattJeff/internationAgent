@@ -10,20 +10,25 @@
 //!
 //! # What it found
 //!
-//! **The line is flat above the tenth employee, and the flatness is not
-//! scoping's doing.** The context moves once, between two employees and ten,
-//! and the reason is the only N-shaped term there is: the employee's own *team*
-//! filling its five recall slots. Past that it does not move again — a company
-//! of fifty bills the same turn as a company of ten. So the growth that exists
-//! is bounded by [`RECALL_LIMIT`] passages, a constant with no company in it,
-//! and it is a function of your team rather than of the payroll.
+//! **The line was flat above the tenth employee, and the flatness was not
+//! scoping's doing.** The context moved once, between two employees and ten, for
+//! the only N-shaped reason there was: the employee's own *team* filling its
+//! five recall slots. Past that it did not move again, because
+//! [`RECALL_LIMIT`] is a constant with no company in it.
 //!
-//! Everything else is flat by construction and would be flat at any company
-//! size: the tool catalogue is five entries no matter how many MCP servers a
-//! tenant binds — fewer once the employee's role floor has narrowed it, which
-//! is a function of the job and not of the payroll either — and the prefix is
-//! the employee's own identity in front of a `&'static str` briefing shared by
-//! everyone wearing the role.
+//! **It is not flat any more**, and the reason is the section below rather than
+//! anything about the corpus: the prefix now names the tenant's MCP inventory,
+//! which is per tenant and scoped by nothing. The context goes 4188 → 4639 →
+//! 4863 tokens at 2, 10 and 50 employees, and every token of that growth is the
+//! inventory. The colleague roster, added in the same change, contributes 137 →
+//! 191 → 191 — it saturates with the employee's own team and then stops, which
+//! is what it was designed to do and what
+//! `the_roster_costs_the_same_in_a_company_of_fifty_as_in_one_of_ten` gates on.
+//!
+//! The tool catalogue is still five entries no matter how many MCP servers a
+//! tenant binds, which is the collapsed `call_mcp_tool` doing its job — fewer
+//! once the employee's role floor has narrowed it, which is a function of the
+//! job and not of the payroll either.
 //!
 //! So the cost premise, taken literally, is **false**: scoping the corpus saves
 //! nothing worth measuring whenever the employee's own scope holds five or more
@@ -38,42 +43,61 @@
 //! the sales strategy is a slot not holding the answer — and that is a quality
 //! argument, not a cost one.
 //!
-//! # The finding that matters more than the flat line
+//! # The finding that mattered more than the flat line, and what came of it
 //!
-//! There is exactly one input to the prefix that is company-wide rather than
-//! employee-wide: [`agentos_app::prompt::SystemPrompt::with_mcp_tools`], fed from
-//! `mcp::Fleet::inventory`, which is per **tenant**. It is filtered by
-//! [`Risk`] and by nothing else — not by team, not by role. Wire it and the
-//! prefix acquires a term linear in what the whole company has bound, paid by
-//! every employee on every turn. The row measures that slope.
+//! The previous revision of this file said the flat line was uninformative,
+//! because it was flat for the wrong reason: the company was **absent** from the
+//! prefix, not scoped out of it. No production path called
+//! [`agentos_app::prompt::SystemPrompt::with_mcp_tools`], nothing named the
+//! colleagues `message_colleague` takes as a free string, and the prediction
+//! recorded here was that the first feature to put a company-shaped list in the
+//! prefix would be the one that made the line slope.
 //!
-//! And it is **not wired**. No production path calls `with_mcp_tools` or
-//! `with_credential`: `apps/server/src/main.rs:879` and
-//! `apps/server/src/loops/initiative.rs:575` build the prompt from
-//! `Charter::system_prompt` and stop. So today's employee is never told which
-//! servers exist (the exact guessing failure `app::prompt`'s docs say was
-//! "fixed elsewhere"), never told which credentials it holds, and — the same
-//! shape again — never told which colleagues exist, though `message_colleague`
-//! takes a colleague's slug as a free string.
+//! **Both are wired now**, and the prediction was half right, which is the
+//! interesting half:
 //!
-//! That is what makes the flat line uninformative as a defence of the design.
-//! It is flat because the company is absent, not because it was scoped. The
-//! first feature that puts a company-shaped list in the prefix is the one that
-//! will need scoping, and the numbers below say what it will cost.
+//! * The **MCP inventory** is per *tenant*, filtered by [`Risk`] and by nothing
+//!   else. It slopes, exactly as predicted and by roughly the predicted amount:
+//!   the `Inventory::Unscoped` row below is the same measurement it always was,
+//!   and it is now a measurement of production. Every employee pays for every
+//!   server the company binds, on every turn.
+//! * The **colleague roster** does not, and that was the design constraint it
+//!   was built under. It is the employee's manager, its direct reports and its
+//!   team-mates — `inbound::colleagues`, ruled on by `inbound::may_message` — so
+//!   it is bounded by the team and not by the payroll. `Inventory::Unscoped`
+//!   below is the counterfactual: the same roster with no join to
+//!   `team_memberships`, which is what a company-wide list would have cost.
+//!
+//! The gap between those two rows is the whole argument for scoping, stated in
+//! tokens, and it is the argument the *corpus* row could never make — because
+//! retrieval is a fixed top-k and a fixed top-k cannot slope, while a list of
+//! names is linear in what it lists. Scoping saves nothing on documents and
+//! everything here.
+//!
+//! [`agentos_app::prompt::SystemPrompt::with_credential`] is still called by
+//! nobody, and deliberately: no tool in `turn::catalogue` takes a credential,
+//! `SecretStore` has no verb that enumerates one, and the only ref production
+//! writes per employee is a provisioning canary. Its own doc comment carries the
+//! three reasons.
 //!
 //! # Assertions are on shape, numbers are on the page
 //!
 //! Nothing here asserts "under 4,312 tokens". A reworded briefing would break
-//! such a test and teach nobody anything. What is asserted is that the total
-//! does not move with company size, that an untrusted turn is offered strictly
-//! fewer tools, and that the per-employee daily cost is independent of how many
-//! employees there already are. Every figure printed is an estimate with a
-//! stated error bound; every property asserted is a comparison between two
-//! contexts weighed by the same estimator, where that error cancels.
+//! such a test and teach nobody anything. What is asserted is that the *roster*
+//! does not move with company size while an unscoped one does, that an untrusted
+//! turn is offered strictly fewer tools, and that the corpus scoping saves less
+//! than one passage. What is **characterised** rather than asserted is
+//! everything the MCP inventory moved: the total, and the per-employee daily
+//! cost, which is no longer one number.
+//!
+//! Every figure printed is an estimate with a stated error bound; every property
+//! asserted is a comparison between two contexts weighed by the same estimator,
+//! where that error cancels.
 
 use std::collections::BTreeSet;
 
 use agentos_app::knowledge::RECALL_LIMIT;
+use agentos_app::prompt::Relation;
 use agentos_app::rolepack::{CountryCode, Objective, RolePack};
 use agentos_app::turn::{Context, tools_for};
 use agentos_app::vertical::Charter;
@@ -345,6 +369,39 @@ impl Company {
         }
     }
 
+    /// **The roster, scoped the way production scopes it.** Employee zero, who
+    /// heads team zero: its manager one team up, and the rest of team zero
+    /// answering to it.
+    ///
+    /// The bound is [`TEAM_SIZE`] and there is no `self.employees` past that
+    /// `min` — which is the entire point of the row it feeds. It saturates
+    /// between two employees and ten for the same reason the recall does, and
+    /// then it stops, at fifty as at ten. `inbound::colleagues` gets the same
+    /// shape from `team_memberships`; this is what that costs in the prefix.
+    fn roster(self) -> Vec<(Slug, Relation)> {
+        let slug = |s: &str| Slug::parse(s).expect("fixture slug");
+        // A manager exists at every company size above one, and there is
+        // exactly one of them: the line is one link, never a walk.
+        let mut out = vec![(slug("ceo"), Relation::Manager)];
+        out.extend(
+            (1..self.employees.min(TEAM_SIZE))
+                .map(|who| (slug(&format!("employee-{who}")), Relation::Report)),
+        );
+        out
+    }
+
+    /// The roster with the join to `team_memberships` taken out: everybody.
+    ///
+    /// The thing that must not be built, priced. One name per employee in the
+    /// tenant, in every employee's prefix, on every turn — which is where the
+    /// bill stops being linear in headcount and starts being quadratic in it.
+    fn payroll(self) -> Vec<(Slug, Relation)> {
+        let slug = |s: &str| Slug::parse(s).expect("fixture slug");
+        (1..self.employees)
+            .map(|who| (slug(&format!("employee-{who}")), Relation::TeamMate))
+            .collect()
+    }
+
     /// What the tenant's MCP fleet holds: one server per team, three tools
     /// each, the last of them destructive so the taint filter has something to
     /// take away.
@@ -383,15 +440,24 @@ pub enum Reach {
     Company,
 }
 
-/// Whether the tenant's MCP inventory is named in the prefix.
+/// What the prefix names about the company around this employee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inventory {
-    /// What production does: `with_mcp_tools` is never called, so the model is
-    /// told nothing about connected systems.
-    AsShipped,
-    /// What `app::prompt`'s docs describe: the tenant's whole bound inventory,
-    /// filtered by risk and by nothing else.
+    /// Neither: the prefix before either feature was wired. Kept as the
+    /// baseline, because "what did this cost us" needs a before.
+    Bare,
+    /// **What production does now.** The tenant's whole bound MCP inventory,
+    /// filtered by risk and by nothing else, plus this employee's own roster —
+    /// manager, direct reports, team-mates, and nobody else.
     Named,
+    /// The counterfactual the roster was built to avoid: the same prefix with
+    /// every employee in the tenant named instead of one team's worth. Nothing
+    /// builds this; it is here so the saving has a number rather than a claim.
+    Unscoped,
+    /// The inventory without the roster. Not a shape anything ships — it exists
+    /// so the two new terms can be told apart, because "the prefix grew" is not
+    /// a finding until you can say *which* of them grew.
+    McpOnly,
 }
 
 /// The counterparty's message. One real supplier email, because the turn's
@@ -426,8 +492,18 @@ regards,\nAnja Vogt";
 pub fn assemble(company: Company, reach: Reach, inventory: Inventory) -> LlmRequest {
     let charter = buyer();
     let prompt = match inventory {
-        Inventory::AsShipped => charter.system_prompt(IDENTITY),
+        Inventory::Bare => charter.system_prompt(IDENTITY),
+        // The two builders `apps/server/src/main.rs` and the initiative loop
+        // both call, in the order they call them.
         Inventory::Named => charter
+            .system_prompt(IDENTITY)
+            .with_mcp_tools(company.inventory())
+            .with_colleagues(company.roster()),
+        Inventory::Unscoped => charter
+            .system_prompt(IDENTITY)
+            .with_mcp_tools(company.inventory())
+            .with_colleagues(company.payroll()),
+        Inventory::McpOnly => charter
             .system_prompt(IDENTITY)
             .with_mcp_tools(company.inventory()),
     };
@@ -498,50 +574,60 @@ fn buyer() -> Charter {
 /// `app::turn::Budgets::max_turns` model calls, every one of them re-sending
 /// the prefix. So this is the floor: the number an operator gets if every turn
 /// is answered in a single round trip. Ten times it is the ceiling.
+///
+/// [`Inventory::Named`] because that is what production sends — and it is why
+/// this stopped being a single number: see the row it feeds.
 pub fn per_day(company: Company) -> usize {
     let turns = RolePack::international_buyer().limits().max_turns_per_day as usize;
-    weigh(&assemble(company, Reach::Team, Inventory::AsShipped)).total() * turns
+    weigh(&assemble(company, Reach::Team, Inventory::Named)).total() * turns
 }
 
 /// Everything measured about what an employee's context costs.
 pub fn evaluate() -> Surface {
     let mut rows = Vec::new();
 
+    let at = |inventory: Inventory| -> Vec<Weighed> {
+        SIZES
+            .iter()
+            .map(|&employees| weigh(&assemble(Company { employees }, Reach::Team, inventory)))
+            .collect()
+    };
+    let join = |weighed: &[Weighed], of: fn(Weighed) -> usize| -> String {
+        weighed
+            .iter()
+            .map(|w| of(*w).to_string())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+
     // --- 1. does the context grow with the company? -------------------------
-    // It moves once and then stops, and the step is the employee's own team
-    // filling its five recall slots — a `min(matches, RECALL_LIMIT)` with no
-    // company size in it. The gate is on the saturated half, because that is
-    // where the claim lives: past your own team, more colleagues cost nothing.
-    let shipped: Vec<Weighed> = SIZES
-        .iter()
-        .map(|&employees| {
-            weigh(&assemble(
-                Company { employees },
-                Reach::Team,
-                Inventory::AsShipped,
-            ))
-        })
-        .collect();
-    let saturated = shipped[shipped.len() - 1] == shipped[shipped.len() - 2];
+    // **It does now**, and this row is the one that changed. Naming the tenant's
+    // MCP inventory put a company-shaped term in the prefix, which is exactly
+    // what the previous revision of this file predicted would happen to whatever
+    // got wired first. It is characterised rather than gated because there is no
+    // pass/fail here to state honestly: the number is the finding.
+    let shipped = at(Inventory::Named);
     rows.push(
         Row::ok(
             "one turn's context at 2 / 10 / 50 staff",
             format!(
                 "{} tok  (prompt {} + schemas {} + context {})",
-                shipped
-                    .iter()
-                    .map(|w| w.total().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" → "),
+                join(&shipped, Weighed::total),
                 shipped[0].system,
                 shipped[0].tools,
                 shipped[0].messages,
             ),
-            Truth::Correct,
+            Truth::Characterises,
         )
-        .gated(saturated)
-        .note("one step, as the employee's own TEAM fills five recall slots; then nothing"),
+        .note("no longer flat: rows 3 and 4 say which half moved and which did not"),
     );
+
+    // The prefix before either builder was wired. Not a row of its own — the
+    // page has a line budget and "what it used to cost" is history rather than
+    // measurement — but it is the zero the two rows below are measured from, and
+    // `the_context_does_not_grow_with_the_company_around_it` still asserts that
+    // this half is flat.
+    let bare = at(Inventory::Bare);
 
     // --- 2. what does scoping the corpus save? ------------------------------
     // The headline, and it is not the one the hierarchy was sold on. Top-k is a
@@ -550,8 +636,8 @@ pub fn evaluate() -> Surface {
     let biggest = Company {
         employees: SIZES[SIZES.len() - 1],
     };
-    let scoped = weigh(&assemble(biggest, Reach::Team, Inventory::AsShipped));
-    let unscoped = weigh(&assemble(biggest, Reach::Company, Inventory::AsShipped));
+    let scoped = weigh(&assemble(biggest, Reach::Team, Inventory::Bare));
+    let unscoped = weigh(&assemble(biggest, Reach::Company, Inventory::Bare));
     // A passage is the unit the budget is denominated in, so "less than one"
     // is the honest way to say "nothing" without pinning a token count that a
     // reworded fixture would move.
@@ -574,30 +660,84 @@ pub fn evaluate() -> Surface {
         .note("scoping can COST tokens: the sign is set by whose prose is longer, not by scope"),
     );
 
-    // --- 3. the one company-wide input, and the slope it would have ---------
-    let slope: Vec<usize> = SIZES
-        .iter()
-        .map(|&employees| {
-            weigh(&assemble(
-                Company { employees },
-                Reach::Team,
-                Inventory::Named,
-            ))
-            .system
-        })
-        .collect();
+    // --- 3. the term that slopes: the tenant's MCP inventory ----------------
+    // Wired now, and it does what this file said it would. Per tenant, filtered
+    // by risk and by nothing else — not by team, not by role — so every employee
+    // pays for every server the company has bound, on every turn, forever.
+    let mcp = at(Inventory::McpOnly);
+    let last = SIZES.len() - 1;
     rows.push(
         Row::ok(
-            "MCP inventory in the prefix, if wired",
+            "…of which the MCP inventory",
             format!(
-                "{} → {} tok as 2 staff become 50 (+{})",
-                slope[0],
-                slope[slope.len() - 1],
-                slope[slope.len() - 1] - slope[0],
+                "{} → {} tok of prefix as 2 staff become 50 (+{})",
+                mcp[0].system - bare[0].system,
+                mcp[last].system - bare[last].system,
+                (mcp[last].system - bare[last].system) - (mcp[0].system - bare[0].system),
             ),
             Truth::Characterises,
         )
-        .note("per tenant, filtered by risk and by nothing else — and no production path calls it"),
+        .note("O(servers bound), and nothing scopes it — the honest place to look next"),
+    );
+
+    // --- 3b. the term that does not: the colleague roster -------------------
+    // **The row this feature was built to be able to print.** It saturates
+    // between two employees and ten — the employee's own team filling up, the
+    // same shape as the recall — and then stops. Fifty employees, ten teams, and
+    // an employee is told about the same handful of people it was told about at
+    // ten, because `inbound::colleagues` is a join on `team_memberships` and
+    // there is no company size anywhere in it.
+    let roster: Vec<usize> = SIZES
+        .iter()
+        .enumerate()
+        .map(|(i, _)| shipped[i].system - mcp[i].system)
+        .collect();
+    let flat = roster[last] == roster[last - 1];
+    rows.push(
+        Row::ok(
+            "…and of which the colleague roster",
+            format!(
+                "{} tok of prefix — manager, reports, team-mates, nobody else",
+                roster
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+            ),
+            Truth::Correct,
+        )
+        .gated(flat)
+        .note(
+            "O(team). The gate is the whole point: a roster that sloped would make the bill \
+               quadratic in headcount, because every employee pays for it every turn",
+        ),
+    );
+
+    // --- 3c. what the unscoped version would have cost ----------------------
+    // The counterfactual, priced. This is the same feature with the join to
+    // `team_memberships` taken out — one line per employee in the tenant — and
+    // it is the number that makes "do not list every employee" an argument
+    // rather than a preference.
+    let payroll = at(Inventory::Unscoped);
+    rows.push(
+        Row::ok(
+            "…the same roster with no team join",
+            format!(
+                "{} tok — +{} on every prefix at 50 staff, and linear from there",
+                SIZES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| (payroll[i].system - mcp[i].system).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+                (payroll[last].system - mcp[last].system) - roster[last],
+            ),
+            Truth::Characterises,
+        )
+        .note(
+            "×50 employees ×their turns a day: the term scoping actually removes, unlike \
+               the corpus, where top-k had already removed it",
+        ),
     );
 
     // --- 4. what taint filtering costs ---------------------------------------
@@ -625,19 +765,25 @@ pub fn evaluate() -> Surface {
     );
 
     // --- 5. the number an operator asks for ----------------------------------
+    // It used to be independent of company size. It is not any more, and the
+    // reason is row 3 and not row 3b: the marginal employee now carries the
+    // whole tenant's MCP inventory in every prefix. Printed at both ends rather
+    // than gated on their being equal, because they are not.
     let day = per_day(biggest);
-    let bounded = per_day(Company { employees: 10 }) == day;
+    let at_ten = per_day(Company { employees: 10 });
     rows.push(
         Row::ok(
             "one more employee costs, per day",
             format!(
-                "{day} tok at {} turns, whatever the company size",
+                "{at_ten} tok at 10 staff → {day} at 50, at {} turns",
                 RolePack::international_buyer().limits().max_turns_per_day
             ),
-            Truth::Correct,
+            Truth::Characterises,
         )
-        .gated(bounded)
-        .note("a floor: one model call per reserved turn, and a run may make ten"),
+        .note(
+            "a floor: one model call per reserved turn, and a run may make ten. The gap \
+               between the two is the MCP inventory; the roster contributes none of it",
+        ),
     );
 
     Surface {
@@ -651,10 +797,15 @@ pub fn evaluate() -> Surface {
              TURN_BRIEF, the initiative loop's, and `knowledge::RECALLED_BRIEF` — two private \
              consts in a binary crate and one private to `app`. The floor above is short by \
              them, and all three are constants, which cannot slope",
-            "what a colleague roster would cost, because there is none. `message_colleague` takes \
-             a slug the model was never told, and the fix that worked for MCP names — name the \
-             inventory in the prefix — is exactly the O(company) term scoping would then have to \
-             pay for. That is the first feature that will make this line slope",
+            "the roster's SHAPE, only its size. Whether an employee is told about the right \
+             colleagues is `inbound::colleagues`' own claim and it needs Postgres — \
+             `a_roster_is_the_line_and_the_team_and_stops_two_links_away` owns it. This file \
+             weighs a fixture roster of the size the real query returns and asserts nothing \
+             about whose names are in it",
+            "what a hire costs. Adding somebody to a team invalidates that team's cached \
+             prefixes exactly once, and the row above prices the steady state rather than the \
+             transition. One uncached prefix per team-mate per hire, against a cache read on \
+             every other turn — but there is no rate card here to turn that into money",
             "growth WITHIN a run: the loop re-sends a growing history up to `Budgets::max_turns`, \
              and only the first round trip is weighed here",
             "cache reads, counted at full price like `Budgets::max_tokens` counts them. The money \
@@ -712,10 +863,15 @@ mod tests {
         assert!(tokens(&format!("{INBOUND} and one more clause")) > base);
     }
 
-    /// **The claim this suite exists for**, asserted as a shape rather than as
-    /// a number: past the point where an employee's own team fills its recall
-    /// slots, the company around it costs nothing. Not "under N tokens" — a
-    /// reworded briefing must not fail this.
+    /// The claim this suite was built for, and now the **baseline** rather than
+    /// the headline: with nothing about the company named in the prefix, past
+    /// the point where an employee's own team fills its recall slots the company
+    /// around it costs nothing. Not "under N tokens" — a reworded briefing must
+    /// not fail this.
+    ///
+    /// It is still worth asserting, because it is what says the growth measured
+    /// in `the_mcp_inventory_is_the_term_that_grows_with_the_company` comes from
+    /// the inventory and not from something that was always there.
     ///
     /// The one step that does exist, between two employees and ten, is the
     /// top-k filling up. It is bounded by [`RECALL_LIMIT`] passages, so the
@@ -729,7 +885,7 @@ mod tests {
                 weigh(&assemble(
                     Company { employees },
                     Reach::Team,
-                    Inventory::AsShipped,
+                    Inventory::Bare,
                 ))
             })
             .collect();
@@ -762,8 +918,8 @@ mod tests {
     #[test]
     fn scoping_the_corpus_saves_less_than_one_passage() {
         let company = Company { employees: 50 };
-        let scoped = weigh(&assemble(company, Reach::Team, Inventory::AsShipped));
-        let unscoped = weigh(&assemble(company, Reach::Company, Inventory::AsShipped));
+        let scoped = weigh(&assemble(company, Reach::Team, Inventory::Bare));
+        let unscoped = weigh(&assemble(company, Reach::Company, Inventory::Bare));
         assert!(
             unscoped.messages.abs_diff(scoped.messages) < tokens(&passage(0, 0)),
             "if these ever differ by a whole passage, retrieval stopped being a fixed \
@@ -782,7 +938,7 @@ mod tests {
     /// The one company-wide input there is. It slopes, it is filtered by risk
     /// alone, and every employee in the tenant pays for all of it.
     #[test]
-    fn the_mcp_inventory_is_the_term_that_does_grow_with_the_company() {
+    fn the_mcp_inventory_is_the_term_that_grows_with_the_company() {
         // Ten and fifty, not two and fifty: at ten the recall has already
         // saturated, so anything that moves from here is the prefix and only
         // the prefix.
@@ -825,26 +981,94 @@ mod tests {
         assert!(schema(TrustLabel::Untrusted) < schema(TrustLabel::Trusted));
     }
 
-    /// The operator's number has to be a property of the employee, not of the
-    /// payroll — otherwise "what does one more cost" has no answer. Measured
-    /// from ten upwards, where the recall has saturated and the only remaining
-    /// variable would be company size itself.
+    /// **The assertion the colleague roster was built to be able to pass.**
+    ///
+    /// Measured from ten upwards, where the recall has already saturated, so
+    /// anything that moves is the prefix and only the prefix. Between ten
+    /// employees and fifty the roster contributes **nothing**: an employee is
+    /// told about its manager, its reports and its team-mates, and there are the
+    /// same number of those in a company of fifty as in a company of ten.
+    ///
+    /// Stated as `Named - McpOnly` rather than as a token count, because the
+    /// number would move with a reworded heading and the property would not. If
+    /// this ever fails, somebody has put a query with no join to
+    /// `team_memberships` behind `inbound::colleagues`, and the company's bill
+    /// has become quadratic in its headcount.
     #[test]
-    fn the_marginal_cost_of_one_more_employee_does_not_depend_on_the_others() {
+    fn the_roster_costs_the_same_in_a_company_of_fifty_as_in_one_of_ten() {
+        let roster_cost = |employees: usize| {
+            let company = Company { employees };
+            weigh(&assemble(company, Reach::Team, Inventory::Named)).system
+                - weigh(&assemble(company, Reach::Team, Inventory::McpOnly)).system
+        };
+        assert_eq!(roster_cost(10), roster_cost(50));
+        assert!(
+            roster_cost(10) > 0,
+            "the fixture names no colleagues at all"
+        );
+
+        // And the counterfactual really is different, or the row above is
+        // comparing a thing to itself: an unscoped roster costs strictly more,
+        // and costs more the bigger the company gets.
+        let payroll = |employees: usize| {
+            weigh(&assemble(
+                Company { employees },
+                Reach::Team,
+                Inventory::Unscoped,
+            ))
+            .system
+        };
+        assert!(payroll(50) > payroll(10));
+        assert!(
+            payroll(50) - payroll(10)
+                > weigh(&assemble(
+                    Company { employees: 50 },
+                    Reach::Team,
+                    Inventory::Named
+                ))
+                .system
+                    - weigh(&assemble(
+                        Company { employees: 10 },
+                        Reach::Team,
+                        Inventory::Named
+                    ))
+                    .system,
+            "the unscoped roster did not slope harder than the scoped one, so this \
+             fixture is not measuring the thing scoping removes"
+        );
+    }
+
+    /// What an operator asks, and the answer changed: it is no longer one
+    /// number. The marginal employee carries the whole tenant's MCP inventory in
+    /// every prefix, so a company that binds more servers pays more per
+    /// employee — and that is a finding about `with_mcp_tools`, not a failure.
+    ///
+    /// The half that *is* still bounded is the half this task was about, and it
+    /// is asserted directly above.
+    #[test]
+    fn the_marginal_cost_of_one_more_employee_now_depends_on_the_tenants_bindings() {
         let ten = per_day(Company { employees: 10 });
-        assert_eq!(ten, per_day(Company { employees: 50 }));
+        let fifty = per_day(Company { employees: 50 });
         assert!(ten > 0);
+        assert!(
+            fifty > ten,
+            "if these are equal again, something stopped naming the tenant's inventory \
+             in the prefix and the employee is back to guessing server names"
+        );
     }
 
     /// A turn that has read a supplier's email and five documents is untrusted,
     /// or the schemas measured above are the wrong ones.
     #[test]
     fn the_assembled_turn_is_untrusted_the_way_a_real_one_is() {
-        let request = assemble(Company { employees: 10 }, Reach::Team, Inventory::AsShipped);
+        let request = assemble(Company { employees: 10 }, Reach::Team, Inventory::Named);
         assert_eq!(
             request.tools.len(),
             tools_for(TrustLabel::Untrusted, &floor()).len()
         );
         assert!(!request.tools.iter().any(|tool| tool.name == "pay"));
+        // The roster survives the taint, and it has to: `message_colleague` is
+        // Low precisely so a turn holding a stranger's text can raise it.
+        assert!(request.system.contains("Colleagues you can reach"));
     }
 }

@@ -144,6 +144,13 @@
 //! purpose — a head answers to the CEO from a different team — which is why the
 //! two are alternatives and not a conjunction.
 //!
+//! It is also the rule the employee is **told**. [`colleagues`] builds the
+//! roster that goes into the system prompt by asking [`may_message`] about an
+//! O(team) candidate set, rather than by restating the disjunction in a second
+//! query. Reach and roster have to be one rule: told-but-refused is a spent
+//! turn the refusal cannot explain, and reachable-but-untold is a colleague the
+//! employee cannot see.
+//!
 //! ## What an internal message costs
 //!
 //! One of the **recipient's** `max_turns_per_day`, reserved by the sender, in
@@ -224,7 +231,7 @@
 //! no row and no counter behind, only its bucket locked until this transaction
 //! ends, which is the same lock a delivered message takes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use agentos_domain::action::E164;
@@ -237,6 +244,7 @@ use agentos_providers::email::{EmailProvider, InboundNotice, ParseError, Route};
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::org;
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
 use agentos_store::turns;
@@ -245,6 +253,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::prompt::Relation;
 use crate::psyche;
 use crate::turn::Context;
 
@@ -1439,6 +1448,99 @@ pub async fn may_message(
             || directs(tx, from, to).await?
             || directs(tx, to, from).await?),
     }
+}
+
+/// **Who this employee may be told about**: its manager, its direct reports and
+/// its team-mates, each with the relation that makes it reachable.
+///
+/// Fed straight to
+/// [`SystemPrompt::with_colleagues`](crate::prompt::SystemPrompt::with_colleagues),
+/// and the two rules must agree: an employee told about a colleague it may not
+/// message is being invited to spend a turn discovering that, and the refusal
+/// it gets back deliberately cannot tell it which of the two things went wrong;
+/// an employee that may message somebody it was never told about has an
+/// invisible colleague.
+///
+/// # `may_message` is the source of truth, and this asks it
+///
+/// The obvious implementation is one query whose `WHERE` restates the
+/// disjunction in [`may_message`]'s question arm. That is two copies of one
+/// rule, and the copy that drifts is the one nobody runs — a reporting line
+/// added to the gate and not to the roster leaves a colleague invisible, and the
+/// reverse leaves the model burning turns on a name it was handed.
+///
+/// So the SQL here is only a **candidate set**, and the ruling is
+/// [`may_message`] itself, once per candidate, with [`Errand::Question`] —
+/// which is exactly the union of the three relations ([`Errand::Order`] is the
+/// line alone, a strict subset, and [`Errand::Answer`] is authorised by an
+/// outstanding question rather than by the chart, which `outstanding_note`
+/// already surfaces). Nothing can be in this list that the send path would
+/// refuse, because the send path is what put it there.
+///
+/// The candidates come from [`agentos_store::org`]'s existing reads —
+/// `manager_of`, `reports`, `team_of` + `members` — every one of them keyed on
+/// `team_memberships`, which is what bounds this at **O(team)** rather than
+/// O(company). That bound is the point: this list goes in the cached prefix of
+/// every turn of every employee, so a roster that grew with headcount would make
+/// the company's token bill quadratic in it. `agentos_eval::scoping` measures
+/// the slope.
+///
+/// ponytail: one `may_message` per candidate, so a seat with a manager and four
+/// reports on a team of five costs on the order of fifteen indexed lookups, once
+/// per turn, inside the caller's transaction — against a model call that costs
+/// money. `line` takes the same bet one query at a time and says so. Upgrade
+/// path if a team ever gets big enough to notice: fold the disjunction into the
+/// candidate query and keep this function as the test oracle.
+pub async fn colleagues(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+) -> Result<Vec<(Slug, Relation)>, StoreError> {
+    // Strongest relation first, so the `retain` below keeps a manager who also
+    // sits on your team as your manager rather than as a team-mate.
+    let mut candidates: Vec<(EmployeeId, Relation)> = Vec::new();
+    if let Some(manager) = org::manager_of(tx, employee).await? {
+        candidates.push((manager, Relation::Manager));
+    }
+    candidates.extend(
+        org::reports(tx, employee)
+            .await?
+            .into_iter()
+            .map(|report| (report, Relation::Report)),
+    );
+    if let Some(team) = org::team_of(tx, employee).await? {
+        candidates.extend(
+            org::members(tx, team)
+                .await?
+                .into_iter()
+                .map(|mate| (mate, Relation::TeamMate)),
+        );
+    }
+
+    // `members` returns this employee too, and an employee that may message
+    // itself may wake itself forever — `may_message` refuses that below, but
+    // dropping it here saves the round trip and the duplicate.
+    let mut seen = HashSet::new();
+    candidates.retain(|(who, _)| *who != employee && seen.insert(*who));
+
+    let mut roster = Vec::with_capacity(candidates.len());
+    for (who, relation) in candidates {
+        // The ruling, not a restatement of it. A terminated colleague, a seat
+        // moved off the team between the two reads, a reporting line deleted —
+        // all of them are refusals here, from the same function that will refuse
+        // the send.
+        if !may_message(tx, employee, who, Errand::Question).await? {
+            continue;
+        }
+        let slug = slug_of(tx, who).await?;
+        // Same argument as `line`: every slug in `employees` went through
+        // `Slug::parse` on the way in, so a column that no longer parses is a
+        // conflict and not a colleague we quietly drop from the roster.
+        roster.push((
+            Slug::parse(&slug).map_err(|err| StoreError::conflict(err.to_string()))?,
+            relation,
+        ));
+    }
+    Ok(roster)
 }
 
 /// Both on one team, both active. The lateral relation.
@@ -4164,6 +4266,268 @@ mod tests {
         for who in line {
             assert_eq!(heard(&db, tenant, who).await, 0);
             assert_eq!(turns_taken(&db, tenant, who).await, 0);
+        }
+    }
+
+    // -- the roster --------------------------------------------------------
+
+    /// One employee's roster, sorted, as `(slug, relation)` — comparable, and
+    /// independent of the order the candidates happened to come back in.
+    async fn roster_of(db: &Db, tenant: TenantId, who: EmployeeId) -> Vec<(String, Relation)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let roster = colleagues(&mut tx, who).await.expect("a roster");
+        tx.rollback().await.expect("rollback");
+        let mut out: Vec<(String, Relation)> = roster
+            .into_iter()
+            .map(|(slug, how)| (slug.as_str().to_owned(), how))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every employee in the tenant, whatever their team — the scan a roster
+    /// must **not** be, used here as the oracle it is fine for a test to be.
+    async fn everyone(db: &Db, tenant: TenantId) -> Vec<(EmployeeId, String)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, slug FROM employees ORDER BY slug")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("the payroll");
+        tx.rollback().await.expect("rollback");
+        rows.into_iter()
+            .map(|(id, slug)| (EmployeeId::from_uuid(id), slug))
+            .collect()
+    }
+
+    /// **The shape of a roster**, on the chart this system was built to express:
+    /// the CEO sits on `Direction`, the Head of Growth sits on `Growth` and
+    /// answers to it, a rep answers to the head, and a stranger sits on `Sales`
+    /// attached to nothing.
+    ///
+    /// Two claims, and the second is the one worth the fixture. The rep's list
+    /// holds its manager and nobody else — **the CEO is two links away and is
+    /// absent**, because authority descends a step at a time and a roster that
+    /// reached further would be inviting the rep to spend a turn on somebody who
+    /// will refuse it. And the stranger is in nobody's list and has nobody in
+    /// its own, which is what "not the payroll" means when the payroll is small
+    /// enough to enumerate.
+    ///
+    /// The cross-check at the end is exhaustive over all twelve ordered pairs:
+    /// what an employee is told it may message is exactly what [`may_message`]
+    /// will let it message. Two rules that agree on a fixture this small are two
+    /// rules, and the assertion is what keeps them one.
+    #[tokio::test]
+    async fn a_roster_is_the_line_and_the_team_and_stops_two_links_away() {
+        let Some(db) = db().await else { return };
+        let (tenant, ceo) = seed(&db).await; // slug `lena`
+        let head = hire(&db, tenant, "bruno").await;
+        let rep = hire(&db, tenant, "dana").await;
+        let stranger = hire(&db, tenant, "omar").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let team = |name: &str| Slug::parse(name).expect("slug");
+        let direction = org::create_team(&mut tx, &team("direction"), "Direction")
+            .await
+            .expect("direction");
+        let growth = org::create_team(&mut tx, &team("growth"), "Growth")
+            .await
+            .expect("growth");
+        let sales = org::create_team(&mut tx, &team("sales"), "Sales")
+            .await
+            .expect("sales");
+        org::set_member(&mut tx, ceo, direction, None)
+            .await
+            .expect("seat the ceo");
+        org::set_member(&mut tx, head, growth, None)
+            .await
+            .expect("seat the head");
+        org::set_member(&mut tx, rep, growth, None)
+            .await
+            .expect("seat the rep");
+        org::set_member(&mut tx, stranger, sales, None)
+            .await
+            .expect("seat the stranger");
+        org::set_position(&mut tx, ceo, Some("CEO"), None)
+            .await
+            .expect("ceo");
+        // The line crosses a team boundary on purpose: that is why an order
+        // rides `reports_to` and not "same team".
+        org::set_position(&mut tx, head, Some("Head of Growth"), Some(ceo))
+            .await
+            .expect("head");
+        org::set_position(&mut tx, rep, Some("Growth rep"), Some(head))
+            .await
+            .expect("rep");
+        tx.commit().await.expect("commit the chart");
+
+        // The CEO: one report, one team of one, so one name.
+        assert_eq!(
+            roster_of(&db, tenant, ceo).await,
+            vec![("bruno".to_owned(), Relation::Report)]
+        );
+
+        // The head: its manager one team over, and its report — which is also
+        // its team-mate, and is listed with the stronger of the two relations
+        // because that is the one that says what may be sent.
+        assert_eq!(
+            roster_of(&db, tenant, head).await,
+            vec![
+                ("dana".to_owned(), Relation::Report),
+                ("lena".to_owned(), Relation::Manager),
+            ]
+        );
+
+        // **The claim.** The rep sees its manager. Not the CEO, which is two
+        // links up; not the stranger, which is on another team.
+        assert_eq!(
+            roster_of(&db, tenant, rep).await,
+            vec![("bruno".to_owned(), Relation::Manager)]
+        );
+
+        // And a seat attached to nothing reaches nobody: an employee alone on a
+        // team has no team-mates, no line, and therefore no roster at all.
+        assert!(roster_of(&db, tenant, stranger).await.is_empty());
+        for who in [ceo, head, rep] {
+            assert!(
+                !roster_of(&db, tenant, who)
+                    .await
+                    .iter()
+                    .any(|(name, _)| name == "omar"),
+                "the stranger reached a roster"
+            );
+        }
+
+        // Every ordered pair: told and allowed are the same set.
+        let payroll = everyone(&db, tenant).await;
+        for (from, from_slug) in &payroll {
+            let told: BTreeSet<String> = roster_of(&db, tenant, *from)
+                .await
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            for (to, to_slug) in &payroll {
+                let allowed = may_message(&mut tx, *from, *to, Errand::Question)
+                    .await
+                    .expect("a ruling");
+                assert_eq!(
+                    told.contains(to_slug),
+                    allowed,
+                    "{from_slug} was told about {to_slug}: {}, but may_message says {allowed}",
+                    told.contains(to_slug)
+                );
+            }
+            tx.rollback().await.expect("rollback");
+        }
+    }
+
+    /// **The assertion this feature exists for.** Forty more employees on eight
+    /// other teams, and the two people on the original desk are told exactly
+    /// what they were told before.
+    ///
+    /// Stated as a property — the same list, byte for byte — and not as a
+    /// number, because a count that happens to stay at two would also pass with
+    /// two *different* names in it. What is being pinned is that headcount is
+    /// not an input: the roster is a function of `team_memberships` around one
+    /// seat, so it is O(team), and the alternative — a list of everyone in the
+    /// tenant — would put a term linear in the payroll into a cached prefix that
+    /// every employee re-sends on every turn, which is a bill quadratic in
+    /// company size. `agentos_eval::scoping` measures what that costs.
+    ///
+    /// The cross-check here runs against the **whole** payroll rather than the
+    /// team: the interesting failure is not a missing colleague, it is one of
+    /// the forty strangers turning up, and only a scan can say it did not.
+    #[tokio::test]
+    async fn the_roster_does_not_grow_when_the_company_does() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, bruno) = company(&db, 9).await;
+
+        let before = (
+            roster_of(&db, tenant, lena).await,
+            roster_of(&db, tenant, bruno).await,
+        );
+        assert_eq!(
+            before.0,
+            vec![("bruno".to_owned(), Relation::Report)],
+            "the fixture's own chart changed; the rest of this test means nothing"
+        );
+
+        // Forty hires on eight teams of five, each team with its own head, none
+        // of them connected to the desk by a line or a membership.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        for team_no in 0..8 {
+            let team = org::create_team(
+                &mut tx,
+                &Slug::parse(&format!("team-{team_no}")).expect("slug"),
+                "Another team",
+            )
+            .await
+            .expect("a team");
+            let mut seats = Vec::new();
+            for seat in 0..5 {
+                let who = EmployeeId::new_v7(Utc::now());
+                sqlx::query(
+                    "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+                     VALUES ($1, $2, $3, $3, 'active')",
+                )
+                .bind(who.as_uuid())
+                .bind(tenant.as_uuid())
+                .bind(format!("hire-{team_no}-{seat}"))
+                .execute(&mut **tx)
+                .await
+                .expect("hire");
+                org::set_member(&mut tx, who, team, None)
+                    .await
+                    .expect("seat");
+                seats.push(who);
+            }
+            // A head and four reports, so the other teams have real lines in
+            // them — a fixture of forty unattached seats would make "the line
+            // does not reach me" true for the wrong reason.
+            org::set_position(&mut tx, seats[0], Some("Head"), None)
+                .await
+                .expect("head");
+            for report in &seats[1..] {
+                org::set_position(&mut tx, *report, None, Some(seats[0]))
+                    .await
+                    .expect("report");
+            }
+        }
+        tx.commit().await.expect("commit forty hires");
+
+        let payroll = everyone(&db, tenant).await;
+        assert_eq!(payroll.len(), 42, "the fixture did not actually grow");
+
+        // The property: five times the company, the same list.
+        let after = (
+            roster_of(&db, tenant, lena).await,
+            roster_of(&db, tenant, bruno).await,
+        );
+        assert_eq!(
+            before, after,
+            "the roster grew with the company; the prefix now slopes with headcount"
+        );
+
+        // …and it is not that the forty are being hidden by a `LIMIT`: the chart
+        // agrees, one ruling per employee in the tenant.
+        for who in [lena, bruno] {
+            let told: BTreeSet<String> = roster_of(&db, tenant, who)
+                .await
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            for (other, other_slug) in &payroll {
+                assert_eq!(
+                    told.contains(other_slug),
+                    may_message(&mut tx, who, *other, Errand::Question)
+                        .await
+                        .expect("a ruling"),
+                    "roster and may_message disagree about {other_slug}"
+                );
+            }
+            tx.rollback().await.expect("rollback");
         }
     }
 }

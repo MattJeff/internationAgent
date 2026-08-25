@@ -136,12 +136,17 @@
 use std::future::Future;
 use std::time::Duration;
 
-use agentos_app::effects::Effects;
+use std::sync::Arc;
+
+use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::Principal as ActingAs;
+use agentos_app::inbound;
+use agentos_app::prompt::Relation;
 use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
+use agentos_domain::ids::Slug;
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
@@ -182,6 +187,10 @@ pub struct Assignment {
     pub address: String,
     /// What this employee was hired to do.
     pub charter: Charter,
+    /// Who it may message, and why: manager, direct reports, team-mates. Read
+    /// in the same transaction as the charter, because it belongs to the same
+    /// cached prefix and there is no reason to open a second one.
+    pub colleagues: Vec<(Slug, Relation)>,
 }
 
 /// What the loop decided about one due employee. The `String`s are ours: a
@@ -501,7 +510,14 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         let charter = Charter::load(&mut tx, due.employee_id)
             .await
             .map_err(|err| Outcome::Unreadable(err.code().to_owned()))?;
-        Ok((employee.employee, charter))
+        // The org chart, in the same read. A self-started turn has no
+        // counterparty, so `message_colleague` is the only outward verb it is
+        // likely to want — and an employee that has to guess a slug for it
+        // spends one of the few turns its cadence gives it per day.
+        let colleagues = inbound::colleagues(&mut tx, due.employee_id)
+            .await
+            .map_err(|err| Outcome::Failed(format!("could not read the colleagues: {err}")))?;
+        Ok((employee.employee, charter, colleagues))
     }
     .await;
 
@@ -509,7 +525,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
     // is awaited rather than dropped so a pooled connection is handed back
     // deliberately.
     let _ = tx.rollback().await;
-    let (employee, charter) = read?;
+    let (employee, charter, colleagues) = read?;
 
     let Some(charter) = charter else {
         return Ok(None);
@@ -527,6 +543,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         ),
         address: employee.address().to_string(),
         charter,
+        colleagues,
     }))
 }
 
@@ -571,6 +588,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         identity,
         address,
         charter,
+        colleagues,
     } = assignment;
     let role = charter.role();
 
@@ -579,8 +597,23 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // transaction spanning this turn to write into.
     let db = agent.db.clone();
 
+    // The tenant's own MCP bindings, substituted into a per-turn copy of the
+    // process-wide `Ports` exactly as `Agent::on_turn` does it.
+    //
+    // This loop used to hand `Effects` the process-wide ports, whose `mcp` is
+    // the unbound stub — so a self-started turn could never reach a tenant's
+    // servers however well they were bound. That was survivable while nothing
+    // named the inventory; it stops being survivable the moment the prefix does,
+    // because a tool named to a turn that cannot call it is the exact leak
+    // `turn::visible` exists to make unrepresentable.
+    let fleet = agent.fleets.for_tenant(due.tenant_id);
+    let ports = Arc::new(Ports {
+        mcp: fleet.clone(),
+        ..(*agent.ports).clone()
+    });
+
     let principal = ActingAs::employee(due.tenant_id, due.employee_id);
-    let effects = Effects::new(agent.db.clone(), agent.ports.clone(), principal.clone());
+    let effects = Effects::new(agent.db.clone(), ports, principal.clone());
 
     // The vertical, before the model and never instead of it. See the module
     // docs on why this is not a branch that skips the turn.
@@ -591,7 +624,14 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         agent.gate,
         effects,
         principal,
-        charter.system_prompt(&identity),
+        // Same prefix as `Agent::on_turn`, down to the order of the builders:
+        // an employee that wakes itself must be told exactly what an employee
+        // woken by a stranger is told, or "same authority either way" is only
+        // true of the gate and not of what the model knows to ask for.
+        charter
+            .system_prompt(&identity)
+            .with_mcp_tools(fleet.inventory())
+            .with_colleagues(colleagues),
         agent.model,
         address,
     );

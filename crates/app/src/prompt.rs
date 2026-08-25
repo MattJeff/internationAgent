@@ -55,6 +55,25 @@
 //!    human put in `mcp_tool_declarations` — which keeps the rule at the top of
 //!    this file true: a counterparty does not write the system prompt.
 //!
+//! # Colleagues are named, and only the ones that can be reached
+//!
+//! [`SystemPrompt::with_colleagues`] is the same fix as the MCP inventory,
+//! applied to the other free string in the catalogue: `message_colleague` takes
+//! a slug, the schema offers `"bruno"` as an *example*, and a wrong guess comes
+//! back as `unreachable_colleague` — which `inbound::InternalError` deliberately
+//! makes indistinguishable from "not on your team", precisely so the org chart
+//! cannot be enumerated by probing. An employee that has to guess therefore
+//! cannot learn, and burns a turn each time it tries.
+//!
+//! The list is **not** the payroll. It is this employee's manager, its direct
+//! reports and its team-mates — [`crate::inbound::colleagues`], which asks
+//! [`crate::inbound::may_message`] itself rather than re-deriving its rule. That
+//! is O(team), and the distinction is the whole cost argument:
+//! `agentos_eval::scoping` measured the per-turn context flat at 2, 10 and 50
+//! employees, and a roster with no join to `team_memberships` in it would be the
+//! first term to make that line slope — quadratic in headcount once every
+//! employee pays for every other.
+//!
 //! # The prefix is a cache key
 //!
 //! Prompt caching is a byte-prefix match, so a single interpolated timestamp,
@@ -72,11 +91,11 @@
 use std::collections::BTreeSet;
 
 use agentos_domain::action::{ActionKind, McpTool, Risk};
-use agentos_domain::ids::SecretRef;
+use agentos_domain::ids::{SecretRef, Slug};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{LlmRequest, Message};
 
-use crate::turn::{UNCHARTERED, tools_for, visible};
+use crate::turn::{COLLEAGUE_RISK, UNCHARTERED, tools_for, visible};
 
 /// The frame marker. Both the opening and the closing line contain it
 /// verbatim, and [`defuse`] removes it from anything untrusted, so no payload
@@ -197,15 +216,56 @@ pub fn render_fenced(content: &Untrusted<String>, source_id: &str) -> Message {
 }
 
 // ---------------------------------------------------------------------------
+// Colleagues
+// ---------------------------------------------------------------------------
+
+/// Why a colleague is reachable — the three relations
+/// [`crate::inbound::may_message`] rules on, and no fourth.
+///
+/// It is in the prompt because it changes what the employee may *ask for*, not
+/// only who it may address: an order rides the reporting line downward and
+/// nothing else, so a model told only "these five names exist" would still
+/// spend turns ordering its peers about. Naming the relation is what turns a
+/// list of slugs into an answer to "who do I ask, and who do I tell".
+///
+/// The order of the variants is load-bearing: [`SystemPrompt::with_colleagues`]
+/// sorts on it and keeps the first of any duplicate name, so a manager who also
+/// sits on your team is listed as your manager. Strongest relation first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Relation {
+    /// The seat this employee answers to. One link up, never a walk.
+    Manager,
+    /// A seat that answers to this employee. One link down, never a walk.
+    Report,
+    /// Another active seat on the same team.
+    TeamMate,
+}
+
+impl Relation {
+    /// How the roster says it, in the employee's own second person.
+    const fn phrase(self) -> &'static str {
+        match self {
+            Relation::Manager => "your manager — you answer to them",
+            Relation::Report => "reports to you — you may give them an order",
+            Relation::TeamMate => "on your team",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The prefix
 // ---------------------------------------------------------------------------
 
 /// The stable, cacheable head of every request for one employee.
 ///
 /// Built once from the employee's configuration and reused for every turn.
-/// Both fields are ours: the briefing is operator-written and the credential
-/// list is rendered from [`SecretRef`]s. Nothing a counterparty wrote gets in
-/// here — that is what [`render_fenced`] is for.
+/// Every field is ours: the briefing is operator-written, the credential list is
+/// rendered from [`SecretRef`]s, and the roster is `employees.slug` out of our
+/// own database. Nothing a counterparty wrote gets in here — that is what
+/// [`render_fenced`] is for, and it is why [`Self::with_colleagues`] takes
+/// parsed [`Slug`]s rather than strings: there is no path from an
+/// `Untrusted<T>` to a `Slug` that does not go through `Slug::parse`, so
+/// untrusted content cannot name a colleague into existence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemPrompt {
     briefing: String,
@@ -229,6 +289,10 @@ pub struct SystemPrompt {
     /// prefix, so two employees of different roles still share every cached
     /// token their briefings share.
     floor: BTreeSet<ActionKind>,
+    /// Who this employee may message, and why. Rendered for the same reason the
+    /// inventory is; the [`Relation`] stays typed, because it is what the line
+    /// is worded from.
+    colleagues: Vec<(String, Relation)>,
 }
 
 impl SystemPrompt {
@@ -248,6 +312,7 @@ impl SystemPrompt {
             credentials: Vec::new(),
             mcp: Vec::new(),
             floor: UNCHARTERED.into_iter().collect(),
+            colleagues: Vec::new(),
         }
     }
 
@@ -299,9 +364,73 @@ impl SystemPrompt {
     /// Order is preserved and never sorted, because the rendered prefix must
     /// be byte-identical between turns and a caller that varies the order has
     /// varied the cache key.
+    ///
+    /// # Still called by nobody in production, and deliberately so
+    ///
+    /// [`Self::with_mcp_tools`] and [`Self::with_colleagues`] were wired for the
+    /// same reason — a tool takes a free string and the model has to guess it.
+    /// This one has no such consumer, and wiring it anyway would be prefix cost
+    /// with nothing to spend it on. Three things have to change first, and none
+    /// of them is a line in a call site:
+    ///
+    /// * **No tool takes one.** `turn::catalogue` is five entries and not one of
+    ///   them has a credential argument. `Action::CredentialChange` exists in
+    ///   the domain and is gated by `allow_credential_change`, but nothing the
+    ///   model can say proposes it — so a named ref is a fact the employee
+    ///   cannot act on.
+    /// * **Nothing can enumerate them.** `providers::secrets::SecretStore` has
+    ///   `put`, `get` and `delete_prefix`; there is no verb that answers "which
+    ///   refs does this employee hold", so a caller would have to guess names —
+    ///   which is the failure this whole file is about, one level down.
+    /// * **The store is a permanent mock.** `config::PERMANENT_MOCKS` says
+    ///   `secrets=MOCK(in-memory)`, and the only ref production ever writes for
+    ///   an employee is `provisioning::VAULT_CANARY` — an infrastructure probe.
+    ///   Naming that to every employee on every turn would be paying tokens
+    ///   forever to announce a canary.
+    ///
+    /// It stays because it is the *shape* the answer will take, it is tested
+    /// here, and `SafeForPrompt` is the type-level rule it enforces —
+    /// `tests/ui/prompt_secret_in_prompt.rs` is the assertion that a value
+    /// rather than a reference is a compile error, and that rule has to keep
+    /// working whether or not a call site exists yet.
     #[must_use]
     pub fn with_credential(mut self, credential: &impl SafeForPrompt) -> Self {
         self.credentials.push(credential.render_for_prompt());
+        self
+    }
+
+    /// Tell the model who it can actually reach, and how.
+    ///
+    /// Feed this from [`crate::inbound::colleagues`] and from nowhere else.
+    /// **The list and [`crate::inbound::may_message`] must agree**, in both
+    /// directions, and each direction fails differently:
+    ///
+    /// * a colleague named here that `may_message` refuses is an invitation to
+    ///   burn a turn — the model addresses it, gets `unreachable_colleague`, and
+    ///   cannot tell that from "no such employee", so it learns nothing and may
+    ///   well try again;
+    /// * a colleague `may_message` would allow and this list omits is invisible,
+    ///   which is the bug this whole builder exists to close.
+    ///
+    /// `colleagues` closes the gap by asking `may_message` about every candidate
+    /// rather than restating its rule in a second query, and
+    /// `everything_an_employee_is_told_it_may_message_it_may_actually_message`
+    /// is the assertion that keeps it closed.
+    ///
+    /// Sorted and deduplicated here rather than trusted to arrive that way, for
+    /// the reason [`Self::with_mcp_tools`] gives: a caller that varies the order
+    /// has varied the cache key. `sort_unstable` on `(name, relation)` with
+    /// [`Relation`]'s own ordering means a duplicated name keeps its strongest
+    /// relation, so a manager sitting on your own team reads as your manager.
+    #[must_use]
+    pub fn with_colleagues(mut self, roster: impl IntoIterator<Item = (Slug, Relation)>) -> Self {
+        self.colleagues.extend(
+            roster
+                .into_iter()
+                .map(|(who, how)| (who.as_str().to_owned(), how)),
+        );
+        self.colleagues.sort_unstable();
+        self.colleagues.dedup_by(|a, b| a.0 == b.0);
         self
     }
 
@@ -353,6 +482,58 @@ impl SystemPrompt {
                 if risk.is_high() {
                     out.push_str(" — a person has to approve this one before it runs");
                 }
+            }
+        }
+
+        // **The roster goes here: inside the prefix, and last inside it.** Both
+        // halves of that are decisions, and the first one is the expensive one
+        // to get backwards.
+        //
+        // *Inside.* [`Self::request`] puts the breakpoint at the end of the
+        // stable prefix, so what is rendered here is billed once and re-read
+        // from cache afterwards, while anything appended as a message lands
+        // outside it and is billed fresh on every round trip — and a turn makes
+        // up to `Budgets::max_turns` of those, each resending the whole history.
+        // The roster is a function of the org chart, so it changes when somebody
+        // is *hired*: days apart, not turns apart. Putting it after the
+        // breakpoint to "avoid invalidating the cache" pays full price hundreds
+        // of times a day to dodge paying it once a hire. Inside, a hire costs
+        // each affected employee exactly one uncached prefix and then nothing —
+        // and it costs only the employees on that team, which is the same
+        // O(team) bound that keeps the list itself from sloping.
+        //
+        // *Last.* The five sections above are in order of how often they move:
+        // the rules never, the role's briefing never, the identity never, the
+        // credentials never, the tenant's MCP bindings when an operator rebinds.
+        // A hire is more frequent than any of them, so the roster sits at the
+        // bottom, where it truncates the least of the prefix ahead of it if a
+        // second breakpoint is ever put above it.
+        //
+        // No trust filter, and not because one was forgotten: `message_colleague`
+        // is [`COLLEAGUE_RISK`] — `Low`, argued in `turn::catalogue` — and
+        // [`visible`] passes `Low` at every label, so the roster is named to
+        // exactly the turns that are offered the tool. Routed through the same
+        // predicate anyway, so that a future change of that risk moves both at
+        // once instead of leaving a tool named to a turn that may not call it.
+        let mut roster = self
+            .colleagues
+            .iter()
+            .filter(|_| visible(trust, COLLEAGUE_RISK))
+            .peekable();
+        if roster.peek().is_some() {
+            out.push_str(
+                "\n\n# Colleagues you can reach\n\n\
+                 `message_colleague` reaches these people and nobody else at this company. \
+                 Name one exactly as written below — anything else is refused before it \
+                 leaves this process, and the refusal cannot tell you whether you spelled a \
+                 colleague wrong or asked for one you are not allowed to reach. This is the \
+                 whole list; there is no directory to search.\n",
+            );
+            for (name, relation) in roster {
+                out.push_str("\n- ");
+                out.push_str(name);
+                out.push_str(" — ");
+                out.push_str(relation.phrase());
             }
         }
         out
@@ -736,6 +917,109 @@ Kind regards, Accounts Payable";
             all_high.render(TrustLabel::Untrusted),
             bare.render(TrustLabel::Untrusted)
         );
+    }
+
+    // -- the colleague roster ----------------------------------------------
+
+    fn slug(name: &str) -> Slug {
+        Slug::parse(name).expect("slug")
+    }
+
+    /// The desk: a manager, a report and a team-mate, which is the whole
+    /// vocabulary.
+    fn desk() -> SystemPrompt {
+        SystemPrompt::new("You are Lena.").with_colleagues([
+            (slug("bruno"), Relation::Report),
+            (slug("dana"), Relation::TeamMate),
+            (slug("mo"), Relation::Manager),
+        ])
+    }
+
+    /// **The claim this builder exists for.** The model is handed the names it
+    /// would otherwise have had to guess, and told which of them it may order
+    /// about — because an order rides the reporting line and a guess at that
+    /// costs a turn as surely as a guess at the slug does.
+    #[test]
+    fn an_employee_is_told_who_it_can_reach_and_how() {
+        let rendered = desk().render(TrustLabel::Trusted);
+
+        for name in ["bruno", "dana", "mo"] {
+            assert!(rendered.contains(name), "{name} was not named: {rendered}");
+        }
+        assert!(rendered.contains("mo — your manager"));
+        assert!(rendered.contains("bruno — reports to you — you may give them an order"));
+        assert!(rendered.contains("dana — on your team"));
+        // And it says the list is closed, or a model reads three names as three
+        // examples — which is the failure the schema's `e.g. "bruno"` was.
+        assert!(rendered.contains("nobody else at this company"));
+        assert!(rendered.contains("no directory to search"));
+
+        // A turn holding a stranger's text still gets it. `message_colleague`
+        // is Low precisely so the employee that has just read something
+        // alarming can say so, and a roster withheld from that turn would take
+        // the tool away by other means.
+        assert_eq!(rendered, desk().render(TrustLabel::Untrusted));
+    }
+
+    #[test]
+    fn an_employee_with_nobody_to_reach_has_no_section_about_colleagues() {
+        // Same argument as the MCP heading: "Colleagues you can reach" is a
+        // claim that some exist, so an employee on no team — deny by default,
+        // and every employee before the org chart was filled in — renders the
+        // prefix it had before this feature existed.
+        let alone = SystemPrompt::new("You are Lena.");
+        assert!(!alone.render(TrustLabel::Trusted).contains("Colleagues"));
+        assert_eq!(
+            SystemPrompt::new("You are Lena.")
+                .with_colleagues([])
+                .render(TrustLabel::Trusted),
+            alone.render(TrustLabel::Trusted)
+        );
+    }
+
+    /// The roster is inside the cached prefix, which is the whole cost argument:
+    /// it is billed once and re-read until the org chart moves, rather than
+    /// billed fresh on every round trip of every turn.
+    ///
+    /// So two things have to hold at once, and they are in tension: two turns of
+    /// the same employee are byte-identical, and a **hire** is not.
+    #[test]
+    fn the_roster_is_in_the_cached_prefix_and_only_a_hire_moves_it() {
+        let history = vec![Message::user("carry on")];
+        let request = |prompt: &SystemPrompt| {
+            prompt.request("claude-opus-5", 1024, TrustLabel::Trusted, history.clone())
+        };
+
+        // Same employee, same chart, two turns: identical bytes, or the cache
+        // never hits and the roster is billed at full price forever.
+        assert_eq!(request(&desk()).system, request(&desk()).system);
+        // Including the order the caller happened to hand them in, which is a
+        // roster read out of the database and therefore not something a caller
+        // can promise.
+        let shuffled = SystemPrompt::new("You are Lena.").with_colleagues([
+            (slug("mo"), Relation::Manager),
+            (slug("dana"), Relation::TeamMate),
+            (slug("bruno"), Relation::Report),
+            // The same colleague twice — a manager who also sits on your team —
+            // is one line, and it is the line that says the stronger thing.
+            (slug("mo"), Relation::TeamMate),
+        ]);
+        assert_eq!(request(&shuffled).system, request(&desk()).system);
+
+        // A hire moves it, and that is the point: the roster is a function of
+        // the org chart, so it changes when the chart does and at no other time.
+        let hired = desk().with_colleagues([(slug("ana"), Relation::Report)]);
+        assert_ne!(request(&hired).system, request(&desk()).system);
+        assert!(request(&hired).system.contains("ana"));
+
+        // And it is in the *prefix*: everything the roster costs sits in
+        // `system`, ahead of the breakpoint, not in a message after it.
+        let request = request(&desk());
+        assert!(request.system.contains("bruno"));
+        assert_eq!(request.cache_breakpoint, Some(history.len() - 1));
+        assert!(!request.messages.iter().any(|message| {
+            matches!(message.content.as_slice(), [Content::Text { text }] if text.contains("bruno"))
+        }));
     }
 
     #[test]

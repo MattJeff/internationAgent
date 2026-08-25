@@ -926,10 +926,38 @@ impl Agent {
                 employee.domain(),
                 employee.address()
             );
-            let prompt = charter.as_ref().map_or_else(
-                || SystemPrompt::new(identity.clone()),
-                |charter| charter.system_prompt(&identity),
-            );
+            // The one port that is per-tenant, resolved here rather than below
+            // because the prefix names what it holds. An unbound tenant gets an
+            // empty fleet, which refuses every MCP call by name — the same
+            // answer the `NotConfigured` stub gives, arrived at without
+            // pretending the adapter is missing.
+            let fleet = self.fleets.for_tenant(event.tenant_id);
+
+            // Everything the employee is allowed to *reach*, named. Without
+            // these three the model is handed `call_mcp_tool` and
+            // `message_colleague`, both of which take free strings, and told
+            // nothing about which strings exist — so it guesses, the gate
+            // denies the guess, and a working integration reads as a broken
+            // one. All three sit inside the cached prefix on purpose:
+            // `app::prompt::SystemPrompt::render` argues where, and why after
+            // the breakpoint would be the expensive answer.
+            //
+            // The roster is O(team) — manager, reports, team-mates — and comes
+            // out of the org chart through `inbound::may_message` itself. It is
+            // the one thing here that is a function of the company rather than
+            // of the employee, which is why it is bounded by the team and not
+            // by the payroll: see `agentos_eval::scoping`.
+            let roster = inbound::colleagues(tx, employee_id)
+                .await
+                .map_err(|err| format!("could not read this employee's colleagues: {err}"))?;
+            let prompt = charter
+                .as_ref()
+                .map_or_else(
+                    || SystemPrompt::new(identity.clone()),
+                    |charter| charter.system_prompt(&identity),
+                )
+                .with_mcp_tools(fleet.inventory())
+                .with_colleagues(roster);
 
             // The counterparty wrote all four of these — who it is from
             // included — so they travel together inside one frame rather than
@@ -949,12 +977,10 @@ impl Agent {
                 .map_err(|err| format!("could not read this employee's open questions: {err}"))?;
 
             let principal = ActingAs::employee(event.tenant_id, employee_id);
-            // The one port that is per-tenant. An unbound tenant gets an empty
-            // fleet, which refuses every MCP call by name — the same answer the
-            // `NotConfigured` stub gives, arrived at without pretending the
-            // adapter is missing.
+            // The same fleet the prefix was built from, so what the model is
+            // told exists and what it can actually call are one binding.
             let ports = Arc::new(Ports {
-                mcp: self.fleets.for_tenant(event.tenant_id),
+                mcp: fleet,
                 ..(*self.ports).clone()
             });
             let turn = Turn::new(
