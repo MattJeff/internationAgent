@@ -164,6 +164,65 @@
 //! The recipient is charged rather than the sender because waking is what costs
 //! money; the sender is already inside a turn it paid for. The refusal goes to
 //! the sender, which is the one that can do something about it.
+//!
+//! ## Briefing a line, and the arithmetic that makes it honest
+//!
+//! [`brief`] is [`send`] fanned out over a manager's direct reports. It adds no
+//! verb to the four in [`Errand`] and no row shape to `messages`: a briefing
+//! *is* N [`Errand::Order`]s that happen to say the same thing, which is why it
+//! reuses that kind rather than growing a fifth one — a fifth kind would be a
+//! migration to widen `messages_internal_kind_values`, a fifth
+//! [`Errand::arrival`] sentence, and a fifth branch in every rule below, all to
+//! express "an order, but to several people at once".
+//!
+//! The audience is [`line`]: `team_memberships.reports_to`, **one link**. A CEO
+//! briefing reaches its heads and stops there. That is the same rule
+//! [`may_message`] holds for a single order and the same rule the gate's
+//! `directs_subject` holds for a charter, and it is the one that would be
+//! easiest to break here without noticing: a recursive audience would make the
+//! briefing the way round the chain of command that no other verb in this
+//! module offers — one call, every employee in the tenant, one authorisation.
+//! There is no walk, and [`send`]'s own `may_message` check refuses any
+//! recipient that is not one link down even if a caller hands one in.
+//!
+//! ### What a briefing costs, and what happens when one report cannot pay
+//!
+//! N turns, one from each of N *different* employees' days. The interesting
+//! case is the partial one — four reports have turns left and the fifth does
+//! not — and the two answers are genuinely both arguable.
+//!
+//! **All-or-nothing** is the tidier invariant: the line either heard it or it
+//! did not, nobody acts on a briefing half the team is missing, and the manager
+//! retries at UTC midnight. It is rejected here, for three reasons.
+//!
+//! * It hands every report a **veto over its whole line**. One report with a
+//!   spent budget — an employee an operator gave two turns a day, or one that
+//!   has been busy — silently stops the head from telling *anybody* anything
+//!   for the rest of the day. The tightest budget in the team becomes the
+//!   team's budget, which is not a limit any operator sized.
+//! * It is worst exactly where this feature matters. The turn that most needs
+//!   to brief its line is the one that has just read something alarming from
+//!   outside (see the trust argument above). Telling four of five is strictly
+//!   better than telling none, and "none" is what all-or-nothing delivers.
+//! * The manager cannot act on it. A refusal names one blocked colleague and
+//!   leaves the head with nothing sent and nothing learned; a partial delivery
+//!   names the blocked colleague *and* leaves four reports informed.
+//!
+//! So: **best effort, with a receipt**. [`Briefing`] names every report that
+//! heard it and every report that did not, each with the closed code that says
+//! why, and [`Briefing::summary`] renders that back to the manager — a briefing
+//! whose delivery is invisible is one the manager cannot act on, and "I told
+//! the team" is exactly the belief a silent failure would leave behind.
+//!
+//! One thing all-or-nothing would *not* have bought, and it is worth saying so
+//! the tidiness is not mourned: the fan-out is still one transaction, so each
+//! recipient's message, reserved turn and wake-up commit together, and a
+//! [`StoreError`] anywhere aborts the lot. What is best-effort is the *policy*
+//! refusal of a single recipient, not the durability of the ones that landed.
+//! A refused reservation writes nothing either — `turns::reserve` refuses after
+//! a `DO UPDATE` that assigns the column to itself — so a missed report leaves
+//! no row and no counter behind, only its bucket locked until this transaction
+//! ends, which is the same lock a delivered message takes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -1728,6 +1787,192 @@ async fn already_sent(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// The briefing: one manager, its whole line, one transaction
+// ---------------------------------------------------------------------------
+
+/// Who this manager may brief: its **direct reports**, oldest seat first.
+///
+/// One link, and the walk is not a missing feature — it is the thing this
+/// function exists to refuse. [`agentos_store::org::reports`] is the other
+/// direction of `manager_of`, which the gate already uses to decide whether a
+/// head may re-task one employee; asking it here means the briefing's audience
+/// and the gate's notion of authority are the same table read the same way, so
+/// they cannot drift into a briefing that reaches somebody nobody may direct.
+///
+/// Slugs rather than ids because that is what the caller needs: a briefing is
+/// gated one [`crate::effects::InternalSend`] at a time, and an `Action` carries
+/// a slug. The lookup is one query per report, which is one query per row of an
+/// org chart a human typed — see `routes::teams`' `MAX_ROWS` for the same bet.
+///
+/// A manager with no reports gets an empty list, which is not an error: an
+/// employee with nobody under it has a line of zero, and briefing it is a
+/// no-op, not a failure.
+pub async fn line(tx: &mut TenantTx<'_>, manager: EmployeeId) -> Result<Vec<Slug>, StoreError> {
+    let reports = agentos_store::org::reports(tx, manager).await?;
+    let mut slugs = Vec::with_capacity(reports.len());
+    for report in reports {
+        let slug = slug_of(tx, report).await?;
+        // Every slug in `employees` went through `Slug::parse` on the way in,
+        // so this cannot fail — and if the column has been widened underneath
+        // us it is a conflict and not a colleague we quietly skip.
+        slugs.push(Slug::parse(&slug).map_err(|err| StoreError::conflict(err.to_string()))?);
+    }
+    Ok(slugs)
+}
+
+/// One direct report that heard the briefing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Briefed {
+    /// The colleague's short name. **Ours** — it came out of `employees.slug`.
+    pub colleague: String,
+    /// The row it woke on.
+    pub delivered: Delivered,
+}
+
+/// One direct report that did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missed {
+    /// The colleague's short name. **Ours**, same as [`Briefed::colleague`].
+    pub colleague: String,
+    /// The closed code from [`InternalError::code`]: `turn_budget_exhausted`,
+    /// `unreachable_colleague`, `recipient_policy_unusable`. A code and not a
+    /// sentence, because this is a metric label and a tool result both.
+    pub why: &'static str,
+}
+
+/// What one briefing produced. **The receipt**, and the reason best effort is
+/// defensible at all — see this module's docs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Briefing {
+    /// Who heard it, in the order the org chart gave them.
+    pub briefed: Vec<Briefed>,
+    /// Who did not, and why.
+    pub missed: Vec<Missed>,
+}
+
+impl Briefing {
+    /// The receipt as one sentence, for the manager that sent it.
+    ///
+    /// Every name in it is a slug out of our own `employees` table and every
+    /// reason is a `&'static str` from [`InternalError::code`], so this is safe
+    /// to render to a model unfenced no matter how tainted the briefing itself
+    /// was — nothing a colleague or a stranger wrote reaches this string.
+    ///
+    /// It says who *missed* it explicitly rather than only counting, because
+    /// "briefed 4 of 5" leaves the manager knowing it has a problem and not
+    /// which colleague has it.
+    pub fn summary(&self) -> String {
+        if self.briefed.is_empty() && self.missed.is_empty() {
+            return "you have no direct reports, so there was nobody to brief".to_owned();
+        }
+        let names = |who: &[String]| who.join(", ");
+        let heard: Vec<String> = self
+            .briefed
+            .iter()
+            .map(|one| one.colleague.clone())
+            .collect();
+        let mut out = match heard.is_empty() {
+            true => "nobody on your line heard this".to_owned(),
+            false => format!(
+                "briefed {} of {} on your line: {}. It costs each of them one of today's turns \
+                 and they will take it",
+                heard.len(),
+                heard.len() + self.missed.len(),
+                names(&heard)
+            ),
+        };
+        if !self.missed.is_empty() {
+            let missed: Vec<String> = self
+                .missed
+                .iter()
+                .map(|one| format!("{} ({})", one.colleague, one.why))
+                .collect();
+            out.push_str(&format!(
+                ". Not delivered to {} — they have not heard this, so do not act as though \
+                 the whole line has",
+                names(&missed)
+            ));
+        }
+        out
+    }
+}
+
+/// **The missing verb.** Say one thing to a manager's whole line, once.
+///
+/// `audience` is the line — [`line`], gated one recipient at a time by the
+/// caller, which is why each entry carries the [`IdempotencyKey`] its own
+/// ruling minted. N rulings and N keys is not ceremony: it is what makes a
+/// briefing exactly the N messages it claims to be, so the trail names every
+/// colleague written to and a replayed briefing collapses onto the same N rows
+/// rather than a second copy of them.
+///
+/// It does **not** trust `audience` to be the line. Every recipient still goes
+/// through [`send`], which asks [`may_message`] with [`Errand::Order`] — one
+/// link, down. A caller that hands in a peer, a grand-report or a suspended
+/// employee gets it back in [`Briefing::missed`] as `unreachable_colleague`,
+/// which is also how a report that was terminated between the read and the
+/// write shows up. The rule lives in one place and this path is not an
+/// exception to it.
+///
+/// Best effort: a recipient the world refuses is recorded and the rest go. Only
+/// a [`StoreError`] stops it, and that aborts the whole transaction — the
+/// argument for both halves of that is in this module's docs.
+///
+/// # On locks
+///
+/// Each delivery takes a row lock on its recipient's `turn_buckets` row and
+/// holds it to `COMMIT`, so a briefing holds N of them. There is no deadlock to
+/// order around: [`line`] is `ORDER BY created_at, employee_id`, so two
+/// briefings from the same manager take the same locks in the same order, and
+/// two different managers cannot overlap at all — `team_memberships` is keyed
+/// `(tenant_id, employee_id)`, so an employee has exactly one manager and
+/// therefore sits on exactly one line.
+pub async fn brief(
+    tx: &mut TenantTx<'_>,
+    manager: EmployeeId,
+    audience: &[(Slug, IdempotencyKey)],
+    body: &str,
+    trust: TrustLabel,
+    now: DateTime<Utc>,
+) -> Result<Briefing, InternalError> {
+    let mut briefing = Briefing::default();
+    for (colleague, key) in audience {
+        // `Errand::Order` and no thread: a briefing is downward and is about
+        // nothing that came before it. That is also the errand whose
+        // `may_message` rule is exactly the reporting line, which is the
+        // audience rule restated where it is enforced.
+        let sent = send(
+            tx,
+            manager,
+            colleague,
+            Errand::Order,
+            body,
+            trust,
+            None,
+            key,
+            now,
+        )
+        .await;
+        match sent {
+            Ok(delivered) => briefing.briefed.push(Briefed {
+                colleague: colleague.as_str().to_owned(),
+                delivered,
+            }),
+            // The database said no, so there is no partial briefing to report:
+            // the transaction is going back and the rows already written with
+            // it. A `Missed` here would be a receipt for work that is about to
+            // be undone.
+            Err(err @ InternalError::Store(_)) => return Err(err),
+            Err(refused) => briefing.missed.push(Missed {
+                colleague: colleague.as_str().to_owned(),
+                why: refused.code(),
+            }),
+        }
+    }
+    Ok(briefing)
+}
+
 /// **The laundering seam.** How one internal message enters the recipient's
 /// turn.
 ///
@@ -1857,6 +2102,8 @@ pub async fn outstanding_note(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use agentos_providers::email::{MockEmailProvider, RawAttachment, RawInbound};
     use agentos_providers::telephony::MockTelephony;
     use chrono::Duration;
@@ -3515,5 +3762,396 @@ mod tests {
             1,
             "a replay must not spend a second turn"
         );
+    }
+
+    // -- the briefing --------------------------------------------------------
+
+    /// A head, a line of three, and two employees who are **not** on it.
+    ///
+    /// `lena` heads the desk. `bruno`, `carla` and `dan` answer to her. The
+    /// other two are the two ways of not being on a line: `eve` answers to
+    /// *bruno*, one link further down, and `mo` sits beside Lena answering to
+    /// nobody.
+    ///
+    /// All six share one team, deliberately. If the audience were the team —
+    /// which is what [`may_message`] uses for a question — every assertion
+    /// below about who did *not* hear the briefing would pass for the wrong
+    /// reason, and this fixture would be testing nothing.
+    async fn department(
+        db: &Db,
+        turns: u32,
+    ) -> (TenantId, EmployeeId, [EmployeeId; 3], [EmployeeId; 2]) {
+        let (tenant, lena) = seed(db).await;
+        let bruno = hire(db, tenant, "bruno").await;
+        let carla = hire(db, tenant, "carla").await;
+        let dan = hire(db, tenant, "dan").await;
+        let eve = hire(db, tenant, "eve").await;
+        let mo = hire(db, tenant, "mo").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let team = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("desk").expect("slug"),
+            "The desk",
+        )
+        .await
+        .expect("create team");
+        for who in [lena, bruno, carla, dan, eve, mo] {
+            agentos_store::org::set_member(&mut tx, who, team, None)
+                .await
+                .expect("join team");
+        }
+        agentos_store::org::set_position(&mut tx, lena, Some("Head of desk"), None)
+            .await
+            .expect("seat lena");
+        for who in [bruno, carla, dan] {
+            agentos_store::org::set_position(&mut tx, who, Some("Buyer"), Some(lena))
+                .await
+                .expect("seat the line");
+        }
+        agentos_store::org::set_position(&mut tx, eve, Some("Junior buyer"), Some(bruno))
+            .await
+            .expect("seat eve one link below lena");
+        agentos_store::org::set_position(&mut tx, mo, Some("Head of the other desk"), None)
+            .await
+            .expect("seat mo beside lena");
+        tx.commit().await.expect("commit the org chart");
+
+        allow_internal(db, tenant, turns).await;
+        (tenant, lena, [bruno, carla, dan], [eve, mo])
+    }
+
+    /// A head briefs its line, committing only what landed.
+    ///
+    /// The two calls are the production shape: `Turn::perform` reads [`line`]
+    /// and mints one gate ruling per report, and [`crate::effects::Effects`]
+    /// turns each ruling's decision id into that report's key. `tag` stands in
+    /// for the decision id, which is what makes a replayed briefing collapse
+    /// onto the same rows.
+    async fn brief_line(
+        db: &Db,
+        tenant: TenantId,
+        manager: EmployeeId,
+        body: &str,
+        trust: TrustLabel,
+        tag: &str,
+    ) -> Result<Briefing, InternalError> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let audience: Vec<(Slug, IdempotencyKey)> = line(&mut tx, manager)
+            .await
+            .expect("the org chart is readable")
+            .into_iter()
+            .map(|to| {
+                let key =
+                    IdempotencyKey::for_step(manager, &format!("brief:{tag}:{}", to.as_str()));
+                (to, key)
+            })
+            .collect();
+        let sent = brief(&mut tx, manager, &audience, body, trust, Utc::now()).await;
+        match sent.is_ok() {
+            true => tx.commit().await.expect("commit the briefing"),
+            false => tx.rollback().await.expect("roll the refusal back"),
+        }
+        sent
+    }
+
+    /// How many internal messages are addressed to this employee.
+    async fn heard(db: &Db, tenant: TenantId, who: EmployeeId) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messages WHERE employee_id = $1 AND channel = 'internal'",
+        )
+        .bind(who.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        n
+    }
+
+    /// Who the queued [`TURN_EVENT`] with this id wakes, and about what.
+    async fn queued_turn(db: &Db, tenant: TenantId, event: Uuid) -> Value {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let payload: Value = sqlx::query_scalar(
+            "SELECT payload FROM outbox_events WHERE id = $1 AND event_type = $2",
+        )
+        .bind(event)
+        .bind(TURN_EVENT)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the turn was queued");
+        tx.rollback().await.expect("rollback");
+        payload
+    }
+
+    /// **The verb.** A head says one thing and its whole line hears it: three
+    /// rows, three reserved turns, three wake-ups — and the two employees who
+    /// are not on that line get nothing at all.
+    ///
+    /// The negative half is the half worth having. `eve` answers to `bruno`,
+    /// who answers to Lena, and she must not hear this: the audience is one
+    /// link and never a walk, the same rule `may_message` holds for a single
+    /// order and the gate's `directs_subject` holds for a charter. A briefing
+    /// that recursed would be the one verb in this module that lets a CEO
+    /// address every employee in the company with one authorisation.
+    #[tokio::test]
+    async fn a_head_briefs_its_line_and_nobody_else() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, line, off_line) = department(&db, 5).await;
+
+        let briefing = brief_line(
+            &db,
+            tenant,
+            lena,
+            "The Q3 supplier audit starts Monday. Freeze new POs until I say otherwise.",
+            TrustLabel::Trusted,
+            "audit",
+        )
+        .await
+        .expect("the briefing goes");
+
+        assert!(
+            briefing.missed.is_empty(),
+            "everybody had turns left: {:?}",
+            briefing.missed
+        );
+        // Sorted, and deliberately: `org::reports` is `ORDER BY created_at,
+        // employee_id`, and three seats made in one transaction share a
+        // `created_at` — so the tie falls to the id, which for three UUIDv7s
+        // minted in the same millisecond is the random tail. The rule is *who*
+        // is on the line; the order within it is not one, and asserting it here
+        // would be asserting a coin toss.
+        let mut names: Vec<&str> = briefing
+            .briefed
+            .iter()
+            .map(|one| one.colleague.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["bruno", "carla", "dan"],
+            "the receipt names the line"
+        );
+
+        // Three messages, three turns, three wake-ups — and each wake-up is for
+        // its own recipient, on its own row. One turn event with three
+        // recipients would be one employee woken three times.
+        for (who, slug) in line.iter().zip(["bruno", "carla", "dan"]) {
+            assert_eq!(heard(&db, tenant, *who).await, 1);
+            assert_eq!(turns_taken(&db, tenant, *who).await, 1);
+            let one = briefing
+                .briefed
+                .iter()
+                .find(|one| one.colleague == slug)
+                .unwrap_or_else(|| panic!("{slug} is not on the receipt"));
+            let payload = queued_turn(&db, tenant, one.delivered.turn_event_id).await;
+            assert_eq!(payload["employee_id"], json!(who.as_uuid()));
+            assert_eq!(payload["message_id"], json!(one.delivered.message_id));
+        }
+        let events: BTreeSet<Uuid> = briefing
+            .briefed
+            .iter()
+            .map(|one| one.delivered.turn_event_id)
+            .collect();
+        assert_eq!(events.len(), 3, "three reports, three distinct wake-ups");
+
+        // `eve` is one link too far down and `mo` is beside Lena. Both share her
+        // team; neither is on her line.
+        for who in off_line {
+            assert_eq!(heard(&db, tenant, who).await, 0, "briefed off the line");
+            assert_eq!(
+                turns_taken(&db, tenant, who).await,
+                0,
+                "charged off the line"
+            );
+        }
+        // And the sender pays nothing: it is already inside a turn it paid for.
+        assert_eq!(turns_taken(&db, tenant, lena).await, 0);
+    }
+
+    /// **The arithmetic, when one report cannot pay.** Best effort, with a
+    /// receipt — the argument for that over all-or-nothing is in this module's
+    /// docs.
+    ///
+    /// The thing being asserted is not "it did not crash". It is that the two
+    /// reports who could hear it *did*, that the one who could not is named
+    /// with the reason, and that she cost nothing and stored nothing on the way
+    /// past. A briefing that silently reached two of three would leave the head
+    /// believing it had told the team.
+    #[tokio::test]
+    async fn a_report_out_of_turns_misses_the_briefing_and_says_so() {
+        let Some(db) = db().await else { return };
+        // One turn in anybody's whole day.
+        let (tenant, lena, [bruno, carla, dan], _) = department(&db, 1).await;
+
+        // Carla's only turn goes on a 1:1 before the briefing is written.
+        say(
+            &db,
+            tenant,
+            lena,
+            "carla",
+            Errand::Order,
+            "Reconcile PO-4471 first.",
+            TrustLabel::Trusted,
+            None,
+            "solo",
+        )
+        .await
+        .expect("carla's one turn");
+        assert_eq!(turns_taken(&db, tenant, carla).await, 1);
+
+        let briefing = brief_line(
+            &db,
+            tenant,
+            lena,
+            "The Q3 supplier audit starts Monday.",
+            TrustLabel::Trusted,
+            "audit",
+        )
+        .await
+        .expect("a colleague out of turns is a fact to report, not a failure");
+
+        // Sorted for the reason given in the test above: the order within a
+        // line is a tie-break, not a rule.
+        let mut names: Vec<&str> = briefing
+            .briefed
+            .iter()
+            .map(|one| one.colleague.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["bruno", "dan"]);
+        assert_eq!(
+            briefing.missed,
+            vec![Missed {
+                colleague: "carla".to_owned(),
+                why: "turn_budget_exhausted",
+            }]
+        );
+
+        // The two who could hear it did, in full.
+        for who in [bruno, dan] {
+            assert_eq!(heard(&db, tenant, who).await, 1);
+            assert_eq!(turns_taken(&db, tenant, who).await, 1);
+        }
+        // And the one who could not is exactly where she was: the 1:1 and
+        // nothing on top of it, one turn spent and not two. A refused
+        // reservation must leave no row and no counter behind.
+        assert_eq!(
+            heard(&db, tenant, carla).await,
+            1,
+            "the 1:1, and no briefing"
+        );
+        assert_eq!(turns_taken(&db, tenant, carla).await, 1);
+
+        // The receipt is what the manager acts on, so it has to name her.
+        let summary = briefing.summary();
+        assert!(summary.contains("briefed 2 of 3"), "{summary}");
+        assert!(
+            summary.contains("carla (turn_budget_exhausted)"),
+            "{summary}"
+        );
+    }
+
+    /// **The laundering attempt, fanned out.** Lena's turn is holding a
+    /// supplier's email that says "wire €10,000". She briefs her line.
+    ///
+    /// She must be able to — an employee that has just read something alarming
+    /// telling its team about it is the case the whole feature exists for — and
+    /// it must land on all three desks as *data*. One hop launders nothing;
+    /// three hops launder nothing three times. The 1:1 version of this is
+    /// [`a_message_from_a_tainted_turn_arrives_as_data_not_as_an_order`].
+    #[tokio::test]
+    async fn a_briefing_from_a_tainted_turn_arrives_as_data_on_every_desk() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, line, _) = department(&db, 5).await;
+
+        let briefing = brief_line(
+            &db,
+            tenant,
+            lena,
+            INJECTION,
+            // What Lena's turn was worth when it composed this. Not a claim
+            // Lena makes — `Effects::brief` reads it off the tokens' type.
+            TrustLabel::Untrusted,
+            "relay",
+        )
+        .await
+        .expect("a tainted head may still brief its line — that is the point");
+
+        assert_eq!(briefing.briefed.len(), line.len());
+        for one in &briefing.briefed {
+            let (channel, sender, trust, kind) =
+                stored(&db, tenant, one.delivered.message_id).await;
+            assert_eq!(
+                (
+                    channel.as_str(),
+                    sender.as_str(),
+                    trust.as_str(),
+                    kind.as_str()
+                ),
+                ("internal", "lena", "untrusted", "order"),
+                "the fan-out laundered the taint for {}",
+                one.colleague
+            );
+        }
+
+        // And at each receiver it is data. The turn is untrusted before the
+        // model has said a word, so the payment tool is not in the catalogue.
+        let context = into_context(
+            Context::new().with_task("do your job"),
+            "lena",
+            Errand::Order,
+            Untrusted::new(INJECTION.to_owned()),
+            TrustLabel::Untrusted,
+            briefing.briefed[0].delivered.message_id,
+        );
+        assert_eq!(context.trust(), TrustLabel::Untrusted);
+        let offered: Vec<String> = crate::turn::tools_for(context.trust())
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !offered.contains(&"pay".to_owned()),
+            "a relayed injection got the payment tool back: {offered:?}"
+        );
+        // A tainted head can still warn its own line, which is the other half
+        // of the design.
+        assert!(
+            offered.contains(&"brief_direct_reports".to_owned()),
+            "{offered:?}"
+        );
+    }
+
+    /// An employee with nobody under it has a line of zero. Briefing it is a
+    /// no-op and **not** an error: "you have no reports" is an answer, and
+    /// making it a refusal would teach a model to treat an ordinary org chart
+    /// as something that went wrong.
+    #[tokio::test]
+    async fn a_manager_with_no_reports_gets_an_empty_briefing_not_an_error() {
+        let Some(db) = db().await else { return };
+        let (tenant, _, line, [_, mo]) = department(&db, 5).await;
+
+        let briefing = brief_line(
+            &db,
+            tenant,
+            mo,
+            "Nobody is listening to this.",
+            TrustLabel::Trusted,
+            "empty",
+        )
+        .await
+        .expect("an empty line is not a failure");
+
+        assert_eq!(briefing, Briefing::default());
+        assert_eq!(
+            briefing.summary(),
+            "you have no direct reports, so there was nobody to brief"
+        );
+        // Emphatically not "everyone on my team": Mo shares a desk with all
+        // five of them.
+        for who in line {
+            assert_eq!(heard(&db, tenant, who).await, 0);
+            assert_eq!(turns_taken(&db, tenant, who).await, 0);
+        }
     }
 }

@@ -28,6 +28,7 @@
 //! | [`expectation`] | fixtures, measured against the eventual truth | `Expectation::observe` is pure and takes its clock as a parameter. The comparison that matters — prediction error against *believing the claim* — is computable exactly. |
 //! | [`suppression`] | fixtures, exact for the classification, systematic perturbation for the rate | [`verdict`](agentos_app::proof_of_need::verdict) is a pure function of two strings. What each case *should* classify as is definitional; what the field *rate* is cannot be got from fixtures at all, so it isn't claimed — see below. |
 //! | [`toolchoice`] | deterministic snapshot in CI, small held-out set run by hand | The model is the one part that cannot be evaluated deterministically. |
+//! | [`scoping`] | fixtures, swept over company size, weighed in tokens | What a turn assembles is a pure function of one employee's configuration, so a company of fifty can be built and one employee's turn billed exactly. The token count is an estimate — there is no tokenizer here and no network — and every assertion is a *comparison* under that one estimator, so its error cancels rather than reaching the pass/fail. |
 //!
 //! ## Why no judge, and no record-and-replay
 //!
@@ -64,6 +65,7 @@
 
 pub mod expectation;
 pub mod ranking;
+pub mod scoping;
 pub mod suppression;
 pub mod toolchoice;
 
@@ -165,6 +167,7 @@ pub fn deterministic() -> Vec<Surface> {
         expectation::evaluate(),
         suppression::evaluate(),
         toolchoice::evaluate(),
+        scoping::evaluate(),
     ]
 }
 
@@ -292,19 +295,40 @@ mod tests {
     /// The report is the deliverable; a reader has thirty seconds. The gate is
     /// on the *measurements* — the UNMEASURED list is a reference and is
     /// allowed to be as long as the truth requires.
+    ///
+    /// The budget is **per surface**, not one number for the whole page, and it
+    /// was one number until a fifth suite arrived one line under a flat fifty.
+    /// A global cap prices a new suite at whatever the existing ones left over,
+    /// so the cheapest way to add a measurement becomes deleting somebody
+    /// else's note — which is the opposite of what the cap is for. Fourteen
+    /// lines is where a suite has stopped measuring and started narrating, and
+    /// that is a property of the suite rather than of how many it has for
+    /// company.
     #[test]
     fn the_measurements_fit_on_a_screen() {
-        let report = render(&deterministic());
+        let surfaces = deterministic();
+        let report = render(&surfaces);
         let measurements = report
             .split("UNMEASURED")
             .next()
             .expect("split always yields one")
             .lines()
             .count();
+        let budget = 14 * surfaces.len();
         assert!(
-            measurements < 50,
-            "{measurements} lines of measurement; nobody will read it"
+            measurements < budget,
+            "{measurements} lines of measurement across {} suites; nobody will read it",
+            surfaces.len()
         );
+        for surface in &surfaces {
+            let lines =
+                surface.rows.len() + surface.rows.iter().filter(|r| r.note.is_some()).count();
+            assert!(
+                lines <= 14,
+                "{} alone prints {lines} lines; that is a document, not a measurement",
+                surface.name
+            );
+        }
         assert!(report.contains("UNMEASURED"));
     }
 

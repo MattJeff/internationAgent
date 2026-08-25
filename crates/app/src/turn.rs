@@ -95,7 +95,7 @@ use crate::effects::{
     PaymentInstruction, RenderedEmail,
 };
 use crate::gate::{Denied, PolicyGate, Principal};
-use crate::inbound::{Delivered, Errand, Thread};
+use crate::inbound::{Briefing, Delivered, Errand, Thread};
 use crate::prompt::{SystemPrompt, render_fenced};
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,7 @@ const SEND_EMAIL: &str = "send_email";
 const CALL_MCP_TOOL: &str = "call_mcp_tool";
 const PAY: &str = "pay";
 const MESSAGE_COLLEAGUE: &str = "message_colleague";
+const BRIEF_DIRECT_REPORTS: &str = "brief_direct_reports";
 
 /// Every tool an employee may be offered, with the blast radius of the effect
 /// behind it.
@@ -115,13 +116,36 @@ const MESSAGE_COLLEAGUE: &str = "message_colleague";
 /// actions along, so the schema the model sees and the ruling the gate makes
 /// cannot drift apart.
 ///
-/// ponytail: four tools, not fourteen. Email, one MCP call, a payment and the
+/// ponytail: five tools, not fourteen. Email, one MCP call, a payment and the
 /// internal channel cover the whole risk axis and both directions, which is
 /// what the loop is about. SMS, WhatsApp and the browser need a sender
 /// identity, a 24-hour window proof and a live `BrowserSession` respectively —
 /// none of which a turn is handed today. Add each one when the thing it needs
 /// exists, as one more row here and one more arm in [`Turn::perform`].
-fn catalogue() -> [(&'static str, Risk, &'static str, Value); 4] {
+///
+/// # Why [`BRIEF_DIRECT_REPORTS`] is the fifth and not a loop over the fourth
+///
+/// The bar for a new row here is that the model cannot already express the
+/// thing, and a briefing clears it for one reason: **the model does not know
+/// who its reports are.** [`MESSAGE_COLLEAGUE`] takes a slug, and the only
+/// things a turn is told about the company are its own identity line, its
+/// charter's briefing and the MCP inventory — nowhere in
+/// [`SystemPrompt`](crate::prompt::SystemPrompt) is there a reporting line. So
+/// "just call `message_colleague` five times" means five guesses at slugs, and
+/// a wrong guess returns `unreachable_colleague`, which `inbound::InternalError`
+/// deliberately makes indistinguishable from "not on your team" precisely so
+/// the org chart cannot be enumerated by asking. The alternative — an operator
+/// listing the reports in the charter's briefing — is a second copy of
+/// `team_memberships` maintained by hand, and therefore a copy that goes wrong
+/// the first time somebody is hired.
+///
+/// This tool reads the audience out of the org chart, server side, one link
+/// down. That is the whole of what it adds: the gate still rules once per
+/// report (see [`Effects::brief`](crate::effects::Effects::brief)), so a
+/// briefing buys the model no authority that five `message_colleague` calls
+/// would not have bought it — only the five addresses it could not have known
+/// and the four round trips it would have spent guessing.
+fn catalogue() -> [(&'static str, Risk, &'static str, Value); 5] {
     [
         (
             SEND_EMAIL,
@@ -203,6 +227,33 @@ fn catalogue() -> [(&'static str, Risk, &'static str, Value); 4] {
                     "body": { "type": "string", "description": "Plain text." }
                 },
                 "required": ["to", "kind", "body"]
+            }),
+        ),
+        (
+            BRIEF_DIRECT_REPORTS,
+            // Low, for the same reason `message_colleague` is, and the reason
+            // holds harder here: the turn that most needs to brief its line is
+            // the one that has just read something alarming from outside. What
+            // keeps it safe is that a tainted turn's briefing lands on every
+            // desk as data rather than as an order — one hop launders nothing,
+            // five hops launder nothing five times.
+            Risk::Low,
+            "Tell everyone who reports directly to you the same thing, once. \
+             The list is your reporting line as the company records it — you do \
+             not name them and you cannot reach anyone else with this, not the \
+             people who report to *them*. It wakes each of them and spends one \
+             of their turns for today, so use it for something the whole line \
+             needs and message one colleague when only one needs it. The result \
+             says who received it and who did not; a colleague who is out of \
+             turns did not hear you, so do not assume they know. If you have \
+             been reading anything from outside this company, what you write \
+             arrives as quoted material rather than as an instruction.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string", "description": "Plain text." }
+                },
+                "required": ["body"]
             }),
         ),
     ]
@@ -295,6 +346,17 @@ impl Context {
     /// What the whole context is worth, trust-wise.
     pub const fn trust(&self) -> TrustLabel {
         self.trust
+    }
+
+    /// What the model will be sent, in order. Read-only: assembly stays with
+    /// the `with_*` builders, which is where the taint is joined.
+    ///
+    /// It exists so a turn's context can be *weighed* from outside this crate —
+    /// `agentos_eval::scoping` bills one in tokens, and the alternative was a
+    /// second copy of `main.rs`'s recipe living in the eval crate, which is the
+    /// parallel model this workspace keeps refusing to build.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
     }
 }
 
@@ -484,6 +546,10 @@ enum Proposal {
     Tool(McpCall, Value),
     Pay(PaymentCreate, PaymentInstruction),
     Colleague(InternalSend, InternalNote),
+    /// No subject: the audience is the reporting line, which the org chart
+    /// supplies and the model is never asked for. That absence is the tool —
+    /// see [`catalogue`].
+    Brief(InternalNote),
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +583,16 @@ struct PayArgs {
 struct ColleagueArgs {
     to: String,
     kind: String,
+    body: String,
+}
+
+/// One field, and the two that are missing are the point. There is no `to` —
+/// the audience is the reporting line and a model that could name it could name
+/// somebody else's — and no `kind`, because a briefing is always an
+/// [`Errand::Order`]: it goes down the line, which is the one direction an
+/// order rides.
+#[derive(Debug, Deserialize)]
+struct BriefArgs {
     body: String,
 }
 
@@ -839,6 +915,16 @@ impl Turn {
                     },
                 ))
             }
+            BRIEF_DIRECT_REPORTS => {
+                let BriefArgs { body } = parse(input).map_err(|_| args("a briefing"))?;
+                Ok(Proposal::Brief(InternalNote {
+                    errand: Errand::Order,
+                    body,
+                    // A briefing is about nothing that came before it, and the
+                    // two errands that need a thread are not spellable here.
+                    thread: None,
+                }))
+            }
             // Including every high-risk tool that was filtered out of this
             // turn's schemas: a model that remembers a name from a trusted
             // turn gets nothing for it.
@@ -901,6 +987,72 @@ impl Turn {
                         }
                     ))
                 })
+            }
+            Proposal::Brief(note) => {
+                // The audience, read out of the org chart rather than out of
+                // the model. One link down: `inbound::line` is
+                // `store::org::reports`, which is `manager_of` read backwards,
+                // and a CEO's briefing therefore stops at its heads.
+                let line = match self.effects.line().await {
+                    Ok(line) => line,
+                    Err(EffectError::Unavailable(err)) => {
+                        return Err(TurnError::Unavailable(err));
+                    }
+                    Err(err) => return Ok(Reply::Error(format!("failed ({}): {err}", err.code()))),
+                };
+                // Not a refusal and not an error: an employee with nobody under
+                // it has a line of zero, and briefing it is a no-op. Answered
+                // here so the effect is never asked to explain an empty set.
+                if line.is_empty() {
+                    return Ok(Reply::Ok(Briefing::default().summary()));
+                }
+
+                // One ruling per report — the argument for that is on
+                // `Effects::brief`. Written twice for the same reason
+                // `gated!` is: `Authorized<InternalSend>` and
+                // `Authorized<Untrusted<InternalSend>>` are different types,
+                // and minting the whole line inside one branch is what makes a
+                // half-tainted briefing unspellable. A denial ends it rather
+                // than being collected, and that is not a shortcut: every
+                // ruling here is the same principal proposing the same
+                // `InternalSend` at the same instant, and the evaluator's arm
+                // for it reads only `allowed_channels` — so if one report is
+                // refused, all of them are, for the one reason worth telling
+                // the model once.
+                let briefed = match trust {
+                    TrustLabel::Trusted => {
+                        let mut tokens = Vec::with_capacity(line.len());
+                        for to in line {
+                            match self
+                                .gate
+                                .authorize(&self.principal, InternalSend { to })
+                                .await
+                            {
+                                Ok(ok) => tokens.push(ok),
+                                Err(denied) => return refusal(denied),
+                            }
+                        }
+                        self.effects.brief(tokens, &note).await
+                    }
+                    TrustLabel::Untrusted => {
+                        let mut tokens = Vec::with_capacity(line.len());
+                        for to in line {
+                            match self
+                                .gate
+                                .authorize(&self.principal, Untrusted::new(InternalSend { to }))
+                                .await
+                            {
+                                Ok(ok) => tokens.push(ok),
+                                Err(denied) => return refusal(denied),
+                            }
+                        }
+                        self.effects.brief(tokens, &note).await
+                    }
+                };
+                // Every name and every reason in this string is ours — see
+                // `Briefing::summary` — so a tainted briefing's receipt is
+                // still safe to hand back unfenced.
+                performed(briefed, |briefing: Briefing| Reply::Ok(briefing.summary()))
             }
         }
     }
@@ -1959,6 +2111,117 @@ mod tests {
             offered(&bruno_llm.requests(), 0).contains(&PAY.to_owned()),
             "an order from an untainted colleague must not cost the tools"
         );
+    }
+
+    /// A second report on the head's existing desk.
+    ///
+    /// [`colleague`] creates the team, so it can only be called once per
+    /// tenant; this joins the team that already exists, which is what a head
+    /// needs to have a *line* rather than a single subordinate.
+    async fn also_reporting(db: &Db, of: &Principal, slug: &str) -> Principal {
+        let employee = EmployeeId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(of.tenant_id.as_uuid())
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        .expect("insert the report");
+        tx.commit().await.expect("commit the report");
+
+        let mut tx = db.tenant_tx(of.tenant_id).await.expect("tenant tx");
+        let team = agentos_store::org::team_of(&mut tx, of.employee_id)
+            .await
+            .expect("read the head's seat")
+            .expect("the head is on a team");
+        agentos_store::org::set_member(&mut tx, employee, team, None)
+            .await
+            .expect("join the team");
+        agentos_store::org::set_position(&mut tx, employee, Some("Buyer"), Some(of.employee_id))
+            .await
+            .expect("seat the report under the head");
+        tx.commit().await.expect("commit the org chart");
+
+        Principal::employee(of.tenant_id, employee)
+    }
+
+    /// **The tool, end to end.** The model asks to brief its line and never
+    /// names anybody; the org chart supplies the audience and both reports wake
+    /// on it.
+    ///
+    /// This is the whole justification for the fifth catalogue entry in one
+    /// test: the arguments carry a `body` and nothing else, so a model that
+    /// does not know its reports — and nothing in
+    /// [`SystemPrompt`](crate::prompt::SystemPrompt) tells it — still reaches
+    /// all of them. The receipt it gets back names them, which is what makes a
+    /// partial delivery something the head can act on.
+    #[tokio::test]
+    async fn a_head_briefs_a_line_it_was_never_told_the_names_of() {
+        let Some(db) = db().await else { return };
+
+        let lena_llm = Arc::new(ScriptedLlm::responses(vec![
+            LlmResponse::tool_use(
+                "toolu_1",
+                BRIEF_DIRECT_REPORTS,
+                json!({ "body": "The Q3 supplier audit starts Monday. Freeze new POs." }),
+                Usage::new(100, 20, 0),
+            ),
+            done(),
+        ]));
+        let lena = harness(&db, lena_llm.clone(), "{}").await;
+        let bruno = colleague(&db, &lena.principal, "bruno").await;
+        let carla = also_reporting(&db, &lena.principal, "carla").await;
+
+        let finished = lena
+            .turn
+            .run(
+                Context::new().with_task("tell the desk about the audit"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the run completes");
+
+        // The model was offered the tool and its schema asks for no recipient.
+        let requests = lena_llm.requests();
+        let brief_schema = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == BRIEF_DIRECT_REPORTS)
+            .expect("the briefing tool was not offered");
+        assert_eq!(
+            brief_schema.input_schema["required"],
+            json!(["body"]),
+            "the model can name an audience: {}",
+            brief_schema.input_schema
+        );
+
+        // One tool call, two colleagues woken.
+        assert_eq!(finished.tool_calls, 1);
+        for who in [&bruno, &carla] {
+            let (_, trust, kind, body) = inbox(&db, who).await;
+            assert_eq!((trust.as_str(), kind.as_str()), ("trusted", "order"));
+            assert!(body.contains("Q3 supplier audit"), "{body}");
+        }
+
+        // And the receipt came back naming them, so the head knows who heard
+        // it. A briefing whose delivery is invisible is one it cannot act on.
+        let results = last_results(&finished);
+        let [
+            Content::ToolResult {
+                content, is_error, ..
+            },
+        ] = results.as_slice()
+        else {
+            panic!("expected one tool result, got {results:?}");
+        };
+        assert!(!is_error, "{content}");
+        assert!(content.contains("briefed 2 of 2"), "{content}");
+        assert!(content.contains("bruno"), "{content}");
+        assert!(content.contains("carla"), "{content}");
     }
 
     /// A colleague nobody may message is a failed tool call, in-band, with a

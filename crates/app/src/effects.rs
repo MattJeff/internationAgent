@@ -62,7 +62,7 @@ use chrono::Utc;
 use serde_json::{Map, Value, json};
 
 use crate::gate::{Authorizable, Authorized, Principal};
-use crate::inbound::{self, Delivered, Errand, InternalError, Thread};
+use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -686,6 +686,110 @@ impl Effects {
                     // Unreachable colleague, unanswerable question, somebody
                     // else's thread, a colleague out of turns. All four are the
                     // world saying no to something the policy allows.
+                    refused => EffectError::Refused(refused.code()),
+                })
+            }
+        }
+    }
+
+    /// Who this employee may brief: its direct reports, by short name.
+    ///
+    /// A read and not an effect — there is no token, because nothing happens.
+    /// It is here rather than on the turn because [`Effects`] is what holds the
+    /// database handle and the principal, and a turn that could open its own
+    /// transaction could read anything.
+    pub async fn line(&self) -> Result<Vec<Slug>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let line = inbound::line(&mut tx, self.principal.employee_id).await;
+        let _ = tx.rollback().await;
+        line.map_err(EffectError::Unavailable)
+    }
+
+    /// Brief the line: the same words to every direct report, in one
+    /// transaction.
+    ///
+    /// # One token per report, and why there is no `Action::InternalBrief`
+    ///
+    /// A briefing is not a new authority. It is N internal sends whose
+    /// *addresses* the org chart supplied instead of the model, so it is ruled
+    /// on as N internal sends — one [`Authorized`] per report, in `line` order,
+    /// each with its own decision, its own audit row naming its own colleague,
+    /// and its own [`IdempotencyKey`]. A briefing-shaped `Action` would have
+    /// been one ruling covering five recipients, and `domain::policy` would
+    /// have had nothing new to say about it: the evaluator's `InternalSend` arm
+    /// asks only whether the internal channel is allowed, and the arm for a
+    /// briefing would have been that same arm. A variant that adds no rule adds
+    /// a discriminant to `ActionKind::ALL`, a row to every role pack's
+    /// partition of the action space, and one more thing for the next reader to
+    /// tell apart from the one it duplicates.
+    ///
+    /// The keys falling out for free is the payoff, not a coincidence: the
+    /// `messages` table is unique on `(tenant_id, idempotency_key)`, so a
+    /// fan-out needs N distinct keys, and N decisions already give N.
+    ///
+    /// # Where the trust label comes from
+    ///
+    /// The same place as [`Effects::send_internal`]'s: the *type* of the token.
+    /// `Turn::perform` mints the whole line's tokens inside one branch of its
+    /// trust match, so `A` is `InternalSend` for every report or
+    /// `Untrusted<InternalSend>` for every report — a briefing cannot be half
+    /// tainted, and a tainted manager's briefing lands on all N desks as data.
+    ///
+    /// # No `record` call
+    ///
+    /// Deliberately, and it is the only effect here that skips it. Nothing is
+    /// missing: `PolicyGate::authorize` wrote one audit row per ruling, and
+    /// `inbound::send` writes one `MessageReceived` row per delivery *inside
+    /// the transaction that wrote the message*. [`Effects::record`] takes one
+    /// token and one outcome; calling it N times would mean N more rows saying
+    /// what those 2N already say, and calling it once would mean picking a
+    /// report to attribute the whole briefing to.
+    pub async fn brief<A: Subject<Of = InternalSend>>(
+        &self,
+        line: Vec<Authorized<A>>,
+        note: &InternalNote,
+    ) -> Result<Briefing, EffectError> {
+        let Some(first) = line.first() else {
+            return Ok(Briefing::default());
+        };
+        let trust = first.action().trust();
+        let audience: Vec<(Slug, IdempotencyKey)> = line
+            .iter()
+            .map(|ok| (ok.action().subject().to.clone(), self.key_for(ok)))
+            .collect();
+
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let briefed = inbound::brief(
+            &mut tx,
+            self.principal.employee_id,
+            &audience,
+            &note.body,
+            trust,
+            Utc::now(),
+        )
+        .await;
+
+        match briefed {
+            Ok(briefing) => {
+                tx.commit().await.map_err(EffectError::Unavailable)?;
+                Ok(briefing)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(match err {
+                    InternalError::Store(err) => EffectError::Unavailable(err),
+                    // Not reachable from `inbound::brief`, which puts every
+                    // per-recipient refusal in the receipt instead of returning
+                    // it. Mapped rather than asserted: a refusal that escaped
+                    // should surface as a coded tool result, not a panic.
                     refused => EffectError::Refused(refused.code()),
                 })
             }
