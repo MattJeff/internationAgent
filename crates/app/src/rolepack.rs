@@ -14,9 +14,11 @@
 //! 1. **Which [`ActionKind`]s it may even propose.** Upstream of the gate, not
 //!    instead of it: [`PolicyGate::authorize`](crate::gate::PolicyGate) is
 //!    still the only way to reach [`Effects`](crate::effects::Effects), and
-//!    [`may_propose`](RolePack::may_propose) exists so the model is never
-//!    offered a tool its role has no business asking for. Two independent
-//!    refusals, and the load-bearing one is the gate.
+//!    [`proposable`](RolePack::proposable) is the floor
+//!    [`turn::tools_for`](crate::turn::tools_for) filters the tool schemas
+//!    against — after the trust filter and never instead of it — so the model
+//!    is never offered a tool its role has no business asking for. Two
+//!    independent refusals, and the load-bearing one is the gate.
 //! 2. **Which MCP [`RiskClass`] it may reach.** A ceiling, compared with
 //!    [`Ord`], so "stricter" is not a comparison anyone has to get the right
 //!    way round.
@@ -340,13 +342,20 @@ impl RolePack {
         self.briefing
     }
 
-    /// A [`SystemPrompt`] carrying this role's briefing and nothing else.
+    /// A [`SystemPrompt`] carrying this role's briefing and this role's floor.
+    ///
+    /// The floor goes on here rather than at the call site because a pack
+    /// building its own prompt is the one place that cannot get the pairing
+    /// wrong: [`SystemPrompt::new`] alone is
+    /// [`UNCHARTERED`](crate::turn::UNCHARTERED) — the internal channel and
+    /// nothing else — so a caller that forgot would get an employee with this
+    /// role's words and no role's tools.
     ///
     /// Add the employee's credentials with
     /// [`SystemPrompt::with_credential`] — those are `SecretRef`s, constant
     /// for the life of the employee, so they sit inside the cached prefix too.
     pub fn system_prompt(&self) -> SystemPrompt {
-        SystemPrompt::new(self.briefing)
+        SystemPrompt::new(self.briefing).with_proposable(self.proposable.clone())
     }
 
     /// Every action kind this role may put on the table.

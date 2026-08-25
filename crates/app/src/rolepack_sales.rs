@@ -291,9 +291,15 @@ impl RolePack {
         self.briefing
     }
 
-    /// A [`SystemPrompt`] carrying this role's briefing and nothing else.
+    /// A [`SystemPrompt`] carrying this role's briefing and this role's floor.
+    ///
+    /// The floor goes on here rather than at the call site because a pack
+    /// building its own prompt is the one place that cannot get the pairing
+    /// wrong: [`SystemPrompt::new`] alone is `UNCHARTERED` — the internal
+    /// channel and nothing else — so a caller that forgot would get an employee
+    /// with this role's words and no role's tools.
     pub fn system_prompt(&self) -> SystemPrompt {
-        SystemPrompt::new(self.briefing)
+        SystemPrompt::new(self.briefing).with_proposable(self.proposable.clone())
     }
 
     /// Every action kind this role may put on the table.

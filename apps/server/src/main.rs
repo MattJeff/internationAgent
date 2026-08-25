@@ -902,10 +902,16 @@ impl Agent {
                 .map_err(|err| format!("could not load the employee: {err}"))?
                 .employee;
 
-            // What this employee was hired to do, if anybody said. `None` is an
-            // employee that answers its mail and has no standing objective,
-            // which is every employee this handler had before the charter
-            // existed — so the fallback below is exactly the old behaviour.
+            // What this employee was hired to do, if anybody said. `None` used
+            // to be "answers its mail, has no standing objective"; it is now
+            // narrower than that, and deliberately. The tool schemas come off
+            // the role pack, so an employee with no charter falls back to
+            // `turn::UNCHARTERED` — the internal channel and nothing else. It
+            // can tell a colleague it has been woken with no idea what its job
+            // is; it cannot answer the stranger who woke it. Fail closed: a role
+            // nobody wrote down is not a licence to write to counterparties in
+            // the company's name, and if it were, omitting the charter row would
+            // be how you opt out of the whole filter.
             let charter = Charter::load(tx, employee_id)
                 .await
                 .map_err(|err| format!("could not load the employee's charter: {err}"))?;
@@ -2252,6 +2258,35 @@ mod tests {
         employee_store::insert(&mut tx, &employee)
             .await
             .expect("insert employee");
+
+        // Lena is a buyer, and she is chartered as one here because the tool
+        // schemas now come off the pack: an employee with no charter is offered
+        // `UNCHARTERED` — the internal channel and nothing else — which would
+        // make `an_injected_instruction_is_denied_and_no_effect_runs` pass
+        // without the taint wire doing any of the work. Chartered, she may
+        // propose a payment, and the only thing that takes `pay` off the request
+        // is the supplier's email in her context.
+        agentos_app::vertical::Charter::Purchasing {
+            pack: agentos_app::rolepack::RolePack::international_buyer(),
+            objective: agentos_app::rolepack::Objective {
+                what: "M6x20 A2-70 stainless hex bolts".to_owned(),
+                quantity: 50_000,
+                max_unit_price: Some(
+                    agentos_domain::money::Money::from_major_str(
+                        "0.21",
+                        agentos_domain::money::Currency::Eur,
+                    )
+                    .expect("a price"),
+                ),
+                delivery_country: Some(
+                    agentos_app::rolepack::CountryCode::parse("de").expect("a country"),
+                ),
+                requirements: vec!["A2-70 stainless".to_owned()],
+            },
+        }
+        .save(&mut tx, employee_id, now)
+        .await
+        .expect("charter the employee");
 
         let provider_message_id = ProviderRef::new(format!("email_{}", Uuid::now_v7().simple()));
         let conversation = agentos_app::inbound::conversation_for(

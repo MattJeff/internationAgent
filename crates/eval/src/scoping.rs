@@ -19,9 +19,11 @@
 //! and it is a function of your team rather than of the payroll.
 //!
 //! Everything else is flat by construction and would be flat at any company
-//! size: the tool catalogue is four entries no matter how many MCP servers a
-//! tenant binds, and the prefix is the employee's own identity in front of a
-//! `&'static str` briefing shared by everyone wearing the role.
+//! size: the tool catalogue is five entries no matter how many MCP servers a
+//! tenant binds — fewer once the employee's role floor has narrowed it, which
+//! is a function of the job and not of the payroll either — and the prefix is
+//! the employee's own identity in front of a `&'static str` briefing shared by
+//! everyone wearing the role.
 //!
 //! So the cost premise, taken literally, is **false**: scoping the corpus saves
 //! nothing worth measuring whenever the employee's own scope holds five or more
@@ -69,11 +71,13 @@
 //! stated error bound; every property asserted is a comparison between two
 //! contexts weighed by the same estimator, where that error cancels.
 
+use std::collections::BTreeSet;
+
 use agentos_app::knowledge::RECALL_LIMIT;
 use agentos_app::rolepack::{CountryCode, Objective, RolePack};
 use agentos_app::turn::{Context, tools_for};
 use agentos_app::vertical::Charter;
-use agentos_domain::action::{McpTool, Risk};
+use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
@@ -455,6 +459,16 @@ const MAX_TOKENS: u32 = 4_096;
 const IDENTITY: &str =
     "You are lena, an AI employee at fabrikam.example. You answer from lena@fabrikam.example.";
 
+/// The floor the weighed employee actually carries: a buyer's `proposable` set.
+///
+/// `tools_for` narrows by trust *and* by the employee's role pack, so a caller
+/// has to say whose schemas it is measuring. It is the buyer's here because
+/// `assemble` builds a `Charter::Purchasing` — measuring some other pack's
+/// schemas against that request would be measuring two employees.
+fn floor() -> BTreeSet<ActionKind> {
+    RolePack::international_buyer().proposable().clone()
+}
+
 /// The employee being weighed: a fully specified objective, so the plan is the
 /// six-stage one rather than the one-line "go and ask".
 fn buyer() -> Charter {
@@ -588,21 +602,22 @@ pub fn evaluate() -> Surface {
 
     // --- 4. what taint filtering costs ---------------------------------------
     let schema = |trust| -> usize {
-        tools_for(trust)
+        tools_for(trust, &floor())
             .iter()
             .map(|tool| tokens(&serde_json::to_string(tool).unwrap_or_default()))
             .sum()
     };
     let (trusted, untrusted) = (schema(TrustLabel::Trusted), schema(TrustLabel::Untrusted));
     let narrower = untrusted < trusted
-        && tools_for(TrustLabel::Untrusted).len() < tools_for(TrustLabel::Trusted).len();
+        && tools_for(TrustLabel::Untrusted, &floor()).len()
+            < tools_for(TrustLabel::Trusted, &floor()).len();
     rows.push(
         Row::ok(
             "an untrusted turn is offered less schema",
             format!(
                 "{untrusted} vs {trusted} tok ({} tools vs {})",
-                tools_for(TrustLabel::Untrusted).len(),
-                tools_for(TrustLabel::Trusted).len(),
+                tools_for(TrustLabel::Untrusted, &floor()).len(),
+                tools_for(TrustLabel::Trusted, &floor()).len(),
             ),
             Truth::Correct,
         )
@@ -679,7 +694,8 @@ mod tests {
     /// misreport the whole content-aware rule exists to avoid.
     #[test]
     fn json_costs_more_per_character_than_prose_does() {
-        let schemas = serde_json::to_string(&tools_for(TrustLabel::Trusted)).expect("json");
+        let schemas =
+            serde_json::to_string(&tools_for(TrustLabel::Trusted, &floor())).expect("json");
         let json = schemas.chars().count() as f64 / tokens(&schemas) as f64;
         let prose = passage(0, 0).chars().count() as f64 / tokens(&passage(0, 0)) as f64;
         assert!(json < prose, "{json:.2} vs {prose:.2} chars/token");
@@ -797,12 +813,15 @@ mod tests {
     #[test]
     fn an_untrusted_turn_is_offered_strictly_fewer_tools_and_fewer_tokens() {
         let schema = |trust| -> usize {
-            tools_for(trust)
+            tools_for(trust, &floor())
                 .iter()
                 .map(|tool| tokens(&serde_json::to_string(tool).expect("json")))
                 .sum()
         };
-        assert!(tools_for(TrustLabel::Untrusted).len() < tools_for(TrustLabel::Trusted).len());
+        assert!(
+            tools_for(TrustLabel::Untrusted, &floor()).len()
+                < tools_for(TrustLabel::Trusted, &floor()).len()
+        );
         assert!(schema(TrustLabel::Untrusted) < schema(TrustLabel::Trusted));
     }
 
@@ -822,7 +841,10 @@ mod tests {
     #[test]
     fn the_assembled_turn_is_untrusted_the_way_a_real_one_is() {
         let request = assemble(Company { employees: 10 }, Reach::Team, Inventory::AsShipped);
-        assert_eq!(request.tools.len(), tools_for(TrustLabel::Untrusted).len());
+        assert_eq!(
+            request.tools.len(),
+            tools_for(TrustLabel::Untrusted, &floor()).len()
+        );
         assert!(!request.tools.iter().any(|tool| tool.name == "pay"));
     }
 }

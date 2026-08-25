@@ -69,12 +69,14 @@
 //! once per run — taint only ever goes up. So an employee has two possible
 //! prefixes, not one per turn, and the tool schemas already split the same way.
 
-use agentos_domain::action::{McpTool, Risk};
+use std::collections::BTreeSet;
+
+use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::SecretRef;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{LlmRequest, Message};
 
-use crate::turn::{tools_for, visible};
+use crate::turn::{UNCHARTERED, tools_for, visible};
 
 /// The frame marker. Both the opening and the closing line contain it
 /// verbatim, and [`defuse`] removes it from anything untrusted, so no payload
@@ -214,6 +216,19 @@ pub struct SystemPrompt {
     /// into bytes and it does not otherwise need to know what an MCP tool is.
     /// The [`Risk`] stays typed, because it is what the filter runs on.
     mcp: Vec<(String, Risk)>,
+    /// What this employee's role pack says it may propose — the floor
+    /// [`Self::request`] hands to [`tools_for`].
+    ///
+    /// It lives here rather than being an argument to `request` for the same
+    /// reason `trust` is the *only* argument that is: a caller with two knobs
+    /// can turn them independently, and this one is not a property of the turn.
+    /// It is a property of the employee, fixed the moment its charter was read,
+    /// so it belongs beside the briefing that came out of the same pack.
+    ///
+    /// Not rendered. It changes which schemas go out, never a byte of the
+    /// prefix, so two employees of different roles still share every cached
+    /// token their briefings share.
+    floor: BTreeSet<ActionKind>,
 }
 
 impl SystemPrompt {
@@ -222,12 +237,40 @@ impl SystemPrompt {
     /// Operator-written and therefore trusted. If this string is ever built
     /// from inbound content, the injection defence is over — take that path
     /// through [`render_fenced`] instead.
+    ///
+    /// The floor starts at [`UNCHARTERED`] — the internal channel and nothing
+    /// else — and [`Self::with_proposable`] is how a role widens it. Deny by
+    /// default, in the constructor, because the alternative is a prompt built
+    /// without a pack quietly being the most capable prompt in the company.
     pub fn new(briefing: impl Into<String>) -> Self {
         Self {
             briefing: briefing.into(),
             credentials: Vec::new(),
             mcp: Vec::new(),
+            floor: UNCHARTERED.into_iter().collect(),
         }
+    }
+
+    /// The role pack's floor: every [`ActionKind`] this employee may put on the
+    /// table.
+    ///
+    /// A set and not a pack. `rolepack::RolePack` and
+    /// `rolepack_service::RolePack` are separate types with the same-named
+    /// methods, and the only thing a trait over them would buy is calling
+    /// `.proposable()` in here instead of at the one call site that has a pack
+    /// in hand — [`Charter::system_prompt`](crate::vertical::Charter::system_prompt),
+    /// which already matches on the role to pick a briefing. One `match`, not a
+    /// trait with two impls whose whole body is a field read.
+    ///
+    /// It **replaces** the floor rather than adding to it, so a pack that omits
+    /// `InternalSend` loses `message_colleague` here and finds out. Unioning
+    /// [`UNCHARTERED`] in would make every pack look like it granted the
+    /// internal channel whether or not it did, which is the bug
+    /// `rolepack::tests::every_role_can_reach_a_colleague` exists to catch.
+    #[must_use]
+    pub fn with_proposable(mut self, kinds: impl IntoIterator<Item = ActionKind>) -> Self {
+        self.floor = kinds.into_iter().collect();
+        self
     }
 
     /// Tell the model that one MCP tool exists.
@@ -332,6 +375,11 @@ impl SystemPrompt {
     /// a caller cannot hand one a label and the other a different one. A tool
     /// named in the prefix but filtered out of the schemas — or the reverse —
     /// is not expressible from here.
+    ///
+    /// The role floor is not a knob either, for the same reason: it is read off
+    /// this value, so the schemas a turn is offered are the ones its employee's
+    /// pack allows and there is no argument position in which to pass somebody
+    /// else's.
     pub fn request(
         &self,
         model: &str,
@@ -342,7 +390,8 @@ impl SystemPrompt {
         history
             .into_iter()
             .fold(
-                LlmRequest::new(model, self.render(trust), max_tokens).with_tools(tools_for(trust)),
+                LlmRequest::new(model, self.render(trust), max_tokens)
+                    .with_tools(tools_for(trust, &self.floor)),
                 LlmRequest::with_message,
             )
             .cache_here()
@@ -613,11 +662,20 @@ Kind regards, Accounts Payable";
         )
     }
 
+    /// A buyer's floor, because the assertions below are about the taint filter
+    /// and a bare prompt is `UNCHARTERED` — which would remove `pay` for the
+    /// wrong reason and make the trusted half of the claim untestable.
     fn erp() -> SystemPrompt {
-        SystemPrompt::new("You are Lena.").with_mcp_tools([
-            (tool("drop-table"), Risk::High),
-            (tool("lookup"), Risk::Low),
-        ])
+        SystemPrompt::new("You are Lena.")
+            .with_proposable(
+                crate::rolepack::RolePack::international_buyer()
+                    .proposable()
+                    .clone(),
+            )
+            .with_mcp_tools([
+                (tool("drop-table"), Risk::High),
+                (tool("lookup"), Risk::Low),
+            ])
     }
 
     /// **The claim this unit exists for.** An untrusted turn is not told that

@@ -932,14 +932,20 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     //     schemas at all. A model that names it anyway reaches the gate as
     //     `Untrusted<PaymentCreate>` and is refused there — defence in depth,
     //     and this asserts both halves.
+    //
+    //     Asked with a buyer's floor, because that is what this employee is:
+    //     `tools_for` narrows by trust and then by the role pack's `proposable`
+    //     set, and a floor that omitted `PaymentCreate` would make the second
+    //     assertion pass without the taint wire doing anything.
+    let floor = RolePack::international_buyer().proposable().clone();
     assert!(
-        tools_for(TrustLabel::Trusted)
+        tools_for(TrustLabel::Trusted, &floor)
             .iter()
             .any(|t| t.name == "pay"),
-        "the payment tool exists at all"
+        "the payment tool exists at all, and a buyer may propose one"
     );
     assert!(
-        !tools_for(TrustLabel::Untrusted)
+        !tools_for(TrustLabel::Untrusted, &floor)
             .iter()
             .any(|t| t.name == "pay"),
         "a turn that has read a supplier's email must not be offered the payment tool"

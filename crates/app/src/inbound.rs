@@ -3344,10 +3344,16 @@ mod tests {
             delivered.message_id,
         );
         assert_eq!(context.trust(), TrustLabel::Untrusted);
-        let offered: Vec<String> = crate::turn::tools_for(context.trust())
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+        // A buyer's floor: the one pack whose `proposable` set covers every
+        // kind the catalogue names, so what is missing below is missing because
+        // of the taint wire and not because of a role.
+        let offered: Vec<String> = crate::turn::tools_for(
+            context.trust(),
+            crate::rolepack::RolePack::international_buyer().proposable(),
+        )
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
         assert!(
             !offered.contains(&"pay".to_owned()),
             "a relayed injection got the payment tool back: {offered:?}"
@@ -4106,10 +4112,16 @@ mod tests {
             briefing.briefed[0].delivered.message_id,
         );
         assert_eq!(context.trust(), TrustLabel::Untrusted);
-        let offered: Vec<String> = crate::turn::tools_for(context.trust())
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+        // A buyer's floor: the one pack whose `proposable` set covers every
+        // kind the catalogue names, so what is missing below is missing because
+        // of the taint wire and not because of a role.
+        let offered: Vec<String> = crate::turn::tools_for(
+            context.trust(),
+            crate::rolepack::RolePack::international_buyer().proposable(),
+        )
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
         assert!(
             !offered.contains(&"pay".to_owned()),
             "a relayed injection got the payment tool back: {offered:?}"

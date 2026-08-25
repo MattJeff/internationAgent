@@ -45,25 +45,33 @@
 //! the approval threshold at one dollar, which is this layer's way of spelling
 //! *every payment*. The argument is on [`RolePack::finance`].
 //!
-//! # Where `proposable` is read, honestly
+//! # Where `proposable` is read
 //!
-//! [`crate::rolepack`] describes it as the floor below which the gate is never
-//! asked, and today that is true at exactly two call sites — `vertical::purchase`
-//! and `vertical::sell`, each checking [`ActionKind::EmailSend`] before it picks
-//! a recipient. `turn::catalogue` is **not** pack-aware: every employee is
-//! offered the same four tool schemas whatever it wears, so a customer success
-//! employee is still shown `pay` and refused by the gate rather than never
-//! offered it.
+//! Everywhere it said it was, now. It is the floor below which the gate is
+//! never asked at two call sites — `vertical::purchase` and `vertical::sell`,
+//! each checking [`ActionKind::EmailSend`] before it picks a recipient — and,
+//! since this note was written as a description of a gap, in
+//! [`turn::tools_for`](crate::turn::tools_for): every entry in
+//! `turn::catalogue` carries the [`ActionKind`] the gate will rule on, and
+//! [`Charter::system_prompt`](crate::vertical::Charter::system_prompt) hands
+//! this set to [`SystemPrompt::request`](crate::prompt::SystemPrompt::request)
+//! as the floor. A customer success employee is no longer shown `pay` and
+//! refused; the schema is not in the request.
 //!
-//! That is a gap in the runtime and not in these packs, and it is written down
-//! here rather than papered over: the fix is one `ActionKind` per entry in
-//! `turn::catalogue` and a floor threaded through
-//! [`SystemPrompt::request`](crate::prompt::SystemPrompt::request), which also
-//! means adding `InternalSend` to the two older packs — they omit it, so
-//! filtering on their sets as they stand would take `message_colleague` away
-//! from every buyer in the company. Until then the second refusal is the
-//! policy layer, which is why every exclusion below is argued at both levels
-//! and why `spend: None` appears under two of the three.
+//! The fix landed as described except for one line of it: the two older packs
+//! were said to omit `InternalSend`, so that filtering on their sets would take
+//! `message_colleague` away from every buyer in the company. They no longer do
+//! — the wave that made the internal channel reachable added it to both, and
+//! `rolepack::tests::every_role_can_reach_a_colleague` holds them there. So the
+//! floor took nothing from anybody, and
+//! `every_pack_is_offered_its_own_tools_and_never_another_pack_s` is where that
+//! is checked for all five rather than argued for any.
+//!
+//! None of which retires the second refusal: the policy layer still refuses the
+//! same things independently, which is why every exclusion below is argued at
+//! both levels and why `spend: None` appears under two of the three. A floor is
+//! a filter on what is offered, and a filter is not a control on its own —
+//! a model that names a tool it was never shown still reaches the gate.
 //!
 //! **All three may talk to a colleague.** [`ActionKind::InternalSend`] is on
 //! every list here, because "hand it to a human" is the sentence all three
@@ -666,9 +674,15 @@ impl RolePack {
         self.briefing
     }
 
-    /// A [`SystemPrompt`] carrying this role's briefing and nothing else.
+    /// A [`SystemPrompt`] carrying this role's briefing and this role's floor.
+    ///
+    /// The floor goes on here rather than at the call site because a pack
+    /// building its own prompt is the one place that cannot get the pairing
+    /// wrong: [`SystemPrompt::new`] alone is `UNCHARTERED` — the internal
+    /// channel and nothing else — so a caller that forgot would get an employee
+    /// with this role's words and no role's tools.
     pub fn system_prompt(&self) -> SystemPrompt {
-        SystemPrompt::new(self.briefing)
+        SystemPrompt::new(self.briefing).with_proposable(self.proposable.clone())
     }
 
     /// Every action kind this role may put on the table.
@@ -1522,6 +1536,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **What each pack is actually offered**, which is the claim the module
+    /// docs above used to have to make in prose.
+    ///
+    /// `turn::catalogue` is pack-aware now, so `proposable` is read where it
+    /// said it was read: a customer success employee is *never shown* `pay`
+    /// rather than being shown it and refused by the gate. This is the table
+    /// over all five packs and both trust labels, in one place, for the same
+    /// reason `no_pack_proposes_a_high_risk_action_it_has_no_business_with` is:
+    /// a claim about the workspace has to be checked against the workspace.
+    ///
+    /// Names, not counts. A count passes a catalogue in which `pay` was swapped
+    /// for another high-risk tool, which is the failure worth catching.
+    #[test]
+    fn every_pack_is_offered_its_own_tools_and_never_another_pack_s() {
+        // Read: (role, trusted, untrusted). The untrusted column is the trusted
+        // one minus every high-risk schema — which is only ever `pay` today, so
+        // the two columns differ for exactly the two packs that may propose a
+        // payment.
+        let table: &[(&str, &[&str], &[&str])] = &[
+            (
+                "international-buyer",
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "pay",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+            ),
+            // Sales sells; it does not settle. No `pay` at either label.
+            (
+                "sales-development",
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+            ),
+            // The one this filter was built for: a refund is what this role is
+            // asked for most often, and the schema is not in the request.
+            (
+                "customer-success",
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+            ),
+            // Growth has no `EmailSend` at all — content distribution over email
+            // is a mailshot and belongs to whoever owns outbound — so it is the
+            // pack that proves the floor filters something other than `pay`.
+            (
+                "growth",
+                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
+                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
+            ),
+            (
+                "finance",
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "pay",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "send_email",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+            ),
+        ];
+
+        let mut seen = 0;
+        for (name, proposable) in every_pack() {
+            let (_, trusted, untrusted) = table
+                .iter()
+                .find(|(role, _, _)| *role == name)
+                .unwrap_or_else(|| panic!("{name} is a pack with no row in this table"));
+
+            for (trust, want) in [
+                (TrustLabel::Trusted, trusted),
+                (TrustLabel::Untrusted, untrusted),
+            ] {
+                let offered: Vec<String> = crate::turn::tools_for(trust, &proposable)
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect();
+                assert_eq!(offered, *want, "{name} at {trust:?}");
+
+                // Stated separately from the table because it is a different
+                // claim: whatever else a role may or may not do, it can always
+                // reach a colleague — including, and especially, on the turn
+                // that has just read something hostile. A row edited to drop
+                // these would still look tidy; this line would not let it pass.
+                for internal in ["message_colleague", "brief_direct_reports"] {
+                    assert!(
+                        offered.iter().any(|tool| tool == internal),
+                        "{name} at {trust:?} cannot reach a colleague: {offered:?}"
+                    );
+                }
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, table.len(), "a pack was added without a row");
     }
 
     // -- customer success --------------------------------------------------

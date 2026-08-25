@@ -264,8 +264,31 @@ impl Charter {
     /// our own configuration. It goes *before* the briefing so that the briefing,
     /// which is byte-identical for every employee wearing the role, sits at the
     /// end of the prefix where the cache breakpoint is.
+    ///
+    /// # This is where the pack's floor reaches the schemas
+    ///
+    /// The `match` below is the join over the two `RolePack` types, and it is
+    /// the same match [`Charter::briefing`] already does — the charter is the
+    /// only value in the workspace that knows which of the five roles an
+    /// employee holds, so it is the only place that can answer "what may this
+    /// employee propose" without a trait existing purely to be asked. What
+    /// crosses into [`SystemPrompt`] is the set, not the pack: `proposable` is
+    /// every field of a pack the tool catalogue has any use for.
+    ///
+    /// A charter that fails to load never gets here, and the employee is left on
+    /// [`UNCHARTERED`](crate::turn::UNCHARTERED) — the internal channel alone.
+    /// That is deliberate and is argued there.
     pub fn system_prompt(&self, identity: &str) -> SystemPrompt {
-        SystemPrompt::new(format!("{identity}\n\n{}", self.briefing()))
+        let proposable = match self {
+            Charter::Purchasing { pack, .. } => pack.proposable().clone(),
+            Charter::Sales { pack, .. } => pack.proposable().clone(),
+            Charter::Support { .. } => rolepack_service::RolePack::customer_success()
+                .proposable()
+                .clone(),
+            Charter::Growth { .. } => rolepack_service::RolePack::growth().proposable().clone(),
+            Charter::Finance { .. } => rolepack_service::RolePack::finance().proposable().clone(),
+        };
+        SystemPrompt::new(format!("{identity}\n\n{}", self.briefing())).with_proposable(proposable)
     }
 
     /// The plan, rendered as the turn's task.
@@ -2052,6 +2075,76 @@ mod tests {
             .expect("load");
         tx.commit().await.expect("commit");
         assert!(none.is_none());
+    }
+
+    /// **The production wire, end to end and without a Postgres.** A charter is
+    /// the only thing that knows which of the five roles an employee holds, so
+    /// it is the only thing that can put a floor on the request — and this is
+    /// the assertion that it does, rather than that it could.
+    ///
+    /// Asserted on `request.tools`, because "the model was never shown `pay`" is
+    /// a property of the bytes that go out. A `may_propose` check next to it
+    /// would be a claim about the pack, which was already true while the model
+    /// was being handed the payment schema anyway.
+    #[test]
+    fn a_charter_puts_its_packs_floor_on_the_request() {
+        let offered = |charter: &Charter| -> Vec<String> {
+            charter
+                .system_prompt("You are lena, an AI employee at fabrikam.example.")
+                .request(
+                    "claude-opus-5",
+                    1024,
+                    agentos_domain::untrusted::TrustLabel::Trusted,
+                    Vec::new(),
+                )
+                .tools
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        };
+
+        for charter in every_charter() {
+            let tools = offered(&charter);
+            let role = charter.role();
+
+            // The two that end in a purchase order and a payment run see `pay`;
+            // the three that do not, do not — and support is the one that is
+            // *asked* for money, by the customer, in an untrusted ticket.
+            let may_pay = matches!(role, "international-buyer" | "finance");
+            assert_eq!(
+                tools.contains(&"pay".to_owned()),
+                may_pay,
+                "{role} was offered: {tools:?}"
+            );
+
+            // And whatever else it holds, it can reach a colleague — the
+            // handover every one of these briefings ends on.
+            assert!(
+                tools.iter().any(|tool| tool == "message_colleague"),
+                "{role} cannot escalate: {tools:?}"
+            );
+        }
+
+        // An employee with no charter never reaches `system_prompt` at all:
+        // `main.rs` falls back to a bare `SystemPrompt`, which is `UNCHARTERED`
+        // — the internal channel and nothing else. Fail closed, and still able
+        // to say that it has been woken with no idea what its job is.
+        let bare = SystemPrompt::new("You are lena.").request(
+            "claude-opus-5",
+            1024,
+            agentos_domain::untrusted::TrustLabel::Trusted,
+            Vec::new(),
+        );
+        assert_eq!(
+            bare.tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "message_colleague".to_owned(),
+                "brief_direct_reports".to_owned()
+            ]
+        );
     }
 
     /// **The name table, checked without a Postgres.** Every pack in the

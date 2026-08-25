@@ -1111,8 +1111,17 @@ mod tests {
     }
 
     /// Whether a turn at this trust level is offered the payment tool.
+    ///
+    /// Asked with a buyer's floor, the one pack whose `proposable` set covers
+    /// every kind the catalogue names — so a `false` here is the retrieved
+    /// passage's taint talking and never a role's.
     fn may_pay(trust: TrustLabel) -> bool {
-        tools_for(trust).iter().any(|tool| tool.name == PAY)
+        tools_for(
+            trust,
+            crate::rolepack::RolePack::international_buyer().proposable(),
+        )
+        .iter()
+        .any(|tool| tool.name == PAY)
     }
 
     /// Chunking is the part that runs on every document and has no database, so
