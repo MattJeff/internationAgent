@@ -72,8 +72,13 @@ pub fn router(db: Db) -> Router {
 
 /// One employee's consumption over the window, or the tenant's total, with the
 /// two derived figures spelled out beside the counts they come from.
+///
+/// `pub(super)` so [`super::reports`] renders a report's tokens with this rather
+/// than a copy. "What did it burn" is one fact and it has one JSON shape; two
+/// structs would eventually disagree about whether `complete` is in it, and
+/// `complete` is the field that stops somebody quoting a floor as a total.
 #[derive(Debug, Serialize)]
-struct Rollup {
+pub(super) struct Rollup {
     #[serde(flatten)]
     consumed: Consumed,
     /// Every token anybody reported. A **floor** when `complete` is false.

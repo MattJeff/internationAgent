@@ -245,6 +245,101 @@ pub async fn load(
         .map_err(|source| PolicyLoadError::Irreconcilable { source })
 }
 
+/// The intersected `max_turns_per_day` of **many** employees, in one statement.
+///
+/// [`load`] is per employee and returns the whole policy; a view that lists a
+/// manager's line would call it once per report, which is the N+1 that makes a
+/// dashboard slower every time somebody is hired. This answers the one cap such
+/// a view needs, for the whole set, in a single round trip. It lives here rather
+/// than in the caller because the layer predicate below is [`SELECT_ACTIVE_LAYERS`]
+/// with the role sub-select flattened into a join — two spellings of one rule,
+/// and they belong in one file where a reader can see both at once.
+///
+/// **`min` really is the intersection, for this column.**
+/// [`EffectivePolicy::try_new`] takes the minimum of every cap, and an absent
+/// layer inherits the layer above — which is already in the minimum, because
+/// intersecting a layer with itself is a no-op. So the minimum over the rows
+/// that exist equals the minimum over the four layers after inheritance. That
+/// identity holds for a scalar cap and for nothing else: an allowlist is an
+/// intersection of sets and a spend limit carries a currency, neither of which
+/// `min()` can express. Add a column here only if it is one more number where
+/// smaller means stricter.
+///
+/// **It does not validate.** [`load`] refuses a policy whose layers contradict
+/// each other or name two currencies; this returns a number for an employee
+/// whose policy `load` would reject, and the gate would then refuse to run that
+/// employee at all. A reader is therefore a *ceiling*, never a licence — which
+/// is exactly what an operator's view of a turn budget is.
+///
+/// An employee with no row in the answer has no layer that applies to it, which
+/// in practice means the deployment has no platform ceiling: [`load`] calls that
+/// [`PolicyLoadError::NoPlatformLayer`] and refuses everything, so the honest
+/// rendering of a missing row is zero turns, not unlimited. The caller decides,
+/// because the caller is the one with a place to say so.
+pub async fn max_turns_per_day(
+    tx: &mut TenantTx<'_>,
+    employees: &[EmployeeId],
+) -> Result<Vec<(EmployeeId, u32)>, StoreError> {
+    let ids: Vec<Uuid> = employees.iter().map(|id| id.as_uuid()).collect();
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT r.employee_id, min(l.max_turns_per_day) AS max_turns_per_day \
+           FROM unnest($2::uuid[]) AS r(employee_id) \
+           LEFT JOIN team_memberships m \
+             ON m.tenant_id = $1 AND m.employee_id = r.employee_id \
+           LEFT JOIN team_policy tp \
+             ON tp.tenant_id = m.tenant_id AND tp.team_id = m.team_id \
+           JOIN policy_versions v ON v.active \
+           JOIN policy_layers l ON l.version_id = v.id AND ( \
+                 (l.layer = 'platform' AND v.tenant_id IS NULL) \
+              OR (l.layer = 'tenant'   AND v.tenant_id = $1) \
+              OR (l.layer = 'role'     AND v.tenant_id = $1 AND l.role_name = tp.role_name) \
+              OR (l.layer = 'employee' AND v.tenant_id = $1 AND l.employee_id = r.employee_id)) \
+          GROUP BY r.employee_id",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(&ids)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    // CHECKed non-negative in `0016_turn_budget.sql`. Clamping a corrupt row to
+    // zero reports an employee as stopped rather than as unlimited, which is the
+    // direction a ceiling has to fail in.
+    Ok(rows
+        .into_iter()
+        .map(|(id, cap)| (EmployeeId::from_uuid(id), u32::try_from(cap).unwrap_or(0)))
+        .collect())
+}
+
+/// Is there an active platform ceiling at all?
+///
+/// [`load`] asks this per decision and answers [`PolicyLoadError::NoPlatformLayer`]
+/// when there is none — correct on the hot path, and a terrible place to find
+/// out, because by then a customer's action has already been refused. This is
+/// the same question with no employee to ask it about, so a boot log and
+/// `/readyz` can say "this replica will deny every action" *before* anybody
+/// discovers it the other way.
+///
+/// Deliberately not a second definition of the ceiling: the predicate is the
+/// `platform` arm of [`SELECT_ACTIVE_LAYERS`] verbatim, because a probe that can
+/// disagree with the loader it reports on is worse than no probe.
+///
+/// Admin transaction for the same reason the ceiling row is `tenant_id IS NULL`:
+/// it belongs to no tenant, and there is no tenant to open a transaction as when
+/// the caller is a boot sequence or a health probe.
+pub async fn platform_ceiling_installed(db: &Db) -> Result<bool, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    let installed: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM policy_layers l \
+             JOIN policy_versions v ON v.id = l.version_id \
+            WHERE v.active AND l.layer = 'platform' AND v.tenant_id IS NULL)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    Ok(installed)
+}
+
 /// Make `version_id` this tenant's active policy version — the rollback verb.
 ///
 /// Two statements rather than one `SET active = (id = $1)`: the partial unique
@@ -1284,6 +1379,121 @@ pub(crate) mod tests {
             .await
             .expect_err("no ceiling, no policy");
         assert!(matches!(err, PolicyLoadError::NoPlatformLayer), "{err:?}");
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// [`max_turns_per_day`] is the loader's answer, in one statement for many
+    /// employees — so the only thing worth asserting is that it *is* the
+    /// loader's answer, for every shape of layer stack at once.
+    ///
+    /// This is the test that catches the two spellings of the layer predicate
+    /// drifting apart: the batch reader restates `SELECT_ACTIVE_LAYERS`, and a
+    /// restatement nobody compares is a restatement that goes wrong quietly —
+    /// in the direction of reporting a ceiling the gate does not enforce.
+    #[tokio::test]
+    async fn the_batch_turn_budget_is_what_the_loader_would_have_said() {
+        let Some(db) = db().await else { return };
+        let _guard = platform(&db, (50_000, 200_000, 50_000), &["example.com"]).await;
+        let (tenant, solo) = seed(&db, "budgets").await;
+
+        // Two more employees in the same tenant, so one statement covers three
+        // different layer stacks.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let mut hire = async |slug: &str| {
+            let id = EmployeeId::new_v7(Utc::now());
+            sqlx::query(
+                "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+                 VALUES ($1, $2, $3, $3, 'active')",
+            )
+            .bind(id.as_uuid())
+            .bind(tenant.as_uuid())
+            .bind(slug)
+            .execute(&mut *admin)
+            .await
+            .expect("insert employee");
+            id
+        };
+        let teamed = hire("teamed").await;
+        let tightened = hire("tightened").await;
+
+        // The tenant allows 120 a day; the purchasing role tightens it to 40;
+        // `tightened` has an employee layer of its own at 12.
+        let version = insert_version(&mut admin, Some(tenant.as_uuid()), "v1", true).await;
+        for row in [
+            Row {
+                tenant: Some(tenant.as_uuid()),
+                layer: "tenant",
+                turns: 120,
+                ..Row::default()
+            },
+            Row {
+                tenant: Some(tenant.as_uuid()),
+                layer: "role",
+                role: Some("purchasing"),
+                turns: 40,
+                ..Row::default()
+            },
+            Row {
+                tenant: Some(tenant.as_uuid()),
+                layer: "employee",
+                employee: Some(tightened.as_uuid()),
+                turns: 12,
+                ..Row::default()
+            },
+        ] {
+            insert_layer(&mut admin, version, row).await;
+        }
+        admin.commit().await.expect("commit the layers");
+
+        // The role layer is reached through the *team*, which is the join the
+        // batch reader flattens out of `SELECT_ACTIVE_LAYERS`' sub-select. An
+        // employee on no team must not pick it up.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let purchasing = crate::org::create_team(
+            &mut tx,
+            &Slug::parse("purchasing").expect("slug"),
+            "Purchasing",
+        )
+        .await
+        .expect("create team");
+        for who in [teamed, tightened] {
+            crate::org::set_member(&mut tx, who, purchasing, None)
+                .await
+                .expect("join the team");
+        }
+
+        let everyone = [solo, teamed, tightened];
+        let batch: std::collections::HashMap<EmployeeId, u32> =
+            max_turns_per_day(&mut tx, &everyone)
+                .await
+                .expect("batch read")
+                .into_iter()
+                .collect();
+
+        for (who, expected) in [(solo, 120u32), (teamed, 40), (tightened, 12)] {
+            let loaded = load(&mut tx, who, None)
+                .await
+                .expect("load")
+                .limits()
+                .max_turns_per_day;
+            assert_eq!(loaded, expected, "the fixture itself is wrong for {who:?}");
+            assert_eq!(
+                batch.get(&who).copied(),
+                Some(expected),
+                "the batch reader and the loader disagree about {who:?}"
+            );
+        }
+        assert_eq!(batch.len(), 3, "one row per employee asked about");
+
+        // An employee nobody has heard of still gets the platform ceiling,
+        // because that is what the loader would give it.
+        let stranger = EmployeeId::new_v7(Utc::now());
+        let unknown = max_turns_per_day(&mut tx, &[stranger])
+            .await
+            .expect("batch read");
+        assert_eq!(unknown, vec![(stranger, 120)]);
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;

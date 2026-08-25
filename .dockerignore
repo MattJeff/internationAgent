@@ -1,0 +1,19 @@
+# The build context is tarred and sent to the daemon before the first
+# instruction runs, so anything listed here is time the build does not spend.
+# `target/` alone is a few gigabytes on any machine that has run the tests.
+target/
+.git/
+
+# Never in an image, not even a layer that gets discarded: a build argument or a
+# leaked layer is how a local .env ends up in a registry.
+.env
+
+# Nothing the build reads, and .claude/ can hold session state.
+.claude/
+docs/
+README.md
+SPEC.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+.github/

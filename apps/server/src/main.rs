@@ -197,7 +197,42 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         .map_err(BootError::Llm)?;
 
     let db = Db::connect(&config.database_url).await?;
+    // On boot, and on every replica's boot. sqlx takes a Postgres advisory lock
+    // around the run (see `Db::migrate`), so two pods started by the same
+    // rollout serialise on it: one applies, the other blocks and then finds
+    // `_sqlx_migrations` already current. The alternative — a separate job an
+    // operator runs first — is one more step to forget, and the step that gets
+    // forgotten is the one that makes the pod crash-loop against a schema that
+    // is one migration behind. See the Dockerfile for the whole argument.
     db.migrate().await?;
+
+    // The one configuration error the environment cannot express, checked here
+    // because it is the first moment the answer exists: the ceiling is four
+    // rows in Postgres, so `Config::parse` could not have known.
+    //
+    // **Warned, not refused, and the two are different levers.** A refusal here
+    // crash-loops a fresh install: there is no route that writes `policy_layers`
+    // yet, so the ceiling arrives out of band, and a pod in CrashLoopBackOff
+    // spends most of its life not running while the operator is trying to read
+    // why. `/readyz` refuses instead, which is what readiness is *for* — the
+    // process stays up and keeps saying what is wrong on a schedule, and the
+    // replica never joins a load balancer while every action it would take is
+    // denied. Loud here, closed there, is the only combination where "a fresh
+    // install has to be able to start" and "a server that denies everything
+    // must not look healthy" are both true.
+    if !agentos_store::policy::platform_ceiling_installed(&db).await? {
+        // Names the rows rather than an API, because there is no API: nothing
+        // in this workspace writes `policy_layers` outside fixtures, so the
+        // operator's only path is SQL and a warning that says "install one"
+        // without saying what one *is* sends them to read four modules.
+        tracing::warn!(
+            "NO PLATFORM POLICY LAYER: the gate is fail-closed, so every action this \
+             deployment takes will be denied with `no_platform_policy`, and /readyz \
+             will report not-ready, until there is an active `policy_versions` row \
+             with `tenant_id IS NULL` carrying a `platform` row in `policy_layers`. \
+             See crates/store/src/policy.rs."
+        );
+    }
 
     // Built once and shared. A gate per router is a gate with a different
     // policy book on each, and a second set of adapters is a second mock inbox
@@ -386,6 +421,11 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             .merge(routes::usage::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
+            // Beside `turns`, and reading the same four names for the same
+            // numbers: this is that endpoint for a whole line at once, plus the
+            // spending, the tokens and the unanswered questions. One link down
+            // the chart, never a walk — the argument is in the module docs.
+            .merge(routes::reports::router(db.clone()))
             // The only writer of `spend_caps` outside a test. Until it was
             // mounted the table was empty in every deployment, which the
             // ledger reads as "may not spend" — safe, and unusable.
@@ -1302,15 +1342,45 @@ struct Health {
 
 /// Readiness: this replica can usefully take traffic *right now*.
 ///
-/// Two questions, both answerable in one round trip: can we get a connection,
-/// and is the outbox draining? A wedged outbox means side effects are being
-/// accepted and not performed, which is worse than refusing the request.
+/// Three questions, each one round trip:
+///
+/// 1. **Does the pool answer, against a migrated schema?** Not a separate
+///    check, and deliberately not a count of `_sqlx_migrations` — that would be
+///    a second opinion about sqlx's own bookkeeping, and it would drift. Both
+///    queries below read tables that only exist once the migrations have run,
+///    so an un-migrated database answers `42P01` and this probe answers 503. The
+///    ordering makes it true a second way: `serve_until_signal` awaits
+///    `db.migrate()` *before* `TcpListener::bind`, so on this deployment nothing
+///    can reach `/readyz` un-migrated at all. The query-level check is what
+///    survives someone later deciding to migrate out of band.
+/// 2. **Is there a platform policy ceiling?** The gate is fail-closed: with no
+///    ceiling `policy::load` returns `NoPlatformLayer` and *every* action for
+///    *every* tenant is denied. A replica in that state passes a connection
+///    check, serves 200s, and refuses all the work — which is the precise shape
+///    of an outage nobody pages on. `main` warns about it at boot; this is what
+///    keeps the replica out of the load balancer until somebody acts on the
+///    warning. The reason string is `gate.rs`'s own deny code, so the probe and
+///    the metric an operator is staring at say the same word.
+/// 3. **Is the outbox draining?** A wedged outbox means side effects are being
+///    accepted and not performed, which is worse than refusing the request.
 ///
 /// A mock adapter is deliberately **not** one of them. A development box has to
 /// be able to come up, so `mock_adapters` is reported and never fails the
 /// probe — an always-present field, empty on a fully real deployment, so an
 /// operator can diff two replicas rather than infer from a silence.
 async fn readyz(State(health): State<Health>) -> Response {
+    match agentos_store::policy::platform_ceiling_installed(&health.db).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("not ready: no platform policy layer, so every action is denied");
+            return not_ready("no_platform_policy").into_response();
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "not ready: could not read the policy ceiling");
+            return not_ready("database").into_response();
+        }
+    }
+
     // The poller's own definition of "behind", not a second copy of it that
     // could disagree with the loop it is reporting on. Cross-tenant by nature:
     // the backlog is not any one tenant's, and `lag_secs` opens the admin
@@ -1723,6 +1793,105 @@ mod tests {
             .expect("service");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The gate is fail-closed: with no platform ceiling `policy::load` answers
+    /// `NoPlatformLayer`, so every action for every tenant is denied. A replica
+    /// in that state has a live pool, a draining outbox and nothing it will
+    /// actually do — the one shape of outage a connection check cannot see — so
+    /// readiness is the probe that has to refuse.
+    ///
+    /// The migrated-schema half of the contract rides along rather than getting
+    /// its own test: `own_database` migrates, and both of `/readyz`'s queries
+    /// read tables that only migrations create, so an un-migrated database
+    /// cannot reach the `ready: true` branch at all.
+    #[tokio::test]
+    async fn readyz_refuses_until_a_platform_policy_ceiling_is_installed() {
+        let Some((db, admin_url, database)) = own_database("readyz").await else {
+            return;
+        };
+
+        let probe = async |db: Db| {
+            let response = Router::new()
+                .route("/readyz", get(readyz))
+                .with_state(Health {
+                    db,
+                    mocks: Vec::new().into(),
+                })
+                .oneshot(
+                    HttpRequest::get("/readyz")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("service");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        // An un-migrated database first, because a pool that answers is not the
+        // same thing as a schema. `Db::connect` succeeds against this one — it
+        // is a live Postgres with nothing in it — and readiness still has to
+        // refuse. It does, without a fourth check written for it: both of the
+        // probe's queries read tables that only the migrations create.
+        let (base_url, _) = admin_url.rsplit_once('/').expect("admin url has a path");
+        let empty = format!("readyz_raw_{}", Uuid::now_v7().simple());
+        let admin = sqlx::PgPool::connect(&admin_url).await.expect("postgres");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {empty}")))
+            .execute(&admin)
+            .await
+            .expect("create the un-migrated database");
+        admin.close().await;
+        let raw = Db::connect(&format!("{base_url}/{empty}"))
+            .await
+            .expect("the pool connects to an empty database perfectly well");
+        let (status, body) = probe(raw.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an un-migrated database must never read as ready: {body}"
+        );
+        drop_database(raw, admin_url.clone(), empty).await;
+
+        // A migrated database and nothing else — which is what every fresh
+        // install is on its first boot.
+        let (status, body) = probe(db.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains("no_platform_policy"),
+            "the probe has to name the reason, in the gate's own word: {body}"
+        );
+
+        // The ceiling, written the one way anything in this workspace writes
+        // one. The tenant layer's own limits are irrelevant here; `install`
+        // maintains the platform row as a side effect, and that row is the
+        // whole subject.
+        let tenant = TenantId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("readyz-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit the tenant");
+        agentos_store::policy::install(
+            &db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits::default(),
+        )
+        .await
+        .expect("install a ceiling");
+
+        let (status, body) = probe(db.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"ready\":true"), "{body}");
+
+        drop_database(db, admin_url, database).await;
     }
 
     // -- rate limiting -----------------------------------------------------

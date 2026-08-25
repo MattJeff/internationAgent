@@ -20,7 +20,10 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 was the budget before the image build joined this job. A release build
+    # of the workspace is the slow half now, and a timeout that fires on a cold
+    # cache is a red build that means nothing.
+    timeout-minutes: 45
 
     services:
       # Same image as docker-compose.yml, deliberately. pg18 + pgvector >= 0.8.6.
@@ -47,6 +50,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      # scripts/test.sh's first guard is `command -v psql`, and the virgin
+      # database step below shells out to it too. The runner image ships
+      # postgresql-client today — which is a property of a base image nobody
+      # here controls, and the failure when it stops being true is a red build
+      # reading "psql is not on PATH. macOS: brew install libpq" on a Linux
+      # runner. Guarded rather than unconditional so it costs nothing on the
+      # normal path, and `update` first because a runner's apt lists are stale
+      # often enough that a bare install 404s.
+      - name: psql, for the test script's first guard
+        run: >-
+          command -v psql ||
+          { sudo apt-get update &&
+            sudo apt-get install -y --no-install-recommends postgresql-client; }
 
       # rust-toolchain.toml is the one pin and it also lists rustfmt + clippy;
       # the rustup proxies install all of it on first use. Nothing to restate
@@ -98,3 +115,15 @@ jobs:
             echo "::error::doctor exited 0 with nothing configured"
             exit 1
           fi
+
+      # Last, because it is the slowest step and the one whose failure is least
+      # urgent — but it is here at all because a Dockerfile that is never built
+      # is a Dockerfile that is broken. It breaks the ordinary way: somebody
+      # adds a workspace member and does not add its Cargo.toml to the
+      # dependency layer, and nobody finds out until a release.
+      #
+      # No push, no registry credentials, no tag anybody could deploy by
+      # accident: this asserts that the image *builds*, and publishing is a
+      # different workflow with different secrets.
+      - name: the image builds
+        run: docker build --tag agentos-server:ci .

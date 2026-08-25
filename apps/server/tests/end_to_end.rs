@@ -64,6 +64,10 @@ struct Server {
     /// on its own `info!`.
     log: PathBuf,
     database_url: String,
+    /// The tenant the API key speaks for. Kept because the readiness section
+    /// installs a policy ceiling against it, which is the one piece of setup a
+    /// real deployment also does out of band.
+    tenant: TenantId,
 }
 
 impl Server {
@@ -158,6 +162,7 @@ impl Server {
             database,
             log,
             database_url,
+            tenant,
         };
         server.wait_until_live();
         Some(server)
@@ -561,6 +566,37 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     }
     eprintln!("--- the signed delivery became an inbound notice");
 
+    // -- readiness refuses a deployment that would deny everything ----------
+    //
+    // Nothing has installed a platform policy ceiling, and the gate is
+    // fail-closed: `policy::load` answers `NoPlatformLayer`, so every action
+    // this deployment took would be denied. Everything else about this replica
+    // is healthy — the pool answers, the outbox just drained a delivery — which
+    // is the whole hazard. A probe that asked only those two would call this
+    // ready and put it behind a load balancer to refuse real work.
+    let (status, refused) = server.get("/readyz", None);
+    assert_eq!(
+        status, 503,
+        "a deployment with no policy ceiling is not ready: {refused:#}"
+    );
+    assert_eq!(
+        refused["code"], "no_platform_policy",
+        "and it has to say which of the three checks failed: {refused:#}"
+    );
+
+    // Installed out of band, because that is the only way it arrives on a real
+    // deployment: there is no route that writes `policy_layers` yet. The limits
+    // are irrelevant here — `policy::install` maintains the platform row as a
+    // side effect, and that row is the entire subject.
+    agentos_store::policy::install(
+        &Db::connect(&server.database_url).await.expect("connect"),
+        server.tenant,
+        agentos_store::policy::Scope::Tenant,
+        &agentos_domain::policy::PolicyLimits::default(),
+    )
+    .await
+    .expect("install a policy ceiling");
+
     // -- readiness reflects the outbox --------------------------------------
     let (status, ready) = server.get("/readyz", None);
     assert_eq!(status, 200, "the replica is not ready: {ready:#}");
@@ -595,6 +631,15 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // spawned cannot log, and one that ignores the token is aborted instead —
     // which logs the line asserted against below.
     let logs = server.shutdown();
+    // The other half of the platform-policy contract, and it is only visible
+    // from here: `/readyz` proved the deployment was held out of the load
+    // balancer, this proves it also *said so* at boot, in a line an operator
+    // reading a crash-loop log would find. Closed without loud is a replica
+    // nobody knows how to fix; loud without closed is the outage.
+    assert!(
+        logs.contains("NO PLATFORM POLICY LAYER"),
+        "booting with no policy ceiling has to be loud, not only unready:\n{logs}"
+    );
     // The MCP binder joined this list when the operator half of MCP shipped,
     // and the initiative loop the moment after. Adding a loop and not adding
     // it here is the mistake this assertion exists to catch: a loop that is

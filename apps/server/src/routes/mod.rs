@@ -7,6 +7,7 @@ pub mod inventory;
 pub mod knowledge;
 pub mod mcp;
 pub mod pool;
+pub mod reports; // the manager's view of its own line
 pub mod spend;
 pub mod teams;
 pub mod turns; // the daily turn budget, read-side
