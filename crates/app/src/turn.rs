@@ -878,6 +878,32 @@ pub struct Finished {
     pub trust: TrustLabel,
 }
 
+impl Finished {
+    /// Proposals this run put in front of the gate — the number that says
+    /// whether there is anything to check [`Self::reply`] against.
+    ///
+    /// **Allowed and denied both count, and that is the whole point.** A refusal
+    /// is an `audit_log` row naming a deny code, and a row is a thing an
+    /// operator can hold the employee's own account of itself up against. What
+    /// is subtracted is [`Self::malformed_calls`], which by its own definition
+    /// never reached the gate and therefore left nothing at all.
+    ///
+    /// Zero here and a long [`Self::reply`] is the failure mode that looks like
+    /// success: a full day of work narrated by a turn that called nothing. This
+    /// crate cannot do anything about that — a model writes what it writes — so
+    /// it exports the honest number and
+    /// [`model_usage::Consumed::unbacked`](agentos_store::model_usage::Consumed::unbacked)
+    /// writes it down beside the length of what was said.
+    ///
+    /// Saturating, because a `malformed_calls` above `tool_calls` would be an
+    /// arithmetic bug in this module and reading it as "it acted" would be the
+    /// wrong direction to be wrong in.
+    #[must_use]
+    pub const fn ruled_calls(&self) -> u32 {
+        self.tool_calls.saturating_sub(self.malformed_calls)
+    }
+}
+
 /// Why a run stopped early.
 ///
 /// A policy denial is *not* here: the model is told about it and carries on,
@@ -3829,6 +3855,15 @@ mod tests {
         // one of them stopped before anybody ruled on it.
         assert_eq!(finished.tool_calls, cases.len() as u32);
         assert_eq!(finished.malformed_calls, cases.len() as u32);
+        // Which is the case `ruled_calls` exists for. Six tool calls and a
+        // reply, and not one row anywhere to check the reply against — the same
+        // standing as a turn that reached for nothing, and the reason the ledger
+        // is told this number rather than `tool_calls`.
+        assert_eq!(
+            finished.ruled_calls(),
+            0,
+            "six calls the parser threw out still left something to check against"
+        );
     }
 
     /// **`malformed_calls` counts what never reached the gate, and a refusal is

@@ -54,6 +54,53 @@
 //! incremented where `spent.usage.add(response.usage)` already is — not a
 //! change here, which would still only see the sum.
 //!
+//! # Said is not did
+//!
+//! The same move as "unknown is not zero", one level up, and it is here for the
+//! same reason: it is a judgement about what an empty number means, so it lives
+//! in one place with both write sites going through it.
+//!
+//! A live run produced the case. One support seat wrote 12,682 tokens describing
+//! five tickets handled and five emails sent, having called nothing —
+//! `tool_calls = 0` was the only thing that distinguished it, and it went to a
+//! log line. That is the one failure in this system that looks like success: a
+//! denial writes an audit row with a reason, a malformed call is counted in
+//! `Finished::malformed_calls`, a provider error is classified and billed, and
+//! an employee that did nothing and said it did everything leaves a beautiful
+//! transcript and no trace.
+//!
+//! [`Consumed::unbacked`] is the fix and it is deliberately the *weakest* of the
+//! four shapes that were on the table:
+//!
+//! * **Record the discrepancy** — this. Two columns, no behaviour change, and
+//!   the manager's view can rank on them. It cannot stop anything.
+//! * **Refuse the note.** A turn with no tool call does not get to write
+//!   anything an operator reads as work. Rejected because on the path this
+//!   matters — `loops::initiative` — there is no note to refuse: the closing
+//!   text is already logged and stored nowhere. On the path where there *is*
+//!   one — `Agent::on_turn` — refusing it would delete the reply to a customer's
+//!   email, which is the healthy case, not the sick one.
+//! * **Make the employee say which.** Require a turn with nothing to do to end
+//!   by saying so through the internal channel, so "did nothing and said
+//!   nothing" and "did nothing and said so" become different rows. Rejected on
+//!   the ground that it *already is* one: a turn that reports through
+//!   `message_colleague` has made a tool call and is therefore backed. Adding a
+//!   rule would only mean a model that narrates a day it did not have also
+//!   declines to file the note, and we would have written a prompt instruction
+//!   and called it an invariant.
+//! * **Score it in the eval.** `eval::dryrun`'s `verdict` already gates on "the
+//!   employees called tools" and should. It tells you about the fleet on the day
+//!   somebody ran it; this tells you about Tuesday, per seat, without anybody
+//!   running anything.
+//!
+//! **What it does not do, said plainly: it does not make a model honest, and
+//! nothing can.** A model writes what it writes. This makes the record carry
+//! both halves — what was said, and whether anything was done — so that a human
+//! comparing them sees the gap. It is a fact for a person to read, not a verdict:
+//! see [`Consumed::unbacked_chars`] for why there are two columns and not a
+//! boolean, and `migrations/0034_unbacked_turns.sql` for why only the
+//! self-started turn writes them.
+//!
 //! # A turn that did not finish is recorded — this section used to say it was
 //! not
 //!
@@ -123,6 +170,19 @@ pub struct Consumed {
     pub output_tokens: i64,
     /// Input served from the prefix cache, billed at a fraction of fresh input.
     pub cache_read_tokens: i64,
+    /// Runs — one `Turn::run`, not one round trip — that ended with prose and
+    /// nothing the gate ruled on. See [`Consumed::unbacked`].
+    ///
+    /// A subset of [`Self::calls`], constrained as one, because a run that
+    /// finished made at least one call.
+    pub runs_unbacked: i64,
+    /// What those runs said, in characters. **Not a verdict**: this is the
+    /// second half of the pair, and the reason [`Self::runs_unbacked`] is not a
+    /// boolean. One unbacked run of thirty characters is an employee saying it
+    /// had nothing to do; one of twelve thousand is an employee describing a day
+    /// of work it did not do, and only a human reading them can say which. This
+    /// column exists so that the two are different rows.
+    pub unbacked_chars: i64,
 }
 
 impl Consumed {
@@ -157,7 +217,40 @@ impl Consumed {
             input_tokens: clamp(input_tokens),
             output_tokens: clamp(output_tokens),
             cache_read_tokens: clamp(cache_read_tokens),
+            runs_unbacked: 0,
+            unbacked_chars: 0,
         }
+    }
+
+    /// Say whether this run left anything to check its own account against.
+    ///
+    /// `ruled` is every proposal the Policy Gate ruled on during the run —
+    /// `Finished::ruled_calls`, plus whatever a vertical operation performed
+    /// before the model. **Allowed and denied both count**, for the same reason
+    /// `Finished::malformed_calls` counts only what never reached the gate: a
+    /// refusal is an `audit_log` row, and a row is a thing an operator can hold
+    /// the prose up against. Zero of them and there is nothing at all — so the
+    /// prose is measured, counted, and left to be read.
+    ///
+    /// **This is the same judgement [`Self::reported`] makes about tokens, one
+    /// level up, and it lives here for the same reason: one place, so two
+    /// callers cannot disagree about what an empty turn is.** Unknown is not
+    /// zero there; here, *said* is not *did*.
+    ///
+    /// It does not stop an employee narrating a day it did not have, and nothing
+    /// can — a model writes what it writes. It stops the record from carrying
+    /// only the half the employee wrote.
+    #[must_use]
+    pub fn unbacked(mut self, ruled: u32, reply: &str) -> Self {
+        if ruled == 0 {
+            self.runs_unbacked = 1;
+            // Characters, not bytes: see decision 4 of the migration. `trim`
+            // because trailing newlines are the provider's, not the employee's.
+            // Saturating upward on the narrowing, like `reported`: an absurd
+            // length is wrong in the direction that makes somebody look.
+            self.unbacked_chars = i64::try_from(reply.trim().chars().count()).unwrap_or(i64::MAX);
+        }
+        self
     }
 
     /// Fold another row in. Saturating, because a wrapped total would be a
@@ -170,6 +263,8 @@ impl Consumed {
         self.cache_read_tokens = self
             .cache_read_tokens
             .saturating_add(other.cache_read_tokens);
+        self.runs_unbacked = self.runs_unbacked.saturating_add(other.runs_unbacked);
+        self.unbacked_chars = self.unbacked_chars.saturating_add(other.unbacked_chars);
     }
 
     /// Every token anybody told us about, cached or not.
@@ -223,8 +318,9 @@ pub async fn record(
     sqlx::query(
         "INSERT INTO model_usage_daily \
            (tenant_id, employee_id, day, calls, calls_unmetered, \
-            input_tokens, output_tokens, cache_read_tokens) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+            input_tokens, output_tokens, cache_read_tokens, \
+            runs_unbacked, unbacked_chars) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (tenant_id, employee_id, day) DO UPDATE SET \
            calls             = model_usage_daily.calls + excluded.calls, \
            calls_unmetered   = model_usage_daily.calls_unmetered + excluded.calls_unmetered, \
@@ -232,6 +328,8 @@ pub async fn record(
            output_tokens     = model_usage_daily.output_tokens + excluded.output_tokens, \
            cache_read_tokens = model_usage_daily.cache_read_tokens \
                              + excluded.cache_read_tokens, \
+           runs_unbacked     = model_usage_daily.runs_unbacked + excluded.runs_unbacked, \
+           unbacked_chars    = model_usage_daily.unbacked_chars + excluded.unbacked_chars, \
            updated_at        = now()",
     )
     .bind(tx.tenant_id().as_uuid())
@@ -242,6 +340,8 @@ pub async fn record(
     .bind(consumed.input_tokens)
     .bind(consumed.output_tokens)
     .bind(consumed.cache_read_tokens)
+    .bind(consumed.runs_unbacked)
+    .bind(consumed.unbacked_chars)
     .execute(&mut ***tx)
     .await?;
 
@@ -261,7 +361,8 @@ pub async fn on_day(
     // No `WHERE tenant_id`: RLS adds it, and a hand-written filter would be a
     // second place to forget it.
     let row: Option<Consumed> = sqlx::query_as(
-        "SELECT calls, calls_unmetered, input_tokens, output_tokens, cache_read_tokens \
+        "SELECT calls, calls_unmetered, input_tokens, output_tokens, cache_read_tokens, \
+                runs_unbacked, unbacked_chars \
            FROM model_usage_daily WHERE employee_id = $1 AND day = $2",
     )
     .bind(employee_id.as_uuid())
@@ -397,6 +498,57 @@ mod tests {
         assert_eq!(Consumed::reported(1, u64::MAX, 0, 0).input_tokens, i64::MAX);
     }
 
+    /// **The distinction the two new columns exist for, at the one place it is
+    /// made.**
+    ///
+    /// Three turns that are indistinguishable in every other number this ledger
+    /// holds — same calls, same tokens, same absence of an error — and the row
+    /// has to tell them apart, because one of them did a day's work, one of them
+    /// honestly had nothing to do, and one of them said it did a day's work and
+    /// did nothing at all.
+    #[test]
+    fn a_turn_that_only_talked_is_not_a_turn_that_worked() {
+        // What the live run produced: prose describing five tickets and five
+        // emails, and not one proposal in front of the gate.
+        let narration = "Today I handled five tickets and sent five replies.";
+        let told = Consumed::reported(1, 4_000, 3_000, 0).unbacked(0, narration);
+        assert_eq!(told.runs_unbacked, 1);
+        assert_eq!(told.unbacked_chars, 51);
+        // It is still a real, metered, billable call. This is not an error
+        // channel and it must not read as one.
+        assert_eq!(told.calls, 1);
+        assert!(told.is_complete());
+
+        // The same turn, having asked for one thing. Backed, and the columns say
+        // nothing — including when the gate REFUSED it, because a refusal is an
+        // `audit_log` row and a row is a thing to check the prose against.
+        let did = Consumed::reported(1, 4_000, 3_000, 0).unbacked(1, narration);
+        assert_eq!(did.runs_unbacked, 0);
+        assert_eq!(did.unbacked_chars, 0, "a backed run measures no prose");
+
+        // And the employee that genuinely had nothing to do. Counted, because it
+        // called nothing — but thirty characters is not twelve thousand, and the
+        // whole reason `unbacked_chars` exists is that this row must not be the
+        // same row as the one above. A boolean here would libel it.
+        let quiet = Consumed::reported(1, 4_000, 12, 0).unbacked(0, "  Nothing was due today.\n");
+        assert_eq!(quiet.runs_unbacked, told.runs_unbacked);
+        assert_eq!(quiet.unbacked_chars, 22, "trimmed, and counted in chars");
+        assert!(
+            quiet.unbacked_chars < told.unbacked_chars,
+            "an employee saying it had nothing to do reads the same as one \
+             narrating a day it did not have"
+        );
+
+        // Characters and not bytes: the same sentence in another script must not
+        // rank three times higher for being written in it.
+        assert_eq!(
+            Consumed::reported(1, 1, 1, 0)
+                .unbacked(0, "こんにちは")
+                .unbacked_chars,
+            5
+        );
+    }
+
     #[test]
     fn folding_rows_together_keeps_the_unknown_visible() {
         let mut total = Consumed::reported(2, 100, 20, 0);
@@ -409,6 +561,14 @@ mod tests {
             !total.is_complete(),
             "120 tokens over 5 calls is a floor, and the reader has to be told"
         );
+
+        // Two unbacked runs in one window are two runs and both their words. A
+        // fold that kept one would make a seat that talks all day look like a
+        // seat that did it once.
+        total.add(&Consumed::reported(1, 5, 5, 0).unbacked(0, "one"));
+        total.add(&Consumed::reported(1, 5, 5, 0).unbacked(0, "two"));
+        assert_eq!(total.runs_unbacked, 2);
+        assert_eq!(total.unbacked_chars, 6);
     }
 
     // -- attribution -------------------------------------------------------

@@ -194,7 +194,17 @@ struct ReportView {
     /// One entry per currency this employee has a cap in or has spent in today.
     /// Empty means neither, which is an employee that may not spend at all.
     spend: Vec<SpendView>,
-    /// Today's tokens and the calls behind them. No money: see the module docs.
+    /// Today's tokens and the calls behind them, and — `runs_unbacked` and
+    /// `unbacked_chars` — how much of today's prose has nothing behind it at
+    /// all. No money: see the module docs.
+    ///
+    /// **The two unbacked figures are the ones to read against everything else
+    /// on this row.** A seat with turns taken, tokens spent, `runs_unbacked`
+    /// equal to those turns and twelve thousand characters against them wrote a
+    /// day's report and did no work; `agentos_store::model_usage` carries the
+    /// argument and the honest limits. They are a fact for a human to read, not
+    /// a verdict — an employee with nothing due says so in thirty characters and
+    /// lands in the same column.
     model_usage: ModelUsage,
 }
 
@@ -251,6 +261,8 @@ SELECT m.employee_id, \
        coalesce(u.input_tokens, 0)      AS input_tokens, \
        coalesce(u.output_tokens, 0)     AS output_tokens, \
        coalesce(u.cache_read_tokens, 0) AS cache_read_tokens, \
+       coalesce(u.runs_unbacked, 0)     AS runs_unbacked, \
+       coalesce(u.unbacked_chars, 0)    AS unbacked_chars, \
        (SELECT count(*) FROM messages q \
          WHERE q.employee_id = m.employee_id \
            AND q.internal_kind = 'question' \
@@ -505,6 +517,16 @@ mod tests {
     /// enough that `carla` can be driven to its ceiling in a loop, big enough
     /// that nobody else runs out mid-fixture.
     const TURN_BUDGET: u32 = 10;
+
+    /// What a turn that did nothing says about its day.
+    ///
+    /// Shortened from the real one — a support seat wrote 12,682 tokens of this
+    /// and called no tool at all — and kept in the first person on purpose. It
+    /// is the shape of the thing this row has to make visible: confident, plural,
+    /// specific, and backed by nothing.
+    const NARRATION: &str = "Today I worked through the ticket queue. I handled five tickets and \
+                             sent five replies, escalating two to the billing team and closing \
+                             the rest. Everything is up to date.";
 
     struct Harness {
         app: Router,
@@ -789,6 +811,17 @@ mod tests {
         )
         .await
         .expect("record");
+        // ...and carla writes a day's report having called nothing at all. The
+        // live case this column exists for, through the same only writer: real
+        // tokens, a real closing summary, and not one thing the gate ruled on.
+        model_usage::record(
+            &mut tx,
+            EmployeeId::from_uuid(carla),
+            Utc::now().date_naive(),
+            Consumed::reported(1, 40, 3_000, 0).unbacked(0, NARRATION),
+        )
+        .await
+        .expect("record");
         tx.commit().await.expect("commit the day's work");
 
         // Carla runs itself out of turns, which is the state a manager most
@@ -873,6 +906,12 @@ mod tests {
         assert_eq!(usage["cache_read_tokens"], json!(5));
         assert_eq!(usage["tokens_measured"], json!(125));
         assert_eq!(usage["complete"], json!(true));
+        // Alba's three calls reached the gate, so its prose has rows behind it
+        // and there is nothing to say about it. Zero here is the ordinary
+        // answer, and it has to be, or the column is an accusation against the
+        // whole fleet.
+        assert_eq!(usage["runs_unbacked"], json!(0), "{usage}");
+        assert_eq!(usage["unbacked_chars"], json!(0));
 
         // -- bruno: owes the head an answer, and has no caps at all ----------
         let bruno = report(&body, "bruno");
@@ -904,6 +943,27 @@ mod tests {
             json!(true),
             "an employee at its cap has stopped, and this is the only view that says so"
         );
+
+        // ...and wrote a day's report with nothing behind it. **The failure that
+        // looks like success, on the screen an operator opens in the morning.**
+        // Without these two fields carla's row is a healthy one: turns taken,
+        // tokens spent, three thousand output tokens, no denial, no error.
+        let carla_usage = &carla["model_usage"];
+        assert_eq!(carla_usage["calls"], json!(1), "{carla_usage}");
+        assert_eq!(carla_usage["output_tokens"], json!(3_000));
+        assert_eq!(carla_usage["complete"], json!(true), "it was metered");
+        assert_eq!(carla_usage["runs_unbacked"], json!(1), "{carla_usage}");
+        assert_eq!(
+            carla_usage["unbacked_chars"],
+            json!(NARRATION.chars().count()),
+            "the length is what separates a story from `nothing was due`: {carla_usage}"
+        );
+
+        // And bruno, which has no ledger row at all, reads as zero rather than
+        // as missing. An employee that did not wake is not an employee that
+        // talked its way through the day.
+        assert_eq!(bruno["model_usage"]["runs_unbacked"], json!(0), "{bruno}");
+        assert_eq!(bruno["model_usage"]["unbacked_chars"], json!(0));
 
         h.teardown().await;
     }

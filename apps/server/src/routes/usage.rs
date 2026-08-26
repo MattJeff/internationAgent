@@ -28,6 +28,16 @@
 //! cost" — which is a different sentence from "forty calls cost nothing", and
 //! the whole table exists to keep them different.
 //!
+//! **Said is not did.** `runs_unbacked` counts the self-started runs that ended
+//! with prose and nothing the Policy Gate ruled on, and `unbacked_chars` is how
+//! much prose that was. Both are in the rollup because they answer the question
+//! that hangs off every token figure here — *and what did it buy* — for the one
+//! case where the answer is nothing and the transcript says otherwise. They are
+//! a measurement, not an accusation: an employee with nothing due says so and is
+//! counted too, which is why there are two numbers rather than a flag. See
+//! [`agentos_store::model_usage`] for the whole argument, including what it
+//! cannot do.
+//!
 //! **This is a floor in a second way, too.** A turn that did not finish records
 //! nothing at all: `Turn::run` drops its `Spent` when it returns `TurnError`, so
 //! the calls a blown budget or a deadline already paid for are invisible here.
@@ -158,7 +168,9 @@ SELECT u.employee_id, \
        sum(u.calls_unmetered)::bigint   AS calls_unmetered, \
        sum(u.input_tokens)::bigint      AS input_tokens, \
        sum(u.output_tokens)::bigint     AS output_tokens, \
-       sum(u.cache_read_tokens)::bigint AS cache_read_tokens \
+       sum(u.cache_read_tokens)::bigint AS cache_read_tokens, \
+       sum(u.runs_unbacked)::bigint     AS runs_unbacked, \
+       sum(u.unbacked_chars)::bigint    AS unbacked_chars \
   FROM model_usage_daily u \
   JOIN employees e ON e.id = u.employee_id \
  WHERE u.day >= $1 AND u.day < $2 \

@@ -802,6 +802,16 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     )
     .await;
 
+    // Whether anything the gate ruled on happened *before* the model did.
+    //
+    // It is half of the answer to "did this turn leave a trace", and without it
+    // the other half would libel every buyer in the fleet: `Buyer::issue_rfq`
+    // authorises each address on its own and every one of them is an `audit_log`
+    // row, so a turn whose vertical issued an RFQ and whose model then wrote a
+    // summary really did do the work the summary describes. Captured here
+    // because `done` is about to be moved into the opening context.
+    let vertical_ran = done.is_some();
+
     // Same prefix as `Agent::on_turn`, down to the order of the builders and to
     // the policy the inventory is narrowed by: an employee that wakes itself
     // must be told exactly what an employee woken by a stranger is told, or
@@ -937,6 +947,22 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         .tenant_tx(due.tenant_id)
         .await
         .map_err(|err| format!("no tenant transaction for the token ledger: {err}"))?;
+    // And beside the bill, what the turn amounted to. **This is the only write
+    // site of `Consumed::unbacked` in the workspace, and the asymmetry with
+    // `Agent::on_turn` is the design rather than an omission.**
+    //
+    // An employee woken by somebody's email answers it: the prose IS the
+    // deliverable, it is recorded on a conversation, and the person who asked is
+    // the check. A turn woken by its own clock has neither — the comment at the
+    // bottom of this function has said so for as long as it has existed, that
+    // "everything the employee actually did went through `Effects`", which is
+    // exactly the sentence that stops being true when nothing did.
+    //
+    // `ruled_calls` and not `tool_calls`: a denial is an audit row and an
+    // operator can hold the prose up against it, where a call the parser
+    // rejected left nothing at all. Plus the vertical, which acted before the
+    // model and left rows of its own — one, because what matters is that there
+    // is something to check and not how much of it there is.
     let recorded = model_usage::record(
         &mut tx,
         due.employee_id,
@@ -946,6 +972,10 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
             finished.usage.input_tokens,
             finished.usage.output_tokens,
             finished.usage.cache_read_tokens,
+        )
+        .unbacked(
+            finished.ruled_calls() + u32::from(vertical_ran),
+            &finished.reply,
         ),
     )
     .await;
@@ -962,13 +992,17 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         }
     }
 
-    // ponytail: the closing text is logged and stored nowhere. `on_turn` records
-    // its reply because there is a conversation it belongs on and a person who is
-    // owed it; this turn has neither. Everything the employee actually *did* went
-    // through `Effects`, which is gated and lands in `audit_log`, so the closing
-    // summary is commentary rather than record. It is also model output, and
-    // `employee_initiative.last_detail` holds only text this codebase authored.
-    // Give it a home the day there is a work journal to put it in.
+    // ponytail: the closing text is logged and stored nowhere; its *length* is,
+    // one paragraph up. `on_turn` records its reply because there is a
+    // conversation it belongs on and a person who is owed it; this turn has
+    // neither. Everything the employee actually *did* went through `Effects`,
+    // which is gated and lands in `audit_log`, so the closing summary is
+    // commentary rather than record — and `model_usage_daily.runs_unbacked` is
+    // the count of the turns where that sentence's premise failed. It is also
+    // model output, and `employee_initiative.last_detail` holds only text this
+    // codebase authored, which is the second reason a character count goes to
+    // the ledger and the characters do not. Give the text a home the day there
+    // is a work journal to put it in.
     Ok(())
 }
 
@@ -1635,6 +1669,230 @@ pub(crate) mod tests {
         count
     }
 
+    // -- what a turn did, beside what it said --------------------------------
+
+    /// A support objective with nothing missing — the seat from the live run.
+    ///
+    /// Support and not purchasing on purpose: `vertical_step` has no operation
+    /// for any of the four service packs, so this employee's whole turn is the
+    /// model. Nothing acts before it and nothing can be mistaken for it having
+    /// acted.
+    fn supporting() -> Charter {
+        Charter::Support {
+            objective: rolepack_service::Support {
+                product: "the visa-data API".to_owned(),
+                first_response_hours: 4,
+                escalate_to: Some("the founders".to_owned()),
+            },
+        }
+    }
+
+    /// What the live run wrote: five tickets and five emails, in the first
+    /// person, having called nothing at all.
+    const NARRATED_A_DAY: &str = "I worked through the ticket queue today. Five tickets handled \
+                                  and five replies sent — two escalated to the founders, three \
+                                  closed. The queue is clear.";
+
+    /// And what an employee with nothing to do says.
+    const HAD_NOTHING_TO_DO: &str = "No tickets are open.";
+
+    /// Seed one supported employee, give it exactly one tick against `script`,
+    /// and hand back what the ledger recorded.
+    ///
+    /// One employee per tick, and the assertion below is what enforces it: the
+    /// claim reschedules a cadence out, so everyone seeded earlier in a test is
+    /// an hour away and this seat is alone in the batch. That is what lets three
+    /// employees have three different models in one test.
+    async fn one_turn(
+        db: &Db,
+        tenant: TenantId,
+        slug: &str,
+        script: Vec<agentos_app::mocks::LlmResponse>,
+    ) -> (EmployeeId, Consumed) {
+        use agentos_app::gate::PolicyGate;
+        use agentos_app::mocks::ScriptedLlm;
+
+        let employee = seed_due(db, tenant, slug, Some(supporting())).await;
+        let cancel = CancellationToken::new();
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(ScriptedLlm::responses(script)),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: crate::routes::mcp::Fleets::new().0,
+            cancel: cancel.clone(),
+        };
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        assert_eq!(
+            tick(db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1,
+            "{slug} was not alone in the batch, so it did not get its own model"
+        );
+        assert_eq!(
+            outcome_of(db, tenant, employee).await.0,
+            "turn",
+            "{slug} never reached the model at all"
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let billed = model_usage::on_day(&mut tx, employee, Utc::now().date_naive())
+            .await
+            .expect("ledger");
+        tx.rollback().await.expect("rollback");
+        (employee, billed)
+    }
+
+    /// Everything this employee put in front of the gate, allowed or refused.
+    async fn rulings(db: &Db, tenant: TenantId, employee: EmployeeId) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE employee_id = $1 AND decision_id IS NOT NULL",
+        )
+        .bind(employee.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// **A turn that did nothing and said it did everything, and the row that
+    /// finally says so.**
+    ///
+    /// This is the failure mode that looks like success. Every other one is
+    /// loud: a refusal writes an audit row naming a deny code, a malformed call
+    /// is counted, a provider error is classified and billed. An employee that
+    /// narrated a day of work it did not have leaves a beautiful transcript, a
+    /// real token bill, `last_outcome = turn`, and — until this — nothing that
+    /// distinguishes it from the employee beside it that did the work.
+    ///
+    /// Three seats, three models, one difference between them. Every other
+    /// number in the ledger agrees across all three.
+    #[tokio::test]
+    async fn a_turn_that_called_nothing_is_recorded_beside_how_much_it_said() {
+        use agentos_app::mocks::{LlmResponse, Usage};
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+
+        // 1. The seat from the live run: a page of prose, not one tool call.
+        let (narrator, told) = one_turn(
+            &db,
+            tenant,
+            "narrator",
+            vec![LlmResponse::text(
+                NARRATED_A_DAY,
+                Usage::new(4_000, 3_000, 0),
+            )],
+        )
+        .await;
+
+        // 2. The employee that genuinely had nothing to do, which is a real
+        //    state — `Outcome::NoWork` exists for the cases the loop can see
+        //    coming, and this is the same thing decided one layer later, by an
+        //    employee looking at its own empty queue.
+        let (quiet, said_so) = one_turn(
+            &db,
+            tenant,
+            "quiet",
+            vec![LlmResponse::text(
+                HAD_NOTHING_TO_DO,
+                Usage::new(4_000, 12, 0),
+            )],
+        )
+        .await;
+
+        // 3. And the employee that asked for something. It does not matter here
+        //    whether the gate allowed it: what matters is that it ruled.
+        let (worker, worked) = one_turn(
+            &db,
+            tenant,
+            "worker",
+            vec![
+                LlmResponse::tool_use(
+                    "call-1",
+                    "send_email",
+                    serde_json::json!({
+                        "to": "customer@example.com",
+                        "subject": "Your ticket",
+                        "body": "Sorted — anything else?",
+                    }),
+                    Usage::new(4_000, 60, 0),
+                ),
+                LlmResponse::text("Replied to the customer.", Usage::new(4_200, 20, 0)),
+            ],
+        )
+        .await;
+
+        // -- what the three have in common, which is everything else ---------
+        //
+        // All three woke, all three called the model, all three were metered,
+        // none of them errored. A dashboard built on any of these numbers shows
+        // three healthy employees.
+        for (who, billed) in [
+            ("narrator", &told),
+            ("quiet", &said_so),
+            ("worker", &worked),
+        ] {
+            assert!(
+                billed.calls >= 1,
+                "{who} did not reach the model: {billed:?}"
+            );
+            assert!(billed.is_complete(), "{who} was not metered: {billed:?}");
+            assert!(billed.input_tokens >= 4_000, "{who}: {billed:?}");
+        }
+
+        // -- and the one thing that tells them apart -------------------------
+
+        // The narrator: one run, nothing ruled on, and the size of what it said
+        // instead. `output_tokens` is the largest of the three, which is the
+        // whole joke.
+        assert_eq!(told.runs_unbacked, 1, "{told:?}");
+        assert_eq!(
+            told.unbacked_chars,
+            i64::try_from(NARRATED_A_DAY.chars().count()).expect("a short string"),
+            "{told:?}"
+        );
+        assert_eq!(rulings(&db, tenant, narrator).await, 0, "nothing to check");
+
+        // The quiet one is counted too — it called nothing, and this column is a
+        // measurement rather than an accusation. What separates it is the second
+        // number, which is why there are two and not a flag.
+        assert_eq!(said_so.runs_unbacked, told.runs_unbacked);
+        assert_eq!(
+            said_so.unbacked_chars,
+            i64::try_from(HAD_NOTHING_TO_DO.chars().count()).expect("a short string")
+        );
+        assert!(
+            said_so.unbacked_chars * 4 < told.unbacked_chars,
+            "an employee saying it had nothing to do is recorded the same as one \
+             narrating a day it did not have: {said_so:?} vs {told:?}"
+        );
+        assert_eq!(rulings(&db, tenant, quiet).await, 0);
+
+        // The worker asked for one thing and the gate ruled on it. Allowed or
+        // refused — this fixture's policy refuses, and that is the point: a
+        // denial is an `audit_log` row, and a row is a thing an operator can
+        // hold the employee's account of itself up against.
+        assert_eq!(worked.calls, 2, "two round trips: the call and the reply");
+        assert_eq!(worked.runs_unbacked, 0, "{worked:?}");
+        assert_eq!(worked.unbacked_chars, 0);
+        assert_eq!(
+            rulings(&db, tenant, worker).await,
+            1,
+            "the gate never ruled on the worker's proposal, so this test proves \
+             nothing about what a ruling buys"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
     /// The whole seam, through the real path: a chartered buyer whose cadence
     /// comes due reaches [`take_turn`], the vertical runs **before** the model,
     /// the RFQ goes out through the gate, and the row that makes the round
@@ -1728,6 +1986,26 @@ pub(crate) mod tests {
             spent, 1,
             "one cadence must cost exactly one turn, vertical or no vertical"
         );
+
+        // **And this turn's model called nothing, and that is fine.**
+        // `scripted_mock` is text-only, so `Finished::ruled_calls` is zero here
+        // — exactly like the seat that narrates a day it did not have. The
+        // difference is the RFQ above: the vertical acted before the model, one
+        // address at a time through the same gate, and left the audit rows this
+        // employee's closing summary can be checked against. A rule that read
+        // `tool_calls == 0` and stopped would libel every buyer in the fleet.
+        let billed = model_usage::on_day(
+            &mut db.tenant_tx(tenant).await.expect("tenant tx"),
+            employee,
+            Utc::now().date_naive(),
+        )
+        .await
+        .expect("ledger");
+        assert_eq!(
+            billed.runs_unbacked, 0,
+            "a turn whose vertical issued the RFQ is not a turn that did nothing: {billed:?}"
+        );
+        assert_eq!(billed.unbacked_chars, 0);
 
         drop_tenant(&db, tenant).await;
     }
