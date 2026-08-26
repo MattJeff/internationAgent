@@ -53,10 +53,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use agentos_domain::action::{Action, ActionCtx};
 use agentos_domain::action::{Channel, Domain};
 use agentos_domain::ids::{EmployeeId, TenantId};
 use agentos_domain::money::Currency;
-use agentos_domain::policy::PolicyLimits;
+use agentos_domain::policy::{EffectivePolicy, PolicyLimits, evaluate};
 use agentos_store::db::Db;
 use agentos_store::policy;
 use chrono::Utc;
@@ -125,15 +126,41 @@ const EXPECTED: &[Expected] = &[
         domains: &[],
         spend: None,
     },
-    // Cold outreach stays off. `contacts: 0` is the assertion that this
-    // document does not turn prospecting on the moment it is applied.
+    // **Cold outreach is on, at five.** The pack still ships `0` — a pack that
+    // turned prospecting on when it was installed would be the wrong default —
+    // and this document is where an operator turns it on, which is what a
+    // document is for. The number is the runbook's own argument: five is what
+    // one founder can personally read in a day, and until 2026-09-01 the
+    // seller's output is a queue that founder uploads by hand, so a day's
+    // openers have to be a day's reading.
+    //
+    // Two counters spend it and they do not share: `discover` counts contacts
+    // created, the approach path counts contacts written to. Five permits five
+    // of each, not five in total. `docs/ORIZN.md` says so under this seat's
+    // heading, because a legal boundary that is quietly doubled is worse than a
+    // higher one written down.
+    //
+    // `booking.com` is the prospect domain, and it buys reading only: no pack
+    // proposes `ActionKind::BrowserWrite`, which is asserted in
+    // `rolepack_sales`. It is one entry because it is the one domain the
+    // founder named — every further prospect is another hand edit here, and
+    // that is the shape of a research capability this system does not have.
     Expected {
         role: "sales-development",
         head: "sdr",
+        // `Web` because this seat reads a page, and reading is a channel now:
+        // it consults no host list, so this seat reads any public host.
+        //
+        // `domains` is **not** empty, and an early version of this change made
+        // it so on the theory that nothing writes. Nothing a *model* proposes
+        // writes — no pack carries `ActionKind::BrowserWrite` — but `Prober`
+        // types a passport into a prospect's form and asks the gate directly.
+        // Three dry-run passes came back `the sales vertical did not run:
+        // no_rule`. These are the hosts this seat may type into.
         turns: 30,
-        contacts: 0,
-        channels: &[Channel::Email, Channel::Internal],
-        domains: &["orizn.app"],
+        contacts: 5,
+        channels: &[Channel::Email, Channel::Internal, Channel::Web],
+        domains: &["booking.com", "orizn.app"],
         spend: None,
     },
     // Not zero contacts, and the difference is the reason: standing is computed
@@ -142,9 +169,18 @@ const EXPECTED: &[Expected] = &[
     Expected {
         role: "customer-success",
         head: "support",
+        // `Web` because this seat reads a page, and reading is a channel now:
+        // it consults no host list, so this seat reads any public host.
+        //
+        // `domains` is **not** empty, and an early version of this change made
+        // it so on the theory that nothing writes. Nothing a *model* proposes
+        // writes — no pack carries `ActionKind::BrowserWrite` — but `Prober`
+        // types a passport into a prospect's form and asks the gate directly.
+        // Three dry-run passes came back `the sales vertical did not run:
+        // no_rule`. These are the hosts this seat may type into.
         turns: 20,
         contacts: 20,
-        channels: &[Channel::Email, Channel::Internal],
+        channels: &[Channel::Email, Channel::Internal, Channel::Web],
         domains: &["orizn.app"],
         spend: None,
     },
@@ -154,7 +190,16 @@ const EXPECTED: &[Expected] = &[
         head: "acquisition",
         turns: 10,
         contacts: 0,
-        channels: &[Channel::Internal],
+        // `Web` because this seat reads a page, and reading is a channel now:
+        // it consults no host list, so this seat reads any public host.
+        //
+        // `domains` is **not** empty, and an early version of this change made
+        // it so on the theory that nothing writes. Nothing a *model* proposes
+        // writes — no pack carries `ActionKind::BrowserWrite` — but `Prober`
+        // types a passport into a prospect's form and asks the gate directly.
+        // Three dry-run passes came back `the sales vertical did not run:
+        // no_rule`. These are the hosts this seat may type into.
+        channels: &[Channel::Internal, Channel::Web],
         domains: &["orizn.app"],
         spend: None,
     },
@@ -570,6 +615,23 @@ async fn stored_layer(db: &Db, tenant: TenantId, role: &str) -> PolicyLimits {
     serde_json::from_value(json).expect("the stored row is a PolicyLimits")
 }
 
+/// A turn in which nothing but the browsing rule can decide.
+///
+/// Trusted and a *known* counterparty on purpose: a read must not depend on the
+/// trust wire (`BROWSE_RISK` is `Low`) and must not spend the cold-outreach
+/// budget (a page is not a person), and a context that left either open would
+/// let this assertion pass or fail for a reason it is not about.
+fn browse_ctx(tenant: TenantId, employee: EmployeeId) -> ActionCtx {
+    ActionCtx {
+        trust: agentos_domain::action::TrustLabel::Trusted,
+        contact: agentos_domain::action::ContactStanding::Known,
+        ..ActionCtx::new(
+            agentos_domain::action::Actor::new(tenant, employee),
+            chrono::Utc::now(),
+        )
+    }
+}
+
 fn channels(of: &[Channel]) -> BTreeSet<Channel> {
     of.iter().copied().collect()
 }
@@ -740,6 +802,72 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
             domains(expected.domains),
             "{role}: allowed_domains"
         );
+
+        // **Can this seat actually do the thing the columns above describe?**
+        //
+        // The columns are values; this is the rule they produce. It is here
+        // because a change that emptied `allowed_domains` — on the theory that
+        // reading no longer needs it and nothing writes — left every column
+        // above internally consistent, passed 1,255 tests, and stopped the
+        // selling vertical dead: `Prober` types a passport into a prospect's
+        // booking form, that is a `BrowserWrite`, and three dry-run passes came
+        // back `no_rule`. A table of values cannot notice that. A ruling can.
+        //
+        // Both halves, because they now come from different fields: any public
+        // host is readable off `Channel::Web`, and only a named host is
+        // writable off `allowed_domains`.
+        let browses = |limits: &PolicyLimits, action| {
+            let policy = EffectivePolicy::try_new(limits, limits, limits, limits)
+                .expect("one layer against itself");
+            evaluate(&policy, &action, &browse_ctx(server.tenant, employee))
+        };
+        let elsewhere = Domain::parse("condor.example").expect("a host nobody named");
+        let elsewhere_write = elsewhere.clone();
+        let carries_web = expected.channels.contains(&Channel::Web);
+
+        assert_eq!(
+            browses(limits, Action::BrowserRead { domain: elsewhere }).is_allow(),
+            carries_web,
+            "{role}: reading a host nobody named must follow `web` and nothing else"
+        );
+        for named in expected.domains {
+            let named = Domain::parse(named).expect("a valid domain");
+            assert!(
+                browses(
+                    limits,
+                    Action::BrowserWrite {
+                        domain: named.clone()
+                    }
+                )
+                .is_allow(),
+                "{role}: {named} is on this seat's write list and it cannot type into it — \
+                 the prober fills a form and that is a write"
+            );
+        }
+        assert!(
+            !browses(
+                limits,
+                Action::BrowserWrite {
+                    domain: elsewhere_write
+                }
+            )
+            .is_allow(),
+            "{role}: a host nobody named is writable — the write allowlist is the \
+             half of the browsing split that did NOT open"
+        );
+
+        // **The loop above is vacuous when the list is empty**, which is how a
+        // first version of this guard passed the very mutation it was written
+        // to catch. So the seat whose job is probing states the requirement
+        // directly: a seller that can type nowhere cannot run a proof of need,
+        // and that is a broken deployment however tidy its columns look.
+        if role == "sales-development" {
+            assert!(
+                !limits.allowed_domains.is_empty(),
+                "the seller has no host it may type into, so `Prober` cannot fill a \
+                 single booking form and the whole vertical returns `no_rule`"
+            );
+        }
 
         match (limits.spend, expected.spend) {
             (None, None) => {}

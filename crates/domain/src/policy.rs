@@ -752,14 +752,31 @@ fn domain_rules(allowed: &BTreeSet<Domain>, denied: &BTreeSet<Domain>, host: &Do
 /// host was wrong or merely not permitted — and a live run spent five of
 /// twenty-three model calls guessing.
 ///
-/// [`Action::BrowserWrite`] and [`Action::FileUpload`] get the same ruling from
-/// the same function, because `PolicyLimits` has one `allowed_domains` set
-/// shared by reading and writing. This is spelled `browser_read` rather than
-/// `domain` because that is the question the prompt asks, and because the upload
-/// arm has a second half (`allow_file_upload`) that this does not answer.
+/// [`Action::BrowserWrite`] and [`Action::FileUpload`] no longer get the same
+/// ruling, and that is the change this function exists to carry. They still ask
+/// `allowed_domains`; reading asks `Channel::Web` and the denylist. Naming it
+/// `browser_read` was a guess about the future that turned out right — the
+/// arms it used to share have separated underneath it and no caller had to
+/// learn that they had.
+///
+/// **What it can no longer be used for.** It used to answer "which domains may
+/// this employee read?", by being asked once per entry in a finite allowlist.
+/// There is no such list now, so a caller wanting to *enumerate* the readable
+/// web is asking a question with no answer, and `app::prompt::render_domains`
+/// was rewritten to stop asking it. What survives is the per-host question the
+/// prober asks before it opens something: *may I read this one?*
 pub fn evaluate_browser_read(policy: &EffectivePolicy, domain: &Domain) -> Decision {
     let limits = policy.limits();
-    domain_rules(&limits.allowed_domains, &limits.denied_domains, domain)
+    if is_denied(&limits.denied_domains, domain) {
+        Decision::deny(DenyReason::DomainDenied)
+    } else if limits.allowed_channels.contains(&Channel::Web) {
+        Decision::Allow
+    } else {
+        Decision::deny(no_match(
+            limits.allowed_channels.is_empty(),
+            DenyReason::ChannelNotAllowed,
+        ))
+    }
 }
 
 /// Does this policy deny **every** action of this kind, whatever its payload
@@ -849,10 +866,22 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         ActionKind::SmsSend => closed(Channel::Sms) || allowed_calling_codes.is_empty(),
         ActionKind::WhatsappSend => closed(Channel::Whatsapp) || allowed_calling_codes.is_empty(),
         ActionKind::CallPlace => closed(Channel::Voice) || allowed_calling_codes.is_empty(),
-        // DomainNotAllowed / NoRule. An empty allowlist is within nothing.
-        ActionKind::BrowserRead | ActionKind::BrowserWrite => allowed_domains.is_empty(),
-        // The same, then FileUploadNotAllowed: an upload has to clear the
-        // domain rules *and* the flag, so either half closing shuts the kind.
+        // **These two stopped agreeing**, and the split is the point.
+        //
+        // ChannelNotAllowed / NoRule for a read: the allowlist is not asked, so
+        // an empty one closes nothing and `Channel::Web` is the only thing that
+        // can. A layer that wants a seat off the web drops the channel, which
+        // intersects like every other allowlist here.
+        ActionKind::BrowserRead => closed(Channel::Web),
+        // ChannelNotAllowed / NoRule, then DomainNotAllowed / NoRule. Writing
+        // has to clear both, so either half closing shuts the kind — and an
+        // empty allowlist is still within nothing.
+        ActionKind::BrowserWrite => closed(Channel::Web) || allowed_domains.is_empty(),
+        // The same as a write, then FileUploadNotAllowed: an upload has to
+        // clear the domain rules *and* the flag, so either half closing shuts
+        // the kind. Deliberately keyed on the allowlist rather than the read
+        // rule — pushing bytes to a host is the write-shaped verb, whatever
+        // the tool is called.
         ActionKind::FileUpload => allowed_domains.is_empty() || !*allow_file_upload,
         // ToolNotAllowed / NoRule — `mcp_rules`, which `evaluate_mcp_call` is
         // the other reader of.
@@ -920,12 +949,30 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
     // of either is the copy that drifts.
     let blocked = |d: &Domain| is_denied(denied_domains, d);
     let domains = |d: &Domain| domain_rules(allowed_domains, denied_domains, d);
-    let channel_rules = |channel: Channel| -> Option<DenyReason> {
-        if !allowed_channels.contains(&channel) {
+    // **Split from `channel_rules` when reading became a channel**, and the
+    // split is not cosmetic. `channel_rules` asks two questions — is this
+    // channel open, and may this employee approach a stranger today — and
+    // routing `BrowserRead` through it made opening a web page spend the
+    // cold-outreach budget. A page is not a person: nobody is contacted, no
+    // personal data is processed, and `max_new_contacts_per_day` is the number
+    // an operator answers a supervisory authority for. Sharing it with the
+    // browser would have quietly halved it.
+    //
+    // `a_check_that_does_not_reproduce_produces_no_evidence` is what caught it:
+    // the prober's second read came back `contact_budget_exhausted`.
+    let channel_open = |channel: Channel| -> Option<DenyReason> {
+        if allowed_channels.contains(&channel) {
+            None
+        } else {
             Some(no_match(
                 allowed_channels.is_empty(),
                 DenyReason::ChannelNotAllowed,
             ))
+        }
+    };
+    let channel_rules = |channel: Channel| -> Option<DenyReason> {
+        if let Some(reason) = channel_open(channel) {
+            Some(reason)
         } else if ctx.contact == ContactStanding::New
             && ctx.new_contacts_today >= *max_new_contacts_per_day
         {
@@ -978,9 +1025,65 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
         }
 
-        Action::BrowserRead { domain } => domains(domain),
+        // **Reading is a channel, not a list**, and it is the only arm here that
+        // changed its shape after shipping. Every other outbound verb asks
+        // `channel_rules` first and consults a list about the *recipient*
+        // second; browsing asked a list and no channel at all, which left
+        // `Channel::Web` in `allowed_channels` with nothing reading it.
+        //
+        // The list could not be the rule for reading, because the rule it
+        // expressed was "an operator has typed this host in advance" — and a
+        // seller that must be handed each prospect's domain is not researching,
+        // it is transcribing. A live dry run said so in the employee's own
+        // words: *"blocked on tool access — I have no way to read their
+        // booking/servicing flows, since read_page only reaches orizn.app."*
+        //
+        // What makes an open read defensible here and not in general is two
+        // properties this workspace already had. A page comes back as
+        // `Untrusted<String>`, which has no `Display`, no `Deref` and no
+        // `Into<String>` — `crates/app/tests/ui` proves `format!("{}", …)`
+        // fails to compile — so its bytes cannot become an email, a prompt or a
+        // column. And the arm below still asks the allowlist, so
+        // `allowed_domains` keeps its whole meaning for the verb that actually
+        // changes somebody else's system.
+        //
+        // **That allowlist is not decorative**, and an early draft of this
+        // change assumed it was. No role pack proposes
+        // `ActionKind::BrowserWrite`, so no *model* can ever ask for one — but
+        // `proof_of_need::Prober` is Rust and asks the gate directly: putting a
+        // passport code into a prospect's booking form is a write, on purpose,
+        // so that the audit trail says so. Emptying `allowed_domains` on the
+        // strength of "nothing writes" stopped the entire selling vertical with
+        // `no_rule`, three dry-run passes out of three. Reading is open;
+        // *typing into somebody's form* is still a host an operator named.
+        //
+        // The denylist is still checked, and still first, so an operator can
+        // block a host for reading exactly as before. What is gone is the
+        // requirement to enumerate the web in order to look at it.
+        //
+        // Turning reading off entirely is `Channel::Web` absent from a layer —
+        // which is a narrowing, intersects like every other allowlist, and is
+        // how `direction.json` keeps a chair from browsing without naming a
+        // single domain.
+        Action::BrowserRead { domain } => {
+            if blocked(domain) {
+                Decision::deny(DenyReason::DomainDenied)
+            } else {
+                match channel_open(Channel::Web) {
+                    Some(reason) => Decision::deny(reason),
+                    None => Decision::Allow,
+                }
+            }
+        }
 
-        Action::BrowserWrite { domain } => domains(domain),
+        // Writing keeps the allowlist, and now asks the channel too — the same
+        // two questions in the same order as `EmailSend`. A host somebody may
+        // read is not a host anything may post to, and that asymmetry is the
+        // whole reason the two arms stopped sharing a rule.
+        Action::BrowserWrite { domain } => match channel_open(Channel::Web) {
+            Some(reason) => Decision::deny(reason),
+            None => domains(domain),
+        },
 
         Action::FileUpload { domain } => match domains(domain) {
             Decision::Allow if *allow_file_upload => Decision::Allow,
@@ -2176,14 +2279,23 @@ mod tests {
         );
     }
 
-    /// The same claim one tool along: `app::prompt` names the domains an
-    /// employee may read by calling [`evaluate_browser_read`], and the gate
-    /// rules on the read itself through [`evaluate`].
+    /// The same claim one tool along: `app::prompt` tells an employee what it
+    /// may read by calling [`evaluate_browser_read`], and the gate rules on the
+    /// read itself through [`evaluate`]. Two spellings of one rule is the copy
+    /// that drifts, and this is what stops it.
     ///
-    /// The denylist is the half that makes this worth its own test.
-    /// `allowed_domains` intersects across layers and `denied_domains` unions,
-    /// so a host can be on the allowlist and still be refused — and a prompt
-    /// that read the allowlist instead of asking would name it and cost a turn.
+    /// **The rule underneath both of them changed**, which is why the tail of
+    /// this test reads the way it does. A read used to clear `allowed_domains`;
+    /// it now clears `Channel::Web` and the denylist, and consults no allowlist
+    /// at all. The loop below is unchanged and still passes, which is the
+    /// interesting part: it never asserted *which* rule, only that one rule has
+    /// one answer.
+    ///
+    /// The denylist is the half that makes this worth its own test. It
+    /// **unions** across layers where allowlists intersect, so it is the only
+    /// thing that can still refuse a host on the open web — and a prompt that
+    /// guessed instead of asking would send a model to spend a turn on
+    /// `domain_denied`.
     #[test]
     fn naming_a_domain_and_ruling_on_it_are_the_same_rule() {
         let walled = effective(&PolicyLimits {
@@ -2228,7 +2340,6 @@ mod tests {
             }
         }
 
-        // The allowlist alone would have named all three of these.
         assert!(evaluate_browser_read(&walled, &domain("example.com")).is_allow());
         assert!(evaluate_browser_read(&walled, &domain("shop.example.com")).is_allow());
         assert_eq!(
@@ -2237,12 +2348,99 @@ mod tests {
                 reason: DenyReason::DomainDenied
             }
         );
-        // And an empty allowlist is nobody having written a rule, not a list
-        // this host failed to be on.
+
+        // **The change, stated as an assertion.** `alibaba.com` is on nobody's
+        // allowlist in either fixture and is readable in both. Before, this was
+        // `DomainNotAllowed` under `walled` and `NoRule` under `silent`; a
+        // seller therefore could not open a prospect's page until an operator
+        // had typed that prospect's domain, which is the thing a live dry run
+        // reported as being blocked on.
+        assert!(evaluate_browser_read(&walled, &domain("alibaba.com")).is_allow());
+        assert!(evaluate_browser_read(&silent, &domain("alibaba.com")).is_allow());
+
+        // What still refuses, and it is a *narrowing* that does it. Dropping
+        // `Channel::Web` takes the whole web away in one field, which is how a
+        // layer says "this seat does not browse" without enumerating anything.
+        let landlocked = effective(&PolicyLimits {
+            allowed_channels: [Channel::Email, Channel::Internal].into_iter().collect(),
+            ..permissive()
+        });
         assert_eq!(
-            evaluate_browser_read(&silent, &domain("example.com")),
+            evaluate_browser_read(&landlocked, &domain("example.com")),
+            Decision::Deny {
+                reason: DenyReason::ChannelNotAllowed
+            }
+        );
+        // And an empty channel list is nobody having written a rule, not a
+        // channel this read failed to be on — the distinction the gate reports
+        // everywhere else, now reported here too.
+        let mute = effective(&PolicyLimits {
+            allowed_channels: BTreeSet::new(),
+            ..permissive()
+        });
+        assert_eq!(
+            evaluate_browser_read(&mute, &domain("example.com")),
             Decision::Deny {
                 reason: DenyReason::NoRule
+            }
+        );
+
+        // The denylist outranks the open web, in both directions of the change.
+        assert_eq!(
+            evaluate_browser_read(&walled, &domain("login.banking.example.com")),
+            Decision::Deny {
+                reason: DenyReason::DomainDenied
+            }
+        );
+
+        // **The hole this test had, and the bug that fell through it.**
+        //
+        // Routing a read through `channel_rules` made it spend
+        // `max_new_contacts_per_day`, because that closure asks two questions
+        // at once. The loop above could not see it: its `ActionCtx` carries a
+        // *known* counterparty, so the contact clause never fired on either
+        // side. A page is not a person — nobody is contacted by being read —
+        // and the number that clause spends is the one an operator answers a
+        // supervisory authority for.
+        let spent = effective(&PolicyLimits {
+            max_new_contacts_per_day: 0,
+            denied_domains: [domain("banking.example.com")].into_iter().collect(),
+            ..permissive()
+        });
+        let stranger = ActionCtx {
+            contact: ContactStanding::New,
+            ..ctx()
+        };
+        for host in ["example.com", "alibaba.com"] {
+            let host = domain(host);
+            assert_eq!(
+                evaluate(
+                    &spent,
+                    &Action::BrowserRead {
+                        domain: host.clone()
+                    },
+                    &stranger
+                ),
+                evaluate_browser_read(&spent, &host),
+                "an exhausted contact budget changed a browser read of {host}"
+            );
+            assert!(
+                evaluate_browser_read(&spent, &host).is_allow(),
+                "{host} was refused to an employee that may browse"
+            );
+        }
+        // …while the verb that *does* approach somebody still pays, on the very
+        // same policy and the very same context.
+        assert_eq!(
+            evaluate(
+                &spent,
+                &Action::EmailSend {
+                    to: EmailAddress::parse("buyer@alibaba.com").unwrap()
+                },
+                &stranger
+            ),
+            Decision::Deny {
+                reason: DenyReason::ContactBudgetExhausted
             }
         );
     }

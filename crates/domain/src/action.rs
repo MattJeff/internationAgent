@@ -40,7 +40,51 @@ pub enum DomainError {
     IpAddress(String),
     #[error("host needs at least two labels: {0:?}")]
     TooFewLabels(String),
+    /// A name that only resolves inside somebody's network.
+    ///
+    /// Its own variant rather than [`NotAHost`](DomainError::NotAHost) because
+    /// it is a *well-formed* host that this system refuses on purpose, and an
+    /// operator reading the error deserves to know which of the two happened.
+    #[error("host is not on the public internet: {0:?}")]
+    NotPublic(String),
 }
+
+/// Suffixes that never name a host on the public internet.
+///
+/// **This became load-bearing when reading stopped consulting an allowlist.**
+/// While `policy::evaluate` answered a browser read out of `allowed_domains`,
+/// an internal name was refused by not being on anybody's list. It is now
+/// refused by not being expressible: `Channel::Web` grants the whole public
+/// web, so the line between "the web" and "somebody's network" has to be drawn
+/// here, at the only constructor, where a `Domain` that names a router admin
+/// page cannot come into existence to be read, mailed to, or bound as a peer.
+///
+/// [RFC 6761] reserves `localhost`; [RFC 6762] reserves `local` for mDNS;
+/// [RFC 8375] reserves `home.arpa`; ICANN reserved `internal` for private use
+/// in 2024. `localhost` is single-label and already dies on
+/// [`DomainError::TooFewLabels`], and it is listed anyway because
+/// `foo.localhost` is not.
+///
+/// **Not listed, deliberately:** `test`, `example`, `example.com` — and
+/// `invalid`, which was listed for one commit until
+/// `peer_keys::a_pinned_peer_never_touches_the_network` failed on
+/// `nobody.example.invalid`. All four are reserved against *collision*, not
+/// against routing: they resolve nowhere and reach nothing, so refusing them
+/// buys no safety. `invalid` is the sharpest case — RFC 6761 guarantees it
+/// never resolves, which makes it the correct host for a test asserting that
+/// no packet leaves, and banning it would have deleted the only spelling of
+/// "this must not be reachable".
+///
+/// **What this does not cover, and cannot.** A perfectly public name that
+/// resolves to `10.0.0.5`. No parser can see that; it needs the resolver, and
+/// checking it here would be a check on a different address from the one the
+/// browser eventually connects to (`crates/providers` owns that, and DNS
+/// rebinding means even there it is a narrowing rather than a proof).
+///
+/// [RFC 6761]: https://www.rfc-editor.org/rfc/rfc6761
+/// [RFC 6762]: https://www.rfc-editor.org/rfc/rfc6762
+/// [RFC 8375]: https://www.rfc-editor.org/rfc/rfc8375
+const PRIVATE_USE_SUFFIXES: &[&str] = &["local", "internal", "localhost", "home.arpa"];
 
 /// A host name normalised once, at the edge, so every later comparison is a
 /// byte comparison.
@@ -75,6 +119,12 @@ impl Domain {
             Some(Host::Domain(host)) => {
                 if !host.contains('.') {
                     return Err(DomainError::TooFewLabels(host.to_owned()));
+                }
+                if PRIVATE_USE_SUFFIXES
+                    .iter()
+                    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+                {
+                    return Err(DomainError::NotPublic(host.to_owned()));
                 }
                 Ok(Self(host.to_owned()))
             }
@@ -824,6 +874,56 @@ mod tests {
             "127.0.0.1",
         ] {
             assert!(Domain::parse(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// **A name that only resolves inside a network cannot be built.**
+    ///
+    /// This is the half of the browsing change that is not in `policy.rs`.
+    /// While a read had to clear `allowed_domains`, an internal name was
+    /// refused for not being on a list somebody typed. Reading now clears
+    /// `Channel::Web` and the denylist only — the whole public web — so
+    /// "public" has to mean something, and the only place it can mean anything
+    /// is here, at the one constructor.
+    ///
+    /// Both halves are asserted: the value cannot be *read*, and it cannot be
+    /// *blocked* either, because a denylist entry is a `Domain` too. That is
+    /// the right trade — an operator cannot block what nobody can name.
+    #[test]
+    fn a_name_inside_somebody_s_network_is_not_a_domain() {
+        for host in [
+            "printer.local",
+            "vault.internal",
+            "api.home.arpa",
+            "app.localhost",
+            // The bare reserved labels, which `TooFewLabels` also refuses —
+            // asserted here so that relaxing the two-label rule cannot quietly
+            // let them back in.
+            "localhost",
+            "local",
+        ] {
+            assert!(
+                Domain::parse(host).is_err(),
+                "{host} parsed, and a policy that grants the public web would read it"
+            );
+        }
+
+        // Reserved against collision rather than against routing. These reach
+        // nothing, so refusing them buys nothing — and every fixture in this
+        // workspace would break.
+        for host in [
+            "example.com",
+            "nordmetall.example",
+            "shop.test",
+            "orizn.app",
+        ] {
+            assert!(Domain::parse(host).is_ok(), "{host} was refused");
+        }
+
+        // Not a suffix match on the raw string: a real public host that merely
+        // ends in those letters is public.
+        for host in ["mylocal.com", "internal-affairs.gov.uk", "local.orizn.app"] {
+            assert!(Domain::parse(host).is_ok(), "{host} was refused");
         }
     }
 

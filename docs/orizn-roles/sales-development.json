@@ -2,10 +2,12 @@
   "spend": null,
   "allowed_channels": [
     "email",
-    "internal"
+    "internal",
+    "web"
   ],
   "allowed_calling_codes": [],
   "allowed_domains": [
+    "booking.com",
     "orizn.app"
   ],
   "denied_domains": [],
@@ -15,7 +17,7 @@
     "claude-haiku-4-5",
     "claude-sonnet-5"
   ],
-  "max_new_contacts_per_day": 0,
+  "max_new_contacts_per_day": 5,
   "max_turns_per_day": 30,
   "allow_file_upload": false,
   "allow_credential_change": false,

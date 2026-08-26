@@ -1539,10 +1539,14 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
             Truth::Characterises,
         )
         .note(
-            "`contact_budget_exhausted` is the approach meeting `max_new_contacts_per_day: 0` in \
-             docs/orizn-roles/sales-development.json — what the pack ships and what this \
-             deployment installed. The finding was still made and still filed; it is a boundary \
-             an operator raises, not a failure of the turn",
+            "`sent` is what this row said `contact_budget_exhausted` for as long as \
+             docs/orizn-roles/sales-development.json carried `max_new_contacts_per_day: 0`. The \
+             operator raised it to five on 2026-08-26 and the approach goes out — five being \
+             what one founder can read in a day, which is the binding constraint while the \
+             queue is loaded into Smartlead by hand. `did not run: no_rule` is the third thing \
+             this row can say and it is never a boundary: it means the seller could not probe \
+             at all, and the one way to earn it is an empty `allowed_domains`, because `Prober` \
+             types into the prospect's form and typing is a write",
         ),
     );
 

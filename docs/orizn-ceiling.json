@@ -1,12 +1,28 @@
 {
   "spend": {
-    "max_per_transaction": { "minor": 50000, "currency": "USD" },
-    "max_per_day": { "minor": 200000, "currency": "USD" },
-    "approval_above": { "minor": 100, "currency": "USD" }
+    "max_per_transaction": {
+      "minor": 50000,
+      "currency": "USD"
+    },
+    "max_per_day": {
+      "minor": 200000,
+      "currency": "USD"
+    },
+    "approval_above": {
+      "minor": 100,
+      "currency": "USD"
+    }
   },
-  "allowed_channels": ["email", "internal", "web"],
+  "allowed_channels": [
+    "email",
+    "internal",
+    "web"
+  ],
   "allowed_calling_codes": [],
-  "allowed_domains": ["orizn.app"],
+  "allowed_domains": [
+    "booking.com",
+    "orizn.app"
+  ],
   "denied_domains": [],
   "allowed_mcp_tools": [],
   "allowed_a2a_peers": [],

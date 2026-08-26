@@ -1107,13 +1107,15 @@ impl Flow {
 /// deployment ever has enough of these to be stuck, the upgrade is a `skipped`
 /// count on the same query, not a filter that hides them.
 ///
-/// # The allowlist is read, not exercised
+/// # The policy is read, not exercised
 ///
 /// [`agentos_store::policy::load`] and
 /// [`evaluate_browser_read`](agentos_domain::policy::evaluate_browser_read) —
-/// the same pair [`crate::prompt`] uses to decide which domains the employee is
-/// *told* about, so the refusal here and the list in its own system prompt
-/// cannot disagree. Deliberately not [`PolicyGate::authorize`]: that mints an
+/// the same pair [`crate::prompt`] uses to decide what the employee is *told*
+/// about the web, so the refusal here and its own system prompt cannot
+/// disagree. Since reading became a channel that pair answers a different
+/// question — `Channel::Web` and the denylist rather than an allowlist — and
+/// the reason to keep asking *it* rather than restating the rule is unchanged. Deliberately not [`PolicyGate::authorize`]: that mints an
 /// audit row for a `browser_read`, and this has not read anything. An audit trail
 /// with browses in it that never happened is worse than no check here at all.
 /// The gate still rules on every actual step; this only decides whether it is
@@ -1985,9 +1987,15 @@ impl Checked {
 /// string.
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
-    /// The gate refused — most often because the prospect's domain is not on
-    /// the allowlist, which is what stops this being a general-purpose
-    /// scraper.
+    /// The gate refused — because the seat carries no `Channel::Web`, or
+    /// because an operator has blocked this host by name.
+    ///
+    /// **It is no longer an allowlist that stops this being a general-purpose
+    /// scraper**, and nothing in the gate is: a seat that may browse may browse
+    /// anywhere public. What bounds it now is upstream and narrower than a host
+    /// list ever was — `next_flow` probes a *confirmed* `ProspectFlow`, a row
+    /// an operator sealed, one at a time, oldest first. There is no verb here
+    /// that takes a URL.
     #[error(transparent)]
     Refused(Denied),
     /// The gate said yes and the browser step failed — including the panel
@@ -2385,11 +2393,26 @@ mod tests {
         Domain::parse(raw).expect("domain")
     }
 
-    /// Only `book.airline.example` may be visited. Everything else in this
-    /// module leans on that being the whole allowlist.
+    /// A seat that may browse, with one host taken away from it.
+    ///
+    /// **This fixture used to be an allowlist of one** — `book.airline.example`
+    /// and nothing else — and the module leaned on that being the whole of what
+    /// the prober could reach. Reading no longer consults `allowed_domains`, so
+    /// an allowlist of one restricts nothing; what a policy can still say about
+    /// a *read* is `Channel::Web` (all of it, or none) and `denied_domains`
+    /// (these holes in it).
+    ///
+    /// So the fixture inverts. `Channel::Web` is granted, because the whole
+    /// point of a prober is to open a prospect's page and no operator can be
+    /// asked to type them in advance. `somewhere.else.example` is *blocked*,
+    /// which is what the tests below that used to lean on the allowlist lean on
+    /// now — and it is a stronger claim than the one it replaces, because a
+    /// denylist entry unions across layers and cannot be widened away.
     fn limits() -> PolicyLimits {
         PolicyLimits {
+            allowed_channels: BTreeSet::from([agentos_domain::message::Channel::Web]),
             allowed_domains: BTreeSet::from([domain("book.airline.example")]),
+            denied_domains: BTreeSet::from([domain("somewhere.else.example")]),
             ..PolicyLimits::default()
         }
     }
@@ -3474,12 +3497,15 @@ mod tests {
             ]
         );
 
-        // The gate refusing is an attempt too, and it carries the deny code.
+        // The gate refusing is an attempt too, and it carries the deny code —
+        // which is now `domain_denied`, because a host is refused by being
+        // blocked rather than by being absent from a list.
         let refused = harness(
             &db,
             &["No visa required."],
             PolicyLimits {
-                allowed_domains: BTreeSet::from([domain("somewhere.else.example")]),
+                allowed_channels: BTreeSet::from([agentos_domain::message::Channel::Web]),
+                denied_domains: BTreeSet::from([domain("book.airline.example")]),
                 ..PolicyLimits::default()
             },
         )
@@ -3488,10 +3514,10 @@ mod tests {
             .prober
             .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
-            .expect_err("not allowed");
+            .expect_err("blocked");
         assert_eq!(
             attempts(&db, &refused.principal).await,
-            vec![("error".to_owned(), Some("domain_not_allowed".to_owned()))]
+            vec![("error".to_owned(), Some("domain_denied".to_owned()))]
         );
 
         // And the view: one evidence, one truth_stale that is *not* in the
@@ -3635,31 +3661,61 @@ mod tests {
         );
     }
 
-    /// The fence. A prospect nobody allow-listed is refused by the gate, and
-    /// the browser is never touched — which is what keeps this a proof-of-need
-    /// tool rather than a scraper aimed at the web.
+    /// **The fence, and it moved.** A refused prospect is refused *before* the
+    /// browser is touched — that is the claim, and it is unchanged. What
+    /// changed is what does the refusing.
+    ///
+    /// It used to be the allowlist: a prospect nobody had typed was
+    /// `domain_not_allowed`. Reading no longer consults an allowlist, so the
+    /// two things that still refuse a read are asserted here instead, on the
+    /// same prospect and the same prober:
+    ///
+    /// 1. **A blocked host** — `denied_domains` unions across layers, so this
+    ///    is the one refusal an operator can add and no layer can take back.
+    /// 2. **A seat with no `Channel::Web`** — the whole-web switch, which is
+    ///    how a policy says "this employee does not browse" without naming
+    ///    anything.
+    ///
+    /// What is *not* what keeps this a proof-of-need tool rather than a scraper
+    /// is the host list, and pretending otherwise would be the comfortable lie.
+    /// What keeps it one is upstream: `next_flow` hands the prober a
+    /// **confirmed** `ProspectFlow` an operator sealed, one at a time. There is
+    /// no verb here that takes a URL.
     #[tokio::test]
-    async fn a_site_outside_the_allowlist_is_denied_before_any_browsing() {
+    async fn a_blocked_site_is_denied_before_any_browsing() {
         let Some(db) = db().await else { return };
-        let h = harness(
-            &db,
-            &["No visa required."],
-            PolicyLimits {
-                allowed_domains: BTreeSet::from([domain("somewhere.else.example")]),
-                ..PolicyLimits::default()
-            },
-        )
-        .await;
 
-        let err = h
-            .prober
-            .check(&flow(), &probe(), Some(&authority()), None, now())
-            .await
-            .expect_err("book.airline.example is not allowed");
+        for (limits, code, why) in [
+            (
+                PolicyLimits {
+                    allowed_channels: BTreeSet::from([agentos_domain::message::Channel::Web]),
+                    denied_domains: BTreeSet::from([domain("book.airline.example")]),
+                    ..PolicyLimits::default()
+                },
+                "domain_denied",
+                "an operator blocked this host by name",
+            ),
+            (
+                PolicyLimits {
+                    allowed_channels: BTreeSet::new(),
+                    ..PolicyLimits::default()
+                },
+                "no_rule",
+                "this seat carries no web channel at all",
+            ),
+        ] {
+            let h = harness(&db, &["No visa required."], limits).await;
 
-        assert_eq!(err.code(), "domain_not_allowed");
-        assert!(h.browser.log().is_empty(), "{:?}", h.browser.log());
-        assert_eq!(h.reads(), 0);
+            let err = h
+                .prober
+                .check(&flow(), &probe(), Some(&authority()), None, now())
+                .await
+                .expect_err(why);
+
+            assert_eq!(err.code(), code, "{why}");
+            assert!(h.browser.log().is_empty(), "{why}: {:?}", h.browser.log());
+            assert_eq!(h.reads(), 0, "{why}");
+        }
     }
 
     // -- where a flow comes from -------------------------------------------
@@ -3770,7 +3826,7 @@ mod tests {
     /// Somebody wrote a flow and somebody signed it; if the employee may not go
     /// there, that is a policy layer to write or a flow to delete, and a loop
     /// that stepped over it would never say so. `Prober::check` refuses the same
-    /// domain with the same code — `a_site_outside_the_allowlist_is_denied_before_any_browsing`
+    /// domain with the same code — `a_blocked_site_is_denied_before_any_browsing`
     /// — and this is the same refusal one round trip earlier, before an Orizn
     /// lookup has been spent on it.
     #[tokio::test]
@@ -3780,7 +3836,11 @@ mod tests {
             &db,
             &["No visa required."],
             PolicyLimits {
-                allowed_domains: BTreeSet::from([domain("somewhere.else.example")]),
+                // Blocked by name rather than absent from a list: an allowlist
+                // no longer decides a read, and `next_flow` must refuse for the
+                // reason the gate would actually give.
+                allowed_channels: BTreeSet::from([agentos_domain::message::Channel::Web]),
+                denied_domains: BTreeSet::from([domain("book.airline.example")]),
                 ..PolicyLimits::default()
             },
         )
@@ -3799,8 +3859,8 @@ mod tests {
 
         let err = next_flow(&db, &h.principal, "airline")
             .await
-            .expect_err("book.airline.example is not on this employee's allowlist");
-        assert_eq!(err.code(), "domain_not_allowed");
+            .expect_err("book.airline.example is blocked for this employee");
+        assert_eq!(err.code(), "domain_denied");
         assert!(err.to_string().contains("book.airline.example"), "{err}");
         assert!(h.browser.log().is_empty(), "{:?}", h.browser.log());
     }

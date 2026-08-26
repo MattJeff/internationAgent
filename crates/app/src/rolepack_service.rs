@@ -532,7 +532,17 @@ impl RolePack {
                 // history that is not in the ticket is a support history the
                 // next person cannot read, which rules out WhatsApp and SMS
                 // before intrusiveness does.
-                allowed_channels: [Channel::Email, Channel::Internal].into_iter().collect(),
+                // `Channel::Web` because `proposable` above carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks `channel_rules(Channel::Web)` and no longer asks
+                // `allowed_domains` at all. A pack that proposes a browser read
+                // while its own channel list withholds the web would be
+                // contradicting itself one field later — and a layer that wants
+                // this seat off the web drops the channel, which narrows like
+                // every other allowlist here.
+                allowed_channels: [Channel::Email, Channel::Internal, Channel::Web]
+                    .into_iter()
+                    .collect(),
 
                 // No voice at all, matching the absent `CallPlace`.
                 allowed_calling_codes: BTreeSet::new(),
@@ -637,7 +647,15 @@ impl RolePack {
                 // public pages and hands drafts to colleagues — so every
                 // outward channel is absent and the absence is what stops an
                 // `EmailSend` that was somehow proposed anyway.
-                allowed_channels: [Channel::Internal].into_iter().collect(),
+                // `Channel::Web` because `proposable` above carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks `channel_rules(Channel::Web)` and no longer asks
+                // `allowed_domains` at all. A pack that proposes a browser read
+                // while its own channel list withholds the web would be
+                // contradicting itself one field later — and a layer that wants
+                // this seat off the web drops the channel, which narrows like
+                // every other allowlist here.
+                allowed_channels: [Channel::Internal, Channel::Web].into_iter().collect(),
                 allowed_calling_codes: BTreeSet::new(),
 
                 // Tenant inventory: which competitors, which analytics
@@ -761,7 +779,17 @@ impl RolePack {
                 // approval and the escalation. Nothing else — see the briefing
                 // on why a finance act that leaves no artefact is not a finance
                 // act.
-                allowed_channels: [Channel::Email, Channel::Internal].into_iter().collect(),
+                // `Channel::Web` because `proposable` above carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks `channel_rules(Channel::Web)` and no longer asks
+                // `allowed_domains` at all. A pack that proposes a browser read
+                // while its own channel list withholds the web would be
+                // contradicting itself one field later — and a layer that wants
+                // this seat off the web drops the channel, which narrows like
+                // every other allowlist here.
+                allowed_channels: [Channel::Email, Channel::Internal, Channel::Web]
+                    .into_iter()
+                    .collect(),
                 allowed_calling_codes: BTreeSet::new(),
 
                 // Tenant inventory: the bank's portal, the tax authority, the
@@ -920,7 +948,15 @@ impl RolePack {
 
                 // Internal only, matching the absent outward kinds. The
                 // findings go to a colleague and nowhere else.
-                allowed_channels: [Channel::Internal].into_iter().collect(),
+                // `Channel::Web` because `proposable` above carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks `channel_rules(Channel::Web)` and no longer asks
+                // `allowed_domains` at all. A pack that proposes a browser read
+                // while its own channel list withholds the web would be
+                // contradicting itself one field later — and a layer that wants
+                // this seat off the web drops the channel, which narrows like
+                // every other allowlist here.
+                allowed_channels: [Channel::Internal, Channel::Web].into_iter().collect(),
                 allowed_calling_codes: BTreeSet::new(),
 
                 // Empty, and this one deserves an argument because it is the
@@ -2271,27 +2307,30 @@ mod tests {
     /// the policy is asked, and this is the same list after: identical minus the
     /// names below, for every pack and both labels.
     ///
-    /// **`read_page` is the second name, and it is the same finding.**
-    /// `default_ceiling` also has an empty `allowed_domains`, so
-    /// `always_denies(BrowserRead)` is true and the read tool is withheld until
-    /// an operator names a domain — exactly as the MCP tool is withheld until
-    /// one names a server. That is the right answer and it is worth being blunt
-    /// about what it means: adding the read schema to the catalogue does not by
-    /// itself give a shipped employee a browser. It gives it one the moment
-    /// somebody says which sites it may see, which is a decision no default can
-    /// make on an operator's behalf — a browsing agent with a blank allowlist is
-    /// either useless or pointed at the whole web.
+    /// **`read_page` and `find_prospects` used to be the second and third
+    /// names, and they are not any more.** That is the whole of what changed
+    /// here, and it is worth being blunt about it rather than letting a list
+    /// quietly shrink.
     ///
-    /// `find_prospects` is the third name and the same finding a third time:
-    /// it is a `BrowserRead` too, so an empty `allowed_domains` withholds it —
-    /// which is exactly right for a tool that turns somebody else's page into
-    /// rows. An employee cannot go looking for prospects until an operator has
-    /// said which directories it may look at, and that seed list is
-    /// `allowed_domains` rather than a new table.
+    /// The old argument was: `default_ceiling` grants no domain, so
+    /// `always_denies(BrowserRead)` holds and a read tool is withheld until an
+    /// operator names a site — *"a browsing agent with a blank allowlist is
+    /// either useless or pointed at the whole web."* Both horns turned out to be
+    /// real. It was useless: a live dry run had the seller report that it could
+    /// not read a single prospect's page, because no operator can be asked to
+    /// type a research list in advance. And it was never the allowlist doing the
+    /// safety work — `read_page` returns `Untrusted<String>`, which cannot
+    /// become an email or a prompt, and no pack proposes `BrowserWrite` at all.
+    ///
+    /// So reading became a channel. `default_ceiling` carries `Channel::Web`,
+    /// and therefore **a shipped employee browses**. What it still cannot do is
+    /// call an MCP tool, because binding a server is an operator decision no
+    /// default can make — which is why one name is left on this list and why
+    /// this test still tests something.
     ///
     /// Derived from the table rather than pinned beside it on purpose — a second
     /// hand-written list of the same names is the copy that drifts, and what is
-    /// worth pinning here is the *difference*, which is three names.
+    /// worth pinning here is the *difference*, which is now one name.
     #[test]
     fn a_fresh_deployment_takes_the_ungranted_tools_off_every_pack_and_a_grant_puts_them_back() {
         let ceiling = agentos_store::policy::default_ceiling();
@@ -2299,13 +2338,17 @@ mod tests {
             EffectivePolicy::try_new(limits, limits, limits, limits).expect("identical layers")
         };
         let fresh = policy(&ceiling);
-        // Every tool whose *kind* the shipped ceiling grants nothing for. All
-        // three are inventory an operator names per deployment, and none has a
-        // default that could be right.
-        let ungranted = ["read_page", "find_prospects", "call_mcp_tool"];
-        // The same ceiling with one server and one domain granted, which is what
-        // an operator's `policy install --tenant …` writes the moment a server
-        // is bound and a prospect list exists.
+        // Every tool whose *kind* the shipped ceiling grants nothing for. One
+        // name: an MCP server is inventory an operator names per deployment and
+        // has no default that could be right. The web does have one now, and
+        // the ceiling carries it.
+        let ungranted = ["call_mcp_tool"];
+        // The same ceiling with one server bound, which is what an operator's
+        // `policy install --tenant …` writes the moment a server exists. The
+        // domain is still granted here and still grants nothing to a *read* —
+        // it is the write allowlist — which this fixture keeps precisely so the
+        // assertion below cannot pass by accident on a policy that changed two
+        // things at once.
         let granted = policy(&PolicyLimits {
             allowed_mcp_tools: [McpTool::new(
                 Slug::parse("erp").expect("slug"),
@@ -2340,9 +2383,10 @@ mod tests {
                         .collect::<Vec<_>>(),
                     "{name} at {trust:?} on a fresh deployment"
                 );
-                // Not vacuous in either direction: every pack proposes both
-                // `McpCall` and `BrowserRead`, so every pack loses exactly these
-                // two schemas and keeps the rest.
+                // Not vacuous in either direction: every pack proposes
+                // `McpCall`, so every pack loses exactly that schema and keeps
+                // the rest — including the two browser tools, which is the
+                // change this test now pins.
                 for tool in ungranted {
                     assert!(
                         unfiltered.contains(&tool.to_owned()),

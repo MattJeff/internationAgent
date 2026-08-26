@@ -111,7 +111,20 @@ async fn live_report(model: Option<&str>) {
         let wanted = case.want.unwrap_or("(prose)");
         let got = match chose {
             Chose::Tool(name, args) => format!("{name} {args}"),
-            Chose::Prose => "(prose)".to_owned(),
+            // The reply itself, clipped. A prose answer where a tool was
+            // wanted is the model declining to act, and `(prose)` alone cannot
+            // say whether it was right to.
+            Chose::Prose(said) => {
+                let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+                if said.is_empty() {
+                    "(prose, empty)".to_owned()
+                } else if said.chars().count() > 240 {
+                    let clipped: String = said.chars().take(240).collect();
+                    format!("(prose) {clipped}…")
+                } else {
+                    format!("(prose) {said}")
+                }
+            }
             Chose::Malformed(code) => format!("shim failed: {code}"),
         };
         println!(

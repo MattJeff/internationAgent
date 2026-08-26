@@ -1,7 +1,8 @@
 {
   "spend": null,
   "allowed_channels": [
-    "internal"
+    "internal",
+    "web"
   ],
   "allowed_calling_codes": [],
   "allowed_domains": [

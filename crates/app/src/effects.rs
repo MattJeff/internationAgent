@@ -1353,7 +1353,15 @@ mod tests {
                     )
                     .expect("coherent"),
                 ),
-                allowed_channels: BTreeSet::from([Channel::Email]),
+                // `Channel::Web` because this fixture browses. It used to be
+                // enough to name the domain; browsing is a channel now, and a
+                // policy that grants a host without granting the channel grants
+                // nothing — which is what the browser tests below discovered
+                // one `ChannelNotAllowed` at a time.
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Web]),
+                // Still here, and still doing work: reading no longer consults
+                // it, but `BrowserWrite` and `FileUpload` do, and the browser
+                // tests below authorise writes against exactly this entry.
                 allowed_domains: BTreeSet::from([
                     Domain::parse("portal.example.com").expect("domain")
                 ]),

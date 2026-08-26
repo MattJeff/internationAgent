@@ -5090,7 +5090,8 @@ mod tests {
             allowed_domains: BTreeSet::from([
                 Domain::parse("book.airline.example").expect("domain")
             ]),
-            allowed_channels: BTreeSet::from([Channel::Email]),
+            // The prober opens the prospect's page, which is a channel now.
+            allowed_channels: BTreeSet::from([Channel::Email, Channel::Web]),
             allowed_mcp_tools: BTreeSet::from([orizn().tool().clone(), orizn().fee_tool().clone()]),
             max_new_contacts_per_day: 10,
             ..PolicyLimits::default()

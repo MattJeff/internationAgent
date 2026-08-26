@@ -308,11 +308,17 @@ impl RolePack {
                 // intersects this set with every other layer, so a channel this
                 // pack omits is a channel no buyer has — see the note on
                 // `proposable`.
+                // `Channel::Web` because `proposable` carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks the channel and no longer asks `allowed_domains`.
+                // A pack that proposes a browser read while its own channel
+                // list withholds the web contradicts itself one field later.
                 allowed_channels: [
                     Channel::Email,
                     Channel::Whatsapp,
                     Channel::Voice,
                     Channel::Internal,
+                    Channel::Web,
                 ]
                 .into_iter()
                 .collect(),

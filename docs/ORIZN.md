@@ -180,7 +180,8 @@ that unions, so a lower layer can always add a block and never remove one.
 | `approval_above` | **$1** | The default ceiling ships $100, i.e. an unsupervised band under a hundred dollars. Orizn has exactly one function that may pay and it already sends every payment to a person; a band nobody at this company is entitled to should not exist at the top either. One dollar means no configuration mistake *below* the ceiling can produce an unsupervised payment. |
 | `allowed_channels` | `email`, `internal`, `web` | `web` is the operator console — inbound only, never gated as an outbound channel — so it grants nothing and is kept only to match the shipped default. |
 | `allowed_calling_codes` | **empty** | Orizn phones nobody. The `sales-development` pack lists thirteen calling codes and `Channel::Voice`; this empty set intersects all fourteen away before any role layer is read. That is the ceiling doing its job, and it is why the sales role layer below writes `{email,internal}` rather than restating a `voice` grant that cannot survive. |
-| `allowed_domains` | `orizn.app` | **This is where the prospect account list goes**, and it is the one genuinely awkward consequence of intersection: an allowlist entry can only be *removed* by a lower layer, so a domain that is not here is unreachable by everybody. `orizn.app` covers `docs.`, `status.` and every other subdomain — entries match themselves and everything beneath them. Adding an account to probe is a ceiling change: `policy install` again, and `/readyz` needs no restart. |
+| `allowed_domains` | `booking.com`, `orizn.app` | **This is the *write* allowlist, and it is still where the prospect list goes.** Reading a page consults `Channel::Web` and `denied_domains` and not this — so an employee reads any public host without an entry here. But `Prober` *types* into a prospect's booking form (passport, destination, date) and that is a `BrowserWrite` on purpose, so the audit trail says what we did on their site. **A prospect the seller can read is not a prospect it can probe until its domain is here.** Entries match themselves and everything beneath them. |
+| `denied_domains` | **empty** | The one thing a policy can still say about a *read*, and the strongest thing it can say about anything: denylists **union** across layers, so a host blocked at any layer is blocked for everybody and no lower layer can put it back. Empty because nobody has needed to block a host yet; this is where a competitor, a rate-limiting complaint, or a site that asked us to stop would go. |
 | `max_new_contacts_per_day` | 20 | The largest any function gets (customer success). |
 | `max_turns_per_day` | 30 | The largest any function gets (sales). This is the blast radius of a typo: a team pointed at an unwritten `role_name` runs on exactly this. Thirty turns a day is 30/66 of the bill in "What this costs per month" — a number you can afford to be wrong about. The shipped default is 200. |
 | the three booleans | `false` | Uploading, rotating a credential and deleting data are `AND`ed down the stack, so `false` here is `false` everywhere, forever, until the ceiling changes. |
@@ -233,14 +234,19 @@ layers, so a later document can add a block and nothing can remove one.
 > `agentos-server policy install` prints back: it is a whole layer, and every
 > layer here is a whole layer.
 
-#### `sales-development` — 30 turns, **0 new contacts**, `{email,internal}`, `orizn.app`
+#### `sales-development` — 30 turns, **5 new contacts**, `{email,internal,web}`, two write domains
 
 The pack sets `max_new_contacts_per_day` to `0` and explains why: the gate reads
 zero as "every first contact is denied", on every channel, with no second flag,
 and B2B prospecting in the EU is lawful on legitimate interest — not
-automatically. **This document keeps it at zero.** A document that switches cold
-outreach on the moment it is applied is precisely the default the pack refuses
-to be.
+automatically. **The pack still ships zero.** A pack that switches cold outreach
+on the moment it is installed is precisely the default it refuses to be.
+
+**This document raises it to five**, which is an operator's decision and is
+recorded here as one. It was made on 2026-08-26 by the founder, who is the
+person point 4 below describes. What follows is what that number commits them
+to, kept in the imperative it was written in because it is a standing
+obligation and not a step that was completed.
 
 **What raising it commits you to.** Not a throughput setting; a legal boundary
 you become the answer for. Before you type the number:
@@ -256,10 +262,69 @@ you become the answer for. Before you type the number:
 4. Being the **person who answers a supervisory authority** about a machine that
    mailed strangers on your behalf.
 
-**Raise it to five.** The right number is the number of approaches you can
-personally read that day, and at a company of one founder that is single digits.
-Five approaches on thirty turns is a seller that spends most of its day on
-evidence, which is what the pack's own plan puts before contacting anyone.
+**Five, and the reason is arithmetic rather than caution.** The right number is
+the number of approaches you can personally read that day, and at a company of
+one founder that is single digits. Five approaches on thirty turns is a seller
+that spends most of its day on evidence, which is what the pack's own plan puts
+before contacting anyone.
+
+It is also the number the *delivery* path can absorb. Until 2026-09-01 the
+seller's output is a queue a human uploads to Smartlead by hand, so a day's
+openers have to be a day's reading. When the Smartlead API lands, the sending
+becomes automatic and this number does not: it is a boundary on people
+approached, not on the machinery that approaches them.
+
+**One number, two counters — read this before you trust it.** `discover` spends
+it against contacts *created* (`revenue::new_contacts_since`) and the approach
+path spends it against contacts *written to*. They are separate counts against
+the same limit, so five permits five rows created **and** five people
+approached in one day, not five events in total. That is defensible — filing a
+public business address and mailing its owner are not the same act — but it is
+not what the field name says, and the number you write is doubled before it
+becomes a promise.
+
+**The prospect domains, and why there are none.** `booking.com` was added here
+for one commit and then removed, because the question that put it there —
+*"isn't it the research team that finds the sites we can sell Orizn to?"* — had
+the answer *no, you type them by hand*, and that was a defect rather than a
+design.
+
+`PolicyLimits` had **one** `allowed_domains` set doing two jobs. Posting to
+somebody's site is dangerous, so the set was kept tight; because it was tight,
+the seller could only read `orizn.app`. A live dry run reported it in the
+employee's own words: *"blocked on tool access — I have no way to read their
+booking/servicing flows."*
+
+The two jobs are now separate. **Reading is a channel**: an employee whose
+layer carries `Channel::Web` reads any public host, and one whose layer does
+not reads nothing — no list either way. **Writing keeps the allowlist**, which
+is what `allowed_domains` means from here on.
+
+**Half of the research problem is solved, and you should know which half.** The
+seller reads any prospect's page without being handed it. It cannot *probe* one
+— running a passport and a destination through their booking flow, which is
+where the evidence comes from — until that host is on the write list, because
+typing into somebody's form is a write. An early version of this change emptied
+`allowed_domains` on the theory that nothing writes; the whole selling vertical
+came back `no_rule`, three dry-run passes out of three. Widening the write list
+the same way reading was widened is a second decision and has not been made.
+
+What makes that defensible here rather than in general is not the policy, it is
+the type system. `read_page` returns `Untrusted<String>`, which has no
+`Display`, no `Deref` and no `Into<String>` — `crates/app/tests/ui` proves that
+`format!("{}", …)` fails to compile — so a page's bytes cannot become an email,
+a prompt or a column. And no role pack proposes `ActionKind::BrowserWrite` at
+all, so nothing this company runs can post anywhere.
+
+**What you give up.** You no longer know in advance which sites an employee
+touched; you know afterwards, from `audit_log`, one `browser_read` row per
+page. **What you keep.** `denied_domains` still refuses a host by name and
+unions across layers, and `Domain::parse` refuses a name that is not on the
+public internet at all — `.local`, `.internal`, `.home.arpa`, an IP literal —
+so an employee cannot be pointed at something inside a network. What that
+cannot see is a public name resolving to a private address; that needs the
+resolver, and it is named in `PRIVATE_USE_SUFFIXES`' own documentation as not
+covered.
 
 Edit `max_new_contacts_per_day` in `docs/orizn-roles/sales-development.json`
 and install it again:
@@ -279,7 +344,7 @@ about another company's booking flow is the one mistake in this job that cannot
 be walked back. Ten findings a day is already more than one founder can follow
 up on. The pack's default is 40; Orizn has one seller and no pipeline yet.
 
-#### `customer-success` — 20 turns, 20 new contacts, `{email,internal}`, `orizn.app`
+#### `customer-success` — 20 turns, 20 new contacts, `{email,internal,web}`, `orizn.app`
 
 **Twenty new contacts, not zero, and the reason is a subtlety worth knowing.**
 `ContactStanding` is computed from this employee's *own outbound trail*
@@ -297,7 +362,7 @@ queue. **This is the setting most likely to be wrong first** — the day an
 airline goes live, a wrong entry requirement is a denied boarding, and this is
 the number to raise.
 
-#### `growth` — 10 turns, 0 new contacts, `{internal}` only, `orizn.app`
+#### `growth` — 10 turns, 0 new contacts, `{internal,web}`, `orizn.app`
 
 Zero contacts here means what it says rather than standing in for a policy
 decision: there is no outward channel for a contact to happen on. The pack omits
@@ -308,7 +373,7 @@ That makes ten turns a purely economic decision, and the only one in this
 document that is. A runaway growth seat costs tokens and nothing else. Ten is a
 keyword study and three drafts; the pack's forty is a research team.
 
-#### `finance` — 6 turns, 5 new contacts, `{email,internal}`, **no domains**, and the only spend row
+#### `finance` — 6 turns, 5 new contacts, `{email,internal}` — **no web**, and the only spend row
 
 The one function whose work genuinely ends in a payment. Refusing it would not
 remove the payment, it would move it — to the buyer, whose interest is the goods
@@ -323,11 +388,17 @@ double-entry bookkeeping was invented to prevent.
 | new contacts | **5** | 15 | The first chaser to a supplier's accounts inbox counts as new. Five, because a finance seat writing to five parties it has never written to before in one day is either a migration or something wrong. Fifteen was sized for a company with fifteen suppliers. |
 | turns | **6** | 30 | Periodic, not continuous: one reconciliation pass and one payment run. Six is two of each with slack — and since every payment goes to a human anyway, a finance seat that wakes more often does not move money faster, it only produces more approvals for one person to read. |
 
-`allowed_domains` is **empty** for finance, and that is a tightening rather than
-an omission. The only sites it would want are the bank portal and the tax
-authority, and a role that may not change a credential cannot log in to either.
-A filing that genuinely needs a browser is a person's job or a declared MCP tool
-with a name an operator wrote.
+**Finance does not browse**, and that is a tightening rather than an omission.
+It used to be said with an empty `allowed_domains`; it is said with the absent
+`web` channel now, which is the field that actually means it — and the change
+is not cosmetic, because an empty allowlist would no longer withhold anything
+from a read. The only sites this seat would want are the bank portal and the
+tax authority, and a role that may not change a credential cannot log in to
+either. A filing that genuinely needs a browser is a person's job or a declared
+MCP tool with a name an operator wrote.
+
+This is the seat to look at first if you want to know what the web channel
+costs you: it is the one that says no.
 
 **A spend row is not a grant, and this is the step most likely to be missed.**
 Three independent things must all say yes before a euro moves, and the policy
@@ -460,7 +531,7 @@ database credential because `app_role` may not write `prospect_flows` — and th
 seller probes it twice, files a finding, and has its approach refused by
 `max_new_contacts_per_day`, which this deployment ships at `0`.
 
-> ### $103–$166 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $38 floor at 1.00 model calls per turn, $520 ceiling at 10.00
+> ### $62–$178 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $38 floor at 1.00 model calls per turn, $481 ceiling at 10.00
 >
 > A **range**, because a reserved turn makes between one and ten model calls and
 > any point estimate inside that is a choice. The floor is the arithmetic this

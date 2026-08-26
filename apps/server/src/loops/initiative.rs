@@ -2384,9 +2384,16 @@ pub(crate) mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                allowed_channels: [agentos_domain::message::Channel::Email]
-                    .into_iter()
-                    .collect(),
+                // `Web` beside `Email`: the seller's turn opens the prospect's
+                // page through the prober, and browsing is a channel now. A
+                // layer that names the domain and withholds the channel makes
+                // the whole selling turn a refusal.
+                allowed_channels: [
+                    agentos_domain::message::Channel::Email,
+                    agentos_domain::message::Channel::Web,
+                ]
+                .into_iter()
+                .collect(),
                 allowed_models: ModelId::ALL.into_iter().collect(),
                 ..rolepack_sales::RolePack::sales_development()
                     .limits()

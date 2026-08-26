@@ -1037,7 +1037,11 @@ mod tests {
             spend: Some(
                 SpendLimits::try_new(usd(50_000), usd(100_000), usd(100)).expect("coherent"),
             ),
-            allowed_channels: [Channel::Email, Channel::Internal].into(),
+            // `Web` kept: this layer narrows spending and nothing else about
+            // reach, and browsing is a channel now — dropping it here would
+            // have made the tenant layer the thing that took the web away and
+            // hidden the employee layer's mistake below.
+            allowed_channels: [Channel::Email, Channel::Internal, Channel::Web].into(),
             ..ceiling.clone()
         };
         install_layer(
@@ -1063,6 +1067,21 @@ mod tests {
         .await
         .expect("the role layer");
 
+        // **The claim, taken while it is still true.** An action that could not
+        // be ruled on before step 2 is now allowed — and browsing is the
+        // specimen because it is the one this sequence's own layers go on to
+        // take away. It is asserted here, after the role layer, rather than
+        // after the employee layer below: reading is a channel now, so the
+        // "mistake" that layer makes costs the web as well as email, and
+        // asserting `Allow` afterwards would have been asserting that the
+        // mistake did not happen.
+        let (allowed, _) = ruling(&db, &browse).await.expect("a policy exists now");
+        assert_eq!(
+            allowed,
+            Decision::Allow,
+            "reading our own docs was `broken_policy` before step 2 and must be Allow now"
+        );
+
         // The employee layer tightens two things, and the second one is the
         // mistake an operator makes: a restated turn budget that quietly drops
         // a channel. Both are asserted below, and the rollback is the fix.
@@ -1080,12 +1099,19 @@ mod tests {
         .await
         .expect("the employee layer");
 
-        // --- the claim: an action that could not be ruled on is now allowed --
-        let (allowed, effective) = ruling(&db, &browse).await.expect("a policy exists now");
+        // --- and what the mistake cost -------------------------------------
+        //
+        // Two channels, not one. Restating `[Channel::Internal]` to tighten a
+        // turn budget drops email *and* the web, and the second is the one an
+        // operator would not think of as a channel at all — which is exactly
+        // why it is asserted here, one line above the column that explains it.
+        let (after_the_mistake, effective) = ruling(&db, &browse).await.expect("a policy");
         assert_eq!(
-            allowed,
-            Decision::Allow,
-            "reading our own docs was `broken_policy` before step 2 and must be Allow now"
+            after_the_mistake,
+            Decision::Deny {
+                reason: DenyReason::ChannelNotAllowed
+            },
+            "the employee layer kept only the internal channel, so it cannot browse"
         );
         // Every layer bound, and the tightest one won each column.
         assert_eq!(effective.limits().max_turns_per_day, 5);

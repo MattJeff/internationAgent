@@ -275,9 +275,22 @@ impl RolePack {
                 // `Internal` is not outbound and is not a fourth way to intrude
                 // on a stranger: it reaches a colleague of this tenant and
                 // spends one of their turns. See the note above `proposable`.
-                allowed_channels: [Channel::Email, Channel::Voice, Channel::Internal]
-                    .into_iter()
-                    .collect(),
+                // `Channel::Web` because `proposable` above carries
+                // `ActionKind::BrowserRead`, and reading is a channel now: the
+                // gate asks `channel_rules(Channel::Web)` and no longer asks
+                // `allowed_domains` at all. A pack that proposes a browser read
+                // while its own channel list withholds the web would be
+                // contradicting itself one field later — and a layer that wants
+                // this seat off the web drops the channel, which narrows like
+                // every other allowlist here.
+                allowed_channels: [
+                    Channel::Email,
+                    Channel::Voice,
+                    Channel::Internal,
+                    Channel::Web,
+                ]
+                .into_iter()
+                .collect(),
 
                 // Where the carriers, platforms and travel programmes we sell
                 // to are headquartered. E.164 is a prefix code, so these match
@@ -1003,11 +1016,30 @@ mod tests {
             )
             .is_allow()
         );
+        // **A read is no longer on this list**, and the empty allowlist is why
+        // it used to be. `allowed_domains` is still empty and still means what
+        // it says — this pack grants no host to *write* to — but reading asks
+        // `Channel::Web`, which this pack carries because it proposes
+        // `BrowserRead`. A seller that could not open a prospect's page was the
+        // bug, not the policy working.
         assert!(sales().limits().allowed_domains.is_empty());
-        assert_eq!(
+        assert!(
             evaluate(
                 &policy,
                 &Action::BrowserRead {
+                    domain: Domain::parse("airline.example.com").expect("domain"),
+                },
+                &ctx,
+            )
+            .is_allow()
+        );
+        // What the empty allowlist still refuses is the verb it was always
+        // about. No pack proposes this, so the schema never reaches a model —
+        // and the layer says no underneath that, which is the point of asking.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &Action::BrowserWrite {
                     domain: Domain::parse("airline.example.com").expect("domain"),
                 },
                 &ctx,
