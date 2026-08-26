@@ -143,6 +143,26 @@ pub enum BrowserStep<'a> {
     Text(&'a str),
     /// Capture the viewport as a PNG.
     Screenshot,
+    /// Ask the session which page it is actually on.
+    ///
+    /// **The step that exists because every other one lies about its target.**
+    /// A [`BrowserStep::Goto`] names a URL, and the URL that comes back in
+    /// [`BrowserOutcome::Navigated`] is often a different one — a `302`, an
+    /// `http`→`https` hop, a country splash. Every step after it names a
+    /// *selector*, which says nothing at all about which host the element is
+    /// on. So a caller that wants to know where its keystroke is going has
+    /// exactly one honest source, and it is the browser.
+    ///
+    /// It answers [`BrowserOutcome::Navigated`] with the current address and
+    /// **navigates nothing**: the variant is shared because the fact is the
+    /// same fact — "this session is here" — and a second URL-shaped outcome
+    /// would be one more thing for a caller to match on for no new information.
+    ///
+    /// A session that has never been anywhere reads `about:blank`, which has no
+    /// host and is therefore inside nobody's domain. That is the answer a
+    /// scope check wants for a fresh tab, and it is not a special case for
+    /// anyone to forget.
+    Location,
 }
 
 impl BrowserStep<'_> {
@@ -158,14 +178,16 @@ impl BrowserStep<'_> {
     ///
     /// `Goto` is a read. Navigating is how you get to a page to look at it, and
     /// the URL is scope-checked against the token's own domain before it runs.
-    /// `Screenshot` and `Text` observe. `Click`, `Type` and `Fill` put
-    /// something of ours into a stranger's system, which is a write whatever
-    /// the element happens to be — a search box today and a "delete account"
-    /// button on the next redesign, and the selector cannot tell them apart.
+    /// `Screenshot`, `Text` and `Location` observe — `Location` most of all: it
+    /// sends nothing to their server and reads a value the browser already
+    /// holds. `Click`, `Type` and `Fill` put something of ours into a
+    /// stranger's system, which is a write whatever the element happens to be —
+    /// a search box today and a "delete account" button on the next redesign,
+    /// and the selector cannot tell them apart.
     #[must_use]
     pub const fn is_a_read(&self) -> bool {
         match self {
-            Self::Goto(_) | Self::Text(_) | Self::Screenshot => true,
+            Self::Goto(_) | Self::Text(_) | Self::Screenshot | Self::Location => true,
             Self::Click(_) | Self::Type { .. } | Self::Fill { .. } => false,
         }
     }
@@ -226,6 +248,15 @@ pub trait BrowserProvider: Send + Sync {
 /// Provider name the mock reports.
 pub const MOCK_PROVIDER: &str = "mock-browser";
 
+/// Where a session that has never navigated is.
+///
+/// A real Chrome tab starts here, and it is the value that makes a scope check
+/// need no "we have not gone anywhere yet" branch: `about:blank` has no host,
+/// so it is within nobody's domain and every step on it is refused.
+pub fn blank_page() -> Url {
+    Url::parse("about:blank").expect("a literal URL")
+}
+
 #[derive(Debug, Default)]
 struct MockState {
     fault: FaultMode,
@@ -240,6 +271,15 @@ struct MockState {
     /// "unscripted" and "scripted as empty" have to be two different pages
     /// here, or a test cannot tell the two facts apart either.
     page: BTreeMap<String, (Vec<String>, usize)>,
+    /// requested URL -> where the site actually sends us. The `302` a real
+    /// prospect's booking page answers with, made expressible: without it the
+    /// mock is a web where every address is its own destination, and the one
+    /// class of bug that lives in the gap between "asked for" and "landed on"
+    /// is untestable.
+    redirects: BTreeMap<String, Url>,
+    /// Where this browser is, as [`BrowserStep::Location`] reports it. `None`
+    /// until something navigates, which reads as [`blank_page`].
+    here: Option<Url>,
 }
 
 impl MockState {
@@ -289,10 +329,30 @@ impl MockBrowser {
         self.lock().page.insert(sel.to_owned(), (texts, 0));
     }
 
+    /// Make `from` answer a redirect to `to`, the way an airline's booking page
+    /// answers with its outsourced engine's.
+    ///
+    /// One hop, not a chain: what a caller has to reason about is "the address
+    /// we ended on is not the address we asked for", and a chain adds a loop to
+    /// the mock without adding a case to the callers.
+    pub fn set_redirect(&self, from: &Url, to: &Url) {
+        self.lock()
+            .redirects
+            .insert(from.as_str().to_owned(), to.clone());
+    }
+
     /// Every step this mock was asked to run, oldest first.
     ///
     /// Secrets are rendered as [`Secret::REDACTED`] — the log is what a real
     /// adapter's tracing spans would carry.
+    ///
+    /// [`BrowserStep::Location`] is deliberately **not** on it. This log
+    /// answers "what did we do to their site", and asking our own browser where
+    /// it is does nothing to their site: no request leaves, no element is
+    /// touched. `app::effects` asks it before every step it did not itself
+    /// navigate, so logging it would put one line of our own bookkeeping
+    /// between every two lines of the thing being counted — and the assertions
+    /// that count steps are the ones that would stop meaning anything.
     pub fn log(&self) -> Vec<String> {
         self.lock().log.clone()
     }
@@ -354,10 +414,29 @@ impl BrowserProvider for MockBrowser {
 
         let ctx = &session.binding.external_id;
         let (line, outcome) = match step {
-            BrowserStep::Goto(url) => (
-                format!("{ctx} goto {url}"),
-                BrowserOutcome::Navigated(url.clone()),
-            ),
+            BrowserStep::Goto(url) => {
+                // What the site answers with, which is what a real adapter
+                // reads back out of `location.href` — not what we asked for.
+                let landed = state
+                    .redirects
+                    .get(url.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| url.clone());
+                state.here = Some(landed.clone());
+                // The requested URL, because that is what we did to their
+                // site. Where it sent us is `Location`'s answer, not a log
+                // line, for the reason `log` gives.
+                (
+                    format!("{ctx} goto {url}"),
+                    BrowserOutcome::Navigated(landed),
+                )
+            }
+            // Not logged, and returns before the log push for that reason.
+            BrowserStep::Location => {
+                let here = state.here.clone().unwrap_or_else(blank_page);
+                state.fault.check_after()?;
+                return Ok(BrowserOutcome::Navigated(here));
+            }
             BrowserStep::Click(sel) => (format!("{ctx} click {sel}"), BrowserOutcome::Done),
             BrowserStep::Type { sel, text } => {
                 (format!("{ctx} type {sel} {text}"), BrowserOutcome::Done)
@@ -460,7 +539,18 @@ pub async fn contract_suite<P: BrowserProvider + ?Sized>(p: &P) {
         p.act(&session(&first), BrowserStep::Goto(&url))
             .await
             .expect("navigate"),
-        BrowserOutcome::Navigated(url)
+        BrowserOutcome::Navigated(url.clone())
+    );
+
+    // And it can say where it is afterwards. Not a nicety: `app::effects`
+    // checks every step against this answer before it runs, so an adapter that
+    // cannot give one cannot be driven at all — its every write is refused.
+    assert_eq!(
+        p.act(&session(&first), BrowserStep::Location)
+            .await
+            .expect("location"),
+        BrowserOutcome::Navigated(url),
+        "a session has to be able to report the page it is on"
     );
 
     // And it can be given back — twice, and for a context that was never
@@ -661,6 +751,49 @@ mod tests {
                 "ctx-1 text #not-there",
             ]
         );
+    }
+
+    /// **A navigation ends where the site says, not where we asked.**
+    ///
+    /// The whole reason `Location` exists: after a redirect the session is on a
+    /// host nobody typed, and the only thing that knows it is the browser. A
+    /// mock where `Goto` always answered with its own argument was a web with
+    /// no redirects in it, and the scope check in `app::effects` could not be
+    /// written against it, let alone broken.
+    #[tokio::test]
+    async fn a_redirect_lands_somewhere_else_and_the_session_says_so() {
+        let p = MockBrowser::new();
+        let provisioned = p
+            .ensure_context(&ctx(EmployeeId::new_v7(Utc::now())))
+            .await
+            .unwrap();
+        let s = session(&provisioned);
+
+        // A fresh tab is nowhere, and nowhere has no host.
+        assert_eq!(
+            p.act(&s, BrowserStep::Location).await.unwrap(),
+            BrowserOutcome::Navigated(blank_page())
+        );
+        assert!(blank_page().host_str().is_none());
+
+        let asked = Url::parse("https://prospect.example/book").unwrap();
+        let landed = Url::parse("https://booking-engine.example.net/step1").unwrap();
+        p.set_redirect(&asked, &landed);
+
+        assert_eq!(
+            p.act(&s, BrowserStep::Goto(&asked)).await.unwrap(),
+            BrowserOutcome::Navigated(landed.clone()),
+            "the outcome carries where we ended up"
+        );
+        assert_eq!(
+            p.act(&s, BrowserStep::Location).await.unwrap(),
+            BrowserOutcome::Navigated(landed),
+            "and the session stays there for the next step"
+        );
+
+        // What we did to their site is one navigation, to the address we asked
+        // for. Asking our own browser where it is is not on the log.
+        assert_eq!(p.log(), ["ctx-1 goto https://prospect.example/book"]);
     }
 
     #[tokio::test]

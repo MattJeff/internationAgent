@@ -700,6 +700,10 @@ mod tests {
     struct RecordingCdp {
         /// The connect URL exactly as the adapter passed it, per call.
         urls: Mutex<Vec<String>>,
+        /// Where the tab is. A driver that answers `Location` with `Done` is a
+        /// driver `app::effects` refuses every step through, so the contract
+        /// suite makes even a recorder keep this.
+        here: Mutex<Option<Url>>,
     }
 
     impl RecordingCdp {
@@ -720,7 +724,17 @@ mod tests {
                 .expect("recorder mutex poisoned")
                 .push(connect_url.expose_for_transport().to_owned());
             Ok(match step {
-                BrowserStep::Goto(url) => BrowserOutcome::Navigated((*url).clone()),
+                BrowserStep::Goto(url) => {
+                    *self.here.lock().expect("recorder mutex poisoned") = Some((*url).clone());
+                    BrowserOutcome::Navigated((*url).clone())
+                }
+                BrowserStep::Location => BrowserOutcome::Navigated(
+                    self.here
+                        .lock()
+                        .expect("recorder mutex poisoned")
+                        .clone()
+                        .unwrap_or_else(crate::browser::blank_page),
+                ),
                 _ => BrowserOutcome::Done,
             })
         }
@@ -765,8 +779,11 @@ mod tests {
             "the contract releases what it made"
         );
         // Every `act` opens its own session and gives it back; the contract
-        // drives one step.
-        assert_eq!(state.sessions.len(), 1);
+        // drives two steps — the navigation, and the question about where it
+        // landed that `app::effects` asks before every step it did not itself
+        // navigate. **That is a session per question**, which is this adapter's
+        // shape and is what the guard costs on it: see `Effects::browse_write`.
+        assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.released, state.sessions);
     }
 

@@ -237,7 +237,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Cdp<S> {
             BrowserStep::Text(sel) => self.text(sel).await,
             BrowserStep::Fill { sel, secret } => self.fill(sel, secret).await,
             BrowserStep::Screenshot => self.screenshot().await,
+            // No fallback here, and that is the difference from `goto` below.
+            // A navigation that cannot read its address back still succeeded
+            // and still went somewhere sensible; a *question* that cannot be
+            // answered has no sensible answer to invent, and the caller asking
+            // it is a scope check that must not be handed a guess.
+            BrowserStep::Location => self
+                .location()
+                .await?
+                .map(BrowserOutcome::Navigated)
+                .ok_or(ProviderError::Terminal { code: CDP_PROTOCOL }),
         }
+    }
+
+    /// Where the tab actually is, as Chrome holds it.
+    ///
+    /// `None` is "Chrome answered with something that is not a URL" — a
+    /// protocol fault, never an address.
+    async fn location(&mut self) -> Result<Option<Url>, ProviderError> {
+        let here = self.evaluate("location.href".to_owned()).await?;
+        Ok(here.as_str().and_then(|href| Url::parse(href).ok()))
     }
 
     /// Navigate, then read back where we actually ended up.
@@ -255,11 +274,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Cdp<S> {
                 code: NAVIGATION_FAILED,
             });
         }
-        let here = self.evaluate("location.href".to_owned()).await?;
-        let landed = here
-            .as_str()
-            .and_then(|href| Url::parse(href).ok())
-            .unwrap_or_else(|| url.clone());
+        let landed = self.location().await?.unwrap_or_else(|| url.clone());
         Ok(BrowserOutcome::Navigated(landed))
     }
 

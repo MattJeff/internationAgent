@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::{IdempotencyKey, Slug};
+use agentos_domain::ids::{DecisionId, IdempotencyKey, Slug};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
@@ -94,6 +94,19 @@ pub const NO_BROWSER: &str = "no_browser";
 /// written from `to_action().kind()`, would have called the typing a
 /// `browser_read`.
 pub const READ_TOKEN: &str = "read_token";
+
+/// The browser was asked where it is and answered with something that is not a
+/// URL — or answered a [`BrowserStep::Goto`] with an outcome that carries no
+/// address at all.
+///
+/// A code and not a panic, because it is a fact about an adapter rather than
+/// about a decision, and the honest handling is the one the scope check needs:
+/// **an unknown position is refused**. Every browser step is checked against the
+/// page the session is actually on (see [`Effects::browse_write`]), so an
+/// adapter that cannot say where it is has no step that can be permitted, and
+/// the caller learns that from a coded refusal rather than from a keystroke that
+/// went somewhere nobody can name.
+pub const NO_LOCATION: &str = "no_location";
 
 /// What [`Effects::discover_prospects`] answers when this employee's policy
 /// cannot be loaded at all.
@@ -479,6 +492,62 @@ impl EffectError {
 }
 
 // ---------------------------------------------------------------------------
+// Where a step actually acted
+// ---------------------------------------------------------------------------
+
+/// The host a browser step acted on, when it is **not** the domain on the
+/// token.
+///
+/// Built only when the two differ, so its absence is the ordinary case and
+/// carries no cost. See [`Effects::browse_write`] for why a redirect out of the
+/// token's domain is followed at all, and what has to permit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Elsewhere {
+    /// The gate ruled on this host too, under a decision of its own. Both ids
+    /// go on the row: the one that authorised the *step*, and the one that
+    /// authorised the *place*.
+    Ruled(Domain, DecisionId),
+    /// Nobody authorised it. `None` is a page with no nameable host at all — a
+    /// blank tab, an IP literal — which is refused without troubling the gate,
+    /// because there is nothing to rule on.
+    Unruled(Option<Domain>),
+}
+
+/// The audit detail every browsing effect shares.
+///
+/// `domain` is what the gate ruled on and is always there. `landed` appears
+/// only when the step acted somewhere else, and it is a **parsed [`Domain`]**
+/// and never the URL: the path and query of a landing page are the page's own
+/// bytes, and an audit payload is a column. The rule this workspace keeps —
+/// nothing a stranger wrote becomes prose, a prompt or a column — is not
+/// suspended because the column is ours.
+fn browse_detail(allowed: &Domain, elsewhere: Option<&Elsewhere>) -> Map<String, Value> {
+    let mut detail = Map::new();
+    detail.insert("domain".to_owned(), json!(allowed.as_str()));
+    match elsewhere {
+        None => {}
+        Some(Elsewhere::Ruled(landed, decision)) => {
+            detail.insert("landed".to_owned(), json!(landed.as_str()));
+            detail.insert(
+                "landed_decision".to_owned(),
+                json!(decision.as_uuid().to_string()),
+            );
+        }
+        // No decision to name: this is the refusal. The host is still recorded,
+        // because "we were sent here and would not stay" is the sentence an
+        // incident starts from.
+        Some(Elsewhere::Unruled(Some(landed))) => {
+            detail.insert("landed".to_owned(), json!(landed.as_str()));
+        }
+        // ...and a page with no nameable host leaves nothing but the refusal
+        // itself. Inventing a name for `about:blank` would be worse than the
+        // silence.
+        Some(Elsewhere::Unruled(None)) => {}
+    }
+    detail
+}
+
+// ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
 
@@ -595,11 +664,90 @@ impl Effects {
 
     /// Run one browser step in an existing session.
     ///
-    /// A [`BrowserStep::Goto`] is checked against the token's domain: the gate
-    /// ruled on a domain, and a plan that navigates away from it is asking for
-    /// an effect nobody authorised. The other steps act on whatever page the
-    /// session already shows, which this layer cannot see — for those, the
-    /// guard that matters is that they got here holding a token at all.
+    /// # The scope check is on the page the session is *on*, not on the URL we
+    /// asked for
+    ///
+    /// This method used to check exactly one thing: that a [`BrowserStep::Goto`]
+    /// named a host inside the token's domain. It then threw away the
+    /// [`BrowserOutcome::Navigated`] URL that says where the navigation actually
+    /// **ended**, and every other step — `Type`, `Click`, `Fill` — was let
+    /// through on the strength of holding a token at all, because "which page is
+    /// up" was a fact this layer did not have.
+    ///
+    /// A `302` is all it took. A token minted for `prospect.example`, a `Goto`
+    /// to `https://prospect.example/book` that clears the check, a redirect to
+    /// `https://booking-engine.example.net/…`, and the session — which is
+    /// **shared for the whole employee** — is on a host the gate never saw. The
+    /// keystrokes that follow land there, under audit rows naming
+    /// `prospect.example`. Both halves are wrong: the effect, and the record of
+    /// it.
+    ///
+    /// So the question every step now asks is the one that was missing: *where
+    /// are we?* A `Goto` is the one step whose answer cannot be known before it
+    /// runs — the redirect is the site's reply, not our request — so it is
+    /// checked from the outcome, after. Every other step acts on a page that is
+    /// already up, so it is checked from [`BrowserStep::Location`], before, and
+    /// a refusal costs their site nothing.
+    ///
+    /// # Refusing every off-domain landing would be the wrong fix
+    ///
+    /// A prospect whose booking funnel is outsourced — an airline on a
+    /// third-party engine — is an ordinary customer, and
+    /// [`Flow::confirmed`](crate::proof_of_need::Flow::confirmed) requires the
+    /// *entry* URL to be within `accounts.domain`, so a redirect is the **only**
+    /// route into such a funnel. Blanket refusal would make those prospects
+    /// silently unreachable, which is a business decision disguised as a
+    /// security one.
+    ///
+    /// # What authorises being somewhere else: the gate, again, on the real host
+    ///
+    /// A landing outside the token's domain re-asks
+    /// [`PolicyGate::authorize`](crate::gate::PolicyGate::authorize) — same
+    /// principal, same policy, same action *kind*, on the host we are actually
+    /// on. That answers the question with the thing that already answers it: an
+    /// operator's `allowed_domains` for a write, `Channel::Web` and the denylist
+    /// for a read. Three consequences, all of them the point:
+    ///
+    /// * **Nothing widens.** The second ruling is an extra condition, never a
+    ///   substitute: the requested URL of a `Goto` still has to be inside the
+    ///   token's domain, and the landing has to clear the same intersected
+    ///   allowlist and unioned denylist as anything else. A host nobody granted
+    ///   is refused whether we arrived by typing it or by being sent there.
+    /// * **The trail says where we really went.** The second decision is an
+    ///   audit row of its own, naming the landing host, and this method's row
+    ///   carries `landed` and `landed_decision` beside the domain that was
+    ///   ruled. A row that named only the token's domain was a false statement
+    ///   the moment a redirect happened.
+    /// * **It is ruled [`Untrusted`].** The landing host is *their* choice. It
+    ///   changes no verdict today — `BrowserWrite` is `Risk::Low`, so the taint
+    ///   wire does not fire — and it is still the honest label, so the day the
+    ///   risk of a browser write is reconsidered this arrives already wired.
+    ///
+    /// Two alternatives were not taken. A token carrying a *set* of domains
+    /// would have to be minted before the redirect is known, which means guessing
+    /// — and it would put a set where `Action::BrowserWrite` carries one domain,
+    /// so the audit vocabulary would stop naming what was ruled. A new policy
+    /// field ("follow redirects to…") would be a second answer to the question
+    /// `allowed_domains` already answers, and two lists that must agree are two
+    /// lists that will not.
+    ///
+    /// # A refused landing does not just fail, it un-parks the session
+    ///
+    /// The browser context is one per employee and outlives this call. Refusing
+    /// the step while leaving the tab on the page we refused hands the next
+    /// caller a page it never asked for — and *its* location check would refuse
+    /// too, forever, for a reason belonging to somebody else's turn. So a
+    /// refusal sends the session back to `about:blank`, which has no host and is
+    /// therefore inside nobody's domain.
+    ///
+    /// ponytail: one extra provider round trip per non-navigating step, and on
+    /// the Browserbase adapter that is a second CDP socket — see
+    /// `the_real_client_satisfies_the_contract`. Bought deliberately: the
+    /// alternative is caching the position, and a cached position is a copy of a
+    /// page-authored URL that a script-driven navigation makes stale, in the one
+    /// place where being stale means a keystroke goes somewhere nobody ruled on.
+    /// Fold the address into every outcome the day the round trips are measured
+    /// to matter.
     pub async fn browse_write<A: Subject<Of = BrowserWrite>>(
         &self,
         ok: Authorized<A>,
@@ -614,22 +762,170 @@ impl Effects {
         // `BrowserStep::is_a_read`'s exhaustive match is the one place a new
         // variant has to be classified.
         let ruled_a_read = matches!(ok.action().to_action(), Action::BrowserRead { .. });
+
+        let mut elsewhere = None;
         let outcome = if ruled_a_read && !step.is_a_read() {
+            // First, and before the browser is touched at all: this refusal is
+            // about the token, so it must not depend on where the session
+            // happens to be, and a fresh context has to answer it too.
             Err(EffectError::Refused(READ_TOKEN))
-        } else if let BrowserStep::Goto(url) = &step
-            && !within(url.host_str(), &allowed)
-        {
-            Err(EffectError::OutOfScope(allowed.clone()))
         } else {
-            self.ports
-                .browser
-                .act(session, step)
+            self.drive(&allowed, ruled_a_read, session, step, &mut elsewhere)
                 .await
-                .map_err(EffectError::Provider)
         };
 
-        let detail = Some(json!({ "domain": allowed.as_str() }));
-        self.record(&ok, detail, outcome).await
+        let detail = browse_detail(&allowed, elsewhere.as_ref());
+        self.record(&ok, Some(Value::Object(detail)), outcome).await
+    }
+
+    /// One browser step, with the scope check on both sides of it.
+    ///
+    /// `elsewhere` is an out-parameter and not a second return value because the
+    /// audit row needs it on **both** paths — a refused landing is exactly the
+    /// row that has to name the host — and `?` throws the success value away.
+    async fn drive(
+        &self,
+        allowed: &Domain,
+        reading: bool,
+        session: &BrowserSession,
+        step: BrowserStep<'_>,
+        elsewhere: &mut Option<Elsewhere>,
+    ) -> Result<BrowserOutcome, EffectError> {
+        let navigating = matches!(step, BrowserStep::Goto(_));
+        // The requested URL still has to be inside the token's domain. Kept
+        // ahead of everything: the landing check below *adds* a condition, and
+        // dropping this one would turn "you may browse prospect.example" into
+        // "you may browse anything your policy allows", which is not what was
+        // ruled.
+        if let BrowserStep::Goto(url) = &step
+            && !within(url.host_str(), allowed)
+        {
+            return Err(EffectError::OutOfScope(allowed.clone()));
+        }
+        if !navigating {
+            let here = self.here(session).await?;
+            self.in_scope(allowed, reading, session, &here, elsewhere)
+                .await?;
+        }
+
+        let outcome = self
+            .ports
+            .browser
+            .act(session, step)
+            .await
+            .map_err(EffectError::Provider)?;
+
+        match (&outcome, navigating) {
+            (BrowserOutcome::Navigated(here), _) => {
+                self.in_scope(allowed, reading, session, here, elsewhere)
+                    .await?;
+            }
+            // A navigation that answered with no address is one whose landing
+            // nobody can check. Fails closed rather than passing unexamined.
+            (_, true) => return Err(EffectError::Refused(NO_LOCATION)),
+            _ => {}
+        }
+        Ok(outcome)
+    }
+
+    /// May this session act on the page it is on?
+    ///
+    /// `Ok(())` and `elsewhere` untouched is the ordinary answer: we are inside
+    /// the domain the token names. Anything else is argued at length on
+    /// [`Effects::browse_write`].
+    async fn in_scope(
+        &self,
+        allowed: &Domain,
+        reading: bool,
+        session: &BrowserSession,
+        here: &Url,
+        elsewhere: &mut Option<Elsewhere>,
+    ) -> Result<(), EffectError> {
+        if within(here.host_str(), allowed) {
+            return Ok(());
+        }
+        // Only the *host*, and only once it parses into a `Domain`. The rest of
+        // the URL is bytes the page chose — a path, a query, a fragment — and
+        // this is the seam where they would become a value the rest of the
+        // process carries around. They stop here.
+        let Some(host) = here.host_str().and_then(|host| Domain::parse(host).ok()) else {
+            // A blank tab, an IP literal, a `file://`: nothing to rule on, so
+            // there is nothing that could permit it.
+            *elsewhere = Some(Elsewhere::Unruled(None));
+            self.park(session).await;
+            return Err(EffectError::OutOfScope(allowed.clone()));
+        };
+        match self.rule_again(reading, &host).await {
+            Some(decision) => {
+                *elsewhere = Some(Elsewhere::Ruled(host, decision));
+                Ok(())
+            }
+            None => {
+                *elsewhere = Some(Elsewhere::Unruled(Some(host)));
+                self.park(session).await;
+                Err(EffectError::OutOfScope(allowed.clone()))
+            }
+        }
+    }
+
+    /// Where the session is, as the browser itself reports it.
+    ///
+    /// Asked of the adapter rather than remembered here, because a page can move
+    /// itself — a `<meta refresh>`, a `location.assign` on a timer — and a
+    /// remembered address would be right until exactly the moment it mattered.
+    async fn here(&self, session: &BrowserSession) -> Result<Url, EffectError> {
+        match self
+            .ports
+            .browser
+            .act(session, BrowserStep::Location)
+            .await
+            .map_err(EffectError::Provider)?
+        {
+            BrowserOutcome::Navigated(here) => Ok(here),
+            _ => Err(EffectError::Refused(NO_LOCATION)),
+        }
+    }
+
+    /// The gate, on the host we turned out to be on.
+    ///
+    /// The action *kind* is the token's own, so a read ruling re-asks as a read
+    /// and a write ruling as a write: a redirect must never be a way to buy the
+    /// other permission. `None` is "not authorised", and it deliberately folds
+    /// in the database being unreachable — a gate that cannot answer has not
+    /// said yes, and it has already written its own audit row either way.
+    async fn rule_again(&self, reading: bool, host: &Domain) -> Option<DecisionId> {
+        let subject = if reading {
+            Action::BrowserRead {
+                domain: host.clone(),
+            }
+        } else {
+            Action::BrowserWrite {
+                domain: host.clone(),
+            }
+        };
+        // `Untrusted`: *they* chose this host, by answering our request with a
+        // redirect. See `browse_write` on why the label is right even though no
+        // verdict turns on it today.
+        crate::gate::PolicyGate::new(self.db.clone())
+            .authorize(&self.principal, Untrusted::new(subject))
+            .await
+            .ok()
+            .map(|ok| ok.decision_id())
+    }
+
+    /// Take the shared session off a page nobody authorised.
+    ///
+    /// Best effort, and it has to be: if it fails the tab stays where it is and
+    /// the next call's own location check refuses again, so there is no path
+    /// where a failed park lets a step through. Reporting it over the refusal
+    /// that actually matters would replace a true answer with a less useful one.
+    async fn park(&self, session: &BrowserSession) {
+        let blank = agentos_providers::browser::blank_page();
+        let _ = self
+            .ports
+            .browser
+            .act(session, BrowserStep::Goto(&blank))
+            .await;
     }
 
     /// Go to a page inside the domain on the token and bring back what one
@@ -648,8 +944,10 @@ impl Effects {
     ///
     /// So it is one token, one ruling, one row. The navigation is scope-checked
     /// against the domain that was ruled on exactly as [`Effects::browse_write`]
-    /// checks a [`BrowserStep::Goto`], because it is the same check on the same
-    /// field.
+    /// checks a [`BrowserStep::Goto`] — literally so: both go through
+    /// `Effects::in_scope`, on the requested URL *and* on the one the page
+    /// redirected us to. A read that lands somewhere else is re-ruled as a read,
+    /// which is what keeps `denied_domains` from being walkable around.
     ///
     /// # It is a read, and it is unspellable as anything else
     ///
@@ -677,9 +975,13 @@ impl Effects {
         selector: &str,
     ) -> Result<Untrusted<String>, EffectError> {
         let allowed = ok.action().subject().domain.clone();
-        let read = self.load_page(&allowed, url, selector).await;
-        let detail = Some(json!({ "domain": allowed.as_str(), "selector": selector }));
-        self.record(&ok, detail, read).await
+        let mut elsewhere = None;
+        let read = self
+            .load_page(&allowed, url, selector, &mut elsewhere)
+            .await;
+        let mut detail = browse_detail(&allowed, elsewhere.as_ref());
+        detail.insert("selector".to_owned(), json!(selector));
+        self.record(&ok, Some(Value::Object(detail)), read).await
     }
 
     /// Read a page that lists companies and turn the addresses on it into
@@ -725,9 +1027,13 @@ impl Effects {
         segment: &str,
     ) -> Result<crate::prospects::Report, EffectError> {
         let allowed = ok.action().subject().domain.clone();
-        let found = self.scan_directory(&allowed, url, segment).await;
-        let detail = Some(json!({ "domain": allowed.as_str(), "segment": segment }));
-        self.record(&ok, detail, found).await
+        let mut elsewhere = None;
+        let found = self
+            .scan_directory(&allowed, url, segment, &mut elsewhere)
+            .await;
+        let mut detail = browse_detail(&allowed, elsewhere.as_ref());
+        detail.insert("segment".to_owned(), json!(segment));
+        self.record(&ok, Some(Value::Object(detail)), found).await
     }
 
     /// The provider-and-store half of [`Effects::discover_prospects`], split out
@@ -738,8 +1044,9 @@ impl Effects {
         allowed: &Domain,
         url: &Url,
         segment: &str,
+        elsewhere: &mut Option<Elsewhere>,
     ) -> Result<crate::prospects::Report, EffectError> {
-        let page = self.load_page(allowed, url, WHOLE_PAGE).await?;
+        let page = self.load_page(allowed, url, WHOLE_PAGE, elsewhere).await?;
         let mut tx = self
             .db
             .tenant_tx(self.principal.tenant_id)
@@ -772,21 +1079,40 @@ impl Effects {
 
     /// The provider half of [`Effects::read_page`], split out so the token, the
     /// audit row and the two steps do not share one method's error paths.
+    ///
+    /// **It navigates, so it has the redirect problem too**, and it has it in
+    /// the sharper form: what a read brings back is quoted. A directory page
+    /// that answers with a `302` would have its landing scanned for prospects,
+    /// and a prospect's panel would be read off a host the token never named and
+    /// filed as *their* page. So the landing goes through the same check
+    /// [`Effects::browse_write`] argues, with `reading = true` — the ruling a
+    /// read bought is the ruling a redirected read gets, which for the shipped
+    /// policy means `Channel::Web` and the denylist, and the denylist is the
+    /// half a redirect could otherwise walk around.
     async fn load_page(
         &self,
         allowed: &Domain,
         url: &Url,
         selector: &str,
+        elsewhere: &mut Option<Elsewhere>,
     ) -> Result<Untrusted<String>, EffectError> {
         if !within(url.host_str(), allowed) {
             return Err(EffectError::OutOfScope(allowed.clone()));
         }
         let session = self.browser_session().await?;
-        self.ports
+        match self
+            .ports
             .browser
             .act(&session, BrowserStep::Goto(url))
             .await
-            .map_err(EffectError::Provider)?;
+            .map_err(EffectError::Provider)?
+        {
+            BrowserOutcome::Navigated(here) => {
+                self.in_scope(allowed, true, &session, &here, elsewhere)
+                    .await?;
+            }
+            _ => return Err(EffectError::Refused(NO_LOCATION)),
+        }
         match self
             .ports
             .browser
@@ -1375,6 +1701,18 @@ mod tests {
         // The policy the gate will read: email, `portal.example.com`, and a
         // small budget. It is a row, not a constructor argument — the gate
         // loads the four layers per decision.
+        install_policy(db, tenant, &["portal.example.com"], BTreeSet::new()).await;
+
+        Principal::employee(tenant, employee)
+    }
+
+    /// The tenant layer, with exactly the hosts a test wants written to and
+    /// exactly the ones it wants blocked.
+    ///
+    /// A function rather than a literal in `seed` because the redirect tests
+    /// need three different shapes of the same policy: the partner granted, the
+    /// partner not granted, and the partner denied.
+    async fn install_policy(db: &Db, tenant: TenantId, allowed: &[&str], denied: BTreeSet<Domain>) {
         agentos_store::policy::install(
             db,
             tenant,
@@ -1397,17 +1735,17 @@ mod tests {
                 // Still here, and still doing work: reading no longer consults
                 // it, but `BrowserWrite` and `FileUpload` do, and the browser
                 // tests below authorise writes against exactly this entry.
-                allowed_domains: BTreeSet::from([
-                    Domain::parse("portal.example.com").expect("domain")
-                ]),
+                allowed_domains: allowed
+                    .iter()
+                    .map(|host| Domain::parse(host).expect("domain"))
+                    .collect(),
+                denied_domains: denied,
                 max_new_contacts_per_day: 5,
                 ..PolicyLimits::default()
             },
         )
         .await
         .expect("install the policy");
-
-        Principal::employee(tenant, employee)
     }
 
     fn gate(db: &Db) -> PolicyGate {
@@ -1422,6 +1760,50 @@ mod tests {
             mcp: Arc::new(StubMcp),
             payments,
         })
+    }
+
+    /// The same, with the browser kept in hand — for the tests that script a
+    /// redirect and then ask where the session ended up.
+    fn ports_browsing(browser: Arc<MockBrowser>) -> Arc<Ports> {
+        Arc::new(Ports {
+            email: Arc::new(MockEmailProvider::new()),
+            telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+            browser,
+            mcp: Arc::new(StubMcp),
+            payments: MockPayments::healthy(),
+        })
+    }
+
+    fn session_for(principal: &Principal) -> BrowserSession {
+        BrowserSession {
+            employee_id: principal.employee_id,
+            binding: ProviderBinding {
+                provider: "mock-browser".to_owned(),
+                external_id: "ctx-1".to_owned(),
+            },
+            user_data_dir: None,
+        }
+    }
+
+    /// The `employee_resources` row `Effects::browser_session` rebuilds a
+    /// session from — the whole of what `read_page` needs, since nothing hands
+    /// it a `BrowserSession`.
+    async fn provision_browser(db: &Db, principal: &Principal) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+                 (employee_id, step, tenant_id, state, provider, external_id) \
+             VALUES ($1, 'browser', $2, 'ready', 'mock-browser', $3)",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .bind(principal.tenant_id.as_uuid())
+        // Unique across employees, per
+        // `employee_resources_provider_external_id_key`.
+        .bind(format!("ctx-{}", principal.employee_id.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("insert the browser resource");
+        tx.commit().await.expect("commit the browser resource");
     }
 
     fn body() -> RenderedEmail {
@@ -1745,6 +2127,19 @@ mod tests {
             .await
             .expect("a reading step on a read ruling");
 
+        // `Location` is a reading step too, and it has to be: the scope guard
+        // asks it before every step it did not itself navigate, so classifying
+        // it as a write would make a read ruling unable to drive anything at
+        // all.
+        let token = gate(&db)
+            .authorize(&principal, reading.clone())
+            .await
+            .expect("still a read");
+        effects
+            .browse_write(token, &session, BrowserStep::Location)
+            .await
+            .expect("asking where we are is looking, not writing");
+
         // The write ruling keeps typing, which is the half that must not have
         // been taken away.
         let token = gate(&db)
@@ -1812,6 +2207,264 @@ mod tests {
             .await
             .expect("inside the authorised domain");
         assert_eq!(effect_rows(&db, &principal).await.len(), 2);
+    }
+
+    /// **A `302` off the token's domain is refused, and the tab is not left
+    /// there.**
+    ///
+    /// The bug this guard exists for, run end to end. Before it, every line
+    /// below succeeded: the `Goto` cleared the check on the URL it *asked* for,
+    /// the landing URL the outcome carries was dropped on the floor, and the
+    /// keystroke that followed went to `booking-engine.example.net` under two
+    /// audit rows that both said `portal.example.com` and `ok`.
+    ///
+    /// The last part is the one a "just refuse it" fix would miss: the browser
+    /// context is shared for the whole employee, so a refusal that leaves the
+    /// tab on the refused page has only moved the problem to whoever calls next.
+    #[tokio::test]
+    async fn a_redirect_off_the_token_domain_is_refused_and_the_session_is_parked() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let browser = Arc::new(MockBrowser::new());
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(browser.clone()),
+            principal.clone(),
+        );
+        let session = session_for(&principal);
+        let subject = BrowserWrite {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+
+        let asked = Url::parse("https://portal.example.com/book").expect("url");
+        let landed = Url::parse("https://booking-engine.example.net/step1").expect("url");
+        browser.set_redirect(&asked, &landed);
+
+        // 1. The navigation is inside the token's domain and still refused,
+        //    because it did not *end* inside it and nobody granted where it
+        //    ended.
+        let token = gate(&db)
+            .authorize(&principal, subject.clone())
+            .await
+            .expect("portal.example.com is on the write list");
+        let err = effects
+            .browse_write(token, &session, BrowserStep::Goto(&asked))
+            .await
+            .expect_err("their site sent us somewhere nobody ruled on");
+        assert_eq!(err.code(), "out_of_scope");
+
+        // 2. The row names the host we were really on. One that said only
+        //    `portal.example.com` would be a false statement about a page we
+        //    had already loaded.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["detail"]["domain"], json!("portal.example.com"));
+        assert_eq!(
+            rows[0].1["detail"]["landed"],
+            json!("booking-engine.example.net"),
+            "the trail has to say where we actually went: {}",
+            rows[0].1
+        );
+        assert_eq!(rows[0].1["outcome"], json!("error"));
+
+        // 3. The shared tab was taken off their page.
+        assert_eq!(
+            browser.act(&session, BrowserStep::Location).await.unwrap(),
+            BrowserOutcome::Navigated(agentos_providers::browser::blank_page()),
+            "the next caller inherits this session"
+        );
+
+        // 4. And the keystroke that used to follow cannot happen: a step is
+        //    checked against where the session *is* before it touches anything,
+        //    so even a tab somebody else parked off-domain refuses it.
+        browser
+            .act(&session, BrowserStep::Goto(&landed))
+            .await
+            .expect("something parks the tab off-domain behind our back");
+        let token = gate(&db)
+            .authorize(&principal, subject)
+            .await
+            .expect("still allowed on paper");
+        let err = effects
+            .browse_write(
+                token,
+                &session,
+                BrowserStep::Type {
+                    sel: "#passport",
+                    text: "FRA",
+                },
+            )
+            .await
+            .expect_err("the page under that selector is not the ruled one");
+        assert_eq!(err.code(), "out_of_scope");
+        assert!(
+            !browser.log().iter().any(|line| line.contains(" type ")),
+            "nothing was typed on their page: {:?}",
+            browser.log()
+        );
+    }
+
+    /// **An outsourced booking funnel still works — because an operator granted
+    /// the partner, and for no other reason.**
+    ///
+    /// The half a blanket refusal would have destroyed.
+    /// `proof_of_need::Flow::confirmed` requires a prospect's entry URL to be
+    /// within `accounts.domain`, so a redirect is the *only* route into a funnel
+    /// run by somebody else; refusing every off-domain landing would have made
+    /// those prospects unreachable and said nothing about it.
+    ///
+    /// What permits it is what already permits typing anywhere at all:
+    /// `allowed_domains`. No new policy field and no new action kind — and the
+    /// rows name the partner and the second decision that cleared it.
+    #[tokio::test]
+    async fn an_outsourced_funnel_is_driven_when_the_operator_granted_the_partner() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        install_policy(
+            &db,
+            principal.tenant_id,
+            &["portal.example.com", "booking-engine.example.net"],
+            BTreeSet::new(),
+        )
+        .await;
+        let browser = Arc::new(MockBrowser::new());
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(browser.clone()),
+            principal.clone(),
+        );
+        let session = session_for(&principal);
+        let subject = BrowserWrite {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+
+        let asked = Url::parse("https://portal.example.com/book").expect("url");
+        let landed = Url::parse("https://booking-engine.example.net/step1").expect("url");
+        browser.set_redirect(&asked, &landed);
+
+        let token = gate(&db)
+            .authorize(&principal, subject.clone())
+            .await
+            .expect("the entry is on the prospect's own domain");
+        effects
+            .browse_write(token, &session, BrowserStep::Goto(&asked))
+            .await
+            .expect("the partner is granted, so the landing is ruled and kept");
+
+        let token = gate(&db)
+            .authorize(&principal, subject)
+            .await
+            .expect("still ruled on the prospect's domain");
+        effects
+            .browse_write(
+                token,
+                &session,
+                BrowserStep::Type {
+                    sel: "#passport",
+                    text: "FRA",
+                },
+            )
+            .await
+            .expect("typing into the partner's field, ruled on the partner");
+
+        assert_eq!(
+            browser.log(),
+            [
+                "ctx-1 goto https://portal.example.com/book",
+                "ctx-1 type #passport FRA",
+            ],
+            "the funnel ran"
+        );
+
+        // Both rows carry the token's domain *and* the host the step really
+        // acted on, plus the id of the ruling that permitted being there.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 2);
+        for (_, row) in &rows {
+            assert_eq!(row["outcome"], json!("ok"));
+            assert_eq!(row["detail"]["domain"], json!("portal.example.com"));
+            assert_eq!(
+                row["detail"]["landed"],
+                json!("booking-engine.example.net"),
+                "{row}"
+            );
+            assert!(
+                row["detail"]["landed_decision"].is_string(),
+                "the second ruling has to be findable from this row: {row}"
+            );
+        }
+        // ...and it is a fresh ruling per step, not one id copied forward: a
+        // policy an operator narrows mid-plan stops the plan.
+        assert_ne!(
+            rows[0].1["detail"]["landed_decision"], rows[1].1["detail"]["landed_decision"],
+            "one re-decision per step, or the trail cannot say which step went where"
+        );
+    }
+
+    /// **A read may be redirected, and the denylist still holds.**
+    ///
+    /// Reads clear `Channel::Web` rather than an allowlist, so a redirected read
+    /// is normally fine — `example.com` to `www.example.com` to a country
+    /// splash, all day. The one thing a redirect must not buy is a host an
+    /// operator explicitly blocked; and `read_page` navigates outside
+    /// `browse_write` entirely, so it needs the check in its own right rather
+    /// than inheriting one.
+    #[tokio::test]
+    async fn a_redirected_read_is_refused_when_it_lands_on_a_denied_host() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        install_policy(
+            &db,
+            principal.tenant_id,
+            &["portal.example.com"],
+            BTreeSet::from([Domain::parse("banking.example.net").expect("domain")]),
+        )
+        .await;
+        let browser = Arc::new(MockBrowser::new());
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(browser.clone()),
+            principal.clone(),
+        );
+        provision_browser(&db, &principal).await;
+
+        let asked = Url::parse("https://portal.example.com/statement").expect("url");
+        let denied = Url::parse("https://banking.example.net/accounts").expect("url");
+        browser.set_redirect(&asked, &denied);
+        browser.set_text("#balance", &["EUR 12,340"]);
+
+        let reading = || BrowserRead {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("reading is a channel, and this seat has it");
+        let err = effects
+            .read_page(token, &asked, "#balance")
+            .await
+            .expect_err("the operator blocked that host");
+        assert_eq!(err.code(), "out_of_scope");
+        assert!(
+            !browser.log().iter().any(|line| line.contains(" text ")),
+            "their page was never read: {:?}",
+            browser.log()
+        );
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows[0].1["detail"]["landed"], json!("banking.example.net"));
+
+        // The same read without a redirect still works, or this guard would be
+        // an off switch for reading rather than a bound on it.
+        let straight = Url::parse("https://portal.example.com/page").expect("url");
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("still allowed");
+        let text = effects
+            .read_page(token, &straight, "#balance")
+            .await
+            .expect("an ordinary read");
+        assert_eq!(text.into_inner_for_rendering(), "EUR 12,340");
     }
 
     #[tokio::test]

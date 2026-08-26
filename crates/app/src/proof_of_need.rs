@@ -477,7 +477,16 @@ pub const MAX_FEE_AGE: TimeDelta = TimeDelta::days(90);
 /// what lets [`Effects::browse_write`] accept the token, which is the only path
 /// from this crate to a browser adapter; the subject it hands back is what that
 /// method scope-checks a [`BrowserStep::Goto`] against, so the URL still cannot
-/// leave the domain the gate ruled on.
+/// be *pointed* outside the domain the gate ruled on.
+///
+/// It can still **land** outside it, and that is not this type's business.
+/// A prospect whose booking is run by a third party answers their own entry URL
+/// with a `302`, and [`Flow::confirmed`] — which demands the entry be within
+/// `accounts.domain` — makes that redirect the only route in. What happens next
+/// belongs to [`Effects::browse_write`]: it re-asks the gate on the host the
+/// session actually reached, for the *kind* of action this token bought. So a
+/// redirect can buy a read of the public web, and can buy a keystroke only on a
+/// host an operator put in `allowed_domains`.
 ///
 /// Nothing here can produce an `Action::BrowserWrite`: the *typing* steps use
 /// the real [`BrowserWrite`] subject, because putting a passport code into
@@ -2271,7 +2280,10 @@ impl Prober {
         match step {
             // Navigation is a read. `browse_write` re-checks the URL against
             // the domain on the token, so a `Flow` whose entry URL is not on
-            // its own domain fails here rather than browsing off-scope.
+            // its own domain fails here rather than browsing off-scope — and it
+            // checks where the navigation *ended* too, so a booking engine on
+            // somebody else's host is ruled on by name before the two steps
+            // below type anything into it.
             Plan::Goto(url) => {
                 let ok = self.authorize_read(flow).await?;
                 self.effects
@@ -3770,6 +3782,86 @@ mod tests {
             ..confirmed_row()
         };
         Flow::confirmed(deeper).expect("a subdomain of their own domain");
+    }
+
+    /// **A prospect whose booking is outsourced is still probeable — and only
+    /// because an operator granted the engine.**
+    ///
+    /// [`Flow::confirmed`] refuses an entry URL that is not within
+    /// `accounts.domain`, so for an airline whose checkout is run by somebody
+    /// else the `302` off their own host is the *only* route into the funnel.
+    /// A guard that refused every off-domain landing would have made this whole
+    /// class of prospect silently unreachable, which is why
+    /// `Effects::browse_write` re-asks the gate on the host it landed on instead
+    /// of refusing.
+    ///
+    /// The two halves are asserted together on purpose: with the engine on
+    /// `allowed_domains` the probe runs to a finding, and with it off — the same
+    /// prospect, the same flow, the same redirect — the very first keystroke is
+    /// refused and their form is never touched. Nothing about the redirect
+    /// decides it; the operator's list does.
+    #[tokio::test]
+    async fn an_outsourced_booking_engine_is_probed_only_if_an_operator_granted_it() {
+        let Some(db) = db().await else { return };
+        let engine = "engine.bookingpartner.example";
+        let landed = Url::parse(&format!("https://{engine}/step1")).expect("url");
+
+        // 1. Granted: the probe runs through their partner's funnel.
+        let h = harness(
+            &db,
+            &["Good news — no visa required for this trip."],
+            PolicyLimits {
+                allowed_domains: BTreeSet::from([domain("book.airline.example"), domain(engine)]),
+                ..limits()
+            },
+        )
+        .await;
+        h.browser.set_redirect(&flow().entry, &landed);
+
+        let checked = h
+            .prober
+            .check(&flow(), &probe(), Some(&authority()), None, now())
+            .await
+            .expect("the engine is granted for writing");
+        assert!(
+            checked.evidence().is_some(),
+            "the funnel ran to a finding: {checked:?}"
+        );
+        assert!(
+            h.browser.log().iter().any(|line| line.contains(" type ")),
+            "their partner's form was filled: {:?}",
+            h.browser.log()
+        );
+
+        // 2. Not granted: the navigation is a read and still allowed, and the
+        //    first thing that would *write* stops. The reproduction steps a
+        //    finding would have carried are never generated, because there is
+        //    no finding.
+        let h = harness(
+            &db,
+            &["Good news — no visa required for this trip."],
+            limits(),
+        )
+        .await;
+        h.browser.set_redirect(&flow().entry, &landed);
+
+        let err = h
+            .prober
+            .check(&flow(), &probe(), Some(&authority()), None, now())
+            .await
+            .expect_err("nobody granted the engine");
+        assert_eq!(err.code(), "out_of_scope");
+        assert!(
+            !h.browser.log().iter().any(|line| line.contains(" type ")),
+            "nothing was typed into a stranger's form: {:?}",
+            h.browser.log()
+        );
+        // Filed as an attempt, so a prospect nobody can reach is countable
+        // rather than invisible.
+        assert_eq!(
+            attempts(&db, &h.principal).await,
+            vec![("error".to_owned(), Some("out_of_scope".to_owned()))]
+        );
     }
 
     /// The mechanism end to end: what an operator writes, what it takes for that
