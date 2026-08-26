@@ -275,6 +275,7 @@ below.
   "denied_domains": [],
   "allowed_mcp_tools": ["sourcing/rfq-send", "sourcing/quote-read"],
   "allowed_a2a_peers": [],
+  "allowed_models": ["claude-haiku-4-5", "claude-sonnet-5"],
   "max_new_contacts_per_day": 15,
   "max_turns_per_day": 30,
   "allow_file_upload": false,
@@ -290,6 +291,14 @@ every action for that employee is refused with `broken_policy`.
 
 Sales may not spend at all, which is `"spend": null` — a layer with no spend
 block permits no spending, whatever the tenant allows.
+
+`allowed_models` is what this team may *think* with, and it behaves like every
+other allowlist here: it intersects downward, an unknown name fails the load
+rather than being skipped, and **an empty list means this team takes no turns at
+all**. The role pack asks for a model and this list decides — a pack asking for
+one that is not here runs the cheapest one that is, and a pack asking under an
+empty list runs nothing and says so. The four names this build knows are
+`claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-5` and `claude-fable-5`.
 
 > **Every field, every time.** The layers *intersect*, so there is no "inherit"
 > marker and an omitted field is **deny**, not "leave it alone". A file

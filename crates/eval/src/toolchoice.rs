@@ -64,7 +64,7 @@ use agentos_app::prompt::{SystemPrompt, render_fenced};
 use agentos_app::rolepack::RolePack;
 use agentos_domain::action::{McpTool, Risk};
 use agentos_domain::ids::Slug;
-use agentos_domain::policy::{EffectivePolicy, PolicyLimits};
+use agentos_domain::policy::{EffectivePolicy, ModelId, PolicyLimits};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{Content, Llm, Message};
 use agentos_providers::llm_cli::CliLlm;
@@ -72,8 +72,18 @@ use sha2::{Digest, Sha256};
 
 use crate::{Row, Surface, Truth};
 
-/// Passed straight through to the CLI. Override with `--model`.
-pub const DEFAULT_MODEL: &str = "claude-opus-5";
+/// The model this fixture's employee runs, read off its own role pack rather
+/// than written down here.
+///
+/// It used to be a constant, and a constant was a second answer to a question
+/// the pack now answers: the fixture *is* the international buyer, so the model
+/// it is scored on has to be the model that buyer actually runs, or `--live`
+/// measures an employee this deployment does not have. Override with `--model`
+/// when you want to score the same prompt on a different one — that is the
+/// comparison the flag is for.
+pub fn default_model() -> ModelId {
+    RolePack::international_buyer().model()
+}
 
 const MAX_TOKENS: u32 = 4_096;
 
@@ -88,19 +98,37 @@ const MAX_TOKENS: u32 = 4_096;
 /// makes a prompt edit visible, so that nobody quotes a tool-choice score
 /// measured against a prompt that no longer exists.
 ///
-/// Last moved by the domain allowlist: the prefix now says where `read_page`
-/// may point, from the policy, and [`prompt`] is built on `default_ceiling` —
-/// which grants no domain — so what it renders is the empty case, one paragraph
-/// saying so. **The live scores below it are stale until somebody re-runs
+/// # Why the model is inside the digest now
+///
+/// A prompt edit makes a recorded score answer a question nobody asked. A
+/// **model** change is worse than that: the score *is* a fact about a model, so
+/// changing which model this employee runs does not make the old number stale in
+/// the way a reworded paragraph does — it makes it a number about a different
+/// subject entirely, while every word of the prompt it names still matches.
+/// Pinning only the prompt would leave that change completely invisible, which
+/// is the one failure this whole mechanism exists to prevent.
+///
+/// So [`digest`] hashes the model id together with the rendered prefix. Moving
+/// `RolePack::international_buyer`'s model turns this suite red with *"the
+/// recorded live scores are stale"*, which is true, and the fix is the same one
+/// a prompt edit calls for: re-run `--live` and re-pin.
+///
+/// **Last moved by two independent changes landing in one merge**, which is
+/// why neither branch's value survived. The domain allowlist put a paragraph in
+/// the prefix — `prompt` is built on `default_ceiling`, which grants no domain,
+/// so what it renders is the empty case saying so — and separately the model
+/// joined the hash. Each agent re-derived against its own base and got a
+/// different answer; the constants below were derived after the merge, from the
+/// bytes that now exist. **The live scores are stale until somebody re-runs
 /// `--live`.** None of the five [`CASES`] is a `read_page` case and this
-/// employee is not even offered the schema, so the expected answers are
-/// unaffected — but the bytes the model was scored against are not the bytes it
-/// would be scored against now, and that is the only claim this pin makes.
-pub const TRUSTED_PROMPT: &str = "679f2570cc557f13";
+/// employee is not offered that schema, so the expected answers are unaffected
+/// — but the bytes the model was scored against are not the bytes it would be
+/// scored against now, and that is the only claim this pin makes.
+pub const TRUSTED_PROMPT: &str = "9e6f941284f79fa8";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named. Differs from [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "ff91216af7f8dd9e";
+pub const UNTRUSTED_PROMPT: &str = "721c6f7882520d20";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.
@@ -160,7 +188,7 @@ fn prompt() -> SystemPrompt {
 /// the request is built is the failure this suite exists to make impossible.
 fn offered(trust: TrustLabel) -> Vec<String> {
     prompt()
-        .request(DEFAULT_MODEL, MAX_TOKENS, trust, Vec::new())
+        .request(default_model().as_str(), MAX_TOKENS, trust, Vec::new())
         .tools
         .into_iter()
         .map(|tool| tool.name)
@@ -181,18 +209,26 @@ fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
         // The same tenant fleet. The employee is told about none of it and
         // offered no schema for it, and both of those come from one policy.
         .with_mcp_tools(&policy, inventory())
-        .request(DEFAULT_MODEL, MAX_TOKENS, trust, Vec::new())
+        .request(default_model().as_str(), MAX_TOKENS, trust, Vec::new())
         .tools
         .into_iter()
         .map(|tool| tool.name)
         .collect()
 }
 
-/// First 16 hex characters of the SHA-256 of the rendered prompt. Short enough
-/// to read in a report, long enough that nothing collides by accident.
+/// First 16 hex characters of the SHA-256 of **the model and the rendered
+/// prompt**. Short enough to read in a report, long enough that nothing
+/// collides by accident.
+///
+/// The model is in here for the reason [`TRUSTED_PROMPT`] gives at length: a
+/// score is a fact about a model, and a pin that could not see the model change
+/// would certify a stale number as fresh.
 pub fn digest(trust: TrustLabel) -> String {
-    let rendered = prompt().render(trust);
-    Sha256::digest(rendered.as_bytes())
+    let mut hasher = Sha256::new();
+    hasher.update(default_model().as_str().as_bytes());
+    hasher.update(prompt().render(trust).as_bytes());
+    hasher
+        .finalize()
         .iter()
         .take(8)
         .map(|byte| format!("{byte:02x}"))
@@ -491,17 +527,23 @@ pub fn evaluate() -> Surface {
     let unchanged = trusted_now == TRUSTED_PROMPT && untrusted_now == UNTRUSTED_PROMPT;
     rows.push(
         Row::ok(
-            "system prompt is the one live was run against",
+            "the model and prompt live was run against",
+            // The model by name and not only inside the hash: a score is a fact
+            // about a model, and a report that made you recompute a digest to
+            // find out which one would be a number with no subject.
             if unchanged {
-                format!("{trusted_now} / {untrusted_now}")
+                format!("{} · {trusted_now} / {untrusted_now}", default_model())
             } else {
-                format!("CHANGED to {trusted_now} / {untrusted_now}")
+                format!(
+                    "CHANGED to {} · {trusted_now} / {untrusted_now}",
+                    default_model()
+                )
             },
             Truth::Correct,
         )
         .gated(unchanged)
         .note(if unchanged {
-            "unchanged since the last live run"
+            "model and prompt both unchanged since the last live run"
         } else {
             "any tool-choice score you have is now stale — re-run `--live` and re-pin"
         }),

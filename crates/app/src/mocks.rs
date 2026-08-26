@@ -51,7 +51,7 @@ use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
 use agentos_providers::email_resend::ResendEmailProvider;
-use agentos_providers::llm_anthropic::{AnthropicLlm, DEFAULT_MODEL};
+use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
 use agentos_providers::secrets::MemorySecretStore;
 use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
@@ -323,12 +323,14 @@ impl LlmBackend {
         }
     }
 
-    /// The model id passed to the provider untouched. One model, deliberately:
-    /// picking a cheaper one is an operator's decision and there is nowhere yet
-    /// for them to record it.
-    pub const fn model(self) -> &'static str {
-        DEFAULT_MODEL
-    }
+    // There was a `model()` here, returning `DEFAULT_MODEL` whatever the
+    // backend was, and its doc comment said picking a cheaper one "is an
+    // operator's decision and there is nowhere yet for them to record it".
+    // There is now: `PolicyLimits::allowed_models` is where an operator records
+    // it and `RolePack::model` is where a role asks for one, so a backend
+    // answering for every employee in the deployment is a second, wrong answer
+    // to a question that has a right one. Deleted rather than rewired — a
+    // process-wide model is the thing this replaced.
 }
 
 /// What the scripted backend answers, every turn.
@@ -687,8 +689,12 @@ mod tests {
         let llm = llm(LlmBackend::Cli, None).expect("the CLI needs no key");
         let response = llm
             .complete(
-                LlmRequest::new(LlmBackend::Cli.model(), "Reply with exactly: OK", 16_000)
-                    .with_message(agentos_providers::llm::Message::user("say OK")),
+                LlmRequest::new(
+                    agentos_domain::policy::ModelId::default().as_str(),
+                    "Reply with exactly: OK",
+                    16_000,
+                )
+                .with_message(agentos_providers::llm::Message::user("say OK")),
             )
             .await
             .expect("the local claude CLI answered");

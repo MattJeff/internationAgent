@@ -377,7 +377,7 @@ struct InitiativeView {
     last_claimed_at: Option<DateTime<Utc>>,
     claims: i64,
     /// What the poller decided last time: `turn`, `clarify`, `no_charter`,
-    /// `unreadable_charter`, `error`.
+    /// `unreadable_charter`, `no_model`, `over_budget`, `error`.
     last_outcome: Option<String>,
     /// The detail behind it — for `clarify`, the question waiting on an answer.
     last_detail: Option<String>,

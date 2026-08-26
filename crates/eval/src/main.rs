@@ -22,18 +22,21 @@
 //! Exit code is 0 unless a [`Truth::Correct`](agentos_eval::Truth) row failed.
 
 use agentos_domain::untrusted::TrustLabel;
-use agentos_eval::toolchoice::{CASES, Chose, DEFAULT_MODEL, digest, run_live};
+use agentos_eval::toolchoice::{CASES, Chose, default_model, digest, run_live};
 use agentos_eval::{Surface, deterministic, render, suppression::REAL_RATE_SQL};
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let live = args.iter().any(|a| a == "--live");
-    let model = args
+    // `None` means "let each seat run what its role pack asks for, bounded by
+    // its policy" — which is what the deployment does. `--model` overrides every
+    // seat at once, and that is a comparison rather than a default.
+    let model: Option<&str> = args
         .iter()
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
-        .map_or(DEFAULT_MODEL, String::as_str);
+        .map(String::as_str);
 
     // The dry run is not a suite and does not print one: it stands a company up
     // and works it, which is its own report. Nothing below it applies.
@@ -78,7 +81,8 @@ async fn main() {
 /// Prints the prompt digest beside the scores, because a tool-choice score
 /// without the prompt it was measured against is a number with no subject —
 /// and CI will refuse the pin the moment that prompt is edited.
-async fn live_report(model: &str) {
+async fn live_report(model: Option<&str>) {
+    let model = model.map_or_else(|| default_model().as_str().to_owned(), ToOwned::to_owned);
     println!("\n─────────────────────────────────────────────────────────────");
     println!("LIVE — {model} via the local `claude` CLI");
     println!(
@@ -87,7 +91,7 @@ async fn live_report(model: &str) {
         digest(TrustLabel::Untrusted)
     );
 
-    let results = run_live(model).await;
+    let results = run_live(&model).await;
     let mut correct = 0usize;
     let mut violations = 0usize;
     let mut malformed = 0usize;

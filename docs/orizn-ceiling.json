@@ -10,6 +10,12 @@
   "denied_domains": [],
   "allowed_mcp_tools": [],
   "allowed_a2a_peers": [],
+  "allowed_models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-fable-5"
+  ],
   "max_new_contacts_per_day": 20,
   "max_turns_per_day": 30,
   "allow_file_upload": false,

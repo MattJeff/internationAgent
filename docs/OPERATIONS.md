@@ -538,6 +538,38 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 An unknown or another tenant's id is **404**, not 403.
 
+### 3.6b The model allowlist, and what "no_model" means
+
+`allowed_models` is the other half of the bill, on the same table and with the
+same intersection: platform ∧ tenant ∧ role ∧ employee, narrowing only. Turns
+say how *often* an employee thinks; this says *what it thinks with*, and the two
+models at the ends of the list differ by ten times per token.
+
+Each role pack names the model its job needs — that is a preference, in code —
+and this column bounds what the deployment will pay for. What runs is the
+intersection, resolved once when the turn is assembled:
+
+* **preference permitted** → it runs;
+* **preference excluded, something else permitted** → the *cheapest* permitted
+  model runs, and the substitution is logged at `INFO` with the role, the
+  preference and what it fell to. Never a more expensive one;
+* **nothing permitted** → **no turn happens.** The initiative loop records
+  `last_outcome = 'no_model'` with the role and preference in `last_detail`; the
+  message handler fails the turn with a sentence saying it is not a provider
+  failure. There is no fallback model, and retrying will not help — the fix is a
+  policy layer.
+
+`AGENTOS_LLM` still selects the *backend* (`mock` / `cli` / `anthropic`) and no
+longer selects a model; there was a process-wide model string and it is gone.
+Under `cli` the deployment is on a subscription, where the rate card is the wrong
+currency entirely and the binding constraint is throughput — the allowlist still
+applies, because `--model` still selects which model the subscription serves.
+
+```sql
+SELECT layer, role_name, allowed_models FROM policy_layers l
+  JOIN policy_versions v ON v.id = l.version_id WHERE v.active;
+```
+
 ### 3.7 Shutdown
 
 SIGTERM or SIGINT cancels the token. In-flight HTTP requests get **20s**

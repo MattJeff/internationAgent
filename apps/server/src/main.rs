@@ -58,6 +58,7 @@ use agentos_app::turn::{Context, Failed, Turn, TurnError};
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::{Lifecycle, Step};
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
+use agentos_domain::policy::{ModelId, model_for};
 use agentos_domain::untrusted::Untrusted;
 use agentos_store::db::{Db, TenantTx};
 use agentos_store::employee as employee_store;
@@ -314,7 +315,6 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         gate: gate.clone(),
         ports: ports.clone(),
         fleets: fleets.clone(),
-        model: config.llm.model(),
         cancel: cancel.clone(),
     };
 
@@ -847,8 +847,6 @@ struct Agent {
     /// fleet is substituted into a per-turn copy of `Ports` in [`Agent::on_turn`]
     /// — four `Arc` bumps and the one field that is genuinely per-tenant.
     fleets: Fleets,
-    /// Passed to the provider untouched. See [`agentos_app::mocks::LlmBackend`].
-    model: &'static str,
     /// The process-wide shutdown token. Each turn takes a child of it under
     /// [`TURN_DEADLINE`].
     cancel: CancellationToken,
@@ -1007,8 +1005,13 @@ impl Agent {
                 || SystemPrompt::new(identity.clone()),
                 |charter| charter.system_prompt(&identity),
             );
-            let prompt = match agentos_store::policy::load(tx, employee_id).await {
-                Ok(policy) => prompt.with_mcp_tools(&policy, fleet.inventory()),
+            //
+            // Read once and used twice, because the two readers must not
+            // disagree: `with_mcp_tools` narrows what the employee is *told*
+            // exists, and `model_for` decides what it *thinks with*. Two loads
+            // would be two versions of the same operator document.
+            let policy = match agentos_store::policy::load(tx, employee_id).await {
+                Ok(policy) => Some(policy),
                 Err(err) => {
                     tracing::warn!(
                         employee_id = %employee_id.as_uuid(),
@@ -1016,10 +1019,52 @@ impl Agent {
                         "no usable policy for this employee; its prefix names no mcp tools \
                          and its tool schemas are not narrowed by one"
                     );
-                    prompt
+                    None
                 }
+            };
+            let prompt = match &policy {
+                Some(policy) => prompt.with_mcp_tools(policy, fleet.inventory()),
+                None => prompt,
             }
             .with_colleagues(roster);
+
+            // **Which model this employee thinks with.** The pack proposes and
+            // the policy layer decides; see `agentos_domain::policy::model_for`
+            // for why the fallback goes down the price list and never up.
+            //
+            // An employee with no charter gets `ModelId::UNCHARTERED`, which
+            // pairs with `turn::UNCHARTERED`: its whole job this turn is one
+            // internal note saying it has been woken and does not know what it
+            // is for, and that sentence does not need a frontier model.
+            let preferred = charter
+                .as_ref()
+                .map_or(ModelId::UNCHARTERED, Charter::model);
+            let Some(model) = model_for(policy.as_ref(), preferred) else {
+                // Fail closed, and **not** as an outage. There is no fallback
+                // model here on purpose: the expensive one would be a bill
+                // nobody authorised and the cheap one would be a policy this
+                // operator did not write. The message names the role, the
+                // preference and the remedy, because "the model was
+                // unreachable" is what an operator would otherwise go looking
+                // for and there is nothing wrong with the provider.
+                return Err(format!(
+                    "this employee's policy permits no model at all, so it cannot take a turn: \
+                     role {role} asked for {preferred}, and platform ∧ tenant ∧ role ∧ employee \
+                     intersected `allowed_models` to the empty set. Grant one in a policy layer \
+                     — this is not a provider failure and retrying will not fix it",
+                    role = charter.as_ref().map_or("(none)", Charter::role),
+                ));
+            };
+            if model != preferred {
+                tracing::info!(
+                    employee_id = %employee_id.as_uuid(),
+                    role = charter.as_ref().map_or("(none)", Charter::role),
+                    %preferred,
+                    substituted = %model,
+                    "this employee's policy does not permit its role's model; running the \
+                     cheapest one it does permit"
+                );
+            }
 
             // The counterparty wrote all four of these — who it is from
             // included — so they travel together inside one frame rather than
@@ -1051,7 +1096,7 @@ impl Agent {
                 Effects::new(self.db.clone(), ports, principal.clone()),
                 principal,
                 prompt,
-                self.model,
+                model.as_str(),
                 employee.address().to_string(),
             )
             // What the employee may answer or hand over: this thread and no
@@ -2545,6 +2590,11 @@ mod tests {
             &agentos_domain::policy::PolicyLimits {
                 allowed_channels: std::collections::BTreeSet::from([Channel::Email]),
                 max_new_contacts_per_day: 100,
+                // Every model: the layers intersect, so a tenant layer that
+                // names none permits none and this employee takes no turn at
+                // all. Restating the grant is the rule `PolicyLimits`' own docs
+                // give for every allowlist here — there is no inherit marker.
+                allowed_models: agentos_domain::policy::ModelId::ALL.into_iter().collect(),
                 ..agentos_domain::policy::PolicyLimits::default()
             },
         )
@@ -2579,7 +2629,6 @@ mod tests {
                 // No binder loop in this test, so every tenant's fleet is
                 // empty and every MCP call is refused by name.
                 fleets: Fleets::new().0,
-                model: "claude-opus-5",
                 cancel: cancel.clone(),
             };
             let handlers = Handlers::default().on(
@@ -2919,7 +2968,6 @@ mod tests {
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: Fleets::new().0,
-            model: "claude-opus-5",
             cancel: cancel.clone(),
         };
         let poller = tokio::spawn(loops::outbox::run(

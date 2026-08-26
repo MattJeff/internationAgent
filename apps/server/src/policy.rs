@@ -434,7 +434,7 @@ async fn rollback(url: &str) -> Result<String, String> {
 ///
 /// Kept honest by `every_field_of_policy_limits_is_named_here`, which asks
 /// serde for the list instead of trusting this one.
-const LAYER_FIELDS: [&str; 12] = [
+const LAYER_FIELDS: [&str; 13] = [
     "spend",
     "allowed_channels",
     "allowed_calling_codes",
@@ -442,6 +442,7 @@ const LAYER_FIELDS: [&str; 12] = [
     "denied_domains",
     "allowed_mcp_tools",
     "allowed_a2a_peers",
+    "allowed_models",
     "max_new_contacts_per_day",
     "max_turns_per_day",
     "allow_file_upload",

@@ -43,6 +43,22 @@
 //! turn is the thing we can refuse before it costs money, so turns are the
 //! proxy, and the multiplier from turns to currency lives outside this
 //! workspace with the rate card.
+//!
+//! # The model allowlist
+//!
+//! [`PolicyLimits::allowed_models`] is the second limit here that is not an
+//! [`Action`], and it is here for the turn budget's reason: the two largest
+//! levers on an LLM bill are *how often* an employee thinks and *what it thinks
+//! with*, and an operator who can bound one and not the other can only bound
+//! half the money. It intersects like every other allowlist — a lower layer
+//! narrows, never widens — and [`model_for`] is its evaluator, asked once when a
+//! turn is assembled rather than once per action, because a model cannot change
+//! inside a turn.
+//!
+//! The multiplier from a model to currency lives outside this workspace with the
+//! rate card, exactly as the multiplier from turns does. What is in here is the
+//! *permission*, and the domain deliberately holds no price: `ModelId`'s ordering
+//! encodes which models cost more than which, and nothing else.
 
 #![deny(unreachable_patterns)]
 
@@ -56,6 +72,106 @@ use crate::action::{
     McpTool,
 };
 use crate::money::{Currency, Money};
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+/// Which model an employee thinks with.
+///
+/// # Why this is an enum and not a string
+///
+/// Every other allowlist in [`PolicyLimits`] is a set of parsed things —
+/// [`Channel`], [`CallingCode`], [`Domain`], [`McpTool`] — and none of them is a
+/// free string, because an allowlist of free strings cannot tell a typo from a
+/// deliberate exclusion. A model name is worse than the others in one specific
+/// way: a misspelling in an operator's document would not merely fail to match,
+/// it would produce a `PolicyLimits` that names a model no provider serves, and
+/// the failure would land at the first model call as a provider 404 that reads
+/// like an outage.
+///
+/// A closed enum makes that a parse error in the operator's file instead.
+/// Adding a model is a code change, which is the honest state of affairs: a
+/// model with no entry in `agentos_eval::cost`'s rate card is a model whose bill
+/// nobody can compute.
+///
+/// # The ordering is cheapest-first, and it is load-bearing
+///
+/// `Ord` derives from declaration order, so `BTreeSet<ModelId>` iterates
+/// cheapest-first and [`BTreeSet::first`] on an allowlist is *the cheapest model
+/// the operator permits*. [`model_for`] relies on exactly that: a role whose
+/// preference an operator has excluded falls **down** the price list, never up.
+/// Reorder these variants and that guarantee is gone; `the_order_is_the_price_list`
+/// is what stops it happening quietly.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum ModelId {
+    #[serde(rename = "claude-haiku-4-5")]
+    Haiku45,
+    #[serde(rename = "claude-sonnet-5")]
+    Sonnet5,
+    /// The default, because it is what every employee ran before roles could
+    /// name a model — a default that changed the bill on upgrade would be a
+    /// silent repricing.
+    #[default]
+    #[serde(rename = "claude-opus-5")]
+    Opus5,
+    #[serde(rename = "claude-fable-5")]
+    Fable5,
+}
+
+impl ModelId {
+    /// Every model this deployment can name, cheapest first.
+    pub const ALL: [ModelId; 4] = [
+        ModelId::Haiku45,
+        ModelId::Sonnet5,
+        ModelId::Opus5,
+        ModelId::Fable5,
+    ];
+
+    /// What an employee nobody chartered thinks with.
+    ///
+    /// Its whole job is `turn::UNCHARTERED` — one internal note saying it has
+    /// been woken and does not know what it is for. That is the cheapest
+    /// sentence in the company and it does not need a frontier model to write
+    /// it.
+    pub const UNCHARTERED: ModelId = ModelId::Haiku45;
+
+    /// The string the provider is given, verbatim.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ModelId::Haiku45 => "claude-haiku-4-5",
+            ModelId::Sonnet5 => "claude-sonnet-5",
+            ModelId::Opus5 => "claude-opus-5",
+            ModelId::Fable5 => "claude-fable-5",
+        }
+    }
+
+    /// The inverse of [`ModelId::as_str`]. `None` for anything else — a column
+    /// or a document naming a model this build does not know is a load failure,
+    /// never a silently dropped entry.
+    pub fn parse(raw: &str) -> Option<Self> {
+        ModelId::ALL.into_iter().find(|m| m.as_str() == raw)
+    }
+
+    /// Every model no more expensive than this one, as an allowlist.
+    ///
+    /// What a role pack ships as its own layer. A role will accept a cheaper
+    /// model an operator forces on it and will not accept an *upgrade* past what
+    /// its job needs — which is the founder's observation written as a set: a
+    /// seller does not need the most expensive model, so a seller's role layer
+    /// does not name it.
+    pub fn at_most(self) -> BTreeSet<ModelId> {
+        ModelId::ALL.into_iter().filter(|m| *m <= self).collect()
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Spend limits
@@ -218,6 +334,27 @@ pub struct PolicyLimits {
     pub denied_domains: BTreeSet<Domain>,
     pub allowed_mcp_tools: BTreeSet<McpTool>,
     pub allowed_a2a_peers: BTreeSet<Domain>,
+    /// Which models this layer permits an employee to think with.
+    ///
+    /// **The one allowlist here that is not about an effect**, and the argument
+    /// for it being here anyway is the same one [`max_turns_per_day`] makes one
+    /// field down: an operator has to be able to bound what an employee spends,
+    /// and every other spending bound is in this struct. A model is not an
+    /// [`Action`] — there is no `Action::Think` and inventing one would put a
+    /// non-effect in the audit vocabulary for no gain — so this field is read by
+    /// [`model_for`] rather than by [`evaluate`], exactly as `max_turns_per_day`
+    /// is read by [`turns_remaining`].
+    ///
+    /// It intersects like every other allowlist, so a tenant, a role or an
+    /// employee layer can only ever narrow it, and **empty denies**. That is
+    /// harsher here than anywhere else in this struct, because an employee with
+    /// no permitted model cannot act at all rather than merely losing a
+    /// capability — which is why [`model_for`] returns `None` for it instead of
+    /// picking something, and why `apps/server`'s two callers turn that `None`
+    /// into a named failure rather than a fallback.
+    ///
+    /// [`max_turns_per_day`]: PolicyLimits::max_turns_per_day
+    pub allowed_models: BTreeSet<ModelId>,
     pub max_new_contacts_per_day: u32,
     /// How many times a day this employee may run a turn at all.
     ///
@@ -253,6 +390,7 @@ impl PolicyLimits {
                 .collect(),
             allowed_mcp_tools: intersect_sets(&self.allowed_mcp_tools, &other.allowed_mcp_tools),
             allowed_a2a_peers: intersect_sets(&self.allowed_a2a_peers, &other.allowed_a2a_peers),
+            allowed_models: intersect_sets(&self.allowed_models, &other.allowed_models),
             max_new_contacts_per_day: self
                 .max_new_contacts_per_day
                 .min(other.max_new_contacts_per_day),
@@ -318,6 +456,53 @@ pub const fn turns_remaining(policy: &EffectivePolicy, turns_today: u32) -> u32 
         .limits()
         .max_turns_per_day
         .saturating_sub(turns_today)
+}
+
+/// Which model this employee actually runs: the role's preference, bounded by
+/// the operator's allowlist.
+///
+/// **The pack proposes and the layer decides**, the same shape `proposable` and
+/// the gate already have — `preferred` is what the job needs and
+/// [`PolicyLimits::allowed_models`] is what the operator permits, and what runs
+/// is drawn from the intersection or the turn does not happen.
+///
+/// Three answers, and the middle one is the whole design:
+///
+/// 1. **The preference is permitted** — run it. The common case, and the only
+///    one where the role's judgement about its own work survives intact.
+/// 2. **The preference is not permitted, but something is** — run the cheapest
+///    thing that is. It is `.next()` on a `BTreeSet<ModelId>` whose `Ord` is the
+///    price list, so the fallback direction is *down*: an operator who has taken
+///    Opus away from a role has said what they meant about money, and answering
+///    that by reaching for Fable would be the one behaviour this whole feature
+///    exists to prevent. It is not silent — the callers log the substitution —
+///    but it is not a refusal either, because "only Sonnet, everywhere" is a
+///    sentence an operator is entitled to say without killing the fleet.
+/// 3. **Nothing is permitted** — `None`, and the caller must fail closed. An
+///    empty allowlist means the same thing here it means everywhere else in
+///    [`PolicyLimits`]: nobody granted anything. It cannot mean "unconstrained",
+///    because there is no model a system with no rate card and no operator
+///    consent should be picking on its own, and it must not mean "the default
+///    one", because [`ModelId::default`] is the most expensive model most seats
+///    would ever run.
+///
+/// `policy` is an `Option` for [`crate::policy`]-external reasons that
+/// `app::turn::tools_for` states in full: `None` is *"nobody could read a
+/// policy"*, which is not the same fact as *"the policy grants nothing"*. An
+/// unreadable policy is not evidence about models, so the preference stands and
+/// the gate refuses each action on the record — the same trade `tools_for` makes
+/// about schemas, made once more so the two cannot disagree.
+pub fn model_for(policy: Option<&EffectivePolicy>, preferred: ModelId) -> Option<ModelId> {
+    let Some(policy) = policy else {
+        return Some(preferred);
+    };
+    let allowed = &policy.limits().allowed_models;
+    if allowed.contains(&preferred) {
+        return Some(preferred);
+    }
+    // Cheapest permitted, or none at all. `BTreeSet` iterates in `Ord` order and
+    // `ModelId`'s `Ord` is the price list — see the type's docs.
+    allowed.iter().copied().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +816,13 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         denied_domains: _,
         allowed_mcp_tools,
         allowed_a2a_peers,
+        // Not read, and it cannot be: there is no `ActionKind` a model choice
+        // makes unreachable. An employee with no permitted model runs no turn at
+        // all, which is `model_for`'s `None` and a failure one level up — not a
+        // kind this function could withhold a schema for. Withholding every
+        // schema on that basis would be the same claim made twice, in the place
+        // where it produces a silent employee instead of a named failure.
+        allowed_models: _,
         // Per-action budgets and a per-day turn ceiling: both are counters in
         // an `ActionCtx` or in the store rather than facts about the policy, so
         // neither can answer "every action of this kind". An exhausted contact
@@ -706,6 +898,12 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
         denied_domains,
         allowed_mcp_tools,
         allowed_a2a_peers,
+        // Not an `Action` either, and for a sharper reason than the turn ceiling
+        // below: a turn is at least a thing that happens, whereas a model is the
+        // apparatus that decides what to propose. `model_for` is its evaluator,
+        // and it is asked once when the turn is assembled rather than once per
+        // action, because the answer cannot change inside one turn.
+        allowed_models: _,
         max_new_contacts_per_day,
         // Deliberately not consulted here, and this binding is the
         // acknowledgement rather than an oversight: a turn is not an `Action`,
@@ -1006,6 +1204,11 @@ mod tests {
                 .into_iter()
                 .collect(),
             allowed_a2a_peers: [domain("partner.example.com")].into_iter().collect(),
+            // Every model, and off the enum rather than by hand: this is the
+            // "everything switched on" fixture, and a list that stopped being
+            // exhaustive the day a fifth model landed is the bug the
+            // `Channel::ALL` note above is about.
+            allowed_models: ModelId::ALL.into_iter().collect(),
             max_new_contacts_per_day: 1_000,
             max_turns_per_day: 500,
             allow_file_upload: true,
@@ -1661,6 +1864,123 @@ mod tests {
         // nothing here exactly as it does everywhere else in this file.
         let unconfigured = effective(&PolicyLimits::default());
         assert_eq!(turns_remaining(&unconfigured, 0), 0);
+    }
+
+    /// The whole mechanism, in one function's worth of assertions.
+    ///
+    /// A pack asks for a model, a layer narrows the set, and what runs is drawn
+    /// from the intersection — never from the preference and never from a
+    /// default. Break any line of `model_for` and one of these goes red.
+    #[test]
+    fn a_role_gets_the_intersection_and_not_its_preference() {
+        let platform = permissive();
+        // An operator who has decided this fleet does not run frontier models.
+        let thrifty = PolicyLimits {
+            allowed_models: [ModelId::Haiku45, ModelId::Sonnet5].into_iter().collect(),
+            ..permissive()
+        };
+
+        // 1. Preference permitted: the role's own judgement stands.
+        let open = effective(&platform);
+        assert_eq!(model_for(Some(&open), ModelId::Opus5), Some(ModelId::Opus5));
+        assert_eq!(
+            model_for(Some(&open), ModelId::Haiku45),
+            Some(ModelId::Haiku45)
+        );
+
+        // 2. Preference excluded: the cheapest thing that *is* permitted, and
+        //    emphatically not the most expensive. A fallback that reached for
+        //    `Fable5` here would be the bug this feature exists to prevent.
+        let narrowed = EffectivePolicy::try_new(&platform, &thrifty, &platform, &platform).unwrap();
+        assert_eq!(
+            narrowed.limits().allowed_models,
+            [ModelId::Haiku45, ModelId::Sonnet5].into_iter().collect(),
+            "a tenant layer narrows the set; it does not replace it"
+        );
+        assert_eq!(
+            model_for(Some(&narrowed), ModelId::Fable5),
+            Some(ModelId::Haiku45)
+        );
+
+        // 3. A layer can only ever narrow. A greedy team asking for everything
+        //    under a thrifty tenant still gets the thrifty tenant's answer.
+        let greedy = PolicyLimits {
+            allowed_models: ModelId::ALL.into_iter().collect(),
+            ..permissive()
+        };
+        let stacked = EffectivePolicy::try_new(&platform, &thrifty, &greedy, &platform).unwrap();
+        assert_eq!(
+            model_for(Some(&stacked), ModelId::Opus5),
+            Some(ModelId::Haiku45),
+            "the role layer named Opus and the intersection ignored it"
+        );
+        // The preference still lands when the tenant permits it — the role
+        // layer widening is what was ignored, not the preference itself.
+        assert_eq!(
+            model_for(Some(&stacked), ModelId::Sonnet5),
+            Some(ModelId::Sonnet5)
+        );
+
+        // 4. Empty intersection: no model, and no guess. Two layers that each
+        //    permit something, with nothing in common, is the realistic way to
+        //    arrive here — a tenant on Sonnet and a team on Opus.
+        let sonnet_only = PolicyLimits {
+            allowed_models: [ModelId::Sonnet5].into_iter().collect(),
+            ..permissive()
+        };
+        let opus_only = PolicyLimits {
+            allowed_models: [ModelId::Opus5].into_iter().collect(),
+            ..permissive()
+        };
+        let contradiction =
+            EffectivePolicy::try_new(&platform, &sonnet_only, &opus_only, &platform).unwrap();
+        assert!(contradiction.limits().allowed_models.is_empty());
+        assert_eq!(model_for(Some(&contradiction), ModelId::Opus5), None);
+        assert_eq!(model_for(Some(&contradiction), ModelId::Haiku45), None);
+
+        // 5. The unconfigured default denies, like every other allowlist here.
+        assert_eq!(
+            model_for(Some(&effective(&PolicyLimits::default())), ModelId::Opus5),
+            None
+        );
+
+        // 6. And no policy at all is *unknown*, not *nothing* — `tools_for`'s
+        //    trade, made once more. The preference stands and the gate refuses
+        //    each action on the record.
+        assert_eq!(model_for(None, ModelId::Opus5), Some(ModelId::Opus5));
+    }
+
+    /// `model_for`'s fallback is `BTreeSet` iteration order, so the enum's
+    /// declaration order is a price list and not a stylistic choice. Reorder
+    /// the variants and a thrifty operator starts paying frontier rates.
+    #[test]
+    fn the_order_is_the_price_list() {
+        assert_eq!(
+            ModelId::ALL,
+            [
+                ModelId::Haiku45,
+                ModelId::Sonnet5,
+                ModelId::Opus5,
+                ModelId::Fable5
+            ]
+        );
+        let mut sorted = ModelId::ALL;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ModelId::ALL, "ALL is not in `Ord` order");
+        assert_eq!(
+            ModelId::Sonnet5.at_most(),
+            [ModelId::Haiku45, ModelId::Sonnet5].into_iter().collect(),
+            "`at_most` must reach down the price list and never up"
+        );
+        // Round-trips through the wire form the operator documents use.
+        for model in ModelId::ALL {
+            assert_eq!(ModelId::parse(model.as_str()), Some(model));
+            assert_eq!(
+                serde_json::to_string(&model).unwrap(),
+                format!("\"{}\"", model.as_str())
+            );
+        }
+        assert_eq!(ModelId::parse("claude-opus-4-8"), None);
     }
 
     #[test]

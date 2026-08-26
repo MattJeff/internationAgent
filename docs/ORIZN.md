@@ -205,6 +205,12 @@ Three fields are `[]` in every document and that emptiness is the control:
   no employee can reach.
 * `allowed_a2a_peers` — selling to a company is not talking to its agent.
 
+`allowed_models` is the one allowlist here that is **not** empty in any
+document, and it cannot be: an employee with no permitted model takes no turn at
+all. What each document names is its role's own model and everything cheaper —
+see "Every seat used to run the same model" below for the table and for what an
+operator changes to move it.
+
 `denied_domains` is `[]` too, and it is the one field that *unions* across
 layers, so a later document can add a block and nothing can remove one.
 
@@ -215,7 +221,10 @@ layers, so a later document can add a block and nothing can remove one.
 > hand-written layer lethal in a way that reads as harmless:
 > `{"max_turns_per_day": 30}` looks like an edit and is a total replacement, and
 > the seat that receives it quietly loses its channels, its domains and its
-> spend while continuing to answer.
+> spend while continuing to answer. Since `allowed_models` joined the struct it
+> also loses its *model*, and that one is not quiet: the seat stops taking turns
+> and says `no_model` rather than carrying on diminished. The trap is the same
+> trap; one of its fields now sets off an alarm.
 >
 > So `policy install` **refuses a document that omits a field**, naming the ones
 > missing. `"allowed_domains": []` is accepted and means deny — a finance seat
@@ -369,14 +378,56 @@ it.
 | term | source |
 |---|---|
 | reserved turns a day | **`docs/orizn-roles/*.json`, summed by `cost::turns_per_day`.** Not restated anywhere |
+| which model each seat runs | **`crates/app/src/rolepack*.rs` ∧ `docs/orizn-roles/*.json`.** The role pack names the model its job needs; the role layer's `allowed_models` bounds what the operator permits; `policy::model_for` intersects them, and `cost::seats` prices the answer. Neither half is restated |
 | model calls per reserved turn | **measured**, by a live `--dry-run`. Between 1 and `app::turn::Budgets::max_turns` = 10 |
 | input tokens per model call | **measured**, `scoping::tokens` over the bytes *we* send — a stated ±20% estimator, unverified against a real tokenizer because there is none in this workspace |
 | output tokens per model call | **measured**, as the `claude` CLI reported them. Nothing of ours weighs a completion |
-| the rate card | `claude-opus-5` at **$5.00/M input, $25.00/M output**. The one number from outside this repository |
+| the rate card | **Four rows, in `cost::rate_card`** — the only numbers from outside this repository. Anthropic list prices per million tokens, read 2026-08-26: `claude-haiku-4-5` $1/$5, `claude-sonnet-5` $3/$15, `claude-opus-5` $5/$25, `claude-fable-5` $10/$50 |
 
 `direction`'s zero turns is a real zero and stays one, so the founder's chair
 contributes nothing to the first row even though four employees can now reach it
 — see "The zero is still zero" above.
+
+### Every seat used to run the same model
+
+It ran `claude-opus-5`, because the model was one process-wide string read from
+`AGENTOS_LLM` and nothing between the config and the provider could vary it. A
+seller writing three paragraphs from a template and an entry-requirements
+analyst deciding whether a bilateral treaty is a revocable tolerance were billed
+at identical rates.
+
+They are not any more. Each role pack names the model its job needs and each
+role layer bounds what this deployment will pay for, and what runs is the
+intersection:
+
+| seat | turns/day | asks for | layer permits | runs |
+|---|---|---|---|---|
+| `sales-development` | 30 | `claude-sonnet-5` | haiku, sonnet | **`claude-sonnet-5`** |
+| `customer-success` | 20 | `claude-sonnet-5` | haiku, sonnet | **`claude-sonnet-5`** |
+| `growth` | 10 | `claude-sonnet-5` | haiku, sonnet | **`claude-sonnet-5`** |
+| `finance` | 6 | `claude-opus-5` | haiku, sonnet, opus | **`claude-opus-5`** |
+| `direction` | 0 | — (no pack) | haiku | **`claude-haiku-4-5`** |
+
+**These assignments are a starting point, not a finding.** Which model a role
+needs is a claim about work quality, and nothing in this workspace measures that:
+the closest instrument is `agentos_eval::toolchoice`, which has five cases and
+scores which tool was reached for rather than the judgement the briefings are
+about. Every one of them carries its reason in the pack, so moving one is an
+argument rather than a preference swap.
+
+**An operator narrows this by writing a layer, not by editing code.**
+`allowed_models` is an allowlist and it intersects like every other one —
+platform ∧ tenant ∧ role ∧ employee, narrowing only — so a tenant layer naming
+only `claude-haiku-4-5` puts the whole fleet on Haiku whatever the packs prefer.
+Two rules are worth knowing before you write one:
+
+* **A role whose preference you exclude falls to the cheapest model you did
+  permit**, never to the most expensive. "Only Sonnet, everywhere" is a sentence
+  an operator is entitled to say without killing the fleet.
+* **An empty set denies, exactly as it does for channels and domains.** An
+  employee with no permitted model does not fall back to anything: its turn does
+  not start, and it is recorded as `no_model` with the role and the preference
+  named. That is not a provider failure and retrying will not fix it.
 
 ### Re-measuring it
 
@@ -398,7 +449,7 @@ which covers the three charters, the turn brief and the five operator documents
 above. Change any of them and the recorded runs are answering a question about a
 different company; the suite says so rather than letting the figure rot.
 
-> ### $303–$560 a month over 3 measured runs at 66 reserved turns a day; $122 floor at 1.00 model calls per turn, $2242 ceiling at 10.00
+> ### $193–$357 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $77 floor at 1.00 model calls per turn, $1427 ceiling at 10.00
 >
 > A **range**, because a reserved turn makes between one and ten model calls and
 > any point estimate inside that is a choice. The floor is the arithmetic this
@@ -418,14 +469,33 @@ different company; the suite says so rather than letting the figure rot.
 >   `claude` CLI, which renders tool schemas into the prompt and demands JSON
 >   back, so the measured output tokens are a completion `llm_anthropic` would
 >   not have produced.
+> * **The token counts were all sampled from `claude-opus-5`**, which is what
+>   every seat ran when the runs were recorded. The *prices* above are each
+>   seat's own; the *counts* they multiply are borrowed. A seat on Sonnet will
+>   plan differently and tokenize differently, and nothing here re-measures that
+>   — re-run `--dry-run` to.
+> * **`claude-sonnet-5` is at an introductory $2/$10 through 2026-08-31**, so the
+>   three Sonnet seats bill about a third less than this until then. The standard
+>   rate is used deliberately: a figure with five days left on it is exactly the
+>   kind this document published once already.
+> * **Under a subscription none of this is the right unit.** The local `claude`
+>   CLI has no per-token invoice at all — the currency is a monthly seat and the
+>   binding constraint is throughput. Every figure in this box is the metered-API
+>   reading of a run that was not metered.
 >
 > And the turns column is a **ceiling on turns, not a forecast of them**: an
 > employee with nothing to do reserves nothing and bills nothing.
 
-The lever an operator actually has is that turns column, and it is linear: the
-whole bill scales with it, so halving `max_turns_per_day` halves every figure in
-the box. Doubling sales from 30 to 60 raises the total by 30/66 of it, and is a
-one-line `update`.
+The operator has two levers and both are `update` statements against a policy
+layer. **Turns are linear**: the whole bill scales with `max_turns_per_day`, so
+halving it halves every figure in the box, and doubling sales from 30 to 60
+raises the total by 30/66 of it. **Models are the multiplier**: the same turn
+costs $1/$5 per million on Haiku and $10/$50 on Fable, so the mix moves the bill
+by up to ten times without a single turn being added or removed. Moving the whole
+fleet to `claude-opus-5` — which is what this deployment did until the packs
+could name a model — costs $303–$560 rather than the $193–$357 above; the
+`the_company_bill_is_a_sum_over_seats_not_one_multiplication` test asserts that
+direction of the inequality so the claim cannot rot.
 
 ---
 

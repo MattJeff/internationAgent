@@ -135,6 +135,7 @@ use std::num::NonZeroU32;
 use agentos_domain::action::{Action, ActionKind, Channel, EmailAddress};
 use agentos_domain::ids::{DecisionId, EmployeeId};
 use agentos_domain::money::{Currency, Money};
+use agentos_domain::policy::ModelId;
 use agentos_domain::sourcing as buying;
 use agentos_domain::untrusted::TrustLabel;
 use agentos_store::db::{Db, StoreError, TenantTx};
@@ -279,6 +280,32 @@ impl Charter {
             Charter::Finance { .. } => rolepack_service::RolePack::finance().briefing(),
             Charter::EntryRequirements { .. } => {
                 rolepack_service::RolePack::entry_requirements().briefing()
+            }
+        }
+    }
+
+    /// What this employee's role needs to think with.
+    ///
+    /// The same join over the two `RolePack` types [`Charter::proposable`] and
+    /// [`Charter::briefing`] already do, for the same reason: the charter is the
+    /// only value that knows which role an employee holds. It is a **preference**
+    /// — `agentos_domain::policy::model_for` intersects it with the employee's
+    /// `allowed_models` and that is what the provider is handed.
+    ///
+    /// An employee with no charter never reaches here. `apps/server` uses
+    /// [`ModelId::UNCHARTERED`] for that case, which pairs with
+    /// [`UNCHARTERED`](crate::turn::UNCHARTERED): the whole job of an employee
+    /// nobody chartered is one internal note saying so, and that sentence does
+    /// not need a frontier model.
+    pub fn model(&self) -> ModelId {
+        match self {
+            Charter::Purchasing { pack, .. } => pack.model(),
+            Charter::Sales { pack, .. } => pack.model(),
+            Charter::Support { .. } => rolepack_service::RolePack::customer_success().model(),
+            Charter::Growth { .. } => rolepack_service::RolePack::growth().model(),
+            Charter::Finance { .. } => rolepack_service::RolePack::finance().model(),
+            Charter::EntryRequirements { .. } => {
+                rolepack_service::RolePack::entry_requirements().model()
             }
         }
     }

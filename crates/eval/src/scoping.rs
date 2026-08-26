@@ -140,7 +140,7 @@ use agentos_app::vertical::Charter;
 use agentos_domain::action::{ActionKind, McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{EffectivePolicy, PolicyLimits};
+use agentos_domain::policy::{EffectivePolicy, ModelId, PolicyLimits};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::llm::{Content, LlmRequest, Message};
 
@@ -629,14 +629,23 @@ pub fn assemble(company: Company, reach: Reach, inventory: Inventory) -> LlmRequ
     }
 
     prompt.request(
-        MODEL,
+        model().as_str(),
         MAX_TOKENS,
         context.trust(),
         context.messages().to_vec(),
     )
 }
 
-const MODEL: &str = "claude-opus-5";
+/// The buyer's own model, off the pack rather than written down here.
+///
+/// This surface weighs the *bytes we send*, and the model id is a handful of
+/// them — but the reason to ask the pack is not the byte count. A constant here
+/// would be a second answer to "what does this employee run", and the first one
+/// moved out of `AGENTOS_LLM` and into `RolePack::model` precisely so that there
+/// would be exactly one.
+fn model() -> ModelId {
+    RolePack::international_buyer().model()
+}
 const MAX_TOKENS: u32 = 4_096;
 const IDENTITY: &str =
     "You are lena, an AI employee at fabrikam.example. You answer from lena@fabrikam.example.";

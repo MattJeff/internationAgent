@@ -106,7 +106,7 @@ use std::fmt;
 
 use agentos_domain::action::{ActionKind, Channel};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{PolicyLimits, SpendLimits};
+use agentos_domain::policy::{ModelId, PolicyLimits, SpendLimits};
 
 use crate::prompt::SystemPrompt;
 use crate::rolepack::CountryCode;
@@ -452,6 +452,8 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
+    /// What this job needs to think with. See [`RolePack::model`].
+    model: ModelId,
     limits: PolicyLimits,
 }
 
@@ -463,6 +465,12 @@ impl RolePack {
     pub fn customer_success() -> Self {
         Self {
             name: CUSTOMER_SUCCESS,
+
+            // Answering a known customer from our own records, against a briefing
+            // that already says when to escalate. The judgement calls it must not
+            // make — refunds, credentials, deletions — are not in `proposable`, so
+            // what is left is comprehension and a well-written reply.
+            model: ModelId::Sonnet5,
             briefing: CUSTOMER_SUCCESS_BRIEFING,
 
             // Read our own systems, reply to the customer, escalate. That is
@@ -538,6 +546,9 @@ impl RolePack {
                 allowed_mcp_tools: BTreeSet::new(),
 
                 // Answering a customer is not talking to their agent.
+                // Sonnet and below: see `model` above.
+                allowed_models: ModelId::Sonnet5.at_most(),
+
                 allowed_a2a_peers: BTreeSet::new(),
 
                 // NOT zero, and the difference from the sales pack is worth
@@ -572,6 +583,10 @@ impl RolePack {
     pub fn growth() -> Self {
         Self {
             name: GROWTH,
+
+            // Drafting and measuring, on the internal channel only. Nothing it
+            // proposes reaches a counterparty, so a weak turn costs a rewrite.
+            model: ModelId::Sonnet5,
             briefing: GROWTH_BRIEFING,
 
             // Read, look up, and hand the draft to a colleague. Nothing this
@@ -631,6 +646,9 @@ impl RolePack {
                 allowed_domains: BTreeSet::new(),
                 denied_domains: BTreeSet::new(),
                 allowed_mcp_tools: BTreeSet::new(),
+                // Sonnet and below: see `model` above.
+                allowed_models: ModelId::Sonnet5.at_most(),
+
                 allowed_a2a_peers: BTreeSet::new(),
 
                 // Zero, and unlike customer success it means what it says:
@@ -673,6 +691,13 @@ impl RolePack {
     pub fn finance() -> Self {
         Self {
             name: FINANCE,
+
+            // Money, and the arithmetic is the job: reconciling a statement against
+            // obligations, spotting the invoice that was paid twice. It proposes
+            // `PaymentCreate`, so its mistakes are the expensive kind — and a
+            // reconciliation that is subtly wrong is worse than one that visibly
+            // fails, because nobody re-checks it.
+            model: ModelId::Opus5,
             briefing: FINANCE_BRIEFING,
 
             // Reconcile, ask, prepare a payment, escalate.
@@ -745,6 +770,9 @@ impl RolePack {
                 allowed_domains: BTreeSet::new(),
                 denied_domains: BTreeSet::new(),
                 allowed_mcp_tools: BTreeSet::new(),
+                // Opus and below. Frontier rates buy nothing a ledger needs.
+                allowed_models: ModelId::Opus5.at_most(),
+
                 allowed_a2a_peers: BTreeSet::new(),
 
                 // Small and non-zero, for the same reason customer success is
@@ -858,6 +886,14 @@ impl RolePack {
     pub fn entry_requirements() -> Self {
         Self {
             name: ENTRY_REQUIREMENTS,
+
+            // **The other seat the founder's observation is about**, at the other
+            // end of it. Whether a bilateral treaty is a revocable tolerance or a
+            // standing right is not retrieval and it is not template-filling: it is
+            // reading two instruments that disagree and saying which one binds a
+            // traveller on Tuesday. Getting it wrong strands somebody at a border,
+            // and the wrong answer reads exactly like the right one.
+            model: ModelId::Opus5,
             briefing: ENTRY_REQUIREMENTS_BRIEFING,
 
             // Read the government's page, read what Orizn currently says, hand
@@ -908,6 +944,9 @@ impl RolePack {
                 // Tenant inventory, as everywhere: which MCP server carries the
                 // visa data, and which of its tools an operator has vetted.
                 allowed_mcp_tools: BTreeSet::new(),
+                // Opus and below.
+                allowed_models: ModelId::Opus5.at_most(),
+
                 allowed_a2a_peers: BTreeSet::new(),
 
                 // Zero, and it means what growth's zero means rather than what
@@ -943,6 +982,27 @@ impl RolePack {
             Self::finance(),
             Self::entry_requirements(),
         ]
+    }
+
+    /// The model this role's work needs — a **preference**, not a grant.
+    ///
+    /// What actually runs is
+    /// [`model_for`](agentos_domain::policy::model_for) over this and the
+    /// employee's intersected `allowed_models`: the pack says what the job needs
+    /// and the operator says what they will pay for, and the intersection is
+    /// what the provider is handed. A role whose preference an operator has
+    /// excluded runs the cheapest model they *have* permitted; a role whose
+    /// intersection is empty runs nothing at all, loudly.
+    ///
+    /// **These assignments are a starting point, not a finding.** Which model a
+    /// role needs is a claim about work quality, and the only instrument in this
+    /// workspace that could test it is `agentos_eval::toolchoice` — five cases,
+    /// scoring which tool was reached for rather than the judgement the
+    /// briefings are actually about. Each constructor carries the reason it was
+    /// given the model it has, so that changing one is an argument with a stated
+    /// opponent rather than a preference swap.
+    pub const fn model(&self) -> ModelId {
+        self.model
     }
 
     /// The role's handle, and the `role` column. Display and metrics only.

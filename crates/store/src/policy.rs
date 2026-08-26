@@ -55,7 +55,7 @@ use agentos_domain::action::{CallingCode, Domain, McpTool};
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
 use agentos_domain::message::Channel;
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{EffectivePolicy, PolicyError, PolicyLimits, SpendLimits};
+use agentos_domain::policy::{EffectivePolicy, ModelId, PolicyError, PolicyLimits, SpendLimits};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -207,8 +207,8 @@ const SELECT_ACTIVE_LAYERS: &str = "\
     SELECT l.id, l.layer, l.spend_currency, l.max_per_transaction_minor, \
            l.max_per_day_minor, l.approval_above_minor, l.allowed_channels, \
            l.allowed_calling_codes, l.allowed_domains, l.denied_domains, \
-           l.allowed_mcp_tools, l.allowed_a2a_peers, l.max_new_contacts_per_day, \
-           l.max_turns_per_day, \
+           l.allowed_mcp_tools, l.allowed_a2a_peers, l.allowed_models, \
+           l.max_new_contacts_per_day, l.max_turns_per_day, \
            l.allow_file_upload, l.allow_credential_change, l.allow_data_delete \
     FROM policy_layers l \
     JOIN policy_versions v ON v.id = l.version_id \
@@ -497,6 +497,14 @@ pub fn default_ceiling() -> PolicyLimits {
         denied_domains: BTreeSet::new(),
         allowed_mcp_tools: BTreeSet::new(),
         allowed_a2a_peers: BTreeSet::new(),
+        // Every model the build knows, and off the enum rather than by hand.
+        // This is the *ceiling*: it is the widest thing an operator can then
+        // narrow, and a platform layer naming fewer models than exist would be a
+        // fleet-wide model policy shipped as a default nobody wrote. The
+        // narrowing belongs in the tenant and role layers, where somebody meant
+        // it — see `docs/orizn-roles/*.json` for what that looks like written
+        // down.
+        allowed_models: ModelId::ALL.into_iter().collect(),
         max_new_contacts_per_day: 50,
         max_turns_per_day: 200,
         allow_file_upload: false,
@@ -658,10 +666,10 @@ pub async fn install_ceiling(
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
-                max_new_contacts_per_day, max_turns_per_day, \
+                allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete) \
              VALUES ($1, $2, NULL, 'platform', NULL, NULL, \
-                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(Uuid::now_v7())
         .bind(version),
@@ -771,6 +779,7 @@ struct Columns {
     denied_domains: Vec<String>,
     mcp_tools: Vec<String>,
     a2a_peers: Vec<String>,
+    models: Vec<String>,
     contacts: i32,
     turns: i32,
     file_upload: bool,
@@ -820,6 +829,11 @@ impl Columns {
                 .map(ToString::to_string)
                 .collect(),
             a2a_peers: strings(&limits.allowed_a2a_peers),
+            models: limits
+                .allowed_models
+                .iter()
+                .map(|m| m.as_str().to_owned())
+                .collect(),
             contacts: i32::try_from(limits.max_new_contacts_per_day).unwrap_or(i32::MAX),
             turns: i32::try_from(limits.max_turns_per_day).unwrap_or(i32::MAX),
             file_upload: limits.allow_file_upload,
@@ -828,7 +842,7 @@ impl Columns {
         }
     }
 
-    /// Append all fifteen, in declaration order. Consumes `self` because sqlx
+    /// Append all sixteen, in declaration order. Consumes `self` because sqlx
     /// encodes on `bind`, so nothing here has to outlive the call.
     fn bind_to<'q>(
         self,
@@ -845,6 +859,7 @@ impl Columns {
             .bind(self.denied_domains)
             .bind(self.mcp_tools)
             .bind(self.a2a_peers)
+            .bind(self.models)
             .bind(self.contacts)
             .bind(self.turns)
             .bind(self.file_upload)
@@ -993,13 +1008,13 @@ pub async fn install(
             spend_currency, max_per_transaction_minor, max_per_day_minor, \
             approval_above_minor, allowed_channels, allowed_calling_codes, \
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
-            max_new_contacts_per_day, max_turns_per_day, \
+            allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete) \
          VALUES \
            ($1, $2, NULL, 'platform', NULL, NULL, \
-            $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23), \
+            $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23, $24), \
            ($3, $4, $5, $6, $7, $8, \
-            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
          ON CONFLICT (id) DO UPDATE SET \
            spend_currency = coalesce(policy_layers.spend_currency, excluded.spend_currency), \
            max_per_transaction_minor = \
@@ -1013,6 +1028,7 @@ pub async fn install(
            allowed_domains = policy_layers.allowed_domains || excluded.allowed_domains, \
            allowed_mcp_tools = policy_layers.allowed_mcp_tools || excluded.allowed_mcp_tools, \
            allowed_a2a_peers = policy_layers.allowed_a2a_peers || excluded.allowed_a2a_peers, \
+           allowed_models = policy_layers.allowed_models || excluded.allowed_models, \
            max_new_contacts_per_day = \
              greatest(policy_layers.max_new_contacts_per_day, excluded.max_new_contacts_per_day), \
            max_turns_per_day = greatest(policy_layers.max_turns_per_day, excluded.max_turns_per_day), \
@@ -1021,7 +1037,7 @@ pub async fn install(
              policy_layers.allow_credential_change OR excluded.allow_credential_change, \
            allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete",
     );
-    // $9..=$23 are the fifteen limit columns, in `Columns` declaration order —
+    // $9..=$24 are the sixteen limit columns, in `Columns` declaration order —
     // the same order and the same mapping `install_ceiling` writes them with.
     let insert = Columns::from(limits).bind_to(
         statement
@@ -1318,13 +1334,13 @@ pub async fn install_layer(
             spend_currency, max_per_transaction_minor, max_per_day_minor, \
             approval_above_minor, allowed_channels, allowed_calling_codes, \
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
-            max_new_contacts_per_day, max_turns_per_day, \
+            allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete) \
          SELECT gen_random_uuid(), $1, tenant_id, layer, role_name, employee_id, \
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
-                max_new_contacts_per_day, max_turns_per_day, \
+                allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete \
            FROM policy_layers \
           WHERE version_id = $2 \
@@ -1346,10 +1362,10 @@ pub async fn install_layer(
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
-                max_new_contacts_per_day, max_turns_per_day, \
+                allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete) \
              VALUES ($1, $2, $3, $4, $5, $6, \
-                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(Uuid::now_v7())
         .bind(next)
@@ -1435,6 +1451,7 @@ struct LayerRow {
     denied_domains: Vec<String>,
     allowed_mcp_tools: Vec<String>,
     allowed_a2a_peers: Vec<String>,
+    allowed_models: Vec<String>,
     max_new_contacts_per_day: i32,
     max_turns_per_day: i32,
     allow_file_upload: bool,
@@ -1530,6 +1547,14 @@ impl LayerRow {
                     parse_tool,
                 )?,
                 allowed_a2a_peers: domains("allowed_a2a_peers", &self.allowed_a2a_peers)?,
+                // Unknown model names fail the load rather than being dropped,
+                // for `parse_set`'s reason turned the other way round: a
+                // silently skipped entry here would narrow the allowlist, and a
+                // narrowed model allowlist is an employee that stops working —
+                // reported as a model outage rather than as the typo it is.
+                allowed_models: parse_set(at, "allowed_models", &self.allowed_models, |s| {
+                    ModelId::parse(s).ok_or("not a model this build knows")
+                })?,
                 // CHECKed non-negative in the schema; clamping a *budget* to
                 // zero fails closed if it ever is not.
                 max_new_contacts_per_day: u32::try_from(self.max_new_contacts_per_day).unwrap_or(0),

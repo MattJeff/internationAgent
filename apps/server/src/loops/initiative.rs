@@ -147,7 +147,7 @@ use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
 use agentos_domain::ids::Slug;
-use agentos_domain::policy::EffectivePolicy;
+use agentos_domain::policy::{EffectivePolicy, ModelId, model_for};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
@@ -201,6 +201,16 @@ pub struct Assignment {
     /// `None` is a policy that would not load, which names nothing — see
     /// [`assignment_for`].
     pub policy: Option<EffectivePolicy>,
+    /// Which model this turn runs on: the charter's preference, already
+    /// intersected with `policy`'s `allowed_models` by
+    /// [`model_for`](agentos_domain::policy::model_for).
+    ///
+    /// Resolved in [`assignment_for`] rather than in [`take_turn`] because the
+    /// empty intersection is a *reason not to start a turn* — the same shape as
+    /// a missing charter or an unanswered gap — and every other such reason is
+    /// an [`Outcome`] decided there. Resolving it later would mean spending a
+    /// reserved turn to discover it.
+    pub model: ModelId,
 }
 
 /// What the loop decided about one due employee. The `String`s are ours: a
@@ -214,6 +224,15 @@ enum Outcome {
     NoCharter,
     /// The charter row will not parse back through its own constructors.
     Unreadable(String),
+    /// Platform ∧ tenant ∧ role ∧ employee intersected `allowed_models` to the
+    /// empty set, so there is no model this employee may think with.
+    ///
+    /// **Its own code, not `Failed`.** The two are indistinguishable to the
+    /// loop and completely different to the operator reading the column: this
+    /// one is a policy they wrote, it will produce the identical result on
+    /// every cadence until they change it, and no amount of retrying or
+    /// provider-status-checking will move it.
+    NoModel(String),
     /// The objective has gaps. Ask the operator, and start no turn.
     Clarify(String),
     /// A turn ran to completion.
@@ -233,6 +252,7 @@ impl Outcome {
         match self {
             Outcome::NoCharter => "no_charter",
             Outcome::Unreadable(_) => "unreadable_charter",
+            Outcome::NoModel(_) => "no_model",
             Outcome::Clarify(_) => "clarify",
             Outcome::Turn => "turn",
             Outcome::Failed(_) => "error",
@@ -245,6 +265,7 @@ impl Outcome {
         match self {
             Outcome::NoCharter | Outcome::Turn => None,
             Outcome::Unreadable(why)
+            | Outcome::NoModel(why)
             | Outcome::Clarify(why)
             | Outcome::Failed(why)
             | Outcome::OverBudget(why) => Some(why),
@@ -564,6 +585,33 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
     // The gaps question, before any model call. See the module docs.
     plan_of(&charter).map_err(Outcome::Clarify)?;
 
+    // And the model question, also before any model call and for the same
+    // reason: an employee whose policy permits no model cannot take this turn or
+    // any other, so it must not reserve one to find that out.
+    //
+    // No fallback. The expensive model would be a bill nobody authorised and the
+    // cheap one would be a policy this operator did not write — see
+    // `agentos_domain::policy::model_for`, which returns `None` here rather than
+    // choosing.
+    let preferred = charter.model();
+    let Some(model) = model_for(policy.as_ref(), preferred) else {
+        return Err(Outcome::NoModel(format!(
+            "role {} asked for {preferred} and `allowed_models` intersected to the empty set; \
+             grant one in a policy layer",
+            charter.role(),
+        )));
+    };
+    if model != preferred {
+        tracing::info!(
+            employee_id = %due.employee_id.as_uuid(),
+            role = charter.role(),
+            %preferred,
+            substituted = %model,
+            "this employee's policy does not permit its role's model; running the cheapest \
+             one it does permit"
+        );
+    }
+
     Ok(Some(Assignment {
         due: due.clone(),
         identity: format!(
@@ -576,6 +624,7 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         charter,
         colleagues,
         policy,
+        model,
     }))
 }
 
@@ -622,6 +671,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         charter,
         colleagues,
         policy,
+        model,
     } = assignment;
     let role = charter.role();
 
@@ -677,7 +727,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         effects,
         principal,
         prompt,
-        agent.model,
+        model.as_str(),
         address,
     );
 
@@ -984,6 +1034,11 @@ pub(crate) mod tests {
             agentos_store::policy::Scope::Tenant,
             &PolicyLimits {
                 max_turns_per_day: turns,
+                // Every model: the layers intersect, so a tenant layer that
+                // names none permits none and this employee takes no turn at
+                // all. Restating the grant is the rule `PolicyLimits`' own docs
+                // give for every allowlist here — there is no inherit marker.
+                allowed_models: ModelId::ALL.into_iter().collect(),
                 ..PolicyLimits::default()
             },
         )
@@ -1128,6 +1183,11 @@ pub(crate) mod tests {
             &PolicyLimits {
                 max_turns_per_day: 100,
                 allowed_mcp_tools: [granted.clone()].into_iter().collect(),
+                // Every model: the layers intersect, so a tenant layer that
+                // names none permits none and this employee takes no turn at
+                // all. Restating the grant is the rule `PolicyLimits`' own docs
+                // give for every allowlist here — there is no inherit marker.
+                allowed_models: ModelId::ALL.into_iter().collect(),
                 ..PolicyLimits::default()
             },
         )
@@ -1387,7 +1447,6 @@ pub(crate) mod tests {
             // No binder loop here, so every tenant's fleet is empty and every
             // MCP call is refused by name.
             fleets: crate::routes::mcp::Fleets::new().0,
-            model: "claude-opus-5",
             cancel: cancel.clone(),
         };
         let take = move |assignment: Assignment| {
@@ -1472,7 +1531,6 @@ pub(crate) mod tests {
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
-            model: "claude-opus-5",
             cancel: cancel.clone(),
         };
         let take = move |assignment: Assignment| {

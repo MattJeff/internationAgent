@@ -114,8 +114,9 @@ use crate::cost::{self, Sample, TURN_BRIEF, charters, limits};
 use crate::scoping::{Weighed, weigh};
 use crate::{Row, Surface, Truth};
 
-/// Passed to the CLI untouched. Same default as the held-out set.
-pub use crate::toolchoice::DEFAULT_MODEL;
+/// The production resolution, re-used rather than restated: a seat's role pack
+/// names a model and its policy bounds it.
+use agentos_domain::policy::model_for;
 
 /// A mock deployment's envelope key. Real crypto over a throwaway key: the
 /// identity step seals a private key with it and would otherwise not run.
@@ -454,7 +455,12 @@ struct Ran {
 /// what it contributes to the turn is one extra trusted sentence. Everything
 /// that decides what the employee may *do* — principal, gate, effects, prompt,
 /// schemas — is the same call in the same order.
-async fn take_turn(company: &Company, seat: &'static str, charter: &Charter, model: &str) -> Ran {
+async fn take_turn(
+    company: &Company,
+    seat: &'static str,
+    charter: &Charter,
+    model: Option<&str>,
+) -> Ran {
     let employee_id = company.id_of(seat);
     let principal = Principal::employee(company.tenant, employee_id);
 
@@ -481,6 +487,27 @@ async fn take_turn(company: &Company, seat: &'static str, charter: &Charter, mod
         .expect("the roster");
     let policy = policy::load(&mut tx, employee_id).await.ok();
     tx.commit().await.expect("commit the charter");
+
+    // **The seam this dry run exists to work.** `apps/server` does exactly this
+    // and the numbers below are worthless if the dry run does something else:
+    // the pack proposes, the policy layer decides, and what the CLI is handed is
+    // the intersection. `--model` overrides every seat at once, which is how you
+    // score the same company on one model rather than on the five it runs.
+    let preferred = charter.model();
+    let model = model.map_or_else(
+        || {
+            model_for(policy.as_ref(), preferred)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{seat}: `allowed_models` intersected to the empty set, so this seat \
+                         cannot take a turn — see docs/orizn-roles/*.json"
+                    )
+                })
+                .as_str()
+                .to_owned()
+        },
+        ToOwned::to_owned,
+    );
 
     let identity = format!(
         "You are {}, an AI employee of Orizn. Your address is {}.",
@@ -510,7 +537,7 @@ async fn take_turn(company: &Company, seat: &'static str, charter: &Charter, mod
         ),
         principal,
         prompt,
-        model,
+        model.as_str(),
         stored.employee.address().to_string(),
     );
 
@@ -966,20 +993,24 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
     );
 
     // --- sampled: the money -------------------------------------------------
+    // A sum over seats, each at its own model's rates — `Sample::company_usd`
+    // owns that arithmetic and this row is a reader of it. It used to be one
+    // multiplication by the summed turn budget, which was right while one model
+    // served every seat and is a category error now.
     let day = f64::from(cost::turns_per_day());
-    let bill: Vec<f64> = samples.iter().map(|s| s.measured_usd(day)).collect();
+    let bill: Vec<f64> = samples.iter().map(|s| s.measured_usd()).collect();
     let (bill_lo, bill_hi) = spread(&bill);
     let floor = spread(
         &samples
             .iter()
-            .map(|s| s.monthly_usd(cost::FLOOR_CALLS_PER_TURN, day))
+            .map(|s| s.company_usd(cost::FLOOR_CALLS_PER_TURN))
             .collect::<Vec<_>>(),
     )
     .0;
     let ceiling = spread(
         &samples
             .iter()
-            .map(|s| s.monthly_usd(cost::ceiling_calls_per_turn(), day))
+            .map(|s| s.company_usd(cost::ceiling_calls_per_turn()))
             .collect::<Vec<_>>(),
     )
     .1;
@@ -994,7 +1025,14 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
             Truth::Characterises,
         )
         .note(format!(
-            "at {day} reserved turns a day, from docs/orizn-roles/*.json; arithmetic in `cost.rs`"
+            "at {day} reserved turns a day across {}, from docs/orizn-roles/*.json; \
+             arithmetic in `cost.rs`",
+            cost::seats()
+                .iter()
+                .filter(|s| s.turns > 0)
+                .map(|s| format!("{} on {}", s.role, s.model))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     );
 
@@ -1253,7 +1291,7 @@ fn report_failures(failures: &[&'static str], runs: usize) {
 /// `runs` is the number of passes, and **three is the smallest useful number**:
 /// one run of a language model is an anecdote, and every sampled row above is
 /// printed as a spread across passes rather than as a figure.
-pub async fn run(model: &str, runs: usize) -> bool {
+pub async fn run(model: Option<&str>, runs: usize) -> bool {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         println!(
             "DATABASE_URL is unset. This stands a real company up in a real database:\n  \
@@ -1266,7 +1304,10 @@ pub async fn run(model: &str, runs: usize) -> bool {
     db.migrate().await.expect("migrate");
 
     println!("─────────────────────────────────────────────────────────────");
-    println!("DRY RUN — Orizn, {runs} pass(es), {model} via the local `claude` CLI");
+    println!(
+        "DRY RUN — Orizn, {runs} pass(es), {} via the local `claude` CLI",
+        model.map_or_else(|| "each seat's own model".to_owned(), ToOwned::to_owned)
+    );
     println!("Real: the ceiling, the tenant, the org chart, five role layers, the");
     println!("provisioning engine, the Policy Gate, the turn loop, the model.");
     println!("Mock: email, telephony, browser, payments — everything but the model.");

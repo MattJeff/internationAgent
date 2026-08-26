@@ -495,7 +495,7 @@ mod tests {
         Action, ActionCtx, Actor, CallingCode, Channel, ContactStanding, Domain, TrustLabel,
     };
     use crate::money::Currency::{Eur, Usd};
-    use crate::policy::{Decision, evaluate};
+    use crate::policy::{Decision, ModelId, evaluate};
     use chrono::{DateTime, Utc};
     use proptest::prelude::*;
 
@@ -550,6 +550,7 @@ mod tests {
             .into_iter()
             .collect(),
             allowed_a2a_peers: BTreeSet::new(),
+            allowed_models: ModelId::ALL.into_iter().collect(),
             max_new_contacts_per_day: 100,
             max_turns_per_day: 200,
             allow_file_upload: true,
@@ -980,6 +981,7 @@ mod tests {
             denied_domains,
             allowed_mcp_tools,
             allowed_a2a_peers,
+            allowed_models,
             max_new_contacts_per_day,
             max_turns_per_day,
             allow_file_upload,
@@ -1005,6 +1007,12 @@ mod tests {
             && denied_domains.is_superset(&outer.denied_domains)
             && allowed_mcp_tools.is_subset(&outer.allowed_mcp_tools)
             && allowed_a2a_peers.is_subset(&outer.allowed_a2a_peers)
+            // A subset, like the other allowlists: delegation hands down
+            // authority and a manager cannot give a team a model it does not
+            // itself hold. Note the direction — a team on a *cheaper* model than
+            // its tenant permits is within it, which is the only direction
+            // anybody should want to move.
+            && allowed_models.is_subset(&outer.allowed_models)
             && *max_new_contacts_per_day <= outer.max_new_contacts_per_day
             && *max_turns_per_day <= outer.max_turns_per_day
             && (!*allow_file_upload || outer.allow_file_upload)
@@ -1074,6 +1082,12 @@ mod tests {
                         denied_domains: dd.into_iter().collect(),
                         allowed_mcp_tools: mcp.into_iter().collect(),
                         allowed_a2a_peers: peers.into_iter().collect(),
+                        // Not generated: the tuple is already at proptest's
+                        // arity limit, and `within`'s model clause is pinned by
+                        // `a_team_may_not_be_given_a_model_its_tenant_forbids`
+                        // instead — one example that says the thing rather than
+                        // a twelfth strategy that says it vaguely.
+                        allowed_models: BTreeSet::new(),
                         max_new_contacts_per_day: contacts,
                         max_turns_per_day: turns,
                         allow_file_upload: upload,

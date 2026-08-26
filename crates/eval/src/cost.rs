@@ -58,7 +58,7 @@ use agentos_app::turn::Budgets;
 use agentos_app::vertical::Charter;
 use agentos_app::{rolepack_sales, rolepack_service};
 use agentos_domain::money::Currency;
-use agentos_domain::policy::PolicyLimits;
+use agentos_domain::policy::{EffectivePolicy, ModelId, PolicyLimits, model_for};
 use agentos_domain::untrusted::TrustLabel;
 use sha2::{Digest, Sha256};
 
@@ -68,38 +68,45 @@ use crate::{Row, Surface, Truth};
 // The rate card and the two ends of the range
 // ---------------------------------------------------------------------------
 
-/// USD per million input tokens for `claude-opus-5`. The one number in this
-/// crate that comes from outside the repository.
+/// USD per million tokens, in and out, for one model.
 ///
-/// **This is metered API pricing, and it is only one of the two ways this
-/// system can be run.** Everything below prices `AGENTOS_LLM=anthropic`: an
-/// API key, billed per token, where the bill grows with the payroll and the
-/// only ceiling is the one an operator sets.
+/// **The one thing in this crate that comes from outside the repository**, and
+/// it is now four rows rather than one because seats no longer share a model.
+/// Published Anthropic first-party API list prices, read 2026-08-26:
 ///
-/// The other way is `AGENTOS_LLM=cli`, which drives the local `claude` binary
-/// (`crates/providers/src/llm_cli.rs`). Under a **subscription**, that binary
-/// bills against the subscription and not per token, so every figure this
-/// module computes is the wrong currency: the marginal cost of a turn is zero
-/// and the constraint that replaces it is **throughput**. See
-/// [`CALLS_PER_DAY_AT_MEASURED_RATE`], which is the number to compare against a
-/// plan's limits, and which is why it is computed here and not left implicit.
+/// | model | in | out |
+/// |---|---|---|
+/// | `claude-haiku-4-5` | $1.00 | $5.00 |
+/// | `claude-sonnet-5` | $3.00 | $15.00 |
+/// | `claude-opus-5` | $5.00 | $25.00 |
+/// | `claude-fable-5` | $10.00 | $50.00 |
 ///
-/// Two things follow, and both are the operator's to check rather than this
-/// crate's to assume:
+/// Every row is sourced. Nothing here is interpolated, averaged or guessed: a
+/// model with no published price would have no arm below and the build would
+/// stop, which is the same reason `ModelId` is a closed enum.
 ///
-/// * A subscription's limits are stated per rolling window, not per month, so
-///   the question is never "does 4,000 calls a month fit" but "does the busiest
-///   window fit". A company whose employees all wake on the same cadence
-///   concentrates its load; `domain::initiative` jitters the schedule, which
-///   helps and is not a plan.
-/// * Whether a given subscription *permits* an unattended fleet is a question
-///   about that plan's terms, not about tokens, and this crate cannot answer
-///   it. It is worth answering before sizing anything on it, because the
-///   failure mode is not a larger bill — it is the account.
-pub const USD_PER_M_INPUT: f64 = 5.0;
-
-/// USD per million output tokens for the same model.
-pub const USD_PER_M_OUTPUT: f64 = 25.0;
+/// # Two things these prices are not
+///
+/// **They are not what a subscription costs.** Under the local `claude` CLI —
+/// which is what `--dry-run` and `--live` actually drive — no per-token invoice
+/// exists at all: the currency is a monthly seat and the binding constraint is
+/// *throughput*, not dollars. Every figure this module publishes is therefore
+/// the metered-API reading of a run that was not metered. See the `unmeasured`
+/// entry that says so.
+///
+/// **They are not the price on the day.** `claude-sonnet-5` is at an
+/// introductory $2.00/$10.00 through 2026-08-31, so the three seats on Sonnet
+/// bill about a third less than the arithmetic below says until then. The
+/// standard rate is used deliberately: a bill quoted at a rate that expires in
+/// five days is the kind of number `docs/ORIZN.md` published once already.
+pub const fn rate_card(model: ModelId) -> (f64, f64) {
+    match model {
+        ModelId::Haiku45 => (1.0, 5.0),
+        ModelId::Sonnet5 => (3.0, 15.0),
+        ModelId::Opus5 => (5.0, 25.0),
+        ModelId::Fable5 => (10.0, 50.0),
+    }
+}
 
 /// Days billed. A month, rounded the way an operator budgets one.
 const DAYS: f64 = 30.0;
@@ -138,23 +145,42 @@ pub struct Sample {
 }
 
 impl Sample {
-    /// Dollars a month, at `calls_per_turn` model calls for each of
-    /// `turns_per_day` reserved turns.
+    /// Dollars a month for **one seat**, at `calls_per_turn` model calls for
+    /// each of `turns_per_day` reserved turns, billed at `model`'s rates.
     ///
     /// The whole arithmetic, in one place, so that nothing anywhere else has to
     /// restate it. Linear in every argument, which is what
     /// `the_arithmetic_is_one_multiplication_anybody_can_redo` checks.
-    pub fn monthly_usd(self, calls_per_turn: f64, turns_per_day: f64) -> f64 {
+    ///
+    /// `model` is the seat's, not [`Sample::model`]: the token counts come from
+    /// the recorded run and the *price* comes from whatever that seat runs
+    /// today. Those are two different facts and conflating them is how a
+    /// per-seat bill would silently stay a single-model one.
+    pub fn monthly_usd(self, model: ModelId, calls_per_turn: f64, turns_per_day: f64) -> f64 {
+        let (per_m_in, per_m_out) = rate_card(model);
         let calls = calls_per_turn * turns_per_day * DAYS;
-        calls
-            * (self.input_tokens_per_call * USD_PER_M_INPUT
-                + self.output_tokens_per_call * USD_PER_M_OUTPUT)
+        calls * (self.input_tokens_per_call * per_m_in + self.output_tokens_per_call * per_m_out)
             / 1_000_000.0
     }
 
-    /// Dollars a month at the rate this sample actually ran at.
-    pub fn measured_usd(self, turns_per_day: f64) -> f64 {
-        self.monthly_usd(self.calls_per_turn, turns_per_day)
+    /// The whole company for a month, at the rate this sample actually ran at:
+    /// every seat at its own model, its own turn budget, summed.
+    ///
+    /// **This is the function the old `measured_usd(turns_per_day)` became.**
+    /// The old one took the sum of the turn budgets and multiplied once, which
+    /// was exactly right while one model served every seat and is a category
+    /// error now: five seats on three models is five multiplications, and the
+    /// mix is most of the answer.
+    pub fn company_usd(self, calls_per_turn: f64) -> f64 {
+        seats()
+            .iter()
+            .map(|seat| self.monthly_usd(seat.model, calls_per_turn, f64::from(seat.turns)))
+            .sum()
+    }
+
+    /// The same, at the calls-per-turn this sample recorded.
+    pub fn measured_usd(self) -> f64 {
+        self.company_usd(self.calls_per_turn)
     }
 }
 
@@ -172,6 +198,21 @@ impl Sample {
 /// separate invocations of `--dry-run 1` against three empty databases. All
 /// three passed every structural row; the spread below is what one language
 /// model does with the same three briefings on the same afternoon.
+///
+/// # These counts are from one model, and the bill is now priced on four
+///
+/// Every figure here was sampled when every seat ran `claude-opus-5`, because
+/// that is what every seat ran. The *prices* [`Sample::company_usd`] multiplies
+/// them by are now each seat's own — but how many calls a turn takes is a fact
+/// about how a model plans, and the token counts move with the tokenizer, so a
+/// seat on Sonnet or Haiku would produce different numbers here.
+///
+/// There is deliberately no `model` field on [`Sample`] recording which one it
+/// came from: a pass covers three seats, they no longer share a model, and a
+/// single-model field on a mixed sample would be a lie with a type on it. What
+/// carries the invalidation instead is [`DIGEST`], which now hashes each seat's
+/// model — so moving one turns this block red with *"the recorded run measured
+/// a different company"*, which is precisely what would have happened.
 ///
 /// # These three predate `MAX_THINKING_TOKENS=0` and are due a re-measure
 ///
@@ -223,7 +264,7 @@ pub const RECORDED: &[Sample] = &[
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "c0c742c04ada7fb1";
+pub const DIGEST: &str = "574ecc743e6919dd";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
@@ -268,20 +309,89 @@ fn role_layers() -> Vec<(String, String)> {
     out
 }
 
-/// Orizn's reserved turns a day: the sum of the five role layers.
+/// One priced seat: a role, its turn budget, and the model it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seat {
+    /// The role layer's file stem, which is the role name.
+    pub role: String,
+    /// `max_turns_per_day` from that layer.
+    pub turns: u32,
+    /// What `model_for` gives that role under that layer.
+    pub model: ModelId,
+}
+
+/// Which model each role *asks* for, off its own pack.
 ///
-/// **This is the column `docs/ORIZN.md` bills, read from the documents that set
-/// it** rather than restated as a constant. `direction`'s zero is a real zero
-/// and contributes nothing, which is the runbook's whole argument for that seat.
-pub fn turns_per_day() -> u32 {
+/// Not a table of names and models — a table of names and **packs**, so the
+/// model itself is still read from the one place that owns it. A role layer
+/// whose name matches no pack is an employee nobody chartered, which is
+/// [`ModelId::UNCHARTERED`]; `every_priced_seat_has_a_pack_or_no_turns` is what
+/// stops that being a silent mispricing rather than the honest zero it is for
+/// `direction`.
+fn preference(role: &str) -> Option<ModelId> {
+    Some(match role {
+        "international-buyer" => rolepack::RolePack::international_buyer().model(),
+        "sales-development" => rolepack_sales::RolePack::sales_development().model(),
+        rolepack_service::CUSTOMER_SUCCESS => {
+            rolepack_service::RolePack::customer_success().model()
+        }
+        rolepack_service::GROWTH => rolepack_service::RolePack::growth().model(),
+        rolepack_service::FINANCE => rolepack_service::RolePack::finance().model(),
+        rolepack_service::ENTRY_REQUIREMENTS => {
+            rolepack_service::RolePack::entry_requirements().model()
+        }
+        _ => return None,
+    })
+}
+
+/// **The payroll, priced.** One entry per role layer in `docs/orizn-roles/`,
+/// carrying the two numbers the bill is made of.
+///
+/// Read off the operator's own documents rather than restated here, exactly as
+/// the turns column always was — and the model comes out of the same documents
+/// by the same rule the running system uses: [`model_for`] over the pack's
+/// preference and the intersected layer. A seat priced by any other rule would
+/// be a seat this deployment does not have.
+///
+/// The ceiling stands in for the platform, tenant and employee layers because
+/// Orizn writes only two of the four; that is stated rather than hidden, and it
+/// is the same shape `apps/server/tests/orizn.rs` installs.
+pub fn seats() -> Vec<Seat> {
+    let ceiling = limits("orizn-ceiling.json");
     role_layers()
         .iter()
         .map(|(name, raw)| {
-            let limits: PolicyLimits =
+            let role = name.strip_suffix(".json").unwrap_or(name).to_owned();
+            let layer: PolicyLimits =
                 serde_json::from_str(raw).unwrap_or_else(|err| panic!("{name}: {err}"));
-            limits.max_turns_per_day
+            let policy = EffectivePolicy::try_new(&ceiling, &ceiling, &layer, &ceiling)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let preferred = preference(&role).unwrap_or(ModelId::UNCHARTERED);
+            let model = model_for(Some(&policy), preferred).unwrap_or_else(|| {
+                panic!(
+                    "{name}: the ceiling and this role layer intersect `allowed_models` to \
+                     nothing, so this seat could not take a turn"
+                )
+            });
+            Seat {
+                role,
+                turns: layer.max_turns_per_day,
+                model,
+            }
         })
-        .sum()
+        .collect()
+}
+
+/// Orizn's reserved turns a day: the sum of the five role layers.
+///
+/// **This is the column `docs/ORIZN.md` billed when every seat ran one model**,
+/// and it is no longer sufficient on its own — the bill is now a sum over
+/// [`seats`], because turns at $1/M and turns at $5/M are not the same turn.
+/// It survives as the headline's denominator and as the thing the runbook's
+/// turn table is checked against. `direction`'s zero is a real zero and
+/// contributes nothing, which is the runbook's whole argument for that seat.
+pub fn turns_per_day() -> u32 {
+    seats().iter().map(|seat| seat.turns).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -368,18 +478,42 @@ const PIN_IDENTITY: &str = "You are seat, an AI employee of Orizn. Your address 
 /// measured against: the turn brief, each charter's rendered system prompt at
 /// both trust levels, each charter's plan, and the five operator documents.
 ///
-/// # What it does not cover, deliberately
+/// # The models are in here now, and they were the gap
+///
+/// This function's own docs used to end *"and the model, which is the one input
+/// to a live measurement that nothing in this repository can pin at all"*. That
+/// was true while the model came from `AGENTOS_LLM` — a process-wide string set
+/// outside the workspace, which no digest could reach. It is now a property of
+/// each role pack and each operator document, both of which are in the
+/// repository, so the sentence is simply false and the hash covers it.
+///
+/// That matters more than it sounds. A recorded bill is arithmetic over token
+/// counts sampled from a model; changing which model a seat runs changes both
+/// the price *and* the sample, and nothing about the prompts would move to show
+/// it. Re-pointing `finance` at Sonnet without this would leave [`RECORDED`]
+/// looking fresh while every figure it feeds was about a company that no longer
+/// exists.
+///
+/// # What it still does not cover
 ///
 /// The colleague roster and the employee's own address, both of which come out
 /// of the database at run time; `crates/eval/src/scoping.rs` owns the roster's
-/// size and it is bounded by the team. And the model, which is the one input to
-/// a live measurement that nothing in this repository can pin at all.
+/// size and it is bounded by the team. And the *snapshot* behind a model name —
+/// a new one shipped under `claude-opus-5` moves every figure here and no test
+/// can see it happen.
 pub fn digest() -> String {
     let mut hasher = Sha256::new();
     hasher.update(TURN_BRIEF.as_bytes());
+    // Every seat's model, in `seats()` order — which is `role_layers()` order,
+    // which is sorted by file name.
+    for seat in seats() {
+        hasher.update(seat.role.as_bytes());
+        hasher.update(seat.model.as_str().as_bytes());
+    }
     for (seat, charter) in charters() {
         hasher.update(seat.as_bytes());
         hasher.update(charter.role().as_bytes());
+        hasher.update(charter.model().as_str().as_bytes());
         let prompt = charter.system_prompt(PIN_IDENTITY);
         hasher.update(prompt.render(TrustLabel::Trusted).as_bytes());
         hasher.update(prompt.render(TrustLabel::Untrusted).as_bytes());
@@ -416,22 +550,45 @@ fn spread(of: impl Fn(Sample) -> f64) -> (f64, f64) {
     })
 }
 
+/// The seat mix, as a phrase: `3 on claude-sonnet-5, 1 on claude-opus-5, …`,
+/// cheapest model first and seats that take no turns left out.
+///
+/// In the headline because it is most of the answer. The same turn count on
+/// Haiku and on Fable differ by a factor of ten, so a bill quoted without the
+/// mix is a number whose largest input is invisible.
+fn mix() -> String {
+    let seats = seats();
+    ModelId::ALL
+        .into_iter()
+        .filter_map(|model| {
+            let n = seats
+                .iter()
+                .filter(|s| s.model == model && s.turns > 0)
+                .count();
+            (n > 0).then(|| format!("{n} on {model}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// **The one sentence, and `docs/ORIZN.md` must contain it verbatim.**
 ///
 /// Three figures and their assumptions, because a point estimate is how $76 got
 /// published: what the recorded runs cost at the rate they actually ran, the
 /// floor at one model call per reserved turn, and the ceiling at
-/// [`Budgets::max_turns`].
+/// [`Budgets::max_turns`]. Plus the seat mix, which is new and is the reason the
+/// figures moved.
 pub fn headline() -> String {
     let turns = f64::from(turns_per_day());
-    let (lo, hi) = spread(|s| s.measured_usd(turns));
-    let (floor, _) = spread(|s| s.monthly_usd(FLOOR_CALLS_PER_TURN, turns));
-    let (_, ceiling) = spread(|s| s.monthly_usd(ceiling_calls_per_turn(), turns));
+    let (lo, hi) = spread(Sample::measured_usd);
+    let (floor, _) = spread(|s| s.company_usd(FLOOR_CALLS_PER_TURN));
+    let (_, ceiling) = spread(|s| s.company_usd(ceiling_calls_per_turn()));
     format!(
-        "${lo:.0}–${hi:.0} a month over {} measured runs at {turns} reserved turns a day; \
-         ${floor:.0} floor at {FLOOR_CALLS_PER_TURN:.2} model calls per turn, ${ceiling:.0} \
-         ceiling at {:.2}",
+        "${lo:.0}–${hi:.0} a month over {} measured runs at {turns} reserved turns a day \
+         ({}); ${floor:.0} floor at {FLOOR_CALLS_PER_TURN:.2} model calls per turn, \
+         ${ceiling:.0} ceiling at {:.2}",
         RECORDED.len(),
+        mix(),
         ceiling_calls_per_turn(),
     )
 }
@@ -496,6 +653,20 @@ pub fn evaluate() -> Surface {
                this document used to publish as an estimate",
         ),
     );
+
+    // --- 1b. the seat mix, which is now half the arithmetic -----------------
+    // Read off the operator's documents and the role packs by the same rule the
+    // running system uses, so this row is what `apps/server` would resolve for
+    // each of these employees and not a summary somebody typed.
+    rows.push(Row::ok(
+        "what each seat thinks with",
+        seats()
+            .iter()
+            .map(|s| format!("{} {} ({} turns)", s.role, s.model, s.turns))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Truth::Characterises,
+    ));
 
     // --- 2. the input that made it a range ----------------------------------
     let (calls_lo, calls_hi) = spread(|s| s.calls_per_turn);
@@ -598,9 +769,21 @@ pub fn evaluate() -> Surface {
             "whether 30 days is a month an operator recognises, and whether every reserved turn \
              is taken. The turns column is a CEILING on turns, not a forecast of them: an \
              employee with nothing to do reserves nothing and bills nothing",
-            "the model. Which model the numbers were sampled from is not in the digest, because \
-             nothing in this repository can pin one — a new snapshot behind the same name moves \
-             every figure above and no test can see it happen",
+            "the model, twice over. Which model each seat runs IS pinned now — it is in the \
+             digest — but every token count above was sampled from `claude-opus-5`, and a \
+             seat moved to Sonnet or Haiku will plan differently and tokenize differently. \
+             The prices below those seats are right and the counts they multiply are borrowed. \
+             And a new snapshot shipped behind an unchanged model name moves everything and \
+             no test can see it happen",
+            "the subscription, which is the regime the measurement was taken in. `--dry-run` \
+             drives the local `claude` CLI, where there is no per-token invoice at all: the \
+             currency is a monthly seat and the binding constraint is throughput. Every figure \
+             above is the metered-API reading of an unmetered run — right for the deployment \
+             that pays per token, and the wrong unit entirely for the one that does not",
+            "the introductory rate. `claude-sonnet-5` bills $2.00/$10.00 per million through \
+             2026-08-31 rather than the $3.00/$15.00 `rate_card` uses, so the three Sonnet \
+             seats are cheaper than this until then. Quoting the introductory number would be \
+             publishing a figure with five days left on it",
         ],
     }
 }
@@ -614,8 +797,8 @@ mod tests {
     use super::*;
 
     /// The bill, by hand: one turn a day, one call each, a round million input
-    /// tokens and nothing out, is 30 × $5 = $150. If this ever disagrees, the
-    /// arithmetic has grown a term nobody can check.
+    /// tokens and nothing out, on Opus, is 30 × $5 = $150. If this ever
+    /// disagrees, the arithmetic has grown a term nobody can check.
     #[test]
     fn the_arithmetic_is_one_multiplication_anybody_can_redo() {
         let round = Sample {
@@ -623,17 +806,111 @@ mod tests {
             input_tokens_per_call: 1_000_000.0,
             output_tokens_per_call: 0.0,
         };
-        assert!((round.measured_usd(1.0) - 150.0).abs() < 1e-9);
+        assert!((round.monthly_usd(ModelId::Opus5, 1.0, 1.0) - 150.0).abs() < 1e-9);
         // And output is priced five times higher, which is the rate card.
         let out = Sample {
             input_tokens_per_call: 0.0,
             output_tokens_per_call: 1_000_000.0,
             ..round
         };
-        assert!((out.measured_usd(1.0) - 750.0).abs() < 1e-9);
+        assert!((out.monthly_usd(ModelId::Opus5, 1.0, 1.0) - 750.0).abs() < 1e-9);
         // Linear in calls per turn: this is the whole reason the range is a
         // range, and a non-linear term here would make the ceiling a guess.
-        assert!((round.monthly_usd(2.0, 1.0) - 2.0 * round.monthly_usd(1.0, 1.0)).abs() < 1e-9);
+        assert!(
+            (round.monthly_usd(ModelId::Opus5, 2.0, 1.0)
+                - 2.0 * round.monthly_usd(ModelId::Opus5, 1.0, 1.0))
+            .abs()
+                < 1e-9
+        );
+    }
+
+    /// **The per-seat claim.** The same seat, the same turns, the same sample,
+    /// priced on four models, is four different bills in the published ratios —
+    /// and the ratios are the rate card, so a row typed wrong shows up here.
+    #[test]
+    fn the_bill_follows_the_seats_model_and_not_a_single_rate() {
+        let seat = Sample {
+            calls_per_turn: 1.0,
+            input_tokens_per_call: 1_000_000.0,
+            output_tokens_per_call: 1_000_000.0,
+        };
+        let on = |model| seat.monthly_usd(model, 1.0, 1.0);
+        // $6, $18, $30, $60 per call-day; ×30 days.
+        assert!((on(ModelId::Haiku45) - 180.0).abs() < 1e-9);
+        assert!((on(ModelId::Sonnet5) - 540.0).abs() < 1e-9);
+        assert!((on(ModelId::Opus5) - 900.0).abs() < 1e-9);
+        assert!((on(ModelId::Fable5) - 1_800.0).abs() < 1e-9);
+        // Strictly increasing along `ModelId`'s order, which is what makes
+        // `model_for`'s cheapest-first fallback a cost guarantee rather than an
+        // implementation detail.
+        for pair in ModelId::ALL.windows(2) {
+            assert!(
+                on(pair[0]) < on(pair[1]),
+                "{} is not cheaper than {}: `ModelId`'s ordering is not the price list",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// The company bill is the sum of its seats, each at its own model — not the
+    /// summed turn budget multiplied once. That distinction is the whole change
+    /// and it is worth an assertion that would fail if somebody collapsed it
+    /// back.
+    #[test]
+    fn the_company_bill_is_a_sum_over_seats_not_one_multiplication() {
+        let sample = RECORDED[0];
+        let by_hand: f64 = seats()
+            .iter()
+            .map(|seat| {
+                sample.monthly_usd(seat.model, sample.calls_per_turn, f64::from(seat.turns))
+            })
+            .sum();
+        assert!((sample.measured_usd() - by_hand).abs() < 1e-9);
+
+        // And the seats really do differ, or the sum proves nothing. Orizn runs
+        // Sonnet seats and an Opus seat side by side.
+        let working: Vec<ModelId> = seats()
+            .iter()
+            .filter(|s| s.turns > 0)
+            .map(|s| s.model)
+            .collect();
+        assert!(
+            working.iter().any(|m| *m != working[0]),
+            "every working seat runs {}, so this suite is not measuring a mix",
+            working[0]
+        );
+
+        // The old arithmetic — one model for everybody — is strictly more
+        // expensive, which is the finding this whole change is about.
+        let all_opus: f64 = seats()
+            .iter()
+            .map(|seat| {
+                sample.monthly_usd(ModelId::Opus5, sample.calls_per_turn, f64::from(seat.turns))
+            })
+            .sum();
+        assert!(
+            by_hand < all_opus,
+            "the seat mix costs {by_hand:.2}, one-model-for-everybody costs {all_opus:.2}"
+        );
+    }
+
+    /// A role layer with turns and no pack would be priced at
+    /// `ModelId::UNCHARTERED` — the cheapest model there is — which is right for
+    /// an employee nobody chartered and a silent under-estimate for one whose
+    /// pack simply is not wired in here. `direction` is the honest case: no
+    /// pack, no turns, no contribution.
+    #[test]
+    fn every_priced_seat_has_a_pack_or_no_turns() {
+        for seat in seats() {
+            assert!(
+                preference(&seat.role).is_some() || seat.turns == 0,
+                "{} reserves {} turns a day and matches no role pack, so its model is a \
+                 guess rather than a reading",
+                seat.role,
+                seat.turns
+            );
+        }
     }
 
     /// The floor is below what was measured and the ceiling above it, for every
@@ -641,11 +918,10 @@ mod tests {
     /// stated the right way round.
     #[test]
     fn every_measurement_sits_inside_its_own_range() {
-        let turns = f64::from(turns_per_day());
         for sample in RECORDED {
-            let floor = sample.monthly_usd(FLOOR_CALLS_PER_TURN, turns);
-            let ceiling = sample.monthly_usd(ceiling_calls_per_turn(), turns);
-            let measured = sample.measured_usd(turns);
+            let floor = sample.company_usd(FLOOR_CALLS_PER_TURN);
+            let ceiling = sample.company_usd(ceiling_calls_per_turn());
+            let measured = sample.measured_usd();
             assert!(
                 floor <= measured && measured <= ceiling,
                 "{measured:.2} is outside {floor:.2}..{ceiling:.2}, so {sample:?} claims a \
@@ -692,6 +968,28 @@ mod tests {
         // It is a function of the charters: two different seats' briefings are
         // in there, so a fixture with one charter would hash differently.
         assert_eq!(charters().len(), 3);
+        // And of the seats' models, which is the claim this file's docs used to
+        // say was impossible. Same seats, one model moved, different digest.
+        let baseline = digest();
+        assert_ne!(
+            baseline,
+            {
+                let mut hasher = Sha256::new();
+                hasher.update(TURN_BRIEF.as_bytes());
+                for seat in seats() {
+                    hasher.update(seat.role.as_bytes());
+                    // One seat pretending to run something else.
+                    hasher.update(ModelId::Fable5.as_str().as_bytes());
+                }
+                hasher
+                    .finalize()
+                    .iter()
+                    .take(8)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            },
+            "the digest does not depend on which model a seat runs"
+        );
     }
 
     /// The reason this module exists. If it fails, `docs/ORIZN.md` is quoting a

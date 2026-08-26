@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use agentos_domain::action::{ActionKind, CallingCode, Channel};
-use agentos_domain::policy::PolicyLimits;
+use agentos_domain::policy::{ModelId, PolicyLimits};
 
 use crate::prompt::SystemPrompt;
 use crate::rolepack::CountryCode;
@@ -193,6 +193,8 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
+    /// What this job needs to think with. See [`RolePack::model`].
+    model: ModelId,
     limits: PolicyLimits,
 }
 
@@ -204,6 +206,15 @@ impl RolePack {
     pub fn sales_development() -> Self {
         Self {
             name: "sales-development",
+
+            // **The seat the founder's observation is about.** Three paragraphs
+            // from a template, personalised from a page this role has just read,
+            // to a stranger who will reply or not — and the briefing does the hard
+            // part, because the qualification rules are written down rather than
+            // reasoned out. This role proposes no payment and no signature, so the
+            // expensive failure mode is not available to it at all; the cheap one
+            // is a dull email, and a dull email costs a reply rather than money.
+            model: ModelId::Sonnet5,
             briefing: SALES_BRIEFING,
 
             // Prospecting is reading public pages, writing to people, and
@@ -296,6 +307,12 @@ impl RolePack {
                 allowed_mcp_tools: BTreeSet::new(),
 
                 // Selling to a company is not talking to its agent.
+                // Sonnet and below. An operator who wants their sellers on Haiku says
+                // so in a tenant layer; one who wants them on Opus is asking this pack
+                // to be wrong about its own job, and should change the pack rather
+                // than widen the layer — the intersection would ignore them anyway.
+                allowed_models: ModelId::Sonnet5.at_most(),
+
                 allowed_a2a_peers: BTreeSet::new(),
 
                 // Cold outreach OFF. The gate denies every first contact while
@@ -318,6 +335,27 @@ impl RolePack {
                 allow_data_delete: false,
             },
         }
+    }
+
+    /// The model this role's work needs — a **preference**, not a grant.
+    ///
+    /// What actually runs is
+    /// [`model_for`](agentos_domain::policy::model_for) over this and the
+    /// employee's intersected `allowed_models`: the pack says what the job needs
+    /// and the operator says what they will pay for, and the intersection is
+    /// what the provider is handed. A role whose preference an operator has
+    /// excluded runs the cheapest model they *have* permitted; a role whose
+    /// intersection is empty runs nothing at all, loudly.
+    ///
+    /// **These assignments are a starting point, not a finding.** Which model a
+    /// role needs is a claim about work quality, and the only instrument in this
+    /// workspace that could test it is `agentos_eval::toolchoice` — five cases,
+    /// scoring which tool was reached for rather than the judgement the
+    /// briefings are actually about. Each constructor carries the reason it was
+    /// given the model it has, so that changing one is an argument with a stated
+    /// opponent rather than a preference swap.
+    pub const fn model(&self) -> ModelId {
+        self.model
     }
 
     /// The role's handle. Display and metrics only.

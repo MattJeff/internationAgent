@@ -22,6 +22,11 @@
   "denied_domains": [],
   "allowed_mcp_tools": [],
   "allowed_a2a_peers": [],
+  "allowed_models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-5",
+    "claude-opus-5"
+  ],
   "max_new_contacts_per_day": 5,
   "max_turns_per_day": 6,
   "allow_file_upload": false,

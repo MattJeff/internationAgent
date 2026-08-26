@@ -114,7 +114,7 @@ use std::fmt;
 
 use agentos_domain::action::{ActionKind, CallingCode, Channel, Domain};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{PolicyLimits, SpendLimits};
+use agentos_domain::policy::{ModelId, PolicyLimits, SpendLimits};
 
 use crate::prompt::SystemPrompt;
 
@@ -220,6 +220,8 @@ pub struct RolePack {
     name: &'static str,
     briefing: &'static str,
     proposable: BTreeSet<ActionKind>,
+    /// What this job needs to think with. See [`RolePack::model`].
+    model: ModelId,
     limits: PolicyLimits,
 }
 
@@ -232,6 +234,16 @@ impl RolePack {
         Self {
             name: "international-buyer",
             briefing: BUYER_BRIEFING,
+
+            // Four quotations in three currencies with different Incoterms,
+            // lead times and deposit schedules, and the job is to notice that
+            // the cheapest unit price is the expensive option. That is
+            // multi-variable comparison against a briefing, not retrieval, and
+            // it ends in a `PaymentCreate` and a `ContractSign` — the two
+            // proposals in this workspace that a human has to read. A cheaper
+            // model here saves tokens on the turn and costs an hour of a
+            // founder's attention on the approval.
+            model: ModelId::Opus5,
 
             // Sourcing is talking to strangers and reading their pages. It is
             // not writing to their portals, uploading files to them, talking
@@ -280,6 +292,11 @@ impl RolePack {
                     )
                     .expect("the buyer's spend caps are coherent"),
                 ),
+
+                // Down to Opus and no further. Frontier rates buy nothing a
+                // purchase order needs, and a role layer that named `Fable5`
+                // would let an employee layer opt into paying them.
+                allowed_models: ModelId::Opus5.at_most(),
 
                 // SMS is absent on purpose: it is the cheapest way to spam a
                 // stranger and WhatsApp covers the same suppliers.
@@ -368,6 +385,29 @@ impl RolePack {
                 allow_data_delete: false,
             },
         }
+    }
+
+    /// The model this role's work needs — a **preference**, not a grant.
+    ///
+    /// What actually runs is
+    /// [`model_for`](agentos_domain::policy::model_for) over this and the
+    /// employee's intersected [`PolicyLimits::allowed_models`]: the pack says
+    /// what the job needs and the operator says what they will pay for, and the
+    /// intersection is what the provider is handed. A role whose preference an
+    /// operator has excluded runs the cheapest model they *have* permitted; a
+    /// role whose intersection is empty runs nothing at all, loudly.
+    ///
+    /// **These assignments are a starting point, not a finding.** Which model a
+    /// role needs is a claim about work quality, and the only instrument in this
+    /// workspace that could test it is `agentos_eval::toolchoice`, which has
+    /// five cases and scores tool choice rather than the judgement the briefings
+    /// are actually about. Each one below carries the reason it was chosen, so
+    /// that changing it is an argument with a stated opponent rather than a
+    /// preference swap.
+    ///
+    /// [`PolicyLimits::allowed_models`]: agentos_domain::policy::PolicyLimits::allowed_models
+    pub const fn model(&self) -> ModelId {
+        self.model
     }
 
     /// The role's handle. Display and metrics only.
