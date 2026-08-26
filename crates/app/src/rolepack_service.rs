@@ -2020,11 +2020,20 @@ mod tests {
         // one minus every high-risk schema — which is only ever `pay` today, so
         // the two columns differ for exactly the two packs that may propose a
         // payment.
+        //
+        // `read_page` is in every row, at both labels, and both facts are
+        // deliberate. Every pack lists `ActionKind::BrowserRead` — reading
+        // somebody's page is the one thing all six of these jobs do — and it
+        // stays on an untrusted turn because a read is `Risk::Low`: an employee
+        // halfway through checking something has to be able to look at the next
+        // page, and what keeps that safe is that everything it reads comes back
+        // wrapped, not that the tool was taken away.
         let table: &[(&str, &[&str], &[&str])] = &[
             (
                 "international-buyer",
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "pay",
                     "message_colleague",
@@ -2032,6 +2041,7 @@ mod tests {
                 ],
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2042,12 +2052,14 @@ mod tests {
                 "sales-development",
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
                 ],
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2059,12 +2071,14 @@ mod tests {
                 "customer-success",
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
                 ],
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2075,13 +2089,24 @@ mod tests {
             // pack that proves the floor filters something other than `pay`.
             (
                 "growth",
-                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
-                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
+                &[
+                    "read_page",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "read_page",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
             ),
             (
                 "finance",
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "pay",
                     "message_colleague",
@@ -2089,6 +2114,7 @@ mod tests {
                 ],
                 &[
                     "send_email",
+                    "read_page",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2102,8 +2128,18 @@ mod tests {
             // pack's ceiling decide what a call through one of them may reach.
             (
                 ENTRY_REQUIREMENTS,
-                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
-                &["call_mcp_tool", "message_colleague", "brief_direct_reports"],
+                &[
+                    "read_page",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
+                &[
+                    "read_page",
+                    "call_mcp_tool",
+                    "message_colleague",
+                    "brief_direct_reports",
+                ],
             ),
         ];
 
@@ -2151,21 +2187,37 @@ mod tests {
     /// no MCP tool at all, so `call_mcp_tool` was a schema every employee of
     /// every fresh install was offered and every call of which came back
     /// `deny/no_rule`. The table above is therefore the offered list *before*
-    /// the policy is asked, and this is the same list after: identical minus
-    /// that one name, for every pack and both labels.
+    /// the policy is asked, and this is the same list after: identical minus the
+    /// names below, for every pack and both labels.
+    ///
+    /// **`read_page` is the second name, and it is the same finding.**
+    /// `default_ceiling` also has an empty `allowed_domains`, so
+    /// `always_denies(BrowserRead)` is true and the read tool is withheld until
+    /// an operator names a domain — exactly as the MCP tool is withheld until
+    /// one names a server. That is the right answer and it is worth being blunt
+    /// about what it means: adding the read schema to the catalogue does not by
+    /// itself give a shipped employee a browser. It gives it one the moment
+    /// somebody says which sites it may see, which is a decision no default can
+    /// make on an operator's behalf — a browsing agent with a blank allowlist is
+    /// either useless or pointed at the whole web.
     ///
     /// Derived from the table rather than pinned beside it on purpose — a second
     /// hand-written list of the same names is the copy that drifts, and what is
-    /// worth pinning here is the *difference*, which is one name.
+    /// worth pinning here is the *difference*, which is two names.
     #[test]
-    fn a_fresh_deployment_takes_call_mcp_tool_off_every_pack_and_a_grant_puts_it_back() {
+    fn a_fresh_deployment_takes_the_ungranted_tools_off_every_pack_and_a_grant_puts_them_back() {
         let ceiling = agentos_store::policy::default_ceiling();
         let policy = |limits: &PolicyLimits| {
             EffectivePolicy::try_new(limits, limits, limits, limits).expect("identical layers")
         };
         let fresh = policy(&ceiling);
-        // The same ceiling with one tool granted, which is what an operator's
-        // `policy install --tenant …` writes the moment a server is bound.
+        // Every tool whose *kind* the shipped ceiling grants nothing for. Both
+        // are inventory an operator names per deployment, and neither has a
+        // default that could be right.
+        let ungranted = ["read_page", "call_mcp_tool"];
+        // The same ceiling with one server and one domain granted, which is what
+        // an operator's `policy install --tenant …` writes the moment a server
+        // is bound and a prospect list exists.
         let granted = policy(&PolicyLimits {
             allowed_mcp_tools: [McpTool::new(
                 Slug::parse("erp").expect("slug"),
@@ -2173,6 +2225,9 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            allowed_domains: [Domain::parse("portal.example.com").expect("domain")]
+                .into_iter()
+                .collect(),
             ..ceiling.clone()
         });
 
@@ -2192,15 +2247,21 @@ mod tests {
                     on_a_fresh_install,
                     unfiltered
                         .iter()
-                        .filter(|tool| *tool != "call_mcp_tool")
+                        .filter(|tool| !ungranted.contains(&tool.as_str()))
                         .cloned()
                         .collect::<Vec<_>>(),
                     "{name} at {trust:?} on a fresh deployment"
                 );
-                // Not vacuous in either direction: every pack proposes McpCall,
-                // so every pack loses exactly one schema and keeps the rest.
-                assert!(unfiltered.contains(&"call_mcp_tool".to_owned()));
-                assert_eq!(on_a_fresh_install.len(), unfiltered.len() - 1);
+                // Not vacuous in either direction: every pack proposes both
+                // `McpCall` and `BrowserRead`, so every pack loses exactly these
+                // two schemas and keeps the rest.
+                for tool in ungranted {
+                    assert!(
+                        unfiltered.contains(&tool.to_owned()),
+                        "{name} at {trust:?} never had {tool} to lose"
+                    );
+                }
+                assert_eq!(on_a_fresh_install.len(), unfiltered.len() - ungranted.len());
                 assert_eq!(offered(trust, &proposable, Some(&granted)), unfiltered);
             }
         }

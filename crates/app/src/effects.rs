@@ -50,19 +50,29 @@ use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
 use agentos_domain::ids::{IdempotencyKey, Slug};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
-use agentos_providers::ProviderError;
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
 use agentos_providers::email::{EmailProvider, OutboundEmail, ProviderMessageId};
 use agentos_providers::telephony::{OpenWindow, OutboundSms, OutboundWhatsapp, TelephonyProvider};
+use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::spend;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
+use url::Url;
 
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
+
+/// What [`Effects::read_page`] answers when this employee has no browser
+/// context to drive.
+///
+/// A code rather than a message, because it is handed to a model as a failed
+/// tool result: "your browser is not provisioned" is a fact about this
+/// deployment that no amount of rephrasing the request will change, and the
+/// model needs to stop asking rather than try a different URL.
+pub const NO_BROWSER: &str = "no_browser";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -150,6 +160,24 @@ subject!(
 subject!(
     /// Send a WhatsApp message to one number.
     WhatsappSend { to: E164 } => WhatsappSend
+);
+subject!(
+    /// Look at what a page on a domain already says.
+    ///
+    /// **Half of the split the audit trail turns on.** Reading a prospect's
+    /// booking flow and typing a passport code into it are two different acts on
+    /// the same domain, and `Effects::record` writes the token's own action kind
+    /// — so one of them leaves a `browser_read` row and the other a
+    /// `browser_write` row, with no flag for a caller to set and nothing to keep
+    /// in step. See [`crate::proof_of_need`], which argues it at length and is
+    /// the reason it exists.
+    ///
+    /// Untrusted in the flavour a turn proposes: the domain comes off a URL a
+    /// model chose. [`Action::BrowserRead`] is [`agentos_domain::action::Risk`]
+    /// `Low`, so the gate rules on the domain rather than on the taint — reading
+    /// one more page is not the act a tainted turn is stopped at, and what keeps
+    /// it safe is that everything it brings back is [`Untrusted`].
+    BrowserRead { domain: Domain } => BrowserRead
 );
 subject!(
     /// Drive a browser somewhere that changes state on a domain.
@@ -364,15 +392,22 @@ pub enum EffectError {
     /// The effect was authorised and could still not be performed, because
     /// something read at write time said no.
     ///
-    /// Only [`Effects::send_internal`] produces one today, and the three
-    /// reasons it does are all facts about the *recipient*: there is no such
-    /// colleague on this employee's team, the thread being answered or handed
-    /// over is not this employee's, or the colleague has no turns left in its
-    /// day. None of the three is expressible as an [`Action`] — an `Action`
-    /// carries a parsed subject and no org chart and no ledger — so the gate
-    /// cannot rule on them, and pushing them into it would mean a second
-    /// transaction between the check and the write for a team membership or a
-    /// turn budget to change in.
+    /// [`Effects::send_internal`] produces four, and they are all facts about
+    /// the *recipient*: there is no such colleague on this employee's team, the
+    /// thread being answered or handed over is not this employee's, or the
+    /// colleague has no turns left in its day. None of them is expressible as an
+    /// [`Action`] — an `Action` carries a parsed subject and no org chart and no
+    /// ledger — so the gate cannot rule on them, and pushing them into it would
+    /// mean a second transaction between the check and the write for a team
+    /// membership or a turn budget to change in.
+    ///
+    /// [`Effects::read_page`] produces two, and they are facts about *this
+    /// deployment* rather than about the recipient — same reasoning, one seam
+    /// over. [`NO_BROWSER`] is an employee whose browser context is not
+    /// provisioned, which is a `employee_resources` row the gate has no business
+    /// reading; `not_text` is a browser adapter that answered a text read with
+    /// something that is not text, which is a bug in an adapter and not a
+    /// decision anybody made.
     ///
     /// The payload is a closed code, because it is handed back to a model as a
     /// failed tool result and it is what teaches it to stop asking.
@@ -547,6 +582,130 @@ impl Effects {
 
         let detail = Some(json!({ "domain": allowed.as_str() }));
         self.record(&ok, detail, outcome).await
+    }
+
+    /// Go to a page inside the domain on the token and bring back what one
+    /// element of it says.
+    ///
+    /// # Why this is not two calls to [`Effects::browse_write`]
+    ///
+    /// A read that a turn can express is *navigate and look*: a
+    /// [`BrowserStep::Text`] on its own reads whatever page the session happens
+    /// to be showing, which for a fresh context is nothing and for a reused one
+    /// is the last page some other task left up. Splitting the pair across two
+    /// tool calls would put a page load and the read of it under two rulings,
+    /// two turns and two audit rows, with the model free to interleave anything
+    /// in between — and the row that mattered ("what did we read, and where")
+    /// would be spread across both.
+    ///
+    /// So it is one token, one ruling, one row. The navigation is scope-checked
+    /// against the domain that was ruled on exactly as [`Effects::browse_write`]
+    /// checks a [`BrowserStep::Goto`], because it is the same check on the same
+    /// field.
+    ///
+    /// # It is a read, and it is unspellable as anything else
+    ///
+    /// The bound is [`BrowserRead`] and not [`BrowserWrite`], so a token minted
+    /// for typing into somebody's form cannot be spent here and a token minted
+    /// for reading cannot be spent on [`Effects::browse_write`]. The audit row
+    /// follows from the token — [`Effects::record`] writes
+    /// `ok.action().to_action().kind()` — so `browser_read` and `browser_write`
+    /// rows say what actually happened, with no flag for a caller to set.
+    ///
+    /// The text comes back [`Untrusted`] because it is a stranger's page, and it
+    /// is the adapter that wrapped it — see
+    /// [`BrowserOutcome::Text`](agentos_providers::browser::BrowserOutcome::Text).
+    pub async fn read_page<A: Subject<Of = BrowserRead>>(
+        &self,
+        ok: Authorized<A>,
+        url: &Url,
+        selector: &str,
+    ) -> Result<Untrusted<String>, EffectError> {
+        let allowed = ok.action().subject().domain.clone();
+        let read = self.load_page(&allowed, url, selector).await;
+        let detail = Some(json!({ "domain": allowed.as_str(), "selector": selector }));
+        self.record(&ok, detail, read).await
+    }
+
+    /// The provider half of [`Effects::read_page`], split out so the token, the
+    /// audit row and the two steps do not share one method's error paths.
+    async fn load_page(
+        &self,
+        allowed: &Domain,
+        url: &Url,
+        selector: &str,
+    ) -> Result<Untrusted<String>, EffectError> {
+        if !within(url.host_str(), allowed) {
+            return Err(EffectError::OutOfScope(allowed.clone()));
+        }
+        let session = self.session().await?;
+        self.ports
+            .browser
+            .act(&session, BrowserStep::Goto(url))
+            .await
+            .map_err(EffectError::Provider)?;
+        match self
+            .ports
+            .browser
+            .act(&session, BrowserStep::Text(selector))
+            .await
+            .map_err(EffectError::Provider)?
+        {
+            // Already wrapped by the adapter, and it stays that way.
+            BrowserOutcome::Text(text) => Ok(text),
+            // Only a broken adapter answers a text read with something else.
+            _ => Err(EffectError::Refused("not_text")),
+        }
+    }
+
+    /// This employee's own browser context, as provisioning left it.
+    ///
+    /// [`BrowserSession`] is a provisioned resource and not a handle this crate
+    /// may conjure — see `providers::browser`. What it *is*, though, is one row:
+    /// `Step::Browser` reaches [`BrowserProvider::ensure_context`] and the
+    /// binding it answers with is written to `employee_resources`, so pairing it
+    /// with this principal's employee id rebuilds the session the provisioner
+    /// made. That is the whole of what a turn was missing, and it is why the
+    /// browser is reachable from one now: nothing new is created here, an
+    /// existing resource is looked up.
+    ///
+    /// An employee whose browser is not `ready` gets [`EffectError::Refused`]
+    /// with a code the model is shown, not a panic and not a silent no-op.
+    ///
+    /// ponytail: one query per browsing tool call, not a cached field.
+    /// `Effects` is built per turn and a turn browses once or twice; a cache
+    /// here would be a copy of a row that provisioning can retire underneath it.
+    /// Cache it the day a turn drives a ten-step plan.
+    async fn session(&self) -> Result<BrowserSession, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let read = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT provider, external_id FROM employee_resources \
+              WHERE employee_id = $1 AND step = 'browser' AND state = 'ready'",
+        )
+        .bind(self.principal.employee_id.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|err| EffectError::Unavailable(StoreError::from(err)));
+        let _ = tx.rollback().await;
+
+        match read? {
+            Some((Some(provider), Some(external_id))) => Ok(BrowserSession {
+                employee_id: self.principal.employee_id,
+                binding: ProviderBinding {
+                    provider,
+                    external_id,
+                },
+                // `None` everywhere in this workspace: no shipped adapter reads
+                // it, and the one that would (self-hosted Chrome) is told its
+                // profile directory when the process is started, not here.
+                user_data_dir: None,
+            }),
+            _ => Err(EffectError::Refused(NO_BROWSER)),
+        }
     }
 
     /// Call the MCP tool named on the token.

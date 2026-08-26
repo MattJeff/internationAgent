@@ -217,6 +217,20 @@ pub const MAX_TRUTH_AGE: TimeDelta = TimeDelta::hours(24);
 /// the real [`BrowserWrite`] subject, because putting a passport code into
 /// their form does change state on their page and pretending otherwise would be
 /// a lie in the audit row.
+///
+/// # Not [`crate::effects::BrowserRead`], and when this can be deleted
+///
+/// There is a plain read subject now — declared beside [`BrowserWrite`] by the
+/// same macro, in both trust flavours — and it is what [`crate::turn`]'s read
+/// tool proposes. This type is not it, because it is not a subject for an
+/// effect: it is a subject for [`Effects::browse_write`], the per-*step* method
+/// this module drives a six-step plan through. That method is keyed on
+/// `Subject<Of = BrowserWrite>` and there is nothing about a `Goto` or a `Text`
+/// step that makes it a write, so `Browse` is the adapter that lets a read
+/// action ride the step API. It goes away the day the step API is keyed on
+/// something that can tell a reading step from a writing one — until then the
+/// pairing is [`Prober::step`]'s to make honestly, and it is made there in one
+/// visible match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Browse {
     scope: BrowserWrite,
