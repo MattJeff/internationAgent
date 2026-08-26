@@ -2088,12 +2088,22 @@ mod tests {
         // halfway through checking something has to be able to look at the next
         // page, and what keeps that safe is that everything it reads comes back
         // wrapped, not that the tool was taken away.
+        //
+        // `find_prospects` is beside it in every row for the arithmetic reason
+        // and not for a good one: this filter is keyed on `ActionKind`, that
+        // tool's action is `BrowserRead`, and so a pack that may read a page is
+        // offered it — including finance, whose job has nothing to do with
+        // prospects. The `ponytail:` note on its catalogue row is the argument
+        // for accepting that, and this table is where it becomes visible: if a
+        // sixteenth `ActionKind` is ever written for "write our own records",
+        // this is the column that thins out.
         let table: &[(&str, &[&str], &[&str])] = &[
             (
                 "international-buyer",
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "pay",
                     "message_colleague",
@@ -2102,6 +2112,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2113,6 +2124,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2120,6 +2132,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2132,6 +2145,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2139,6 +2153,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2151,12 +2166,14 @@ mod tests {
                 "growth",
                 &[
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
                 ],
                 &[
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2167,6 +2184,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "pay",
                     "message_colleague",
@@ -2175,6 +2193,7 @@ mod tests {
                 &[
                     "send_email",
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2190,12 +2209,14 @@ mod tests {
                 ENTRY_REQUIREMENTS,
                 &[
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
                 ],
                 &[
                     "read_page",
+                    "find_prospects",
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
@@ -2261,9 +2282,16 @@ mod tests {
     /// make on an operator's behalf — a browsing agent with a blank allowlist is
     /// either useless or pointed at the whole web.
     ///
+    /// `find_prospects` is the third name and the same finding a third time:
+    /// it is a `BrowserRead` too, so an empty `allowed_domains` withholds it —
+    /// which is exactly right for a tool that turns somebody else's page into
+    /// rows. An employee cannot go looking for prospects until an operator has
+    /// said which directories it may look at, and that seed list is
+    /// `allowed_domains` rather than a new table.
+    ///
     /// Derived from the table rather than pinned beside it on purpose — a second
     /// hand-written list of the same names is the copy that drifts, and what is
-    /// worth pinning here is the *difference*, which is two names.
+    /// worth pinning here is the *difference*, which is three names.
     #[test]
     fn a_fresh_deployment_takes_the_ungranted_tools_off_every_pack_and_a_grant_puts_them_back() {
         let ceiling = agentos_store::policy::default_ceiling();
@@ -2271,10 +2299,10 @@ mod tests {
             EffectivePolicy::try_new(limits, limits, limits, limits).expect("identical layers")
         };
         let fresh = policy(&ceiling);
-        // Every tool whose *kind* the shipped ceiling grants nothing for. Both
-        // are inventory an operator names per deployment, and neither has a
+        // Every tool whose *kind* the shipped ceiling grants nothing for. All
+        // three are inventory an operator names per deployment, and none has a
         // default that could be right.
-        let ungranted = ["read_page", "call_mcp_tool"];
+        let ungranted = ["read_page", "find_prospects", "call_mcp_tool"];
         // The same ceiling with one server and one domain granted, which is what
         // an operator's `policy install --tenant …` writes the moment a server
         // is bound and a prospect list exists.

@@ -522,4 +522,145 @@ mod live {
 
         server.close().await.expect("the binding closes");
     }
+
+    /// **The keyed tool, through the bridge, priced and dated.**
+    ///
+    /// This is the one test in the workspace that proves the commercial claim
+    /// end to end: the destination's own consular fee, with the date its
+    /// schedule carries, arriving through the deployment `crate::mcp`'s module
+    /// docs tell an operator to run, and parsed by the function that decides
+    /// what a prospect may be told.
+    ///
+    /// # Why the bridge and not stdio
+    ///
+    /// Because that is where the key works. `https://visa.orizn.app/mcp` serves
+    /// only `quick_visa_check` and ignores an API key in every header form; the
+    /// **stdio** package serves all six tools and reads `ORIZN_API_KEY` from its
+    /// environment. `supergateway` inherits this process's environment, so the
+    /// documented arrangement is also the only arrangement in which
+    /// `check_visa_requirement` answers at all — which makes the bridge not an
+    /// operator's convenience but the path.
+    ///
+    /// # Why two pairs
+    ///
+    /// They are the same destination and the same schedule. `visa_fee` is
+    /// `granularity: "destination"`, so both replies carry JPY 15,000 for a
+    /// single entry — and only one of the two passports owes it. `CHN` → `JPN`
+    /// needs a visa in advance and is billed; `FRA` → `JPN` is one of the 68+
+    /// exempt nationalities the same payload's `fee_waivers` names, and quoting
+    /// the number at them would be a false statement to a prospect whose
+    /// business is knowing that. One live call each is what makes the refusal an
+    /// observation rather than a fixture.
+    ///
+    /// The pairs are chosen to be dull for the reason the test above gives:
+    /// Japan's visa exemption for French nationals has stood since the 1950s,
+    /// and Chinese nationals have needed a Japanese visa throughout. Neither
+    /// moves by ministerial notice on a Tuesday.
+    ///
+    /// # It needs a key, and the feature is where that is declared
+    ///
+    /// `live-orizn` already means "npx, the open internet, and a real server".
+    /// A paid entitlement is one more precondition of the same opt-out, and the
+    /// panic below names the variable rather than the value.
+    #[tokio::test]
+    async fn the_keyed_tool_prices_a_visa_and_refuses_to_bill_a_passport_that_is_exempt() {
+        assert!(
+            std::env::var_os("ORIZN_API_KEY").is_some(),
+            "ORIZN_API_KEY is unset; check_visa_requirement is advertised keyless and fails at \
+             call time, so this test would be asserting an empty result"
+        );
+
+        let bridge = Bridge::start().await;
+        let declared: BTreeMap<Slug, agentos_app::mcp::Declaration> = ORIZN_TOOLS
+            .iter()
+            .map(|tool| {
+                (
+                    slug(&handle(tool.wire)),
+                    agentos_app::mcp::Declaration {
+                        risk: tool.risk,
+                        digest: None,
+                    },
+                )
+            })
+            .collect();
+
+        let server = McpServer::bind(
+            slug("orizn"),
+            &bridge.url(),
+            &declared,
+            Reach::Private,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the bridged orizn server binds");
+
+        let tool = McpTool::new(slug("orizn"), slug("check-visa-requirement"));
+        let ask = |passport: &'static str| {
+            let server = &server;
+            let tool = tool.clone();
+            async move {
+                let mut arguments = JsonObject::new();
+                arguments.insert("passport".to_owned(), passport.into());
+                arguments.insert("destination".to_owned(), "JPN".into());
+                let result = server
+                    .call(&tool, Some(arguments))
+                    .await
+                    .expect("check_visa_requirement answers");
+                // `Untrusted<CallToolResult>` to the `Untrusted<Value>` the
+                // parser takes, wrapped end to end — the same shape
+                // `Effects::call_tool` hands `crate::orizn`.
+                agentos_domain::untrusted::Untrusted::new(
+                    serde_json::to_value(result.expose_for_parsing()).expect("serialisable"),
+                )
+            }
+        };
+
+        // The pair that is billed.
+        let billed = ask("CHN").await;
+        let fee = agentos_app::orizn::read_fee(&billed)
+            .expect("orizn no longer prices a single entry to Japan with a citation");
+        assert_eq!(
+            fee.currency(),
+            "JPY",
+            "Japan's consular fee is no longer quoted in yen"
+        );
+        assert!(fee.amount() > 0);
+
+        // Not an assertion on the number, which is Orizn's to change, but on the
+        // thing the whole path exists for: the fee dates itself, and the date is
+        // the bar. Printed rather than asserted against `MAX_FEE_AGE`, because a
+        // schedule ageing past ninety days is news about the dataset's curation
+        // and must not stop a build.
+        let age = chrono::Utc::now().date_naive() - fee.as_of();
+        eprintln!(
+            "live orizn fee: {} {} for a single entry, as_of {} ({} days old)",
+            fee.amount(),
+            fee.currency(),
+            fee.as_of(),
+            age.num_days()
+        );
+        assert!(
+            age.num_days() >= 0,
+            "the fee schedule is dated in the future: {}",
+            fee.as_of()
+        );
+
+        // The same destination, the same schedule, a passport that owes nothing.
+        let exempt = ask("FRA").await;
+        let refused = agentos_app::orizn::read_fee(&exempt);
+        assert!(
+            matches!(refused, Err(agentos_app::orizn::TruthError::FeeNotOwed)),
+            "an exempt passport was billed Japan's consular fee: {refused:?}"
+        );
+
+        // And the reason it is refused is the pair's requirement rather than a
+        // missing schedule: the *rule* tool still says this pair is visa-free,
+        // and the fee tool answered with a schedule that priced the other one.
+        assert!(
+            agentos_app::orizn::read_fee(&billed).is_ok(),
+            "the billed pair stopped being priced between two calls"
+        );
+
+        server.close().await.expect("the binding closes");
+    }
 }

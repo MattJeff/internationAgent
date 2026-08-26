@@ -56,6 +56,7 @@ use agentos_providers::telephony::{OpenWindow, OutboundSms, OutboundWhatsapp, Te
 use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
+use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -64,6 +65,7 @@ use url::Url;
 
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
+use crate::turn::WHOLE_PAGE;
 
 /// What [`Effects::read_page`] answers when this employee has no browser
 /// context to drive.
@@ -73,6 +75,24 @@ use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 /// deployment that no amount of rephrasing the request will change, and the
 /// model needs to stop asking rather than try a different URL.
 pub const NO_BROWSER: &str = "no_browser";
+
+/// What [`Effects::discover_prospects`] answers when this employee's policy
+/// cannot be loaded at all.
+///
+/// It is very nearly unreachable — the gate loads the same four layers to rule
+/// on the browser read that got here — and it is not an
+/// [`EffectError::Unavailable`], because the honest reading of "nobody could
+/// build an enforceable policy" is that the daily new-contact limit is unknown,
+/// and an unknown limit is not a limit. Fails closed and says so, exactly as
+/// [`crate::gate::Denied::BrokenPolicy`] does one seam up.
+pub const NO_POLICY: &str = "broken_policy";
+
+/// What [`Effects::discover_prospects`] answers when the segment it was handed
+/// is not one `accounts_segment` permits.
+///
+/// A closed set, checked twice: `Turn::propose` names the eight to the model
+/// before the gate is troubled, and this is the same refusal at the write.
+pub const BAD_SEGMENT: &str = "unknown_segment";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -627,6 +647,94 @@ impl Effects {
         self.record(&ok, detail, read).await
     }
 
+    /// Read a page that lists companies and turn the addresses on it into
+    /// ordinary prospect rows.
+    ///
+    /// # Why this is one effect and not "read, then write"
+    ///
+    /// The same argument [`Effects::read_page`] makes about navigate-and-look,
+    /// one step further, plus a stronger one. Splitting it would mean handing a
+    /// model the page and asking it to hand back the prospects — and a model
+    /// transcribing a stranger's page into a tool call is precisely the channel
+    /// `apps/server/tests/sourcing_e2e.rs` plants `IGNORE PREVIOUS
+    /// INSTRUCTIONS` in a supplier name to test for. Here nothing does: the
+    /// page is scanned in Rust by
+    /// [`prospects::discover`](crate::prospects::discover), the only strings
+    /// that survive are what [`agentos_domain::action::EmailAddress::parse`]
+    /// accepted, and what comes back to the caller is a
+    /// [`Report`](crate::prospects::Report) of our own counts in our own
+    /// sentences. Not one byte the page authored crosses back, which is why the
+    /// turn that calls this stays *trusted* while the same page read through
+    /// [`Effects::read_page`] taints it — the difference is real and it is this.
+    ///
+    /// # The ruling is the read
+    ///
+    /// The token is a [`BrowserRead`], because that is the whole of what this
+    /// does to the outside world: one page load on a domain the policy allows,
+    /// scope-checked against the token exactly as a read is. Writing rows into
+    /// this tenant's own `accounts` and `contacts` is not an
+    /// [`Action`] and there is no kind for it — `knowledge::ingest` writes rows
+    /// with no ruling at all — so inventing a sixteenth [`ActionKind`] to cover
+    /// it would put a non-effect in the audit vocabulary.
+    ///
+    /// The bound on the rows is the policy's `max_new_contacts_per_day`, loaded
+    /// here and passed down. See [`crate::prospects`] for why that number and
+    /// not a new one.
+    ///
+    /// [`Action`]: agentos_domain::action::Action
+    /// [`ActionKind`]: agentos_domain::action::ActionKind
+    pub async fn discover_prospects<A: Subject<Of = BrowserRead>>(
+        &self,
+        ok: Authorized<A>,
+        url: &Url,
+        segment: &str,
+    ) -> Result<crate::prospects::Report, EffectError> {
+        let allowed = ok.action().subject().domain.clone();
+        let found = self.scan_directory(&allowed, url, segment).await;
+        let detail = Some(json!({ "domain": allowed.as_str(), "segment": segment }));
+        self.record(&ok, detail, found).await
+    }
+
+    /// The provider-and-store half of [`Effects::discover_prospects`], split out
+    /// for [`Effects::load_page`]'s reason: the token and the audit row do not
+    /// share this method's error paths.
+    async fn scan_directory(
+        &self,
+        allowed: &Domain,
+        url: &Url,
+        segment: &str,
+    ) -> Result<crate::prospects::Report, EffectError> {
+        let page = self.load_page(allowed, url, WHOLE_PAGE).await?;
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+
+        // The intersected four layers, read here rather than carried on the
+        // token: `Authorized` holds a decision and not a policy, deliberately.
+        // One query per call, like `browser_session`.
+        let budget = agentos_store::policy::load(&mut tx, self.principal.employee_id)
+            .await
+            .map_err(|_| EffectError::Refused(NO_POLICY))?
+            .limits()
+            .max_new_contacts_per_day;
+
+        let list = crate::prospects::List {
+            segment,
+            // A page does not say where a company is incorporated and this does
+            // not guess — `0033_prospect_listing.sql`'s own argument, and the
+            // reason `ZZ` exists.
+            country: crate::prospects::UNKNOWN_COUNTRY,
+            employee_id: Some(self.principal.employee_id),
+        };
+        let report = crate::prospects::discover(&mut tx, &list, &page, Utc::now(), budget)
+            .await
+            .map_err(discovery_error)?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        Ok(report)
+    }
+
     /// The provider half of [`Effects::read_page`], split out so the token, the
     /// audit row and the two steps do not share one method's error paths.
     async fn load_page(
@@ -1059,6 +1167,29 @@ impl Effects {
 fn within(host: Option<&str>, allowed: &Domain) -> bool {
     host.and_then(|host| Domain::parse(host).ok())
         .is_some_and(|host| host.is_within(allowed))
+}
+
+/// An import error, as the thing that will be handed back to a model.
+///
+/// Three of the four variants are decided before any write and the fourth is
+/// the database saying no, so the split is between "you asked for something
+/// this schema does not have" and "we could not reach the tables".
+/// [`crate::prospects::ImportError::Header`] cannot arise here — there is no
+/// header on a page — and is folded in with the segment for the same reason a
+/// wrong country is: the caller named something the store will not take.
+fn discovery_error(err: crate::prospects::ImportError) -> EffectError {
+    use crate::prospects::ImportError;
+    match err {
+        ImportError::Store(RevenueError::Store(err)) => EffectError::Unavailable(err),
+        // `upsert_contact` answers `Upserted::Suppressed` rather than raising,
+        // so this is the trigger underneath it firing on something else.
+        ImportError::Store(other) => {
+            EffectError::Unavailable(StoreError::conflict(other.to_string()))
+        }
+        ImportError::Header(_) | ImportError::Segment(_) | ImportError::Country(_) => {
+            EffectError::Refused(BAD_SEGMENT)
+        }
+    }
 }
 
 /// The payload detail every message-shaped effect shares.

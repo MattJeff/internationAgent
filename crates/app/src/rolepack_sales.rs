@@ -22,6 +22,14 @@
 //!   the EU is lawful on legitimate interest, not automatic, and a sales agent
 //!   that mails strangers the moment it is provisioned is a compliance
 //!   incident with a default value behind it.
+//!
+//!   The same zero is what bounds *finding* people, not only writing to them:
+//!   [`crate::prospects::discover`] meters new rows against this number too,
+//!   so a fresh seller adds nobody to the list either. That is deliberate and
+//!   it is the earlier end of the same obligation — storing a stranger's
+//!   business address is already processing their personal data, and the lawful
+//!   basis is recorded per person in `contacts.lawful_basis` at the moment the
+//!   row is written, not at the moment it is mailed.
 //! * **The evidence comes first.** The plan puts finding and *reproducing* a
 //!   verifiable defect in the prospect's own booking flow before it puts
 //!   contacting anyone. An unreproduced finding is a false statement about
@@ -452,6 +460,17 @@ impl RolePack {
         vec![
             Task::new(
                 Stage::Research,
+                // A sentence naming `find_prospects` belongs here — "the named
+                // accounts are where to start and not the whole market" is the
+                // founder's instruction in the place the model reads it in
+                // order — and it is deliberately **not** here. `Charter::brief`
+                // renders this plan into `eval::cost::digest`, which pins the
+                // company that `RECORDED`'s three `--dry-run` passes measured;
+                // editing it makes a published bill stale while the row that
+                // says so still reads green. Add the sentence and re-paste
+                // `RECORDED` and `DIGEST` from a fresh `--dry-run 3`, together,
+                // as one change. Until then the tool's own catalogue entry is
+                // where the seller learns it exists, which is in every request.
                 format!(
                     "Research these {segment} accounts in {market}: {accounts}. For each, find \
                      where its booking or servicing flow tells a traveller about entry \

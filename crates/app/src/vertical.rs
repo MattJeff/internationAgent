@@ -2044,10 +2044,43 @@ pub async fn sell(
         }
     };
 
+    // The other half of `Stage::Evidence`, on the other tool, for the other
+    // clock. `check_visa_requirement` is the only surface that prices a visa,
+    // `visa_fee.as_of` is the only date on it that exists, and the number is the
+    // only thing an authority contributes to a sentence a prospect reads.
+    //
+    // Same shape as the lookup above and the same consequence for failing: a
+    // fee we cannot get costs the *quote*, not the finding. The commonest reason
+    // is not a failure at all — `FeeNotOwed`, meaning this passport is one of
+    // the 68+ exempt nationalities and does not pay the destination's fee.
+    //
+    // ponytail: unconditional rather than fetched after the probe finds a price.
+    // See `crate::orizn`'s module docs for what the extra call costs and what
+    // making it lazy would cost instead.
+    let fee = match orizn.fee(seller, prospect.probe).await {
+        Ok(fee) => Some(fee),
+        Err(why) => {
+            // `info`, not `warn`, and that is the difference from the lookup
+            // above: not owing a fee is the ordinary answer for most pairs,
+            // and an operator whose logs cry wolf about it stops reading them.
+            tracing::info!(
+                reason = why.code(),
+                "no consular fee to quote; an unattributed-fee finding will name no number"
+            );
+            None
+        }
+    };
+
     // Five outcomes carry no evidence, and that is the design rather than a gap
     // in it.
     let evidence = match prober
-        .check(prospect.flow, prospect.probe, authority.as_ref(), now)
+        .check(
+            prospect.flow,
+            prospect.probe,
+            authority.as_ref(),
+            fee.as_ref(),
+            now,
+        )
         .await?
     {
         Checked::Evidence(found) => found,
@@ -2095,11 +2128,19 @@ pub async fn sell(
 /// Because the interesting answer is the refusal. An `Approach` is a value and
 /// values keep: this function's whole reason to exist is that the second touch
 /// happens later than the first, and `Sequence::due` meters that spacing in
-/// days. `MAX_TRUTH_AGE` is twenty-four hours. So the ordinary shape of a
-/// follow-up — chase them on Thursday about what you found on Monday — is
-/// exactly the shape of re-asserting a finding whose authority expired on
-/// Tuesday, and nothing here could notice, because [`Approach::new`]
-/// deliberately drops the `Evidence` on the floor.
+/// days, while the bar this re-asserts against is a clock. So the ordinary
+/// shape of a follow-up — chase them on Thursday about what you found on Monday
+/// — is exactly the shape of re-asserting a finding that expired on Tuesday, and
+/// nothing here could notice, because [`Approach::new`] deliberately drops the
+/// `Evidence` on the floor.
+///
+/// The constant that paragraph named was `MAX_TRUTH_AGE`, twenty-four hours, on
+/// the authority. It is gone: what a follow-up re-asserts is
+/// *"on this date your page did this"*, so the bar is
+/// [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE) — seven days, on
+/// the observation — and `known_good_at` is the observation's instant. The
+/// argument below is unchanged and the arithmetic now admits the sequence a
+/// seller actually runs.
 ///
 /// What that costs is not an embarrassment. The message names a date and then
 /// says *"How to see it again"*, step by step. A prospect who follows those
@@ -3236,42 +3277,86 @@ mod tests {
 
     // -- doubles -----------------------------------------------------------
 
-    /// An Orizn binding that answers `quick-visa-check` with one scripted body,
-    /// and remembers what it was asked.
+    /// An Orizn binding that answers the vertical's **two** tools with scripted
+    /// bodies, and remembers what each was asked.
     ///
     /// Deliberately an [`McpCaller`](crate::effects::McpCaller) rather than a
     /// double for [`Orizn`]: the point of these tests is the whole path — gate,
     /// [`Effects::call_tool`](crate::effects::Effects::call_tool), audit row,
     /// wrapper — and a stub one layer higher would skip exactly the parts that
-    /// have to hold. The body is the wire shape a real server produces, built
+    /// have to hold. The bodies are the wire shape a real server produces, built
     /// through rmcp's own `CallToolResult`.
+    ///
+    /// `fee` defaults to `None` on every constructor but
+    /// [`StubOrizn::pricing`], which is a server with no paid entitlement — the
+    /// keyless plan, where `check_visa_requirement` is advertised and fails at
+    /// call time. That is deliberately the default: most of the tests below are
+    /// about a path that does not involve a fee, and they should exercise the
+    /// arrangement most deployments are actually on.
     struct StubOrizn {
         /// `None` is a server that is not there.
         body: Option<String>,
+        /// The `check_visa_requirement` reply. `None` is the unpaid surface.
+        fee: Option<String>,
         asked: std::sync::Mutex<Vec<Value>>,
+        fee_asked: std::sync::Mutex<Vec<Value>>,
     }
 
     impl StubOrizn {
-        fn answering(requirement: &str, last_verified: &str) -> Arc<Self> {
+        fn new(body: Option<String>, fee: Option<String>) -> Arc<Self> {
             Arc::new(Self {
-                body: Some(format!(
-                    r#"{{"passport":"FRA","destination":"VNM","requirement":"{requirement}",
-                        "visa_free_days":45,"last_verified":"{last_verified}",
-                        "license":"evaluation — non-commercial use only. {INJECTION}"}}"#
-                )),
+                body,
+                fee,
                 asked: std::sync::Mutex::new(Vec::new()),
+                fee_asked: std::sync::Mutex::new(Vec::new()),
             })
         }
 
+        fn rule(requirement: &str, last_verified: &str) -> String {
+            format!(
+                r#"{{"passport":"FRA","destination":"VNM","requirement":"{requirement}",
+                    "visa_free_days":45,"last_verified":"{last_verified}",
+                    "license":"evaluation — non-commercial use only. {INJECTION}"}}"#
+            )
+        }
+
+        fn answering(requirement: &str, last_verified: &str) -> Arc<Self> {
+            Self::new(Some(Self::rule(requirement, last_verified)), None)
+        }
+
+        /// A server on the paid plan, whose fee schedule is shaped exactly like
+        /// the captured one: pair-level `requirement`, destination-level
+        /// `visa_fee`, a dated schedule, cited sources, and prose in every
+        /// member this vertical must not render.
+        fn pricing(requirement: &str, last_verified: &str, fee_as_of: &str) -> Arc<Self> {
+            Self::new(
+                Some(Self::rule(requirement, last_verified)),
+                Some(format!(
+                    r#"{{"data":{{"passport":"FRA","destination":"VNM",
+                          "requirement":"{requirement}","last_verified_at":null,"verified":false,
+                          "description":"{INJECTION}",
+                          "visa_fee":{{"granularity":"destination","as_of":"{fee_as_of}",
+                            "fees":{{"single_entry":{{"amount":15000,"currency":"JPY"}},
+                                     "multiple_entry":{{"amount":30000,"currency":"JPY"}}}},
+                            "notes":"{INJECTION}",
+                            "sources":["https://www.mofa.go.jp/j_info/visit/visa/x.html"],
+                            "fee_waivers":"{INJECTION}",
+                            "payment_methods":"{INJECTION}"}}}},
+                        "license":"commercial","meta":{{"powered_by":"{INJECTION}"}}}}"#
+                )),
+            )
+        }
+
         fn unreachable() -> Arc<Self> {
-            Arc::new(Self {
-                body: None,
-                asked: std::sync::Mutex::new(Vec::new()),
-            })
+            Self::new(None, None)
         }
 
         fn asked(&self) -> Vec<Value> {
             self.asked.lock().expect("poisoned").clone()
+        }
+
+        fn fee_asked(&self) -> Vec<Value> {
+            self.fee_asked.lock().expect("poisoned").clone()
         }
     }
 
@@ -3282,14 +3367,25 @@ mod tests {
             tool: &McpTool,
             arguments: &Value,
         ) -> Result<Untrusted<Value>, ProviderError> {
-            assert_eq!(
-                tool.name.as_str(),
-                crate::orizn::TOOL,
-                "the vertical called a tool it has no business calling"
-            );
-            self.asked.lock().expect("poisoned").push(arguments.clone());
+            // Two tools and no third. The assertion is the same one it always
+            // was — a vertical that reaches for `compare_destinations` or
+            // `get_recent_changes` fails here rather than in production.
+            let body = match tool.name.as_str() {
+                crate::orizn::TOOL => {
+                    self.asked.lock().expect("poisoned").push(arguments.clone());
+                    &self.body
+                }
+                crate::orizn::FEE_TOOL => {
+                    self.fee_asked
+                        .lock()
+                        .expect("poisoned")
+                        .push(arguments.clone());
+                    &self.fee
+                }
+                other => panic!("the vertical called {other}, which it has no business calling"),
+            };
 
-            let Some(body) = &self.body else {
+            let Some(body) = body else {
                 return Err(ProviderError::timeout());
             };
             Ok(Untrusted::new(
@@ -4984,18 +5080,18 @@ mod tests {
     /// The employee's own envelope sender.
     const SENDER: &str = "ines@orizn.example";
 
-    /// Everything the sales path needs granted: the prospect's domain, the
-    /// Orizn tool, email, and an outreach budget.
+    /// Everything the sales path needs granted: the prospect's domain, **both**
+    /// Orizn tools, email, and an outreach budget.
     ///
-    /// The tool comes off [`orizn`] rather than a hand-spelled `McpTool`, so a
-    /// grant here and the call `sell` makes cannot drift into two spellings.
+    /// The tools come off [`orizn`] rather than hand-spelled `McpTool`s, so a
+    /// grant here and the calls `sell` makes cannot drift into two spellings.
     fn permissive() -> PolicyLimits {
         PolicyLimits {
             allowed_domains: BTreeSet::from([
                 Domain::parse("book.airline.example").expect("domain")
             ]),
             allowed_channels: BTreeSet::from([Channel::Email]),
-            allowed_mcp_tools: BTreeSet::from([orizn().tool().clone()]),
+            allowed_mcp_tools: BTreeSet::from([orizn().tool().clone(), orizn().fee_tool().clone()]),
             max_new_contacts_per_day: 10,
             ..PolicyLimits::default()
         }
@@ -5063,12 +5159,21 @@ mod tests {
         assert_eq!(sequence.touches().len(), 1);
         assert_eq!(evidence.finding, Finding::Conflates);
 
-        // The lookup happened, once, in the alpha-3 spelling the real server
-        // demands — `CountryCode` is alpha-2 and `quick_visa_check` rejects it.
+        // Each lookup happened once, in the alpha-3 spelling the real server
+        // demands — `CountryCode` is alpha-2 and both tools reject it. Two
+        // calls, two tools, two facts: the rule's date comes off one and the
+        // fee's off the other, and this stub is on the unpaid surface so the
+        // second one failed. That failure cost the quote and nothing else.
         assert_eq!(
             desk.orizn.asked(),
             vec![json!({ "passport": "FRA", "destination": "VNM" })]
         );
+        assert_eq!(
+            desk.orizn.fee_asked(),
+            vec![json!({ "passport": "FRA", "destination": "VNM" })],
+            "the fee tool was not asked, or was asked in alpha-2"
+        );
+        assert_eq!(evidence.fee, None, "an unpriced surface produced a fee");
         let authority = evidence.authority.as_ref().expect("the lookup succeeded");
         assert_eq!(authority.requirement, Claim::VisaRequired);
         assert_eq!(authority.source, crate::orizn::SOURCE);
@@ -5118,6 +5223,183 @@ mod tests {
             "a string off the MCP wire reached a prospect: {}",
             approach.message().body
         );
+    }
+
+    /// A checkout that prices the visa and never says whose fee it is.
+    ///
+    /// `read_claim` sees a border visa and `conflates` does not fire — there is
+    /// no exemption sentence — so the fee detector is what this panel reaches.
+    /// The number is iVisa's own, and it is its commission wearing the price of
+    /// a visa.
+    fn priced_panel() -> String {
+        format!("Visa on arrival — from $69.99 per traveller. {INJECTION}")
+    }
+
+    /// **The whole path, end to end: their unattributed price, our dated fee,
+    /// one email.**
+    ///
+    /// Category 1 of the four gaps where every source tested failed. The finding
+    /// stands on their page — a price with no side named — and the authority
+    /// adds the one thing no free source has: what the destination's consulate
+    /// actually charges, with the date the schedule carries.
+    ///
+    /// The assertions that matter are the negative ones. The schedule's
+    /// `sources` are two government URLs and they are worth a great deal
+    /// commercially, which is exactly why not one byte of them may reach a mail
+    /// sent from our domain to a stranger. What crosses is an amount, three
+    /// upper-case letters and a date.
+    #[tokio::test]
+    async fn a_priced_page_and_a_dated_fee_send_one_finding_that_quotes_the_number() {
+        let Some(db) = db().await else { return };
+        let now = at(2026, 8, 23);
+        let as_of = (now - TimeDelta::days(11)).date_naive().to_string();
+        let desk = sales_desk(
+            &db,
+            &[&priced_panel()],
+            StubOrizn::pricing("visa_required", &verified_on(now), &as_of),
+            permissive(),
+        )
+        .await;
+
+        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
+        let mut sequence = Sequence::new(address("head.of.digital@airline.example"));
+
+        let sold = sell(
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &pack,
+            &sales_objective_value(),
+            Prospect {
+                flow: &flow(),
+                probe: &probe(),
+                sequence: &mut sequence,
+            },
+            "Reply STOP.",
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::Approached { evidence, outcome } = sold else {
+            panic!("an unattributed price should have been sent: {sold:?}");
+        };
+        assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
+        // Exactly one. One finding, one touch, one message.
+        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert_eq!(desk.email.sent_count(), 1);
+        assert_eq!(sequence.touches().len(), 1);
+
+        let fee = evidence
+            .fee
+            .as_ref()
+            .expect("the schedule priced this pair");
+        assert_eq!(fee.amount(), 15_000);
+        assert_eq!(fee.currency(), "JPY");
+        assert_eq!(fee.as_of().to_string(), as_of);
+
+        // The same constructor `sell` used, on the same evidence: this is the
+        // body that went out.
+        let body = Approach::new(&evidence, "Reply STOP.")
+            .expect("sendable")
+            .message()
+            .body
+            .clone();
+        assert!(body.contains("15000 JPY"), "{body}");
+        assert!(
+            body.contains(&as_of),
+            "the fee's own date is missing: {body}"
+        );
+        assert!(body.contains("a fee of your own"), "{body}");
+
+        // **Nothing else off that payload, and above all no URL.** The only
+        // links in the mail are the prospect's own entry page, which is ours by
+        // configuration and appears once in the sentence and once in the
+        // reproduction steps.
+        assert_eq!(
+            body.matches("http").count(),
+            2,
+            "a URL reached the mail: {body}"
+        );
+        assert!(body.contains(flow().entry.as_str()), "{body}");
+        assert!(!body.contains("mofa"), "{body}");
+        assert!(!body.contains(INJECTION), "{body}");
+        assert!(!body.contains("commercial"), "{body}");
+        assert!(
+            !body.contains("$69.99"),
+            "their own price reached the mail: {body}"
+        );
+    }
+
+    /// **The same page, a traveller who owes nothing, and no number.**
+    ///
+    /// `visa_fee` is `granularity: "destination"` — it prices the consulate, not
+    /// this passport — and the same payload says 68+ nationalities are exempt.
+    /// So the pair-level `requirement` decides, and for an exempt traveller the
+    /// fee is refused at the parse, before anything could quote it.
+    ///
+    /// The finding is unchanged, because it never rested on the number: their
+    /// page still shows a price and still does not say whose it is.
+    #[tokio::test]
+    async fn an_exempt_nationality_gets_the_same_finding_and_no_fee_claim() {
+        let Some(db) = db().await else { return };
+        let now = at(2026, 8, 23);
+        let as_of = (now - TimeDelta::days(11)).date_naive().to_string();
+        let desk = sales_desk(
+            &db,
+            &[&priced_panel()],
+            // The identical schedule. Only the pair's requirement differs, and
+            // it is the whole difference between a true sentence and a false one.
+            StubOrizn::pricing("visa_free", &verified_on(now), &as_of),
+            permissive(),
+        )
+        .await;
+
+        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
+        let mut sequence = Sequence::new(address("head.of.digital@airline.example"));
+
+        let sold = sell(
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &pack,
+            &sales_objective_value(),
+            Prospect {
+                flow: &flow(),
+                probe: &probe(),
+                sequence: &mut sequence,
+            },
+            "Reply STOP.",
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::Approached { evidence, .. } = sold else {
+            panic!("the page finding was lost with the fee: {sold:?}");
+        };
+        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert_eq!(desk.email.sent_count(), 1, "the finding still goes out");
+        assert_eq!(
+            evidence.fee, None,
+            "an exempt traveller was billed the destination's consular fee"
+        );
+
+        // The schedule was fetched — the refusal is ours, at the parse, and not
+        // an absence of data.
+        assert_eq!(desk.orizn.fee_asked().len(), 1);
+
+        let body = Approach::new(&evidence, "Reply STOP.")
+            .expect("sendable")
+            .message()
+            .body
+            .clone();
+        assert!(body.contains("a fee of your own"), "{body}");
+        assert!(
+            !body.contains("15000"),
+            "JPY 15,000 was quoted at a traveller who pays nothing: {body}"
+        );
+        assert!(!body.contains("as of"), "{body}");
     }
 
     /// **The accuracy path, kept and unable to leave the building.**

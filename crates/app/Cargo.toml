@@ -37,8 +37,16 @@ url.workspace = true
 uuid.workspace = true
 
 [features]
-# `tests/orizn.rs`'s one live test: it starts a stdio→HTTP MCP bridge in front of
-# the real `orizn-visa-mcp` server and dials it through `mcp::McpServer::bind`.
+# `tests/orizn.rs`'s live tests: they start a stdio→HTTP MCP bridge in front of
+# the real `orizn-visa-mcp` server and dial it through `mcp::McpServer::bind`.
+#
+# One of them, `the_keyed_tool_prices_a_visa_…`, also needs **`ORIZN_API_KEY` in
+# the environment**. `check_visa_requirement` is advertised keyless and fails at
+# call time, and the hosted HTTP endpoint ignores the key in every header form —
+# the key works on the stdio package, which is what the bridge wraps and what
+# `supergateway` inherits this process's environment for. So the bridge is not
+# an operator's convenience for that tool; it is the only path to it. The test
+# asserts the variable is *set* and never reads or prints its value.
 #
 # A feature and not a runtime skip, and the difference is `scripts/test.sh`. That
 # script fails the build when a test prints `SKIP:` — because ~34 tests in this

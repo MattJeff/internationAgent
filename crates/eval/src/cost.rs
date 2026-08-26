@@ -217,24 +217,24 @@ impl Sample {
 pub const RECORDED: &[Sample] = &[
     Sample {
         calls_per_turn: 4.33,
-        input_tokens_per_call: 3661.4,
-        output_tokens_per_call: 231.6,
+        input_tokens_per_call: 4263.6,
+        output_tokens_per_call: 365.0,
     },
     Sample {
-        calls_per_turn: 4.67,
-        input_tokens_per_call: 3794.6,
-        output_tokens_per_call: 162.4,
+        calls_per_turn: 2.00,
+        input_tokens_per_call: 4445.8,
+        output_tokens_per_call: 762.8,
     },
     Sample {
-        calls_per_turn: 2.33,
-        input_tokens_per_call: 4882.1,
-        output_tokens_per_call: 601.6,
+        calls_per_turn: 2.00,
+        input_tokens_per_call: 4306.2,
+        output_tokens_per_call: 770.3,
     },
 ];
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "26a6b978379873b4";
+pub const DIGEST: &str = "2f88cffd841173b0";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
@@ -562,6 +562,21 @@ const PIN_IDENTITY: &str = "You are seat, an AI employee of Orizn. Your address 
 /// looking fresh while every figure it feeds was about a company that no longer
 /// exists.
 ///
+/// # Why the tool schemas are in here now
+///
+/// They were not, and it cost a published figure its truth. `turn::catalogue`'s
+/// `kind` field gained a description — roughly six hundred characters sent on
+/// every turn of every seat — and this digest did not move, so [`RECORDED`]
+/// went on certifying a bill measured against a shorter prompt. The schemas are
+/// not adjacent to the cost; on the `--dry-run` path the CLI shim renders them
+/// *into* the prompt, and on the metered path they are input tokens either way.
+///
+/// A tool is also the thing a seat can be given more of. Adding a seventh
+/// raises input tokens on every call this file prices, and before this it did
+/// so invisibly — which is the failure a colleague hit from the other side,
+/// wanting to name a new tool in a charter's plan and finding that only the
+/// *sentence about it* moved the pin, never the tool.
+///
 /// # What it still does not cover
 ///
 /// The colleague roster and the employee's own address, both of which come out
@@ -583,8 +598,19 @@ pub fn digest() -> String {
         hasher.update(charter.role().as_bytes());
         hasher.update(charter.model().as_str().as_bytes());
         let prompt = charter.system_prompt(PIN_IDENTITY);
-        hasher.update(prompt.render(TrustLabel::Trusted).as_bytes());
-        hasher.update(prompt.render(TrustLabel::Untrusted).as_bytes());
+        for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
+            // The request rather than the prefix: what this file prices is
+            // tokens, and a tool schema is tokens. `max_tokens` is a ceiling on
+            // the *reply* and never reaches the wire as prompt, so any value
+            // does — it is not hashed.
+            let request = prompt.request(charter.model().as_str(), 1, trust, Vec::new());
+            hasher.update(request.system.as_bytes());
+            for tool in &request.tools {
+                hasher.update(tool.name.as_bytes());
+                hasher.update(tool.description.as_bytes());
+                hasher.update(tool.input_schema.to_string().as_bytes());
+            }
+        }
         hasher.update(charter.brief().as_bytes());
     }
     // The seeded prospect, for [`Prospect`]'s reason: with no prospect the

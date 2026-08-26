@@ -1,4 +1,6 @@
 /target
 .env
-.claude/
+# A live Orizn API key. `.env` did not cover it and `git status` listed it as
+# untracked, one `git add .` away from being published.
 .orizn.env
+.claude/

@@ -205,6 +205,22 @@
 //! [`Answer::retrieved_at`] carries the argument about *whose* clock
 //! [`MAX_AUTHORITY_AGE`] is measured against, and it is not ours.
 //!
+//! ## And one authority value that does leave the building
+//!
+//! [`ConsularFee`] is the exception to the paragraph above and the only one:
+//! the destination's own price for one entry, which is category 1 of the four
+//! and the one number no free source has. It is a **separate** value from an
+//! [`Answer`] because it is dated by a separate field on a separate tool
+//! (`check_visa_requirement`'s `visa_fee.as_of`, where `last_verified_at` is
+//! `null` for every pair), it is gated by a separate constant
+//! ([`MAX_FEE_AGE`], ninety days rather than a year), and a stale one costs the
+//! quote rather than the check. Three clocks, three constants, and each measures
+//! exactly one thing.
+//!
+//! It never decides a finding. [`verdict`] does not see it; it is appended to
+//! the [`Finding::UnattributedFee`] sentence by [`Evidence::claim_line`] when
+//! there is one, and the sentence is the same sentence without it.
+//!
 //! # What the page says is [`Untrusted`], always
 //!
 //! The panel text is the *subject* of the investigation. It is never an
@@ -398,6 +414,45 @@ pub const MAX_FINDING_AGE: TimeDelta = TimeDelta::days(7);
 /// because they measure two different clocks. Make either configurable when an
 /// operator asks, not before.
 pub const MAX_AUTHORITY_AGE: TimeDelta = TimeDelta::days(365);
+
+/// How old a [`ConsularFee`] may be and still be **quoted at a prospect**.
+///
+/// A third clock, and it is a third constant for the reason the note on
+/// [`MAX_AUTHORITY_AGE`] gives: it measures a third thing. [`MAX_FINDING_AGE`]
+/// dates our look at their page. `MAX_AUTHORITY_AGE` dates the authority's
+/// *rule*, and it is long because nothing resting on it is ever asserted. This
+/// one dates the authority's *fee schedule*, and a number off it goes into an
+/// email — so it is the one authority clock guarding something that leaves the
+/// building, and it cannot borrow either of the other two.
+///
+/// # Ninety days, derived from how a fee actually moves
+///
+/// Two observations, both from the payload this bar exists for. Japan raised its
+/// consular fee by Cabinet Order revised **19 June 2026**, effective **1 July** —
+/// twelve days' notice, on a schedule that had not moved since 1978. Orizn's row
+/// for Japan carries `as_of: 2026-08-12`, forty-two days after the change. So
+/// the observed lag from a real fee change to a corrected row on this surface is
+/// about six weeks, and it is a *curation* lag rather than a publication one: the
+/// government published on time.
+///
+/// A quarter is that lag doubled. It admits a schedule curated one revision
+/// behind and refuses one curated two behind, which is the only distinction a
+/// bar on this clock can honestly make. Anything near
+/// [`MAX_AUTHORITY_AGE`] would be indefensible on the same evidence: the
+/// Schengen fee moved EUR 80 → 90 on **11 June 2026**, so a schedule dated
+/// 2026-05-27 is already wrong about it, and a year-long bar would have quoted
+/// that number until next spring.
+///
+/// # What it costs on the first day it exists
+///
+/// Thirteen of the fifteen destinations sampled on 2026-08-26 carry
+/// `as_of: 2026-05-27` — one bulk curation date, ninety-one days old, one day
+/// outside this bar. So today it refuses nearly the whole dataset and admits
+/// Japan, which is also the only destination that carries `sources`. That is the
+/// bar working rather than a bug in it, exactly as the old twenty-four-hour
+/// authority bar refusing every keyless answer was, and it is a fact about how
+/// much of the fee data is hand-curated rather than about this code.
+pub const MAX_FEE_AGE: TimeDelta = TimeDelta::days(90);
 
 // ---------------------------------------------------------------------------
 // A read-only browse
@@ -598,10 +653,15 @@ fn read_claim(text: &Untrusted<String>) -> Seen {
 /// Nobody publishes official consular fees. iVisa shows "from $69.99", which is
 /// its own commission presented as the price of the visa, and a traveller
 /// reading it has no way to know that. So the observable property is not "the
-/// number is wrong" — we have no number to compare it to, and
-/// `quick_visa_check` does not carry one. It is **a price with no side named**:
-/// the panel puts money on the screen and never says whether it goes to the
-/// destination's consulate or to the prospect.
+/// number is wrong" — even with a [`ConsularFee`] in hand we do not know whether
+/// theirs is meant to be the same number, because they have not said what it is
+/// a number *for*. It is **a price with no side named**: the panel puts money on
+/// the screen and never says whether it goes to the destination's consulate or
+/// to the prospect.
+///
+/// That is why the authority stays out of this function and out of [`verdict`]'s
+/// branch for it. The fee is a thing the *message* may add — see
+/// [`Evidence::claim_line`] — and never a thing the finding depends on.
 ///
 /// That is a claim about their page and nothing else, which is what makes it
 /// sendable. A hostile prospect's reply is "it is in our terms" or "everyone
@@ -1168,6 +1228,109 @@ impl Answer {
     }
 }
 
+/// **What the destination's own consulate charges for one entry, and when the
+/// authority last said so.**
+///
+/// The number nobody publishes — category 1, the first of the four gaps where
+/// every source tested failed. iVisa shows "from $69.99", which is its own
+/// commission wearing the price of a visa; the official schedule behind it is
+/// not on any of the four sources and is not on the free one either. So this is
+/// the one value in this vertical that a prospect cannot rebut by opening
+/// Wikipedia, and it is the *only* thing an authority contributes to a sendable
+/// sentence.
+///
+/// # It is not an [`Answer`], and welding it onto one would be a bug
+///
+/// They date different facts. `Answer::retrieved_at` comes from
+/// `quick_visa_check`'s `last_verified`, which dates **the rule for this
+/// passport**. This comes from `check_visa_requirement`'s `visa_fee.as_of`,
+/// which dates **the destination's fee schedule** — and on that tool
+/// `last_verified_at` is `null` for every pair, so there is no rule date there
+/// at all. Stamping a fee's date onto an `Answer` would date an undated rule
+/// with a schedule's clock and make every accuracy finding available again on a
+/// provenance it does not have.
+///
+/// The practical half matters as much: [`Prober::check`]'s inner `run` abandons
+/// the whole check on an unusable `Answer` ([`Checked::TruthStale`]). A stale
+/// *fee* must cost
+/// the number and not the finding — the sentence about their page stands on its
+/// own — so it cannot ride on a value whose staleness ends the check.
+///
+/// # Three values, and every one of them is bounded
+///
+/// This reaches an outbound email, which is why the fields are private and
+/// [`ConsularFee::new`] is the only way to one. `amount` is a number and
+/// `as_of` is a date, so neither is a slot. `currency` is the only string, and
+/// it is admitted only as **three upper-case ASCII letters** — an alphabet of
+/// 17,576 values, none of which is a sentence. Everything else on the wire,
+/// including the schedule's prose `notes` and its `sources` URLs, stays off this
+/// struct: see [`crate::orizn::read_fee`] for what is dropped and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsularFee {
+    amount: u64,
+    currency: String,
+    as_of: NaiveDate,
+}
+
+impl ConsularFee {
+    /// The only constructor.
+    ///
+    /// `None` for a currency that is not three upper-case ASCII letters, and for
+    /// a zero amount — which the schedules spell for genuinely free categories
+    /// (`schengen_child_under_6`) and is indistinguishable from an unset field.
+    /// "This costs nothing" is a strong sentence and it may not be said by
+    /// accident.
+    ///
+    /// ponytail: three letters, not an ISO 4217 table. The table is 180 rows to
+    /// stop a value that is already incapable of carrying a sentence, and a code
+    /// that is well-formed but wrong is a data error rather than an injection —
+    /// `MAX_FEE_AGE` and the `sources` gate in [`crate::orizn::read_fee`] are
+    /// what stand between us and that. Add the table the day a rendered
+    /// currency has to be resolved to a symbol.
+    pub fn new(amount: u64, currency: &str, as_of: NaiveDate) -> Option<Self> {
+        let well_formed = currency.len() == 3 && currency.bytes().all(|b| b.is_ascii_uppercase());
+        (well_formed && amount != 0).then(|| Self {
+            amount,
+            currency: currency.to_owned(),
+            as_of,
+        })
+    }
+
+    /// What one entry costs, in whole units of [`ConsularFee::currency`].
+    pub const fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    /// ISO 4217, three upper-case ASCII letters by construction.
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    /// The date the authority's fee schedule carries.
+    pub const fn as_of(&self) -> NaiveDate {
+        self.as_of
+    }
+
+    /// Whether this fee may be quoted at `now`.
+    ///
+    /// [`MAX_FEE_AGE`], and the future branch refuses for the same reason
+    /// [`Answer::usable_at`]'s does. `as_of` is a **date**, so it is read as the
+    /// start of that day: reading it as the end would borrow up to a day of
+    /// freshness the authority never asserted, the same argument
+    /// [`crate::orizn::read_answer`] makes about `last_verified`.
+    pub fn usable_at(&self, now: DateTime<Utc>) -> bool {
+        // Midnight exists on every date; the fallback is unreachable and yields
+        // the epoch, which reads as maximally stale rather than as fresh.
+        let from = self
+            .as_of
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default()
+            .and_utc();
+        let age = now.signed_duration_since(from);
+        age <= MAX_FEE_AGE && age >= TimeDelta::zero()
+    }
+}
+
 /// How long the correct rule has been the correct rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleAge {
@@ -1287,10 +1450,18 @@ pub enum Finding {
     SaysNothing,
     /// The flow prices the visa and never says whose fee it is — category 1.
     ///
-    /// No fields: there is no correct number to carry, because nobody publishes
-    /// official consular fees and `quick_visa_check` does not answer them. The
-    /// finding is the *absence of an attribution*, and the panel text on the
-    /// [`Evidence`] is the whole exhibit.
+    /// No fields, and the finding is still the *absence of an attribution*: it
+    /// is decided from the panel alone, by [`verdict`], with no authority in the
+    /// room. That is what makes it sendable, and it is why the correct number is
+    /// **not** a field here — a variant carrying one would be a finding that
+    /// needs an authority to exist.
+    ///
+    /// The number is [`Evidence::fee`], beside the finding rather than in it.
+    /// `check_visa_requirement` does answer it — the keyed tool, the one field
+    /// on it that carries its own date — and [`Evidence::claim_line`] appends it
+    /// when there is one this traveller would actually pay. Without one the
+    /// sentence is exactly what it was, and the panel text on the [`Evidence`]
+    /// is the whole exhibit.
     UnattributedFee,
     /// The flow states an exemption and a border visa for the same trip —
     /// category 3.
@@ -1414,6 +1585,18 @@ pub struct Evidence {
     /// which is every [`Finding::stands_on_their_page`] finding, and is the
     /// ordinary case on Orizn's keyless surface.
     pub authority: Option<Answer>,
+    /// The destination's own consular fee for one entry, when the authority
+    /// prices one this traveller would actually pay and dates it inside
+    /// [`MAX_FEE_AGE`].
+    ///
+    /// The only authority value that reaches a *sendable* sentence, and it is
+    /// beside [`Evidence::authority`] rather than on it because the two are
+    /// dated by different fields on different tools — see [`ConsularFee`].
+    ///
+    /// `None` is the ordinary case and costs nothing: the
+    /// [`Finding::UnattributedFee`] sentence is about their page not naming a
+    /// side, and it stands whether or not we can say what the real number is.
+    pub fee: Option<ConsularFee>,
     /// How long the correct rule has been in force.
     pub rule_age: RuleAge,
     /// When the observation was made.
@@ -1468,10 +1651,30 @@ impl Evidence {
                 "On {when}, {prospect} at {entry} showed nothing about entry requirements for \
                  {who}."
             ),
-            Finding::UnattributedFee => format!(
-                "On {when}, {prospect} at {entry} showed {who} a price for the visa without saying \
-                 whether it is the consular fee set by the destination or a fee of your own."
-            ),
+            // The one sendable sentence an authority may add to. The first half
+            // is about their page and stands alone; the second is the number
+            // nobody publishes, and it is appended only when there is a fee this
+            // traveller would actually pay, dated inside `MAX_FEE_AGE`. Three
+            // bounded values — a `u64`, three upper-case letters and a date —
+            // and no URL: see `crate::orizn::read_fee` for why the authority's
+            // own `sources` gate this sentence without appearing in it.
+            Finding::UnattributedFee => {
+                let mut line = format!(
+                    "On {when}, {prospect} at {entry} showed {who} a price for the visa without \
+                     saying whether it is the consular fee set by the destination or a fee of \
+                     your own."
+                );
+                if let Some(fee) = &self.fee {
+                    line.push_str(&format!(
+                        " The single-entry consular fee set by {} is {} {}, as of {}.",
+                        self.probe.destination,
+                        fee.amount(),
+                        fee.currency(),
+                        fee.as_of()
+                    ));
+                }
+                line
+            }
             Finding::Conflates => format!(
                 "On {when}, {prospect} at {entry} told {who} both that no visa is required and \
                  that a visa is issued on arrival. Those are different regimes: a visa issued at \
@@ -1865,14 +2068,20 @@ impl Prober {
     /// not in [`Prober::run`]: one place that every path leaves through, rather
     /// than a `record` call next to each of the eight `return`s, one of which
     /// somebody eventually forgets.
+    ///
+    /// `fee` is the other half of what the authority contributes and it is a
+    /// separate argument for the reason [`ConsularFee`] gives: it is dated by a
+    /// different field on a different tool, and a stale one may not end the
+    /// check the way a stale [`Answer`] does.
     pub async fn check(
         &self,
         flow: &Flow,
         probe: &Probe,
         authority: Option<&Answer>,
+        fee: Option<&ConsularFee>,
         now: DateTime<Utc>,
     ) -> Result<Checked, ProbeError> {
-        let outcome = self.run(flow, probe, authority, now).await;
+        let outcome = self.run(flow, probe, authority, fee, now).await;
 
         // "error" is not a `Checked`, because a check that never reached an
         // outcome did not reach one. It is still an attempt, and an attempt
@@ -1913,6 +2122,7 @@ impl Prober {
         flow: &Flow,
         probe: &Probe,
         authority: Option<&Answer>,
+        fee: Option<&ConsularFee>,
         now: DateTime<Utc>,
     ) -> Result<Checked, ProbeError> {
         // An answer we were given and cannot use is refused first, so it costs
@@ -1926,6 +2136,14 @@ impl Prober {
         if authority.is_some_and(|answer| !answer.usable_at(now)) {
             return Ok(Checked::TruthStale);
         }
+
+        // **The fee's bar, and it is the choke point rather than one of two.**
+        // `Evidence` is sealed and built here, `claim_line` is the only thing
+        // that renders a fee, so a number that survives this line is the only
+        // number that can reach an email. Not a `TruthStale` return: a stale
+        // schedule costs the quote and not the finding, because the sentence
+        // about their page never needed it.
+        let fee = fee.filter(|fee| fee.usable_at(now));
 
         let plan = Plan::for_probe(flow, probe);
 
@@ -1954,6 +2172,7 @@ impl Prober {
             finding,
             observed: second,
             authority: authority.cloned(),
+            fee: fee.cloned(),
             rule_age: RuleAge::between(authority.and_then(|a| a.effective_from), now),
             observed_at: now,
             steps: reproduction(&plan, &flow.panel),
@@ -2398,7 +2617,7 @@ mod tests {
 
         let checked = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("the domain is on the allowlist");
 
@@ -2470,7 +2689,7 @@ mod tests {
 
         let checked = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         let evidence = checked.evidence().expect("a discrepancy");
@@ -2490,7 +2709,7 @@ mod tests {
 
         let checked = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         let evidence = checked
@@ -2538,7 +2757,7 @@ mod tests {
         .await;
         let evidence = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed")
             .evidence()
@@ -2566,7 +2785,7 @@ mod tests {
         .await;
         let checked = honest
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         assert_ne!(
@@ -2574,6 +2793,256 @@ mod tests {
             Some(Finding::UnattributedFee),
             "an attributed fee became a fee finding"
         );
+    }
+
+    /// Japan's schedule as `check_visa_requirement` prices it, dated the day the
+    /// authority says.
+    fn fee(as_of: NaiveDate) -> ConsularFee {
+        ConsularFee::new(15_000, "JPY", as_of).expect("a well-formed fee")
+    }
+
+    /// **The number nobody publishes, in the one sentence that may carry it.**
+    ///
+    /// Their page shows a price and never says whose it is — that is the whole
+    /// finding, and it is decided without an authority. What the authority adds
+    /// is the destination's own single-entry consular fee, which is category 1
+    /// of the four gaps and the one value a prospect cannot rebut with a free
+    /// source.
+    ///
+    /// Three bounded values reach the sentence: a `u64`, three upper-case
+    /// letters, and a date. No URL, and the assertions below are what say so.
+    #[tokio::test]
+    async fn a_dated_fee_is_quoted_in_the_sentence_and_its_sources_are_not() {
+        let Some(db) = db().await else { return };
+
+        let h = harness(
+            &db,
+            &[&format!(
+                "Visa on arrival — from $69.99 per traveller. {INJECTION}"
+            )],
+            limits(),
+        )
+        .await;
+        let evidence = h
+            .prober
+            .check(
+                &flow(),
+                &probe(),
+                Some(&authority()),
+                Some(&fee(now().date_naive() - TimeDelta::days(14))),
+                now(),
+            )
+            .await
+            .expect("allowed")
+            .evidence()
+            .expect("an unattributed price is still a finding")
+            .clone();
+
+        // Exactly one finding, and it is the categorical one that may be sent.
+        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert!(evidence.finding.stands_on_their_page());
+
+        let line = evidence.claim_line();
+        // The first half is unchanged and stands on its own.
+        assert!(line.contains("a fee of your own"), "{line}");
+        // The second half is the authority's, and it is exactly three values —
+        // spelled out in full, so a fourth one appearing there is a diff.
+        let dated = now().date_naive() - TimeDelta::days(14);
+        assert!(
+            line.ends_with(&format!(
+                " The single-entry consular fee set by VN is 15000 JPY, as of {dated}."
+            )),
+            "the fee sentence is not the three bounded values: {line}"
+        );
+        // The only URL in it is the prospect's own entry page, which is ours by
+        // configuration. Nothing from the schedule, and nothing from their page.
+        assert_eq!(line.matches("http").count(), 1, "{line}");
+        assert!(line.contains(flow().entry.as_str()), "{line}");
+        assert!(!line.contains(INJECTION), "{line}");
+        assert!(!line.contains("orizn:"), "{line}");
+    }
+
+    /// **`granularity: "destination"`, asserted at the far end.**
+    ///
+    /// The same page, and a traveller who is exempt. The fee schedule prices the
+    /// destination's consulate; the exempt traveller pays it nothing, and the
+    /// same payload's `fee_waivers` says so for 68+ nationalities. Quoting
+    /// JPY 15,000 at them would be a false statement to a prospect whose business
+    /// is knowing that.
+    ///
+    /// The decision is made where the payload is read —
+    /// [`crate::orizn::read_fee`] returns
+    /// [`TruthError::FeeNotOwed`](crate::orizn::TruthError::FeeNotOwed) for
+    /// every requirement but `visa_required`, so nothing arrives here at all.
+    /// This is the assertion that the *consequence* is the right one: the
+    /// finding still stands, because it never needed the number.
+    #[tokio::test]
+    async fn an_exempt_traveller_gets_the_finding_and_no_number() {
+        let Some(db) = db().await else { return };
+
+        let h = harness(
+            &db,
+            &[&format!(
+                "Visa on arrival — from $69.99 per traveller. {INJECTION}"
+            )],
+            limits(),
+        )
+        .await;
+        let evidence = h
+            .prober
+            .check(&flow(), &probe(), Some(&exempt_for_90_days()), None, now())
+            .await
+            .expect("allowed")
+            .evidence()
+            .expect("the finding stands without a fee")
+            .clone();
+
+        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert_eq!(evidence.fee, None);
+
+        let line = evidence.claim_line();
+        assert!(
+            line.ends_with("or a fee of your own."),
+            "a number was quoted at a traveller who does not owe one: {line}"
+        );
+        assert!(!line.contains("15000"), "{line}");
+        assert!(!line.contains("as of"), "{line}");
+    }
+
+    /// **`MAX_FEE_AGE`, at the one choke point that can enforce it.**
+    ///
+    /// A schedule older than the bar costs the *quote* and not the finding —
+    /// which is the difference between this bar and [`MAX_AUTHORITY_AGE`], where
+    /// an unusable answer ends the check with [`Checked::TruthStale`]. The
+    /// sentence about their page never needed the number, so losing it is not a
+    /// reason to lose the sentence.
+    ///
+    /// Ninety-one days is the case that made the bar concrete: it is the age of
+    /// the bulk `as_of: 2026-05-27` row that thirteen of fifteen sampled
+    /// destinations carry, one day outside.
+    #[tokio::test]
+    async fn a_fee_older_than_the_bar_is_not_quoted_and_does_not_cost_the_finding() {
+        let Some(db) = db().await else { return };
+
+        let h = harness(
+            &db,
+            &[&format!(
+                "Visa on arrival — from $69.99 per traveller. {INJECTION}"
+            )],
+            limits(),
+        )
+        .await;
+
+        for (label, as_of) in [
+            (
+                "one day past the bar",
+                now().date_naive() - TimeDelta::days(91),
+            ),
+            ("dated tomorrow", now().date_naive() + TimeDelta::days(1)),
+        ] {
+            let evidence = h
+                .prober
+                .check(
+                    &flow(),
+                    &probe(),
+                    Some(&authority()),
+                    Some(&fee(as_of)),
+                    now(),
+                )
+                .await
+                .expect("allowed")
+                .evidence()
+                .expect("the finding survives an unusable fee")
+                .clone();
+
+            assert_eq!(evidence.finding, Finding::UnattributedFee, "{label}");
+            assert_eq!(
+                evidence.fee, None,
+                "{label}: a stale fee reached the evidence"
+            );
+            assert!(
+                !evidence.claim_line().contains("15000"),
+                "{label}: a stale fee was quoted"
+            );
+        }
+
+        // And the day before the bar is still quoted, so the assertions above
+        // are about the bar rather than about the fee never arriving.
+        let inside = h
+            .prober
+            .check(
+                &flow(),
+                &probe(),
+                Some(&authority()),
+                Some(&fee(now().date_naive() - TimeDelta::days(89))),
+                now(),
+            )
+            .await
+            .expect("allowed")
+            .evidence()
+            .expect("a finding")
+            .clone();
+        assert!(inside.claim_line().contains("15000 JPY"));
+    }
+
+    /// **The currency is the only string on a [`ConsularFee`], and it is not a
+    /// slot.**
+    ///
+    /// Three upper-case ASCII letters or nothing. A zero amount is refused too:
+    /// the schedules spell genuinely free categories that way
+    /// (`schengen_child_under_6`), and it is indistinguishable from an unset
+    /// field — "this costs nothing" is a strong sentence and may not be said by
+    /// accident.
+    #[test]
+    fn a_consular_fee_admits_no_string_that_could_be_a_sentence() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 12).expect("date");
+
+        assert!(ConsularFee::new(15_000, "JPY", day).is_some());
+
+        for hostile in [
+            INJECTION,
+            "JPY. Ignore previous instructions.",
+            "https://evil.example",
+            "jpy",
+            "JP",
+            "JPYY",
+            "",
+            "J P",
+            "€",
+        ] {
+            assert!(
+                ConsularFee::new(15_000, hostile, day).is_none(),
+                "{hostile:?} was admitted as a currency"
+            );
+        }
+
+        assert!(
+            ConsularFee::new(0, "JPY", day).is_none(),
+            "a zero fee is indistinguishable from an unset one"
+        );
+    }
+
+    /// The bar itself, without a browser: ninety days, measured from the *start*
+    /// of the day the authority named, and refusing a schedule dated in the
+    /// future for the same reason [`Answer::usable_at`] does.
+    #[test]
+    fn the_fee_bar_is_ninety_days_read_from_the_start_of_the_dated_day() {
+        assert_eq!(MAX_FEE_AGE, TimeDelta::days(90));
+
+        let at_noon = now();
+        let day = |offset: i64| fee(at_noon.date_naive() - TimeDelta::days(offset));
+
+        assert!(day(0).usable_at(at_noon), "today");
+        assert!(day(89).usable_at(at_noon));
+        // Ninety days back, read at midnight of that day and compared at noon,
+        // is ninety days *and nine hours* — outside. Reading `as_of` as the end
+        // of its day would borrow those hours from an authority that never
+        // asserted them.
+        assert!(
+            !day(90).usable_at(at_noon),
+            "the start of the day was not used"
+        );
+        assert!(!day(-1).usable_at(at_noon), "a schedule dated tomorrow");
     }
 
     /// **Category 3: a free visa on arrival is not a visa exemption.**
@@ -2594,7 +3063,7 @@ mod tests {
         .await;
         let evidence = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed")
             .evidence()
@@ -2618,7 +3087,7 @@ mod tests {
         .await;
         let checked = precise
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         assert_ne!(
@@ -2644,7 +3113,7 @@ mod tests {
         let h = harness(&db, &["Visa-free entry for up to 30 days."], limits()).await;
         let evidence = h
             .prober
-            .check(&flow(), &probe(), Some(&exempt_for_90_days()), now())
+            .check(&flow(), &probe(), Some(&exempt_for_90_days()), None, now())
             .await
             .expect("allowed")
             .evidence()
@@ -2670,7 +3139,7 @@ mod tests {
         assert_eq!(
             right
                 .prober
-                .check(&flow(), &probe(), Some(&exempt_for_90_days()), now())
+                .check(&flow(), &probe(), Some(&exempt_for_90_days()), None, now())
                 .await
                 .expect("allowed"),
             Checked::Agrees
@@ -2703,7 +3172,7 @@ mod tests {
         };
         assert_eq!(
             h.prober
-                .check(&flow(), &probe(), Some(&tolerated), now())
+                .check(&flow(), &probe(), Some(&tolerated), None, now())
                 .await
                 .expect("allowed"),
             Checked::Agrees,
@@ -2739,7 +3208,7 @@ mod tests {
             let h = harness(&db, &[panel], limits()).await;
             let checked = h
                 .prober
-                .check(&flow(), &probe(), None, now())
+                .check(&flow(), &probe(), None, None, now())
                 .await
                 .expect("allowed");
             assert_eq!(
@@ -2833,7 +3302,7 @@ mod tests {
 
         let checked = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -2882,7 +3351,7 @@ mod tests {
         .await;
         let blocked = challenged
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -2890,7 +3359,7 @@ mod tests {
         let split = harness(&db, &["No visa required.", "A visa is required."], limits()).await;
         let disagreed = split
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -2952,7 +3421,7 @@ mod tests {
             let h = harness(&db, panel, limits()).await;
             let checked = h
                 .prober
-                .check(&flow(), &probe(), Some(&authority()), now())
+                .check(&flow(), &probe(), Some(&authority()), None, now())
                 .await
                 .expect("allowed");
 
@@ -2983,7 +3452,7 @@ mod tests {
         // Same employee throughout: the row is per attempt, not per prober.
         let h = harness(&db, &["No visa required."], limits()).await;
         h.prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -2993,7 +3462,7 @@ mod tests {
             ..authority()
         };
         h.prober
-            .check(&flow(), &probe(), Some(&stale), now())
+            .check(&flow(), &probe(), Some(&stale), None, now())
             .await
             .expect("allowed");
 
@@ -3017,7 +3486,7 @@ mod tests {
         .await;
         refused
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect_err("not allowed");
         assert_eq!(
@@ -3062,7 +3531,7 @@ mod tests {
         .await;
         let checked = banner
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -3091,7 +3560,7 @@ mod tests {
         .await;
         let checked = silent
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         assert_eq!(checked, Checked::NotReproducible(Divergence::BothSilent));
@@ -3111,7 +3580,7 @@ mod tests {
         assert_eq!(
             half_loaded
                 .prober
-                .check(&flow(), &probe(), Some(&authority()), now())
+                .check(&flow(), &probe(), Some(&authority()), None, now())
                 .await
                 .expect("allowed"),
             Checked::NotReproducible(Divergence::Undetermined)
@@ -3127,7 +3596,7 @@ mod tests {
         assert_eq!(
             unreadable
                 .prober
-                .check(&flow(), &probe(), Some(&authority()), now())
+                .check(&flow(), &probe(), Some(&authority()), None, now())
                 .await
                 .expect("allowed"),
             Checked::NotReproducible(Divergence::Undetermined)
@@ -3144,7 +3613,7 @@ mod tests {
         assert_eq!(
             right
                 .prober
-                .check(&flow(), &probe(), Some(&authority()), now())
+                .check(&flow(), &probe(), Some(&authority()), None, now())
                 .await
                 .expect("allowed"),
             Checked::Agrees
@@ -3159,7 +3628,7 @@ mod tests {
         assert_eq!(
             vague
                 .prober
-                .check(&flow(), &probe(), Some(&authority()), now())
+                .check(&flow(), &probe(), Some(&authority()), None, now())
                 .await
                 .expect("allowed"),
             Checked::Unreadable
@@ -3184,7 +3653,7 @@ mod tests {
 
         let err = h
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect_err("book.airline.example is not allowed");
 
@@ -3277,7 +3746,7 @@ mod tests {
         // And it is a flow a probe actually runs on.
         let checked = h
             .prober
-            .check(&flow, &probe(), Some(&authority()), now())
+            .check(&flow, &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         assert!(
@@ -3375,7 +3844,7 @@ mod tests {
 
         let err = h
             .prober
-            .check(&elsewhere, &probe(), Some(&authority()), now())
+            .check(&elsewhere, &probe(), Some(&authority()), None, now())
             .await
             .expect_err("the ruling was for book.airline.example");
 
@@ -3405,7 +3874,7 @@ mod tests {
         let empty = harness(&db, &[""], limits()).await;
         let checked = empty
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         assert_eq!(
@@ -3424,7 +3893,7 @@ mod tests {
         let h = harness(&db, &["A visa is required before travel."], limits()).await;
         let err = h
             .prober
-            .check(&mistyped, &probe(), Some(&authority()), now())
+            .check(&mistyped, &probe(), Some(&authority()), None, now())
             .await
             .expect_err("nothing matches #visa-nfo");
 
@@ -3461,7 +3930,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let h = harness(&db, &["No visa required."], limits()).await;
         h.prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
@@ -3518,7 +3987,7 @@ mod tests {
             };
             assert_eq!(
                 h.prober
-                    .check(&flow(), &probe(), Some(&answer), now())
+                    .check(&flow(), &probe(), Some(&answer), None, now())
                     .await
                     .expect("allowed"),
                 Checked::TruthStale
@@ -3535,7 +4004,7 @@ mod tests {
         };
         assert!(
             h.prober
-                .check(&flow(), &probe(), Some(&months_old), now())
+                .check(&flow(), &probe(), Some(&months_old), None, now())
                 .await
                 .expect("allowed")
                 .evidence()
@@ -3556,12 +4025,12 @@ mod tests {
 
         let a = first
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
         let b = second
             .prober
-            .check(&flow(), &probe(), Some(&authority()), now())
+            .check(&flow(), &probe(), Some(&authority()), None, now())
             .await
             .expect("allowed");
 
