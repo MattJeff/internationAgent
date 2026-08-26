@@ -449,7 +449,7 @@ which covers the three charters, the turn brief and the five operator documents
 above. Change any of them and the recorded runs are answering a question about a
 different company; the suite says so rather than letting the figure rot.
 
-> ### $193–$357 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $77 floor at 1.00 model calls per turn, $1427 ceiling at 10.00
+> ### $119–$191 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $27 floor at 1.00 model calls per turn, $319 ceiling at 10.00
 >
 > A **range**, because a reserved turn makes between one and ten model calls and
 > any point estimate inside that is a choice. The floor is the arithmetic this

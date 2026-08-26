@@ -199,72 +199,27 @@ impl Sample {
 /// three passed every structural row; the spread below is what one language
 /// model does with the same three briefings on the same afternoon.
 ///
-/// # These counts are from one model, and the bill is now priced on four
-///
-/// Every figure here was sampled when every seat ran `claude-opus-5`, because
-/// that is what every seat ran. The *prices* [`Sample::company_usd`] multiplies
-/// them by are now each seat's own — but how many calls a turn takes is a fact
-/// about how a model plans, and the token counts move with the tokenizer, so a
-/// seat on Sonnet or Haiku would produce different numbers here.
-///
-/// There is deliberately no `model` field on [`Sample`] recording which one it
-/// came from: a pass covers three seats, they no longer share a model, and a
-/// single-model field on a mixed sample would be a lie with a type on it. What
-/// carries the invalidation instead is [`DIGEST`], which now hashes each seat's
-/// model — so moving one turns this block red with *"the recorded run measured
-/// a different company"*, which is precisely what would have happened.
-///
-/// # These three predate `MAX_THINKING_TOKENS=0` and are due a re-measure
-///
-/// **`output_tokens_per_call` below is high, and by a term the production path
-/// does not have.** They were recorded while `llm_cli` still let the CLI run
-/// with extended thinking on and dropped [`LlmRequest::max_tokens`] on the floor.
-/// `llm_anthropic::body` sends no `thinking` field and does send `max_tokens`, so
-/// production generates no thinking tokens at all — and thinking is billed as
-/// output, which is four fifths of the bill these numbers produce.
-///
-/// The size of it, measured the same day: on one fixed prompt, six reps each,
-/// **1,443 output tokens per call with thinking against 486 without**. Three
-/// `--dry-run 3` passes after the switch landed came in at **767–1,163** output
-/// tokens per call — *below the bottom of the 1,800–3,833 range recorded here*.
-/// A single sdr call in the run that motivated the fix returned **12,850** output
-/// tokens against a request for 4,096.
-///
-/// So [`headline`] is currently an over-estimate on its largest term, and
-/// `docs/ORIZN.md` quotes it. Left standing rather than hand-edited, because a
-/// sample is a thing a run printed and editing one by hand is how this file stops
-/// meaning anything — the [`DIGEST`] pairing exists for exactly that reason. It
-/// wants one honest measurement pass, `RECORD` pasted whole, and this section
-/// deleted.
-///
-/// **[`DIGEST`] is stale too, and independently.** `the company those runs
-/// measured` fails as of this writing, reporting `3a520bfd534b083b`: the
-/// `orizn.app` rename edited all five documents [`digest`] hashes after this pin
-/// was taken. That is the mechanism working — it is supposed to go red when the
-/// company moves under a recorded number — but it means the pin and the samples
-/// are now stale for two unrelated reasons at once. One `--dry-run 3`, one
-/// `RECORD` block pasted whole, clears both; neither clears alone.
 pub const RECORDED: &[Sample] = &[
     Sample {
-        calls_per_turn: 2.00,
-        input_tokens_per_call: 2_987.5,
-        output_tokens_per_call: 2_468.0,
+        calls_per_turn: 4.33,
+        input_tokens_per_call: 3625.8,
+        output_tokens_per_call: 144.8,
     },
     Sample {
-        calls_per_turn: 2.50,
-        input_tokens_per_call: 3_482.0,
-        output_tokens_per_call: 3_832.8,
+        calls_per_turn: 5.67,
+        input_tokens_per_call: 3968.5,
+        output_tokens_per_call: 205.5,
     },
     Sample {
-        calls_per_turn: 4.00,
-        input_tokens_per_call: 3_280.5,
-        output_tokens_per_call: 1_800.0,
+        calls_per_turn: 6.00,
+        input_tokens_per_call: 4000.7,
+        output_tokens_per_call: 212.8,
     },
 ];
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "574ecc743e6919dd";
+pub const DIGEST: &str = "861afcbdc9f56dc2";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
