@@ -37,6 +37,7 @@ mod flow; // the selectors on a prospect's booking page, written by a human
 mod loops; // U35 U36 U37
 mod metrics;
 mod policy;
+mod prospects; // the founder's lists, become rows
 mod routes; // U31 U32 U33 U34
 
 use std::collections::HashMap;
@@ -182,17 +183,17 @@ enum BootError {
 fn main() -> ExitCode {
     // All three subcommands run before `Config::from_env`, and for the same
     // reason: `doctor` answers "what do I still need to make this work?",
-    // `policy` installs the one thing it cannot answer for, and `flow` writes
-    // the one piece of material the sales vertical cannot invent — so none of
-    // them may require the configuration it exists to fix. Each reads
-    // `DATABASE_URL` itself and nothing else; see those modules for why writing
-    // a limit and writing a selector are proved by the operator's own database
-    // credential rather than by an API key.
+    // `policy` installs the one thing it cannot answer for, `flow` writes the one
+    // piece of material the sales vertical cannot invent, and `import` loads a
+    // file from the operator's own disk — so none of them may require the
+    // configuration they exist to fix or to precede. Each reads `DATABASE_URL`
+    // itself and nothing else; see those modules' docs.
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor::main(),
         Some("policy") => return policy::main(&args[1..]),
         Some("flow") => return flow::main(&args[1..]),
+        Some("import") => return prospects::main(&args[1..]),
         _ => {}
     }
 

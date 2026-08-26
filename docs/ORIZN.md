@@ -803,6 +803,56 @@ select occurred_at, actor, payload ->> 'event' as event
 `decision_id` is null on all of them, and that is honest: no Policy Gate ruling
 authorised these. They are an operator's key acting directly.
 
+### 8. Load the prospect lists
+
+Everything above stands up a company with an empty pipeline. `accounts` and
+`contacts` had no writer outside tests, so `contacts_due_for_follow_up` returned
+nothing and the seller had nobody to write to. The lists are Smartlead exports
+in `~/Desktop/VOYAGEURS`:
+
+```sh
+IMPORT="$BIN import --tenant $TENANT"
+
+# Look first. --dry-run does every judgement and commits nothing.
+$IMPORT --segment relocation --country PH --dry-run \
+  ~/Desktop/VOYAGEURS/gisement_dmw_philippines.csv
+
+# Then for real. Several files in one run are one transaction.
+$IMPORT --segment relocation --country PH ~/Desktop/VOYAGEURS/gisement_dmw_philippines.csv
+$IMPORT --segment tmc        --country HK ~/Desktop/VOYAGEURS/gisement_hongkong_tia.csv
+$IMPORT --segment other                   ~/Desktop/VOYAGEURS/gisement_associations_eu.csv
+```
+
+**Run it twice if you are not sure.** A prospect is its domain and a person is
+their address, both already unique per tenant in `0011_revenue.sql`, so a second
+run reports `already there` and writes nothing. That is not a nicety: the
+`getorizn_*` and `oriznapi_*` files are the same people under two sending
+domains, and `gisement_associations_eu.csv` contains every row of
+`smartlead_associations_ectaa.csv` **and** every row of the two FIDI files. Of
+2,209 rows across the prospect lists, 1,133 are distinct people.
+
+`--segment` is not guessed from the filename and `--country` is not guessed from
+the row. Imported contacts are due for follow-up immediately; what leaves the
+building is still capped by `max_new_contacts_per_day`, which for
+`sales-development` ships at **0** — so an import is not a send, and step 5's
+table is still the thing that decides.
+
+**What the import will not store, and says so every run:**
+
+| the founder's column | where it goes |
+|---|---|
+| `email` | `contacts.email`, lower-cased. The natural key. |
+| `first_name` `last_name` | joined into `contacts.full_name` — **empty for 3,012 of 3,048 rows**, and nothing is invented to fill it. Smartlead's API requires `first_name` from 2026-09-01; that decision is not made here. |
+| `company_name` | `accounts.legal_name`. **A row without one is refused by name** — its account would be its mailbox provider. |
+| `phone_number` | `contacts.phone` only if it is already E.164. **584 of 2,044 are not** (`(02)83518906`) and are dropped, because that CHECK is what lets the suppression list match a number by equality, and normalising one means guessing a country. |
+| `website` | `accounts.website` verbatim; `accounts.domain` is the host, minus `www.`, and is the identity. |
+| `linkedin_profile` | **nowhere.** No column, and no data either — empty in all 3,048 rows. Any that turn up are counted and dropped, and that is the day to add the column. |
+| `location` | `accounts.location` verbatim. `accounts.country` is `ZZ` unless you pass `--country`, because 118 spellings in three languages do not map to ISO-2 without guessing. |
+
+An address on the suppression list is skipped, is not created, and is not
+re-activated if it opted out between two imports. That is enforced inside the
+INSERT *and* by a trigger under it.
+
 ---
 
 ## What this document knows it does not do

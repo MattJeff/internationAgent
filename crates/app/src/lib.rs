@@ -17,6 +17,7 @@ pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23
 pub mod proof_of_need; // wave 12
+pub mod prospects; // the seller's input: the founder's own lists, become rows
 pub mod provisioning; // U24
 pub mod psyche; // le fil de production de la psyché
 pub mod queue; // the seller's output: one producer, two sinks

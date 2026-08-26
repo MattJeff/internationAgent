@@ -138,13 +138,25 @@
 //!
 //! # Fields the schema does not have
 //!
-//! Two of the eight columns have no column behind them and are **not invented
-//! here** — [`Recipient`] takes them as strings from whoever loads the list:
+//! [`Recipient`] takes all eight as strings from whoever loads the list, and
+//! `crate::prospects` is now the thing that loads it. Two of them had no column
+//! behind them at all; `0033_prospect_listing.sql` gave one of them one.
 //!
-//! * `location`. `accounts.country` is ISO 3166-1 alpha-2 with a CHECK; the
+//! * `location`. `accounts.country` is ISO 3166-1 alpha-2 with a CHECK and the
 //!   founder's lists carry `États-Unis`, `Mandaluyong, Philippines`,
-//!   `Portugal / Royaume-Uni`. A free-text `accounts.location` would hold it.
-//! * `linkedin_profile`. No column anywhere, on `accounts` or `contacts`.
+//!   `Portugal / Royaume-Uni`. **`accounts.location` now holds that string
+//!   verbatim** and `country` is `ZZ` when nobody passed one, so the import
+//!   guesses nothing and the export has the founder's own words to put back.
+//! * `linkedin_profile`. Still no column anywhere, on `accounts` or `contacts` —
+//!   and still no data either: it is empty in all 3,048 rows of every list. The
+//!   importer counts any it meets and says so rather than storing it, which is
+//!   the signal that this is the day for the migration.
+//!
+//! One more does not survive, and it is the importer's finding rather than this
+//! module's: a `phone_number` that is not E.164 has nowhere to go, because
+//! `contacts.phone` has a CHECK that exists so `revenue_suppression_of` can
+//! match a number by equality. 584 of the 2,044 numbers in these lists are in
+//! some other shape and are not stored. They are still in the CSVs.
 //!
 //! And one rule does not survive the round trip: `contacts` has no touch
 //! counter, so [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) and
@@ -703,6 +715,8 @@ mod tests {
                 segment: "insurer",
                 country: "US",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await

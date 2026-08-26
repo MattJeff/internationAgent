@@ -142,10 +142,20 @@ pub struct NewAccount<'a> {
     /// `airline`, `ota`, `corporate_travel`, `tmc`, `insurer`, `cruise`,
     /// `relocation`, `other`.
     pub segment: &'a str,
-    /// ISO 3166-1 alpha-2, upper case.
+    /// ISO 3166-1 alpha-2, upper case. `ZZ` when nobody knows — see
+    /// `0033_prospect_listing.sql` for why an importer writes that rather than
+    /// guessing at `Mandaluyong, Philippines`.
     pub country: &'a str,
     /// The employee working it.
     pub employee_id: Option<EmployeeId>,
+    /// Where the source list says they are, in the source list's own words.
+    /// Free text; [`Self::country`] is the typed half and is not derived from
+    /// this. `0033_prospect_listing.sql`.
+    pub location: Option<&'a str>,
+    /// Their site as the source list spells it, scheme and `www.` and all.
+    /// [`Self::domain`] is the derived identity; this is the input it was
+    /// derived from, kept because the derivation is lossy.
+    pub website: Option<&'a str>,
 }
 
 /// Create an account in the `candidate` state.
@@ -155,8 +165,9 @@ pub async fn insert_account(
     account: &NewAccount<'_>,
 ) -> Result<(), RevenueError> {
     sqlx::query(
-        "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country, employee_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country, employee_id, \
+                               location, website) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(id)
     .bind(tx.tenant_id().as_uuid())
@@ -165,9 +176,83 @@ pub async fn insert_account(
     .bind(account.segment)
     .bind(account.country)
     .bind(account.employee_id.map(|e| e.as_uuid()))
+    .bind(account.location)
+    .bind(account.website)
     .execute(&mut ***tx)
     .await?;
     Ok(())
+}
+
+/// What an idempotent write did, so a caller that runs a list twice can say so
+/// rather than guess from a rows-affected count.
+///
+/// [`upsert_account`] never answers [`Upserted::Suppressed`]: a company is not a
+/// person and cannot opt out. Only [`upsert_contact`] can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upserted {
+    /// The row was not there and now is.
+    Created(Uuid),
+    /// The natural key was already taken. **Nothing was written** — no column
+    /// was refreshed from the new values, deliberately: re-running an import is
+    /// a no-op and never a silent edit to a row somebody has since worked.
+    Existing(Uuid),
+    /// This address is on the suppression list, for this tenant or globally, so
+    /// no contact row was written and no inactive one was woken up.
+    Suppressed,
+}
+
+impl Upserted {
+    /// The row's id, when there is one.
+    pub const fn id(self) -> Option<Uuid> {
+        match self {
+            Self::Created(id) | Self::Existing(id) => Some(id),
+            Self::Suppressed => None,
+        }
+    }
+}
+
+/// Create an account, or find the one that already holds this domain.
+///
+/// The idempotent twin of [`insert_account`], for loading a list that will be
+/// loaded again. The natural key is `(tenant_id, domain)` — the same unique
+/// constraint `0011_revenue.sql` already carries, so this is that rule being
+/// *used* rather than a second copy of it.
+pub async fn upsert_account(
+    tx: &mut TenantTx<'_>,
+    id: Uuid,
+    account: &NewAccount<'_>,
+) -> Result<Upserted, RevenueError> {
+    let created: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country, employee_id, \
+                               location, website) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (tenant_id, domain) DO NOTHING \
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(tx.tenant_id().as_uuid())
+    .bind(account.legal_name)
+    .bind(account.domain)
+    .bind(account.segment)
+    .bind(account.country)
+    .bind(account.employee_id.map(|e| e.as_uuid()))
+    .bind(account.location)
+    .bind(account.website)
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    if let Some(id) = created {
+        return Ok(Upserted::Created(id));
+    }
+
+    // Two statements rather than one CTE: the second only runs on the second
+    // import of a row, and `WHERE domain = $1` under RLS is the same lookup the
+    // conflict just did.
+    let existing: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE domain = $1")
+        .bind(account.domain)
+        .fetch_one(&mut ***tx)
+        .await?;
+    Ok(Upserted::Existing(existing))
 }
 
 /// A prospect, as a search returns it.
@@ -484,6 +569,81 @@ pub async fn insert_contact(
     .execute(&mut ***tx)
     .await?;
     Ok(())
+}
+
+/// Create a contact, or find the one that already holds this address — and
+/// skip it, silently and without waking it, if it has opted out.
+///
+/// The idempotent twin of [`insert_contact`], for loading a list that will be
+/// loaded again. Two things are different from its twin and both are the point:
+///
+/// **The natural key is the address.** `contacts_email_key unique (tenant_id,
+/// email)` in `0011_revenue.sql` is the rule, and the reason it is the right key
+/// is written there: two rows for one address is one row that dodges the
+/// suppression cascade. So this reuses it rather than inventing a key beside it.
+///
+/// **A suppressed address answers [`Upserted::Suppressed`] instead of
+/// [`RevenueError::Suppressed`].** A list of a thousand people that dies on the
+/// one who opted out is a list nobody imports, and the pressure that creates is
+/// pressure to skip the check. The check is not skipped and it is not weakened:
+/// `revenue_suppression_of` is called **inside the INSERT**, in the same
+/// statement and the same snapshot, so there is still no moment where a caller
+/// holds an answer it could act on separately — this module still exposes no
+/// `is_suppressed()` — and the BEFORE trigger on `contacts` is still there
+/// behind it, refusing an active suppressed row whatever this statement thinks.
+/// An address that is on the list is never inserted and an inactive row for it
+/// is never touched, so an import cannot re-activate an opt-out.
+pub async fn upsert_contact(
+    tx: &mut TenantTx<'_>,
+    id: Uuid,
+    contact: &NewContact<'_>,
+) -> Result<Upserted, RevenueError> {
+    // One statement, three facts: what this insert wrote, what was already
+    // there before it, and whether the address is suppressed. The subqueries run
+    // in the statement's own snapshot, so `existing` cannot see the row the CTE
+    // just wrote.
+    let (created, existing, suppressed): (Option<Uuid>, Option<Uuid>, bool) = sqlx::query_as(
+        "WITH ins AS ( \
+           INSERT INTO contacts (id, tenant_id, account_id, full_name, email, phone, role, \
+                                 language, is_primary, lawful_basis, next_follow_up_at) \
+           SELECT $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text, $7::text, \
+                  $8::text, $9::boolean, $10::text, $11::timestamptz \
+            WHERE revenue_suppression_of($5::text, $6::text) IS NULL \
+           ON CONFLICT (tenant_id, email) DO NOTHING \
+           RETURNING id \
+         ) \
+         SELECT (SELECT id FROM ins), \
+                (SELECT id FROM contacts WHERE email = $5::text), \
+                revenue_suppression_of($5::text, $6::text) IS NOT NULL",
+    )
+    .bind(id)
+    .bind(tx.tenant_id().as_uuid())
+    .bind(contact.account_id)
+    .bind(contact.full_name)
+    .bind(contact.email)
+    .bind(contact.phone)
+    .bind(contact.role)
+    .bind(contact.language)
+    .bind(contact.is_primary)
+    .bind(contact.lawful_basis)
+    .bind(contact.next_follow_up_at)
+    .fetch_one(&mut ***tx)
+    .await?;
+
+    // Suppression outranks "already there": both can be true of the same row,
+    // and which one a report should say is not a close call.
+    if suppressed {
+        Ok(Upserted::Suppressed)
+    } else if let Some(id) = created {
+        Ok(Upserted::Created(id))
+    } else if let Some(id) = existing {
+        Ok(Upserted::Existing(id))
+    } else {
+        // Nothing written, nothing there, nobody suppressed: the only way here
+        // is a race with a concurrent insert of the same address, which is that
+        // insert's row and not this caller's business.
+        Err(StoreError::NotFound.into())
+    }
 }
 
 /// A contact who is due to be chased.
@@ -1587,6 +1747,8 @@ mod tests {
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await
@@ -1854,6 +2016,8 @@ mod tests {
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await
@@ -1938,6 +2102,8 @@ mod tests {
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await
@@ -2093,6 +2259,8 @@ mod tests {
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await
@@ -2231,6 +2399,8 @@ mod tests {
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
+                location: None,
+                website: None,
             },
         )
         .await
@@ -2435,6 +2605,8 @@ mod tests {
                     segment,
                     country: "FR",
                     employee_id: None,
+                    location: None,
+                    website: None,
                 },
             )
             .await
@@ -2529,6 +2701,8 @@ mod tests {
                     segment: "ota",
                     country: "US",
                     employee_id: None,
+                    location: None,
+                    website: None,
                 },
             )
             .await

@@ -2220,6 +2220,10 @@ mod tests {
                 segment: "airline",
                 country: "FR",
                 employee_id: Some(principal.employee_id),
+                // Not what this fixture is about: a flow is keyed on the
+                // account, and the listing columns are the importer's.
+                location: None,
+                website: None,
             },
         )
         .await

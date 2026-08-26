@@ -169,6 +169,33 @@ Three things follow from the confirmation being the point:
 Both verbs read `DATABASE_URL` and nothing else, for §1.4's reason. The running
 server has no INSERT or UPDATE on this table at all.
 
+### 1.4d Prospect lists
+
+The third subcommand, and the only one that writes tenant *data* rather than
+limits:
+
+```bash
+agentos-server import --tenant $TENANT --segment relocation --country PH \
+  --dry-run list.csv        # every judgement, nothing committed
+```
+
+It loads Smartlead-shaped CSVs (`email,first_name,last_name,company_name,
+phone_number,website,linkedin_profile,location`) into `accounts` and `contacts`,
+which have no other writer outside tests. Several files are one transaction, and
+running the same file twice writes nothing the second time — a prospect is its
+domain and a person is their address, both already unique per tenant.
+
+It reads `DATABASE_URL` and nothing else, for the same reason `policy` does plus
+one: the lists are on the operator's disk, and a route would mean uploading a
+thousand people's contact details to a server that has no reason to hold them.
+
+**It drops three things and prints a count of each every run** — a
+`linkedin_profile` (no column anywhere), a phone that is not E.164 (the CHECK
+that lets the suppression list match by equality), and any country name it was
+not given as ISO-2 (the location string is kept verbatim instead). An address on
+the suppression list is skipped and never re-activated. `docs/ORIZN.md` §8 is the
+column-by-column table and `agentos_app::prospects` is the argument for each.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**
