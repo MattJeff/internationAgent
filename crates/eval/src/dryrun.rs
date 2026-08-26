@@ -1,8 +1,8 @@
 //! **The dry run.** Orizn, stood up for real, working against the real model.
 //!
 //! ```sh
-//! createdb r1app                       # any empty database will do
-//! DATABASE_URL=postgres://postgres:postgres@localhost:5443/r1app \
+//! createdb orizn_dryrun                 # EMPTY, and a new one for every run
+//! DATABASE_URL=postgres://postgres:postgres@localhost:5443/orizn_dryrun \
 //!   cargo run -p agentos-eval --features live-orizn -- --dry-run 3
 //! ```
 //!
@@ -46,6 +46,40 @@
 //! result rather than raising, so the failures are *in* the transcript and this
 //! module's whole job is to not throw them away.
 //!
+//! # Structural, and sampled. They are not the same thing and are not mixed
+//!
+//! For a year this was a transcript somebody read and wrote prose about, so two
+//! runs a week apart could not be compared and nothing recorded what a good run
+//! looked like. [`verdict`] is the fix, and the split it draws is the whole
+//! idea:
+//!
+//! * **Structural** — [`Truth::Correct`], and the process exits non-zero. The
+//!   loop ran; at least one turn survived the shim; a tool was called; every
+//!   tool call except the ones the budget cut off got a ruling. None of these is
+//!   a fact about the model. A turn that produces zero tool calls in nine
+//!   attempts is not a sample, it is a broken system — that was true three days
+//!   ago and nothing automated noticed.
+//! * **Sampled** — [`Truth::Characterises`], reported and never gated. How many
+//!   calls a turn took, how many tokens they weighed, what that comes to a
+//!   month, and **how often the shim dropped a call**. A threshold on any of
+//!   these is a threshold on a coin flip, and a flaky test is a deleted test.
+//!
+//! The shim's failure rate began on the structural side and was moved, which is
+//! worth stating because it is the mistake this split is easiest to make.
+//! `cli_not_json` is a documented, expected behaviour of `llm_cli` — its own
+//! module docs put a number on it, and `toolchoice::Chose::Malformed` already
+//! reports shim failures as a figure rather than gating on one. Gating on it
+//! would have contradicted a decision this repository had already taken, and
+//! would have made a contended laptop look like a broken employee OS. What
+//! survived onto the structural side is the weaker, true claim: **something has
+//! to have run**, or the averages are arithmetic over calls that never returned.
+//! Only [`Ran::intact`] turns are billed, for the same reason.
+//!
+//! The sampled half is printed a second time as a `RECORD` block, ready to paste
+//! into [`crate::cost::RECORDED`] beside the digest that says which company it
+//! measured. That is the only route a live number takes into this repository —
+//! and it is withheld entirely when a structural row failed.
+//!
 //! # `Failed` carries no transcript, so the transcript is taken upstream
 //!
 //! `Turn::run`'s error carries the bill and not the conversation, so a run
@@ -62,12 +96,11 @@ use agentos_app::gate::{PolicyGate, Principal};
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::Charter;
-use agentos_app::{inbound, mocks, rolepack, rolepack_sales, rolepack_service};
+use agentos_app::{inbound, mocks};
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Lifecycle};
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::PolicyLimits;
 use agentos_providers::ProviderError;
 use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, Message, Usage};
 use agentos_providers::llm_cli::CliLlm;
@@ -77,7 +110,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
+use crate::cost::{self, Sample, TURN_BRIEF, charters, limits};
 use crate::scoping::{Weighed, weigh};
+use crate::{Row, Surface, Truth};
 
 /// Passed to the CLI untouched. Same default as the held-out set.
 pub use crate::toolchoice::DEFAULT_MODEL;
@@ -85,22 +120,6 @@ pub use crate::toolchoice::DEFAULT_MODEL;
 /// A mock deployment's envelope key. Real crypto over a throwaway key: the
 /// identity step seals a private key with it and would otherwise not run.
 const MASTER_KEY: &str = "dryrun-master-key-0123456789abcdef";
-
-/// What `docs/ORIZN.md` derives from `scoping.rs`, so the measurement has
-/// something to disagree with. Input tokens per model call at ten staff.
-const PREDICTED_TOKENS_PER_CALL: usize = 4_639;
-
-/// The rate card, from `docs/ORIZN.md`. The one thing here that comes from
-/// outside this repository.
-const USD_PER_M_INPUT: f64 = 5.0;
-const USD_PER_M_OUTPUT: f64 = 25.0;
-
-/// Orizn's reserved turns per day, summed over the five seats — the column
-/// `docs/ORIZN.md` bills.
-const TURNS_PER_DAY: f64 = 66.0;
-
-/// What `docs/ORIZN.md` budgets, at one model call per reserved turn.
-const PREDICTED_USD_PER_MONTH: f64 = 76.0;
 
 // ---------------------------------------------------------------------------
 // The model, with a tape recorder on it
@@ -153,20 +172,6 @@ impl Llm for Recorder {
 // ---------------------------------------------------------------------------
 // The company
 // ---------------------------------------------------------------------------
-
-/// `docs/`, from `crates/eval/`.
-fn docs(file: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs")
-        .join(file)
-}
-
-/// One of the operator's policy documents, as the installer reads it.
-fn limits(file: &str) -> PolicyLimits {
-    let path = docs(file);
-    let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path:?}: {err}"));
-    serde_json::from_str(&raw).unwrap_or_else(|err| panic!("{path:?}: {err}"))
-}
 
 /// One row of `docs/orizn-org.json`, plus what this seat is being asked to do.
 struct Seat {
@@ -240,6 +245,29 @@ impl Company {
     }
 }
 
+/// What the two unique-constraint panics in [`stand_up`] actually mean.
+///
+/// **Found by running the dry run three times, which nobody had ever done.**
+/// This module's own doc comment used to promise that re-running against the
+/// same database "adds a company rather than replacing one". It does not, and it
+/// cannot, for two independent reasons:
+///
+/// * `tenants.slug` is UNIQUE and the slug is `orizn`, from the runbook;
+/// * the mock providers mint sequential external ids — `dom_0001`,
+///   `PN0000000000000001` — from **process-local** state, so a second
+///   invocation mints the same ids and collides on
+///   `employee_resources_provider_external_id_key`.
+///
+/// The second is not fixable here and should not be: the mocks are correct to be
+/// deterministic, and a dry run that renamed its own seats to dodge a constraint
+/// would be measuring a company nobody deployed. So the requirement is a fresh
+/// database per invocation, and this string is what says so at the moment it
+/// matters instead of a `Conflict(...)` forty frames down.
+const EMPTY_DATABASE: &str = "this needs an EMPTY database and this one already holds a dry run — \
+     `createdb orizn_dryrun_2` and point DATABASE_URL at it. Two runs cannot share \
+     a database: the tenant slug is unique and the mock providers mint the same \
+     external ids in every process";
+
 /// Steps 2 through 6 of `docs/ORIZN.md`, in order, against a real database.
 async fn stand_up(db: Db) -> Company {
     let now = Utc::now();
@@ -255,7 +283,7 @@ async fn stand_up(db: Db) -> Company {
     // 3. the tenant — and the active policy version its layers hang off.
     policy::create_tenant(&db, tenant, "orizn", "Orizn")
         .await
-        .expect("create the tenant");
+        .expect(EMPTY_DATABASE);
 
     // 4. the org chart. `POST /v1/org`'s two passes: every seat before any
     //    line, because a `reports_to` must name a head of this same document.
@@ -299,10 +327,7 @@ async fn stand_up(db: Db) -> Company {
         EngineConfig::default(),
     );
     for (_, id, _) in &seats {
-        engine
-            .converge(tenant, *id)
-            .await
-            .expect("converge the seat");
+        engine.converge(tenant, *id).await.expect(EMPTY_DATABASE);
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let stored = employee_store::load(&mut tx, *id).await.expect("load");
         let mut employee = stored.employee;
@@ -355,75 +380,6 @@ async fn stand_up(db: Db) -> Company {
 
     Company { db, tenant, seats }
 }
-
-// ---------------------------------------------------------------------------
-// The objectives
-// ---------------------------------------------------------------------------
-
-/// The charters these seats are given, in the operator's words.
-///
-/// **Written once and not touched again.** Tuning a briefing until the run
-/// looks good is how a dry run stops being evidence; if one of these produces a
-/// bad turn, the bad turn is the finding.
-fn charters() -> Vec<(&'static str, Charter)> {
-    vec![
-        (
-            "sdr",
-            Charter::Sales {
-                pack: rolepack_sales::RolePack::sales_development(),
-                objective: rolepack_sales::Objective {
-                    segment: rolepack_sales::Segment::Airline,
-                    market: Some(rolepack::CountryCode::parse("de").expect("country")),
-                    target_accounts: vec![
-                        "Condor".to_owned(),
-                        "Eurowings".to_owned(),
-                        "Lufthansa".to_owned(),
-                    ],
-                },
-            },
-        ),
-        (
-            "support",
-            Charter::Support {
-                objective: rolepack_service::Support {
-                    product: "the Orizn entry-requirements API".to_owned(),
-                    first_response_hours: 8,
-                    escalate_to: Some("founder".to_owned()),
-                },
-            },
-        ),
-        (
-            "books",
-            Charter::Finance {
-                objective: rolepack_service::Books {
-                    period: "2026-08".to_owned(),
-                    currency: Some(Currency::Usd),
-                    obligations: vec![
-                        "settle the approved hosting invoice INV-4471 from acme-cloud for \
-                         USD 240.00 against PO-889"
-                            .to_owned(),
-                        "reconcile the August card statement".to_owned(),
-                    ],
-                },
-            },
-        ),
-    ]
-}
-
-/// What a self-started turn is, in the model's terms.
-///
-/// A verbatim copy of `apps/server/src/loops/initiative.rs`'s `TURN_BRIEF`, a
-/// private const in a binary crate with no library target. Copied rather than
-/// paraphrased: a dry run that sends different bytes from the running system is
-/// measuring a company nobody deployed. If the original moves, this moves.
-const TURN_BRIEF: &str = "Nobody has written to you. Your working rhythm has come round, so this \
-                          turn is yours to spend on your own objective. You have been here before \
-                          and the plan below does not know it: start by finding out where you \
-                          actually got to — read your own conversations, notes and records — then \
-                          advance the earliest stage that is not finished. One turn is not the \
-                          whole plan. Do the next real piece of work, finish it, and write down \
-                          what you did. If a stage is blocked on somebody else, say so and move to \
-                          what is not blocked rather than waiting inside this turn.";
 
 // ---------------------------------------------------------------------------
 // One run
@@ -718,62 +674,358 @@ fn first_line(text: &str, max: usize) -> String {
     format!("{}…", line.chars().take(max).collect::<String>())
 }
 
-/// The cost and the clock, measured against what `docs/ORIZN.md` predicts.
-fn report_cost(runs: &[Ran]) {
-    let calls: Vec<&Call> = runs.iter().flat_map(|ran| ran.calls.iter()).collect();
-    if calls.is_empty() {
-        println!("\nNo model call completed, so there is nothing to bill.");
-        return;
+// ---------------------------------------------------------------------------
+// The gate: structural, and sampled
+// ---------------------------------------------------------------------------
+
+impl Ran {
+    /// Tool calls the model proposed across this turn.
+    fn proposed(&self) -> usize {
+        self.calls
+            .iter()
+            .filter_map(|call| call.out.as_ref().ok())
+            .flat_map(|response| &response.content)
+            .filter(|block| matches!(block, Content::ToolUse { .. }))
+            .count()
     }
 
-    let n = calls.len() as f64;
-    let prompt_tokens: usize = calls.iter().map(|call| call.weighed.total()).sum();
-    let per_call = prompt_tokens as f64 / n;
-    let output: u64 = runs.iter().map(|ran| ran.usage.output_tokens).sum();
-    let per_call_out = output as f64 / n;
-    let calls_per_turn = n / runs.len() as f64;
+    /// The ones proposed in the **last** model call, which the loop never got to
+    /// answer because the turn ended there.
+    ///
+    /// `Turn::attempt` checks the budget before each tool call and returns from
+    /// inside the loop, so an over-budget run drops the whole final call's
+    /// results. Subtracting these is what makes the ruling check a claim about
+    /// the wiring rather than about how a run happened to end.
+    fn unanswered(&self) -> usize {
+        self.calls
+            .last()
+            .and_then(|call| call.out.as_ref().ok())
+            .map(|response| {
+                response
+                    .content
+                    .iter()
+                    .filter(|block| matches!(block, Content::ToolUse { .. }))
+                    .count()
+            })
+            .unwrap_or_default()
+    }
 
-    let mut walls: Vec<f64> = calls.iter().map(|c| c.elapsed.as_secs_f64()).collect();
+    /// Tool results that came back and were shown to the model. The gate's own
+    /// answers: `Turn` hands a refusal back as a failed tool result rather than
+    /// raising, so a denial counts here exactly like an allow.
+    fn ruled(&self) -> usize {
+        self.calls
+            .iter()
+            .filter_map(|call| call.last_in.as_ref())
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Content::ToolResult { .. }))
+            .count()
+    }
+
+    /// Model calls that came back as a provider or shim error.
+    fn provider_errors(&self) -> usize {
+        self.calls.iter().filter(|call| call.out.is_err()).count()
+    }
+
+    /// Did this turn get all the way through without the provider or the shim
+    /// dropping a call?
+    ///
+    /// **Only intact turns are billed**, and that is not fastidiousness. A turn
+    /// that died on `cli_not_json` still has a prompt that was sent and a
+    /// completion that never came, so averaging it in reports input tokens
+    /// nobody answered and divides real output by calls that returned nothing —
+    /// arithmetic that looks exactly like a measurement. `llm_cli`'s own docs
+    /// call the shim lossy and put a number on it, so this is expected
+    /// behaviour to *report*, never numbers to fold in.
+    fn intact(&self) -> bool {
+        self.provider_errors() == 0 && !self.calls.is_empty()
+    }
+}
+
+/// One pass reduced to the three numbers the bill is made of, over its
+/// [`Ran::intact`] turns alone.
+///
+/// `None` when the pass had no intact turn — nothing to bill, and the structural
+/// row that says so has already failed.
+fn sample(pass: &[Ran]) -> Option<Sample> {
+    let billed: Vec<&Ran> = pass.iter().filter(|ran| ran.intact()).collect();
+    let calls = billed.iter().map(|ran| ran.calls.len()).sum::<usize>();
+    if calls == 0 {
+        return None;
+    }
+    let prompt: usize = billed
+        .iter()
+        .flat_map(|ran| ran.calls.iter())
+        .map(|call| call.weighed.total())
+        .sum();
+    let output: u64 = billed.iter().map(|ran| ran.usage.output_tokens).sum();
+    Some(Sample {
+        calls_per_turn: calls as f64 / billed.len() as f64,
+        input_tokens_per_call: prompt as f64 / calls as f64,
+        output_tokens_per_call: output as f64 / calls as f64,
+    })
+}
+
+/// Smallest and largest of a slice of floats — the spread, which is the whole
+/// reason a dry run is three passes and not one.
+///
+/// Empty gives `(MAX, MIN)`, which is nonsense on purpose: it can only happen
+/// when no pass produced a sample, and every caller checks that first rather
+/// than printing a zero that reads like a measurement.
+fn spread(values: &[f64]) -> (f64, f64) {
+    values
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)))
+}
+
+/// **What the run said, split into what is pass/fail and what is a sample.**
+///
+/// The four [`Truth::Correct`] rows are properties of the wiring: a broken
+/// system fails them and a merely disappointing model does not. Everything else
+/// is [`Truth::Characterises`] — reported, spread across passes, never gated.
+/// See this module's docs for the argument.
+fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
+    let runs: Vec<&Ran> = passes.iter().flatten().collect();
+    let turns = runs.len();
+    let mut rows = Vec::new();
+
+    // --- structural: the loop ran ------------------------------------------
+    let ran = runs.iter().filter(|r| !r.calls.is_empty()).count();
+    rows.push(
+        Row::ok(
+            "every turn reached the model",
+            format!("{ran}/{turns} turns made at least one call"),
+            Truth::Correct,
+        )
+        .gated(ran == turns && turns > 0),
+    );
+
+    // --- structural: something survived to be measured ----------------------
+    // **Not "no call failed".** That was the first version of this row and it
+    // was wrong, because it contradicted a decision this repository had already
+    // made: `llm_cli`'s own docs call the shim lossy and put a number on it, and
+    // `toolchoice::Chose::Malformed` reports shim failures as a figure rather
+    // than gating on them. A `cli_not_json` is a measurement of the shim, so it
+    // is characterised on the row below. What IS structural is that at least one
+    // turn survived — a run where the shim ate every call measured nothing at
+    // all, and its averages would be arithmetic over calls that never returned.
+    let calls: usize = runs.iter().map(|r| r.calls.len()).sum();
+    let broken: usize = runs.iter().map(|r| r.provider_errors()).sum();
+    let intact = runs.iter().filter(|r| r.intact()).count();
+    rows.push(
+        Row::ok(
+            "some turn ran without a shim failure",
+            format!("{intact}/{turns} turns intact, and only those are billed"),
+            Truth::Correct,
+        )
+        .gated(intact > 0),
+    );
+
+    // --- structural: it acted ------------------------------------------------
+    // **The row that would have caught the three-day-old bug.** Zero tool calls
+    // across a whole dry run is not a shy model, it is a system that cannot act:
+    // the schemas never arrived, or the shim ate them, or the policy withheld
+    // every one. Gated at the run and not per turn, because one quiet turn is a
+    // sample and a silent run is not.
+    let proposed: usize = runs.iter().map(|r| r.proposed()).sum();
+    let acted = runs.iter().filter(|r| r.proposed() > 0).count();
+    rows.push(
+        Row::ok(
+            "the employees called tools",
+            format!("{proposed} calls, from {acted}/{turns} turns"),
+            Truth::Correct,
+        )
+        .gated(proposed > 0),
+    );
+
+    // --- structural: the gate answered --------------------------------------
+    let ruled: usize = runs.iter().map(|r| r.ruled()).sum();
+    let cut_off: usize = runs.iter().map(|r| r.unanswered()).sum();
+    rows.push(
+        Row::ok(
+            "…and every one of them got a ruling",
+            format!(
+                "{ruled} rulings for {} answerable calls",
+                proposed - cut_off
+            ),
+            Truth::Correct,
+        )
+        .gated(ruled == proposed - cut_off)
+        .note("allow and deny both count: a refusal comes back as a failed tool result"),
+    );
+
+    // --- sampled: how many calls a turn takes -------------------------------
+    let samples: Vec<Sample> = passes.iter().filter_map(|pass| sample(pass)).collect();
+    let per_turn: Vec<f64> = samples.iter().map(|s| s.calls_per_turn).collect();
+    let (lo, hi) = spread(&per_turn);
+    rows.push(
+        Row::ok(
+            "model calls per intact turn",
+            if samples.is_empty() {
+                "nothing to bill".to_owned()
+            } else {
+                format!("{lo:.2}–{hi:.2} over {} pass(es)", samples.len())
+            },
+            Truth::Characterises,
+        )
+        .note("`docs/ORIZN.md` billed 1.00, which is the floor of a range that ends at 10"),
+    );
+
+    // --- sampled: what a call weighs ----------------------------------------
+    let (in_lo, in_hi) = spread(
+        &samples
+            .iter()
+            .map(|s| s.input_tokens_per_call)
+            .collect::<Vec<_>>(),
+    );
+    let (out_lo, out_hi) = spread(
+        &samples
+            .iter()
+            .map(|s| s.output_tokens_per_call)
+            .collect::<Vec<_>>(),
+    );
+    rows.push(
+        Row::ok(
+            "tokens per model call",
+            if samples.is_empty() {
+                "nothing to weigh".to_owned()
+            } else {
+                format!("in {in_lo:.0}–{in_hi:.0}, out {out_lo:.0}–{out_hi:.0}")
+            },
+            Truth::Characterises,
+        )
+        .note("input by `scoping::tokens` over OUR bytes, not the CLI's — it bills its own prefix"),
+    );
+
+    // --- sampled: the money -------------------------------------------------
+    let day = f64::from(cost::turns_per_day());
+    let bill: Vec<f64> = samples.iter().map(|s| s.measured_usd(day)).collect();
+    let (bill_lo, bill_hi) = spread(&bill);
+    let floor = spread(
+        &samples
+            .iter()
+            .map(|s| s.monthly_usd(cost::FLOOR_CALLS_PER_TURN, day))
+            .collect::<Vec<_>>(),
+    )
+    .0;
+    let ceiling = spread(
+        &samples
+            .iter()
+            .map(|s| s.monthly_usd(cost::ceiling_calls_per_turn(), day))
+            .collect::<Vec<_>>(),
+    )
+    .1;
+    rows.push(
+        Row::ok(
+            "…which comes to, a month",
+            if samples.is_empty() {
+                "no sample".to_owned()
+            } else {
+                format!("${bill_lo:.0}–${bill_hi:.0}  (floor ${floor:.0}, ceiling ${ceiling:.0})")
+            },
+            Truth::Characterises,
+        )
+        .note(format!(
+            "at {day} reserved turns a day, from docs/orizn-roles/*.json; arithmetic in `cost.rs`"
+        )),
+    );
+
+    // --- sampled: the shim, and what went wrong -----------------------------
+    // Reported and not gated, for the reason the structural row above gives.
+    // `llm_cli` is a documented lossy shim and this is its rate on this run —
+    // the number an operator needs to decide whether the dry run is telling
+    // them about their company or about the local binary.
+    rows.push(
+        Row::ok(
+            "…the rest died at the shim",
+            format!(
+                "{broken} of {calls} model calls, {} turns lost",
+                turns - intact
+            ),
+            Truth::Characterises,
+        )
+        .note(
+            "`llm_cli` is lossy by construction and says so; the production path is llm_anthropic",
+        ),
+    );
+    rows.push(Row::ok(
+        "failures classified",
+        format!("{} across {turns} turns", failures.len()),
+        Truth::Characterises,
+    ));
+    let mut walls: Vec<f64> = runs
+        .iter()
+        .flat_map(|r| r.calls.iter())
+        .map(|c| c.elapsed.as_secs_f64())
+        .collect();
     walls.sort_by(f64::total_cmp);
-    let median = walls[walls.len() / 2];
-    let slowest = walls.last().copied().unwrap_or_default();
+    rows.push(Row::ok(
+        "wall clock per model call",
+        if walls.is_empty() {
+            "no call completed".to_owned()
+        } else {
+            format!(
+                "median {:.1}s, slowest {:.1}s",
+                walls[walls.len() / 2],
+                walls.last().copied().unwrap_or_default()
+            )
+        },
+        Truth::Characterises,
+    ));
 
-    let monthly = |tokens: f64, rate: f64| {
-        tokens * calls_per_turn * TURNS_PER_DAY * 30.0 * rate / 1_000_000.0
-    };
-    let projected = monthly(per_call, USD_PER_M_INPUT) + monthly(per_call_out, USD_PER_M_OUTPUT);
+    Surface {
+        name: "orizn (dry run)",
+        method: "a real company in a real database, worked by the real model through the local \
+                 `claude` CLI",
+        rows,
+        unmeasured: vec![
+            "whether the work was any GOOD. Every row above is about whether the machinery \
+             turned; whether the email was worth sending is a human reading the transcript",
+            "the model. A new snapshot behind the same name moves every sampled row and no pin \
+             in this repository can see it happen",
+            "the vertical step, omitted here because it needs a sourcing round or a pipeline in \
+             the database — one extra trusted sentence the real turn carries and this does not",
+            "everything the mocks stand in for: email, telephony, browser, payments. A tool call \
+             that the gate allowed and a mock accepted is not a tool call that worked",
+        ],
+    }
+}
 
+/// The sampled half again, in the shape [`crate::cost::RECORDED`] takes.
+///
+/// Paste it **with** the digest, never without: a sample and a digest from
+/// different runs is the exact lie this whole mechanism exists to stop.
+///
+/// **Withheld when a structural row failed**, and that is the join between the
+/// two halves of this module. A run in which two of four model calls timed out
+/// still produces averages, and they look exactly like measurements — an input
+/// figure over prompts nobody answered and an output figure divided by calls
+/// that returned nothing. Printing them next to the word `paste` is how a bad
+/// number gets into `cost.rs`, so the structural rows decide whether there is
+/// anything here worth recording.
+fn record(passes: &[Vec<Ran>], structurally_sound: bool) {
     println!("\n─────────────────────────────────────────────────────────────");
-    println!("COST — measured against what docs/ORIZN.md predicts\n");
-    println!(
-        "  prompt tokens per model call   {per_call:>8.0}   predicted {PREDICTED_TOKENS_PER_CALL} \
-         ({:+.0}%)",
-        (per_call / PREDICTED_TOKENS_PER_CALL as f64 - 1.0) * 100.0
-    );
-    println!("  output tokens per model call   {per_call_out:>8.0}   assumed 600 in the runbook");
-    println!(
-        "  model calls per reserved turn  {calls_per_turn:>8.2}   the runbook's table is the \
-         floor at 1.00"
-    );
-    println!(
-        "  projected                      ${projected:>7.2}/mo  budgeted ${PREDICTED_USD_PER_MONTH:.0}/mo \
-         at {TURNS_PER_DAY:.0} turns a day"
-    );
-    println!(
-        "\n  The prompt token count is `scoping::tokens`, a ±20% estimator over the bytes we \
-         send.\n  It is NOT what the CLI reported: the CLI bills its own system prompt, its own \
-         tool\n  schemas and its own cache, so its `input_tokens` is a number about the CLI. \
-         The\n  production path is `llm_anthropic`, which sends exactly the bytes weighed here."
-    );
-
-    println!("\nWALL CLOCK\n");
-    println!("  per model call   median {median:.1}s   slowest {slowest:.1}s");
-    let per_run: Vec<f64> = runs.iter().map(|ran| ran.wall.as_secs_f64()).collect();
-    println!(
-        "  per turn         mean {:.1}s over {} runs",
-        per_run.iter().sum::<f64>() / per_run.len() as f64,
-        per_run.len()
-    );
+    if !structurally_sound {
+        println!(
+            "NO RECORD — a structural check failed, so this run measured a broken system\n\n  \
+             The numbers above are still printed, because a broken run is a finding. They are \
+             not\n  offered for pasting: an average over model calls that never returned is \
+             arithmetic,\n  not a measurement. Fix what failed, run again."
+        );
+        return;
+    }
+    println!("RECORD — paste into crates/eval/src/cost.rs, both parts together\n");
+    println!("pub const RECORDED: &[Sample] = &[");
+    for pass in passes {
+        let Some(s) = sample(pass) else { continue };
+        println!(
+            "    Sample {{ calls_per_turn: {:.2}, input_tokens_per_call: {:.1}, \
+             output_tokens_per_call: {:.1} }},",
+            s.calls_per_turn, s.input_tokens_per_call, s.output_tokens_per_call
+        );
+    }
+    println!("];");
+    println!("pub const DIGEST: &str = \"{}\";", cost::digest());
 }
 
 /// Every failure, and how often — the part of this report that is the point.
@@ -806,17 +1058,26 @@ fn report_failures(failures: &[&'static str], runs: usize) {
 
 /// Stand Orizn up, work it `runs` times, and print what happened.
 ///
-/// One database per invocation is the caller's business: this writes a tenant
-/// with a fresh id every time, so re-running against the same database adds a
-/// company rather than replacing one.
-pub async fn run(model: &str, runs: usize) {
+/// Returns whether the **structural** rows passed — see [`verdict`]. `false` is
+/// an exit code, because a run in which nothing called a tool is a broken system
+/// and a report nobody reads is how it stayed broken for three days.
+///
+/// **An empty database per invocation, and that is not negotiable** — see
+/// [`EMPTY_DATABASE`] for the two constraints that make it so. Passes *within*
+/// one invocation share a company, which is the point: it is the same seats
+/// taking a second and third turn.
+///
+/// `runs` is the number of passes, and **three is the smallest useful number**:
+/// one run of a language model is an anecdote, and every sampled row above is
+/// printed as a spread across passes rather than as a figure.
+pub async fn run(model: &str, runs: usize) -> bool {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         println!(
             "DATABASE_URL is unset. This stands a real company up in a real database:\n  \
              DATABASE_URL=postgres://postgres:postgres@localhost:5432/orizn_dryrun \\\n    \
-             cargo run -p agentos-eval --features live-orizn -- --dry-run"
+             cargo run -p agentos-eval --features live-orizn -- --dry-run 3"
         );
-        return;
+        return false;
     };
     let db = Db::connect(&url).await.expect("connect to DATABASE_URL");
     db.migrate().await.expect("migrate");
@@ -826,6 +1087,10 @@ pub async fn run(model: &str, runs: usize) {
     println!("Real: the ceiling, the tenant, the org chart, five role layers, the");
     println!("provisioning engine, the Policy Gate, the turn loop, the model.");
     println!("Mock: email, telephony, browser, payments — everything but the model.");
+    println!(
+        "Company digest {} — what these numbers are about.",
+        cost::digest()
+    );
 
     let company = stand_up(db).await;
     let charters = charters();
@@ -835,17 +1100,248 @@ pub async fn run(model: &str, runs: usize) {
         charters.len()
     );
 
-    let mut all = Vec::new();
+    let mut passes: Vec<Vec<Ran>> = Vec::new();
     let mut failures = Vec::new();
     for pass in 1..=runs {
         println!("\n═══ pass {pass}/{runs} ═══");
+        let mut this = Vec::new();
         for (seat, charter) in &charters {
             let ran = take_turn(&company, seat, charter, model).await;
             report_run(&ran, &mut failures);
-            all.push(ran);
+            this.push(ran);
+        }
+        passes.push(this);
+    }
+
+    report_failures(&failures, passes.iter().flatten().count());
+
+    let surface = verdict(&passes, &failures);
+    println!("\n{}", crate::render(std::slice::from_ref(&surface)));
+    let sound = surface.passed();
+    record(&passes, sound);
+    sound
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// The gate's own gate, and it needs no model, no database and no `claude`
+// binary — [`verdict`] is a pure function of a recorded tape. Which is the
+// point: the half of a live measurement that can be tested deterministically is
+// the half that decides pass from fail, and it is tested here.
+
+#[cfg(test)]
+mod tests {
+    use agentos_providers::llm::{Message, Role};
+    use serde_json::json;
+
+    use super::*;
+
+    fn weighed() -> Weighed {
+        Weighed {
+            system: 1_000,
+            tools: 800,
+            messages: 200,
         }
     }
 
-    report_failures(&failures, all.len());
-    report_cost(&all);
+    fn call(last_in: Option<Message>, out: Result<LlmResponse, &'static str>) -> Call {
+        Call {
+            elapsed: Duration::from_secs(3),
+            offered: vec!["send_email".to_owned()],
+            weighed: weighed(),
+            last_in,
+            out,
+        }
+    }
+
+    fn asked(id: &str) -> LlmResponse {
+        LlmResponse::tool_use(
+            id,
+            "send_email",
+            json!({"to": "a@b.example"}),
+            Usage::new(0, 40, 0),
+        )
+    }
+
+    fn answered(id: &str) -> Message {
+        Message::new(Role::User, vec![Content::tool_result(id, "queued")])
+    }
+
+    fn said() -> LlmResponse {
+        LlmResponse::text("done", Usage::new(0, 40, 0))
+    }
+
+    fn ran(calls: Vec<Call>) -> Ran {
+        Ran {
+            seat: "sdr",
+            role: "sales-development",
+            ended: Ok("end_turn"),
+            usage: Usage::new(0, 40 * calls.len() as u64, 0),
+            wall: Duration::from_secs(10),
+            calls,
+        }
+    }
+
+    /// One tool asked for, one ruling back, one prose reply. The shape a working
+    /// turn has, and every structural row passes on it.
+    fn healthy() -> Ran {
+        ran(vec![
+            call(Some(Message::user("go")), Ok(asked("t1"))),
+            call(Some(answered("t1")), Ok(said())),
+        ])
+    }
+
+    fn structural(surface: &Surface) -> Vec<&Row> {
+        surface
+            .rows
+            .iter()
+            .filter(|row| row.truth == Truth::Correct)
+            .collect()
+    }
+
+    #[test]
+    fn a_working_run_passes_every_structural_check_and_gates_no_number() {
+        let surface = verdict(&[vec![healthy(), healthy()]], &[]);
+        assert!(
+            surface.passed(),
+            "{}",
+            crate::render(std::slice::from_ref(&surface))
+        );
+        assert_eq!(
+            structural(&surface).len(),
+            4,
+            "four structural rows, no more"
+        );
+        // And not one of the sampled rows is gated, however the numbers came
+        // out. A threshold on a sample is a flaky build.
+        assert!(
+            surface
+                .rows
+                .iter()
+                .filter(|row| row.truth == Truth::Characterises)
+                .all(|row| row.ok)
+        );
+    }
+
+    /// **The failure this whole mechanism was built for.** Nine turns of
+    /// well-written prose and no tool call is not a shy model, it is a system
+    /// that cannot act — and for three days nothing automated noticed.
+    #[test]
+    fn a_run_that_called_nothing_fails_and_names_the_row() {
+        let quiet = ran(vec![call(Some(Message::user("go")), Ok(said()))]);
+        let surface = verdict(&[vec![quiet]], &[]);
+        assert!(!surface.passed());
+        let report = crate::render(&[surface]);
+        assert!(report.contains("the employees called tools"), "{report}");
+        assert!(report.contains("0 calls, from 0/1 turns"), "{report}");
+    }
+
+    /// A turn that never reached the model at all — the database refused, the
+    /// budget was already spent — is not a sample of anything.
+    #[test]
+    fn a_turn_that_never_reached_the_model_fails() {
+        let surface = verdict(&[vec![healthy(), ran(Vec::new())]], &[]);
+        assert!(!surface.passed());
+        assert!(crate::render(&[surface]).contains("1/2 turns made at least one call"));
+    }
+
+    /// A shim failure alongside a turn that worked is **reported and not
+    /// gated** — `llm_cli` is lossy by construction — but the broken turn is
+    /// kept out of the numbers, or the input figure counts a prompt nobody
+    /// answered and the output figure divides by a call that returned nothing.
+    #[test]
+    fn a_shim_failure_is_characterised_and_never_billed() {
+        let broke = ran(vec![call(Some(Message::user("go")), Err("cli_not_json"))]);
+        let pass = vec![healthy(), broke];
+        let surface = verdict(std::slice::from_ref(&pass), &[]);
+        assert!(
+            surface.passed(),
+            "{}",
+            crate::render(std::slice::from_ref(&surface))
+        );
+        let report = crate::render(&[surface]);
+        assert!(report.contains("1/2 turns intact"), "{report}");
+        assert!(
+            report.contains("1 of 3 model calls, 1 turns lost"),
+            "{report}"
+        );
+
+        // And the sample is the healthy turn alone: two calls, not three.
+        let s = sample(&pass).expect("one intact turn");
+        assert!((s.calls_per_turn - 2.0).abs() < 1e-9);
+        assert!((s.input_tokens_per_call - 2_000.0).abs() < 1e-9);
+    }
+
+    /// But a run where the shim ate **every** call measured nothing at all, and
+    /// that is structural: there is no intact turn to average.
+    #[test]
+    fn a_run_the_shim_ate_entirely_fails() {
+        let broke = ran(vec![call(Some(Message::user("go")), Err("cli_not_json"))]);
+        let surface = verdict(&[vec![broke]], &[]);
+        assert!(!surface.passed());
+        let report = crate::render(&[surface]);
+        assert!(report.contains("0/1 turns intact"), "{report}");
+        assert!(report.contains("nothing to bill"), "{report}");
+    }
+
+    /// A tool call whose result never came back means the loop dropped a ruling
+    /// on the floor, which no amount of model behaviour can cause.
+    #[test]
+    fn a_ruling_that_never_came_back_fails() {
+        let dropped = ran(vec![
+            call(Some(Message::user("go")), Ok(asked("t1"))),
+            call(Some(Message::user("go on")), Ok(said())),
+        ]);
+        let surface = verdict(&[vec![dropped]], &[]);
+        assert!(!surface.passed());
+        assert!(crate::render(&[surface]).contains("0 rulings for 1 answerable calls"));
+    }
+
+    /// …but a tool call the **budget** cut off is not a dropped ruling. The loop
+    /// checks its budget before each tool call and returns from inside the final
+    /// model call, so those results were never owed. Without this subtraction
+    /// every over-budget run would fail a structural check for behaving exactly
+    /// as designed.
+    #[test]
+    fn a_tool_call_the_budget_cut_off_is_not_a_dropped_ruling() {
+        let mut cut = ran(vec![
+            call(Some(Message::user("go")), Ok(asked("t1"))),
+            call(Some(answered("t1")), Ok(asked("t2"))),
+        ]);
+        cut.ended = Err("max_tool_calls".to_owned());
+        let surface = verdict(&[vec![cut]], &[]);
+        assert!(
+            surface.passed(),
+            "{}",
+            crate::render(std::slice::from_ref(&surface))
+        );
+        assert!(crate::render(&[surface]).contains("1 rulings for 1 answerable calls"));
+    }
+
+    /// The sampled half is an average per pass, and a pass that made no call has
+    /// no sample rather than a zero — a zero would drag a spread toward a run
+    /// that never happened.
+    #[test]
+    fn a_pass_with_no_model_call_contributes_no_sample() {
+        assert!(sample(&[ran(Vec::new())]).is_none());
+        assert!(sample(&[]).is_none());
+
+        let s = sample(&[healthy()]).expect("two calls");
+        assert!((s.calls_per_turn - 2.0).abs() < 1e-9);
+        assert!((s.input_tokens_per_call - 2_000.0).abs() < 1e-9);
+        // 80 output tokens over two calls.
+        assert!((s.output_tokens_per_call - 40.0).abs() < 1e-9);
+    }
+
+    /// Spread over passes, not over turns: the run reports a range because one
+    /// run of a language model is an anecdote.
+    #[test]
+    fn the_sampled_rows_report_a_spread_across_passes() {
+        let quiet = ran(vec![call(Some(Message::user("go")), Ok(asked("t1")))]);
+        let surface = verdict(&[vec![healthy()], vec![quiet]], &[]);
+        let report = crate::render(&[surface]);
+        assert!(report.contains("1.00–2.00 over 2 pass(es)"), "{report}");
+    }
 }

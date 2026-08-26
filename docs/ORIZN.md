@@ -97,12 +97,12 @@ it and no reply will come.
 
 Three things did **not** change, and they are the point:
 
-* **The number.** `max_turns_per_day` is still `0`, so the cost table below is
-  untouched. Giving this seat a budget would have been the cheaper fix and it
-  would have bought a language model answering on the founder's behalf, plus
-  about **$6 a month** (five turns a day: 5 × 4,639 × 30 = 695,850 input tokens
-  ≈ $3.48, plus ≈$2.25 of output at this document's 600-token assumption) — and
-  a charter for the one seat this file exists to keep empty.
+* **The number.** `max_turns_per_day` is still `0`, so the bill below is
+  untouched: `cost::turns_per_day` sums the five role layers and this seat
+  contributes nothing to the sum. Giving it a budget would have been the cheaper
+  fix and it would have bought a language model answering on the founder's
+  behalf, at five sixty-sixths of whatever "What this costs per month" says
+  today — and a charter for the one seat this file exists to keep empty.
 * **The throttle.** Waking is what costs money, and nothing is woken here. The
   ceiling is still the sum of every employee's `max_turns_per_day`, because the
   only recipients exempted are the ones contributing zero to that sum. A seat
@@ -182,7 +182,7 @@ that unions, so a lower layer can always add a block and never remove one.
 | `allowed_calling_codes` | **empty** | Orizn phones nobody. The `sales-development` pack lists thirteen calling codes and `Channel::Voice`; this empty set intersects all fourteen away before any role layer is read. That is the ceiling doing its job, and it is why the sales role layer below writes `{email,internal}` rather than restating a `voice` grant that cannot survive. |
 | `allowed_domains` | `orizn.app` | **This is where the prospect account list goes**, and it is the one genuinely awkward consequence of intersection: an allowlist entry can only be *removed* by a lower layer, so a domain that is not here is unreachable by everybody. `orizn.app` covers `docs.`, `status.` and every other subdomain — entries match themselves and everything beneath them. Adding an account to probe is a ceiling change: `policy install` again, and `/readyz` needs no restart. |
 | `max_new_contacts_per_day` | 20 | The largest any function gets (customer success). |
-| `max_turns_per_day` | 30 | The largest any function gets (sales). This is the blast radius of a typo: a team pointed at an unwritten `role_name` runs on exactly this. Thirty turns a day is about **$21 a month** — a number you can afford to be wrong about. The shipped default is 200. |
+| `max_turns_per_day` | 30 | The largest any function gets (sales). This is the blast radius of a typo: a team pointed at an unwritten `role_name` runs on exactly this. Thirty turns a day is 30/66 of the bill in "What this costs per month" — a number you can afford to be wrong about. The shipped default is 200. |
 | the three booleans | `false` | Uploading, rotating a credential and deleting data are `AND`ed down the stack, so `false` here is `false` everywhere, forever, until the ceiling changes. |
 
 **There is no tenant layer, on purpose.** This deployment has one tenant, so the
@@ -339,77 +339,93 @@ the logs like a bug and is a missing row.
 
 ## What this costs per month
 
-Every turn pays for the context it carries, and `crates/eval/src/scoping.rs`
-measured how much. Run it yourself — no API key, no network:
+**This section holds no arithmetic of its own, and that is the point.**
+
+It used to. It published **≈ $76 a month**, derived here in prose from three
+numbers: 4,639 input tokens per model call, an assumed 600 output tokens, and
+**one model call per reserved turn**. The first was measured once and then moved.
+The second was a guess. The third was the *floor* of a range that runs to ten,
+quoted as though it were an estimate. When somebody finally ran the thing and
+counted, every one of the three was wrong in the same direction, and the honest
+figure was several times what this document said — because prose cannot be
+re-run, so a number typed into it is right on the day it is written and drifts
+silently forever after.
+
+So the arithmetic now lives in `crates/eval/src/cost.rs`, in one function, with a
+unit test anyone can redo by hand. Read it in thirty seconds:
 
 ```sh
-cargo run -p agentos-eval
+cargo run -p agentos-eval          # the `orizn (bill)` surface
 ```
 
-> `one turn's context at 2 / 10 / 50 staff — 4188 → 4639 → 4863 tok`
-> `(prompt 1238 + schemas 812 + context 2138)`
+**The sentence in the box below is checked character-for-character against this
+file on every `cargo test`** — the row `the runbook quotes this measurement`.
+Edit it here and the build goes red. Measure a new one and the build stays red
+until it is pasted in. There is exactly one copy of the number and this is not
+it.
 
-**4,639 input tokens per model call** at ten staff, by `scoping::tokens` — a
-stated ±20% estimator, unverified against a real tokenizer, because there is
-none in this workspace. Orizn has five employees, so ten staff is the closer of
-the two published points.
+### Where each term comes from
 
-The model is `claude-opus-5` (`providers::llm_anthropic::DEFAULT_MODEL`) at
-**$5.00 per million input tokens and $25.00 per million output**. That rate card
-is the one thing here that comes from outside this repository; `scoping.rs` says
-so itself under what it does not measure.
+| term | source |
+|---|---|
+| reserved turns a day | **`docs/orizn-roles/*.json`, summed by `cost::turns_per_day`.** Not restated anywhere |
+| model calls per reserved turn | **measured**, by a live `--dry-run`. Between 1 and `app::turn::Budgets::max_turns` = 10 |
+| input tokens per model call | **measured**, `scoping::tokens` over the bytes *we* send — a stated ±20% estimator, unverified against a real tokenizer because there is none in this workspace |
+| output tokens per model call | **measured**, as the `claude` CLI reported them. Nothing of ours weighs a completion |
+| the rate card | `claude-opus-5` at **$5.00/M input, $25.00/M output**. The one number from outside this repository |
 
-`max_turns_per_day` counts **reserved turns**, and one reserved turn makes
-between one and `app::turn::Budgets::max_turns` = **ten** model calls. The table
-is the floor.
+`direction`'s zero turns is a real zero and stays one, so the founder's chair
+contributes nothing to the first row even though four employees can now reach it
+— see "The zero is still zero" above.
 
-| Function | turns/day | input tokens/day | input $/month |
-|---|---:|---:|---:|
-| `direction` | 0 | 0 | $0.00 |
-| `sales-development` | 30 | 139,170 | $20.88 |
-| `customer-success` | 20 | 92,780 | $13.92 |
-| `growth` | 10 | 46,390 | $6.96 |
-| `finance` | 6 | 27,834 | $4.18 |
-| **total** | **66** | **306,174** | **$45.93** |
+### Re-measuring it
 
-`306,174 × 30 days = 9,185,220 tokens × $5/1M = $45.93`.
+One command, a database and the local `claude` binary. No API key and no spend:
 
-`direction`'s zero is a real zero and stays one. Escalating to that seat delivers
-a message without waking it, so the founder's chair costs nothing per month even
-though four employees can now reach it — see "The zero is still zero" above.
+```sh
+DATABASE_URL=postgres://…/orizn_dryrun \
+  cargo run -p agentos-eval --features live-orizn -- --dry-run 3
+```
 
-**Output is not measured anywhere in this workspace**, so it is an assumption and
-labelled as one: at ~600 output tokens per model call, 66 turns a day is
-1,188,000 output tokens a month = **$29.70**. The hard per-request ceiling is
-`max_tokens = 4096`, so the worst case is about seven times that.
+Three passes, not one: one run of a language model is an anecdote, and every
+figure it prints is a spread across passes. It exits non-zero when a
+**structural** check fails — the loop did not run, no tool was called, a tool
+call got no ruling, the provider errored — and never for a number, because a
+threshold on a sample is a flaky build that ends up deleted.
 
-> ### **≈ $76 a month, and that is the number to budget.**
+It prints a `RECORD` block. Paste it into `cost.rs` **together with its digest**,
+which covers the three charters, the turn brief and the five operator documents
+above. Change any of them and the recorded runs are answering a question about a
+different company; the suite says so rather than letting the figure rot.
+
+> ### $303–$560 a month over 3 measured runs at 66 reserved turns a day; $122 floor at 1.00 model calls per turn, $2242 ceiling at 10.00
 >
-> $45.93 input + $29.70 output, at these settings, one model call per reserved
-> turn. Two things move it, in opposite directions and both by a lot:
+> A **range**, because a reserved turn makes between one and ten model calls and
+> any point estimate inside that is a choice. The floor is the arithmetic this
+> document used to publish as its estimate.
+>
+> Three things move it and none of them is in the figure:
 >
 > * **Prompt caching lowers it.** `llm_anthropic` puts a `cache_control`
 >   breakpoint on the system block, which caches tools and system together —
->   2,501 of the 4,639 tokens at ten staff. A prefix re-sent inside the cache
->   window bills at a tenth, which takes the input half to roughly $24 and the
->   total to about **$53**. `scoping.rs` deliberately prices cache reads at full
->   rate and says why: no rate card lives in this workspace, so full price is the
->   honest ceiling and the cache is upside.
-> * **A ten-call turn raises it tenfold.** A turn that reads a page, calls a
->   tool, reads the result and answers is several model calls, each re-sending
->   the prefix. If every reserved turn ran the full loop the bill would be
->   **≈ $760**. The truth is between; `scoping.rs` lists "growth WITHIN a run"
->   as unmeasured, and it is the largest thing nobody here has numbers for.
+>   roughly half the prefix. A prefix re-sent inside the cache window bills at a
+>   tenth. `cost.rs` prices cache reads at full rate and says why: no rate card
+>   for them lives in this workspace, so full price is the honest ceiling and the
+>   cache is upside.
+> * **The provisioning loop's own model calls raise it.** The dry run stands the
+>   company up before it starts counting.
+> * **The shim is not the production path.** `--dry-run` drives the local
+>   `claude` CLI, which renders tool schemas into the prompt and demands JSON
+>   back, so the measured output tokens are a completion `llm_anthropic` would
+>   not have produced.
 >
-> Two things are **not** in this figure: the provisioning loop's own calls, and
-> the three trusted paragraphs the real path adds that `scoping.rs` cannot reach
-> (the server's `TURN_BRIEF`, the initiative loop's, and `knowledge::RECALLED_BRIEF`).
-> All three are constants, so they raise the per-turn number and cannot make it
-> slope.
+> And the turns column is a **ceiling on turns, not a forecast of them**: an
+> employee with nothing to do reserves nothing and bills nothing.
 
-The lever an operator actually has is the turns column. Each turn per day, on
-one employee, is **$0.70 a month** at the floor and $7 at the ceiling. Doubling
-sales from 30 to 60 costs about $21 a month more and is a one-line `update`.
+The lever an operator actually has is that turns column, and it is linear: the
+whole bill scales with it, so halving `max_turns_per_day` halves every figure in
+the box. Doubling sales from 30 to 60 raises the total by 30/66 of it, and is a
+one-line `update`.
 
 ---
 

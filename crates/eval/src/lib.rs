@@ -29,6 +29,7 @@
 //! | [`suppression`] | fixtures, exact for the classification, systematic perturbation for the rate | [`verdict`](agentos_app::proof_of_need::verdict) is a pure function of two strings. What each case *should* classify as is definitional; what the field *rate* is cannot be got from fixtures at all, so it isn't claimed — see below. |
 //! | [`toolchoice`] | deterministic snapshot in CI, small held-out set run by hand | The model is the one part that cannot be evaluated deterministically. |
 //! | [`scoping`] | fixtures, swept over company size, weighed in tokens | What a turn assembles is a pure function of one employee's configuration, so a company of fifty can be built and one employee's turn billed exactly. The token count is an estimate — there is no tokenizer here and no network — and every assertion is a *comparison* under that one estimator, so its error cancels rather than reaching the pass/fail. |
+//! | [`cost`] | one arithmetic function over samples a live run recorded, pinned by digest | What a month costs is arithmetic; what goes into it is a sample from a model. So the arithmetic is tested and the samples are recorded — and `docs/ORIZN.md` has to quote the sentence this crate produces rather than keep a copy of the number. |
 //!
 //! ## Why no judge, and no record-and-replay
 //!
@@ -68,6 +69,8 @@
 /// module docs and `crates/eval/Cargo.toml`.
 #[cfg(feature = "live-orizn")]
 pub mod dryrun;
+
+pub mod cost;
 pub mod expectation;
 pub mod ranking;
 pub mod scoping;
@@ -173,6 +176,7 @@ pub fn deterministic() -> Vec<Surface> {
         suppression::evaluate(),
         toolchoice::evaluate(),
         scoping::evaluate(),
+        cost::evaluate(),
     ]
 }
 

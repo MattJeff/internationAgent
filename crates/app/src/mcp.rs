@@ -90,21 +90,32 @@
 //! can already have one, by running it and pointing a `private` binding at it,
 //! which is what [`Reach::Private`] is for and is why it exists.
 //!
-//! **What the operator therefore has to run.** One process per stdio server, in
-//! front of it, speaking Streamable HTTP. Off the shelf, and the command is
-//! exactly this:
+//! **A server that already speaks Streamable HTTP needs none of this.** Bind its
+//! URL and stop; that is the ordinary case and it is the whole of what this
+//! module was built for. Orizn's own data is reachable that way — the MCP
+//! endpoint under `visa.orizn.app` answers `tools/list` and `tools/call` over
+//! HTTP directly — so the tenant this workspace exists to serve does not need a
+//! bridge at all. Do not read the paragraph below as the Orizn path; it is not.
+//!
+//! **What the operator has to run for a server that speaks only stdio.** One
+//! process per such server, in front of it, translating to Streamable HTTP. This
+//! is the general mechanism and it is the reason the decision above cost
+//! nothing: refusing stdio *in the product* does not refuse stdio *servers*, it
+//! moves the containment to where the operator already has it. Off the shelf:
 //!
 //! ```text
-//! npx -y supergateway --stdio "npx -y orizn-visa-mcp" \
+//! npx -y supergateway --stdio "<the server's own command>" \
 //!     --outputTransport streamableHttp --port 8931 --streamableHttpPath /mcp
 //! ```
 //!
 //! and then a binding at `http://127.0.0.1:8931/mcp` with `reach = 'private'`.
 //! That is a sidecar — the case [`Reach::Private`] was written for — and it is
-//! how `crates/app/tests/orizn.rs` reaches the real server, with the same
-//! command and no test-only path through this module. Writing our own proxy
-//! instead would be re-implementing a JSON-RPC pipe pump in order to avoid
-//! depending on one.
+//! how `crates/app/tests/orizn.rs` reaches `orizn-visa-mcp`'s **stdio** package,
+//! with the same command and no test-only path through this module. That test
+//! keeps using the bridge deliberately even though the HTTP endpoint exists,
+//! because the bridge is the path every *other* tenant's stdio server will take
+//! and it should be exercised by something. Writing our own proxy instead would
+//! be re-implementing a JSON-RPC pipe pump in order to avoid depending on one.
 //!
 //! The containment moves with the process: the bridge runs where the operator
 //! puts it, under whatever the operator's platform gives it, and this server

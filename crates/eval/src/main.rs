@@ -5,9 +5,14 @@
 //! cargo run -p agentos-eval -- --live           …plus the model held-out set, ~1 minute
 //! cargo run -p agentos-eval -- --live --model X  a different model
 //!
-//! DATABASE_URL=… cargo run -p agentos-eval --features live-orizn -- --dry-run [passes]
+//! DATABASE_URL=… cargo run -p agentos-eval --features live-orizn -- --dry-run [passes=3]
 //!                                               Orizn stood up for real and worked, ~10 min
 //! ```
+//!
+//! `--dry-run` exits non-zero when a **structural** row fails — the loop did not
+//! run, no tool was called, a tool call got no ruling, the provider errored. It
+//! never exits non-zero for a number: how many calls a turn took and what they
+//! cost are samples, and a threshold on a sample is a flaky build.
 //!
 //! The deterministic half is the same code CI runs as a test, so this binary
 //! and the build agree by construction rather than by somebody remembering to
@@ -34,13 +39,17 @@ async fn main() {
     // and works it, which is its own report. Nothing below it applies.
     #[cfg(feature = "live-orizn")]
     if args.iter().any(|a| a == "--dry-run") {
+        // Three, not one: every sampled row it prints is a spread across passes,
+        // and a spread over one pass is a figure wearing a range's clothes.
         let passes = args
             .iter()
             .position(|a| a == "--dry-run")
             .and_then(|i| args.get(i + 1))
             .and_then(|n| n.parse().ok())
-            .unwrap_or(1);
-        agentos_eval::dryrun::run(model, passes).await;
+            .unwrap_or(3);
+        if !agentos_eval::dryrun::run(model, passes).await {
+            std::process::exit(1);
+        }
         return;
     }
 
