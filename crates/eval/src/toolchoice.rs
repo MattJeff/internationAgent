@@ -535,6 +535,13 @@ pub fn evaluate() -> Surface {
     // A pack that covers less would move this list, which is the point: run the
     // same lines against `customer_success` and `pay` is gone from both columns.
     //
+    // **A third browser tool joined both columns.** `propose_flow` is
+    // `ActionKind::BrowserRead` and `BROWSE_RISK`, so it sits exactly where the
+    // other two do, in both columns, on the same grant. What it is *not* is a
+    // `BrowserWrite`: it reads one page and writes a proposal this tenant owns,
+    // and the selectors in that proposal are still probed by nothing until a
+    // named human promotes them — see `crates/app/src/flow_proposal.rs`.
+    //
     // **`read_page` and `find_prospects` joined both columns** when reading
     // became a channel: this fixture's policy is built on `default_ceiling`,
     // which carries `Channel::Web`, and a read no longer has to clear an
@@ -548,6 +555,7 @@ pub fn evaluate() -> Surface {
             "send_email",
             "read_page",
             "find_prospects",
+            "propose_flow",
             "call_mcp_tool",
             "pay",
             "message_colleague",
@@ -558,6 +566,7 @@ pub fn evaluate() -> Surface {
                 "send_email",
                 "read_page",
                 "find_prospects",
+                "propose_flow",
                 "call_mcp_tool",
                 "message_colleague",
                 "brief_direct_reports",
@@ -611,6 +620,7 @@ pub fn evaluate() -> Surface {
                 // measures something.
                 "read_page",
                 "find_prospects",
+                "propose_flow",
                 "pay",
                 "message_colleague",
                 "brief_direct_reports",

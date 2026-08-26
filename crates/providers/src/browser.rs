@@ -141,6 +141,26 @@ pub enum BrowserStep<'a> {
     /// silent about visas; an `Err` cannot be mistaken for an answer because a
     /// caller cannot get past it without saying so.
     Text(&'a str),
+    /// Read the **markup** of the first match of a CSS selector: `outerHTML`.
+    ///
+    /// [`BrowserStep::Text`] answers "what does their page tell a traveller".
+    /// This answers "what is their page made of", and there is exactly one
+    /// caller that needs the difference: `agentos_app::flow_proposal`, which
+    /// derives the `#id` of a booking form's fields so a human can review five
+    /// selectors instead of authoring them. `innerText` cannot answer it —
+    /// attributes are not rendered text, and an `id` is an attribute.
+    ///
+    /// **It is a read, and it is the most dangerous thing to render that this
+    /// enum produces.** The text a `Text` brings back is a stranger's prose;
+    /// the markup a `Markup` brings back is a stranger's prose *plus* their
+    /// script bodies, their inline event handlers and their comments. So it is
+    /// [`Untrusted`] like `Text` and, unlike `Text`, nothing in this workspace
+    /// hands the result to a model or to a screen: the one caller scans it in
+    /// Rust and returns counts and identifiers of a shape a CHECK constraint
+    /// re-states. Point a tool at this and the fence is gone.
+    ///
+    /// `NO_SUCH_ELEMENT` on no match, for [`BrowserStep::Text`]'s reason.
+    Markup(&'a str),
     /// Capture the viewport as a PNG.
     Screenshot,
 }
@@ -158,14 +178,14 @@ impl BrowserStep<'_> {
     ///
     /// `Goto` is a read. Navigating is how you get to a page to look at it, and
     /// the URL is scope-checked against the token's own domain before it runs.
-    /// `Screenshot` and `Text` observe. `Click`, `Type` and `Fill` put
-    /// something of ours into a stranger's system, which is a write whatever
+    /// `Screenshot`, `Text` and `Markup` observe. `Click`, `Type` and `Fill`
+    /// put something of ours into a stranger's system, which is a write whatever
     /// the element happens to be — a search box today and a "delete account"
     /// button on the next redesign, and the selector cannot tell them apart.
     #[must_use]
     pub const fn is_a_read(&self) -> bool {
         match self {
-            Self::Goto(_) | Self::Text(_) | Self::Screenshot => true,
+            Self::Goto(_) | Self::Text(_) | Self::Markup(_) | Self::Screenshot => true,
             Self::Click(_) | Self::Type { .. } | Self::Fill { .. } => false,
         }
     }
@@ -186,6 +206,16 @@ pub enum BrowserOutcome {
     /// says nothing; a selector that found no element does not come back at
     /// all. See the module docs.
     Text(Untrusted<String>),
+    /// The `outerHTML` of the element a [`BrowserStep::Markup`] named.
+    ///
+    /// **A separate variant from [`BrowserOutcome::Text`] on purpose.** The two
+    /// are both `Untrusted<String>` and a shared variant would compile
+    /// everywhere — which is the problem: `Effects::read_page` matches on `Text`
+    /// and hands what it finds to a model, so a day when a `Markup` step could
+    /// answer with a `Text` outcome is a day a stranger's script bodies reach a
+    /// prompt because two call sites drifted. They cannot drift; they do not
+    /// share a name.
+    Markup(Untrusted<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +270,13 @@ struct MockState {
     /// "unscripted" and "scripted as empty" have to be two different pages
     /// here, or a test cannot tell the two facts apart either.
     page: BTreeMap<String, (Vec<String>, usize)>,
+    /// selector -> `outerHTML`. A second map rather than a second use of
+    /// `page`, for the reason [`BrowserOutcome::Markup`] is a second variant: a
+    /// test that scripts the *text* of `body` has said nothing about its
+    /// markup, and a mock that answered a `Markup` with the scripted text would
+    /// make `flow_proposal` look like it worked on pages that have no `id` on
+    /// anything.
+    markup: BTreeMap<String, String>,
 }
 
 impl MockState {
@@ -287,6 +324,16 @@ impl MockBrowser {
             "an element with no text still reads as \"\""
         );
         self.lock().page.insert(sel.to_owned(), (texts, 0));
+    }
+
+    /// Put markup on the page: what a [`BrowserStep::Markup`] of `sel` reads.
+    ///
+    /// One string and not a sequence, unlike [`MockBrowser::set_text`]: nothing
+    /// reads markup twice to compare the two, because the question markup
+    /// answers is what the page is built out of and the reproducibility bar is
+    /// about what it says.
+    pub fn set_markup(&self, sel: &str, html: &str) {
+        self.lock().markup.insert(sel.to_owned(), html.to_owned());
     }
 
     /// Every step this mock was asked to run, oldest first.
@@ -379,6 +426,16 @@ impl BrowserProvider for MockBrowser {
                 state.fault.check_after()?;
                 return found
                     .map(|text| BrowserOutcome::Text(Untrusted::new(text)))
+                    .ok_or(ProviderError::Terminal {
+                        code: NO_SUCH_ELEMENT,
+                    });
+            }
+            BrowserStep::Markup(sel) => {
+                let found = state.markup.get(sel).cloned();
+                state.log.push(format!("{ctx} markup {sel}"));
+                state.fault.check_after()?;
+                return found
+                    .map(|html| BrowserOutcome::Markup(Untrusted::new(html)))
                     .ok_or(ProviderError::Terminal {
                         code: NO_SUCH_ELEMENT,
                     });

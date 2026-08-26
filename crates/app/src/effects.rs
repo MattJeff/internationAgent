@@ -113,6 +113,15 @@ pub const NO_POLICY: &str = "broken_policy";
 /// before the gate is troubled, and this is the same refusal at the write.
 pub const BAD_SEGMENT: &str = "unknown_segment";
 
+/// What [`Effects::propose_flow`] answers when the page's host belongs to no
+/// prospect on this tenant's list.
+///
+/// A proposal is a row on an `accounts` row and the account is resolved from the
+/// host — see [`propose_prospect_flow`](agentos_store::revenue::propose_prospect_flow).
+/// So this is not "we could not find the form": it is "there is nobody here this
+/// page could be about", and the answer to it is an import, not another read.
+pub const NO_PROSPECT: &str = "no_such_prospect";
+
 // ---------------------------------------------------------------------------
 // Subjects
 // ---------------------------------------------------------------------------
@@ -770,6 +779,133 @@ impl Effects {
         Ok(report)
     }
 
+    /// Read a prospect's booking page and file what its form is made of, for a
+    /// human to confirm.
+    ///
+    /// # Why this is one effect and not "read, then write"
+    ///
+    /// [`Effects::discover_prospects`]'s argument, and the same one that put
+    /// [`ActionKind::BrowserWrite`] in [`crate::turn::UNSERVED`]: splitting it
+    /// would mean handing a model the markup and asking it for the selectors,
+    /// and a selector a page talked a model into is exactly what the
+    /// confirmation in `0032_prospect_flows.sql` exists to keep out of a probe.
+    /// Here nothing does. [`crate::flow_proposal::propose`] scans the markup in
+    /// Rust, the only strings that survive are what
+    /// [`Selector::parse`](crate::flow_proposal::Selector::parse) accepted, and
+    /// what comes back is a [`Proposed`](crate::flow_proposal::Proposed) whose
+    /// `summary` is counts and our own field names.
+    ///
+    /// # The ruling is a read, and the row is a proposal
+    ///
+    /// [`BrowserRead`], because one page load on a public host is the whole of
+    /// what this does to the outside world — the same token, the same scope
+    /// check, the same audit kind as [`Effects::read_page`]. It does **not**
+    /// need `allowed_domains`, and the promotion later does not grant it
+    /// either: `proof_of_need::Prober` types into the form, which is a
+    /// `BrowserWrite`, so a promoted flow on a host that is not on the write
+    /// list still will not probe. `docs/ORIZN.md` says so where the promotion
+    /// is documented, because granting it quietly here would be a policy change
+    /// hidden inside a data change.
+    ///
+    /// The row it writes is this tenant's own and is not an [`Action`], exactly
+    /// as `discover_prospects`' rows are not.
+    ///
+    /// [`Action`]: agentos_domain::action::Action
+    /// [`ActionKind`]: agentos_domain::action::ActionKind
+    pub async fn propose_flow<A: Subject<Of = BrowserRead>>(
+        &self,
+        ok: Authorized<A>,
+        url: &Url,
+    ) -> Result<crate::flow_proposal::Proposed, EffectError> {
+        let allowed = ok.action().subject().domain.clone();
+        let proposed = self.read_form(&allowed, url).await;
+        let detail = Some(json!({ "domain": allowed.as_str() }));
+        self.record(&ok, detail, proposed).await
+    }
+
+    /// The provider-and-store half of [`Effects::propose_flow`], split out for
+    /// [`Effects::load_page`]'s reason.
+    async fn read_form(
+        &self,
+        allowed: &Domain,
+        url: &Url,
+    ) -> Result<crate::flow_proposal::Proposed, EffectError> {
+        let markup = self.load_markup(allowed, url).await?;
+        let proposed = crate::flow_proposal::propose(&markup);
+        // The markup is dropped here and never leaves this function. It is the
+        // most dangerous string this process holds — a stranger's script bodies
+        // and inline handlers — and the only thing that ever looked at it was a
+        // scanner that returns identifiers.
+        drop(markup);
+
+        let host = url.host_str().ok_or(EffectError::Refused(NO_PROSPECT))?;
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let filed = agentos_store::revenue::propose_prospect_flow(
+            &mut tx,
+            self.principal.employee_id,
+            host,
+            &agentos_store::revenue::NewFlowProposal {
+                entry_url: url.as_str(),
+                passport_field: proposed.passport_field.as_ref().map(sel),
+                destination_field: proposed.destination_field.as_ref().map(sel),
+                date_field: proposed.date_field.as_ref().map(sel),
+                submit: proposed.submit.as_ref().map(sel),
+                panel: proposed.panel.as_ref().map(sel),
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            RevenueError::Store(err) => EffectError::Unavailable(err),
+            other => EffectError::Unavailable(StoreError::conflict(other.to_string())),
+        })?;
+        if filed.is_none() {
+            // Nothing was written, so nothing to commit; the message is the
+            // point. A host no account owns is a page about nobody.
+            return Err(EffectError::Refused(NO_PROSPECT));
+        }
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        Ok(proposed)
+    }
+
+    /// The provider half of [`Effects::propose_flow`].
+    ///
+    /// Deliberately **not** a `selector` parameter, unlike [`Effects::load_page`]:
+    /// there is one element worth asking for and it is the whole document, so
+    /// there is nothing here for a caller to choose. A markup read that took a
+    /// selector would be a markup read a tool could one day be built on.
+    async fn load_markup(
+        &self,
+        allowed: &Domain,
+        url: &Url,
+    ) -> Result<Untrusted<String>, EffectError> {
+        if !within(url.host_str(), allowed) {
+            return Err(EffectError::OutOfScope(allowed.clone()));
+        }
+        let session = self.browser_session().await?;
+        self.ports
+            .browser
+            .act(&session, BrowserStep::Goto(url))
+            .await
+            .map_err(EffectError::Provider)?;
+        match self
+            .ports
+            .browser
+            .act(&session, BrowserStep::Markup(WHOLE_PAGE))
+            .await
+            .map_err(EffectError::Provider)?
+        {
+            // Already wrapped by the adapter, and it stays that way.
+            BrowserOutcome::Markup(html) => Ok(html),
+            // Only a broken adapter answers a markup read with something else —
+            // including with a `Text`, which is why those are two variants.
+            _ => Err(EffectError::Refused("not_markup")),
+        }
+    }
+
     /// The provider half of [`Effects::read_page`], split out so the token, the
     /// audit row and the two steps do not share one method's error paths.
     async fn load_page(
@@ -1225,6 +1361,12 @@ fn discovery_error(err: crate::prospects::ImportError) -> EffectError {
             EffectError::Refused(BAD_SEGMENT)
         }
     }
+}
+
+/// A proposed selector as the store takes it. One place, so the five bindings
+/// in [`Effects::read_form`] cannot each spell it differently.
+fn sel(selector: &crate::flow_proposal::Selector) -> &str {
+    selector.as_str()
 }
 
 /// The payload detail every message-shaped effect shares.
