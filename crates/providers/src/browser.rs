@@ -145,6 +145,32 @@ pub enum BrowserStep<'a> {
     Screenshot,
 }
 
+impl BrowserStep<'_> {
+    /// Does this step only *look*, or does it change somebody else's page?
+    ///
+    /// **The classification lives here, beside the variants, and the match has
+    /// no `_` arm** — so adding a step to the enum above stops the build until
+    /// somebody says which side it is on. That is the same discipline
+    /// `agentos_domain::policy::evaluate_rules` keeps for `Action`, and it is
+    /// here for a sharper reason than tidiness: the default a `_` arm would
+    /// pick is the one that decides whether an unclassified step can be driven
+    /// by a token that was only ruled a read.
+    ///
+    /// `Goto` is a read. Navigating is how you get to a page to look at it, and
+    /// the URL is scope-checked against the token's own domain before it runs.
+    /// `Screenshot` and `Text` observe. `Click`, `Type` and `Fill` put
+    /// something of ours into a stranger's system, which is a write whatever
+    /// the element happens to be — a search box today and a "delete account"
+    /// button on the next redesign, and the selector cannot tell them apart.
+    #[must_use]
+    pub const fn is_a_read(&self) -> bool {
+        match self {
+            Self::Goto(_) | Self::Text(_) | Self::Screenshot => true,
+            Self::Click(_) | Self::Type { .. } | Self::Fill { .. } => false,
+        }
+    }
+}
+
 /// What a [`BrowserStep`] produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserOutcome {

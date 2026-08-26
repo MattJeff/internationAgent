@@ -267,10 +267,22 @@
 //!   knob is the scheduler that calls it — the day a caller loops over a
 //!   prospect list, the per-domain gap and the robots.txt fetch belong in that
 //!   caller, next to the loop, not hidden in here.
-//! * **The allowlist is the real fence.** Every browser touch is gated, so the
-//!   set of sites this can ever visit is `allowed_domains` on the policy. That
-//!   is what keeps it a proof-of-need tool and not a scraper pointed at the
-//!   web.
+//! * **The confirmed flow is the real fence, and the allowlist never was.**
+//!   Every browser touch is gated, but the three gates are not equal. A *read*
+//!   asks `Channel::Web` and the denylist, which since the browsing split is
+//!   the whole public web — so no host list bounds what this can look at. A
+//!   *write* additionally asks `allowed_domains`. And a probe additionally
+//!   needs a `Flow`, whose private seal cannot be spelled outside this file
+//!   and whose only constructor demands a `prospect_flows` row confirmed by a
+//!   named human, on a table `app_role` may not INSERT into.
+//!
+//!   That last one is what keeps this a proof-of-need tool and not a scraper:
+//!   it names the entry URL *and* the selectors, where a host list names a
+//!   host. It also became more load-bearing the day reads opened, because
+//!   `store::revenue::set_prospect_flow`'s own argument for being an admin
+//!   transaction is that an employee writing this table "could point a
+//!   selector at any element on a domain its policy lets it read" — and that
+//!   domain set is now every domain.
 //!
 //! # Where a [`Flow`] comes from, and the two shapes it is not
 //!

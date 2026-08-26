@@ -326,6 +326,29 @@ fn preference(role: &str) -> Option<ModelId> {
 /// The ceiling stands in for the platform, tenant and employee layers because
 /// Orizn writes only two of the four; that is stated rather than hidden, and it
 /// is the same shape `apps/server/tests/orizn.rs` installs.
+/// The effective policy one seat runs under, off the operator's own documents.
+///
+/// **Extracted because two callers need it and only one had it.** [`seats`]
+/// built this and threw it away; [`digest`] never had one, so the prompts it
+/// hashed were built with `SystemPrompt::policy == None` — and
+/// `app::prompt::render_domains` returns early on that, meaning the entire
+/// "Sites you can read" section was outside the pin. An edit to that paragraph
+/// changed every real prefix and moved no digest, which is the same defect the
+/// tool schemas had and is fixed here the same way.
+///
+/// Ceiling ∧ ceiling ∧ role ∧ ceiling: the tenant and employee layers are the
+/// ceiling because Orizn installs neither, which is what
+/// `apps/server/tests/orizn.rs` stands up and asserts.
+pub fn policy_for(role: &str) -> Option<EffectivePolicy> {
+    let ceiling = limits("orizn-ceiling.json");
+    let raw = role_layers()
+        .into_iter()
+        .find(|(name, _)| name.strip_suffix(".json").unwrap_or(name) == role)
+        .map(|(_, raw)| raw)?;
+    let layer: PolicyLimits = serde_json::from_str(&raw).ok()?;
+    EffectivePolicy::try_new(&ceiling, &ceiling, &layer, &ceiling).ok()
+}
+
 pub fn seats() -> Vec<Seat> {
     let ceiling = limits("orizn-ceiling.json");
     role_layers()
@@ -597,7 +620,17 @@ pub fn digest() -> String {
         hasher.update(seat.as_bytes());
         hasher.update(charter.role().as_bytes());
         hasher.update(charter.model().as_str().as_bytes());
-        let prompt = charter.system_prompt(PIN_IDENTITY);
+        // The policy attached, so `render_domains` renders. Without it the
+        // prompt carries `policy: None`, that section returns early, and the
+        // paragraph telling an employee what it may read — which is prefix on
+        // every turn this file prices — sits outside the hash. See
+        // [`policy_for`].
+        let prompt = match policy_for(charter.role()) {
+            Some(policy) => charter
+                .system_prompt(PIN_IDENTITY)
+                .with_mcp_tools(&policy, []),
+            None => charter.system_prompt(PIN_IDENTITY),
+        };
         for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
             // The request rather than the prefix: what this file prices is
             // tokens, and a tool schema is tokens. `max_tokens` is a ceiling on

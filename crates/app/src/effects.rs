@@ -76,6 +76,25 @@ use crate::turn::WHOLE_PAGE;
 /// model needs to stop asking rather than try a different URL.
 pub const NO_BROWSER: &str = "no_browser";
 
+/// A step that writes, driven by a token the gate ruled as a *read*.
+///
+/// **This was reachable, and widening reads made it live.** `Browse`
+/// (`proof_of_need::Browse`) rules as `Action::BrowserRead` and declares
+/// `type Of = BrowserWrite`, so it satisfies [`Effects::browse_write`]'s bound
+/// and could drive a `Type` or a `Click`. `read_page`'s own documentation
+/// asserted the opposite — *"a token minted for reading cannot be spent on
+/// `Effects::browse_write`"* — which was a claim about a bound that both
+/// tokens satisfy.
+///
+/// It mattered little while a read had to clear `allowed_domains`: the two
+/// rulings then permitted the same set of hosts, so the escalation bought
+/// nothing. Since reads clear `Channel::Web` alone, a read ruling covers the
+/// entire public web and a write ruling covers a list an operator typed — so
+/// the same token now spans two very different permissions, and the audit row,
+/// written from `to_action().kind()`, would have called the typing a
+/// `browser_read`.
+pub const READ_TOKEN: &str = "read_token";
+
 /// What [`Effects::discover_prospects`] answers when this employee's policy
 /// cannot be loaded at all.
 ///
@@ -588,7 +607,16 @@ impl Effects {
         step: BrowserStep<'_>,
     ) -> Result<BrowserOutcome, EffectError> {
         let allowed = ok.action().subject().domain.clone();
-        let outcome = if let BrowserStep::Goto(url) = &step
+        // **What the gate actually ruled on**, not what the bound admits. Both
+        // subjects reach here — see [`READ_TOKEN`] — and only the action says
+        // which permission was bought. Written as "a read ruling may drive a
+        // reading step" rather than as a denylist of writing steps, so
+        // `BrowserStep::is_a_read`'s exhaustive match is the one place a new
+        // variant has to be classified.
+        let ruled_a_read = matches!(ok.action().to_action(), Action::BrowserRead { .. });
+        let outcome = if ruled_a_read && !step.is_a_read() {
+            Err(EffectError::Refused(READ_TOKEN))
+        } else if let BrowserStep::Goto(url) = &step
             && !within(url.host_str(), &allowed)
         {
             Err(EffectError::OutOfScope(allowed.clone()))
@@ -626,11 +654,18 @@ impl Effects {
     /// # It is a read, and it is unspellable as anything else
     ///
     /// The bound is [`BrowserRead`] and not [`BrowserWrite`], so a token minted
-    /// for typing into somebody's form cannot be spent here and a token minted
-    /// for reading cannot be spent on [`Effects::browse_write`]. The audit row
+    /// for typing into somebody's form cannot be spent here. The audit row
     /// follows from the token — [`Effects::record`] writes
     /// `ok.action().to_action().kind()` — so `browser_read` and `browser_write`
     /// rows say what actually happened, with no flag for a caller to set.
+    ///
+    /// **The converse was claimed here and was false.** A token minted for
+    /// reading *could* be spent on [`Effects::browse_write`], because
+    /// `proof_of_need::Browse` rules as a read while declaring
+    /// `type Of = BrowserWrite`; the bound admits it. What stops it is a check
+    /// inside that method rather than this one's signature — see
+    /// [`READ_TOKEN`], which explains why widening reads to the public web
+    /// turned a harmless overlap into a live escalation.
     ///
     /// The text comes back [`Untrusted`] because it is a stranger's page, and it
     /// is the adapter that wrapped it — see
@@ -1633,6 +1668,100 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1["outcome"], json!("error"));
         assert_eq!(rows[0].1["effect"], json!("payment_create"));
+    }
+
+    /// **A read ruling cannot buy a keystroke on somebody's page.**
+    ///
+    /// `proof_of_need::Browse` rules as `Action::BrowserRead` and declares
+    /// `type Of = BrowserWrite`, so it satisfies `browse_write`'s bound. That
+    /// overlap was harmless while a read had to clear `allowed_domains` — the
+    /// two rulings permitted the same hosts. Since a read clears
+    /// `Channel::Web` alone it permits the entire public web, so the same
+    /// token spanned "look at anything" and "type into a named list", and the
+    /// audit row would have called the typing a `browser_read`.
+    ///
+    /// The fixture's employee has `portal.example.com` on its write list, so
+    /// the host is not what refuses this: the *ruling* is. Both directions are
+    /// asserted, because a check that only refused would pass by being an off
+    /// switch and would break every `Goto` the prober makes.
+    #[tokio::test]
+    async fn a_read_ruling_cannot_drive_a_step_that_types() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let session = BrowserSession {
+            employee_id: principal.employee_id,
+            binding: ProviderBinding {
+                provider: "mock-browser".to_owned(),
+                external_id: "ctx-1".to_owned(),
+            },
+            user_data_dir: None,
+        };
+        let host = Domain::parse("portal.example.com").expect("domain");
+        let reading = crate::proof_of_need::Browse::of(host.clone());
+
+        for step in [
+            BrowserStep::Type {
+                sel: "#passport",
+                text: "FRA",
+            },
+            BrowserStep::Click("#search"),
+        ] {
+            let token = gate(&db)
+                .authorize(&principal, reading.clone())
+                .await
+                .expect("a read is allowed: the seat carries the web channel");
+            let err = effects
+                .browse_write(token, &session, step)
+                .await
+                .expect_err("a read ruling must not type");
+            assert_eq!(err.code(), READ_TOKEN);
+        }
+
+        // Refusals are recorded like any other failed effect, and as what the
+        // token was — a read that did not happen, not a write that did.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1["error"], json!(READ_TOKEN));
+        assert_eq!(rows[0].1["effect"], json!("browser_read"));
+
+        // And the steps a read *is* for still run, or the prober's every
+        // navigation would have died with this fix.
+        // `Text` is a read too and is deliberately not exercised here: this
+        // mock browser has no page loaded, so it answers `no_such_element` and
+        // would fail for a reason that is not this test's. `Goto` is the step
+        // the neighbouring test already proves the mock serves.
+        let inside = Url::parse("https://portal.example.com/book").expect("url");
+        let token = gate(&db)
+            .authorize(&principal, reading.clone())
+            .await
+            .expect("still a read");
+        effects
+            .browse_write(token, &session, BrowserStep::Goto(&inside))
+            .await
+            .expect("a reading step on a read ruling");
+
+        // The write ruling keeps typing, which is the half that must not have
+        // been taken away.
+        let token = gate(&db)
+            .authorize(&principal, BrowserWrite { domain: host })
+            .await
+            .expect("portal.example.com is on the write list");
+        effects
+            .browse_write(
+                token,
+                &session,
+                BrowserStep::Type {
+                    sel: "#passport",
+                    text: "FRA",
+                },
+            )
+            .await
+            .expect("a write ruling may type");
     }
 
     #[tokio::test]

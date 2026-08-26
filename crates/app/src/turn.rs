@@ -208,10 +208,15 @@ pub const UNSERVED: [(ActionKind, &str); 10] = [
     ),
     (
         ActionKind::BrowserWrite,
-        "no pack proposes it, and every one of them explains the refusal in the same terms: \
-         `PolicyLimits` has a single `allowed_domains` set shared by reading and writing, so a \
-         layer that lets an employee read a site lets it post there. Submitting a form on \
-         somebody's production system is a person's decision.",
+        "no pack proposes it, and the reason the packs gave has stopped being true: they argued \
+         that `PolicyLimits` has a single `allowed_domains` set shared by reading and writing, \
+         so a layer letting an employee read a site let it post there. Reading is a channel now \
+         and asks no host list, so that argument is gone and the refusal outlives it. What \
+         withholds this is narrower and better: the only thing in this workspace that types \
+         into a stranger's page is `proof_of_need::Prober`, which is Rust holding a `&Flow` \
+         whose selectors a named human confirmed — `app_role` has no INSERT on `prospect_flows`. \
+         A tool here would hand that verb to a model with a free-string selector, which is the \
+         one thing the confirmation exists to prevent.",
     ),
     (
         ActionKind::FileUpload,
@@ -355,7 +360,7 @@ pub(crate) const BROWSE_RISK: Risk = Risk::Low;
 /// it — and the two audiences come from the same table read the same way, so a
 /// report named in the prefix and a report reached by a briefing cannot be
 /// different sets.
-fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 7] {
+pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 7] {
     [
         (
             SEND_EMAIL,

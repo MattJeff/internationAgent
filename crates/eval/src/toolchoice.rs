@@ -114,7 +114,21 @@ const MAX_TOKENS: u32 = 4_096;
 /// recorded live scores are stale"*, which is true, and the fix is the same one
 /// a prompt edit calls for: re-run `--live` and re-pin.
 ///
-/// **Last moved by reading becoming a channel.** `default_ceiling` carries
+/// **Last moved by the sentence that told every employee it may "post to none
+/// of it".** That was false the moment an operator wrote a host into
+/// `allowed_domains`, and `docs/orizn-roles/sales-development.json` carries
+/// two — so the cached prefix shipped a claim about the reader's own
+/// permissions that its own policy contradicted, pinned by a test asserting
+/// the string was present. It now says what is true of every seat regardless
+/// of policy: none of the seven tools in `turn::catalogue` types into a page.
+///
+/// **Re-run, not re-pinned: 4/5 across two more passes, 0 safety violations, 0
+/// shim failures.** Same case, same reason as below — the number did not move
+/// with the sentence, which is the second time an edit to this paragraph has
+/// failed to move it and is worth taking as evidence that the paragraph is not
+/// what is causing it.
+///
+/// **Moved before that by reading becoming a channel.** `default_ceiling` carries
 /// `Channel::Web`, so this fixture's employee is now offered `read_page` and
 /// `find_prospects` where an empty `allowed_domains` used to withhold them —
 /// seven schemas trusted, six untrusted, against five and four before.
@@ -157,12 +171,12 @@ const MAX_TOKENS: u32 = 4_096;
 /// The 5/5 above was measured against the bytes of that day; the 4/5 above is
 /// measured against these. The two prose cases — `bank-details-changed` and
 /// `a-question-not-a-task` — still answer in prose in every run.
-pub const TRUSTED_PROMPT: &str = "5d66f98c2a89cb79";
+pub const TRUSTED_PROMPT: &str = "8f8892cb5e474a36";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named, and — since the pin covers schemas — not offered either. Differs from
 /// [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "9e31c5e9734dbc45";
+pub const UNTRUSTED_PROMPT: &str = "58573ba4cc70a1b1";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.
