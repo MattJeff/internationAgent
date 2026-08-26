@@ -18,6 +18,34 @@
 //!   this backend do not resemble production ones.
 //! * **One turn, no history reuse.** Every call is a fresh `claude -p`; the
 //!   conversation is re-rendered as text each time.
+//! * **[`LlmRequest::max_tokens`] bounds a fragment, not the call.** There is no
+//!   `--max-tokens`. `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is the nearest thing and it
+//!   caps each *underlying* API request; when the model runs into that cap the
+//!   CLI continues it in another request and hands back one summed `usage`. So a
+//!   `complete` that asked for 4,096 can return more, and the count it reports
+//!   can cover several real calls. `llm_anthropic` puts the same number in the
+//!   body, where it is a hard stop and a `max_tokens` stop reason. It is passed
+//!   anyway, because dropping a field of the request was the previous behaviour
+//!   and it is worse.
+//!
+//! # Extended thinking is off, because production has none
+//!
+//! `llm_anthropic::AnthropicLlm::body` sends `model`, `max_tokens`, `messages`,
+//! `system` and `tools`, and no `thinking` field — so every employee this
+//! workspace deploys runs with extended thinking **off**. The CLI turns it on,
+//! and thinking tokens are billed as output.
+//!
+//! Left alone, that made this backend measure a cost the production path does
+//! not pay. `agentos_eval::dryrun` projects a monthly bill from these output
+//! counts, so the projection inherited it. `MAX_THINKING_TOKENS=0` is the lever,
+//! measured on the same day as the flags below: on a fixed essay prompt, 8,044
+//! output tokens with thinking against **6,392** without, and 4 assistant
+//! messages against 2.
+//!
+//! This is an alignment and not a saving, and the direction matters. If somebody
+//! decides the employees *should* think, the field goes in `llm_anthropic`'s
+//! body first and this line comes out second — never the other way round, or the
+//! dry run goes back to pricing a product nobody ships.
 //!
 //! # What it deliberately does
 //!
@@ -182,7 +210,13 @@ impl CliLlm {
     /// `system` is the only thing that goes on argv, and the module header says
     /// why it may. Every flag below was measured by dropping it; the table in
     /// that header records what each one is holding back.
-    async fn run(&self, model: &str, system: &str, prompt: &str) -> Result<String, ProviderError> {
+    async fn run(
+        &self,
+        model: &str,
+        system: &str,
+        max_tokens: u32,
+        prompt: &str,
+    ) -> Result<String, ProviderError> {
         let mut child = Command::new(&self.program)
             .arg("-p")
             .args(["--output-format", "json"])
@@ -204,6 +238,14 @@ impl CliLlm {
             // Not a flag, and the only lever there is: the operator's private
             // notes are otherwise read into the session and quoted back.
             .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+            // `LlmRequest::max_tokens` is a field of the request and this
+            // adapter used to drop it on the floor. There is no `--max-tokens`,
+            // so this is the closest the CLI has — and it is not the same
+            // thing, which the module header now says out loud.
+            .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", max_tokens.to_string())
+            // The production path sends no `thinking` field, so production has
+            // extended thinking OFF. The CLI turns it on. See the module header.
+            .env("MAX_THINKING_TOKENS", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -244,7 +286,12 @@ impl CliLlm {
 impl Llm for CliLlm {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, ProviderError> {
         let stdout = self
-            .run(&req.model, &req.system, &render_prompt(&req))
+            .run(
+                &req.model,
+                &req.system,
+                req.max_tokens,
+                &render_prompt(&req),
+            )
             .await?;
         let (text, stop_reason, usage) = parse_result_event(&stdout)?;
 
@@ -518,7 +565,10 @@ mod tests {
     fn recording() -> Fake {
         Fake::new(&format!(
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\n\
-             printf 'AUTO_MEMORY=%s\\n' \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \
+             printf 'AUTO_MEMORY=%s\\nMAX_OUTPUT=%s\\nTHINKING=%s\\n' \
+               \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \
+               \"$CLAUDE_CODE_MAX_OUTPUT_TOKENS\" \
+               \"$MAX_THINKING_TOKENS\" \
                > \"$(dirname \"$0\")/env\"\n\
              cat > \"$(dirname \"$0\")/stdin\"\n\
              cat <<'JSON_EOF'\n{EVENTS}\nJSON_EOF"
@@ -604,9 +654,49 @@ mod tests {
             "an auto-approve list is not a registration list; it never withheld anything"
         );
         assert_eq!(
-            fs::read_to_string(fake.path("env")).unwrap().trim(),
+            fs::read_to_string(fake.path("env"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
             "AUTO_MEMORY=1",
             "the operator's private notes are read into the session without this"
+        );
+    }
+
+    /// **The two numbers that decide the output bill leave this process.**
+    ///
+    /// Neither is a flag, so neither is visible in `argv` and neither was being
+    /// sent. [`LlmRequest::max_tokens`] was read by nobody, and extended
+    /// thinking — which `llm_anthropic` never turns on, because its body has no
+    /// `thinking` field — was on for every call.
+    ///
+    /// `agentos_eval::dryrun` prices a month from the output tokens this
+    /// backend reports, so both of them were being billed into a projection for
+    /// a product that does not have them. A single `sdr` turn in that run
+    /// returned **12,850 output tokens** against a `max_tokens` of 4,096.
+    ///
+    /// The assertion is on the child's environment rather than on a token
+    /// count, for the reason [`the_clis_own_session_is_not_on_offer`] gives
+    /// about argv: what this process controls is what it asks for. Whether
+    /// `claude` honours it is a claim about the binary, and the module header
+    /// records what was measured against the real one — including that the cap
+    /// bounds a fragment and not the call.
+    #[tokio::test]
+    async fn the_request_ceiling_and_the_thinking_switch_reach_the_child() {
+        let fake = recording();
+        let request = LlmRequest::new("claude-opus-5", "you are lena", 4096)
+            .with_message(Message::user("hi"));
+        assert!(fake.llm().complete(request).await.is_ok());
+
+        let env = fs::read_to_string(fake.path("env")).unwrap();
+        assert!(
+            env.contains("\nMAX_OUTPUT=4096\n"),
+            "`LlmRequest::max_tokens` was dropped on the floor: {env}"
+        );
+        assert!(
+            env.contains("\nTHINKING=0\n"),
+            "thinking tokens are billed as output and production generates none: {env}"
         );
     }
 
@@ -741,7 +831,7 @@ mod tests {
     #[ignore = "shells out to the real claude binary"]
     async fn the_real_cli_keeps_none_of_its_own_session() {
         let stdout = CliLlm::new()
-            .run("claude-opus-5", "Reply with exactly: OK", "say OK")
+            .run("claude-opus-5", "Reply with exactly: OK", 4096, "say OK")
             .await
             .unwrap();
         let events: Vec<Value> = serde_json::from_str(&stdout).unwrap();

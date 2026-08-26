@@ -70,6 +70,32 @@ use crate::{Row, Surface, Truth};
 
 /// USD per million input tokens for `claude-opus-5`. The one number in this
 /// crate that comes from outside the repository.
+///
+/// **This is metered API pricing, and it is only one of the two ways this
+/// system can be run.** Everything below prices `AGENTOS_LLM=anthropic`: an
+/// API key, billed per token, where the bill grows with the payroll and the
+/// only ceiling is the one an operator sets.
+///
+/// The other way is `AGENTOS_LLM=cli`, which drives the local `claude` binary
+/// (`crates/providers/src/llm_cli.rs`). Under a **subscription**, that binary
+/// bills against the subscription and not per token, so every figure this
+/// module computes is the wrong currency: the marginal cost of a turn is zero
+/// and the constraint that replaces it is **throughput**. See
+/// [`CALLS_PER_DAY_AT_MEASURED_RATE`], which is the number to compare against a
+/// plan's limits, and which is why it is computed here and not left implicit.
+///
+/// Two things follow, and both are the operator's to check rather than this
+/// crate's to assume:
+///
+/// * A subscription's limits are stated per rolling window, not per month, so
+///   the question is never "does 4,000 calls a month fit" but "does the busiest
+///   window fit". A company whose employees all wake on the same cadence
+///   concentrates its load; `domain::initiative` jitters the schedule, which
+///   helps and is not a plan.
+/// * Whether a given subscription *permits* an unattended fleet is a question
+///   about that plan's terms, not about tokens, and this crate cannot answer
+///   it. It is worth answering before sizing anything on it, because the
+///   failure mode is not a larger bill — it is the account.
 pub const USD_PER_M_INPUT: f64 = 5.0;
 
 /// USD per million output tokens for the same model.
@@ -379,6 +405,36 @@ pub fn headline() -> String {
     )
 }
 
+/// The same load, priced in requests instead of dollars.
+///
+/// **The figure to carry to a subscription**, where tokens are not what runs
+/// out. Metered pricing and a subscription bound the same system with different
+/// resources, and the arithmetic above answers only the first — so an operator
+/// who reads `$303–$560` and concludes the CLI backend is free has not
+/// converted the constraint, they have dropped it.
+///
+/// The spread is the point. Calls per turn varied 2× across the recorded runs,
+/// so this is a range and not a rate, and the wide end is what a plan has to
+/// absorb. It is also a *daily* figure against limits usually stated per
+/// rolling window: a company whose seats all fall due together spends its
+/// allowance in one hour and idles for the rest, which is a scheduling
+/// property and not a budget one.
+pub fn calls_per_day() -> (f64, f64) {
+    let turns = f64::from(turns_per_day());
+    spread(|s| s.calls_per_turn * turns)
+}
+
+/// [`calls_per_day`] as the sentence a subscription is sized against.
+pub fn throughput_headline() -> String {
+    let (lo, hi) = calls_per_day();
+    let turns = turns_per_day();
+    format!(
+        "{lo:.0}–{hi:.0} model calls a day at {turns} reserved turns, over {} measured runs — \
+         the figure a subscription is bounded by, where the bill is not",
+        RECORDED.len(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The suite
 // ---------------------------------------------------------------------------
@@ -390,6 +446,19 @@ pub fn evaluate() -> Surface {
     // --- 1. the number ------------------------------------------------------
     // Characterised, and it can be nothing else: it is arithmetic over a sample
     // from a model. A pass/fail on it would be a threshold on a coin flip.
+    rows.push(
+        Row::ok(
+            "the same load, priced in requests",
+            throughput_headline(),
+            Truth::Characterises,
+        )
+        .note(
+            "The bill above is metered API pricing. Driving the local `claude` binary under a \
+             subscription bills nothing per token, and this is the resource that runs out \
+             instead. Whether a plan permits an unattended fleet is a question about its terms, \
+             not about tokens.",
+        ),
+    );
     rows.push(
         Row::ok("Orizn's monthly bill", headline(), Truth::Characterises).note(
             "a range because a reserved turn is 1–10 model calls; the floor alone is what \

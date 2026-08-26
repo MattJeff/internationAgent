@@ -2571,6 +2571,85 @@ mod tests {
         assert_eq!(h.payments.calls(), vec!["5000000 to account-X".to_owned()]);
     }
 
+    /// **Each round extends the last one's prompt instead of rewriting it, and
+    /// says so on the wire.**
+    ///
+    /// This is the arithmetic that makes a multi-round turn affordable, and it
+    /// is invisible from either side of this function. `prompt::request` proves
+    /// it marks the end of the history it is *handed*; `llm_anthropic` proves
+    /// the mark reaches the wire and that the system block carries one too. Only
+    /// the loop decides what history each round is handed — and a cache read is
+    /// a *prefix* match, so it needs all three of the things asserted below: the
+    /// same system block, the same schemas, and a message list that grows at the
+    /// end.
+    ///
+    /// Break any one of them — rebuild `messages` instead of cloning it, sort
+    /// the tool results, drop the breakpoint, put a clock in the prefix — and
+    /// every other test in this workspace still passes while every round after
+    /// the first is billed at full price. `agentos_eval::dryrun` measured 3.56
+    /// model calls per reserved turn and 6,155 prompt tokens on the fourth
+    /// round against 4,235 on the first: this property is worth roughly 3× the
+    /// input half of the bill, and nothing else was watching it.
+    #[tokio::test]
+    async fn each_round_extends_the_previous_prompt_instead_of_rewriting_it() {
+        let Some(db) = db().await else { return };
+        let llm = Arc::new(ScriptedLlm::responses(vec![
+            email_call("toolu_1", "supplier@example.com"),
+            pay_call("toolu_2"),
+            done(),
+        ]));
+        let h = harness(&db, llm.clone(), "{}").await;
+
+        h.turn
+            .run(
+                Context::new().with_task("settle invoice 42"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("a trusted run");
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 3, "three rounds, three prompts");
+
+        for (round, request) in requests.iter().enumerate() {
+            assert_eq!(
+                request.cache_breakpoint,
+                Some(request.messages.len() - 1),
+                "round {} sent a history it did not mark as cacheable",
+                round + 1
+            );
+        }
+
+        for (round, pair) in requests.windows(2).enumerate() {
+            let [before, after] = pair else {
+                unreachable!("windows(2)")
+            };
+            // The taint never moves in this run — it is email and payment, both
+            // ours — so a prefix that moved anyway is a prefix with something
+            // per-turn in it, which is the expensive kind of bug.
+            assert_eq!(
+                before.system,
+                after.system,
+                "round {} re-rendered the system prompt; every cache read after it misses",
+                round + 2
+            );
+            assert_eq!(
+                before.tools,
+                after.tools,
+                "round {} re-rendered the schemas; they sit inside the same breakpoint",
+                round + 2
+            );
+            assert!(
+                after.messages.len() > before.messages.len()
+                    && after.messages[..before.messages.len()] == before.messages[..],
+                "round {} rewrote the conversation instead of appending to it, so the entry \
+                 round {} just paid to write can never be read back",
+                round + 2,
+                round + 1
+            );
+        }
+    }
+
     /// The link the spec never made: a tool result is a stranger's text, so it
     /// taints the *rest of the run* and the high-risk schema disappears
     /// mid-conversation.
