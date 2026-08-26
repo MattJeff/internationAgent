@@ -752,6 +752,11 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         role,
         turns = finished.turns,
         tool_calls = finished.tool_calls,
+        // Beside `tool_calls` because it is the half of it that did nothing.
+        // Without it a turn whose every proposal was rejected by the parser
+        // logs the same line as a turn whose every proposal ran, and the only
+        // way to tell them apart is a join against `audit_log`.
+        malformed_calls = finished.malformed_calls,
         stop_reason = finished.stop_reason.code(),
         input_tokens = finished.usage.input_tokens,
         output_tokens = finished.usage.output_tokens,

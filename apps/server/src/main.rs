@@ -1225,6 +1225,12 @@ impl Agent {
                 %employee_id,
                 turns = finished.turns,
                 tool_calls = finished.tool_calls,
+                // The other turn path logs this too. Both, or the number is
+                // only true of self-started turns and an employee answering a
+                // customer keeps the blind spot: `tool_calls = 3` reads the
+                // same whether three things happened or three were rejected by
+                // the parser before the gate ever saw them.
+                malformed_calls = finished.malformed_calls,
                 stop_reason = finished.stop_reason.code(),
                 input_tokens = finished.usage.input_tokens,
                 output_tokens = finished.usage.output_tokens,

@@ -761,6 +761,9 @@ impl Default for Budgets {
 struct Spent {
     turns: u32,
     tool_calls: u32,
+    /// Of those, the ones [`Turn::propose`] could not parse — see
+    /// [`Finished::malformed_calls`].
+    malformed_calls: u32,
     usage: Usage,
 }
 
@@ -827,6 +830,23 @@ pub struct Finished {
     pub turns: u32,
     /// Tool calls attempted, denied ones included.
     pub tool_calls: u32,
+    /// Of [`Self::tool_calls`], the ones that never reached the gate because
+    /// [`Turn::propose`] could not parse them.
+    ///
+    /// **This is the number that makes a bad turn legible.** A turn that
+    /// proposed three actions and had all three rejected by the parser logs
+    /// `tool_calls = 3` and writes no `audit_log` row, which is
+    /// indistinguishable at a glance from three actions that worked — and
+    /// exactly that reading is how a live run reporting "23 tool calls" hid the
+    /// fact that eight of them never happened. Reconstructing it needs a join
+    /// against the audit log per turn, so it is counted where it is known.
+    ///
+    /// Deliberately **not** a count of failed tool results. A gate refusal is
+    /// also `is_error`, and `denied (pending_approval)` on a payment is the
+    /// system working exactly as Orizn configured it — folding that in would
+    /// make the healthiest finance turn in the company look like the worst one.
+    /// This counts only calls that failed *before* anybody ruled on them.
+    pub malformed_calls: u32,
     /// The whole conversation, for persisting as history.
     pub messages: Vec<Message>,
     /// What the context was worth by the end. Untrusted if anything
@@ -1146,6 +1166,7 @@ impl Turn {
                     usage: spent.usage,
                     turns: spent.turns,
                     tool_calls: spent.tool_calls,
+                    malformed_calls: spent.malformed_calls,
                     messages,
                     trust,
                 });
@@ -1166,7 +1187,10 @@ impl Turn {
 
                 let reply = match self.propose(name, input) {
                     Ok(proposal) => self.perform(proposal, trust).await?,
-                    Err(why) => Reply::Error(why),
+                    Err(why) => {
+                        spent.malformed_calls += 1;
+                        Reply::Error(why)
+                    }
                 };
 
                 results.push(match reply {
@@ -1191,12 +1215,39 @@ impl Turn {
 
     /// Parse one tool call. `Err` is the sentence the model is shown, so it
     /// says what was wrong with the call and nothing else.
+    ///
+    /// **The sentence names the field.** It used to stop at "arguments are not
+    /// an email", which tells a model that its call was rejected and not one
+    /// thing about why — so the retry it is about to spend is a guess, and a
+    /// model guessing at six fields will guess wrong more often than not.
+    /// [`serde_json`]'s own message is `missing field \`subject\`` or `invalid
+    /// type: string "240.00", expected u64`, and both of those are precisely
+    /// the correction, in the schema's own field names: [`EmailArgs`] and its
+    /// siblings are named after the `properties` in [`catalogue`], and
+    /// `every_required_field_is_named_back_to_the_model` is what keeps that
+    /// true — it takes each required field out in turn and asserts the sentence
+    /// names the one it removed.
+    ///
+    /// The doc on [`parse`] used to argue the opposite — that serde's message
+    /// "names our internal field types" and the model deserves a sentence
+    /// written for it. The first half is not true of these six structs and the
+    /// second half was being used to justify saying nothing.
+    ///
+    /// **It costs no extra model call**, which is the whole argument for doing
+    /// it here rather than anywhere else. A malformed call already comes back
+    /// as a failed tool result and the loop already goes round —
+    /// `a_malformed_tool_call_costs_a_tool_result_not_a_decision` is that
+    /// contract, and it predates this change. The retry is already bought and
+    /// paid for out of [`Budgets::max_turns`]; until now it was spent on a
+    /// sentence the model could not act on.
     fn propose(&self, name: &str, input: &Value) -> Result<Proposal, String> {
-        let args = |kind: &str| format!("{name}: arguments are not {kind}");
+        let args = |kind: &'static str| {
+            move |err: serde_json::Error| format!("{name}: arguments are not {kind}: {err}")
+        };
 
         match name {
             SEND_EMAIL => {
-                let EmailArgs { to, subject, body } = parse(input).map_err(|_| args("an email"))?;
+                let EmailArgs { to, subject, body } = parse(input).map_err(args("an email"))?;
                 Ok(Proposal::Email(
                     EmailSend {
                         to: to
@@ -1214,8 +1265,7 @@ impl Turn {
                 ))
             }
             READ_PAGE => {
-                let ReadArgs { url, selector } =
-                    parse(input).map_err(|_| args("a page to read"))?;
+                let ReadArgs { url, selector } = parse(input).map_err(args("a page to read"))?;
                 let url =
                     Url::parse(&url).map_err(|e| format!("url: {url:?} is not a URL: {e}"))?;
                 // The host is the subject. A URL with none — `file:`, `data:`,
@@ -1240,7 +1290,7 @@ impl Turn {
                     server,
                     tool,
                     arguments,
-                } = parse(input).map_err(|_| args("a tool call"))?;
+                } = parse(input).map_err(args("a tool call"))?;
                 let server = Slug::parse(&server).map_err(|e| format!("server: {e}"))?;
                 let tool = Slug::parse(&tool).map_err(|e| format!("tool: {e}"))?;
                 Ok(Proposal::Tool(
@@ -1256,7 +1306,7 @@ impl Turn {
                     amount_minor,
                     currency,
                     memo,
-                } = parse(input).map_err(|_| args("a payment"))?;
+                } = parse(input).map_err(args("a payment"))?;
                 let currency = currency
                     .parse::<Currency>()
                     .map_err(|e| format!("currency: {e}"))?;
@@ -1270,7 +1320,7 @@ impl Turn {
             }
             MESSAGE_COLLEAGUE => {
                 let ColleagueArgs { to, kind, body } =
-                    parse(input).map_err(|_| args("a message to a colleague"))?;
+                    parse(input).map_err(args("a message to a colleague"))?;
                 let to = Slug::parse(&to).map_err(|e| format!("to: {e}"))?;
                 let errand = Errand::parse(&kind).ok_or_else(|| {
                     format!("kind: {kind:?} is not one of order, question, answer, handover")
@@ -1287,7 +1337,7 @@ impl Turn {
                 ))
             }
             BRIEF_DIRECT_REPORTS => {
-                let BriefArgs { body } = parse(input).map_err(|_| args("a briefing"))?;
+                let BriefArgs { body } = parse(input).map_err(args("a briefing"))?;
                 Ok(Proposal::Brief(InternalNote {
                     errand: Errand::Order,
                     body,
@@ -1455,9 +1505,22 @@ impl Turn {
     }
 }
 
-/// Tool arguments, parsed. The error is thrown away on purpose — serde's
-/// message names our internal field types, and the model gets a sentence
-/// written for it instead.
+/// Tool arguments, parsed. The error is **kept** and shown to the model, and
+/// the comment that used to sit here said the opposite: "serde's message names
+/// our internal field types, and the model gets a sentence written for it
+/// instead."
+///
+/// Both halves were wrong about these six structs. [`EmailArgs`],
+/// [`ReadArgs`], [`McpArgs`], [`PayArgs`], [`ColleagueArgs`] and [`BriefArgs`]
+/// have no internal field types to leak — every field is named after a
+/// `properties` key in [`catalogue`] and typed as `String`, `u64` or
+/// `Option<String>` — so "missing field `subject`" is the schema's own word for
+/// the schema's own gap. And the sentence written for the model was
+/// "arguments are not an email", which is not a sentence written for the model,
+/// it is a sentence written about it.
+///
+/// Nothing of ours is disclosed by it. The values serde quotes back in a type
+/// error came from the model in the first place.
 fn parse<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, serde_json::Error> {
     T::deserialize(input)
 }
@@ -3485,6 +3548,247 @@ mod tests {
         };
         assert!(*is_error);
         assert!(content.contains("unreachable_colleague"), "{content}");
+    }
+
+    /// **Every malformed shape a live run produced, and the sentence each one
+    /// has to come back with.**
+    ///
+    /// The three `--dry-run` passes of 2026-08-26 and three raw replays of the
+    /// finance seat's own prompt produced these; the arguments are the ones the
+    /// parser actually saw, not ones invented here. Two of them —
+    /// `send_email {}` and `message_colleague {}` — are what `llm_cli`'s shim
+    /// used to hand over when the model flattened its arguments into the reply
+    /// envelope instead of nesting them under `input`: a complete and correct
+    /// call, emptied on the way in. `llm_cli::the_arguments_survive_wherever_the_model_puts_them`
+    /// is the other half of that repair; this half is what the parser must say
+    /// when the arguments really are missing.
+    ///
+    /// The assertion is on the **field name**, not on "it failed". Failing was
+    /// never in doubt — the old code failed too, with "arguments are not an
+    /// email", which names nothing the model can change. A retry is spent
+    /// either way out of [`Budgets::max_turns`]; the only question this test
+    /// pins is whether it is spent on information.
+    #[tokio::test]
+    async fn a_malformed_call_names_the_field_and_the_turn_carries_on() {
+        let Some(db) = db().await else { return };
+
+        // (tool, what the parser was handed, the word the reply must contain)
+        let cases: Vec<(&str, Value, &str)> = vec![
+            // The flattened envelope, emptied by the old shim.
+            (SEND_EMAIL, json!({}), "missing field `to`"),
+            // Partly filled: a model that forgot one field is told which.
+            (
+                SEND_EMAIL,
+                json!({ "to": "ops@larkspurtravel.example", "body": "b" }),
+                "missing field `subject`",
+            ),
+            // The live finance seat settles "USD 240.00", and minor units are
+            // the one place a model reaches for the decimal it was given.
+            (
+                PAY,
+                json!({
+                    "payee": "acme-cloud",
+                    "amount_minor": "240.00",
+                    "currency": "USD",
+                    "memo": "INV-4471 against PO-889"
+                }),
+                "invalid type: string",
+            ),
+            (
+                MESSAGE_COLLEAGUE,
+                json!({ "to": "founder", "kind": "question" }),
+                "missing field `body`",
+            ),
+            (BRIEF_DIRECT_REPORTS, json!({}), "missing field `body`"),
+            (
+                READ_PAGE,
+                json!({ "selector": "main" }),
+                "missing field `url`",
+            ),
+        ];
+
+        let mut script: Vec<LlmResponse> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (name, input, _))| {
+                LlmResponse::tool_use(
+                    format!("toolu_{i}"),
+                    *name,
+                    input.clone(),
+                    Usage::new(10, 5, 0),
+                )
+            })
+            .collect();
+        script.push(done());
+
+        let h = harness(&db, Arc::new(ScriptedLlm::responses(script)), "{}").await;
+        let finished = h
+            .turn
+            .run(Context::new(), &CancellationToken::new())
+            .await
+            .expect("a malformed call is a tool result, never the end of the run");
+
+        // Every one of them is in the transcript, in order, as a failed result.
+        let told: Vec<String> = finished
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                Content::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), cases.len(), "{told:?}");
+        for ((name, input, wanted), said) in cases.iter().zip(&told) {
+            assert!(
+                said.contains(wanted),
+                "{name} with {input} was told {said:?}, which does not contain {wanted:?} — \
+                 the model cannot correct what it is not told"
+            );
+            // The old sentence is still the prefix, so `eval::dryrun::classify`
+            // keeps counting these under the same heading.
+            assert!(
+                said.starts_with(&format!("{name}: arguments are not ")),
+                "{said}"
+            );
+        }
+
+        // Nothing reached the gate, so nothing reached a provider.
+        assert_eq!(h.email.sent_count(), 0);
+        assert!(h.payments.calls().is_empty());
+
+        // And the turn is legible as what it was: every call attempted, every
+        // one of them stopped before anybody ruled on it.
+        assert_eq!(finished.tool_calls, cases.len() as u32);
+        assert_eq!(finished.malformed_calls, cases.len() as u32);
+    }
+
+    /// **`malformed_calls` counts what never reached the gate, and a refusal is
+    /// not that.**
+    ///
+    /// The number exists to tell a turn that did nothing from a turn that
+    /// worked, so the one thing it must not do is call the healthiest finance
+    /// turn in the company broken: at Orizn's threshold *every* payment comes
+    /// back `denied (pending_approval)` with `is_error` set, and a counter of
+    /// failed tool results would score that 1.
+    #[tokio::test]
+    async fn a_gate_refusal_is_not_a_malformed_call() {
+        let Some(db) = db().await else { return };
+        let llm = Arc::new(ScriptedLlm::responses(vec![
+            // Untrusted context, so the gate refuses this on the record.
+            pay_call("toolu_1"),
+            done(),
+        ]));
+        let h = harness(&db, llm, "{}").await;
+
+        let finished = h
+            .turn
+            .run(
+                Context::new().with_untrusted(&Untrusted::new(INJECTION.to_owned()), "email-1"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the run completes");
+
+        assert_eq!(finished.tool_calls, 1);
+        assert_eq!(
+            finished.malformed_calls, 0,
+            "a ruling the gate made is not a call the parser rejected"
+        );
+    }
+
+    /// **The schemas and the parser cannot drift apart silently.**
+    ///
+    /// [`Turn::propose`] hands the model [`serde_json`]'s own message, which
+    /// names the *struct* field. That is only useful because every struct field
+    /// is named after a `properties` key in [`catalogue`] — so this walks the
+    /// catalogue and, for each tool, holds out one required field at a time
+    /// from an otherwise complete object, asserting the sentence the model gets
+    /// names the field that was held out.
+    ///
+    /// Rename `EmailArgs::subject` to `subj` and this goes red at `send_email`,
+    /// which is the point: the model would otherwise be told to fix a field
+    /// that does not appear in the schema it was given.
+    ///
+    /// **One field at a time, and that is the whole design of the loop.** The
+    /// first version of this called each tool with `{}` and asserted the reply
+    /// named *some* required field — and it passed with `subject` renamed to
+    /// `subj`, because serde reports the first missing field it meets and `to`
+    /// was still fine. A guard that green-lights the drift it was written for
+    /// is worse than none. So every required field gets its own turn at being
+    /// the missing one, over an otherwise complete object built from the
+    /// schema's own `properties` types.
+    #[tokio::test]
+    async fn every_required_field_is_named_back_to_the_model() {
+        let Some(db) = db().await else { return };
+        let h = harness(&db, Arc::new(ScriptedLlm::responses(vec![done()])), "{}").await;
+
+        // A value the schema's own declared type accepts. Nothing here has to
+        // be *meaningful* — `Errand::parse` and `Money::new` run after the
+        // struct is built, and what is under test is the struct.
+        let filler = |ty: &str| match ty {
+            "string" => json!("x"),
+            "integer" => json!(1),
+            "object" => json!({}),
+            other => panic!("no filler for a {other} property; teach this test the new type"),
+        };
+
+        for (name, _, _, _, schema) in catalogue() {
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .expect("every schema in the catalogue lists its required fields")
+                .iter()
+                .map(|field| field.as_str().expect("a field name"))
+                .collect();
+            assert!(!required.is_empty(), "{name} requires nothing");
+
+            let complete: serde_json::Map<String, Value> = required
+                .iter()
+                .map(|field| {
+                    let ty = schema["properties"][field]["type"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{name}.{field} declares no type"));
+                    ((*field).to_owned(), filler(ty))
+                })
+                .collect();
+
+            // The complete object clears the *struct*, so that a refusal below
+            // is about the field that was taken out and not about the filler.
+            // It need not clear everything after it: `to: "x"` is a well-formed
+            // `EmailArgs` and not an address, and teaching this test a valid
+            // address, URL, currency and slug per tool would be a second copy
+            // of the catalogue's own validation rules.
+            if let Err(said) = h.turn.propose(name, &Value::Object(complete.clone())) {
+                assert!(
+                    !said.contains("missing field"),
+                    "{name} calls a field required that its own schema does not list: {said}"
+                );
+            }
+
+            for missing in &required {
+                let mut short = complete.clone();
+                short.remove(*missing);
+                let said = h
+                    .turn
+                    .propose(name, &Value::Object(short))
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name} accepted a call with no {missing}, which it declares required"
+                        )
+                    });
+                assert!(
+                    said.contains(&format!("`{missing}`")),
+                    "{name} without {missing} was refused with {said:?}, which does not name it — \
+                     the parser's field names have drifted from the schema's, and the model is \
+                     being told to fix a field it was never offered"
+                );
+            }
+        }
     }
 
     #[tokio::test]

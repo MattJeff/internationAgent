@@ -325,6 +325,12 @@ async fn stand_up(db: Db) -> Company {
         .expect("install the ceiling");
 
     // 3. the tenant — and the active policy version its layers hang off.
+    //
+    // `"orizn"` is a literal and `tenants.slug` is UNIQUE, which is one of the
+    // two reasons a second `--dry-run` against the same database cannot start.
+    // See [`run`]: the fix is an empty database, not a unique slug here — the
+    // other collision is downstream in provisioning and making this one unique
+    // only moves the panic.
     policy::create_tenant(&db, tenant, "orizn", "Orizn")
         .await
         .expect(EMPTY_DATABASE);
@@ -1215,10 +1221,34 @@ fn report_failures(failures: &[&'static str], runs: usize) {
 /// an exit code, because a run in which nothing called a tool is a broken system
 /// and a report nobody reads is how it stayed broken for three days.
 ///
-/// **An empty database per invocation, and that is not negotiable** — see
-/// [`EMPTY_DATABASE`] for the two constraints that make it so. Passes *within*
-/// one invocation share a company, which is the point: it is the same seats
-/// taking a second and third turn.
+/// **One empty database per invocation, and it is not a preference.** This used
+/// to say re-running "adds a company rather than replacing one", which is what
+/// a fresh `TenantId` every time looks like it should buy. It does not: the
+/// second invocation panics `Conflict("tenants_slug_key")` on the literal slug
+/// `"orizn"`, and making *that* unique only moves the panic one step to
+/// `Conflict("employee_resources_provider_external_id_key")` in provisioning,
+/// because the mock adapters derive an external id from the employee slug and
+/// this document seats the same five slugs every time. [`EMPTY_DATABASE`] is
+/// the message a caller gets when they forget.
+///
+/// It is worth naming rather than shrugging at, because of what this instrument
+/// is for. A model is a sample: one dry run is one draw, and the only question
+/// it can settle — did a change move anything? — needs two. Whoever compares
+/// them has to remember `createdb` in between or the second run dies in the
+/// first three seconds, with a Postgres constraint name for a message.
+/// `--dry-run` is the deliverable here, so:
+///
+/// ```sh
+/// createdb before && createdb after
+/// ```
+///
+/// ponytail: two `createdb`s, not a per-run namespace. Threading a run id
+/// through the tenant slug, the five employee slugs and whatever the mock
+/// adapters key on is a change to the *company being stood up* to work around a
+/// habit, and this run's whole claim is that it stands up the real one.
+///
+/// Passes *within* one invocation share a company, which is the point: it is the
+/// same seats taking a second and third turn.
 ///
 /// `runs` is the number of passes, and **three is the smallest useful number**:
 /// one run of a language model is an anecdote, and every sampled row above is
