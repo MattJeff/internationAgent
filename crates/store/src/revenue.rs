@@ -49,7 +49,11 @@
 //! [`confirm_prospect_flow`] are the only two functions in this file that take
 //! an admin transaction. A selector decides which element on somebody else's
 //! page a claim gets made about; see [`set_prospect_flow`] for why that is not
-//! a thing an employee may write.
+//! a thing an employee may write. What an employee *may* write is a
+//! [`FlowProposal`] — a different table with full grants, no column that can
+//! spell a confirmation, and no path to the constructor that builds a probeable
+//! flow. See [`propose_prospect_flow`] and
+//! `0037_prospect_flow_proposals.sql`.
 //!
 //! **Money is [`Money`] on the way in and on the way out**, never a bare
 //! integer: minor units plus a currency, converted at the boundary.
@@ -541,6 +545,174 @@ pub async fn flow_of(
     .await?;
 
     Ok(row)
+}
+
+// ---------------------------------------------------------------------------
+// Prospect flow proposals
+// ---------------------------------------------------------------------------
+
+/// What an employee read off a prospect's booking page, waiting for a human.
+///
+/// `0037_prospect_flow_proposals.sql` carries the argument. The three things
+/// worth knowing here are the three that keep this from being a [`ProspectFlow`]
+/// with a different name.
+///
+/// **It has no `confirmed_by` field, so it cannot reach `Flow::confirmed`.**
+/// That constructor takes a [`ProspectFlow`] and there is no `From` between
+/// these two types in either direction. The `confirmed_by` below is *joined off
+/// `prospect_flows`* and is a fact about the flow this account already has, not
+/// about this proposal — it is what tells `flow review` that a prospect is done
+/// and `flow promote` that it is about to overwrite somebody's confirmation.
+///
+/// **Every selector is optional.** A proposal is what could be found. See the
+/// migration's decision 2 for why an incomplete one is still worth storing and
+/// why `flow promote` refuses it by name.
+///
+/// **Deliberately not `Deserialize`**, for [`ProspectFlow`]'s reason and one
+/// more: this is the struct closest to a page, so it is the one that must never
+/// be parseable from a tool result.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct FlowProposal {
+    /// The account this is a proposal for.
+    pub account_id: Uuid,
+    /// `accounts.legal_name`, joined.
+    pub prospect: String,
+    /// `accounts.domain`, joined.
+    pub domain: String,
+    /// The page the employee looked at.
+    pub entry_url: String,
+    /// `#id` of the passport / nationality field, when one was found.
+    pub passport_field: Option<String>,
+    /// `#id` of the destination field, when one was found.
+    pub destination_field: Option<String>,
+    /// `#id` of the travel-date field, when one was found.
+    pub date_field: Option<String>,
+    /// `#id` of their "check requirements" button, when one was found.
+    pub submit: Option<String>,
+    /// `#id` of the element that displays the answer, when one was found.
+    pub panel: Option<String>,
+    /// `employees.slug` of the employee that looked, joined. Ours, so it is safe
+    /// to render; and a slug is not a person, which is the point.
+    pub proposed_by: String,
+    /// When it looked.
+    pub proposed_at: DateTime<Utc>,
+    /// `prospect_flows.confirmed_by` for the same account, joined. `None` is
+    /// "this prospect is still waiting for a human", which is the queue.
+    pub confirmed_by: Option<String>,
+}
+
+/// The selectors an employee proposes. Everything else on the row is derived.
+///
+/// `entry_url` is the only required field and it is the one the account is
+/// resolved *from* — see [`propose_prospect_flow`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewFlowProposal<'a> {
+    /// Absolute `https://` URL of the page that was read.
+    pub entry_url: &'a str,
+    /// `#id` of the passport / nationality field.
+    pub passport_field: Option<&'a str>,
+    /// `#id` of the destination field.
+    pub destination_field: Option<&'a str>,
+    /// `#id` of the travel-date field.
+    pub date_field: Option<&'a str>,
+    /// `#id` of their "check requirements" button.
+    pub submit: Option<&'a str>,
+    /// `#id` of the element that displays the answer.
+    pub panel: Option<&'a str>,
+}
+
+/// File one employee's proposal, resolving the prospect from the page's host.
+///
+/// **A [`TenantTx`], and that is the difference this whole mechanism turns on.**
+/// [`set_prospect_flow`] two screens up needs an admin transaction because
+/// `app_role` holds no INSERT on `prospect_flows`; `app_role` holds all four
+/// grants here, because a row here is probed by nothing. `next_flow_to_probe`
+/// and [`flow_of`] read `prospect_flows` and have never heard of this table, and
+/// [`FlowProposal`] cannot be handed to the constructor that builds a probeable
+/// flow.
+///
+/// **The caller does not name the account.** `host` is the entry page's host and
+/// the account is resolved from it *inside the INSERT*, longest matching
+/// `accounts.domain` first, so `book.airline.com` files under `airline.com` and
+/// a host no prospect owns files nowhere. Two things follow. A proposal can only
+/// ever be about a prospect that is already on this tenant's list, and the
+/// account and the entry URL cannot disagree — which is the invariant
+/// `Flow::confirmed` re-checks with `Domain::is_within` when the row is
+/// eventually promoted, so a proposal that would fail that check is one this
+/// statement never wrote.
+///
+/// `Ok(None)` is "no prospect owns that host". Re-proposing overwrites: the
+/// newer look at the page is the better one and there is no confirmation here to
+/// revoke.
+pub async fn propose_prospect_flow(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    host: &str,
+    proposal: &NewFlowProposal<'_>,
+) -> Result<Option<Uuid>, RevenueError> {
+    let account: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO prospect_flow_proposals (account_id, tenant_id, entry_url, passport_field, \
+                                              destination_field, date_field, submit, panel, \
+                                              proposed_by) \
+         SELECT a.id, a.tenant_id, $2, $3, $4, $5, $6, $7, $8 \
+           FROM accounts a \
+          WHERE $1 = a.domain OR $1 LIKE '%.' || a.domain \
+          ORDER BY length(a.domain) DESC \
+          LIMIT 1 \
+         ON CONFLICT (account_id) DO UPDATE SET \
+           entry_url = excluded.entry_url, \
+           passport_field = excluded.passport_field, \
+           destination_field = excluded.destination_field, \
+           date_field = excluded.date_field, \
+           submit = excluded.submit, \
+           panel = excluded.panel, \
+           proposed_by = excluded.proposed_by, \
+           proposed_at = now() \
+         RETURNING account_id",
+    )
+    .bind(host)
+    .bind(proposal.entry_url)
+    .bind(proposal.passport_field)
+    .bind(proposal.destination_field)
+    .bind(proposal.date_field)
+    .bind(proposal.submit)
+    .bind(proposal.panel)
+    .bind(employee_id.as_uuid())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    Ok(account)
+}
+
+/// Every proposal on file, oldest prospect first, each carrying the
+/// confirmation state of the flow it would become.
+///
+/// **One reader for both verbs**, and the joined `confirmed_by` is why: `flow
+/// review` prints the rows where it is `None` — the queue of prospects still
+/// waiting on a human — and `flow promote` uses the same list, so an account an
+/// operator names that is already confirmed comes back as a sentence saying so
+/// rather than as "no proposal". Two queries would make those two answers come
+/// from two places, and the one that got them wrong would be the one nobody
+/// tested.
+///
+/// Nothing is deleted on promotion, deliberately. A promoted proposal drops out
+/// of the review queue because its account's flow is now confirmed, and it comes
+/// back into it by itself the day somebody edits a selector and the trigger in
+/// `0032_prospect_flows.sql` revokes the confirmation — which is exactly when a
+/// human wants to see what the machine last read off that page.
+pub async fn flow_proposals(tx: &mut TenantTx<'_>) -> Result<Vec<FlowProposal>, RevenueError> {
+    let rows: Vec<FlowProposal> = sqlx::query_as(
+        "SELECT p.account_id, a.legal_name AS prospect, a.domain AS domain, p.entry_url, \
+                p.passport_field, p.destination_field, p.date_field, p.submit, p.panel, \
+                e.slug AS proposed_by, p.proposed_at, f.confirmed_by \
+           FROM prospect_flow_proposals p \
+           JOIN accounts a ON a.id = p.account_id \
+           JOIN employees e ON e.id = p.proposed_by \
+           LEFT JOIN prospect_flows f ON f.account_id = p.account_id \
+          ORDER BY a.created_at, a.id",
+    )
+    .fetch_all(&mut ***tx)
+    .await?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1957,10 +2129,11 @@ mod tests {
     use chrono::TimeDelta;
 
     /// Every table the seller vertical adds — `0011_revenue.sql`,
-    /// `0015_proof_of_need.sql` and `0032_prospect_flows.sql`. A table that
+    /// `0015_proof_of_need.sql`, `0032_prospect_flows.sql` and
+    /// `0037_prospect_flow_proposals.sql`. A table that
     /// joins the vertical and not this array is a table whose RLS nobody
     /// checked.
-    const REVENUE_TABLES: [&str; 8] = [
+    const REVENUE_TABLES: [&str; 9] = [
         "accounts",
         "contacts",
         "evidence",
@@ -1969,6 +2142,7 @@ mod tests {
         "suppressions",
         "proof_of_need_attempts",
         "prospect_flows",
+        "prospect_flow_proposals",
     ];
 
     /// Connect and migrate, or `None` when there is no database.
@@ -2378,6 +2552,137 @@ mod tests {
         assert!(
             format!("{updated}").contains("permission denied"),
             "expected a privilege error, got: {updated}"
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The application may write a proposal, and a proposal is not a flow.**
+    ///
+    /// The other half of the test above. `0037_prospect_flow_proposals.sql`
+    /// hands `app_role` all four grants on a table that looks a great deal like
+    /// `prospect_flows`, so the three things that keep that from being a way
+    /// around the confirmation are asserted against Postgres here:
+    ///
+    /// 1. the table has **no column** an employee could put a name in — asked of
+    ///    `information_schema`, so a later migration that adds one turns this
+    ///    red rather than turning the confirmation bar into a formality;
+    /// 2. the selector shape is enforced by the database and not only by
+    ///    `flow_proposal::Selector`, so a `psql` session cannot write
+    ///    `#a, .cookie-banner` either;
+    /// 3. the account is resolved from the page's host inside the INSERT, so a
+    ///    caller cannot file a proposal against an account the URL is not on —
+    ///    which is the invariant `Flow::confirmed` re-checks at promotion time.
+    #[tokio::test]
+    async fn a_proposal_is_writable_and_still_cannot_become_a_confirmation() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db, "revenue-flow-proposals").await;
+        let employee = EmployeeId::new_v7(Utc::now());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, 'Ada', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(format!("ada-{}", employee.as_uuid()))
+        .execute(&mut *tx)
+        .await
+        .expect("employee");
+        tx.commit().await.expect("commit employee");
+
+        // 1. No column of this table can hold a person's name.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+              WHERE table_name = 'prospect_flow_proposals'",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .expect("columns");
+        assert!(
+            !columns.iter().any(|name| name.contains("confirm")),
+            "a proposal table with a confirmation column is a confirmation an \
+             employee can write: {columns:?}"
+        );
+        let proposed_by: String = sqlx::query_scalar(
+            "SELECT data_type::text FROM information_schema.columns \
+              WHERE table_name = 'prospect_flow_proposals' AND column_name = 'proposed_by'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("proposed_by");
+        assert_eq!(
+            proposed_by, "uuid",
+            "proposed_by must be a uuid, so it cannot hold a person's name"
+        );
+
+        let account = Uuid::now_v7();
+        insert_account(
+            &mut tx,
+            account,
+            &NewAccount {
+                legal_name: "Deutsche Lufthansa AG",
+                domain: "lufthansa.com",
+                segment: "airline",
+                country: "DE",
+                employee_id: None,
+                location: None,
+                website: None,
+            },
+        )
+        .await
+        .expect("account");
+
+        let proposal = NewFlowProposal {
+            entry_url: "https://book.lufthansa.com/entry",
+            passport_field: Some("#pp"),
+            destination_field: Some("#dest"),
+            date_field: None,
+            submit: None,
+            panel: Some("#visa-result"),
+        };
+
+        // 3. A subdomain of the account's domain resolves to that account, and
+        //    the caller never names it.
+        assert_eq!(
+            propose_prospect_flow(&mut tx, employee, "book.lufthansa.com", &proposal)
+                .await
+                .expect("app_role may write a proposal"),
+            Some(account),
+        );
+        // A host no prospect owns is a page about nobody, not a row about the
+        // nearest account.
+        assert_eq!(
+            propose_prospect_flow(&mut tx, employee, "evil.example", &proposal)
+                .await
+                .expect("no error, no row"),
+            None,
+        );
+
+        // It reads back with the flow's confirmation state joined, which is
+        // `None`: writing a proposal confirmed nothing.
+        let found = flow_proposals(&mut tx).await.expect("read");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].account_id, account);
+        assert_eq!(found[0].confirmed_by, None);
+        assert_eq!(found[0].panel.as_deref(), Some("#visa-result"));
+
+        // 2. The shape is the database's rule too. This is the statement a
+        //    compromised process or a `psql` session would run.
+        let bad = sqlx::query(
+            "UPDATE prospect_flow_proposals SET panel = '#a, .cookie-banner' \
+              WHERE account_id = $1",
+        )
+        .bind(account)
+        .execute(&mut **tx)
+        .await
+        .expect_err("a selector list is not a selector");
+        assert!(
+            format!("{bad}").contains("prospect_flow_proposals_selector_shape"),
+            "expected the CHECK to name itself, got: {bad}"
         );
         tx.rollback().await.expect("rollback");
 

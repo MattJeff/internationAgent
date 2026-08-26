@@ -141,6 +141,26 @@ pub enum BrowserStep<'a> {
     /// silent about visas; an `Err` cannot be mistaken for an answer because a
     /// caller cannot get past it without saying so.
     Text(&'a str),
+    /// Read the **markup** of the first match of a CSS selector: `outerHTML`.
+    ///
+    /// [`BrowserStep::Text`] answers "what does their page tell a traveller".
+    /// This answers "what is their page made of", and there is exactly one
+    /// caller that needs the difference: `agentos_app::flow_proposal`, which
+    /// derives the `#id` of a booking form's fields so a human can review five
+    /// selectors instead of authoring them. `innerText` cannot answer it —
+    /// attributes are not rendered text, and an `id` is an attribute.
+    ///
+    /// **It is a read, and it is the most dangerous thing to render that this
+    /// enum produces.** The text a `Text` brings back is a stranger's prose;
+    /// the markup a `Markup` brings back is a stranger's prose *plus* their
+    /// script bodies, their inline event handlers and their comments. So it is
+    /// [`Untrusted`] like `Text` and, unlike `Text`, nothing in this workspace
+    /// hands the result to a model or to a screen: the one caller scans it in
+    /// Rust and returns counts and identifiers of a shape a CHECK constraint
+    /// re-states. Point a tool at this and the fence is gone.
+    ///
+    /// `NO_SUCH_ELEMENT` on no match, for [`BrowserStep::Text`]'s reason.
+    Markup(&'a str),
     /// Capture the viewport as a PNG.
     Screenshot,
     /// Ask the session which page it is actually on.
@@ -178,16 +198,25 @@ impl BrowserStep<'_> {
     ///
     /// `Goto` is a read. Navigating is how you get to a page to look at it, and
     /// the URL is scope-checked against the token's own domain before it runs.
-    /// `Screenshot`, `Text` and `Location` observe — `Location` most of all: it
-    /// sends nothing to their server and reads a value the browser already
-    /// holds. `Click`, `Type` and `Fill` put something of ours into a
+    /// `Screenshot`, `Text` and `Markup` observe. `Location` observes most of
+    /// all: it sends nothing to their server and reads a value the browser
+    /// already holds. `Click`, `Type` and `Fill` put something of ours into a
     /// stranger's system, which is a write whatever the element happens to be —
     /// a search box today and a "delete account" button on the next redesign,
     /// and the selector cannot tell them apart.
+    ///
+    /// **Two variants arrived here from two directions on the same day**, which
+    /// is the case this match has no `_` arm for: `Location` so a step can be
+    /// ruled against the page the session is actually on, and `Markup` so a
+    /// selector can be proposed at all. Both read. Had either landed without
+    /// being classified, the build would have stopped — which is the whole
+    /// argument for writing it this way.
     #[must_use]
     pub const fn is_a_read(&self) -> bool {
         match self {
-            Self::Goto(_) | Self::Text(_) | Self::Screenshot | Self::Location => true,
+            Self::Goto(_) | Self::Text(_) | Self::Markup(_) | Self::Screenshot | Self::Location => {
+                true
+            }
             Self::Click(_) | Self::Type { .. } | Self::Fill { .. } => false,
         }
     }
@@ -208,6 +237,16 @@ pub enum BrowserOutcome {
     /// says nothing; a selector that found no element does not come back at
     /// all. See the module docs.
     Text(Untrusted<String>),
+    /// The `outerHTML` of the element a [`BrowserStep::Markup`] named.
+    ///
+    /// **A separate variant from [`BrowserOutcome::Text`] on purpose.** The two
+    /// are both `Untrusted<String>` and a shared variant would compile
+    /// everywhere — which is the problem: `Effects::read_page` matches on `Text`
+    /// and hands what it finds to a model, so a day when a `Markup` step could
+    /// answer with a `Text` outcome is a day a stranger's script bodies reach a
+    /// prompt because two call sites drifted. They cannot drift; they do not
+    /// share a name.
+    Markup(Untrusted<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +319,13 @@ struct MockState {
     /// Where this browser is, as [`BrowserStep::Location`] reports it. `None`
     /// until something navigates, which reads as [`blank_page`].
     here: Option<Url>,
+    /// selector -> `outerHTML`. A second map rather than a second use of
+    /// `page`, for the reason [`BrowserOutcome::Markup`] is a second variant: a
+    /// test that scripts the *text* of `body` has said nothing about its
+    /// markup, and a mock that answered a `Markup` with the scripted text would
+    /// make `flow_proposal` look like it worked on pages that have no `id` on
+    /// anything.
+    markup: BTreeMap<String, String>,
 }
 
 impl MockState {
@@ -339,6 +385,16 @@ impl MockBrowser {
         self.lock()
             .redirects
             .insert(from.as_str().to_owned(), to.clone());
+    }
+
+    /// Put markup on the page: what a [`BrowserStep::Markup`] of `sel` reads.
+    ///
+    /// One string and not a sequence, unlike [`MockBrowser::set_text`]: nothing
+    /// reads markup twice to compare the two, because the question markup
+    /// answers is what the page is built out of and the reproducibility bar is
+    /// about what it says.
+    pub fn set_markup(&self, sel: &str, html: &str) {
+        self.lock().markup.insert(sel.to_owned(), html.to_owned());
     }
 
     /// Every step this mock was asked to run, oldest first.
@@ -458,6 +514,16 @@ impl BrowserProvider for MockBrowser {
                 state.fault.check_after()?;
                 return found
                     .map(|text| BrowserOutcome::Text(Untrusted::new(text)))
+                    .ok_or(ProviderError::Terminal {
+                        code: NO_SUCH_ELEMENT,
+                    });
+            }
+            BrowserStep::Markup(sel) => {
+                let found = state.markup.get(sel).cloned();
+                state.log.push(format!("{ctx} markup {sel}"));
+                state.fault.check_after()?;
+                return found
+                    .map(|html| BrowserOutcome::Markup(Untrusted::new(html)))
                     .ok_or(ProviderError::Terminal {
                         code: NO_SUCH_ELEMENT,
                     });

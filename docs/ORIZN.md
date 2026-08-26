@@ -935,6 +935,65 @@ An address on the suppression list is skipped, is not created, and is not
 re-activated if it opted out between two imports. That is enforced inside the
 INSERT *and* by a trigger under it.
 
+### 9. Get the booking flows written — the employee proposes, you confirm
+
+Step 8 gives the seller people to write to. It does not give it the thing the
+cold email is *about*: the proof of need — the contradiction `proof_of_need`
+finds by putting one passport/destination pair through a prospect's own booking
+flow twice. That needs a `prospect_flows` row: an entry URL and five CSS
+selectors, per prospect.
+
+`app_role` holds no INSERT and no UPDATE on that table and it never will. The
+reason is in `migrations/0032_prospect_flows.sql` and it is the reason this
+vertical is sellable: a selector aimed at the wrong element that *exists* reads
+the same wrong thing on both runs, passes the two-run bar, gets screenshotted,
+and goes out as a dated claim about somebody's checkout with steps to reproduce
+it. Nothing downstream can tell that from a real finding, because from the
+inside it *is* one.
+
+So the only thing that changes is who does the typing. The employee reads the
+page and files a **proposal**; you read the proposal and **promote** it, in
+batches. `0037_prospect_flow_proposals.sql` is the table it writes: full grants
+for `app_role`, no column that can hold a person's name, and nothing anywhere
+reads it into a probe.
+
+```sh
+# What is waiting: the page to open and the selectors to check on it.
+agentos-server flow review --tenant $TENANT
+
+# Then, having opened each page and checked each selector:
+agentos-server flow promote --tenant $TENANT --by "Mathis Higuinen" --all
+
+# Or only the ones you actually looked at:
+agentos-server flow promote --tenant $TENANT --by "Mathis Higuinen" <account-uuid>...
+```
+
+`--by` means the same thing it means in `flow confirm`, because `promote` *is*
+`flow set` followed by `flow confirm`, run in a loop on your own database
+credential. A batch is one person's attention spent once instead of 1,615 times.
+It is not a looser rule, and the caveat printed after it is the same caveat.
+
+**What proposals do not cover.** A form whose fields carry no `id`, a submit
+button whose `id` says nothing about itself, and — most of the time — the
+results panel, which an entry-requirements widget usually renders only after the
+form is submitted. `flow review` prints `NOT FOUND` against any of the three
+columns `prospect_flows` has NOT NULL, `flow promote` refuses that prospect by
+naming the column, and the answer is `flow set` for that one. Four selectors read
+and one typed is still four fewer than five typed.
+
+**Promotion grants nothing else, and this is the part that will surprise you.**
+A promoted flow whose host is not on `allowed_domains` **will not probe**.
+Reading a page consults `Channel::Web` and needs no entry there, which is why
+the employee could look at the page in the first place — but the prober *types*
+into the form, and that is a `BrowserWrite`, which is exactly what the row for
+`allowed_domains` at the top of this document says. `sales-development` ships
+with two write domains and neither of them is a prospect's. So promoting a flow
+for `lufthansa.com` and expecting a probe is the mistake to expect; the probe
+comes back refused with the domain named. Widening that list is
+`agentos-server policy install` with the host added, per host, deliberately —
+and it is a decision about typing into a stranger's system, which is not a
+decision a data command gets to make on your behalf.
+
 ---
 
 ## What this document knows it does not do
