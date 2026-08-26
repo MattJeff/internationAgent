@@ -80,6 +80,13 @@ pub use agentos_providers::llm::{Llm, LlmResponse, ScriptedLlm, Usage};
 // in the crate that cannot reach the loop.
 pub use agentos_providers::browser::MockBrowser;
 
+// And the lead sink, for the third time and the same reason: `routes::queue`
+// is the only caller of the send path, it lives in the binary, and the binary
+// may not name `agentos-providers`. Without this line the export route's
+// send-path tests could construct the `Ports` but never read what reached the
+// platform — which is the only thing those tests are about.
+pub use agentos_providers::leads::MockLeadSink;
+
 /// The signing secret the mock telephony adapter verifies callbacks against.
 /// Fixed and public, because a fake secret that has to be configured is a fake
 /// secret that stops a development box from booting.
@@ -257,6 +264,18 @@ pub fn ports_for(credentials: &Credentials) -> Ports {
         browser: browser_provider(credentials),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
+        // Always the mock, and there is no `Credentials` field to select on
+        // yet — which is a statement about 2026-09-01 rather than an omission.
+        // A real adapter needs two things this deployment does not have: the
+        // account's API key, and **which campaign** a segment's leads land in.
+        // The second is not a credential and not inferable; see
+        // `crate::queue::push`. Until the founder settles it, every deployment
+        // runs the export path — `agentos_domain::policy::may_upload_leads` is
+        // `false` everywhere — so the mock behind this field is never reached,
+        // and a plausible fake that *was* reached would be the worst of the
+        // three options: it would report leads staged that no platform ever
+        // received.
+        leads: Arc::new(MockLeadSink::new()),
     }
 }
 

@@ -357,7 +357,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             "inbound",
             tokio::spawn(loops::inbound::run(
                 db.clone(),
-                ports,
+                ports.clone(),
                 blobs,
                 cancel.clone(),
             )),
@@ -377,7 +377,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
 
     let served = serve(
         listener,
-        app(db, &config, gate, fleets),
+        app(db, &config, gate, fleets, ports.clone()),
         {
             let cancel = cancel.clone();
             async move {
@@ -438,7 +438,7 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
-fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
+fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets, ports: Arc<Ports>) -> Router {
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -477,7 +477,11 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             // only a request that hands the bytes back can honour that — so this
             // route is not a convenience over a cadence, it is the whole design.
             // Its module docs argue the verb and the lost response.
-            .merge(routes::queue::router(db.clone()))
+            .merge(routes::queue::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
             .merge(routes::knowledge::router(db.clone()))
             // The pool has a source now: `phone_numbers`, written by this
             // router's own `POST /v1/pool/numbers` and read per request. It

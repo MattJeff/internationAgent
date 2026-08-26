@@ -52,6 +52,7 @@ use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
 use agentos_providers::email::{EmailProvider, OutboundEmail, ProviderMessageId};
+use agentos_providers::leads::{self as leads, LeadSink};
 use agentos_providers::telephony::{OpenWindow, OutboundSms, OutboundWhatsapp, TelephonyProvider};
 use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
@@ -134,6 +135,23 @@ pub const BAD_SEGMENT: &str = "unknown_segment";
 /// So this is not "we could not find the form": it is "there is nobody here this
 /// page could be about", and the answer to it is an import, not another read.
 pub const NO_PROSPECT: &str = "no_such_prospect";
+
+/// What [`Effects::stage_lead`] answers when the row's `email` column is not
+/// the address the gate ruled on.
+///
+/// The lead-shaped twin of [`READ_TOKEN`]: a token names one counterparty, and
+/// a payload that names another is asking for an effect nobody authorised. The
+/// difference from a rendered email — where the recipient is simply taken off
+/// the token and the body's headers ignored — is that this payload's address
+/// column is *also* what the platform substitutes into `{{email}}`, so it
+/// cannot merely be overruled. Both spellings have to agree or nothing is
+/// staged.
+///
+/// Unreachable through `crate::queue`, whose `Lead::fields` and `Lead::email`
+/// read the same `Recipient`. It is a named refusal rather than an assertion
+/// because the two are separated by a gate call and a crate boundary, and the
+/// audit row should say which of them moved.
+pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -570,6 +588,15 @@ fn browse_detail(allowed: &Domain, elsewhere: Option<&Elsewhere>) -> Map<String,
 pub struct Ports {
     /// Outbound email.
     pub email: Arc<dyn EmailProvider>,
+    /// The outbound sending platform's prospect list.
+    ///
+    /// Distinct from [`Ports::email`] and not a second implementation of it:
+    /// that one sends *a message we composed* to an address we hold, this one
+    /// hands a person to a platform that composes from its own campaign
+    /// template and mails on its own schedule. They fail differently, they are
+    /// billed differently, and only one of them can be told somebody
+    /// unsubscribed. See [`agentos_providers::leads`].
+    pub leads: Arc<dyn LeadSink>,
     /// SMS and WhatsApp.
     pub telephony: Arc<dyn TelephonyProvider>,
     /// The employee's browser.
@@ -631,6 +658,89 @@ impl Effects {
             .await
             .map_err(EffectError::Provider);
         self.record(&ok, message_detail(&sent), sent).await
+    }
+
+    /// Put the prospect on the token onto the sending platform's list.
+    ///
+    /// **The same act as [`Effects::send_email`], down a different road**, and
+    /// it takes the same token type on purpose: `Authorized<EmailSend>`. There
+    /// is no `LeadUpload` subject beside `EmailSend`, because inventing one
+    /// would create a second permission for one act — and the day the two
+    /// disagreed, the narrower one would be the one nobody consulted. The gate
+    /// therefore applies the channel check, the denylist and
+    /// `max_new_contacts_per_day` to a staged lead exactly as it does to a
+    /// message we send ourselves, and the counterparty in the audit trail is
+    /// the same string either way.
+    ///
+    /// `row` is `(column, value)` in the producer's order — see
+    /// [`agentos_providers::leads`] for why that shape and not a struct. The
+    /// **address is not read from it**: it is taken off the token, the same way
+    /// [`Effects::send_email`] takes `to` off the token rather than out of the
+    /// rendered body, so a row cannot be re-addressed after the ruling. What
+    /// the row's own `email` column is for is the platform's template
+    /// substitution, and [`Effects::stage_lead`] refuses when the two disagree
+    /// rather than letting the provider pick.
+    ///
+    /// Idempotent through [`Effects::key_for`], which derives the key from the
+    /// ruling's `decision_id`: replaying one token cannot buy a second copy of
+    /// the same cold email to the same stranger. That is the weakest of the
+    /// three locks on this path — see `crate::queue` for the other two.
+    pub async fn stage_lead<A: Subject<Of = EmailSend>>(
+        &self,
+        ok: Authorized<A>,
+        row: &[(&str, &str)],
+    ) -> Result<ProviderMessageId, EffectError> {
+        let ruled = ok.action().subject().to.to_string();
+        // The token is the authority on who this is about. A row whose address
+        // column says somebody else is not a row to fix up quietly: the gate
+        // ruled on one person and the platform would mail another.
+        let addressed = row
+            .iter()
+            .find(|(name, _)| *name == leads::EMAIL_COLUMN)
+            .map(|(_, value)| *value);
+        let staged = if addressed == Some(ruled.as_str()) {
+            self.ports
+                .leads
+                .stage(&self.key_for(&ok), row)
+                .await
+                .map_err(EffectError::Provider)
+        } else {
+            Err(EffectError::Refused(LEAD_NOT_THE_RULED_ADDRESS))
+        };
+
+        self.record(&ok, message_detail(&staged), staged).await
+    }
+
+    /// Everyone the sending platform has been told to stop mailing.
+    ///
+    /// **The one method on this type that takes no [`Authorized`] token, and
+    /// the exception is the rule pointing the same way.** Every other method
+    /// here performs an effect on the world and must not run without a ruling.
+    /// This one performs no effect: it reads a list, and the only thing its
+    /// answer can ever do is put rows in `suppressions`, which *removes*
+    /// permission to write to somebody. Requiring a token would mean a policy
+    /// denial — a suspended employee, an exhausted budget, a ceiling nobody
+    /// installed — could stop this system from learning that a stranger asked
+    /// to be left alone. That is precisely backwards, and it is the one place
+    /// where "fail closed" and "the safe direction" are not the same sentence.
+    ///
+    /// It is on [`Effects`] rather than on a port the caller holds because the
+    /// ports are private here and there is no accessor: this is the crate's one
+    /// door to a provider, and an ungated read should be visible *in that
+    /// file*, next to the gated writes, rather than hidden behind a handle
+    /// somebody passed around.
+    ///
+    /// No audit row, and deliberately: the record this produces is the
+    /// `suppressions` rows themselves, which are append-only, carry the reason
+    /// and the note, and outlive both the tenant and the contact. A
+    /// `provider_call_attempted` row saying we asked would add a line nobody
+    /// queries beside the line everybody does.
+    pub async fn opted_out(&self) -> Result<Vec<String>, EffectError> {
+        self.ports
+            .leads
+            .opted_out()
+            .await
+            .map_err(EffectError::Provider)
     }
 
     /// Send the rendered SMS to the number on the token.
@@ -1718,6 +1828,7 @@ mod tests {
     use agentos_domain::policy::{PolicyLimits, SpendLimits};
     use agentos_providers::browser::MockBrowser;
     use agentos_providers::email::MockEmailProvider;
+    use agentos_providers::leads::MockLeadSink;
     use agentos_providers::telephony::MockTelephony;
     use agentos_providers::{FaultMode, ProviderBinding};
     use agentos_store::spend::SpendCaps;
@@ -1895,17 +2006,34 @@ mod tests {
     }
 
     fn ports(email: MockEmailProvider, payments: Arc<MockPayments>) -> Arc<Ports> {
+        with_leads(email, payments, Arc::new(MockLeadSink::new()))
+    }
+
+    /// The same ports with a lead sink the caller keeps a handle on, for the
+    /// `stage_lead` tests: what those assert is what actually reached the
+    /// platform, which is unreadable through an `Arc<dyn LeadSink>`.
+    fn with_leads(
+        email: MockEmailProvider,
+        payments: Arc<MockPayments>,
+        leads: Arc<MockLeadSink>,
+    ) -> Arc<Ports> {
         Arc::new(Ports {
             email: Arc::new(email),
             telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
             browser: Arc::new(MockBrowser::new()),
             mcp: Arc::new(StubMcp),
             payments,
+            leads,
         })
     }
 
     /// The same, with the browser kept in hand — for the tests that script a
     /// redirect and then ask where the session ended up.
+    ///
+    /// `leads` is a sink nothing in these tests reaches, and it is here because
+    /// `Ports` has no `..Default::default()`: a port added to that struct has to
+    /// be answered by every fixture, which is how a build stops when somebody
+    /// adds a way to affect the world and a test harness quietly does not.
     fn ports_browsing(browser: Arc<MockBrowser>) -> Arc<Ports> {
         Arc::new(Ports {
             email: Arc::new(MockEmailProvider::new()),
@@ -1913,6 +2041,7 @@ mod tests {
             browser,
             mcp: Arc::new(StubMcp),
             payments: MockPayments::healthy(),
+            leads: Arc::new(MockLeadSink::new()),
         })
     }
 
@@ -2029,6 +2158,70 @@ mod tests {
         // A payment is a different subject type, so a token for one can never
         // be spent on the other — see the compile-fail case.
         assert_eq!(euros(100).to_action().kind(), ActionKind::PaymentCreate);
+    }
+
+    /// A staged lead is an email, so it leaves the same trail an email leaves —
+    /// and a row that names somebody other than the person the gate ruled on is
+    /// refused rather than reconciled.
+    ///
+    /// The mismatch is unreachable through `crate::queue`, whose `Lead` builds
+    /// both spellings off one `Recipient`. It is checked here because the two
+    /// are separated by a gate call and a crate boundary, and because the
+    /// failure it prevents — the platform mailing a different person from the
+    /// one in the audit row — is unrecoverable and silent.
+    #[tokio::test]
+    async fn a_staged_lead_is_ruled_on_by_address_and_refused_when_they_disagree() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let gate = gate(&db);
+        let leads = Arc::new(MockLeadSink::new());
+        let effects = Effects::new(
+            db.clone(),
+            with_leads(
+                MockEmailProvider::new(),
+                MockPayments::healthy(),
+                leads.clone(),
+            ),
+            principal.clone(),
+        );
+
+        // The happy path: the row agrees with the token.
+        let ok = gate
+            .authorize(&principal, to("buyer@example.com"))
+            .await
+            .expect("email is allowed");
+        let staged = effects
+            .stage_lead(ok, &[("email", "buyer@example.com"), ("objet_email", "s")])
+            .await
+            .expect("staged");
+        assert_eq!(leads.staged_addresses(), ["buyer@example.com"]);
+
+        // One `provider_call_attempted` row, tied to the ruling that allowed it
+        // — the same trail `send_email` leaves, because it is the same act.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["effect"], json!("email_send"));
+        assert_eq!(rows[0].1["outcome"], json!("ok"));
+        assert_eq!(
+            rows[0].1["detail"]["provider_message_id"],
+            json!(staged.as_str())
+        );
+
+        // And the mismatch: ruled on one person, row names another.
+        let ok = gate
+            .authorize(&principal, to("buyer@example.com"))
+            .await
+            .expect("email is allowed");
+        let err = effects
+            .stage_lead(ok, &[("email", "someone.else@example.com")])
+            .await
+            .expect_err("a row that names somebody the gate did not rule on");
+        assert_eq!(err.code(), LEAD_NOT_THE_RULED_ADDRESS);
+        assert_eq!(
+            leads.staged_addresses(),
+            ["buyer@example.com"],
+            "and nobody new reached the platform"
+        );
     }
 
     #[test]

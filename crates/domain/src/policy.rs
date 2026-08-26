@@ -365,6 +365,44 @@ pub struct PolicyLimits {
     pub allow_file_upload: bool,
     pub allow_credential_change: bool,
     pub allow_data_delete: bool,
+    /// May this employee hand a prospect to the outbound sending platform,
+    /// instead of producing a file for a human to upload?
+    ///
+    /// **The one field in this struct that chooses a sink rather than bounding
+    /// an effect**, and it is here rather than in a config file for one reason:
+    /// it is the only place in this system where a permission can be written
+    /// down and *cannot* be widened by the layer below it. `false` here on the
+    /// platform layer means `false` for every tenant, every role and every
+    /// employee under it, because [`PolicyLimits::intersect`] is `&&` — and the
+    /// question this answers is "does an address leave the building without a
+    /// human looking at it", which is exactly the shape of question that must
+    /// only ever get narrower as it travels down.
+    ///
+    /// [`Default`] is `false`, which is the export path: `agentos_app::queue`
+    /// produces the CSV the founder uploads by hand, and every safety check on
+    /// that path has already run by the time the bytes exist. Turning this on
+    /// does not skip any of them — it replaces the human's upload with a gated,
+    /// audited call per prospect. See `agentos_app::queue::push`.
+    ///
+    /// # Why it is not an `Action` and not an `ActionKind`
+    ///
+    /// Because the effect already has one. Handing somebody's address to a
+    /// mailer *is* sending them an email, and the gate rules on it as
+    /// [`Action::EmailSend`] — same channel check, same denylist, same
+    /// [`max_new_contacts_per_day`], same audit row. Inventing an
+    /// `Action::LeadUpload` beside it would create a second permission for one
+    /// act, and the day they disagreed the narrower one would be the one nobody
+    /// consulted.
+    ///
+    /// So this is read by its own evaluator, [`may_upload_leads`], exactly as
+    /// [`max_turns_per_day`] is read by [`turns_remaining`] and
+    /// [`allowed_models`] by [`model_for`]. [`evaluate`] deliberately does not
+    /// consult it: there is no arm it could belong to.
+    ///
+    /// [`max_new_contacts_per_day`]: PolicyLimits::max_new_contacts_per_day
+    /// [`max_turns_per_day`]: PolicyLimits::max_turns_per_day
+    /// [`allowed_models`]: PolicyLimits::allowed_models
+    pub allow_lead_upload: bool,
 }
 
 impl PolicyLimits {
@@ -398,6 +436,7 @@ impl PolicyLimits {
             allow_file_upload: self.allow_file_upload && other.allow_file_upload,
             allow_credential_change: self.allow_credential_change && other.allow_credential_change,
             allow_data_delete: self.allow_data_delete && other.allow_data_delete,
+            allow_lead_upload: self.allow_lead_upload && other.allow_lead_upload,
         })
     }
 }
@@ -456,6 +495,26 @@ pub const fn turns_remaining(policy: &EffectivePolicy, turns_today: u32) -> u32 
         .limits()
         .max_turns_per_day
         .saturating_sub(turns_today)
+}
+
+/// Whether this employee's outreach queue may go to the sending platform
+/// instead of to a file.
+///
+/// One field, read through one function, and the function is the point rather
+/// than the line inside it: it takes an [`EffectivePolicy`], so the value it
+/// reads can only be one that came out of [`EffectivePolicy::try_new`]. A bare
+/// [`PolicyLimits`] cannot be passed, which is how a tenant layer would
+/// otherwise have said `true` over a platform layer that said `false`. Same
+/// argument, same shape, as [`turns_remaining`] — and it is worth more here,
+/// because the thing on the other side of a wrong answer is a stranger's inbox.
+///
+/// `false` is the shipped answer everywhere: [`PolicyLimits::default`] grants
+/// nothing, the platform ceiling and every role pack in `docs/` leave it unset,
+/// and `#[serde(default)]` makes an operator's document that never mentions it
+/// mean the same thing. Turning it on is a policy layer somebody writes on
+/// purpose.
+pub const fn may_upload_leads(policy: &EffectivePolicy) -> bool {
+    policy.limits().allow_lead_upload
 }
 
 /// Which model this employee actually runs: the role's preference, bounded by
@@ -849,6 +908,15 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         allow_file_upload,
         allow_credential_change,
         allow_data_delete,
+        // Not read, and it cannot be: it withholds no `ActionKind`. Handing a
+        // prospect to the sending platform is an `EmailSend` and is denied or
+        // allowed as one — the arm below already answers for it. What this flag
+        // decides is *which sink* the outreach queue drains into, which is a
+        // question about a code path rather than about a tool schema, and its
+        // evaluator is `may_upload_leads`. Reading it here would withhold the
+        // mail tool from every employee on the export path, i.e. from every
+        // employee the founder has today.
+        allow_lead_upload: _,
     } = policy.limits();
 
     let closed = |channel: Channel| !allowed_channels.contains(&channel);
@@ -942,6 +1010,15 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
         allow_file_upload,
         allow_credential_change,
         allow_data_delete,
+        // Deliberately not consulted, and this binding is the acknowledgement
+        // rather than an oversight — the same shape as `max_turns_per_day`
+        // above. There is no `Action` that means "put this person on a list":
+        // the act is an `Action::EmailSend` and the arm below rules on it with
+        // the channel, the denylist and the contact budget, exactly as it does
+        // for a message we send ourselves. This flag only says which piece of
+        // our own code performs it, and `may_upload_leads` is where that is
+        // asked.
+        allow_lead_upload: _,
     } = policy.limits();
 
     // Both of these are free functions above rather than closures here, because
@@ -1317,6 +1394,7 @@ mod tests {
             allow_file_upload: true,
             allow_credential_change: true,
             allow_data_delete: true,
+            allow_lead_upload: true,
         }
     }
 
@@ -2106,6 +2184,59 @@ mod tests {
             Decision::Deny {
                 reason: DenyReason::DomainDenied
             }
+        );
+    }
+
+    /// **The capability that mails strangers can only ever be taken away.**
+    ///
+    /// Four assertions and each one is a different way to get this wrong: the
+    /// shipped default, a layer that tries to grant what its ceiling withholds,
+    /// the same in the other direction, and the only arrangement that is
+    /// actually permission.
+    #[test]
+    fn only_a_unanimous_stack_may_upload_leads() {
+        let open = permissive();
+        let closed = PolicyLimits {
+            allow_lead_upload: false,
+            ..permissive()
+        };
+
+        // What a deployment nobody has configured gets, and what this workspace
+        // ships: the export path.
+        assert!(
+            !PolicyLimits::default().allow_lead_upload,
+            "an unwritten layer must not be the one that lets an address leave \
+             the building"
+        );
+
+        // A tenant, a role or an employee layer saying yes over a platform
+        // ceiling that says no. Each position on its own, because an `&&` chain
+        // written in the wrong order is right for three of them and wrong for
+        // the fourth.
+        for (n, layers) in [
+            [&closed, &open, &open, &open],
+            [&open, &closed, &open, &open],
+            [&open, &open, &closed, &open],
+            [&open, &open, &open, &closed],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let policy =
+                EffectivePolicy::try_new(layers[0], layers[1], layers[2], layers[3]).unwrap();
+            assert!(
+                !may_upload_leads(&policy),
+                "layer {n} withheld lead upload and the intersection granted it \
+                 anyway; every other layer saying yes must not add up to a yes"
+            );
+        }
+
+        // And the one arrangement that is a grant: all four, on purpose.
+        let unanimous = EffectivePolicy::try_new(&open, &open, &open, &open).unwrap();
+        assert!(
+            may_upload_leads(&unanimous),
+            "an operator who has switched it on at every layer must be able to \
+             switch it on, or the flag is decoration"
         );
     }
 

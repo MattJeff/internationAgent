@@ -1823,6 +1823,7 @@ mod tests {
     use agentos_providers::ProviderBinding;
     use agentos_providers::browser::{BrowserSession, BrowserStep, MockBrowser};
     use agentos_providers::email::MockEmailProvider;
+    use agentos_providers::leads::MockLeadSink;
     use agentos_providers::llm::{LlmRequest, LlmResponse, ScriptedLlm};
     use agentos_providers::telephony::MockTelephony;
     use agentos_store::db::Db;
@@ -2086,6 +2087,7 @@ mod tests {
             browser: browser.clone(),
             mcp,
             payments: payments.clone(),
+            leads: Arc::new(MockLeadSink::new()),
         });
         let effects = Effects::new(db.clone(), ports, principal.clone());
 
