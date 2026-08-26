@@ -409,7 +409,10 @@ mod tests {
     use chrono::TimeDelta;
 
     use super::*;
-    use crate::proof_of_need::MAX_TRUTH_AGE;
+    // The seller's own bar on how old a look at a prospect's page may be. Not
+    // the authority's bar: that is `MAX_AUTHORITY_AGE`, and it guards a claim
+    // nothing in this file may assert.
+    use crate::proof_of_need::MAX_FINDING_AGE;
 
     /// The real thing, copied out of `~/Desktop/VOYAGEURS`: the header, a plain
     /// row, a row whose `company_name` contains a comma, and a row that is not
@@ -826,7 +829,7 @@ mod tests {
                     .to_owned(),
                 body: "line one\nline two\n\nReply STOP and I will not write again.".to_owned(),
             },
-            Utc::now() - MAX_TRUTH_AGE / 2,
+            Utc::now() - MAX_FINDING_AGE / 2,
         )
     }
 }

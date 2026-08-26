@@ -10,7 +10,7 @@ fn pitch_with_nothing_behind_it() -> Approach {
     // private and this is the error.
     //
     // Both fields, deliberately. `known_good_at` is what `follow_up` re-checks
-    // against `MAX_TRUTH_AGE`, so a forgery that could set it would not merely
+    // against `MAX_FINDING_AGE`, so a forgery that could set it would not merely
     // invent a finding — it would invent one that never expires.
     Approach {
         message: Outreach {

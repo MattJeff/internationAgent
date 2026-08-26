@@ -144,7 +144,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::gate::{Denied, PolicyGate, Principal};
-use crate::orizn::{Orizn, TruthError};
+use crate::orizn::Orizn;
 use crate::prompt::SystemPrompt;
 use crate::proof_of_need::{Checked, Evidence, Flow, Probe, ProbeError, Prober};
 use crate::psyche;
@@ -1704,47 +1704,72 @@ async fn open_the_round(
 /// So "we approached a prospect about a finding we could not reproduce" is not a
 /// review item on this path. It is a program that does not compile.
 ///
+/// # And the half of the bar a type could not hold on its own
+///
+/// **Not every reproduced finding may be sent.** Two of the five rest entirely
+/// on Orizn's row being right about the pair —
+/// [`Finding::Contradicts`](crate::proof_of_need::Finding) and
+/// [`Finding::StayLength`](crate::proof_of_need::Finding) — and free Wikipedia
+/// scored 78% against the ten cases our own row got the Croatian one wrong on.
+/// Asserting one of those to a prospect is betting the account on a database
+/// that has been beaten by a free source. So [`Approach::new`] returns nothing
+/// for them: they are evidence, they are filed, and a human reads them.
+/// [`Finding::stands_on_their_page`](crate::proof_of_need::Finding::stands_on_their_page)
+/// is the predicate and this is its only enforcement point.
+///
 /// # And a claim that *was* reproducible, once
 ///
 /// The second field is the instant the finding is known good as of, and it is
-/// here because the bar has a second half that a type alone could not hold: an
-/// `Approach` is a value, values keep, and [`follow_up`] takes one. A server
-/// runs for weeks. Nothing stopped it re-sending a three-day-old sentence about
-/// a rule that changed on the second day — and the sentence names a date and
-/// says "here is how to see it again", so a prospect who follows the steps and
-/// sees something else has been told, in writing, a thing that is not true
-/// about their own product. That is the one mistake in this job that cannot be
-/// walked back.
+/// here because an `Approach` is a value, values keep, and [`follow_up`] takes
+/// one. A server runs for weeks. Nothing stopped it re-sending a three-day-old
+/// sentence about a page that was fixed on the second day — and the sentence
+/// names a date and says "here is how to see it again", so a prospect who
+/// follows the steps and sees something else has been told, in writing, a thing
+/// that is not true about their own product. That is the one mistake in this job
+/// that cannot be walked back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approach {
     message: crate::revenue::Outreach,
-    /// [`Answer::retrieved_at`](crate::proof_of_need::Answer), copied off the
-    /// evidence, so [`follow_up`] can apply `MAX_TRUTH_AGE` to a claim it is
-    /// about to re-assert.
+    /// [`Evidence::observed_at`](crate::proof_of_need::Evidence), copied off the
+    /// evidence, so [`follow_up`] can apply
+    /// [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE) to a claim it
+    /// is about to re-assert.
     ///
-    /// The authority's instant and not [`Evidence::observed_at`], deliberately:
-    /// `Prober::run` measures the bar from `retrieved_at`, so this is literally
-    /// the predicate the first send passed, re-run. `observed_at` is always the
-    /// later of the two — it is `now` at check time — so measuring from it
-    /// would give a finding built on an answer that was already twenty-three
-    /// hours old another full day, and the bar would silently mean forty-seven.
+    /// The observation's instant and not the authority's, and that swap is the
+    /// re-derivation. Every sentence that reaches this struct is of the form
+    /// *"on this date your page did this"* — the clauses about what the rule is
+    /// were removed from the sendable findings, and the findings that are made
+    /// of nothing else do not get here. So the thing that goes stale is the
+    /// look at their page, and their page is what the bar now measures.
     known_good_at: DateTime<Utc>,
 }
 
 impl Approach {
-    /// Render the approach from a reproduced finding.
+    /// Render the approach from a reproduced finding, when it is one we may
+    /// send.
+    ///
+    /// `None` for a finding that rests on Orizn's row rather than on the
+    /// prospect's page — see the type docs. That is not a soft preference
+    /// expressed in a briefing a busy turn can skip: this is the only
+    /// constructor of the value [`Seller::touch`](crate::revenue::Seller::touch)
+    /// needs, so "we asserted our database at a prospect" is a program that does
+    /// not run rather than a review item.
     ///
     /// Not one byte of the prospect's page is in it.
     /// [`Evidence::claim_line`](crate::proof_of_need::Evidence::claim_line) is
-    /// built from our own configuration, the probe inputs and two parsed enums,
-    /// and [`Evidence::steps`](crate::proof_of_need::Evidence) is the plan we
-    /// ran, also ours. The verbatim panel text stays an
+    /// built from our own configuration, the probe inputs and parsed enums, and
+    /// [`Evidence::steps`](crate::proof_of_need::Evidence) is the plan we ran,
+    /// also ours. The verbatim panel text stays an
     /// [`Untrusted`](agentos_domain::untrusted::Untrusted) on the evidence, for
     /// a human to attach if they want to.
     ///
     /// `opt_out` is the plain way out that every approach carries — an
     /// operator's sentence, not a model's.
-    pub fn new(evidence: &Evidence, opt_out: &str) -> Self {
+    pub fn new(evidence: &Evidence, opt_out: &str) -> Option<Self> {
+        if !evidence.finding.stands_on_their_page() {
+            return None;
+        }
+
         let steps: Vec<String> = evidence
             .steps
             .iter()
@@ -1752,7 +1777,7 @@ impl Approach {
             .map(|(n, step)| format!("{}. {step}", n + 1))
             .collect();
 
-        Self {
+        Some(Self {
             message: crate::revenue::Outreach {
                 subject: format!(
                     "{}: what your entry-requirements step shows for {} → {}",
@@ -1764,8 +1789,8 @@ impl Approach {
                     steps.join("\n"),
                 ),
             },
-            known_good_at: evidence.authority.retrieved_at,
-        }
+            known_good_at: evidence.observed_at,
+        })
     }
 
     /// The message, for [`Seller::touch`](crate::revenue::Seller::touch).
@@ -1801,16 +1826,14 @@ impl Approach {
         }
     }
 
-    /// Whether this claim is still inside [`MAX_TRUTH_AGE`] at `now`.
+    /// Whether this claim is still inside
+    /// [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE) at `now`.
     ///
-    /// The same predicate `Prober::run` applies before it loads a page, on the
-    /// same field, so "may I say this?" has one answer and one line that
-    /// decides it. The negative branch — a clock that has gone backwards —
-    /// refuses too, for the reason it does over there: an age we cannot compute
-    /// is not an age inside the bar.
+    /// The negative branch — a clock that has gone backwards — refuses too: an
+    /// age we cannot compute is not an age inside the bar.
     fn still_true(&self, now: DateTime<Utc>) -> bool {
         let age = now.signed_duration_since(self.known_good_at);
-        age <= crate::proof_of_need::MAX_TRUTH_AGE && age >= chrono::TimeDelta::zero()
+        age <= crate::proof_of_need::MAX_FINDING_AGE && age >= chrono::TimeDelta::zero()
     }
 }
 
@@ -1849,20 +1872,19 @@ pub enum Sold {
     /// The check produced no finding, and the outcome says which of the five
     /// reasons it was. Never [`Checked::Evidence`] — that arm is the one below.
     NoFinding(Checked),
-    /// There is no authoritative answer to compare their flow against, so
-    /// nothing was compared: the gate refused the Orizn lookup, the server did
-    /// not answer, or it answered something this vertical may not build a claim
-    /// on. **No page was loaded and no email was sent.**
+    /// A reproduced finding that this system may not assert.
     ///
-    /// Its own variant rather than a [`Checked`], because a `Checked` is what a
-    /// probe came to and no probe happened — the same reason
-    /// [`Checked::TruthStale`] excludes itself from the suppression denominator.
-    /// A stale-but-dated answer is not here: that one becomes a real
-    /// [`Answer`](crate::proof_of_need::Answer),
-    /// reaches [`Prober::check`](crate::proof_of_need::Prober::check), and is
-    /// refused by `MAX_TRUTH_AGE` as `NoFinding(Checked::TruthStale)` with an
-    /// attempt row behind it.
-    NoTruth(TruthError),
+    /// [`Finding::Contradicts`](crate::proof_of_need::Finding) or
+    /// [`Finding::StayLength`](crate::proof_of_need::Finding): real, filed, and
+    /// resting entirely on Orizn's row being right about this pair. It goes to
+    /// [`Stage::Handoff`](crate::rolepack_sales::Stage) with a human on the end
+    /// of it. **No email was sent.**
+    ///
+    /// It is the accuracy path's whole remaining life, and it is deliberately a
+    /// value a caller has to handle rather than a silent deletion: the finding
+    /// is worth having, and the seller that sends it is the seller who gets
+    /// Wikipedia opened in its face.
+    ForHuman(Box<Evidence>),
     /// A reproduced finding, and what the approach came to.
     Approached {
         /// The finding, for filing.
@@ -1924,29 +1946,35 @@ pub async fn sell(
         return Ok(Sold::Forbidden(ActionKind::EmailSend));
     }
 
-    // `Stage::Evidence` starts with the authority, not the browser, for the
-    // reason `Prober::run` checks `MAX_TRUTH_AGE` before it loads a page: a
-    // truth we cannot establish should cost the prospect zero page loads. It is
-    // also the order that makes the gate's answer decisive — an employee whose
-    // policy does not list the Orizn tool never touches their site either.
+    // `Stage::Evidence` still starts with the authority, and it is still tried
+    // before the browser — but a lookup that fails no longer ends the turn.
+    //
+    // That is the categorical criterion arriving. Three of the five findings
+    // stand on the prospect's own page and need no row of ours, so a failed
+    // lookup costs the two that do and nothing else. Under the old criterion
+    // every claim shape needed a requirement to compare against, and Orizn's
+    // keyless surface answers `last_verified: null` — so this branch was, in
+    // production, the reason a seller could produce no finding at all.
     let authority = match orizn.answer(seller, prospect.probe, now).await {
-        Ok(answer) => answer,
+        Ok(answer) => Some(answer),
         Err(why) => {
-            // One low-cardinality label, like `Prober::check`'s. Sending a
-            // "defect" on the back of a failed lookup is the mistake that
-            // cannot be walked back, so the refusal is loud and the turn ends.
+            // One low-cardinality label, like `Prober::check`'s. Loud, because
+            // it is still a degraded check: the gate may have refused the tool,
+            // and an operator watching this rate is watching their own
+            // provisioning.
             tracing::warn!(
                 reason = why.code(),
-                "no authoritative answer; nothing to compare their flow against"
+                "no authoritative answer; only the findings that stand on the prospect's own page \
+                 are available on this check"
             );
-            return Ok(Sold::NoTruth(why));
+            None
         }
     };
 
-    // Five of the six outcomes carry no evidence, and that is the design rather
-    // than a gap in it.
+    // Five outcomes carry no evidence, and that is the design rather than a gap
+    // in it.
     let evidence = match prober
-        .check(prospect.flow, prospect.probe, &authority, now)
+        .check(prospect.flow, prospect.probe, authority.as_ref(), now)
         .await?
     {
         Checked::Evidence(found) => found,
@@ -1954,11 +1982,21 @@ pub async fn sell(
     };
 
     // `Stage::Approach`, and it is unreachable above this line: `Approach::new`
-    // takes the `&Evidence` that only the match arm above can bind.
+    // takes the `&Evidence` that only the match arm above can bind — and it
+    // hands back nothing at all for the two findings made entirely of our own
+    // database. Those go to a human.
+    let Some(approach) = Approach::new(&evidence, opt_out) else {
+        tracing::info!(
+            finding = evidence.finding.code(),
+            "finding rests on our row rather than on their page; handing it to a human unsent"
+        );
+        return Ok(Sold::ForHuman(evidence));
+    };
+
     let outcome = seller
         .touch(
             prospect.sequence,
-            Approach::new(&evidence, opt_out).message(),
+            approach.message(),
             TrustLabel::Untrusted,
             now,
         )
@@ -2065,7 +2103,7 @@ mod tests {
     use super::*;
     use crate::effects::{Effects, Ports};
     use crate::gate::{PolicyGate, Principal};
-    use crate::proof_of_need::Claim;
+    use crate::proof_of_need::{Claim, Finding};
     use crate::revenue::{Contacted, Suppression};
 
     /// A prospect's page is the subject of the investigation and it is also a
@@ -3814,15 +3852,26 @@ mod tests {
         }
     }
 
-    /// Yesterday, as Orizn dates a rule. `MAX_TRUTH_AGE` is 24 hours and
-    /// `last_verified` is a date, so the freshest a rule can ever read is the
-    /// start of its verification day — see `orizn`'s module docs.
+    /// A rule's own verification date, as Orizn dates one. `last_verified` is a
+    /// date, so the freshest a rule can ever read is the start of that day —
+    /// see `orizn`'s module docs.
     fn verified_on(now: DateTime<Utc>) -> String {
         now.date_naive().to_string()
     }
 
-    /// The bar, end to end: their flow says the same wrong thing twice, so
-    /// there is a finding and it goes out.
+    /// A panel exhibiting a finding this system may actually assert: their own
+    /// two sentences, one saying no visa is required and one saying a visa is
+    /// issued at the border.
+    ///
+    /// Every send test below uses one of these rather than a bare contradiction,
+    /// and that is the criterion arriving in the fixtures: a page whose only
+    /// defect is disagreeing with our row produces evidence and no email.
+    fn conflating_panel() -> String {
+        format!("No visa required for this trip. Visa on arrival at the airport. {INJECTION}")
+    }
+
+    /// The bar, end to end: their flow says the same categorically wrong thing
+    /// twice, so there is a finding and it goes out.
     #[tokio::test]
     async fn a_reproduced_finding_becomes_one_approach() {
         let Some(db) = db().await else { return };
@@ -3831,11 +3880,7 @@ mod tests {
             &db,
             // Both sides of the comparison are a stranger's text and both carry
             // the same sentence a stranger would write. It is a document, twice.
-            &[&format!("No visa required for this trip. {INJECTION}")],
-            // Orizn says a visa is required and their checkout says it is not:
-            // the contradiction this vertical exists to find. Verified today,
-            // because `MAX_TRUTH_AGE` is 24 hours and a date-grained
-            // `last_verified` clears that bar only on the day it was set.
+            &[&conflating_panel()],
             StubOrizn::answering("visa_required", &verified_on(now)),
             permissive(),
         )
@@ -3862,11 +3907,12 @@ mod tests {
         .expect("the check reached an outcome");
 
         let Sold::Approached { evidence, outcome } = sold else {
-            panic!("a reproducible contradiction should have been sent: {sold:?}");
+            panic!("a reproducible conflation should have been sent: {sold:?}");
         };
         assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
         assert_eq!(desk.email.sent_count(), 1);
         assert_eq!(sequence.touches().len(), 1);
+        assert_eq!(evidence.finding, Finding::Conflates);
 
         // The lookup happened, once, in the alpha-3 spelling the real server
         // demands — `CountryCode` is alpha-2 and `quick_visa_check` rejects it.
@@ -3874,11 +3920,13 @@ mod tests {
             desk.orizn.asked(),
             vec![json!({ "passport": "FRA", "destination": "VNM" })]
         );
-        assert_eq!(evidence.authority.requirement, Claim::VisaRequired);
-        assert_eq!(evidence.authority.source, crate::orizn::SOURCE);
+        let authority = evidence.authority.as_ref().expect("the lookup succeeded");
+        assert_eq!(authority.requirement, Claim::VisaRequired);
+        assert_eq!(authority.source, crate::orizn::SOURCE);
 
         // The message is built from the finding and from nothing they wrote.
-        let approach = Approach::new(&evidence, "Reply STOP and I will not write again.");
+        let approach =
+            Approach::new(&evidence, "Reply STOP and I will not write again.").expect("sendable");
         assert!(approach.message().body.contains("Airline Example"));
         assert!(approach.message().body.contains("How to see it again"));
         assert!(
@@ -3904,14 +3952,16 @@ mod tests {
             "the panel text was not preserved as evidence"
         );
 
-        // Nothing Orizn's server wrote is in it either. The only field of an
-        // `Answer` this sentence renders is `source`, and `source` is ours — so
-        // the licence banner riding along on every reply, and anything else a
-        // compromised endpoint chose to put beside it, is quoted nowhere and
-        // obeyed nowhere.
+        // **And our own database is not in it either, which is the change.**
+        // The old sentence ended "— orizn:quick_visa_check/v1 says a visa is
+        // required", and that clause is the one a prospect rebuts by opening a
+        // free source. This finding is made of their two sentences, so the
+        // authority is on the evidence for a human and nowhere in the mail. The
+        // licence banner riding along on every MCP reply was never quotable and
+        // still is not.
         assert!(
-            approach.message().body.contains(crate::orizn::SOURCE),
-            "the claim does not name the source it stands on: {}",
+            !approach.message().body.contains(crate::orizn::SOURCE),
+            "the mail asserts our row at a prospect: {}",
             approach.message().body
         );
         assert!(
@@ -3921,16 +3971,88 @@ mod tests {
         );
     }
 
+    /// **The accuracy path, kept and unable to leave the building.**
+    ///
+    /// Their checkout says no visa; Orizn says a visa is required. That is the
+    /// highest-stakes discrepancy this system can find and it is a real
+    /// `Evidence` with reproduction steps — and it is also a sentence made of
+    /// nothing but "our database disagrees with yours", which free Wikipedia
+    /// beat 78% to 57% on the same ten cases our own row got Croatia wrong on.
+    ///
+    /// So it is filed, it goes to a human, and no email is sent. Deleting the
+    /// path instead would have thrown away the denied-boarding case; asserting
+    /// it is the mistake that cannot be walked back.
+    #[tokio::test]
+    async fn a_finding_that_rests_on_our_own_row_goes_to_a_human_and_not_to_the_prospect() {
+        let Some(db) = db().await else { return };
+        let now = at(2026, 8, 23);
+        let desk = sales_desk(
+            &db,
+            &["No visa required for this trip."],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+
+        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
+        let mut sequence = Sequence::new(address("head.of.digital@airline.example"));
+        let sold = sell(
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &pack,
+            &sales_objective_value(),
+            Prospect {
+                flow: &flow(),
+                probe: &probe(),
+                sequence: &mut sequence,
+            },
+            "Reply STOP.",
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::ForHuman(evidence) = sold else {
+            panic!("a bare contradiction was not held back: {sold:?}");
+        };
+        assert_eq!(
+            evidence.finding,
+            Finding::Contradicts {
+                shown: Claim::NoVisa,
+                correct: Claim::VisaRequired,
+            }
+        );
+        // It is real evidence: reproduction steps, a screenshot, the source.
+        assert_eq!(evidence.steps.len(), 6);
+        assert!(!evidence.screenshot.is_empty());
+        assert!(evidence.claim_line().contains(crate::orizn::SOURCE));
+
+        // And there is no way to turn it into a message.
+        assert!(Approach::new(&evidence, "Reply STOP.").is_none());
+        assert_eq!(
+            desk.email.sent_count(),
+            0,
+            "a claim about our own row reached a prospect"
+        );
+        assert!(sequence.touches().is_empty(), "the sequence was advanced");
+    }
+
     /// **A finding stops being sayable at the same moment it stopped being
     /// checkable.**
     ///
-    /// The same `Approach`, the same colleagues, twice: inside `MAX_TRUTH_AGE`
-    /// it goes out, and three days later — which is what `next_follow_up_at`
-    /// puts on a contact — it does not. The gap between those two calls is the
-    /// entire bug: `Approach::new` drops the `Evidence`, so before
-    /// `known_good_at` there was nothing left in the value that could tell the
-    /// difference, and the second call sent a dated claim with reproduction
-    /// steps for a rule that may have changed on the second day.
+    /// The same `Approach`, the same colleagues, twice: inside
+    /// `MAX_FINDING_AGE` it goes out, and past it — which is what a second
+    /// round of `next_follow_up_at` reaches — it does not. The gap between
+    /// those two calls is the entire bug: `Approach::new` drops the `Evidence`,
+    /// so before `known_good_at` there was nothing left in the value that could
+    /// tell the difference, and the second call sent a dated claim with
+    /// reproduction steps for a page that may have been fixed on the second day.
+    ///
+    /// The clock the bar reads is the **observation's**, which is the
+    /// re-derivation: the sentence says "on this date your page did this", so
+    /// what expires is the look at the page. Seven days is two follow-ups at
+    /// `FOLLOW_UP_AFTER`'s 72-hour cadence and refuses the third.
     ///
     /// The refusal is asserted to cost nothing as well as to happen: no send,
     /// and no `Sequence` advanced. A follow-up that burned the touch on its way
@@ -3942,7 +4064,7 @@ mod tests {
         let now = at(2026, 8, 23);
         let desk = sales_desk(
             &db,
-            &[&format!("No visa required for this trip. {INJECTION}")],
+            &[&conflating_panel()],
             StubOrizn::answering("visa_required", &verified_on(now)),
             permissive(),
         )
@@ -3967,9 +4089,10 @@ mod tests {
         .await
         .expect("the check reached an outcome");
         let Sold::Approached { evidence, .. } = sold else {
-            panic!("a reproducible contradiction should have been sent: {sold:?}");
+            panic!("a reproducible conflation should have been sent: {sold:?}");
         };
-        let approach = Approach::new(&evidence, "Reply STOP and I will not write again.");
+        let approach =
+            Approach::new(&evidence, "Reply STOP and I will not write again.").expect("sendable");
         assert_eq!(desk.email.sent_count(), 1);
 
         // The rest of the account: the product owner's lead, and whoever
@@ -3989,29 +4112,43 @@ mod tests {
         );
         assert_eq!(desk.email.sent_count(), 3);
 
-        // Thursday, about what we found on Monday. `MAX_TRUTH_AGE` is 24 hours
-        // and `Sequence::due` meters in days, so this is the ordinary shape of
-        // a follow-up, not a corner of one.
+        // Thursday, about what we found on Monday: the ordinary shape of a
+        // follow-up, and the shape the old 24-hour bar made impossible.
+        let mut thursday = [Sequence::new(address("coo@airline.example"))];
+        let sent = follow_up(
+            &desk.seller,
+            &mut thursday,
+            &approach,
+            now + TimeDelta::days(3),
+        )
+        .await
+        .expect("three days is inside the observation bar");
+        assert!(sent.iter().all(Contacted::is_sent), "{sent:?}");
+        assert_eq!(desk.email.sent_count(), 4);
+
+        // A fortnight later, about a page we have not looked at since. The
+        // message names a date and says "here is how to see it again", so this
+        // is the send that gets a prospect to follow the steps and see
+        // something else.
         let mut later = [
-            Sequence::new(address("coo@airline.example")),
+            Sequence::new(address("cfo@airline.example")),
             Sequence::new(address("head.of.product@airline.example")),
         ];
         let refused = follow_up(
             &desk.seller,
             &mut later,
             &approach,
-            now + TimeDelta::days(3),
+            now + TimeDelta::days(14),
         )
         .await
-        .expect_err("a three-day-old claim is a claim nobody re-checked");
+        .expect_err("a fortnight-old observation is one nobody re-checked");
         assert!(
             matches!(refused, Checked::TruthStale),
-            "the refusal has to be the one `Prober::run` makes, on the same \
-             field, or there are two answers to 'may I say this': {refused:?}"
+            "the refusal has to be one word an operator already reads: {refused:?}"
         );
         assert_eq!(
             desk.email.sent_count(),
-            3,
+            4,
             "a stale finding reached a prospect"
         );
         assert!(
@@ -4072,26 +4209,36 @@ mod tests {
         assert!(sequence.touches().is_empty(), "the sequence was advanced");
     }
 
-    /// The panel we compare against is unreachable, so there is nothing to
-    /// compare. No claim, no page load, no email — the employee's answer is
-    /// [`Sold::NoTruth`] and the reason is on it.
+    /// **A failed lookup costs the two findings that need one, and nothing
+    /// else.**
+    ///
+    /// Orizn's keyless surface answers `last_verified: null` and `crate::orizn`
+    /// correctly refuses to build an `Answer` out of it. Under the old
+    /// criterion that ended the turn, every time, for every prospect: the only
+    /// claim shapes were "you say nothing" and "you are wrong", and both wanted
+    /// a requirement to compare against. The seller could produce no finding at
+    /// all against the plan it is actually on.
+    ///
+    /// So: a page whose only defect is disagreeing with a row we do not have
+    /// still produces nothing and still sends nothing. A page that conflates two
+    /// regimes in its own words produces a finding and sends it, because that
+    /// finding never needed our row.
     #[tokio::test]
-    async fn an_unreachable_orizn_produces_no_claim_and_no_outreach() {
+    async fn an_unreachable_orizn_costs_only_the_findings_that_rest_on_it() {
         let Some(db) = db().await else { return };
         let now = at(2026, 8, 23);
+        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
+
+        // Their flow is saying something we would call wrong. Without an
+        // authority that is an opinion, not a finding.
         let desk = sales_desk(
             &db,
-            // Their flow is saying something wrong the whole time. It does not
-            // matter: without an authority this is an opinion, not a finding.
             &["No visa required for this trip."],
             StubOrizn::unreachable(),
             permissive(),
         )
         .await;
-
-        let pack = rolepack_sales::RolePack::sales_development().with_limits(permissive());
         let mut sequence = Sequence::new(address("head.of.digital@airline.example"));
-
         let sold = sell(
             &desk.prober,
             &desk.seller,
@@ -4109,21 +4256,58 @@ mod tests {
         .await
         .expect("the turn ended without a probe error");
 
-        let Sold::NoTruth(why) = sold else {
-            panic!("a failed lookup did not stop the turn: {sold:?}");
-        };
-        assert_eq!(why.code(), "retryable", "{why:?}");
-        assert_eq!(
-            desk.email.sent_count(),
-            0,
-            "a defect was sent on the back of a failed lookup"
+        assert!(
+            matches!(sold, Sold::NoFinding(Checked::TruthStale)),
+            "a defect was invented on the back of a failed lookup: {sold:?}"
         );
+        assert_eq!(desk.email.sent_count(), 0);
         assert!(sequence.touches().is_empty(), "the sequence was advanced");
+
+        // The same failed lookup, a page that indicts itself. This is the send
+        // the old criterion could not make.
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::unreachable(),
+            permissive(),
+        )
+        .await;
+        let mut sequence = Sequence::new(address("head.of.digital@airline.example"));
+        let sold = sell(
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &pack,
+            &sales_objective_value(),
+            Prospect {
+                flow: &flow(),
+                probe: &probe(),
+                sequence: &mut sequence,
+            },
+            "Reply STOP.",
+            now,
+        )
+        .await
+        .expect("the turn ended without a probe error");
+
+        let Sold::Approached { evidence, outcome } = sold else {
+            panic!("a page-only finding still needed our row: {sold:?}");
+        };
+        assert_eq!(evidence.finding, Finding::Conflates);
+        assert_eq!(evidence.authority, None, "there was no row to carry");
+        assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
+        assert_eq!(desk.email.sent_count(), 1);
     }
 
     /// The gate rules on the lookup, and a policy that does not grant the Orizn
     /// tool means **no lookup happens** — not a lookup whose refusal is noted
     /// and stepped over. Reading our own product is still an effect.
+    ///
+    /// What that costs the employee is now exactly what a failed lookup costs
+    /// anyone: the two findings that rest on our row. It no longer costs it the
+    /// three that rest on the prospect's page — reading a public booking flow
+    /// and writing to a business are separately gated acts, and neither of them
+    /// is `orizn/quick-visa-check`.
     #[tokio::test]
     async fn a_policy_that_does_not_allow_the_orizn_tool_stops_the_turn_before_the_call() {
         let Some(db) = db().await else { return };
@@ -4168,10 +4352,10 @@ mod tests {
         .await
         .expect("the turn ended without a probe error");
 
-        let Sold::NoTruth(why) = sold else {
-            panic!("an ungranted tool did not stop the turn: {sold:?}");
-        };
-        assert_eq!(why.code(), "tool_not_allowed", "{why:?}");
+        assert!(
+            matches!(sold, Sold::NoFinding(Checked::TruthStale)),
+            "an ungranted tool did not cost the finding that needed it: {sold:?}"
+        );
         assert!(
             desk.orizn.asked().is_empty(),
             "the call reached the server despite the gate: {:?}",
@@ -4180,19 +4364,24 @@ mod tests {
         assert_eq!(desk.email.sent_count(), 0);
     }
 
-    /// `MAX_TRUTH_AGE`, measured against **the rule's own verification date**
+    /// `MAX_AUTHORITY_AGE`, measured against **the rule's own verification date**
     /// rather than the moment of the call.
     ///
     /// The lookup succeeds, right now, and answers instantly — and the rule it
-    /// reports was last checked ten days ago. If `retrieved_at` were the call
-    /// time this would sail through and an airline would get a letter about a
-    /// rule nobody has looked at since. It is the earlier of the two instead, so
-    /// the existing check refuses it before a single page of theirs is loaded.
+    /// reports was last checked in another year. If `retrieved_at` were the call
+    /// time this would sail through and a human would be handed a finding built
+    /// on a row nobody has looked at since. It is the earlier of the two
+    /// instead, so the check refuses it before a single page of theirs is
+    /// loaded.
+    ///
+    /// The bar is a year rather than a day now, and the number is the argument:
+    /// a consular fee schedule and a bilateral agreement move on that scale, and
+    /// nothing resting on this clock is ever asserted to a prospect.
     #[tokio::test]
     async fn a_rule_verified_before_the_bar_produces_no_claim() {
         let Some(db) = db().await else { return };
         let now = at(2026, 8, 23);
-        let stale = (now - TimeDelta::days(10)).date_naive().to_string();
+        let stale = (now - TimeDelta::days(400)).date_naive().to_string();
         let desk = sales_desk(
             &db,
             &["No visa required for this trip."],

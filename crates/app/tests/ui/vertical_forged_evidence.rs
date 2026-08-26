@@ -24,18 +24,19 @@ fn invented_finding() -> Approach {
         },
         finding: Finding::SaysNothing,
         observed: Untrusted::new(String::new()),
-        authority: Answer {
+        authority: Some(Answer {
             requirement: Claim::VisaRequired,
+            stay_days: None,
             source: "made up".to_owned(),
             retrieved_at: Utc::now(),
             effective_from: None,
-        },
+        }),
         rule_age: RuleAge::Unknown,
         observed_at: Utc::now(),
         steps: Vec::new(),
         screenshot: Vec::new(),
     };
-    Approach::new(&evidence, "Reply STOP.")
+    Approach::new(&evidence, "Reply STOP.").expect("sendable")
 }
 
 fn main() {

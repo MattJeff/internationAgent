@@ -332,8 +332,21 @@ pub fn read_answer(result: &Untrusted<Value>, now: DateTime<Utc>) -> Result<Answ
         .and_then(|raw| raw.parse().ok())
         .ok_or(TruthError::Undated)?;
 
+    // The entitlement, and the only new thing this module reads. It is a number
+    // rather than text, so it crosses the wrapper on the same terms
+    // `requirement` does, and it is the authority behind
+    // [`Finding::StayLength`](crate::proof_of_need::Finding) — the quiet
+    // bilateral agreements, where India↔Maldives has been 90 days since 2019
+    // while Sherpa and VisaHQ both say 30. Absent, null or negative is `None`,
+    // which is "we do not know" and produces no finding.
+    let stay_days = payload
+        .get("visa_free_days")
+        .and_then(Value::as_u64)
+        .and_then(|days| u32::try_from(days).ok());
+
     Ok(Answer {
         requirement,
+        stay_days,
         // Ours. See the module docs: this is the one field that reaches a
         // prospect's inbox.
         source: SOURCE.to_owned(),

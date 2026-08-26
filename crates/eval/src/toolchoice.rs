@@ -36,6 +36,21 @@
 //! a score without the prompt it was measured against is a number with no
 //! subject.
 //!
+//! ## What the pin covers, and what it does not
+//!
+//! **One pack.** [`prompt`] renders [`RolePack::international_buyer`], so the
+//! two digests move when the *buyer's* briefing moves and stay put when any
+//! other pack's does. That is correct — all five [`CASES`] are buyer turns, and
+//! a pin that went red on an unrelated pack would invalidate scores that are
+//! still good — but it is worth saying out loud, because "the prompt digest is
+//! pinned" reads like a claim about every briefing in the workspace and is not
+//! one. `agentos_app::rolepack_sales::RolePack::sales_development`'s briefing
+//! has no pin and no live cases, and an edit to it turns nothing here red.
+//!
+//! The fix, on the day somebody writes a sales case, is a third constant and a
+//! `sales` fixture beside `prompt` — not before, because a digest guarding
+//! scores that do not exist is a constant somebody re-derives out of habit.
+//!
 //! # Ground truth for the cases
 //!
 //! High confidence, and cheaply so: each case is written so exactly one tool is

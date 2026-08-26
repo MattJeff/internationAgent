@@ -68,8 +68,9 @@
 //! that never rendered, and it stays [`Divergence::Undetermined`] — the
 //! `one run silent, one run blank` fixture below is what holds that line.
 
-use agentos_app::proof_of_need::{Checked, Claim, Divergence, Verdict, verdict};
+use agentos_app::proof_of_need::{Answer, Checked, Claim, Divergence, Verdict, verdict};
 use agentos_domain::untrusted::Untrusted;
+use chrono::DateTime;
 
 use crate::{Row, Surface, Truth};
 
@@ -241,6 +242,55 @@ const CASES: &[Case] = &[
         authority: Claim::EVisa,
         expect: ("evidence", Some("contradicts")),
     },
+    // --- the categorical findings ------------------------------------------
+    // The three that stand on the prospect's own page, and the two negatives
+    // that keep them sendable. Without these the row above measures two of the
+    // five findings the module has and reports the number as if it were all of
+    // them.
+    Case {
+        // Category 1. A price with no side named — iVisa's "from $69.99" is its
+        // own commission presented as the visa's cost.
+        name: "a price with no side named",
+        first: "Visa required. Fee from $69.99 per traveller.",
+        second: "Visa required. Fee from $69.99 per traveller.",
+        authority: Claim::VisaRequired,
+        expect: ("evidence", Some("unattributed_fee")),
+    },
+    Case {
+        // The same page, attributed. It agrees with the authority and it says
+        // whose money is whose, so there is nothing to report.
+        name: "a price whose side is named",
+        first: "Visa required. Government fee $25, our service fee $44.99.",
+        second: "Visa required. Government fee $25, our service fee $44.99.",
+        authority: Claim::VisaRequired,
+        expect: ("agrees", None),
+    },
+    Case {
+        // Category 3. Two regimes in one panel, in their words — no external
+        // fact in dispute, which is what makes it sendable.
+        name: "an exemption and a border visa in one panel",
+        first: "No visa required. Your visa on arrival is issued at the airport.",
+        second: "No visa required. Your visa on arrival is issued at the airport.",
+        authority: Claim::VisaOnArrival,
+        expect: ("evidence", Some("conflates")),
+    },
+    Case {
+        // The sentence we would want them to write. `conflates` must not fire
+        // on it — a false positive there is a letter telling an airline its
+        // correct wording is wrong, and that letter would go out.
+        //
+        // What it *does* become is `contradicts`, and honestly so: `read_claim`
+        // is first-match-wins, "no visa" is the first phrase in the panel, and
+        // the parser has no way to carry "in advance". That is a real limitation
+        // and this is where it lands — on the finding nobody may send. The
+        // parser's monolingual, first-match ceiling can cost us a handoff; it
+        // cannot cost us a false statement in somebody's inbox.
+        name: "an exemption qualified in its own sentence",
+        first: "No visa is required in advance; a visa is issued on arrival.",
+        second: "No visa is required in advance; a visa is issued on arrival.",
+        authority: Claim::VisaOnArrival,
+        expect: ("evidence", Some("contradicts")),
+    },
 ];
 
 /// The `(outcome, detail)` pair a verdict would file.
@@ -253,11 +303,25 @@ fn filed(verdict: &Verdict) -> (&'static str, Option<&'static str>) {
     }
 }
 
+/// The authority as a bare requirement, which is all these cases are about.
+///
+/// `verdict` takes the whole [`Answer`] now, because two of the five findings
+/// need more of it than the requirement — the entitlement behind
+/// `Finding::StayLength`, and the date behind the refusal. Neither is what this
+/// suite measures: every case here is about the byte comparison and the
+/// suppression reasons, so the extra fields are pinned at their "says nothing"
+/// values and the requirement is the only thing that varies.
 fn run(first: &str, second: &str, authority: Claim) -> Verdict {
     verdict(
         &Untrusted::new(first.to_owned()),
         &Untrusted::new(second.to_owned()),
-        authority,
+        Some(&Answer {
+            requirement: authority,
+            stay_days: None,
+            source: "eval".to_owned(),
+            retrieved_at: DateTime::UNIX_EPOCH,
+            effective_from: None,
+        }),
     )
 }
 
@@ -537,6 +601,13 @@ mod tests {
         ];
         let details = [
             Finding::SaysNothing.code(),
+            Finding::UnattributedFee.code(),
+            Finding::Conflates.code(),
+            Finding::StayLength {
+                shown: 30,
+                correct: 90,
+            }
+            .code(),
             Finding::Contradicts {
                 shown: Claim::NoVisa,
                 correct: Claim::VisaRequired,

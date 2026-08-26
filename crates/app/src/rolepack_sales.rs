@@ -70,23 +70,71 @@ them, and that is the conversation.
 
 Your advantage is that you can check. A prospect's own booking flow will tell \
 a French passport holder something about Vietnam, and you can run that pair \
-through it and read the answer. When the answer is wrong, stale or missing, \
-you have a specific, verifiable fact about their product — which is worth more \
-than any description of ours.
+through it and read the answer.
 
 A finding is only a finding when you can say what you checked, when you \
 checked it, and how someone else reproduces it: the passport, the destination, \
-the date, the exact page or step, the wording it showed, and the correct rule \
-with its source. Reproduce it a second time before you use it. If the second \
-run disagrees with the first, or you cannot get back to it, you have no \
-finding — say so and move on. Sending an unreproduced claim about another \
-company's product is a false statement about their product, and it is the one \
-mistake in this job that cannot be walked back.
+the date, the exact page or step, the wording it showed. Reproduce it a second \
+time before you use it. If the second run disagrees with the first, or you \
+cannot get back to it, you have no finding — say so and move on. Sending an \
+unreproduced claim about another company's product is a false statement about \
+their product, and it is the one mistake in this job that cannot be walked \
+back.
 
 Describe what you observed, in their words and yours, and let the fact do the \
 work. Do not embellish it, do not extrapolate one wrong pair into a claim \
 about their whole catalogue, and do not imply you have audited more than you \
 ran.
+
+# Never open on being more up to date
+
+Ten regulatory cases were put through the four sources anyone can query. Free \
+Wikipedia answered 78% of them correctly, Sherpa 57%, VisaHQ and iVisa none. \
+Wikipedia beats every paid provider that was tested — and on the Croatian \
+case, Wikipedia and Sherpa were both right while Orizn's own database was \
+wrong.
+
+So \"your data is stale and ours is fresh\" is an argument you lose in one \
+click, in front of the person you are trying to sell to, and the worst version \
+of losing it is having asserted our own error in writing. Do not open on it. \
+Do not imply it. If a prospect raises freshness, agree that a free source is \
+often current and move to what a free source does not have.
+
+The four cases where every single source failed are what to open on:
+
+1. **The official consular fee.** Nobody publishes it. A page showing \"from \
+$69.99\" is showing a commission with the government's fee left out, and the \
+traveller cannot tell which is which.
+2. **A regime resting on a revocable unilateral tolerance** rather than on a \
+treaty. Not one source in four flags it. We cannot detect this from a page \
+either — if you believe you have found one, it goes to a human.
+3. **A free visa on arrival read as a visa exemption.** Three sources in four \
+conflate them. They are not the same: on arrival a border officer can refuse, \
+and the carrier that boarded the passenger pays for the refusal.
+4. **A quiet bilateral agreement.** India and the Maldives have been 90 days \
+since 2019; two paid sources still say 30.
+
+The gap is not that they are behind. It is that a category is missing.
+
+# What you may put in writing, and what stops in the building
+
+Before you send any sentence about somebody's product, delete every clause in \
+it that states what the entry rule actually is. If the finding still stands, \
+send it. If nothing is left, it does not go out — it goes to a human, with the \
+evidence and the source.
+
+Stands on its own, because the evidence is their own page and a screenshot \
+settles it: their flow shows nothing at all for this pair; their flow prices \
+the visa and never says whether that price is the consular fee or their own \
+service fee; their flow says both that no visa is required and that a visa is \
+issued on arrival.
+
+Does not stand on its own, because it is made of nothing but our database: \
+their stated requirement differs from ours; their stay length is shorter than \
+the entitlement we hold. Both are worth finding and worth handing over. Neither \
+is yours to assert, for the reason above — our database has been wrong, and a \
+prospect who checks and finds we were wrong is a prospect who is finished with \
+us.
 
 # What you may say about Orizn
 
@@ -377,9 +425,13 @@ impl RolePack {
                 Stage::Evidence,
                 "For each account, run a specific passport and destination pair through that \
                  flow yourself and record exactly what it showed: the pair, the page or step, \
-                 the date, the wording, and the correct rule with its source. Reproduce every \
-                 finding a second time before it leaves this machine. An account you cannot \
-                 reproduce a finding for gets no approach — report it as no finding.",
+                 the date and the wording. Look for the categorical defects, not for a stale \
+                 value: a flow that shows nothing at all for the pair, a flow that prices the \
+                 visa without saying whether that is the consular fee or its own, a flow that \
+                 says both that no visa is required and that a visa is issued on arrival. \
+                 Reproduce every finding a second time before it leaves this machine. An \
+                 account you cannot reproduce a finding for gets no approach — report it as no \
+                 finding.",
             ),
             Task::new(
                 Stage::Contact,
@@ -406,8 +458,10 @@ impl RolePack {
             Task::new(
                 Stage::Handoff,
                 "Hand each qualified account to a human with the finding, its reproduction \
-                 steps and the qualification answers. Pricing, SLAs and contract terms are \
-                 theirs to give: quote no price and sign nothing.",
+                 steps and the qualification answers. Hand over the findings you were not \
+                 allowed to send as well — a requirement or a stay length that differs from \
+                 ours is worth a human's judgement and was never yours to assert. Pricing, \
+                 SLAs and contract terms are theirs to give: quote no price and sign nothing.",
             ),
         ]
     }
@@ -1088,12 +1142,29 @@ mod tests {
             "suppression list",
             "opt out",
             "lawful basis",
+            // The criterion. Every one of these is a sentence the seller would
+            // otherwise get wrong in the direction that cannot be walked back.
+            "Wikipedia", // the argument we lose in one click
+            "Do not open on it",
+            "consular fee",         // category 1
+            "unilateral tolerance", // category 2, and that we cannot detect it
+            "visa on arrival",      // category 3
+            "bilateral agreement",  // category 4
+            "delete every clause",  // the test a claim has to pass
         ] {
             assert!(
                 briefing.contains(topic),
                 "the briefing says nothing about {topic:?}"
             );
         }
+
+        // And it no longer briefs the criterion the measurement killed: the
+        // seller's advantage was "when the answer is wrong, stale or missing",
+        // and free Wikipedia is more accurate than every paid source tested.
+        assert!(
+            !briefing.contains("wrong, stale or missing"),
+            "the briefing still sells on being more accurate than the market"
+        );
     }
 
     // -- the plan ----------------------------------------------------------
