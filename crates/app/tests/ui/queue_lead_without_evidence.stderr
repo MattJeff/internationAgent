@@ -1,0 +1,9 @@
+error[E0451]: fields `who` and `opener` of struct `Lead` are private
+  --> tests/ui/queue_lead_without_evidence.rs:24:9
+   |
+23 |     Lead {
+   |     ---- in this type
+24 |         who,
+   |         ^^^ private field
+25 |         opener: Outreach {
+   |         ^^^^^^ private field

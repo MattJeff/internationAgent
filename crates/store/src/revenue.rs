@@ -413,6 +413,32 @@ pub async fn new_contacts_since(
     Ok(count)
 }
 
+/// How many contacts this tenant has **written to** since `since`.
+///
+/// The twin of [`new_contacts_since`], and it answers a different question: that
+/// one counts people added, this one counts people approached. The gate spends
+/// `max_new_contacts_per_day` at the moment an email is authorised, which works
+/// while sending is what this system does. It is not what it does before
+/// 2026-09-01 — `agentos_app::queue` produces a file for a human to upload, and
+/// the gate never sees it — so the budget for that path is measured here, off
+/// the column [`mark_contacted`] writes.
+///
+/// ponytail: no index on `last_contacted_at`; this is a count over one tenant's
+/// contacts and a sequential scan of a few thousand rows costs less than a
+/// fourth index on the table. Add `contacts (tenant_id, last_contacted_at)` if a
+/// tenant's list ever reaches six figures.
+pub async fn contacted_since(
+    tx: &mut TenantTx<'_>,
+    since: DateTime<Utc>,
+) -> Result<i64, RevenueError> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM contacts WHERE last_contacted_at >= $1")
+            .bind(since)
+            .fetch_one(&mut ***tx)
+            .await?;
+    Ok(count)
+}
+
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------

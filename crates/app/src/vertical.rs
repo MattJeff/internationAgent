@@ -1773,6 +1773,34 @@ impl Approach {
         &self.message
     }
 
+    /// An `Approach` with a message nobody proved, for this crate's own tests.
+    ///
+    /// `#[cfg(test)]`, so it exists only while compiling `agentos-app`'s unit
+    /// tests and is absent from every build anything links against. The seal is
+    /// unchanged: `tests/ui/vertical_approach_without_evidence.rs` and
+    /// `tests/ui/queue_lead_without_evidence.rs` are separate crates compiled
+    /// without `cfg(test)`, so they cannot see this and still fail to compile —
+    /// which is the property, and it is checked rather than asserted.
+    ///
+    /// It exists because the alternative is worse. The only honest way to a real
+    /// [`Evidence`] is [`Prober::check`](crate::proof_of_need::Prober::check),
+    /// which needs a browser session, a [`PolicyGate`](crate::gate::PolicyGate)
+    /// and therefore Postgres; making [`crate::queue`]'s pure tests — a CSV
+    /// quoting rule, a suppression filter, an arithmetic cap — carry all three
+    /// would mean they skip themselves on a machine with no database, and a
+    /// suppression test that silently does not run is the failure this whole
+    /// module is about.
+    #[cfg(test)]
+    pub(crate) const fn for_tests(
+        message: crate::revenue::Outreach,
+        known_good_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            message,
+            known_good_at,
+        }
+    }
+
     /// Whether this claim is still inside [`MAX_TRUTH_AGE`] at `now`.
     ///
     /// The same predicate `Prober::run` applies before it loads a page, on the
