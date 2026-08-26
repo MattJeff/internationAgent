@@ -64,7 +64,21 @@ fi
 # forever on a connection the first run still holds, and neither ever finishes.
 # `$$` is the shell's PID, so a stale set from a killed run can never collide
 # with a live one either. Override RUN_ID to get stable names for debugging.
-RUN_ID=${RUN_ID:-$$}
+#
+# Lowercased, and that is not tidiness. `CREATE DATABASE ci_agentosstore_wB`
+# is an *unquoted* identifier, which PostgreSQL folds to `ci_agentosstore_wb` —
+# while `DATABASE_URL` below is a string and keeps the `B`. So an override with
+# a capital in it creates one database and connects to another, and every test
+# in the package dies with `3D000: database … does not exist` a tenth of a
+# second in. It reads exactly like somebody dropped the database mid-run, which
+# is what it cost to find: an accusation aimed at the wrong process.
+#
+# Folding here rather than quoting the identifiers: quoting would make
+# `ci_agentosstore_wB` real and case-sensitive everywhere, including in the
+# cleanup pattern and in anything an operator types by hand at 2am. Postgres
+# already has an opinion about the case of a bare identifier and this agrees
+# with it.
+RUN_ID=$(printf '%s' "${RUN_ID:-$$}" | tr '[:upper:]' '[:lower:]')
 
 log=$(mktemp)
 # Drop this run's databases whichever way we leave — including the ^C that
