@@ -194,32 +194,47 @@ impl Sample {
 /// **Re-paste these together with [`DIGEST`], never separately.** A sample and a
 /// digest that came from different runs is exactly the lie this module was built
 /// to stop.
-/// Recorded 2026-08-26, `claude-opus-5` through the local `claude` CLI, three
-/// separate invocations of `--dry-run 1` against three empty databases. All
-/// three passed every structural row; the spread below is what one language
-/// model does with the same three briefings on the same afternoon.
+/// Recorded 2026-08-26, each seat on its own model through the local `claude`
+/// CLI, one invocation of `--dry-run 3` against an empty database. All nine
+/// turns reached the model, all nine were intact, and every structural row
+/// passed.
 ///
+/// # These are the first samples taken with the seller actually selling
+///
+/// The three before them were taken while `dryrun::take_turn` omitted the
+/// vertical step entirely — the sales seat had no prospect, so
+/// `vertical::due_prospect` would have answered `None`, and what the sample
+/// recorded for that seat was an ordinary conversational turn. The seller now
+/// runs a confirmed prospect's booking flow twice, files a finding and has its
+/// approach refused by `max_new_contacts_per_day` before the model generates a
+/// token. See [`Prospect`] and `dryrun`'s module docs.
+///
+/// So the figures below are not a drift from the ones above them. They are
+/// about a different measurement of a company that did not change — which is
+/// why [`DIGEST`] had to grow the prospect: without it, the two sets of numbers
+/// would sit under the same pin, and the pin's whole job is to make that
+/// impossible.
 pub const RECORDED: &[Sample] = &[
     Sample {
         calls_per_turn: 4.33,
-        input_tokens_per_call: 3625.8,
-        output_tokens_per_call: 144.8,
+        input_tokens_per_call: 3661.4,
+        output_tokens_per_call: 231.6,
     },
     Sample {
-        calls_per_turn: 5.67,
-        input_tokens_per_call: 3968.5,
-        output_tokens_per_call: 205.5,
+        calls_per_turn: 4.67,
+        input_tokens_per_call: 3794.6,
+        output_tokens_per_call: 162.4,
     },
     Sample {
-        calls_per_turn: 6.00,
-        input_tokens_per_call: 4000.7,
-        output_tokens_per_call: 212.8,
+        calls_per_turn: 2.33,
+        input_tokens_per_call: 4882.1,
+        output_tokens_per_call: 601.6,
     },
 ];
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "861afcbdc9f56dc2";
+pub const DIGEST: &str = "26a6b978379873b4";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
@@ -421,6 +436,104 @@ pub fn charters() -> Vec<(&'static str, Charter)> {
     ]
 }
 
+/// **The prospect the dry run seeds, and the flow a human confirmed for it.**
+///
+/// It lives here, beside [`charters`] and inside [`digest`], because it is part
+/// of the company the recorded numbers are about in exactly the way a charter
+/// is. `charters` gives the SDR an objective; without a prospect in the segment
+/// it names, `vertical::due_prospect` answers `None`,
+/// `loops::initiative::assignment_for` resolves `Outcome::NoWork`, and **the
+/// seller takes no turn at all**. Every sample in [`RECORDED`] before
+/// 2026-08-26 was taken in that state: the seller's row measured an ordinary
+/// conversational turn and nothing in this file could see the difference.
+///
+/// Each field is the narrowest thing that makes the vertical run, and two of
+/// them are findings rather than choices.
+///
+/// # `zone` is `orizn.app`, and that is a fact about the operator's documents
+///
+/// `docs/orizn-ceiling.json` and `docs/orizn-roles/sales-development.json` both
+/// list exactly one entry in `allowed_domains`, so the intersection a seller
+/// acts under permits a browser read of `orizn.app` and nothing else. A prospect
+/// seeded anywhere else is refused by the gate as `domain_not_allowed` **before**
+/// the browser is reached, `sell` returns `ProbeError::Refused`, and the seller
+/// falls back to the ordinary turn this fixture exists to stop it taking.
+///
+/// That is not this fixture bending a rule to make its own path run, and it is
+/// not a hole in the operator's documents either — `docs/ORIZN.md` says in as
+/// many words that `allowed_domains` "is where the prospect account list goes"
+/// and that adding an account to probe is a ceiling change. The shipped ceiling
+/// simply has no prospect in it yet, so the seeded one lives on the only domain
+/// this deployment, as written, can look at. Seeding it anywhere else would
+/// measure a `domain_not_allowed` and call it a probe.
+///
+/// # `says` is a conflation, because Orizn binds no MCP server
+///
+/// Two incompatible sentences about one trip is
+/// `proof_of_need::Finding::Conflates` — one of the three findings that stand on
+/// the prospect's own page alone. `allowed_mcp_tools` is empty in both operator
+/// documents, so `vertical::orizn_binding`'s lookup is refused by name and
+/// `sell` runs with no authority; the two findings that need Orizn's own row are
+/// unavailable on this surface. A panel that produced one of those would file
+/// evidence no employee may send, which measures a different path.
+pub struct Prospect {
+    /// `accounts.legal_name`. Ours, and the only name in the vertical's note.
+    pub name: &'static str,
+    /// The zone every seeded prospect's domain sits under. See above.
+    pub zone: &'static str,
+    /// Path of the booking page the check starts on, under the account's own
+    /// domain — `Flow::confirmed` refuses an entry URL anywhere else.
+    pub entry_path: &'static str,
+    /// CSS selector of the passport field.
+    pub passport_field: &'static str,
+    /// CSS selector of the destination field.
+    pub destination_field: &'static str,
+    /// CSS selector of the travel-date field.
+    pub date_field: &'static str,
+    /// CSS selector of their "check requirements" button. Never a booking or a
+    /// payment submit; see `migrations/0032_prospect_flows.sql`.
+    pub submit: &'static str,
+    /// CSS selector of the element the answer is read out of. It has to match
+    /// what the mock browser was told about, or the read comes back
+    /// `no_such_element` and the probe errors instead of finding.
+    pub panel: &'static str,
+    /// What that element says, to both runs of the flow.
+    pub says: &'static str,
+}
+
+/// The one prospect, and it is not tuned: see [`Prospect`] on both halves.
+pub const PROSPECT: Prospect = Prospect {
+    name: "Prospect Air",
+    zone: "orizn.app",
+    entry_path: "/booking/entry",
+    passport_field: "#passport",
+    destination_field: "#destination",
+    date_field: "#travel-date",
+    submit: "#check",
+    panel: "#visa-info",
+    says: "No visa required for this trip. Visa on arrival at the airport.",
+};
+
+impl Prospect {
+    /// The nth seeded prospect's registrable domain.
+    ///
+    /// One per pass, and that is not tidiness. A filed finding takes an account
+    /// out of `accounts_without_evidence` permanently, and the approach this
+    /// deployment makes comes back refused — so `mark_contacted` never runs and
+    /// there is no chase either. A second pass against the same company with one
+    /// seeded prospect is a seller back on `NoWork`, which is the non-event this
+    /// whole fixture exists to end.
+    pub fn domain(&self, nth: usize) -> String {
+        format!("prospect-{nth}.{}", self.zone)
+    }
+
+    /// Where the approach to the nth prospect would go. Per prospect, so one
+    /// person is not written to three times by three passes.
+    pub fn contact(&self, nth: usize) -> String {
+        format!("head.of.digital@prospect-{nth}.example")
+    }
+}
+
 /// A stand-in for the employee's own name and address, so the digest is a
 /// function of the charters and not of a `uuid` minted at run time.
 ///
@@ -473,6 +586,23 @@ pub fn digest() -> String {
         hasher.update(prompt.render(TrustLabel::Trusted).as_bytes());
         hasher.update(prompt.render(TrustLabel::Untrusted).as_bytes());
         hasher.update(charter.brief().as_bytes());
+    }
+    // The seeded prospect, for [`Prospect`]'s reason: with no prospect the
+    // seller resolves `NoWork` and takes no turn, so this decides whether the
+    // sales row above is a selling turn or a conversation. Nothing else in this
+    // function can see that difference.
+    for field in [
+        PROSPECT.name,
+        PROSPECT.zone,
+        PROSPECT.entry_path,
+        PROSPECT.passport_field,
+        PROSPECT.destination_field,
+        PROSPECT.date_field,
+        PROSPECT.submit,
+        PROSPECT.panel,
+        PROSPECT.says,
+    ] {
+        hasher.update(field.as_bytes());
     }
     for file in ["orizn-ceiling.json", "orizn-org.json"] {
         let path = docs(file);

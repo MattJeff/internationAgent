@@ -37,6 +37,35 @@
 //! payments — which is the point: the model is the part that has never been
 //! exercised.
 //!
+//! # The seller works a prospect, and for a while it did not
+//!
+//! [`take_turn`] used to omit the vertical step with a comment saying it needed
+//! "a sourcing round or a sales pipeline in the database". That was true when
+//! `loops::initiative` answered a sales charter with `return None`; it stopped
+//! being true when `vertical::selling_turn` was dispatched for real, and nothing
+//! here noticed. **Every sample recorded before 2026-08-26 measured a seller
+//! that took an ordinary conversational turn** — and the transcript of one is
+//! worth reading, because the model works it out: nine model calls, seven of
+//! them `read_page` against `orizn.app`, and a closing paragraph explaining that
+//! the evidence stage is "structurally blocked" because no tool it has reaches
+//! an airline.
+//!
+//! So [`stand_up`] now seeds a prospect with a **confirmed** flow, [`vertical`]
+//! runs before the model exactly as `loops::initiative::vertical_step` does, and
+//! the seller's own numbers are reported on a row of their own — a turn that
+//! runs somebody's booking flow twice and files a finding before it thinks is a
+//! different shape of turn from a buyer's, and an average over both hides it.
+//!
+//! Four constraints made that seeding narrow, and all four are deliberate:
+//! `proof_of_need::Flow` carries a private seal, so it cannot be built by hand
+//! and has to come through `Flow::confirmed`; `app_role` is granted no INSERT on
+//! `prospect_flows`, so the row goes in on an admin connection through
+//! `revenue::set_prospect_flow`; `confirmed_by` must be set or `Flow::confirmed`
+//! refuses the row; and `MockBrowser`'s page map is empty, so the panel read
+//! comes back `no_such_element` unless the fixture puts an element there. Not
+//! one of them is worked around here — see [`crate::cost::Prospect`], which owns
+//! what is seeded and is inside [`crate::cost::digest`] because of it.
+//!
 //! # What it records, and why that is the deliverable
 //!
 //! Not a score. A transcript: every tool the model reached for, the arguments
@@ -91,11 +120,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentos_app::effects::Effects;
+use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal};
+use agentos_app::proof_of_need::Prober;
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
+use agentos_app::revenue::Seller;
 use agentos_app::turn::{Context, Turn};
-use agentos_app::vertical::Charter;
+use agentos_app::vertical::{self, Charter};
 use agentos_app::{inbound, mocks};
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Lifecycle};
@@ -105,12 +136,12 @@ use agentos_providers::ProviderError;
 use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, Message, Usage};
 use agentos_providers::llm_cli::CliLlm;
 use agentos_store::db::Db;
-use agentos_store::{employee as employee_store, org, policy, spend};
+use agentos_store::{employee as employee_store, org, policy, revenue, spend};
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
-use crate::cost::{self, Sample, TURN_BRIEF, charters, limits};
+use crate::cost::{self, PROSPECT, Sample, TURN_BRIEF, charters, limits};
 use crate::scoping::{Weighed, weigh};
 use crate::{Row, Surface, Truth};
 
@@ -278,6 +309,17 @@ struct Company {
     tenant: TenantId,
     /// `(slug, employee id, team id)`, in [`SEATS`] order.
     seats: Vec<(&'static str, EmployeeId, uuid::Uuid)>,
+    /// The mock providers, **built once and shared by every turn**.
+    ///
+    /// It used to be `mocks::ports()` called per turn, which was equivalent
+    /// while nothing in a turn had state worth keeping. The browser does:
+    /// `MockBrowser`'s page map is what makes a probe find something rather
+    /// than error, and its step log is the only record of what the vertical
+    /// actually did with somebody's booking flow — the model's own tool calls
+    /// are in the transcript, and the prober's are not.
+    ports: Arc<Ports>,
+    /// The same browser again, by its own type, for [`mocks::MockBrowser::log`].
+    browser: Arc<mocks::MockBrowser>,
 }
 
 impl Company {
@@ -313,8 +355,9 @@ const EMPTY_DATABASE: &str = "this needs an EMPTY database and this one already 
      a database: the tenant slug is unique and the mock providers mint the same \
      external ids in every process";
 
-/// Steps 2 through 6 of `docs/ORIZN.md`, in order, against a real database.
-async fn stand_up(db: Db) -> Company {
+/// Steps 2 through 6 of `docs/ORIZN.md`, in order, against a real database —
+/// and then `passes` prospects for the seller to work, one per pass.
+async fn stand_up(db: Db, passes: usize) -> Company {
     let now = Utc::now();
     let tenant = TenantId::new_v7(now);
     let domain = Domain::parse("agents.orizn.app").expect("the org document's domain");
@@ -429,7 +472,146 @@ async fn stand_up(db: Db) -> Company {
     .expect("spend caps");
     tx.commit().await.expect("commit finance");
 
-    Company { db, tenant, seats }
+    // 7. and the seller's prospects — not a step in `docs/ORIZN.md` because the
+    //    operator's step is `agentos-server import` against a list this
+    //    repository does not ship, followed by `agentos-server flow set` /
+    //    `flow confirm` per prospect. Same rows, written the same way: two on
+    //    the application's credential and one on the operator's.
+    let sdr = seats
+        .iter()
+        .find(|(slug, ..)| *slug == "sdr")
+        .expect("the sales seat")
+        .1;
+    for nth in 1..=passes {
+        seed_prospect(&db, tenant, sdr, nth).await;
+    }
+
+    // The browser the vertical will actually drive, with the prospect's panel on
+    // it. One instance for the whole run: `mocks::ports()` mints a fresh
+    // `MockBrowser` every call, and a page set on one of those is invisible to
+    // the next.
+    let browser = Arc::new(mocks::MockBrowser::new());
+    // One entry, and `set_text`'s last entry repeats — so both runs of the flow
+    // read the same thing, which is what `proof_of_need`'s two-run bar is
+    // looking for. A second, different entry here is how a flaky widget is
+    // spelled, and it would measure `Checked::NotReproducible` instead.
+    browser.set_text(PROSPECT.panel, &[PROSPECT.says]);
+    let ports = Arc::new(Ports {
+        browser: browser.clone(),
+        ..mocks::ports()
+    });
+
+    Company {
+        db,
+        tenant,
+        seats,
+        ports,
+        browser,
+    }
+}
+
+/// One prospect the seller can honestly work: an account, a person at it, and a
+/// booking flow with a human's name on it.
+///
+/// **Three writes and two connections**, and the split is the product's rather
+/// than this fixture's. The account and the contact are ordinary application
+/// rows and go in on a tenant transaction. The flow does not:
+/// `migrations/0032_prospect_flows.sql` grants `app_role` no INSERT and no
+/// UPDATE on `prospect_flows` at all, because an employee that could write that
+/// table could aim a selector at any element on a domain its policy lets it read
+/// and then produce a screenshotted, reproducible finding about whatever that
+/// element happened to say. Writing one is an operator's act proved by the
+/// operator's own database credential — `agentos-server flow set` / `flow
+/// confirm` — and [`revenue::set_prospect_flow`] is the same pair of functions
+/// that verb calls. A fixture that wrote this row as the application would be
+/// asserting a privilege the product deliberately withholds.
+///
+/// `confirm_prospect_flow` is not decoration either. `set_prospect_flow` always
+/// writes an **unconfirmed** row — and re-writing a confirmed one revokes the
+/// confirmation, in a trigger — while `proof_of_need::Flow::confirmed` refuses a
+/// row nobody put a name on. Skip the second call and this seeds a prospect the
+/// seller correctly skips, and the dry run goes back to measuring nothing while
+/// looking like it measured something.
+async fn seed_prospect(db: &Db, tenant: TenantId, sdr: EmployeeId, nth: usize) {
+    let domain = PROSPECT.domain(nth);
+    let contact = PROSPECT.contact(nth);
+    let account = uuid::Uuid::now_v7();
+
+    let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+    revenue::insert_account(
+        &mut tx,
+        account,
+        &revenue::NewAccount {
+            legal_name: PROSPECT.name,
+            domain: &domain,
+            // `charters()` sells to `Segment::Airline`, and
+            // `vertical::segment_column` maps that to this string. A different
+            // one here is an empty queue, which reads as no work.
+            segment: "airline",
+            // The objective's market. Nothing filters on it — the queue is by
+            // segment — but a prospect in the wrong country is a fixture that
+            // does not match the briefing the model is reading.
+            country: "DE",
+            employee_id: Some(sdr),
+            location: None,
+            website: None,
+        },
+    )
+    .await
+    .expect(EMPTY_DATABASE);
+    revenue::insert_contact(
+        &mut tx,
+        uuid::Uuid::now_v7(),
+        &revenue::NewContact {
+            account_id: account,
+            full_name: "Head of Digital",
+            email: Some(&contact),
+            phone: None,
+            role: Some("Head of Digital"),
+            language: Some("de"),
+            is_primary: true,
+            // B2B prospecting in the EU needs one, recorded per person. The
+            // column has a CHECK; this is the value the importer writes.
+            lawful_basis: "legitimate_interest",
+            // `None`, and it is the difference between a first touch and a
+            // chase: `vertical::due_chase` asks for contacts with at least one
+            // touch already, and `prospects::import` primes this column on every
+            // row it lands. A date here would put a person nobody has written to
+            // at the head of the follow-up queue.
+            next_follow_up_at: None,
+        },
+    )
+    .await
+    .expect("the prospect's contact");
+    // Committed before the flow, not after: the flow is written on a different
+    // connection and its composite foreign key has to be able to see the
+    // account.
+    tx.commit().await.expect("commit the prospect");
+
+    let entry = format!("https://{domain}{}", PROSPECT.entry_path);
+    revenue::set_prospect_flow(
+        db,
+        tenant,
+        account,
+        &revenue::NewProspectFlow {
+            entry_url: &entry,
+            passport_field: PROSPECT.passport_field,
+            destination_field: PROSPECT.destination_field,
+            date_field: Some(PROSPECT.date_field),
+            submit: Some(PROSPECT.submit),
+            panel: PROSPECT.panel,
+        },
+    )
+    .await
+    .expect("write the prospect's flow");
+    let confirmed =
+        revenue::confirm_prospect_flow(db, tenant, account, "orizn dry run", Utc::now())
+            .await
+            .expect("confirm the prospect's flow");
+    assert!(
+        confirmed,
+        "the flow was written and then not found to confirm"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -445,16 +627,48 @@ struct Ran {
     usage: Usage,
     wall: Duration,
     calls: Vec<Call>,
+    /// What the vertical did before the model was asked anything, for the one
+    /// charter that has one.
+    vertical: Option<Vertical>,
+}
+
+/// The vertical half of a turn: what it came to, and what it touched.
+///
+/// Kept beside the model's tape rather than folded into it because they are
+/// different measurements. Every [`Call`] above is a round trip to a language
+/// model; none of this is. A selling turn runs somebody else's booking flow
+/// twice, takes a screenshot, files a row and attempts an email **before** the
+/// first token is generated, and a report that only counted model calls would
+/// price that work at zero.
+struct Vertical {
+    /// `Sold::code`, `Chased::outcome.code`, or the error's code — a closed
+    /// vocabulary either way.
+    outcome: &'static str,
+    /// Did a finding reach a row a human can read?
+    filed: bool,
+    /// Every browser step the prober ran, in order, as the mock logged it.
+    /// Empty for a chase, which never opens their page — deliberately.
+    steps: Vec<String>,
+    /// The trusted sentence the model was handed, if there was one.
+    note: Option<String>,
 }
 
 /// Assemble one employee exactly as `loops::initiative::take_turn` does, and
-/// run it.
+/// run it — **vertical included**.
 ///
-/// The one difference from the running system is the vertical step, which is
-/// omitted: it needs a sourcing round or a sales pipeline in the database, and
-/// what it contributes to the turn is one extra trusted sentence. Everything
-/// that decides what the employee may *do* — principal, gate, effects, prompt,
-/// schemas — is the same call in the same order.
+/// Everything that decides what the employee may *do* — principal, gate,
+/// effects, prompt, schemas — is the same call in the same order, and the
+/// vertical now runs before the model in the same place `vertical_step` runs it,
+/// out of the same `Effects` the turn is built on.
+///
+/// Two differences from `apps/server` remain and neither can be closed from
+/// here. `assignment_for` resolves the seller's work **before** the turn is
+/// reserved, so a seller with nothing due costs nothing; this has no reservation
+/// to be before, so [`vertical`] reads the same two queues inside the turn and a
+/// `None` is reported rather than skipped. And a vertical that fails is logged
+/// and swallowed there, where the employee still has a turn worth taking; here
+/// it is counted as a failure, because a dry run that quietly degraded to an
+/// ordinary turn is exactly how the seller went unmeasured for three days.
 async fn take_turn(
     company: &Company,
     seat: &'static str,
@@ -523,6 +737,22 @@ async fn take_turn(
     }
     .with_colleagues(colleagues);
 
+    let effects = Effects::new(company.db.clone(), company.ports.clone(), principal.clone());
+
+    // The vertical, before the model and never instead of it — the same order
+    // `loops::initiative::take_turn` uses, and the reason a selling turn's
+    // opening message is a report of work already done rather than an
+    // instruction to go and do it.
+    let started = Instant::now();
+    let vertical = vertical(
+        company,
+        &effects,
+        &principal,
+        &stored.employee.address().to_string(),
+        &charter,
+    )
+    .await;
+
     let llm = Arc::new(Recorder {
         inner: CliLlm::new(),
         calls: Mutex::new(Vec::new()),
@@ -530,23 +760,28 @@ async fn take_turn(
     let turn = Turn::new(
         llm.clone(),
         PolicyGate::new(company.db.clone()),
-        Effects::new(
-            company.db.clone(),
-            Arc::new(mocks::ports()),
-            principal.clone(),
-        ),
+        effects,
         principal,
         prompt,
         model.as_str(),
         stored.employee.address().to_string(),
     );
 
-    let context = Context::new()
+    // The vertical's note goes after the plan, exactly as it does in the running
+    // system, and it is ours as thoroughly as the plan is: parsed addresses,
+    // closed reason codes, and not one byte of the prospect's page.
+    let mut context = Context::new()
         .with_task(TURN_BRIEF)
         .with_task(charter.brief());
+    if let Some(note) = vertical.as_ref().and_then(|ran| ran.note.clone()) {
+        context = context.with_task(note);
+    }
 
-    let started = Instant::now();
     let outcome = turn.run(context, &CancellationToken::new()).await;
+    // **From before the vertical**, so this is what an operator waits: a selling
+    // turn that runs somebody's booking flow twice before it thinks is slower
+    // than a turn that only thinks, and a clock started after the probe would
+    // report the two as the same product.
     let wall = started.elapsed();
 
     let (ended, usage) = match outcome {
@@ -563,7 +798,166 @@ async fn take_turn(
         usage,
         wall,
         calls,
+        vertical,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The vertical, before the model
+// ---------------------------------------------------------------------------
+
+/// `loops::initiative::vertical_step`, for the charter that has one.
+///
+/// A copy and not a call, for the same reason `TURN_BRIEF` is a copy: it lives
+/// in a binary crate with no library target. What is *not* copied is any part of
+/// the decision — [`vertical::due_chase`] and [`vertical::due_prospect`] are the
+/// same two queries `sales_work_for` asks in the same order, and
+/// [`vertical::selling_turn`] and [`vertical::chasing_turn`] are the same two
+/// entry points. Everything that decides what happens to a prospect is in
+/// `crates/app`, where both callers can reach it.
+///
+/// **The chase is asked first**, which is `sales_work_for`'s order and its
+/// argument: it is a promise already made, and it is the cheaper turn by a wide
+/// margin — a probe is two full runs of somebody else's booking flow plus a
+/// screenshot, a chase is one email built from our own columns.
+///
+/// The four service charters have no vertical operation to call — there is no
+/// `vertical::support_turn` — so they take the ordinary turn they always took.
+async fn vertical(
+    company: &Company,
+    effects: &Effects,
+    principal: &Principal,
+    address: &str,
+    charter: &Charter,
+) -> Option<Vertical> {
+    let Charter::Sales { pack, objective } = charter else {
+        return None;
+    };
+    let now = Utc::now();
+
+    let mut tx = company
+        .db
+        .tenant_tx(company.tenant)
+        .await
+        .expect("tenant tx");
+    let chase = vertical::due_chase(&mut tx, objective, now)
+        .await
+        .expect("read the follow-up queue");
+    let prospect = match chase {
+        Some(_) => None,
+        None => vertical::due_prospect(&mut tx, objective, now)
+            .await
+            .expect("read the prospect queue"),
+    };
+    // Read-only, and rolled back before a page of the prospect's is loaded: the
+    // check is several seconds of somebody else's website and a pooled
+    // connection held across it is a connection held across their latency.
+    let _ = tx.rollback().await;
+
+    // Both branches build one, and the suppression list is loaded rather than
+    // defaulted in either: `vertical::suppression_for` asks the schema's own
+    // `SECURITY DEFINER` lookup — the only reader that can see a *global*
+    // opt-out, which the per-tenant RLS policy hides from an ordinary SELECT —
+    // and fails closed. An empty one here would be a fixture quietly granting
+    // itself permission to write to somebody who said no.
+    let seller = |suppression| {
+        Seller::new(
+            PolicyGate::new(company.db.clone()),
+            effects.clone(),
+            principal.clone(),
+            address.to_owned(),
+            suppression,
+        )
+    };
+
+    if let Some(chase) = chase {
+        let seller = seller(vertical::suppression_for(&company.db, principal, &chase.to).await);
+        return Some(
+            match vertical::chasing_turn(&company.db, &seller, principal, &chase, now).await {
+                Ok(chased) => Vertical {
+                    outcome: chased.outcome.code(),
+                    filed: false,
+                    // Empty, and it is an assertion rather than an omission: a
+                    // chase re-asserts nothing about the prospect's product, so
+                    // it opens no page. A step here would be the one mistake in
+                    // this job that cannot be walked back.
+                    steps: Vec::new(),
+                    note: Some(chased.note()),
+                },
+                Err(err) => Vertical {
+                    outcome: coded("the chase did not run", &err.to_string()),
+                    filed: false,
+                    steps: Vec::new(),
+                    note: None,
+                },
+            },
+        );
+    }
+
+    // **Reported, never silent.** `assignment_for` answers this with
+    // `Outcome::NoWork` and spends no turn, which is right there. Here it means
+    // the fixture failed: [`stand_up`] seeded one prospect per pass, so a seller
+    // with nothing due has a flow nobody confirmed, a segment nobody imported
+    // into, or an account something already filed evidence against — and a
+    // `None` returned quietly would be indistinguishable from a service charter
+    // that simply has no vertical, which is exactly how this went unnoticed
+    // before.
+    let Some(prospect) = prospect else {
+        return Some(Vertical {
+            outcome: "no_work",
+            filed: false,
+            steps: Vec::new(),
+            note: None,
+        });
+    };
+    // The employee's own browser context, as provisioning left it. A `Prober`
+    // takes the session rather than looking one up — a browser context is a
+    // provisioned resource — so this is where the two meet.
+    let session = effects
+        .browser_session()
+        .await
+        .expect("provisioning left this seller a browser context");
+    let seller = seller(vertical::suppression_for(&company.db, principal, &prospect.to).await);
+    let prober = Prober::new(
+        company.db.clone(),
+        PolicyGate::new(company.db.clone()),
+        effects.clone(),
+        principal.clone(),
+        session,
+    );
+
+    // Everything the mock browser did during the probe, and nothing it did
+    // before: the model's `read_page` calls run through the same instance.
+    let before = company.browser.log().len();
+    let worked = vertical::selling_turn(
+        &company.db,
+        &prober,
+        &seller,
+        &vertical::orizn_binding(),
+        principal,
+        pack,
+        objective,
+        &prospect,
+        now,
+    )
+    .await;
+    let mut log = company.browser.log();
+    let steps = log.split_off(before);
+
+    Some(match worked {
+        Ok(worked) => Vertical {
+            outcome: worked.sold.code(),
+            filed: worked.filed.is_some(),
+            steps,
+            note: Some(worked.note()),
+        },
+        Err(err) => Vertical {
+            outcome: coded("the sales vertical did not run", err.code()),
+            filed: false,
+            steps,
+            note: None,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +1013,29 @@ fn report_run(ran: &Ran, failures: &mut Vec<&'static str>) {
         "\n  ── {} ({}) ──────────────────────────────────────────",
         ran.seat, ran.role
     );
+
+    // The vertical first, because it happened first — and because it is the
+    // half of a selling turn that no `Call` below can show. The steps are the
+    // prober's, in order, as the mock browser logged them: this is the only
+    // record of what was done to somebody else's booking page.
+    if let Some(vertical) = &ran.vertical {
+        println!(
+            "    vertical  {} · finding {} · {} browser step(s)",
+            vertical.outcome,
+            if vertical.filed { "filed" } else { "none" },
+            vertical.steps.len()
+        );
+        for step in &vertical.steps {
+            println!("        · {step}");
+        }
+        match &vertical.note {
+            Some(note) => println!("      ⟦trusted note⟧ {}", first_line(note, 200)),
+            None => {
+                failures.push("the vertical did not run and the seller fell back to talking");
+                println!("      ! no note: this turn had no vertical half after all");
+            }
+        }
+    }
 
     for (i, call) in ran.calls.iter().enumerate() {
         // The previous call's tool results arrive as this call's last message.
@@ -826,8 +1243,12 @@ impl Ran {
 ///
 /// `None` when the pass had no intact turn — nothing to bill, and the structural
 /// row that says so has already failed.
-fn sample(pass: &[Ran]) -> Option<Sample> {
-    let billed: Vec<&Ran> = pass.iter().filter(|ran| ran.intact()).collect();
+///
+/// An iterator rather than a slice so the same arithmetic answers "this pass"
+/// and "this pass's seller", which are two different questions with the same
+/// three numbers. See the seller's own row in [`verdict`].
+fn sample<'a>(turns: impl Iterator<Item = &'a Ran>) -> Option<Sample> {
+    let billed: Vec<&Ran> = turns.filter(|ran| ran.intact()).collect();
     let calls = billed.iter().map(|ran| ran.calls.len()).sum::<usize>();
     if calls == 0 {
         return None;
@@ -934,7 +1355,10 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
     );
 
     // --- sampled: how many calls a turn takes -------------------------------
-    let samples: Vec<Sample> = passes.iter().filter_map(|pass| sample(pass)).collect();
+    let samples: Vec<Sample> = passes
+        .iter()
+        .filter_map(|pass| sample(pass.iter()))
+        .collect();
     let per_turn: Vec<f64> = samples.iter().map(|s| s.calls_per_turn).collect();
     let (lo, hi) = spread(&per_turn);
     rows.push(
@@ -1054,6 +1478,74 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
             "`llm_cli` is lossy by construction and says so; the production path is llm_anthropic",
         ),
     );
+    // --- sampled: the seller on its own -------------------------------------
+    // **The row this dry run grew a vertical for.** A selling turn runs
+    // somebody's booking flow twice, files a finding and attempts an email
+    // before the model generates its first token, and then opens with a report
+    // of work already done rather than a plan to go and do it. That is a
+    // different shape of turn from a buyer's, and averaging the two hides
+    // exactly the thing the change was made to see.
+    //
+    // Characterised, like every other number here, and it must be: a seller that
+    // asked for three calls where a supporter asked for six is a sample from a
+    // model, not a property of this code. What IS structural about the seller is
+    // already covered — its turn reached the model, it called tools, and every
+    // call got a ruling, on the four rows above.
+    let selling: Vec<Sample> = passes
+        .iter()
+        .filter_map(|pass| sample(pass.iter().filter(|ran| ran.vertical.is_some())))
+        .collect();
+    let (sell_lo, sell_hi) = spread(&selling.iter().map(|s| s.calls_per_turn).collect::<Vec<_>>());
+    let filed = runs
+        .iter()
+        .filter(|r| r.vertical.as_ref().is_some_and(|v| v.filed))
+        .count();
+    let probes: usize = runs
+        .iter()
+        .filter_map(|r| r.vertical.as_ref())
+        .map(|v| v.steps.len())
+        .sum();
+    rows.push(
+        Row::ok(
+            "the selling turn on its own",
+            if selling.is_empty() {
+                "no seller took a turn with a vertical half".to_owned()
+            } else {
+                format!(
+                    "{sell_lo:.2}–{sell_hi:.2} model calls, {filed} finding(s) filed, {probes} \
+                     browser step(s)",
+                )
+            },
+            Truth::Characterises,
+        )
+        .note(
+            "the browser steps are the prober's and happened before the first token; the model \
+             calls are what it did afterwards, having been told what it found",
+        ),
+    );
+    let outcomes: Vec<&str> = runs
+        .iter()
+        .filter_map(|r| r.vertical.as_ref())
+        .map(|v| v.outcome)
+        .collect();
+    rows.push(
+        Row::ok(
+            "…and what the vertical came to",
+            if outcomes.is_empty() {
+                "no vertical ran".to_owned()
+            } else {
+                outcomes.join(", ")
+            },
+            Truth::Characterises,
+        )
+        .note(
+            "`contact_budget_exhausted` is the approach meeting `max_new_contacts_per_day: 0` in \
+             docs/orizn-roles/sales-development.json — what the pack ships and what this \
+             deployment installed. The finding was still made and still filed; it is a boundary \
+             an operator raises, not a failure of the turn",
+        ),
+    );
+
     rows.push(Row::ok(
         "failures classified",
         format!("{} across {turns} turns", failures.len()),
@@ -1089,8 +1581,17 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
              turned; whether the email was worth sending is a human reading the transcript",
             "the model. A new snapshot behind the same name moves every sampled row and no pin \
              in this repository can see it happen",
-            "the vertical step, omitted here because it needs a sourcing round or a pipeline in \
-             the database — one extra trusted sentence the real turn carries and this does not",
+            "the BUYER's vertical. `vertical::purchasing_turn` needs a sourcing round in the \
+             database and no charter here is a buyer's, so `international-buyer` is priced in \
+             `cost.rs` and worked nowhere. The seller's is now run",
+            "whether one seeded prospect is a pipeline. The seller works a real flow through the \
+             real prober, and it works the same one shape every pass: a confirmed flow, a panel \
+             that reproduces, no MCP authority. Nothing here samples a flaky widget, a bot \
+             challenge, or a prospect whose page was fixed between passes",
+            "the gate's reach on a real prospect. `docs/orizn-ceiling.json` allows exactly one \
+             domain and `docs/ORIZN.md` says that is where a prospect list would be added, so the \
+             seeded prospect lives under `orizn.app`. What is measured is the probe; whether this \
+             operator has granted a real airline's domain is a ceiling change nobody has made",
             "everything the mocks stand in for: email, telephony, browser, payments. A tool call \
              that the gate allowed and a mock accepted is not a tool call that worked",
         ],
@@ -1123,7 +1624,9 @@ fn record(passes: &[Vec<Ran>], structurally_sound: bool) {
     println!("RECORD — paste into crates/eval/src/cost.rs, both parts together\n");
     println!("pub const RECORDED: &[Sample] = &[");
     for pass in passes {
-        let Some(s) = sample(pass) else { continue };
+        let Some(s) = sample(pass.iter()) else {
+            continue;
+        };
         println!(
             "    Sample {{ calls_per_turn: {:.2}, input_tokens_per_call: {:.1}, \
              output_tokens_per_call: {:.1} }},",
@@ -1316,12 +1819,15 @@ pub async fn run(model: Option<&str>, runs: usize) -> bool {
         cost::digest()
     );
 
-    let company = stand_up(db).await;
+    let company = stand_up(db, runs).await;
     let charters = charters();
     println!(
-        "\nStood up: {} seats, {} of them given an objective.",
+        "\nStood up: {} seats, {} of them given an objective, and {runs} prospect(s) under {} \
+         with a confirmed booking flow — one per pass, because a filed finding takes an account \
+         out of the queue for good.",
         company.seats.len(),
-        charters.len()
+        charters.len(),
+        PROSPECT.zone,
     );
 
     let mut passes: Vec<Vec<Ran>> = Vec::new();
@@ -1406,6 +1912,20 @@ mod tests {
             usage: Usage::new(0, 40 * calls.len() as u64, 0),
             wall: Duration::from_secs(10),
             calls,
+            vertical: None,
+        }
+    }
+
+    /// The same turn with a vertical half in front of it.
+    fn sold(calls: Vec<Call>) -> Ran {
+        Ran {
+            vertical: Some(Vertical {
+                outcome: "refused",
+                filed: true,
+                steps: vec!["ctx-1 goto https://prospect-1.orizn.app/booking/entry".to_owned()],
+                note: Some("their flow was run twice and it reproduced".to_owned()),
+            }),
+            ..ran(calls)
         }
     }
 
@@ -1539,7 +2059,7 @@ mod tests {
         );
 
         // And the sample is the healthy turn alone: two calls, not three.
-        let s = sample(&pass).expect("one intact turn");
+        let s = sample(pass.iter()).expect("one intact turn");
         assert!((s.calls_per_turn - 2.0).abs() < 1e-9);
         assert!((s.input_tokens_per_call - 2_000.0).abs() < 1e-9);
     }
@@ -1595,14 +2115,52 @@ mod tests {
     /// that never happened.
     #[test]
     fn a_pass_with_no_model_call_contributes_no_sample() {
-        assert!(sample(&[ran(Vec::new())]).is_none());
-        assert!(sample(&[]).is_none());
+        assert!(sample([ran(Vec::new())].iter()).is_none());
+        assert!(sample(std::iter::empty()).is_none());
 
-        let s = sample(&[healthy()]).expect("two calls");
+        let s = sample([healthy()].iter()).expect("two calls");
         assert!((s.calls_per_turn - 2.0).abs() < 1e-9);
         assert!((s.input_tokens_per_call - 2_000.0).abs() < 1e-9);
         // 80 output tokens over two calls.
         assert!((s.output_tokens_per_call - 40.0).abs() < 1e-9);
+    }
+
+    /// **The seller is reported on its own, and it is never gated.**
+    ///
+    /// The row exists because a turn that runs somebody's booking flow twice
+    /// before it thinks is a different shape of turn from one that only thinks,
+    /// and the pass average hides it. What it must NOT become is a threshold: a
+    /// seller taking one model call where a supporter took six is a sample from
+    /// a model, and a threshold on a sample is a flaky build.
+    #[test]
+    fn the_seller_is_reported_apart_from_the_seats_that_only_talked() {
+        // One seller with a vertical, one seat without. The pass average is 1.5
+        // calls a turn; the seller's own figure is 1.00, and both are printed.
+        let pass = vec![
+            sold(vec![call(Some(Message::user("go")), Ok(asked("t1")))]),
+            healthy(),
+        ];
+        let surface = verdict(std::slice::from_ref(&pass), &[]);
+        assert!(
+            surface.passed(),
+            "{}",
+            crate::render(std::slice::from_ref(&surface))
+        );
+        let report = crate::render(&[surface]);
+        assert!(report.contains("1.50–1.50 over 1 pass(es)"), "{report}");
+        assert!(
+            report.contains("1.00–1.00 model calls, 1 finding(s) filed, 1 browser step(s)"),
+            "{report}"
+        );
+        assert!(report.contains("refused"), "{report}");
+
+        // And a run with no seller at all says so rather than printing a zero
+        // that reads like a measurement.
+        let quiet = crate::render(&[verdict(&[vec![healthy()]], &[])]);
+        assert!(
+            quiet.contains("no seller took a turn with a vertical half"),
+            "{quiet}"
+        );
     }
 
     /// Spread over passes, not over turns: the run reports a range because one

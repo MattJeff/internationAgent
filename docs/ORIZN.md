@@ -445,11 +445,22 @@ call got no ruling, the provider errored — and never for a number, because a
 threshold on a sample is a flaky build that ends up deleted.
 
 It prints a `RECORD` block. Paste it into `cost.rs` **together with its digest**,
-which covers the three charters, the turn brief and the five operator documents
-above. Change any of them and the recorded runs are answering a question about a
-different company; the suite says so rather than letting the figure rot.
+which covers the three charters, the turn brief, the five operator documents
+above, and the prospect the run seeds for the seller. Change any of them and the
+recorded runs are answering a question about a different company; the suite says
+so rather than letting the figure rot.
 
-> ### $119–$191 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $27 floor at 1.00 model calls per turn, $319 ceiling at 10.00
+The prospect is in there because without one the seller has no work:
+`vertical::due_prospect` answers `None`, the initiative loop resolves `no_work`,
+and the sales seat takes an ordinary conversational turn instead of running
+somebody's booking flow. Every figure recorded before 2026-08-26 was measured in
+that state. The run now seeds one prospect per pass — an account, a contact and a
+booking flow **confirmed** by a named human, written with the operator's own
+database credential because `app_role` may not write `prospect_flows` — and the
+seller probes it twice, files a finding, and has its approach refused by
+`max_new_contacts_per_day`, which this deployment ships at `0`.
+
+> ### $116–$136 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $29 floor at 1.00 model calls per turn, $497 ceiling at 10.00
 >
 > A **range**, because a reserved turn makes between one and ten model calls and
 > any point estimate inside that is a choice. The floor is the arithmetic this
