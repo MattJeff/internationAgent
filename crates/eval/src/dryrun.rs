@@ -121,6 +121,25 @@ pub use crate::toolchoice::DEFAULT_MODEL;
 /// identity step seals a private key with it and would otherwise not run.
 const MASTER_KEY: &str = "dryrun-master-key-0123456789abcdef";
 
+/// What `scoping.rs` predicts one model call weighs, so the measurement has
+/// something to disagree with. Input tokens at ten staff, and it is the **first**
+/// round trip of a turn — `scoping.rs` lists "growth WITHIN a run" as one of the
+/// things it does not measure, which is precisely the term [`report_rounds`]
+/// fills in.
+///
+/// It lives here and not in [`crate::cost`] on purpose: `cost.rs` holds the rate
+/// card and the arithmetic that turns tokens into money, and this is neither. It
+/// is a prediction by another suite in this same crate, kept next to the run that
+/// checks it.
+///
+/// **It has moved three times and a copy of it in `docs/ORIZN.md` did not.**
+/// 4,639 when the tenant's whole MCP inventory sat in the prefix; 4,611 once
+/// `SystemPrompt::with_mcp_tools` scoped it to the employee's policy; **4,701**
+/// since the catalogue grew `read_page` and `brief_direct_reports`. Run
+/// `cargo run -p agentos-eval` — no key, no network — and if its
+/// `app::prompt (cost)` row disagrees with this number, that row is right.
+const PREDICTED_TOKENS_PER_CALL: f64 = 4_701.0;
+
 // ---------------------------------------------------------------------------
 // The model, with a tape recorder on it
 // ---------------------------------------------------------------------------
@@ -140,6 +159,31 @@ struct Call {
     last_in: Option<Message>,
     /// The model's turn, or the provider code that came back instead.
     out: Result<LlmResponse, &'static str>,
+}
+
+impl Call {
+    /// Generated tokens, as the provider reported them. A call that failed
+    /// generated nothing we were billed for, so it is a real zero — and every
+    /// average over these has to say whether it counted the zeros, for the
+    /// reason [`Ran::intact`] gives one screen down.
+    fn output(&self) -> u64 {
+        self.out.as_ref().map_or(0, |out| out.usage.output_tokens)
+    }
+
+    /// Did this round ask for a tool, or only talk?
+    ///
+    /// This is the whole question behind "how many model calls does a turn
+    /// take". A round that calls a tool is the loop earning its cost: something
+    /// happened, its result came back, and the next round is reading it. A round
+    /// that produces prose and is followed by another round is a thought, billed
+    /// at five times the input rate.
+    fn acted(&self) -> bool {
+        self.out.as_ref().is_ok_and(|out| {
+            out.content
+                .iter()
+                .any(|block| matches!(block, Content::ToolUse { .. }))
+        })
+    }
 }
 
 /// A [`Llm`] that keeps the tape. Everything else is [`CliLlm`]'s.
@@ -572,13 +616,15 @@ fn report_run(ran: &Ran, failures: &mut Vec<&'static str>) {
 
         let w = call.weighed;
         println!(
-            "    call {}  {:>5.1}s  prompt≈{} tok (sys {} + tools {} + msgs {})  offered [{}]",
+            "    call {}  {:>5.1}s  prompt≈{} tok (sys {} + tools {} + msgs {})  out {} tok  \
+             offered [{}]",
             i + 1,
             call.elapsed.as_secs_f64(),
             w.total(),
             w.system,
             w.tools,
             w.messages,
+            call.output(),
             call.offered.join(", ")
         );
 
@@ -894,7 +940,23 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
             },
             Truth::Characterises,
         )
-        .note("input by `scoping::tokens` over OUR bytes, not the CLI's — it bills its own prefix"),
+        .note(if samples.is_empty() {
+            "input by `scoping::tokens` over OUR bytes, not the CLI's — it bills its own prefix"
+                .to_owned()
+        } else {
+            // The prediction is a ten-employee fixture with an MCP server bound
+            // and Orizn binds none, so measuring UNDER it is the expected
+            // direction. Printed as a percentage because the sign is the
+            // finding: `docs/ORIZN.md` billed the input side pessimistically
+            // and the output side out of thin air, and only one of those two
+            // errors was in the operator's favour.
+            format!(
+                "input by `scoping::tokens` over OUR bytes, not the CLI's; \
+                 {:+.0}%–{:+.0}% against `scoping`'s {PREDICTED_TOKENS_PER_CALL:.0} at ten staff",
+                (in_lo / PREDICTED_TOKENS_PER_CALL - 1.0) * 100.0,
+                (in_hi / PREDICTED_TOKENS_PER_CALL - 1.0) * 100.0,
+            )
+        }),
     );
 
     // --- sampled: the money -------------------------------------------------
@@ -1028,6 +1090,97 @@ fn record(passes: &[Vec<Ran>], structurally_sound: bool) {
     println!("pub const DIGEST: &str = \"{}\";", cost::digest());
 }
 
+/// **The per-round picture.** `scoping.rs` weighs the *first* round trip of a
+/// turn and lists "growth WITHIN a run" as the largest thing nobody has numbers
+/// for. This is that number.
+///
+/// One row per round *index*, across every turn that got that far, because the
+/// per-turn average hides the only thing worth knowing: round 1 is a fixed
+/// prefix and a two-paragraph brief, and round 10 is that same prefix plus nine
+/// rounds of transcript the loop resends in full. A turn averaging 2.5 rounds
+/// does not cost 2.5 one-round turns, and the `msgs` column is why.
+///
+/// Measured across three passes: the prefix (`sys` + `tools`) holds near 2,500
+/// tokens while `msgs` climbs 589 → 3,902, so the growth is entirely history and
+/// the fixed part is entirely cacheable. `app::turn`'s
+/// `each_round_extends_the_previous_prompt_instead_of_rewriting_it` is what
+/// keeps it that way on the production path.
+///
+/// `acted` is the other half, and the one that says whether a round was work: a
+/// round that asks for a tool is the loop earning its cost, and a round that
+/// only talks is a thought. `out` averages **only calls that came back**, for
+/// [`Ran::intact`]'s reason — a provider error contributes a zero that looks
+/// exactly like a short answer — so `died` is printed beside it rather than
+/// folded into it.
+fn report_rounds(passes: &[Vec<Ran>]) {
+    let runs: Vec<&Ran> = passes.iter().flatten().collect();
+    let depth = runs.iter().map(|ran| ran.calls.len()).max().unwrap_or(0);
+    if depth == 0 {
+        return;
+    }
+
+    println!("\n─────────────────────────────────────────────────────────────");
+    println!("PER ROUND — what the calls-per-turn multiplier actually buys\n");
+    println!("  round  turns   prompt≈   of which msgs     out   acted   died   median wall");
+    for round in 0..depth {
+        let calls: Vec<&Call> = runs.iter().filter_map(|ran| ran.calls.get(round)).collect();
+        let returned: Vec<&&Call> = calls.iter().filter(|c| c.out.is_ok()).collect();
+        let n = calls.len() as f64;
+        let mut walls: Vec<f64> = calls.iter().map(|c| c.elapsed.as_secs_f64()).collect();
+        walls.sort_by(f64::total_cmp);
+        println!(
+            "  {:>5}  {:>5}  {:>8.0}  {:>14.0}  {:>6}  {:>3}/{:<3}  {:>4}  {:>9.1}s",
+            round + 1,
+            calls.len(),
+            calls.iter().map(|c| c.weighed.total()).sum::<usize>() as f64 / n,
+            calls.iter().map(|c| c.weighed.messages).sum::<usize>() as f64 / n,
+            if returned.is_empty() {
+                "—".to_owned()
+            } else {
+                format!(
+                    "{:.0}",
+                    returned.iter().map(|c| c.output()).sum::<u64>() as f64 / returned.len() as f64
+                )
+            },
+            calls.iter().filter(|c| c.acted()).count(),
+            calls.len(),
+            calls.len() - returned.len(),
+            walls[walls.len() / 2],
+        );
+    }
+
+    // Where the output actually went, which is the line that decides whether the
+    // loop is working or thinking. On the CLI shim the model's whole reply is
+    // one JSON object, so a round that acted spent its output on a tool's
+    // arguments — an email body is work — and a round that did not spent it on
+    // prose. Only rounds that came back, again: averaging a rejected call's zero
+    // into the prose figure understates the exact quantity this split exists to
+    // expose, and the first version of this line did, by 40%.
+    let (acted, idle): (Vec<&Call>, Vec<&Call>) = runs
+        .iter()
+        .flat_map(|ran| ran.calls.iter())
+        .filter(|c| c.out.is_ok())
+        .partition(|c| c.acted());
+    let mean = |group: &[&Call]| {
+        if group.is_empty() {
+            return 0.0;
+        }
+        group.iter().map(|c| c.output()).sum::<u64>() as f64 / group.len() as f64
+    };
+    println!(
+        "\n  output on the {:>2} rounds that called a tool     {:>6.0} tok/call — arguments, and \
+         arguments are work",
+        acted.len(),
+        mean(&acted)
+    );
+    println!(
+        "  output on the {:>2} rounds that only wrote prose  {:>6.0} tok/call — a thought, billed \
+         at 5× the input rate",
+        idle.len(),
+        mean(&idle)
+    );
+}
+
 /// Every failure, and how often — the part of this report that is the point.
 fn report_failures(failures: &[&'static str], runs: usize) {
     println!("\n─────────────────────────────────────────────────────────────");
@@ -1114,6 +1267,7 @@ pub async fn run(model: &str, runs: usize) -> bool {
     }
 
     report_failures(&failures, passes.iter().flatten().count());
+    report_rounds(&passes);
 
     let surface = verdict(&passes, &failures);
     println!("\n{}", crate::render(std::slice::from_ref(&surface)));
@@ -1191,6 +1345,51 @@ mod tests {
             call(Some(Message::user("go")), Ok(asked("t1"))),
             call(Some(answered("t1")), Ok(said())),
         ])
+    }
+
+    /// **A rejected call generated nothing, and must not be averaged as if it
+    /// generated a short answer.**
+    ///
+    /// [`report_rounds`] splits output tokens by whether the round asked for a
+    /// tool, and that split is the evidence for where a turn's output goes. The
+    /// first version of it counted provider errors as prose rounds of zero
+    /// tokens, which understated the prose figure by 40% on a run where four of
+    /// nine silent rounds were `cli_not_json` — the split then said the opposite
+    /// of what the transcript said.
+    #[test]
+    fn a_call_that_never_returned_is_neither_work_nor_prose() {
+        let died = call(None, Err("cli_not_json"));
+        assert!(!died.acted(), "a call that failed asked for nothing");
+        assert_eq!(died.output(), 0, "nothing was generated to bill");
+
+        let acted = call(None, Ok(asked("t1")));
+        assert!(acted.acted());
+        assert_eq!(acted.output(), 40);
+
+        let prose = call(None, Ok(said()));
+        assert!(!prose.acted(), "a text-only round is a thought, not work");
+        assert_eq!(prose.output(), 40);
+
+        // The distinction the report rests on: `died` and `prose` both return
+        // false from `acted`, so only `out.is_ok()` separates them — which is
+        // why every average in `report_rounds` filters on it first.
+        assert!(died.out.is_err() && prose.out.is_ok());
+
+        // And it runs. `report_rounds` indexes turns of unequal depth and takes
+        // a median of each round's wall clocks, so an off-by-one there is an
+        // index panic — at the very end of a run that took fifteen minutes and
+        // real money, after the transcript is printed and before it is gated.
+        // Ragged depths, a turn that died on its first call, and no turns at all.
+        report_rounds(&[vec![
+            ran(vec![
+                call(None, Ok(asked("t1"))),
+                call(Some(answered("t1")), Ok(said())),
+                call(None, Err("cli_not_json")),
+            ]),
+            ran(vec![call(None, Err("cli_not_json"))]),
+            ran(vec![]),
+        ]]);
+        report_rounds(&[]);
     }
 
     fn structural(surface: &Surface) -> Vec<&Row> {

@@ -172,6 +172,37 @@ impl Sample {
 /// separate invocations of `--dry-run 1` against three empty databases. All
 /// three passed every structural row; the spread below is what one language
 /// model does with the same three briefings on the same afternoon.
+///
+/// # These three predate `MAX_THINKING_TOKENS=0` and are due a re-measure
+///
+/// **`output_tokens_per_call` below is high, and by a term the production path
+/// does not have.** They were recorded while `llm_cli` still let the CLI run
+/// with extended thinking on and dropped [`LlmRequest::max_tokens`] on the floor.
+/// `llm_anthropic::body` sends no `thinking` field and does send `max_tokens`, so
+/// production generates no thinking tokens at all — and thinking is billed as
+/// output, which is four fifths of the bill these numbers produce.
+///
+/// The size of it, measured the same day: on one fixed prompt, six reps each,
+/// **1,443 output tokens per call with thinking against 486 without**. Three
+/// `--dry-run 3` passes after the switch landed came in at **767–1,163** output
+/// tokens per call — *below the bottom of the 1,800–3,833 range recorded here*.
+/// A single sdr call in the run that motivated the fix returned **12,850** output
+/// tokens against a request for 4,096.
+///
+/// So [`headline`] is currently an over-estimate on its largest term, and
+/// `docs/ORIZN.md` quotes it. Left standing rather than hand-edited, because a
+/// sample is a thing a run printed and editing one by hand is how this file stops
+/// meaning anything — the [`DIGEST`] pairing exists for exactly that reason. It
+/// wants one honest measurement pass, `RECORD` pasted whole, and this section
+/// deleted.
+///
+/// **[`DIGEST`] is stale too, and independently.** `the company those runs
+/// measured` fails as of this writing, reporting `3a520bfd534b083b`: the
+/// `orizn.app` rename edited all five documents [`digest`] hashes after this pin
+/// was taken. That is the mechanism working — it is supposed to go red when the
+/// company moves under a recorded number — but it means the pin and the samples
+/// are now stale for two unrelated reasons at once. One `--dry-run 3`, one
+/// `RECORD` block pasted whole, clears both; neither clears alone.
 pub const RECORDED: &[Sample] = &[
     Sample {
         calls_per_turn: 2.00,
