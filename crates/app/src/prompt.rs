@@ -96,6 +96,24 @@
 //! first term to make that line slope — quadratic in headcount once every
 //! employee pays for every other.
 //!
+//! **An empty roster is a sentence and not a silence.** This section used to be
+//! omitted entirely when the list came back empty, on the MCP inventory's
+//! argument: a heading is a claim that some exist. The argument does not carry,
+//! and the difference is [`crate::turn::UNCHARTERED`]. A turn with no bound MCP
+//! server is not offered `call_mcp_tool` at all — `tools_for` asks the policy —
+//! so saying nothing costs it nothing. *Every* turn is offered
+//! `message_colleague`, including an employee on no team and in no reporting
+//! line, and that schema tells the model to copy a name "from the list under
+//! 'Colleagues you can reach' in your brief". With no such section that is a
+//! pointer at nothing, and what a model does with one is guess, read a refusal
+//! that by design cannot say whether the name was wrong or out of reach, and go
+//! looking for another channel — a live run answered it by inventing an email
+//! address for a colleague and calling the escalation done. Withdrawing the tool
+//! instead is the option `UNCHARTERED` already refused: a turn with no schemas
+//! can only emit prose into a loop that wakes it again. So the tool stays and
+//! the prefix says who it reaches, which on that seat is nobody, with what to do
+//! about it. It is static text and moves no cache key.
+//!
 //! # The prefix is a cache key
 //!
 //! Prompt caching is a byte-prefix match, so a single interpolated timestamp,
@@ -634,6 +652,35 @@ impl SystemPrompt {
                 out.push_str(" — ");
                 out.push_str(relation.phrase());
             }
+        } else {
+            // **The empty roster is said out loud**, and it did not used to be.
+            // Silence here is not neutral: `turn::UNCHARTERED` means even an
+            // employee with no role pack is still offered `message_colleague`,
+            // whose own description tells it to copy a name "from the list under
+            // 'Colleagues you can reach' in your brief". A prompt with no such
+            // section is a pointer at nothing, so the model guesses a name, gets
+            // back `unreachable_colleague` — which by design cannot say whether
+            // the name was wrong or out of reach — and concludes the tool is the
+            // problem rather than the org chart. That is the failure this
+            // section exists to name: a live run answered it by inventing an
+            // email address for a colleague and calling the escalation done.
+            //
+            // Withdrawing the tool instead is the other half of an argument
+            // `turn::UNCHARTERED` already settled: a turn with no schemas can
+            // only emit prose into a loop that wakes it again, so the answer is
+            // to keep the tool and tell the truth about who it reaches.
+            //
+            // Static text, so it costs the cached prefix nothing.
+            out.push_str(
+                "\n\n# Colleagues you can reach\n\n\
+                 Nobody. The company has recorded no manager, no reports and no team-mates \
+                 for you, so `message_colleague` has no recipient it will accept and every \
+                 name you could try is refused before it leaves this process. There is no \
+                 directory to search and no other channel that reaches a colleague. If what \
+                 you are doing needs a decision from someone above you, you cannot get one: \
+                 say so plainly in your reply, say what you would have asked, and stop \
+                 there.",
+            );
         }
         out
     }
@@ -1185,19 +1232,50 @@ Kind regards, Accounts Payable";
         assert_eq!(rendered, desk().render(TrustLabel::Untrusted));
     }
 
+    /// **An employee with nobody to reach is told so**, on every turn, in the
+    /// prefix.
+    ///
+    /// This asserted the opposite until escalation was fixed, on the MCP
+    /// heading's argument: a section is a claim that some exist, so an employee
+    /// on no team rendered the prefix it had before the roster existed. The MCP
+    /// argument does not carry, and the difference is `turn::UNCHARTERED`. A
+    /// turn with no bound MCP server is not offered `call_mcp_tool` at all —
+    /// `tools_for` asks the policy — so saying nothing costs it nothing. Every
+    /// turn is offered `message_colleague`, including this one, and its schema
+    /// points at a section that was not being rendered. Silence there is not the
+    /// absence of a claim; it is a dangling pointer, and what a model does with
+    /// one is guess a name, get a refusal that cannot explain itself, and go
+    /// looking for another channel.
     #[test]
-    fn an_employee_with_nobody_to_reach_has_no_section_about_colleagues() {
-        // Same argument as the MCP heading: "Colleagues you can reach" is a
-        // claim that some exist, so an employee on no team — deny by default,
-        // and every employee before the org chart was filled in — renders the
-        // prefix it had before this feature existed.
-        let alone = SystemPrompt::new("You are Lena.");
-        assert!(!alone.render(TrustLabel::Trusted).contains("Colleagues"));
+    fn an_employee_with_nobody_to_reach_is_told_that_rather_than_left_to_guess() {
+        let alone = SystemPrompt::new("You are Lena.").render(TrustLabel::Trusted);
+        assert!(alone.contains("# Colleagues you can reach"), "{alone}");
+        assert!(alone.contains("Nobody."), "{alone}");
+        // And it says what to do instead, because "you have no colleagues" with
+        // no next step is the same dead end one sentence later.
+        assert!(alone.contains("say so plainly in your reply"), "{alone}");
+        assert!(alone.contains("no directory to search"), "{alone}");
+
+        // An explicitly empty roster is the same state as never having been
+        // handed one: both mean the org chart named nobody.
         assert_eq!(
             SystemPrompt::new("You are Lena.")
                 .with_colleagues([])
                 .render(TrustLabel::Trusted),
-            alone.render(TrustLabel::Trusted)
+            alone
+        );
+        // A tainted turn is told the same thing. `message_colleague` is `Low`,
+        // so it keeps the tool, and a turn that keeps the tool keeps the answer
+        // to "who does it reach".
+        assert_eq!(
+            SystemPrompt::new("You are Lena.").render(TrustLabel::Untrusted),
+            alone
+        );
+        // Still static: the section is prose with no name in it, so it cannot
+        // move the cache key.
+        assert_eq!(
+            SystemPrompt::new("You are Lena.").render(TrustLabel::Trusted),
+            alone
         );
     }
 

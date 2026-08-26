@@ -819,10 +819,21 @@ pub fn evaluate() -> Surface {
     // an employee is told about the same handful of people it was told about at
     // ten, because `inbound::colleagues` is a join on `team_memberships` and
     // there is no company size anywhere in it.
-    let roster: Vec<usize> = SIZES
+    //
+    // **Signed, and the baseline is no longer zero.** `Inventory::McpOnly`
+    // hands `SystemPrompt` no colleagues, and a prompt with no colleagues now
+    // renders a section saying so — because an employee that can reach nobody is
+    // still offered `message_colleague` and used to be left to discover the
+    // empty list by guessing a name. So this difference is "listing your
+    // colleagues, over saying there are none", and on a small team that is
+    // legitimately **negative**: three names are shorter than the paragraph that
+    // replaces them. Printing a magnitude here would have hidden that, and
+    // subtracting the two as `usize` panicked outright, which is how it was
+    // found. The claim being gated is unchanged and is about the *slope*.
+    let roster: Vec<isize> = SIZES
         .iter()
         .enumerate()
-        .map(|(i, _)| shipped[i].system - mcp[i].system)
+        .map(|(i, _)| shipped[i].system as isize - mcp[i].system as isize)
         .collect();
     let flat = roster[last] == roster[last - 1];
     rows.push(
@@ -832,7 +843,7 @@ pub fn evaluate() -> Surface {
                 "{} tok of prefix — manager, reports, team-mates, nobody else",
                 roster
                     .iter()
-                    .map(usize::to_string)
+                    .map(|tok| format!("{tok:+}"))
                     .collect::<Vec<_>>()
                     .join(" → "),
             ),
@@ -840,8 +851,9 @@ pub fn evaluate() -> Surface {
         )
         .gated(flat)
         .note(
-            "O(team). The gate is the whole point: a roster that sloped would make the bill \
-               quadratic in headcount, because every employee pays for it every turn",
+            "O(team), over a prefix that says \"nobody\" rather than nothing — so a small \
+               team reads negative. The gate is the slope: a roster that grew with headcount \
+               would make the bill quadratic in it",
         ),
     );
 
@@ -851,6 +863,10 @@ pub fn evaluate() -> Surface {
     // it is the number that makes "do not list every employee" an argument
     // rather than a preference.
     let payroll = at(Inventory::Unscoped);
+    // Signed against the same baseline as the row above, and for the same
+    // reason: at two employees "everybody" is one name, which is shorter than
+    // the paragraph that says there are none.
+    let everybody = |i: usize| payroll[i].system as isize - mcp[i].system as isize;
     rows.push(
         Row::ok(
             "…the same roster with no team join",
@@ -859,10 +875,10 @@ pub fn evaluate() -> Surface {
                 SIZES
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| (payroll[i].system - mcp[i].system).to_string())
+                    .map(|(i, _)| format!("{:+}", everybody(i)))
                     .collect::<Vec<_>>()
                     .join(" → "),
-                (payroll[last].system - mcp[last].system) - roster[last],
+                everybody(last) - roster[last],
             ),
             Truth::Characterises,
         )

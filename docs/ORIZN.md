@@ -71,6 +71,59 @@ The founder is a person. This seat is the person's place in the chart and the
 `reports_to` target of every head, and it is `UNCHARTERED` — `SystemPrompt::new`
 alone is the internal channel and nothing else — because no role pack briefs it.
 
+#### The zero is still zero, and it now means something it did not
+
+**A live dry run of this document found that no employee at Orizn could escalate
+to its owner.** The gate allowed every `message_colleague` to `founder` —
+`audit_log` says `internal_send | allow` — and the executor then refused it with
+`no_turn_budget`, because sending an internal message reserves one of the
+*recipient's* turns and this seat has none. The seller's next move was to invent
+an email address for the founder and report the escalation as done.
+
+Both halves were right. The zero above is right: this seat holds no charter and
+must not burn model turns. The recipient-pays reservation is right: it is the
+only throttle that stops two employees waking each other forever
+(`crates/app/src/inbound.rs` argues it at length). What was wrong was that
+nobody had reconciled them, and the seat where they collide is the root of the
+org chart.
+
+So `crates/app/src/inbound.rs::send` now asks one more question before it
+charges anybody: **can a turn ever run for this recipient?** A seat whose
+intersected `max_turns_per_day` is zero is *delivered to and not woken* — no
+turn reserved, and no `agent.turn.requested` queued either. The message is a
+real `messages` row on the founder's desk with a real `audit_log` receipt saying
+`"woken": false`, and the seller is told in its tool result that a person reads
+it and no reply will come.
+
+Three things did **not** change, and they are the point:
+
+* **The number.** `max_turns_per_day` is still `0`, so the cost table below is
+  untouched. Giving this seat a budget would have been the cheaper fix and it
+  would have bought a language model answering on the founder's behalf, plus
+  about **$6 a month** (five turns a day: 5 × 4,639 × 30 = 695,850 input tokens
+  ≈ $3.48, plus ≈$2.25 of output at this document's 600-token assumption) — and
+  a charter for the one seat this file exists to keep empty.
+* **The throttle.** Waking is what costs money, and nothing is woken here. The
+  ceiling is still the sum of every employee's `max_turns_per_day`, because the
+  only recipients exempted are the ones contributing zero to that sum. A seat
+  with no budget can receive and can never send: it is a sink, not a relay.
+* **The gate.** `may_message` is asked first and is unchanged, and the gate has
+  already ruled before any of this runs. There is no escalation verb and no side
+  door — only a price of zero for a recipient that consumes nothing.
+
+**Who reads it.** `GET /v1/employees/{founder-id}/reports` — the morning screen
+— already counts `questions_waiting_on` per direct report, off the same
+anti-join that makes a question "outstanding". A seller blocked on the founder
+shows up there as a number against its own name, with no new endpoint and no new
+table. That is why escalation is an ordinary internal message rather than an
+approval-queue entry: `approvals` binds a token to the hash of one `Action` and
+re-checks it at execution, and an escalation authorises nothing.
+
+**What it costs.** An employee you zero *by mistake* used to refuse its incoming
+messages loudly and now accepts them into a mailbox nobody wakes for. That is
+the real price, and `GET /v1/employees/{id}/turns` is where you find a zero you
+did not mean.
+
 ### Three functions deliberately left empty
 
 `docs/TEAMS.md` §7 draws a seven-row generic startup. Orizn is not that company,
@@ -320,6 +373,10 @@ is the floor.
 | **total** | **66** | **306,174** | **$45.93** |
 
 `306,174 × 30 days = 9,185,220 tokens × $5/1M = $45.93`.
+
+`direction`'s zero is a real zero and stays one. Escalating to that seat delivers
+a message without waking it, so the founder's chair costs nothing per month even
+though four employees can now reach it — see "The zero is still zero" above.
 
 **Output is not measured anywhere in this workspace**, so it is an assumption and
 labelled as one: at ~600 output tokens per model call, 66 turns a day is

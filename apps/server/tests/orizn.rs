@@ -105,6 +105,17 @@ const EXPECTED: &[Expected] = &[
     // A chair, not an employee: zero turns, no channel, no domain, no spend.
     // Without this row the seat at the root of the chart would inherit the
     // ceiling, because an absent layer inherits the one above it.
+    //
+    // **The zero is load-bearing in a second way now.** It used to also mean
+    // "unreachable": every escalation to this seat passed the gate and was then
+    // refused by `inbound::send`'s reservation with `no_turn_budget`, which
+    // severed the chain of command at its root. `send` asks whether a turn can
+    // ever run for a recipient before it charges one, so a message to this seat
+    // lands on a desk without waking anybody — no reservation, no
+    // `agent.turn.requested`. Raising this number to make escalation work would
+    // charter the one seat `docs/orizn-roles/direction.json` exists to keep
+    // empty, and would move the monthly figure the test below derives. It is
+    // still zero, and `docs/ORIZN.md` argues why under "The zero is still zero".
     Expected {
         role: "direction",
         head: "founder",

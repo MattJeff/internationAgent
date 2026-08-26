@@ -72,11 +72,19 @@ const MAX_TOKENS: u32 = 4_096;
 /// correctness assertion about the prompt's contents — it is the thing that
 /// makes a prompt edit visible, so that nobody quotes a tool-choice score
 /// measured against a prompt that no longer exists.
-pub const TRUSTED_PROMPT: &str = "afac0d164fae0c43";
+///
+/// Last moved by the empty-roster notice: [`prompt`] hands `SystemPrompt` no
+/// colleagues, and a prompt with no colleagues now renders one paragraph saying
+/// so rather than nothing at all. **The live scores below it are stale until
+/// somebody re-runs `--live`.** None of the five [`CASES`] is a
+/// `message_colleague` case, so the expected answers are unaffected — but the
+/// bytes the model was scored against are not the bytes it would be scored
+/// against now, and that is the only claim this pin makes.
+pub const TRUSTED_PROMPT: &str = "32dcf2c9e57a6a5b";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named. Differs from [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "c8cbf12b7f31388c";
+pub const UNTRUSTED_PROMPT: &str = "28fa31bfd67192eb";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.

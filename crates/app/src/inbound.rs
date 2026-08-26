@@ -172,6 +172,134 @@
 //! money; the sender is already inside a turn it paid for. The refusal goes to
 //! the sender, which is the one that can do something about it.
 //!
+//! ## The one recipient that is not charged: a seat that takes no turns
+//!
+//! **The chain of command was severed, and both halves were right.** A live dry
+//! run of `docs/ORIZN.md` found that no employee at Orizn could escalate to its
+//! owner. `docs/orizn-roles/direction.json` gives the founder's seat
+//! `max_turns_per_day: 0` — deliberately: the seat is a person's place in the
+//! chart, wears no role pack, and must not burn model turns. The rule above is
+//! deliberate too. Together they meant every `message_colleague` to `founder`
+//! was **allowed by the gate** (`audit_log`: `internal_send | allow`) and then
+//! refused here with `no_turn_budget`. The employee's next move was to invent an
+//! email address for its founder and report the escalation as done.
+//!
+//! Note which rule was the odd one out. [`may_message`] said yes — a question up
+//! the line is the ordinary case. [`colleagues`] said yes, so the founder was
+//! *named in the employee's own prefix* as "your manager — you answer to them".
+//! The two rules that decide who may say what to whom agreed. The only dissenter
+//! was a **price**, and a price is not an authorisation rule.
+//!
+//! So the reservation is conditional on the recipient being *wakeable*:
+//!
+//! > **A seat whose intersected `max_turns_per_day` is zero is delivered to and
+//! > not woken.** No turn is reserved, because none can ever run, and — this is
+//! > the load-bearing half — **no [`TURN_EVENT`] is enqueued either**.
+//! > [`Delivered::turn_event_id`] is `None`, which is how the sender is told.
+//!
+//! Dropping only the reservation would have been strictly worse than the refusal
+//! it replaces: nothing between `enqueue_turn` and `Agent::on_turn` reserves
+//! anything, so the wake-up would have run an *unbudgeted* model turn for the
+//! one seat in the company an operator wrote a document to keep silent.
+//! Not-charged and not-woken are the same decision, taken once.
+//!
+//! ### Zero, and not "exhausted", and not "unchartered"
+//!
+//! **[`turns::TurnBudgetError::Exhausted`] stays a refusal**, and that is what
+//! keeps the throttle. An exhausted seat *will* wake — tomorrow — so delivering
+//! to it without a wake-up would drop a real message into a mailbox its owner
+//! never reads. Zero is different in kind: it is not "not today", it is "not
+//! ever, under this policy".
+//!
+//! **Unchartered is the wrong signal**, and it is the one this seam invites you
+//! to reach for, because the founder is unchartered too. It is neither necessary
+//! nor sufficient. An employee with no role pack and thirty turns a day *is*
+//! woken and *does* spend tokens — [`crate::turn::UNCHARTERED`] exists precisely
+//! so that it can say "I have been woken and I do not know what my job is" — so
+//! keying on the pack would stop charging a seat that genuinely runs. And a
+//! *chartered* seat can be zeroed, which is the hole the question asks about: a
+//! rule that reads the pack would keep charging it for turns it cannot take.
+//! `max_turns_per_day` is not a proxy for the question. It **is** the question:
+//! will a turn ever run for this seat.
+//!
+//! ### The one errand a chair may not receive
+//!
+//! [`Errand::Handover`], refused with [`InternalError::NotAnOwner`]. Three of
+//! the four errands are *notes*: an order, a question or an answer on a desk a
+//! person reads is exactly what escalation is for. A handover is not a note, it
+//! is a transfer of **routing** — `resolve_phone_recipient` prefers whoever
+//! already holds a conversation with a counterparty, and `hand_over` moves that
+//! row precisely so the counterparty's next message follows it. Onto a seat that
+//! never wakes, that is a customer writing to a mailbox nobody answers.
+//!
+//! It also matters more than it looks, because inbound mail is the one wake-up
+//! in this system that reserves nothing — [`land`] enqueues a [`TURN_EVENT`]
+//! unconditionally, on the argument that the counterparty's arrival is the
+//! throttle. So a thread parked on a zero-turn seat would go on running
+//! unbudgeted turns for an employee an operator switched off. The guard is here,
+//! in the one function every internal message routes through, rather than in
+//! [`land`]: what is wrong is handing live work to a seat that cannot do it, not
+//! a stranger writing to an address that exists.
+//!
+//! ### Why this is not a way around the throttle
+//!
+//! Waking is what costs money, and this path wakes nobody. The ceiling in the
+//! paragraph above — a company can spend at most the sum of its employees'
+//! `max_turns_per_day` talking to itself — is unchanged, because the only
+//! recipients this exempts are the ones contributing **zero** to that sum.
+//!
+//! A pair of employees spinning each other needs both of them to run turns. A
+//! seat with no budget runs none, so it can receive and can never send: it is a
+//! sink, not a relay. There is no configuration in which routing through it
+//! multiplies anything, because nothing on the other side of it ever executes.
+//!
+//! The gate is untouched. [`may_message`] is asked first and unchanged, and
+//! `PolicyGate::authorize` has already ruled before [`send`] is called at all —
+//! there is no escalation verb, no second entrance and no exemption. What
+//! changed is what happens *after* authorisation, and charging nothing for a
+//! recipient that consumes nothing is arithmetic rather than permission.
+//!
+//! Nor is it a laundering path. The row is written with the sending turn's own
+//! [`TrustLabel`] exactly as every other internal message is, and [`send`] is
+//! the same function it always was. A seat that is never woken never renders
+//! anything, so an instruction relayed to a chair reaches no model at all — the
+//! label is on the row for the operator who reads it, and the taint test
+//! (`a_message_from_a_tainted_turn_arrives_as_data_not_as_an_order`) runs
+//! through this same path.
+//!
+//! ### What it costs, in money and in honesty
+//!
+//! In money: nothing. `direction`'s zero stays zero, so `docs/ORIZN.md`'s
+//! ≈$76 a month does not move — which is the argument against the cheapest
+//! alternative, **giving the founder a small budget**. Five turns a day is
+//! 5 × 4,639 × 30 = 695,850 input tokens ≈ $3.48, plus ≈$2.25 of output at that
+//! document's 600-token assumption: about $6 a month, ~8% of the bill, spent so
+//! that *a language model* answers where the entire point was to reach the
+//! person. It would also charter by accident the one seat
+//! `docs/orizn-roles/direction.json` exists to keep empty.
+//!
+//! The other alternative, **making escalation an approval-queue entry**, is
+//! rejected on what `agentos_store::approvals` is: a token bound to the sha256
+//! of one [`agentos_domain::action::Action`], re-hashed at redemption so that a
+//! human who approved "pay supplier A" cannot be replayed into "pay supplier B".
+//! An escalation authorises nothing — no action to hash, no nonce to redeem, no
+//! execution to bind it to — so it would mean minting a fake `Action` for its
+//! hash and a pending row nobody ever redeems. And the operator screen it was
+//! reaching for already exists: `GET /v1/employees/{id}/reports` counts
+//! `questions_waiting_on` per direct report, off the same anti-join
+//! [`unanswered`] uses, so the founder's morning screen already says which of
+//! its reports is blocked waiting on it. Nothing had to be built. The message
+//! only had to land.
+//!
+//! In honesty, there is one real cost and it is worth naming rather than
+//! hiding: an employee an operator zeroed **by mistake** used to refuse its
+//! incoming messages loudly, and now accepts them into a mailbox nobody wakes
+//! for. That is the price of the rule, and it points the way an operator's own
+//! words point — in this system, zero turns a day is how "this seat does not
+//! act" is spelled. The senders are told which of the two happened, in the tool
+//! result they get back, and `GET /v1/employees/{id}/turns` is where an operator
+//! finds a zero they did not mean.
+//!
 //! ## Briefing a line, and the arithmetic that makes it honest
 //!
 //! [`brief`] is [`send`] fanned out over a manager's direct reports. It adds no
@@ -1325,8 +1453,13 @@ pub struct Delivered {
     pub conversation_id: ConversationId,
     /// Who it went to.
     pub recipient: EmployeeId,
-    /// The queued [`TURN_EVENT`].
-    pub turn_event_id: Uuid,
+    /// The queued [`TURN_EVENT`], or **`None` when nobody was woken** — the
+    /// recipient is a seat with no turn budget at all, so the message is on a
+    /// desk for a person and no turn will run on it. See the module docs.
+    ///
+    /// An `Option` rather than a `woken: bool` beside a `Uuid`, so "an id for a
+    /// wake-up that never happened" is not a state anything can read.
+    pub turn_event_id: Option<Uuid>,
     /// True when this exact send had already landed. Not an error.
     pub duplicate: bool,
 }
@@ -1354,9 +1487,39 @@ pub enum InternalError {
     #[error("that is not a thread of yours to hand over")]
     NotYourThread,
 
-    /// The recipient has no turns left today, or was never granted any. The
-    /// company is out of budget and stops talking; it resumes at UTC midnight.
-    #[error("your colleague has no turns left today ({0})")]
+    /// A handover to a seat that takes no turns.
+    ///
+    /// The other three errands land on such a desk as a note for a person to
+    /// read, which is the point of the whole not-woken path. A handover is
+    /// different in kind: **the thread is the routing**, so moving one onto a
+    /// desk nobody wakes for points the counterparty's *next* message at an
+    /// employee that will never answer it — and unlike an internal message,
+    /// inbound mail is not throttled by a reservation, so it would quietly run
+    /// unbudgeted turns for a seat an operator switched off.
+    #[error(
+        "that colleague takes no turns, so they cannot own a thread — handing it to them \
+         would leave the counterparty writing to somebody who never answers. Keep it, or \
+         hand it to a colleague who is working."
+    )]
+    NotAnOwner,
+
+    /// The recipient has used up today's turns. The company is out of budget and
+    /// stops talking; it resumes at UTC midnight.
+    ///
+    /// **Not** "was never granted any" any more: a seat whose ceiling is zero is
+    /// delivered to without being woken, so the only refusal left here is
+    /// `turn_budget_exhausted`. The payload stays a `&'static str` because it is
+    /// [`turns::TurnBudgetError::code`]'s own word, carried rather than
+    /// re-spelled, and [`Missed::why`] renders it to a manager.
+    ///
+    /// The sentence tells the sender what to do next, because the alternative it
+    /// reaches for on its own is to invent a channel: a live run answered
+    /// `no_turn_budget` by making up an email address for its founder.
+    #[error(
+        "your colleague has used all of today's turns ({0}); they resume at UTC midnight. \
+         Do not try to reach them some other way — wait, work around it, or say in your \
+         reply that you are blocked on them."
+    )]
     NoTurnsLeft(&'static str),
 
     /// The recipient's policy would not load, so its turn budget cannot be
@@ -1376,6 +1539,7 @@ impl InternalError {
             InternalError::Unreachable => "unreachable_colleague",
             InternalError::NotAnswerable => "not_answerable",
             InternalError::NotYourThread => "not_your_thread",
+            InternalError::NotAnOwner => "not_an_owner",
             InternalError::NoTurnsLeft(code) => code,
             InternalError::RecipientPolicyUnusable => "recipient_policy_unusable",
             InternalError::Store(_) => "store",
@@ -1706,11 +1870,19 @@ async fn hand_over(
 /// The order of operations is the argument:
 ///
 /// 1. **Resolve and authorise the recipient** before anything is spent.
-/// 2. **Cheap duplicate check.** A replayed send costs one `SELECT`, not a
-///    second turn out of somebody's day.
-/// 3. **Validate the errand**, and perform the handover if it is one.
-/// 4. **Reserve the recipient's turn**, which is the thing that can refuse.
-/// 5. **Write and wake.**
+/// 2. **Price it**: read the recipient's policy and decide whether waking it is
+///    a thing that can happen at all.
+/// 3. **Cheap duplicate check.** A replayed send costs one `SELECT` and that
+///    policy read, not a second turn out of somebody's day.
+/// 4. **Validate the errand**, and perform the handover if it is one.
+/// 5. **Reserve the recipient's turn**, which is the thing that can refuse.
+/// 6. **Write, and wake if there is anybody to wake.**
+///
+/// Step 2 used to sit between 4 and 5, next to the reservation it feeds. It is
+/// hoisted because `wakes` is what step 3 has to know: a replay of a message to
+/// a seat that takes no turns must not enqueue the wake-up the first one
+/// correctly withheld, and `already_sent` has no other way to find that out —
+/// `messages` records who was written to, never who was woken.
 #[allow(clippy::too_many_arguments)]
 pub async fn send(
     tx: &mut TenantTx<'_>,
@@ -1730,7 +1902,23 @@ pub async fn send(
         return Err(InternalError::Unreachable);
     }
 
-    if let Some(delivered) = already_sent(tx, key, recipient, now).await? {
+    // The cost, read through the same four-layer intersection as every other
+    // limit, so a team can only ever tighten it. Against the *recipient's*
+    // policy, because it is the recipient's day being spent.
+    let policy = policy_store::load(tx, recipient)
+        .await
+        .map_err(|err| match err {
+            PolicyLoadError::Store(err) => InternalError::Store(err),
+            _ => InternalError::RecipientPolicyUnusable,
+        })?;
+    // **Is there anybody to wake?** A ceiling of zero is not "not today", it is
+    // "not ever, under this policy" — so this message lands on a desk a person
+    // reads and nothing is reserved and nothing is queued. The module docs argue
+    // it, including why this is not a way round the throttle and why
+    // `Exhausted` is still a refusal a few lines below.
+    let wakes = policy.limits().max_turns_per_day > 0;
+
+    if let Some(delivered) = already_sent(tx, key, recipient, wakes, now).await? {
         return Ok(delivered);
     }
 
@@ -1745,6 +1933,14 @@ pub async fn send(
         }
         Errand::Handover => {
             let thread = thread.ok_or(InternalError::NotYourThread)?;
+            // The one errand a seat that takes no turns may not receive, and the
+            // one place the not-woken path needed a guard rather than a
+            // sentence. See [`InternalError::NotAnOwner`]: this moves *routing*,
+            // not a note, and inbound mail has no reservation to stop what it
+            // points at.
+            if !wakes {
+                return Err(InternalError::NotAnOwner);
+            }
             if !hand_over(tx, thread.conversation_id, from, recipient, now).await? {
                 return Err(InternalError::NotYourThread);
             }
@@ -1752,22 +1948,20 @@ pub async fn send(
         }
     };
 
-    // The cost, and the only thing here that refuses a well-formed message.
-    // Against the *recipient's* policy, because it is the recipient's day being
-    // spent — read through the same four-layer intersection as every other
-    // limit, so a team can only ever tighten it.
-    let policy = policy_store::load(tx, recipient)
-        .await
-        .map_err(|err| match err {
-            PolicyLoadError::Store(err) => InternalError::Store(err),
-            _ => InternalError::RecipientPolicyUnusable,
-        })?;
-    turns::reserve(tx, recipient, now.date_naive(), &policy)
-        .await
-        .map_err(|err| match err {
-            turns::TurnBudgetError::Store(err) => InternalError::Store(err),
-            other => InternalError::NoTurnsLeft(other.code()),
-        })?;
+    // The only thing here that refuses a well-formed message, and it refuses
+    // exactly one way now: `Exhausted`, a seat that has spent a budget it has.
+    // `NoBudget` is unreachable from here — `wakes` is that same zero, read off
+    // the same `EffectivePolicy` — and it is still mapped rather than asserted,
+    // because a refusal that escaped should be a coded tool result and not a
+    // panic.
+    if wakes {
+        turns::reserve(tx, recipient, now.date_naive(), &policy)
+            .await
+            .map_err(|err| match err {
+                turns::TurnBudgetError::Store(err) => InternalError::Store(err),
+                other => InternalError::NoTurnsLeft(other.code()),
+            })?;
+    }
 
     let from_slug = slug_of(tx, from).await?;
     let conversation_id = conversation_for(tx, recipient, Channel::Internal, &from_slug, None, now)
@@ -1808,7 +2002,7 @@ pub async fn send(
     // the turn just reserved is spent — over-counting is the side of that trade
     // `store::turns` takes everywhere.
     let Some(message_id) = inserted else {
-        return already_sent(tx, key, recipient, now)
+        return already_sent(tx, key, recipient, wakes, now)
             .await?
             .ok_or_else(|| StoreError::conflict("internal message vanished").into());
     };
@@ -1820,9 +2014,18 @@ pub async fn send(
         .await
         .map_err(StoreError::from)?;
 
-    let turn_event_id = enqueue_turn(tx, recipient, conversation_id, message_id, key, now)
-        .await
-        .map_err(store_only)?;
+    // The wake-up, when there is somebody to wake. Withholding it is the whole
+    // safety of the not-charged path: nothing between here and `Agent::on_turn`
+    // reserves anything, so queueing this for a seat with no budget would run an
+    // unbudgeted turn for the one seat an operator wrote a policy to silence.
+    let turn_event_id = match wakes {
+        true => Some(
+            enqueue_turn(tx, recipient, conversation_id, message_id, key, now)
+                .await
+                .map_err(store_only)?,
+        ),
+        false => None,
+    };
 
     // Same row an arriving email writes, for the same reason: the trail and the
     // conversation must not be able to disagree about whether this employee was
@@ -1839,6 +2042,10 @@ pub async fn send(
                 "from": from_slug,
                 "internal_kind": errand.as_str(),
                 "trust_label": trust_str(trust),
+                // False is an escalation to a seat that takes no turns: it is on
+                // a desk and nothing will act on it. The operator reading this
+                // trail is the one it is waiting for.
+                "woken": wakes,
             }),
             ..AuditEvent::new(AuditActor::System, AuditKind::MessageReceived, now)
         },
@@ -1855,10 +2062,18 @@ pub async fn send(
 }
 
 /// The message this key already landed as, if it did.
+///
+/// `wakes` is the recipient's, from [`send`]: a replay must reproduce the
+/// original delivery, and a seat that takes no turns had no wake-up to
+/// re-enqueue. Getting this wrong is not a cosmetic difference — a second
+/// attempt would queue the [`TURN_EVENT`] the first one correctly withheld, and
+/// the dedupe key cannot stop it because there is no first event to collapse
+/// onto.
 async fn already_sent(
     tx: &mut TenantTx<'_>,
     key: &IdempotencyKey,
     recipient: EmployeeId,
+    wakes: bool,
     now: DateTime<Utc>,
 ) -> Result<Option<Delivered>, InternalError> {
     let found: Option<(Uuid, Uuid)> = sqlx::query_as(
@@ -1875,10 +2090,16 @@ async fn already_sent(
     };
     let conversation_id = ConversationId::from_uuid(conversation_id);
     // The dedupe key makes `enqueue` hand back the original event, so this
-    // re-reads the wake-up rather than queueing a second one.
-    let turn_event_id = enqueue_turn(tx, recipient, conversation_id, message_id, key, now)
-        .await
-        .map_err(store_only)?;
+    // re-reads the wake-up rather than queueing a second one — when there was
+    // one at all.
+    let turn_event_id = match wakes {
+        true => Some(
+            enqueue_turn(tx, recipient, conversation_id, message_id, key, now)
+                .await
+                .map_err(store_only)?,
+        ),
+        false => None,
+    };
 
     Ok(Some(Delivered {
         message_id,
@@ -1994,6 +2215,25 @@ impl Briefing {
                 ". Not delivered to {} — they have not heard this, so do not act as though \
                  the whole line has",
                 names(&missed)
+            ));
+        }
+        // A report that takes no turns is delivered to and not woken, so the
+        // sentence above — "it costs each of them one of today's turns and they
+        // will take it" — is false of it. Said separately rather than by
+        // softening that sentence for everybody: the cost is what stops a
+        // manager briefing its line to think out loud, and it is true of every
+        // report that will actually act.
+        let asleep: Vec<String> = self
+            .briefed
+            .iter()
+            .filter(|one| one.delivered.turn_event_id.is_none())
+            .map(|one| one.colleague.clone())
+            .collect();
+        if !asleep.is_empty() {
+            out.push_str(&format!(
+                ". It reached {} without waking anybody — those seats take no turns, so a \
+                 person reads what lands on them and no reply will come back",
+                names(&asleep)
             ));
         }
         out
@@ -3272,7 +3512,11 @@ mod tests {
         let payload: Value = sqlx::query_scalar(
             "SELECT payload FROM outbox_events WHERE id = $1 AND event_type = $2",
         )
-        .bind(delivered.turn_event_id)
+        .bind(
+            delivered
+                .turn_event_id
+                .expect("a colleague with turns is woken"),
+        )
         .bind(TURN_EVENT)
         .fetch_one(&mut **tx)
         .await
@@ -3528,6 +3772,433 @@ mod tests {
         tx.rollback().await.expect("rollback");
         assert_eq!(landed, 2, "a refused message must leave no row");
         assert_eq!(turns_taken(&db, tenant, bruno).await, 2);
+    }
+
+    /// **The throttle, driven from both ends.** The test above proves one
+    /// employee cannot wake another past its budget; this one proves the pair
+    /// cannot wake *each other* past the sum of theirs, which is the property
+    /// the module docs claim and the one the not-charged path must not weaken.
+    ///
+    /// Both seats here have a budget, so both pay. Four deliveries against
+    /// 2 + 2, and then the conversation stops — not because either employee
+    /// decided to, and not on a rule about who spoke last.
+    #[tokio::test]
+    async fn two_employees_cannot_spin_each_other_past_the_sum_of_their_budgets() {
+        let Some(db) = db().await else { return };
+        // Two turns each, in anybody's whole day.
+        let (tenant, lena, bruno) = company(&db, 2).await;
+
+        // Strictly alternating, which is what a runaway pair looks like: every
+        // message is a reply to the one before it and each one wakes the other.
+        let mut sent = 0;
+        let mut refused = Vec::new();
+        for round in 1..=6 {
+            let (from, to, errand) = match round % 2 {
+                1 => (lena, "bruno", Errand::Order),
+                _ => (bruno, "lena", Errand::Question),
+            };
+            match say(
+                &db,
+                tenant,
+                from,
+                to,
+                errand,
+                "and another thing",
+                TrustLabel::Trusted,
+                None,
+                &format!("spin-{round}"),
+            )
+            .await
+            {
+                Ok(_) => sent += 1,
+                Err(err) => refused.push(err.code()),
+            }
+        }
+
+        assert_eq!(sent, 4, "the ceiling is the sum of the two budgets, 2 + 2");
+        assert_eq!(
+            refused,
+            ["turn_budget_exhausted", "turn_budget_exhausted"],
+            "and it stops by refusing the sender, not by anybody choosing to stop"
+        );
+        assert_eq!(turns_taken(&db, tenant, lena).await, 2);
+        assert_eq!(turns_taken(&db, tenant, bruno).await, 2);
+        assert_eq!(
+            turns(&db, tenant).await,
+            4,
+            "four wake-ups queued, one per delivered message and no more"
+        );
+    }
+
+    // -- escalation to a seat that takes no turns ----------------------------
+
+    /// **The Orizn chart at both ends, plus a seat that is on no chart at all.**
+    ///
+    /// `founder` is the chair at the root: an employee row, because there is no
+    /// way to draw a reporting line to a seat nobody holds, and an **employee**
+    /// policy layer that permits nothing — zero turns, no channel, no domain, no
+    /// spend, which is `docs/orizn-roles/direction.json` field for field.
+    /// `sdr` is a seat at the bottom of the chart that answers to it.
+    ///
+    /// Two teams and not one, because the reporting line crosses them in the
+    /// chart this is modelled on. On a single team `same_team` would answer the
+    /// question the line is supposed to answer and the fixture would prove
+    /// nothing about escalation.
+    ///
+    /// The zero sits on the employee layer rather than on `allow_internal`'s
+    /// tenant one so that the rest of the company keeps its turns: a fixture
+    /// that zeroed everybody would only re-prove the silence
+    /// `a_company_out_of_turns_stops_talking` already owns.
+    ///
+    /// `seed`'s own `lena` is left exactly where it lands — on no team and in no
+    /// line — and that is the third fact this fixture carries: an employee the
+    /// org chart has never mentioned.
+    async fn chart_with_a_chair(db: &Db) -> (TenantId, EmployeeId, EmployeeId, EmployeeId) {
+        let (tenant, lena) = seed(db).await;
+        let founder = hire(db, tenant, "founder").await;
+        let sdr = hire(db, tenant, "sdr").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let direction = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("direction").expect("slug"),
+            "Direction",
+        )
+        .await
+        .expect("team");
+        let commercial = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("sales-development").expect("slug"),
+            "Commercial",
+        )
+        .await
+        .expect("team");
+        agentos_store::org::set_member(&mut tx, founder, direction, None)
+            .await
+            .expect("seat the chair");
+        agentos_store::org::set_member(&mut tx, sdr, commercial, None)
+            .await
+            .expect("seat the seller");
+        agentos_store::org::set_position(&mut tx, founder, Some("CEO / founder"), None)
+            .await
+            .expect("the root reports to nobody");
+        agentos_store::org::set_position(&mut tx, sdr, Some("Sales Development"), Some(founder))
+            .await
+            .expect("the seller answers to the founder");
+        tx.commit().await.expect("commit the org chart");
+
+        allow_internal(db, tenant, 30).await;
+        // The emptiest document in the runbook, as a layer.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Employee(founder),
+            &agentos_domain::policy::PolicyLimits::default(),
+        )
+        .await
+        .expect("install the chair's layer");
+
+        (tenant, founder, sdr, lena)
+    }
+
+    /// **The seam this exists to close.** A seat at the bottom of the chart
+    /// escalates to the chair at the top, through the real path, and it lands.
+    ///
+    /// Before this, `may_message` said yes, `colleagues` put the founder in the
+    /// seller's own prefix as "your manager", the gate wrote
+    /// `internal_send | allow` — and the executor then refused with
+    /// `no_turn_budget`, because the seat that roots the reporting line is
+    /// deliberately budgeted at zero. Two correct rules, one severed chain of
+    /// command, and an employee that answered it by inventing an email address
+    /// for its founder.
+    ///
+    /// The two halves asserted here are one decision: **not charged** and **not
+    /// woken**. Dropping only the first would be strictly worse than the refusal
+    /// it replaces — nothing between `enqueue_turn` and the agent loop reserves
+    /// anything, so the wake-up would run an unbudgeted turn for the one seat an
+    /// operator wrote a policy to silence.
+    #[tokio::test]
+    async fn a_seat_at_the_bottom_of_the_chart_reaches_the_chair_at_the_top() {
+        let Some(db) = db().await else { return };
+        let (tenant, founder, sdr, _) = chart_with_a_chair(&db).await;
+
+        // The two rules that decide who may say what already agreed, and the
+        // roster is what the model is *told*. Told and refused was the bug.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            may_message(&mut tx, sdr, founder, Errand::Question)
+                .await
+                .expect("the chart is readable"),
+            "a report may ask the seat it answers to"
+        );
+        let roster: Vec<(String, Relation)> = colleagues(&mut tx, sdr)
+            .await
+            .expect("roster")
+            .into_iter()
+            .map(|(who, how)| (who.as_str().to_owned(), how))
+            .collect();
+        tx.rollback().await.expect("rollback");
+        assert_eq!(roster, [("founder".to_owned(), Relation::Manager)]);
+
+        let escalated = say(
+            &db,
+            tenant,
+            sdr,
+            "founder",
+            Errand::Question,
+            "The airline is asking for terms I am not allowed to quote. What do I tell them?",
+            TrustLabel::Trusted,
+            None,
+            "escalation",
+        )
+        .await
+        .expect("an employee can reach its owner");
+
+        // Not woken, and that is what the sender is handed back.
+        assert!(
+            escalated.turn_event_id.is_none(),
+            "the chair was woken; nothing may run a turn for a seat budgeted at zero"
+        );
+        assert_eq!(escalated.recipient, founder);
+        assert!(!escalated.duplicate);
+
+        // Not charged, and nothing queued anywhere in the tenant.
+        assert_eq!(turns_taken(&db, tenant, founder).await, 0);
+        assert_eq!(
+            turns(&db, tenant).await,
+            0,
+            "a wake-up was queued for a seat that cannot take one"
+        );
+
+        // But it *landed*: a real row, on the founder's desk, from the seller.
+        let (channel, sender, trust, kind) = stored(&db, tenant, escalated.message_id).await;
+        assert_eq!((channel.as_str(), sender.as_str()), ("internal", "sdr"));
+        assert_eq!((trust.as_str(), kind.as_str()), ("trusted", "question"));
+
+        // And the trail says which kind of delivery it was, because the operator
+        // reading it is the one the message is waiting for.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let trail = agentos_store::audit::trail_for_employee(&mut tx, founder, 10)
+            .await
+            .expect("read the trail");
+        let outstanding = unanswered(&mut tx, sdr).await.expect("read the questions");
+        let note = outstanding_note(&mut tx, sdr)
+            .await
+            .expect("read the reminder");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(trail.len(), 1, "{trail:?}");
+        assert_eq!(trail[0].action_kind, "message_received");
+        assert_eq!(trail[0].payload["from"], "sdr");
+        assert_eq!(trail[0].payload["internal_kind"], "question");
+        assert_eq!(
+            trail[0].payload["woken"], false,
+            "the trail has to say nobody will act on this"
+        );
+
+        // The escalation stays visible to the seller until a person answers it,
+        // which is the same anti-join `GET /v1/employees/{id}/reports` counts as
+        // `questions_waiting_on` on the founder's own morning screen.
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].asked_of, "founder");
+        assert!(
+            note.expect("a blocked employee is reminded")
+                .contains("founder"),
+            "the seller's next turn has to know it is still waiting"
+        );
+
+        // A replay is the same message and still wakes nobody — `already_sent`
+        // has to reproduce the original delivery, and the dedupe key cannot
+        // collapse a second wake-up onto a first one that never existed.
+        let again = say(
+            &db,
+            tenant,
+            sdr,
+            "founder",
+            Errand::Question,
+            "The airline is asking for terms I am not allowed to quote. What do I tell them?",
+            TrustLabel::Trusted,
+            None,
+            "escalation",
+        )
+        .await
+        .expect("a replayed escalation is not an error");
+        assert!(again.duplicate);
+        assert_eq!(again.message_id, escalated.message_id);
+        assert!(again.turn_event_id.is_none());
+        assert_eq!(turns(&db, tenant).await, 0, "the replay queued a wake-up");
+        assert_eq!(messages(&db, tenant).await, 1);
+    }
+
+    /// One hop to a chair launders nothing either. The row carries the sending
+    /// turn's own label, exactly as it would to any colleague — and because the
+    /// chair is never woken, the instruction reaches no model at all.
+    ///
+    /// The label still matters on a row nobody wakes for: it is what an operator
+    /// reads the message under, and it is what the recipient's turn would render
+    /// it as the day somebody gives that seat a budget.
+    #[tokio::test]
+    async fn a_tainted_turn_escalating_to_the_chair_arrives_as_data_and_wakes_nobody() {
+        let Some(db) = db().await else { return };
+        let (tenant, founder, sdr, _) = chart_with_a_chair(&db).await;
+
+        let escalated = say(
+            &db,
+            tenant,
+            sdr,
+            "founder",
+            Errand::Question,
+            INJECTION,
+            // What the seller's turn was worth when it composed this. Not a
+            // claim it makes — `Effects::send_internal` reads it off the token's
+            // type — and escalation is not an exception to that.
+            TrustLabel::Untrusted,
+            None,
+            "tainted-escalation",
+        )
+        .await
+        .expect("a tainted employee may still escalate — that is the point");
+
+        let (_, _, trust, _) = stored(&db, tenant, escalated.message_id).await;
+        assert_eq!(trust, "untrusted", "escalating laundered the taint");
+        assert!(escalated.turn_event_id.is_none());
+        assert_eq!(turns_taken(&db, tenant, founder).await, 0);
+
+        // And at whatever reads it, it is data: the same `into_context` branch,
+        // and the payment tool is not in the catalogue that turn would be
+        // offered.
+        let context = into_context(
+            Context::new().with_task("do your job"),
+            "sdr",
+            Errand::Question,
+            Untrusted::new(INJECTION.to_owned()),
+            TrustLabel::Untrusted,
+            escalated.message_id,
+        );
+        assert_eq!(context.trust(), TrustLabel::Untrusted);
+        let offered: Vec<String> = crate::turn::tools_for(
+            context.trust(),
+            crate::rolepack::RolePack::international_buyer().proposable(),
+            None,
+        )
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+        assert!(!offered.contains(&"pay".to_owned()), "{offered:?}");
+    }
+
+    /// **The one errand a chair may not receive.** A note for a person is what
+    /// the not-woken path is for; a handover is a transfer of routing, and
+    /// pointing a live counterparty thread at a desk nobody wakes for is a
+    /// customer writing to a mailbox with no reader.
+    ///
+    /// It is also where this change met the one wake-up that reserves nothing:
+    /// `land` queues a turn for arriving mail unconditionally, so a thread
+    /// parked on a zero-turn seat would keep running unbudgeted turns for an
+    /// employee an operator switched off. The refusal is in `send`, which every
+    /// internal message routes through.
+    #[tokio::test]
+    async fn a_live_thread_cannot_be_handed_to_a_seat_that_takes_no_turns() {
+        let Some(db) = db().await else { return };
+        let (tenant, founder, sdr, _) = chart_with_a_chair(&db).await;
+
+        // A customer thread the seller owns.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let customer = conversation_for(
+            &mut tx,
+            sdr,
+            Channel::Email,
+            "ops@airline.example",
+            Some("Entry requirements API"),
+            Utc::now(),
+        )
+        .await
+        .expect("the thread");
+        tx.commit().await.expect("commit the thread");
+        let thread = Some(Thread {
+            conversation_id: customer,
+            message_id: Uuid::now_v7(),
+        });
+
+        let err = say(
+            &db,
+            tenant,
+            sdr,
+            "founder",
+            Errand::Handover,
+            "You take the airline from here.",
+            TrustLabel::Trusted,
+            thread,
+            "handover-to-the-chair",
+        )
+        .await
+        .expect_err("a seat that takes no turns cannot own a customer");
+        assert_eq!(err.code(), "not_an_owner");
+
+        // The thread did not move, so the airline still reaches somebody who
+        // answers — a refusal that had already run the `UPDATE` would be worse
+        // than the one it replaced.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let owner: Uuid = sqlx::query_scalar("SELECT employee_id FROM conversations WHERE id = $1")
+            .bind(customer.as_uuid())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the owner");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(EmployeeId::from_uuid(owner), sdr);
+
+        // And the refusal is about the handover and not about the colleague: the
+        // same seller escalates a question to the same seat and it lands.
+        say(
+            &db,
+            tenant,
+            sdr,
+            "founder",
+            Errand::Question,
+            "The airline wants terms. What do I tell them?",
+            TrustLabel::Trusted,
+            None,
+            "still-reachable",
+        )
+        .await
+        .expect("the chair is still reachable for the three errands that are notes");
+        assert_eq!(turns_taken(&db, tenant, founder).await, 0);
+    }
+
+    /// **An employee that genuinely cannot reach anybody is told so**, in the
+    /// prefix, on every turn — rather than finding out by guessing a name and
+    /// reading a refusal that by design cannot explain itself.
+    ///
+    /// The two halves have to be asserted together, because they are the two
+    /// ends of one rule: `colleagues` is what the roster is built from, and the
+    /// rendered section is what the model actually reads. An employee on no team
+    /// and no line is the deny-by-default case, and it is still offered
+    /// `message_colleague` — `turn::UNCHARTERED` is the internal channel and
+    /// nothing else — so the empty answer has to be written down somewhere the
+    /// next turn sees it.
+    #[tokio::test]
+    async fn an_employee_the_org_chart_never_mentions_is_told_it_can_reach_nobody() {
+        let Some(db) = db().await else { return };
+        let (tenant, _, sdr, lena) = chart_with_a_chair(&db).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let alone = colleagues(&mut tx, lena).await.expect("roster");
+        // The control: the same query, on a seat the chart does mention.
+        let seated = colleagues(&mut tx, sdr).await.expect("roster");
+        tx.rollback().await.expect("rollback");
+
+        assert!(alone.is_empty(), "an employee on no team reaches nobody");
+        assert_eq!(seated.len(), 1, "and the fixture is not simply broken");
+
+        let prefix = crate::prompt::SystemPrompt::new("You are lena.")
+            .with_colleagues(alone)
+            .render(TrustLabel::Trusted);
+        assert!(prefix.contains("# Colleagues you can reach"), "{prefix}");
+        assert!(prefix.contains("Nobody."), "{prefix}");
+        assert!(
+            prefix.contains("say so plainly in your reply"),
+            "being told the list is empty is not enough on its own: {prefix}"
+        );
     }
 
     /// One tenant's employees cannot reach another's. Not a rule anybody
@@ -4055,14 +4726,18 @@ mod tests {
                 .iter()
                 .find(|one| one.colleague == slug)
                 .unwrap_or_else(|| panic!("{slug} is not on the receipt"));
-            let payload = queued_turn(&db, tenant, one.delivered.turn_event_id).await;
+            let woke = one
+                .delivered
+                .turn_event_id
+                .expect("a report with turns is woken");
+            let payload = queued_turn(&db, tenant, woke).await;
             assert_eq!(payload["employee_id"], json!(who.as_uuid()));
             assert_eq!(payload["message_id"], json!(one.delivered.message_id));
         }
         let events: BTreeSet<Uuid> = briefing
             .briefed
             .iter()
-            .map(|one| one.delivered.turn_event_id)
+            .filter_map(|one| one.delivered.turn_event_id)
             .collect();
         assert_eq!(events.len(), 3, "three reports, three distinct wake-ups");
 

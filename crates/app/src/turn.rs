@@ -1356,9 +1356,26 @@ impl Turn {
                     .send_internal(ok, &note)
                     .await);
                 performed(sent, move |delivered: Delivered| {
+                    // Two receipts, because they mean different things to the
+                    // next thing this turn does. A woken colleague will act and
+                    // may answer. A seat with no turn budget — the founder's
+                    // chair, an employee an operator switched off — is a desk a
+                    // *person* reads: saying "delivered" and stopping there is
+                    // what left a live run waiting for a reply that could not
+                    // come, and then inventing an email address to chase it.
+                    let landing = match delivered.turn_event_id {
+                        Some(_) => {
+                            "it costs your colleague one of today's turns and they will take it"
+                        }
+                        None => {
+                            "nobody was woken: that seat takes no turns, so this is on a desk \
+                             for a person to read. No employee will act on it and no reply \
+                             will come back to you — do not send it again and do not look for \
+                             another way to reach them"
+                        }
+                    };
                     Reply::Ok(format!(
-                        "{} delivered; it costs your colleague one of today's turns and they \
-                         will take it{}",
+                        "{} delivered; {landing}{}",
                         errand.as_str(),
                         if delivered.duplicate {
                             " (this had already been sent)"
