@@ -304,9 +304,21 @@ impl Relation {
     /// How the roster says it, in the employee's own second person.
     const fn phrase(self) -> &'static str {
         match self {
-            Relation::Manager => "your manager — you answer to them",
+            // Each phrase names the *verb* that reaches this person, not just
+            // the relation. A live run had the seller reach for `order` upward
+            // six times in three turns: "you answer to them" is a fact about
+            // the chart and the model read it as permission to direct. The
+            // refusal cannot explain itself — see the `kind` description in
+            // `turn::catalogue` — so the brief has to.
+            Relation::Manager => {
+                "your manager — you answer to them; ask them a question, \
+                                  never give them an order"
+            }
             Relation::Report => "reports to you — you may give them an order",
-            Relation::TeamMate => "on your team",
+            Relation::TeamMate => {
+                "on your team — ask them a question; an order goes down a \
+                                   reporting line and they are not on yours"
+            }
         }
     }
 }
@@ -1549,6 +1561,54 @@ Kind regards, Accounts Payable";
             (slug("dana"), Relation::TeamMate),
             (slug("mo"), Relation::Manager),
         ])
+    }
+
+    /// **Every relation names the verb that reaches it, not just the fact.**
+    ///
+    /// A live run had the seller reach for `order` **six times in three turns**,
+    /// aimed at the seat it answers to, and be refused every time. The refusal
+    /// could not explain itself and must not: `unreachable_colleague` reads the
+    /// same for "no such colleague" and "out of reach" precisely so the org
+    /// chart cannot be enumerated by guessing at names. That silence is right
+    /// about *who exists*.
+    ///
+    /// It is expensive about *which verb*, and that part is not a secret —
+    /// `inbound::may_message` is public and the rule is one sentence. So the
+    /// brief carries it: "your manager — you answer to them" is a fact about
+    /// the chart, and a model read it as permission to direct. Each phrase now
+    /// says what may be sent, and the `kind` field's own description in
+    /// `turn::catalogue` says the same thing from the other side.
+    ///
+    /// Asserted on the *rendered* prefix rather than on `Relation::phrase`,
+    /// because a phrase nothing renders is a phrase nobody reads.
+    #[test]
+    fn a_relation_says_which_verb_reaches_it() {
+        let rendered = desk().render(TrustLabel::Trusted);
+
+        for (who, must) in [
+            ("mo", "never give them an order"),
+            ("dana", "an order goes down a reporting line"),
+        ] {
+            let line = rendered
+                .lines()
+                .find(|line| line.contains(who))
+                .unwrap_or_else(|| panic!("{who} is not in the brief:\n{rendered}"));
+            assert!(
+                line.contains(must),
+                "the line for {who} does not say which verb reaches them: {line}"
+            );
+        }
+
+        // The one relation an order *may* travel to still says so, or the rule
+        // would read as "never order anybody" and the tool would be dead.
+        let report = rendered
+            .lines()
+            .find(|line| line.contains("bruno"))
+            .expect("the report is in the brief");
+        assert!(
+            report.contains("you may give them an order"),
+            "a report must still be orderable: {report}"
+        );
     }
 
     /// **The claim this builder exists for.** The model is handed the names it

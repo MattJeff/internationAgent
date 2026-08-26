@@ -26,7 +26,8 @@
 //! exactly when it is most wrong.
 //!
 //! What replaces replay is one line: CI pins [`TRUSTED_PROMPT`] and
-//! [`UNTRUSTED_PROMPT`], digests of the rendered system prompt. Editing the
+//! [`UNTRUSTED_PROMPT`], digests of the request as sent — prefix and tool
+//! schemas both, since a tool description is prompt. Editing the
 //! prompt turns this suite red with *"the recorded live scores are stale"*,
 //! which is a true statement, and the fix is to re-run the live set and update
 //! the constants. That is the whole mechanism: the deterministic half's job is
@@ -66,7 +67,7 @@ use agentos_domain::action::{McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::policy::{EffectivePolicy, ModelId, PolicyLimits};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
-use agentos_providers::llm::{Content, Llm, Message};
+use agentos_providers::llm::{Content, Llm, LlmRequest, Message};
 use agentos_providers::llm_cli::CliLlm;
 use sha2::{Digest, Sha256};
 
@@ -113,22 +114,30 @@ const MAX_TOKENS: u32 = 4_096;
 /// recorded live scores are stale"*, which is true, and the fix is the same one
 /// a prompt edit calls for: re-run `--live` and re-pin.
 ///
-/// **Last moved by two independent changes landing in one merge**, which is
-/// why neither branch's value survived. The domain allowlist put a paragraph in
-/// the prefix — `prompt` is built on `default_ceiling`, which grants no domain,
-/// so what it renders is the empty case saying so — and separately the model
-/// joined the hash. Each agent re-derived against its own base and got a
-/// different answer; the constants below were derived after the merge, from the
-/// bytes that now exist. **The live scores are stale until somebody re-runs
-/// `--live`.** None of the five [`CASES`] is a `read_page` case and this
-/// employee is not offered that schema, so the expected answers are unaffected
-/// — but the bytes the model was scored against are not the bytes it would be
-/// scored against now, and that is the only claim this pin makes.
-pub const TRUSTED_PROMPT: &str = "9e6f941284f79fa8";
+/// **Last moved by the upward-order fix, and by the widening this pin needed
+/// in order to see it.** A live run had the seller reach for `order` at the
+/// seat above it six times in three turns; the fix put the rule in the roster
+/// phrase (which `render` emits) and in the `kind` field's own description in
+/// `turn::catalogue` (which it does not). Re-running this suite then reported
+/// **both digests unchanged** — an edit made specifically to move tool choice,
+/// invisible to the pin that certifies tool-choice scores.
+///
+/// So [`digest`] now hashes the whole built request, schemas included, and the
+/// constants below were derived from the bytes that exist after both changes.
+///
+/// They were **not** re-pinned on their own. Moving this constant without
+/// re-running `--live` is the one move the mechanism exists to prevent, so
+/// `--live` was re-run against exactly these bytes: **5/5 tool choice, 0 safety
+/// violations, 0 shim failures on `claude-opus-5` via the local CLI.** The two
+/// prose cases — `bank-details-changed` and `a-question-not-a-task` — still
+/// answer in prose, which is what the upward-order fix could plausibly have
+/// broken by making the tool list read as more permissive than it is.
+pub const TRUSTED_PROMPT: &str = "b65be9d4f2042ee6";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
-/// named. Differs from [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "721c6f7882520d20";
+/// named, and — since the pin covers schemas — not offered either. Differs from
+/// [`TRUSTED_PROMPT`] by construction.
+pub const UNTRUSTED_PROMPT: &str = "5e6e5e43029d3e3d";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.
@@ -216,17 +225,57 @@ fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
         .collect()
 }
 
-/// First 16 hex characters of the SHA-256 of **the model and the rendered
-/// prompt**. Short enough to read in a report, long enough that nothing
-/// collides by accident.
+/// First 16 hex characters of the SHA-256 of **everything the model reads
+/// before it chooses**: the model id, the rendered prefix, and every tool
+/// schema the turn offers. Short enough to read in a report, long enough that
+/// nothing collides by accident.
 ///
 /// The model is in here for the reason [`TRUSTED_PROMPT`] gives at length: a
 /// score is a fact about a model, and a pin that could not see the model change
 /// would certify a stale number as fresh.
+///
+/// # Why the schemas are in here now
+///
+/// They were not, and the gap was found the way gaps are: a live run showed
+/// the seller reaching for `order` at the seat above it six times in three
+/// turns. The fix put the rule in two places — the roster phrase, which
+/// `render` emits, and the `kind` field's own description in
+/// `turn::catalogue`, which it does not. Re-running this suite afterwards
+/// reported **both digests unchanged**, so an edit made specifically to change
+/// what the model picks left the pin that certifies tool-choice scores exactly
+/// where it was.
+///
+/// A tool's `description` is prompt. It is the sentence the model reads when
+/// deciding whether this is the tool, and on this suite — whose entire subject
+/// is *which tool* — it is closer to the measurement than half the prefix.
+/// Hashing the prefix alone drew the boundary at where the bytes happen to
+/// live rather than at what the score depends on, which is the same mistake
+/// pinning the prompt without the model would have been.
+///
+/// So the hash is taken over the built request, not over `render`: the model,
+/// the system prefix, and each offered tool's name, description and schema.
+/// `input_schema` goes through `Value`'s own `Display`, whose object keys are
+/// ordered, so the bytes do not depend on the order the fields were inserted.
+///
+/// The `messages` and `max_tokens` of that request are deliberately *not*
+/// hashed. They vary per case by design — each of [`CASES`] carries its own —
+/// and a pin that moved per case would be a pin on nothing.
 pub fn digest(trust: TrustLabel) -> String {
+    digest_of(&prompt().request(default_model().as_str(), MAX_TOKENS, trust, Vec::new()))
+}
+
+/// [`digest`]'s body, over a request handed in rather than built — so a test
+/// can hand it two requests differing by one tool description and hold the
+/// pin to the claim its doc comment makes.
+fn digest_of(request: &LlmRequest) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(default_model().as_str().as_bytes());
-    hasher.update(prompt().render(trust).as_bytes());
+    hasher.update(request.model.as_bytes());
+    hasher.update(request.system.as_bytes());
+    for tool in &request.tools {
+        hasher.update(tool.name.as_bytes());
+        hasher.update(tool.description.as_bytes());
+        hasher.update(tool.input_schema.to_string().as_bytes());
+    }
     hasher
         .finalize()
         .iter()
@@ -584,6 +633,53 @@ pub fn evaluate() -> Surface {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A tool description is prompt, and the pin has to see it move.**
+    ///
+    /// It did not. The `kind` field's description in `turn::catalogue` was
+    /// rewritten precisely to change which tool the model reaches for, this
+    /// suite was re-run, and it reported both digests unchanged — certifying
+    /// tool-choice scores as fresh against a request the model would no longer
+    /// receive. `digest` hashed `render` only, so every byte of every schema
+    /// was outside the boundary, on the one suite whose subject is *which
+    /// tool*.
+    ///
+    /// This is the assertion that would have been red that day. It changes one
+    /// description and nothing else, so a `digest_of` that ever narrows back to
+    /// the prefix fails here rather than in a report six weeks of scores later.
+    #[test]
+    fn the_pin_sees_a_tool_description_change() {
+        let before = prompt().request(
+            default_model().as_str(),
+            MAX_TOKENS,
+            TrustLabel::Trusted,
+            Vec::new(),
+        );
+        assert!(
+            !before.tools.is_empty(),
+            "the fixture offers no tool, so this proves nothing"
+        );
+
+        let mut after = before.clone();
+        after.tools[0].description.push_str(" (and one more word)");
+        assert_ne!(
+            digest_of(&before),
+            digest_of(&after),
+            "a reworded tool description left the pin where it was — which is \
+             the exact failure this covers"
+        );
+
+        // The schema itself, not only the prose around it: withdrawing an enum
+        // variant changes what may be sent without touching a description.
+        let mut narrowed = before.clone();
+        narrowed.tools[0].input_schema = serde_json::json!({"type": "object", "properties": {}});
+        assert_ne!(
+            digest_of(&before),
+            digest_of(&narrowed),
+            "a rewritten input schema left the pin where it was"
+        );
+    }
+
     use super::*;
 
     #[test]

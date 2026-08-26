@@ -516,7 +516,30 @@ fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 6] {
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["order", "question", "answer", "handover"]
+                        "enum": ["order", "question", "answer", "handover"],
+                        // The enum alone is what a live run showed is not
+                        // enough: an employee wanting to escalate to the seat
+                        // above it reached for `order` six times in three
+                        // turns, was refused each time, and could not tell why
+                        // — `unreachable_colleague` deliberately reads the same
+                        // for "wrong name" and "out of reach" so the org chart
+                        // cannot be enumerated by asking. That silence is right
+                        // about *who exists*; it is expensive about *which
+                        // verb*, because the rule is not a secret. So the rule
+                        // is stated here, where a wrong choice is still free.
+                        "description": "Which way it travels, and the list in \
+                                        your brief says which applies to whom. \
+                                        `order` goes DOWN your reporting line \
+                                        only — to somebody the brief says \
+                                        reports to you. Sending one to your \
+                                        manager, or to a team-mate who does not \
+                                        report to you, is refused. `question` \
+                                        goes either way and to anyone on the \
+                                        list: use it to escalate, to ask your \
+                                        manager for a decision, or to raise \
+                                        something upward. `answer` closes a \
+                                        question you were asked. `handover` \
+                                        gives them the thread you are on."
                     },
                     "body": { "type": "string", "description": "Plain text." }
                 },

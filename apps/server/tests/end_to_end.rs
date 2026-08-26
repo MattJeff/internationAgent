@@ -1401,7 +1401,9 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         .collect();
     assert_eq!(
         listed,
-        ["- fondateur — your manager — you answer to them"],
+        [
+            "- fondateur — your manager — you answer to them; ask them a question, never give them an order"
+        ],
         "the roster is not this employee's line: the org chart drew one manager \
          and five strangers, and the prompt has to carry the manager and none of \
          the strangers"
