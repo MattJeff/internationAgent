@@ -90,6 +90,28 @@
 //! A prospect who gets the same cold email twice reports it, and a sending
 //! domain does not recover from that on a schedule.
 //!
+//! # Who calls this, and why only one thing can
+//!
+//! `apps/server/src/routes/queue.rs` — `POST /v1/employees/{id}/queue/export`,
+//! and nothing else in the workspace. That rule above admits exactly one shape:
+//! the mark has to commit before the bytes exist, so the bytes have to be handed
+//! to somebody in the same breath, so the caller has to be a request rather than
+//! a cadence. [`crate::vertical::selling_turn`]'s docs make the argument from the
+//! other end and name this route.
+//!
+//! The route holds one transaction across [`due`], [`suppression`], [`plan`],
+//! [`record_queued`] and [`csv`], so there is no state in which somebody is
+//! marked contacted and the file that says so does not exist. What it hands back
+//! is JSON with the CSV in it, so that the API stack's idempotency layer — which
+//! stores `jsonb` — can replay the exact bytes of a response that was lost in
+//! flight. That is where the residual risk of mark-then-write actually goes.
+//!
+//! [`due`] is where a [`Ready`] comes from: `contacts` that are due, joined to
+//! the opener their account's newest fresh finding came to.
+//! [`file_finding`](crate::vertical) stores that opener when the turn renders
+//! it; see `0035_evidence_opener.sql` for why it lives on the `evidence` row and
+//! not in a queue table.
+//!
 //! # The September sink: what it is and what it needs
 //!
 //! Not built, by instruction. The shape, from the live tool schemas:
@@ -294,6 +316,128 @@ impl Lead {
             self.opener.body.clone(),
         ]
     }
+}
+
+// ---------------------------------------------------------------------------
+// The source
+// ---------------------------------------------------------------------------
+
+/// Everyone this tenant could write to right now, with the opener their finding
+/// came to.
+///
+/// [`plan`]'s input, out of the tables. Three rules apply here rather than in
+/// [`plan`] because they are the *database's* and a `Vec<Ready>` cannot express
+/// them — see
+/// [`queueable`](agentos_store::revenue::queueable) for each one; the short
+/// version is due-and-active, a stored opener, and
+/// [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE) on the claim.
+/// Everything a *caller* could get wrong stays in [`plan`].
+///
+/// # Where the openers come from
+///
+/// [`crate::vertical::file_finding`], and nowhere else. A selling turn renders
+/// [`Approach::new`](crate::vertical::Approach::new) from the [`Evidence`] it
+/// has and stores it on the same `evidence` row; this reads it back. The
+/// evidence bar is unchanged and one link longer — the argument is on
+/// `Approach::filed`, which is `pub(crate)` and which this function is the only
+/// caller of.
+///
+/// `limit` bounds the scan, not the export: [`plan`] truncates to the contact
+/// budget afterwards. Pass something comfortably above the budget so a run of
+/// suppressed addresses cannot starve it.
+pub async fn due(
+    tx: &mut TenantTx<'_>,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<Ready>, RevenueError> {
+    let rows =
+        revenue_store::queueable(tx, now, now - crate::proof_of_need::MAX_FINDING_AGE, limit)
+            .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            // The column has a CHECK and the importer parses, so an address that
+            // will not parse is a row written by something that did neither.
+            // Skipped rather than failed, exactly as `due_prospect` skips one:
+            // one bad address must not cost the founder his morning's file.
+            let Ok(email) = EmailAddress::parse(&row.email) else {
+                tracing::warn!(
+                    contact_id = %row.contact_id,
+                    "a contact's address will not parse; it is left out of the export"
+                );
+                return None;
+            };
+            // `contacts.full_name` is the import's `"first last"`, trimmed, and
+            // empty for the `info@` inboxes that are most of these lists. Split
+            // back at the first space so a row of the founder's own file makes
+            // the round trip; nothing is invented for a row that has no name,
+            // which is what Smartlead's required `first_name` will have to be
+            // told about in September.
+            let (first_name, last_name) = row
+                .full_name
+                .split_once(' ')
+                .map_or((row.full_name.as_str(), ""), |(a, b)| (a, b));
+            Some(Ready {
+                who: Recipient {
+                    contact_id: row.contact_id,
+                    email,
+                    first_name: first_name.to_owned(),
+                    last_name: last_name.to_owned(),
+                    company_name: row.company_name,
+                    phone_number: row.phone.unwrap_or_default(),
+                    website: row.website.unwrap_or_default(),
+                    // No column anywhere, on `accounts` or `contacts`, and no
+                    // data either — empty in all 3,048 rows of every list. See
+                    // the module docs.
+                    linkedin_profile: String::new(),
+                    location: row.location.unwrap_or_default(),
+                },
+                approach: Approach::filed(
+                    Outreach {
+                        subject: row.opener_subject,
+                        body: row.opener_body,
+                    },
+                    row.known_good_at,
+                ),
+            })
+        })
+        .collect())
+}
+
+/// The suppression list, for exactly the people about to be exported.
+///
+/// The batch twin of
+/// [`suppression_for`](crate::vertical::suppression_for), through the same
+/// `SECURITY DEFINER` lookup for the same reason — a plain `SELECT` over
+/// `suppressions` cannot see a **global** suppression at all.
+///
+/// It differs from that one in how it fails, and deliberately. `suppression_for`
+/// judges one address and fails closed by suppressing it, because the cost is
+/// one prospect losing a cadence. This is called inside the transaction that is
+/// about to mark everybody contacted, so a list that will not answer is an
+/// error: export nobody, mark nobody, commit nothing.
+pub async fn suppression(
+    tx: &mut TenantTx<'_>,
+    ready: &[Ready],
+) -> Result<Suppression, RevenueError> {
+    let addresses: Vec<String> = ready.iter().map(|r| r.who.email.to_string()).collect();
+    let mut list = Suppression::new();
+    for raw in revenue_store::suppressed_among(tx, &addresses).await? {
+        // The lookup echoes back the string it was given, and every one of them
+        // came out of an `EmailAddress` a moment ago, so a parse failure here is
+        // unreachable rather than optimistic.
+        if let Ok(address) = EmailAddress::parse(&raw) {
+            list.suppress(address);
+        }
+    }
+    if !list.is_empty() {
+        tracing::info!(
+            suppressed = list.len(),
+            "addresses on the suppression list are left out of the export"
+        );
+    }
+    Ok(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -831,13 +975,17 @@ mod tests {
     ///
     /// `Approach::new` takes an `&Evidence`, `Evidence` has a private seal, and
     /// the only thing that mints one is `Prober::check` behind a browser and a
-    /// database. So the runtime tests above use `Approach::for_tests`, which is
-    /// `#[cfg(test)]` and lives beside `Approach` itself — unreachable from any
-    /// build that is not this crate's own test build, which is why it is not the
-    /// hole. `tests/ui/queue_lead_without_evidence.rs` is the assertion that the
-    /// hole is closed for everybody else.
+    /// database. So the runtime tests above use `Approach::filed` — the same
+    /// `pub(crate)` constructor [`due`] reads a stored opener back through,
+    /// unreachable from any crate but this one, which is why it is not the hole.
+    /// `tests/ui/queue_lead_without_evidence.rs` is the assertion that the hole
+    /// is closed for everybody else.
+    ///
+    /// It used to be a second constructor behind `#[cfg(test)]`, byte-identical
+    /// to this one. Once the export needed a real one, that was two spellings of
+    /// the same hole and one of them was load-bearing.
     fn an_approach() -> Approach {
-        Approach::for_tests(
+        Approach::filed(
             Outreach {
                 subject: "SafetyWing: what your entry-requirements step shows for FRA → VNM"
                     .to_owned(),

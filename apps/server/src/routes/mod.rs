@@ -7,6 +7,7 @@ pub mod inventory;
 pub mod knowledge;
 pub mod mcp;
 pub mod pool;
+pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
 pub mod reports; // the manager's view of its own line
 pub mod spend;
 pub mod teams;

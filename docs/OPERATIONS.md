@@ -196,6 +196,46 @@ not given as ISO-2 (the location string is kept verbatim instead). An address on
 the suppression list is skipped and never re-activated. `docs/ORIZN.md` §8 is the
 column-by-column table and `agentos_app::prospects` is the argument for each.
 
+### 1.4e The file you upload — the other end of the same pipeline
+
+`import` puts prospects in. This takes them out, in the shape Smartlead loads:
+
+```bash
+curl -sX POST -H "Authorization: Bearer $KEY" \
+     -H "Idempotency-Key: $(uuidgen)" \
+     "$HOST/v1/employees/$EMPLOYEE/queue/export" | jq -r .csv > leads.csv
+```
+
+Ten columns: the import's eight plus `objet_email` and `angle_email`, which are
+the subject and body of an opener rendered from a **reproduced** finding about
+that prospect's own booking flow. A row cannot exist without one — that is a
+type, not a review step.
+
+Four things to know before running it every morning:
+
+* **It is a write.** Everyone in the file is marked contacted, with the next
+  follow-up 72 hours out, committed *before* the bytes reach you. Run it twice
+  and the second file is empty; that is the point, and it is why the verb is
+  `POST`.
+* **Keep the `Idempotency-Key`.** If the response is lost — proxy timeout, a
+  dropped connection — retrying with the *same* key replays the exact same
+  bytes. A new key gets a new (probably empty) export, and the openers in the
+  lost one wait 72 hours.
+* **The size is `max_new_contacts_per_day` minus whoever was already written to
+  today**, from the same intersected policy the gate enforces (§1.5). The sales
+  pack ships that at `0`, so a fresh deployment exports an empty file until an
+  operator raises it. The response says `budget` and `spent_today` so you can
+  tell "nobody was due" from "the limit is zero".
+* **A 200 with just a header row is a normal morning.** Nothing was fresh, or
+  the day is spent. Findings older than seven days are left out rather than
+  re-asserted: the opener names a date and tells the prospect how to check it.
+
+The employee id picks *whose limits*; the tenant always comes from the API key,
+and another tenant's employee id is a 404.
+
+From 2026-09-01 the same slice goes to Smartlead's API instead of to your
+clipboard. Nothing above changes except where the bytes land.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**

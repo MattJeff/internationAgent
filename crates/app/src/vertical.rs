@@ -1826,25 +1826,38 @@ impl Approach {
         &self.message
     }
 
-    /// An `Approach` with a message nobody proved, for this crate's own tests.
+    /// The same approach, read back off the `evidence` row [`file_finding`]
+    /// wrote it to.
     ///
-    /// `#[cfg(test)]`, so it exists only while compiling `agentos-app`'s unit
-    /// tests and is absent from every build anything links against. The seal is
-    /// unchanged: `tests/ui/vertical_approach_without_evidence.rs` and
+    /// # This is not a hole in the seal, and here is the whole argument
+    ///
+    /// **`pub(crate)`.** `tests/ui/vertical_approach_without_evidence.rs` and
     /// `tests/ui/queue_lead_without_evidence.rs` are separate crates compiled
-    /// without `cfg(test)`, so they cannot see this and still fail to compile —
-    /// which is the property, and it is checked rather than asserted.
+    /// without `cfg(test)` and they cannot name this, so "a row of the export
+    /// with nothing reproduced behind it" is still a program that does not
+    /// compile for everybody outside `agentos-app`. Inside it there is exactly
+    /// one caller, [`crate::queue::due`], and it reads
+    /// `evidence.opener_subject` — a column written by nothing but
+    /// [`file_finding`], from an `&Evidence` it was handed. The chain is one
+    /// link longer and no weaker: the bytes came from
+    /// [`Approach::new`](Self::new) applied to a reproduced finding, and
+    /// nothing else in this workspace can put a row in that column.
     ///
-    /// It exists because the alternative is worse. The only honest way to a real
-    /// [`Evidence`] is [`Prober::check`](crate::proof_of_need::Prober::check),
-    /// which needs a browser session, a [`PolicyGate`](crate::gate::PolicyGate)
-    /// and therefore Postgres; making [`crate::queue`]'s pure tests — a CSV
-    /// quoting rule, a suppression filter, an arithmetic cap — carry all three
-    /// would mean they skip themselves on a machine with no database, and a
-    /// suppression test that silently does not run is the failure this whole
-    /// module is about.
-    #[cfg(test)]
-    pub(crate) const fn for_tests(
+    /// **It is not a rehydrated `Evidence`.** That type is sealed and
+    /// deliberately not `Deserialize`, and nothing here reconstructs one: no
+    /// `Finding` enum is parsed back out of a string, no `claim_line` is
+    /// re-rendered, no second copy of the sentence templates exists. What is
+    /// persisted and read back is the [`Approach`] — which this codebase has
+    /// already decided must outlive its evidence, because [`follow_up`] takes
+    /// one and an `Evidence` carries a screenshot and a seal. See that
+    /// function's docs for the argument; this is the same argument one
+    /// persistence layer further out.
+    ///
+    /// **The freshness half travels too.** `known_good_at` is `checked_at` off
+    /// the same row, so [`Approach::still_true`](Self::still_true) means the
+    /// same thing about a loaded approach as about a fresh one, and
+    /// [`crate::queue::due`] filters on that column before it gets here.
+    pub(crate) const fn filed(
         message: crate::revenue::Outreach,
         known_good_at: DateTime<Utc>,
     ) -> Self {
@@ -2378,7 +2391,18 @@ impl Worked {
 /// error in this vertical that costs a real prospect. The export belongs to
 /// whoever the file reaches: one route, running
 /// [`plan`](crate::queue::plan) and `record_queued` in the same transaction as
-/// the bytes it hands back. That is a pull, not a cadence.
+/// the bytes it hands back. That is a pull, not a cadence, and it is
+/// `POST /v1/employees/{id}/queue/export`.
+///
+/// What this turn *does* leave behind for it is the **sentence**, not the queue
+/// entry: [`file_finding`] stores [`Approach::new`]'s output in
+/// `evidence.opener_subject` / `opener_body`, so the pull has a source without
+/// this cadence ever deciding that somebody was written to. The two halves of a
+/// [`Lead`](crate::queue::Lead) now both survive a restart — the person in
+/// `contacts`, the opener on the `evidence` row it was rendered from — and
+/// neither of them means anybody was approached. Only
+/// [`record_queued`](crate::queue::record_queued) means that, and only the route
+/// calls it.
 ///
 /// # Three transactions, and none of them spans the check
 ///
@@ -2691,6 +2715,24 @@ pub async fn suppression_for(db: &Db, principal: &Principal, to: &EmailAddress) 
 /// turn here would throw away a note the employee is about to read for the sake
 /// of a row it can write again next cadence. The account keeps no evidence, so
 /// [`due_prospect`] offers it again — a retry with no retry logic in it.
+///
+/// # It also files the sentence, and that is what makes the export possible
+///
+/// [`Approach::new`] is pure over an `&Evidence`, so the opener is rendered here
+/// from the same value and stored beside the finding it is about. Until it was,
+/// an `Approach` lived only for the few milliseconds of [`sell`] that built one
+/// — which is the whole of why [`crate::queue`] had ten unit tests and no
+/// caller: a `Lead` had nowhere durable to live between this turn and the
+/// founder's upload. It has one now, and it is one column pair on a row that
+/// already exists, is already append-only, and already means "a finding was
+/// reproduced".
+///
+/// **Nothing is sent by writing it.** The two columns are NULL for the findings
+/// [`Approach::new`] refuses, so which findings may ever be asserted to a
+/// prospect is still decided by that one constructor, once, and stored rather
+/// than recomputed. And the export is still a pull — see the docs on
+/// [`selling_turn`]: this writes a *sentence*, not a queue entry, and nobody is
+/// marked contacted anywhere near here.
 async fn file_finding(
     db: &Db,
     principal: &Principal,
@@ -2719,6 +2761,11 @@ async fn file_finding(
         },
         |answer| format!("{} — {}", answer.requirement.phrase(), answer.source),
     );
+    // `None` for the two findings that rest on our own row: see the function
+    // docs and `0035_evidence_opener.sql`. The same constructor the send path
+    // uses, on the same value, with the same `OPT_OUT` — one rendering, stored,
+    // rather than a second one at export time.
+    let opener = Approach::new(evidence, OPT_OUT);
 
     let mut tx = match db.tenant_tx(principal.tenant_id).await {
         Ok(tx) => tx,
@@ -2748,6 +2795,8 @@ async fn file_finding(
             correct_claim: &correct,
             authority_url: None,
             checked_at: evidence.observed_at,
+            opener_subject: opener.as_ref().map(|a| a.message().subject.as_str()),
+            opener_body: opener.as_ref().map(|a| a.message().body.as_str()),
         },
     )
     .await;

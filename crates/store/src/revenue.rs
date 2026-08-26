@@ -881,6 +881,18 @@ pub struct NewEvidence<'a> {
     pub authority_url: Option<&'a str>,
     /// When it was observed.
     pub checked_at: DateTime<Utc>,
+    /// The subject line this finding came to, when it is one that may be
+    /// asserted to the prospect at all.
+    ///
+    /// `agentos_app::vertical::Approach::new`'s output, and `None` is that
+    /// constructor answering `None` — a finding resting on our own row rather
+    /// than on the prospect's page is filed and handed to a human. See
+    /// `0035_evidence_opener.sql`; the export selects on this column, so the
+    /// decision is stored rather than recomputed.
+    pub opener_subject: Option<&'a str>,
+    /// The body, and it travels with [`Self::opener_subject`] — the table's
+    /// `evidence_opener_pair` CHECK refuses one without the other.
+    pub opener_body: Option<&'a str>,
 }
 
 /// File a finding. Append-only: there is no update and no delete.
@@ -893,8 +905,8 @@ pub async fn insert_evidence(
         "INSERT INTO evidence (id, tenant_id, account_id, employee_id, kind, passport_country, \
                                destination_country, travel_date, source_url, reproduction, \
                                artifact_ref, observed_claim, correct_claim, authority_url, \
-                               checked_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                               checked_at, opener_subject, opener_body) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(id)
     .bind(tx.tenant_id().as_uuid())
@@ -911,9 +923,190 @@ pub async fn insert_evidence(
     .bind(evidence.correct_claim)
     .bind(evidence.authority_url)
     .bind(evidence.checked_at)
+    .bind(evidence.opener_subject)
+    .bind(evidence.opener_body)
     .execute(&mut ***tx)
     .await?;
     Ok(())
+}
+
+/// One row of the export, as the tables hold it.
+///
+/// The raw materials for an `agentos_app::queue::Ready` and nothing more: this
+/// crate knows no `Approach` and no `Recipient`, so the mapping — including the
+/// evidence bar the types enforce — is `agentos_app::queue::due`'s job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queueable {
+    /// The `contacts` row `mark_contacted` will mark.
+    pub contact_id: Uuid,
+    /// Lower-case, and never NULL here — the query requires one.
+    pub email: String,
+    /// First and last joined, which is `''` for the `info@` inboxes that are
+    /// most of the founder's lists.
+    pub full_name: String,
+    /// E.164, when the import could store one.
+    pub phone: Option<String>,
+    /// `accounts.legal_name` — the export's `company_name`.
+    pub company_name: String,
+    /// `accounts.website`, as the founder's list spells it.
+    pub website: Option<String>,
+    /// `accounts.location`, verbatim.
+    pub location: Option<String>,
+    /// The stored opener's subject. Never NULL — the query requires one.
+    pub opener_subject: String,
+    /// The stored opener's body.
+    pub opener_body: String,
+    /// `evidence.checked_at`: when the claim in that opener was last known
+    /// good.
+    pub known_good_at: DateTime<Utc>,
+}
+
+/// Everyone who is due, whose account carries a fresh sendable finding, and the
+/// opener that finding came to.
+///
+/// The join `agentos_app::queue` needs and the reason `0035_evidence_opener.sql`
+/// exists. Three predicates, and each is somewhere else's rule repeated rather
+/// than invented:
+///
+/// * **due and active** — the same `WHERE` as
+///   [`contacts_due_for_follow_up`], including the half a suppression sets
+///   (`active = false` *and* `next_follow_up_at = NULL`, in one statement).
+/// * **`opener_subject is not null`** — `Approach::new` refused the findings
+///   that rest on our own row, and that refusal was stored. See the migration.
+/// * **`checked_at >= fresh_since`** — the caller passes
+///   `now - MAX_FINDING_AGE`. A claim of the form *"on this date your page did
+///   this, here is how to see it again"* that has gone stale is the one mistake
+///   in this job that cannot be walked back, so the export applies the same bar
+///   `vertical::follow_up` applies to a kept `Approach`.
+///
+/// Newest finding per account, and one row per contact: an account with three
+/// mailboxes yields three rows carrying the same opener, which is
+/// [`vertical::follow_up`](agentos_app)'s campaign shape and what the founder's
+/// lists actually look like.
+///
+/// No `WHERE tenant_id`: RLS adds it, and a hand-written filter here would be a
+/// second place for it to be forgotten.
+///
+/// # `FOR UPDATE OF c SKIP LOCKED`, and it is not decoration
+///
+/// The caller marks every row this returns as contacted and commits, in the
+/// transaction this read happens in. Two of those running at once would both
+/// read the same due contacts — a plain `SELECT` takes no lock — and the second
+/// `mark_contacted` would simply queue behind the first's row lock and then
+/// succeed, because the row is still `active`. Same prospect, two files, one
+/// cold email sent twice. That is the failure this whole vertical is arranged
+/// around, and it costs one clause to remove: the rows are locked as they are
+/// read, and a concurrent export skips them rather than waiting for them, which
+/// is right — they are already in somebody's file.
+///
+/// Only `c` is locked. `accounts` and `evidence` are read here and written
+/// nowhere on this path, and `evidence` is append-only anyway.
+pub async fn queueable(
+    tx: &mut TenantTx<'_>,
+    as_of: DateTime<Utc>,
+    fresh_since: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<Queueable>, RevenueError> {
+    type Row = (
+        Uuid,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        DateTime<Utc>,
+    );
+
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT c.id, c.email, c.full_name, c.phone, \
+                a.legal_name, a.website, a.location, \
+                e.opener_subject, e.opener_body, e.checked_at \
+           FROM contacts c \
+           JOIN accounts a ON a.id = c.account_id \
+           JOIN LATERAL ( \
+                  SELECT opener_subject, opener_body, checked_at \
+                    FROM evidence \
+                   WHERE account_id = c.account_id \
+                     AND opener_subject IS NOT NULL \
+                     AND checked_at >= $2 \
+                   ORDER BY checked_at DESC, id \
+                   LIMIT 1 \
+                ) e ON true \
+          WHERE c.active \
+            AND c.email IS NOT NULL \
+            AND c.next_follow_up_at IS NOT NULL \
+            AND c.next_follow_up_at <= $1 \
+          ORDER BY c.next_follow_up_at, c.id \
+          LIMIT $3 \
+            FOR UPDATE OF c SKIP LOCKED",
+    )
+    .bind(as_of)
+    .bind(fresh_since)
+    .bind(limit)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                contact_id,
+                email,
+                full_name,
+                phone,
+                company_name,
+                website,
+                location,
+                opener_subject,
+                opener_body,
+                known_good_at,
+            )| Queueable {
+                contact_id,
+                email,
+                full_name,
+                phone,
+                company_name,
+                website,
+                location,
+                opener_subject,
+                opener_body,
+                known_good_at,
+            },
+        )
+        .collect())
+}
+
+/// Which of these addresses are on a suppression list, global one included.
+///
+/// The batch twin of `agentos_app::vertical::suppression_for`, and it asks the
+/// same question of the same function for the same reason: `suppressions` is
+/// under the ordinary per-tenant RLS policy, so a plain `SELECT` over it cannot
+/// see a **global** suppression at all. `revenue_suppression_of` is
+/// `SECURITY DEFINER` and takes no tenant argument, which is what makes it the
+/// only correct reader.
+///
+/// One round trip rather than one per address, and it **fails loudly** rather
+/// than per-address closed: the caller is one transaction that is about to mark
+/// forty people contacted, and the right answer to "the suppression list would
+/// not answer" there is to export nobody, not to export the rest.
+pub async fn suppressed_among(
+    tx: &mut TenantTx<'_>,
+    addresses: &[String],
+) -> Result<Vec<String>, RevenueError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT a FROM unnest($1::text[]) AS a \
+          WHERE revenue_suppression_of(a, null::text) IS NOT NULL",
+    )
+    .bind(addresses)
+    .fetch_all(&mut ***tx)
+    .await?;
+    Ok(found)
 }
 
 /// A stored finding.
@@ -1826,6 +2019,11 @@ mod tests {
                                 the 45-day exemption does not apply to this itinerary.",
                 authority_url: Some("https://evisa.gov.vn/"),
                 checked_at: now,
+                // A `wrong_requirement` rests on our own row, so
+                // `Approach::new` refuses it and nothing is stored — see
+                // `0035_evidence_opener.sql`. `queueable` has its own test.
+                opener_subject: None,
+                opener_body: None,
             },
         )
         .await
@@ -2467,6 +2665,79 @@ mod tests {
         drop_tenant(&db, b).await;
     }
 
+    /// The batch lookup the export hands to `agentos_app::queue::plan`, and the
+    /// property that makes it worth having: it sees a **global** suppression,
+    /// which the per-tenant RLS policy hides from an ordinary `SELECT` over
+    /// this table.
+    ///
+    /// This is tested here rather than through the route because the route
+    /// cannot make it bite: recording an opt-out deactivates the contact rows it
+    /// names, so a suppressed person never reaches the queue at all. That is the
+    /// database being the lock and this being the third one — which is the shape
+    /// you want a legal boundary in, and it is also why a test that only asserts
+    /// "the address is not in the file" would pass with this call deleted. What
+    /// this asserts is that the value handed to `plan` is a real list and not an
+    /// empty one.
+    #[tokio::test]
+    async fn the_export_lookup_sees_a_suppression_the_table_hides() {
+        let Some(db) = db().await else { return };
+        let now = at(1_800_000_000);
+        let a = seed_tenant(&db, "revenue-among-a").await;
+        let b = seed_tenant(&db, "revenue-among-b").await;
+        let stopped = format!("stopped-{}@example.test", Uuid::now_v7());
+        let fine = format!("fine-{}@example.test", Uuid::now_v7());
+
+        // Recorded by A, globally.
+        let mut tx = db.tenant_tx(a).await.expect("tenant tx");
+        suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &NewSuppression {
+                channel: Channel::Email,
+                address: &stopped,
+                reason: "legal_request",
+                scope: Scope::Global,
+                contact_id: None,
+                note: None,
+                suppressed_at: now,
+            },
+        )
+        .await
+        .expect("suppression");
+        tx.commit().await.expect("commit");
+
+        // Read by B, which cannot see the row and is bound by it anyway.
+        let mut tx = db.tenant_tx(b).await.expect("tenant tx");
+        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM suppressions")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        assert_eq!(visible, 0, "a global opt-out must not leak across tenants");
+
+        let found = suppressed_among(&mut tx, &[stopped.clone(), fine.clone()])
+            .await
+            .expect("lookup");
+        assert_eq!(
+            found,
+            vec![stopped],
+            "the export's suppression list must carry the opted-out address and \
+             only it"
+        );
+
+        // And an empty batch is one fewer round trip, not one more.
+        assert!(
+            suppressed_among(&mut tx, &[])
+                .await
+                .expect("lookup")
+                .is_empty(),
+            "an empty export asks the suppression list nothing"
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, a).await;
+        drop_tenant(&db, b).await;
+    }
+
     // -- evidence -----------------------------------------------------------
 
     /// A finding that can be edited after it was sent is not evidence, and an
@@ -2682,6 +2953,8 @@ mod tests {
                 correct_claim: "An Indian national transiting the US needs a C-1 transit visa.",
                 authority_url: Some("https://travel.state.gov/"),
                 checked_at: now,
+                opener_subject: None,
+                opener_body: None,
             },
         )
         .await

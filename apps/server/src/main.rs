@@ -471,6 +471,13 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets) -> Router {
             // ledger reads as "may not spend" — safe, and unusable.
             .merge(routes::spend::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
+            // The only caller of `agentos_app::queue`, which had ten unit tests,
+            // a compile-fail case and nothing calling it. The export has to be a
+            // pull — `record_queued` commits before the bytes are written, and
+            // only a request that hands the bytes back can honour that — so this
+            // route is not a convenience over a cadence, it is the whole design.
+            // Its module docs argue the verb and the lost response.
+            .merge(routes::queue::router(db.clone()))
             .merge(routes::knowledge::router(db.clone()))
             // The pool has a source now: `phone_numbers`, written by this
             // router's own `POST /v1/pool/numbers` and read per request. It
