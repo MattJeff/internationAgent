@@ -142,6 +142,8 @@ use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::Principal as ActingAs;
 use agentos_app::inbound;
 use agentos_app::prompt::Relation;
+use agentos_app::proof_of_need::Prober;
+use agentos_app::revenue::Seller;
 use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
@@ -211,6 +213,20 @@ pub struct Assignment {
     /// an [`Outcome`] decided there. Resolving it later would mean spending a
     /// reserved turn to discover it.
     pub model: ModelId,
+    /// The prospect a sales charter works this turn, resolved here for exactly
+    /// the reason [`Assignment::model`] is: **an empty answer is a reason not to
+    /// start a turn.**
+    ///
+    /// `None` for every other role, and the asymmetry is the point rather than
+    /// an omission. A buyer with no supplier on file still has a turn worth
+    /// taking — mail to read, quotes to chase, a plan to report on — and
+    /// [`vertical_step`] hands it `None` and lets it think. A seller with no
+    /// prospect due has *nothing*: the whole of its vertical is "run one
+    /// prospect's flow and say what it showed", and there is no prospect. So the
+    /// buyer's material is read inside the turn and the seller's is read before
+    /// it, and a seller whose operator has described no booking flows costs one
+    /// query per cadence rather than a model call.
+    pub prospect: Option<vertical::DueProspect>,
 }
 
 /// What the loop decided about one due employee. The `String`s are ours: a
@@ -235,6 +251,19 @@ enum Outcome {
     NoModel(String),
     /// The objective has gaps. Ask the operator, and start no turn.
     Clarify(String),
+    /// The objective is workable and there is nothing to work on: no prospect
+    /// due, or none an operator has described a booking flow for.
+    ///
+    /// **Its own code, not `Clarify` and not `Turn`.** It is not a question —
+    /// the operator answered every question the objective asks, and the answer
+    /// to this one is data rather than words. It is not a turn either: a seller
+    /// whose whole vertical is "run one prospect's flow" and who has no prospect
+    /// has nothing to spend a model call on, and spending one anyway is how a
+    /// transcript comes to read like a day's work with nothing behind it.
+    ///
+    /// It costs one query per cadence and resolves by itself the moment a flow
+    /// is configured or a prospect's three days are up. Nothing has to notice.
+    NoWork(String),
     /// A turn ran to completion.
     Turn,
     /// A turn started and did not finish.
@@ -254,6 +283,7 @@ impl Outcome {
             Outcome::Unreadable(_) => "unreadable_charter",
             Outcome::NoModel(_) => "no_model",
             Outcome::Clarify(_) => "clarify",
+            Outcome::NoWork(_) => "no_work",
             Outcome::Turn => "turn",
             Outcome::Failed(_) => "error",
             Outcome::OverBudget(_) => "over_budget",
@@ -267,6 +297,7 @@ impl Outcome {
             Outcome::Unreadable(why)
             | Outcome::NoModel(why)
             | Outcome::Clarify(why)
+            | Outcome::NoWork(why)
             | Outcome::Failed(why)
             | Outcome::OverBudget(why) => Some(why),
         }
@@ -444,7 +475,7 @@ where
     H: Fn(Assignment) -> F,
     F: Future<Output = Result<(), String>>,
 {
-    let outcome = match assignment_for(db, due).await {
+    let outcome = match assignment_for(db, due, now).await {
         Ok(Some(assignment)) => {
             // The per-day turn budget, and it lives here rather than inside
             // `take_turn` because the budget belongs to the employee, not to
@@ -526,7 +557,11 @@ async fn reserve_a_turn(db: &Db, due: &Due, now: DateTime<Utc>) -> Result<(), St
         .map_err(|err| format!("could not commit the turn reservation: {err}"))
 }
 
-async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcome> {
+async fn assignment_for(
+    db: &Db,
+    due: &Due,
+    now: DateTime<Utc>,
+) -> Result<Option<Assignment>, Outcome> {
     // The claim was cross-tenant; everything after it is not. RLS applies from
     // here, and an employee that vanished between the claim and now is simply
     // not found.
@@ -612,6 +647,31 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         );
     }
 
+    // And the sales vertical's material, for the same reason again and in the
+    // same place: **a seller with nobody to work must not pay for a turn to find
+    // that out.** `NoCharter`, `Clarify` and `NoModel` are all decided here
+    // rather than inside `take_turn` precisely because the reservation is
+    // between the two, and this is a fourth reason of exactly that shape.
+    //
+    // The buyer has no matching arm and does not want one. Its material is read
+    // inside the turn because a buyer with no supplier still has a turn worth
+    // taking; a seller's whole vertical is one prospect's flow, and with no
+    // prospect there is nothing for the model to write about that it did not
+    // invent.
+    let prospect = match &charter {
+        Charter::Sales { objective, .. } => match prospect_for(db, due, objective, now).await? {
+            Some(prospect) => Some(prospect),
+            None => {
+                return Err(Outcome::NoWork(
+                    "no prospect is due for this segment with a booking flow described for it; \
+                     import prospects, describe a flow, or wait for the follow-up window"
+                        .to_owned(),
+                ));
+            }
+        },
+        _ => None,
+    };
+
     Ok(Some(Assignment {
         due: due.clone(),
         identity: format!(
@@ -625,7 +685,38 @@ async fn assignment_for(db: &Db, due: &Due) -> Result<Option<Assignment>, Outcom
         colleagues,
         policy,
         model,
+        prospect,
     }))
+}
+
+/// The prospect a sales charter would work now, in a read of its own.
+///
+/// Its own short transaction rather than the one above: that one is already
+/// rolled back by the time the charter has been parsed, and re-opening it to
+/// carry a read that only one of six roles needs would make every other role pay
+/// for the shape of this one.
+///
+/// A store that will not answer is [`Outcome::Failed`] and no turn — not
+/// [`Outcome::NoWork`], which claims the queue is empty, and not a turn taken
+/// anyway. "We could not tell whether there is work" and "there is no work" are
+/// different sentences on an operator's status page, and only one of them is
+/// worth waking up for.
+async fn prospect_for(
+    db: &Db,
+    due: &Due,
+    objective: &agentos_app::rolepack_sales::Objective,
+    now: DateTime<Utc>,
+) -> Result<Option<vertical::DueProspect>, Outcome> {
+    let mut tx = db
+        .tenant_tx(due.tenant_id)
+        .await
+        .map_err(|err| Outcome::Failed(format!("no tenant transaction: {err}")))?;
+    let read = vertical::due_prospect(&mut tx, objective, now).await;
+    // Read-only, so the rollback is bookkeeping rather than a decision — but it
+    // is awaited so the pooled connection goes back deliberately.
+    let _ = tx.rollback().await;
+
+    read.map_err(|err| Outcome::Failed(format!("could not read this seller's prospects: {err}")))
 }
 
 /// Write the outcome down, in its own short transaction.
@@ -672,6 +763,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         colleagues,
         policy,
         model,
+        prospect,
     } = assignment;
     let role = charter.role();
 
@@ -700,7 +792,15 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
 
     // The vertical, before the model and never instead of it. See the module
     // docs on why this is not a branch that skips the turn.
-    let done = vertical_step(&agent, &effects, &principal, &charter, &address).await;
+    let done = vertical_step(
+        &agent,
+        &effects,
+        &principal,
+        &charter,
+        &address,
+        prospect.as_ref(),
+    )
+    .await;
 
     // Same prefix as `Agent::on_turn`, down to the order of the builders and to
     // the policy the inventory is narrowed by: an employee that wakes itself
@@ -890,42 +990,165 @@ async fn vertical_step(
     principal: &ActingAs,
     charter: &Charter,
     address: &str,
+    prospect: Option<&vertical::DueProspect>,
 ) -> Option<String> {
-    let Charter::Purchasing { pack, objective } = charter else {
-        // Sales. `vertical::sell` needs a `Flow` — the selectors on a
-        // prospect's own booking page — and an authoritative `Answer` to
-        // compare its output against. Neither has a table, a route or a config
-        // key anywhere in this product, so there is no material to assemble and
-        // nothing here can invent one: a probe pointed at a guessed selector
-        // reads the wrong element and the evidence bar cannot tell the
-        // difference. The sales employee takes the turn it always took.
-        return None;
+    match charter {
+        Charter::Purchasing { pack, objective } => {
+            let buyer = Buyer::new(
+                agent.gate.clone(),
+                effects.clone(),
+                principal.clone(),
+                address.to_owned(),
+            );
+
+            match vertical::purchasing_turn(
+                &agent.db,
+                &buyer,
+                principal,
+                pack,
+                objective,
+                Utc::now(),
+            )
+            .await
+            {
+                Ok(ran) => {
+                    tracing::info!(
+                        unreachable = ran.unreachable.len(),
+                        "the purchasing vertical ran before the turn"
+                    );
+                    Some(ran.note())
+                }
+                // Logged and swallowed. A round that could not be read is not a
+                // reason to spend the reserved turn on nothing, and it is not a
+                // reason to pull the cadence back in either — the next tick
+                // reads it again.
+                Err(err) => {
+                    tracing::error!(
+                        code = err.code(),
+                        error = %err,
+                        "the purchasing vertical did not run; the employee takes an ordinary turn"
+                    );
+                    None
+                }
+            }
+        }
+
+        // The prospect was resolved before the turn was reserved, so `None`
+        // here is not "nothing due" — that never got this far. It is the one
+        // race the split leaves: a prospect that was written to, suppressed or
+        // proved something about between `assignment_for` and now. One ordinary
+        // turn, and the next cadence reads the queue again.
+        Charter::Sales { pack, objective } => {
+            let prospect = prospect?;
+            selling_step(
+                agent, effects, principal, address, pack, objective, prospect,
+            )
+            .await
+        }
+
+        // The four service packs. No vertical operation exists for any of them
+        // — there is no `vertical::support_turn` to call, not a decision made
+        // here — so the employee takes the ordinary turn it always took, and
+        // `Charter::brief` still tells it which stage its own plan makes due.
+        Charter::Support { .. }
+        | Charter::Growth { .. }
+        | Charter::Finance { .. }
+        | Charter::EntryRequirements { .. } => None,
+    }
+}
+
+/// The sales vertical, out of the same [`Effects`] the turn is built on.
+///
+/// Every provider call inside this is [`Prober`]'s or [`Seller`]'s, each of
+/// which gates its own subject and hands the resulting `Authorized<A>` to those
+/// same `Effects`. There is no second path and no widened authority: the browser
+/// steps are ruled on one domain at a time, the Orizn lookup is an
+/// `Action::McpCall` this employee's policy has to name, and the approach is one
+/// `EmailSend` per address, counted against the same
+/// `max_new_contacts_per_day` every other outbound message spends.
+///
+/// # The suppression list is loaded, not defaulted
+///
+/// [`Seller::new`] takes one and every caller in the workspace used to pass an
+/// empty one, which was survivable exactly as long as nothing reached
+/// [`Seller::touch`](agentos_app::revenue::Seller::touch). This is the dispatch
+/// that reaches it. [`vertical::suppression_for`] asks the schema's own
+/// `SECURITY DEFINER` lookup — the only reader that can see a *global*
+/// suppression, which the per-tenant RLS policy hides from an ordinary `SELECT`
+/// — and fails closed.
+#[allow(clippy::too_many_arguments)]
+async fn selling_step(
+    agent: &Agent,
+    effects: &Effects,
+    principal: &ActingAs,
+    address: &str,
+    pack: &rolepack_sales::RolePack,
+    objective: &rolepack_sales::Objective,
+    prospect: &vertical::DueProspect,
+) -> Option<String> {
+    // The employee's own browser context, as provisioning left it. A `Prober`
+    // takes the session rather than looking one up, deliberately — a browser
+    // context is a provisioned resource — so this is where the two meet.
+    let session = match effects.browser_session().await {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::warn!(
+                code = err.code(),
+                "this seller has no ready browser context; it takes an ordinary turn"
+            );
+            return None;
+        }
     };
 
-    let buyer = Buyer::new(
+    let seller = Seller::new(
         agent.gate.clone(),
         effects.clone(),
         principal.clone(),
         address.to_owned(),
+        vertical::suppression_for(&agent.db, principal, &prospect.to).await,
+    );
+    let prober = Prober::new(
+        agent.db.clone(),
+        agent.gate.clone(),
+        effects.clone(),
+        principal.clone(),
+        session,
     );
 
-    match vertical::purchasing_turn(&agent.db, &buyer, principal, pack, objective, Utc::now()).await
+    match vertical::selling_turn(
+        &agent.db,
+        &prober,
+        &seller,
+        &vertical::orizn_binding(),
+        principal,
+        pack,
+        objective,
+        prospect,
+        Utc::now(),
+    )
+    .await
     {
-        Ok(ran) => {
+        Ok(worked) => {
+            // Two stable labels and nothing else. The prospect is on the
+            // evidence row and in the note, never on a metric: a counter keyed
+            // by prospect is one time series per prospect and a leak in every
+            // collector that scrapes it.
             tracing::info!(
-                unreachable = ran.unreachable.len(),
-                "the purchasing vertical ran before the turn"
+                sold = worked.sold.code(),
+                filed = worked.filed.is_some(),
+                "the sales vertical ran before the turn"
             );
-            Some(ran.note())
+            Some(worked.note())
         }
-        // Logged and swallowed. A round that could not be read is not a reason
-        // to spend the reserved turn on nothing, and it is not a reason to pull
-        // the cadence back in either — the next tick reads it again.
+        // Logged and swallowed, exactly as the buyer's is. A check that could
+        // not run is not a reason to spend the reserved turn on nothing — the
+        // employee can still read its mail and report — and the attempt is
+        // already a row in `proof_of_need_attempts` whatever it came to.
         Err(err) => {
             tracing::error!(
                 code = err.code(),
                 error = %err,
-                "the purchasing vertical did not run; the employee takes an ordinary turn"
+                "the sales vertical did not run; the employee takes an ordinary turn"
             );
             None
         }
@@ -1120,6 +1343,33 @@ pub(crate) mod tests {
             let _ = employee.set_resource(step, ResourceState::Provisioning, now);
             let _ = employee.set_resource(step, ResourceState::Ready, now);
         }
+        // A second pass, because `Step::ALL` is not in dependency order:
+        // `Step::Browser` needs `Step::Vault`, which comes after it, and
+        // `set_resource` refuses a `Ready` whose dependencies are not. One pass
+        // left every employee here with a browser stuck in `provisioning` — an
+        // employee that cannot probe anything — and nothing noticed until one
+        // had to.
+        for step in Step::ALL {
+            let _ = employee.set_resource(step, ResourceState::Ready, now);
+        }
+        // The browser binding, which every employee here gets and only a seller
+        // uses. `Effects::browser_session` rebuilds the session out of this row
+        // and refuses without it, so a `ready` browser with no provider id is an
+        // employee that cannot probe anything — which is a real state, and not
+        // the one these fixtures are about.
+        employee
+            .bind(
+                Step::Browser,
+                // Per employee: `employee_resources` is unique on
+                // (provider, external_id), which is the schema refusing to let
+                // two employees share one browser context.
+                agentos_domain::employee::ProviderBinding::new(
+                    "mock-browser",
+                    format!("ctx-{}", id.as_uuid().simple()),
+                ),
+                now,
+            )
+            .expect("bind the browser");
         employee
             .set_lifecycle(Lifecycle::Active, now)
             .expect("release");
@@ -1609,5 +1859,456 @@ pub(crate) mod tests {
 
         let question = plan_of(&vague()).expect_err("gaps must not produce a plan");
         assert!(question.contains("which market"), "{question}");
+    }
+
+    // -- the selling turn, through the loop ---------------------------------
+
+    /// The prospect's own page, and the two things about it that matter: it
+    /// says something categorically wrong, and it says the same thing twice.
+    ///
+    /// A conflation rather than a contradiction, because a contradiction rests
+    /// on our own entry-requirements row and this employee's fleet is empty —
+    /// no MCP binding, no authority, and the three findings that stand on the
+    /// prospect's own page are the ones left. That is the ordinary production
+    /// case on Orizn's keyless surface, not a corner of the fixture.
+    const PANEL: &str = "No visa required for this trip. Visa on arrival at the airport.";
+
+    /// The prospect's flow, its selectors, and the account they hang off.
+    const PROSPECT_DOMAIN: &str = "book.airline.example";
+    const PANEL_SELECTOR: &str = "#visa-info";
+
+    /// A sales objective an operator really would state, complete.
+    fn selling() -> Charter {
+        Charter::Sales {
+            pack: rolepack_sales::RolePack::sales_development(),
+            objective: rolepack_sales::Objective {
+                segment: rolepack_sales::Segment::Airline,
+                market: Some(CountryCode::parse("FR").expect("country")),
+                target_accounts: vec!["Airline Example".to_owned()],
+            },
+        }
+    }
+
+    /// One imported prospect with a flow described for it — the two rows the
+    /// import lands and the one a human writes.
+    async fn seed_prospect(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        // `accounts.domain` is unique per tenant, and it is also the host the
+        // gate rules on, so two prospects in one test are two domains.
+        domain: &str,
+        email: &str,
+    ) -> Uuid {
+        use agentos_store::revenue as revenue_store;
+
+        let account = Uuid::now_v7();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        revenue_store::insert_account(
+            &mut tx,
+            account,
+            &revenue_store::NewAccount {
+                legal_name: "Airline Example",
+                domain,
+                segment: "airline",
+                country: "FR",
+                location: None,
+                website: None,
+                employee_id: Some(employee),
+            },
+        )
+        .await
+        .expect("insert account");
+        revenue_store::insert_contact(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewContact {
+                account_id: account,
+                full_name: "Head of Digital",
+                email: Some(email),
+                phone: None,
+                role: Some("Head of Digital"),
+                language: Some("fr"),
+                is_primary: true,
+                lawful_basis: "legitimate_interest",
+                next_follow_up_at: None,
+            },
+        )
+        .await
+        .expect("insert contact");
+        sqlx::query(
+            "INSERT INTO prospect_flows \
+                 (tenant_id, account_id, entry, passport_field, destination_field, date_field, \
+                  submit, panel) \
+             VALUES ($1, $2, $3, '#passport', '#destination', '#travel-date', '#check', $4)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(account)
+        .bind(format!("https://{domain}/entry"))
+        .bind(PANEL_SELECTOR)
+        .execute(&mut **tx)
+        .await
+        .expect("insert flow");
+        tx.commit().await.expect("commit the prospect");
+        account
+    }
+
+    /// Everything the sales path needs granted, as a tenant layer: the
+    /// prospect's domain to browse, email to send on, and an outreach budget
+    /// that is not zero.
+    ///
+    /// `max_new_contacts_per_day` is the one value that differs from the shipped
+    /// `sales_development()` pack, which ships it at **0** on purpose. Raising it
+    /// is a deliberate act by an operator who can answer for the lawful basis,
+    /// and here it is the difference between testing the send path and testing
+    /// the refusal — `the_contact_budget_and_the_suppression_list_both_bite`
+    /// next door tests the other side.
+    async fn sales_limits(db: &Db, tenant: TenantId, contacts_per_day: u32) {
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                spend: None,
+                max_turns_per_day: 100,
+                max_new_contacts_per_day: contacts_per_day,
+                allowed_domains: [
+                    agentos_domain::action::Domain::parse(PROSPECT_DOMAIN).expect("domain")
+                ]
+                .into_iter()
+                .collect(),
+                allowed_channels: [agentos_domain::message::Channel::Email]
+                    .into_iter()
+                    .collect(),
+                allowed_models: ModelId::ALL.into_iter().collect(),
+                ..rolepack_sales::RolePack::sales_development()
+                    .limits()
+                    .clone()
+            },
+        )
+        .await
+        .expect("install the seller's limits");
+    }
+
+    /// The agent the loop runs a seller with: a scripted model, and a browser
+    /// whose one page is [`PANEL`].
+    fn selling_agent(
+        db: &Db,
+        cancel: &CancellationToken,
+    ) -> (Agent, Arc<agentos_app::mocks::MockBrowser>) {
+        use agentos_app::gate::PolicyGate;
+
+        let browser = Arc::new(agentos_app::mocks::MockBrowser::new());
+        // One entry, repeating: the same page to both runs of the probe, which
+        // is what the evidence bar is looking for.
+        browser.set_text(PANEL_SELECTOR, &[PANEL]);
+        let ports = agentos_app::effects::Ports {
+            browser: browser.clone(),
+            ..agentos_app::mocks::ports()
+        };
+        (
+            Agent {
+                db: db.clone(),
+                llm: Arc::new(agentos_app::mocks::scripted_mock()),
+                gate: PolicyGate::new(db.clone()),
+                ports: Arc::new(ports),
+                // No binder loop, so the fleet is empty and the Orizn lookup is
+                // refused by name. See `PANEL`.
+                fleets: crate::routes::mcp::Fleets::new().0,
+                cancel: cancel.clone(),
+            },
+            browser,
+        )
+    }
+
+    /// Findings filed against one account, by kind.
+    async fn findings(db: &Db, tenant: TenantId, account: Uuid) -> Vec<String> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let filed = agentos_store::revenue::evidence_for_account(&mut tx, account, 10)
+            .await
+            .expect("read the evidence");
+        tx.rollback().await.expect("rollback");
+        filed.into_iter().map(|finding| finding.kind).collect()
+    }
+
+    /// **The whole sales seam, through the real path.**
+    ///
+    /// The twin of `a_due_buyer_issues_its_rfq_through_the_loop_and_spends_one_turn`,
+    /// and it is the test this unit exists for: until it passed,
+    /// `vertical_step` answered a sales charter with `return None` and the
+    /// entire vertical — `sell`, the prober, the evidence bar, Orizn — was
+    /// reachable only from its own tests.
+    ///
+    /// A chartered seller whose cadence comes due reaches `take_turn`, the
+    /// vertical runs **before** the model, the prospect's own flow is run twice,
+    /// the approach goes out through the gate, and the finding lands in a row a
+    /// human can read. And the budget is spent once: an employee that probes a
+    /// site and emails somebody and then thinks about it has taken one turn.
+    #[tokio::test]
+    async fn a_due_seller_files_a_finding_through_the_loop_and_spends_one_turn() {
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "seller", Some(selling())).await;
+        let account = seed_prospect(
+            &db,
+            tenant,
+            employee,
+            PROSPECT_DOMAIN,
+            "head.of.digital@airline.example",
+        )
+        .await;
+        sales_limits(&db, tenant, 5).await;
+
+        let cancel = CancellationToken::new();
+        let (agent, browser) = selling_agent(&db, &cancel);
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        let claimed = tick(&db, &take, &cancel, Utc::now()).await.expect("tick");
+        assert_eq!(claimed, 1);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "turn");
+
+        assert_eq!(
+            findings(&db, tenant, account).await,
+            vec!["wrong_requirement".to_owned()],
+            "the finding never reached a row a human reads"
+        );
+        assert_eq!(
+            emails_sent(&db, tenant, employee).await,
+            1,
+            "the approach never reached a provider through the gate"
+        );
+        // Twice, which is the bar rather than a retry: two identical reads of
+        // the panel, and a screenshot only after they agreed.
+        assert_eq!(
+            browser
+                .log()
+                .iter()
+                .filter(|line| line.contains(&format!("text {PANEL_SELECTOR}")))
+                .count(),
+            2,
+            "the flow was not run twice: {:?}",
+            browser.log()
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let spent = turns::taken_today(&mut tx, employee, Utc::now().date_naive())
+            .await
+            .expect("taken today");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            spent, 1,
+            "one cadence must cost exactly one turn, vertical or no vertical"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **A seller with nothing to work spends no turn.**
+    ///
+    /// Two ways to have nothing, and they are the two an operator will actually
+    /// hit: no prospects imported at all, and prospects imported that nobody has
+    /// described a booking flow for. Both are `no_work` — a recorded outcome, a
+    /// question-free status line, and **no reservation** — because a seller
+    /// whose whole vertical is "run one prospect's flow" and has no prospect has
+    /// nothing to spend a model call on. A turn taken anyway is a transcript
+    /// that reads like a day's work with nothing behind it.
+    #[tokio::test]
+    async fn a_seller_with_nothing_due_takes_no_turn_and_reserves_none() {
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "idle-seller", Some(selling())).await;
+        sales_limits(&db, tenant, 5).await;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let counter = started.clone();
+        let take = move |_: Assignment| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let cancel = CancellationToken::new();
+
+        // Nothing imported.
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1
+        );
+        let (outcome, detail, _) = outcome_of(&db, tenant, employee).await;
+        assert_eq!(outcome, "no_work");
+        assert!(
+            detail.unwrap_or_default().contains("booking flow"),
+            "the operator is not told what would give this employee work"
+        );
+
+        // Imported, and undescribed. `seed_prospect` writes the flow row too, so
+        // this is the account and the contact without it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let account = Uuid::now_v7();
+        agentos_store::revenue::insert_account(
+            &mut tx,
+            account,
+            &agentos_store::revenue::NewAccount {
+                legal_name: "Undescribed Airline",
+                domain: "undescribed.example",
+                segment: "airline",
+                country: "FR",
+                location: None,
+                website: None,
+                employee_id: Some(employee),
+            },
+        )
+        .await
+        .expect("insert account");
+        agentos_store::revenue::insert_contact(
+            &mut tx,
+            Uuid::now_v7(),
+            &agentos_store::revenue::NewContact {
+                account_id: account,
+                full_name: "Somebody",
+                email: Some("somebody@undescribed.example"),
+                phone: None,
+                role: None,
+                language: None,
+                is_primary: true,
+                lawful_basis: "legitimate_interest",
+                next_follow_up_at: None,
+            },
+        )
+        .await
+        .expect("insert contact");
+        tx.commit().await.expect("commit");
+
+        // Due again on the next cadence, and still nothing to do.
+        let later = Utc::now() + chrono::TimeDelta::hours(2);
+        assert_eq!(tick(&db, &take, &cancel, later).await.expect("tick"), 1);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "no_work");
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "a seller with nothing to work started a turn"
+        );
+
+        // The whole point: no model call, and no reservation either. A budget
+        // spent on nothing is a budget the employee does not have on the day it
+        // has something.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let spent = turns::taken_today(&mut tx, employee, Utc::now().date_naive())
+            .await
+            .expect("taken today");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(spent, 0, "a turn with no work reserved one anyway");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The two legal boundaries, on the dispatch that reaches them.**
+    ///
+    /// `sales_development()` ships `max_new_contacts_per_day: 0` — cold outreach
+    /// off until an operator turns it on — so the first half is the shipped
+    /// configuration and not a contrived one: the check still runs, the finding
+    /// is still filed, and **no email leaves the building**.
+    ///
+    /// The second half is the hole this dispatch would have opened.
+    /// `Seller::new` takes a suppression list and every caller in the workspace
+    /// used to pass an empty one, which was survivable exactly as long as
+    /// nothing reached `Seller::touch`. This is the caller that reaches it.
+    #[tokio::test]
+    async fn the_contact_budget_and_the_suppression_list_both_bite_on_this_path() {
+        use agentos_store::revenue as revenue_store;
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "broke-seller", Some(selling())).await;
+        let account = seed_prospect(
+            &db,
+            tenant,
+            employee,
+            PROSPECT_DOMAIN,
+            "head.of.digital@airline.example",
+        )
+        .await;
+        // The pack's own default, spelled out.
+        sales_limits(&db, tenant, 0).await;
+
+        let cancel = CancellationToken::new();
+        let (agent, _browser) = selling_agent(&db, &cancel);
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1
+        );
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "turn");
+        assert_eq!(
+            findings(&db, tenant, account).await.len(),
+            1,
+            "the budget stopped the work as well as the approach"
+        );
+        assert_eq!(
+            emails_sent(&db, tenant, employee).await,
+            0,
+            "the contact budget is zero and a stranger was mailed anyway"
+        );
+
+        // And the suppression list, on a prospect nothing else stops. A second
+        // employee, because the first one's account now has evidence and has
+        // left the queue.
+        let seller = seed_due(&db, tenant, "seller-two", Some(selling())).await;
+        let opted_out = "opted.out@airline.example";
+        let second = seed_prospect(&db, tenant, seller, "book.other.example", opted_out).await;
+        sales_limits(&db, tenant, 5).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        revenue_store::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewSuppression {
+                channel: revenue_store::Channel::Email,
+                address: opted_out,
+                reason: "opt_out",
+                scope: revenue_store::Scope::Tenant,
+                contact_id: None,
+                note: Some("replied STOP"),
+                suppressed_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("record the opt-out");
+        tx.commit().await.expect("commit the opt-out");
+
+        // Two: the first seller's hourly cadence has come round again as well,
+        // and it now has nothing to work — its account has evidence.
+        let later = Utc::now() + chrono::TimeDelta::hours(2);
+        assert_eq!(tick(&db, &take, &cancel, later).await.expect("tick"), 2);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "no_work");
+        // Nothing to work: the only prospect in this segment either has
+        // evidence already or has opted out, and neither is an error.
+        assert_eq!(outcome_of(&db, tenant, seller).await.0, "no_work");
+        assert_eq!(
+            emails_sent(&db, tenant, seller).await,
+            0,
+            "a person who opted out was written to"
+        );
+        assert!(
+            findings(&db, tenant, second).await.is_empty(),
+            "a person who opted out had their site probed"
+        );
+
+        drop_tenant(&db, tenant).await;
     }
 }

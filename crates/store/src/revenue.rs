@@ -508,6 +508,41 @@ pub async fn next_flow_to_probe(
     Ok(row)
 }
 
+/// One prospect's flow, by account, whether or not it is anybody's turn.
+///
+/// [`next_flow_to_probe`] answers "who is next" and is the operator's queue —
+/// it orders, it skips accounts that already have evidence, and it takes one.
+/// This answers "what about *this* one", which is what a seller's turn needs
+/// once its own selection has already picked the account: asking the queue
+/// again would re-apply an ordering the caller has already resolved and could
+/// hand back a different prospect than the one being worked.
+///
+/// Deliberately the same projection, aliases included, so both callers hand
+/// [`ProspectFlow`] to the same constructor and neither can see a column the
+/// other cannot. Confirmation is **not** filtered here: an unconfirmed row is a
+/// row, and refusing it is `Flow::confirmed`'s job — a reader that silently
+/// returned `None` for one would make "no flow written" and "written but nobody
+/// looked" the same answer, and they call for different things from an
+/// operator.
+pub async fn flow_of(
+    tx: &mut TenantTx<'_>,
+    account_id: Uuid,
+) -> Result<Option<ProspectFlow>, RevenueError> {
+    let row: Option<ProspectFlow> = sqlx::query_as(
+        "SELECT f.account_id, a.legal_name AS prospect, a.domain AS domain, f.entry_url, \
+                f.passport_field, f.destination_field, f.date_field, f.submit, f.panel, \
+                f.confirmed_by, f.confirmed_at \
+           FROM prospect_flows f \
+           JOIN accounts a ON a.id = f.account_id \
+          WHERE f.account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    Ok(row)
+}
+
 // ---------------------------------------------------------------------------
 // Contacts
 // ---------------------------------------------------------------------------

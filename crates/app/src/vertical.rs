@@ -133,12 +133,13 @@
 use std::num::NonZeroU32;
 
 use agentos_domain::action::{Action, ActionKind, Channel, EmailAddress};
-use agentos_domain::ids::{DecisionId, EmployeeId};
+use agentos_domain::ids::{DecisionId, EmployeeId, Slug};
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::ModelId;
 use agentos_domain::sourcing as buying;
 use agentos_domain::untrusted::TrustLabel;
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::revenue as revenue_store;
 use agentos_store::sourcing::{self as sourcing_store, OpenRfq};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -147,9 +148,9 @@ use uuid::Uuid;
 use crate::gate::{Denied, PolicyGate, Principal};
 use crate::orizn::Orizn;
 use crate::prompt::SystemPrompt;
-use crate::proof_of_need::{Checked, Evidence, Flow, Probe, ProbeError, Prober};
+use crate::proof_of_need::{Checked, Evidence, Finding, Flow, Probe, ProbeError, Prober};
 use crate::psyche;
-use crate::revenue::{Seller, Sequence};
+use crate::revenue::{Seller, Sequence, Suppression};
 use crate::rolepack::{self, CountryCode};
 use crate::rolepack_sales::{self, Segment};
 use crate::rolepack_service;
@@ -1921,6 +1922,38 @@ pub enum Sold {
     },
 }
 
+impl Sold {
+    /// Stable, low-cardinality metric label.
+    ///
+    /// [`Sold::Approached`] borrows the touch's own code rather than adding a
+    /// sixth of its own: "we found something and the gate refused to send it"
+    /// and "we found something and sent it" are the two outcomes an operator
+    /// watching this rate has opposite reactions to, and a single `approached`
+    /// label would average them into a number that means nothing.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Sold::Clarify(_) => "clarify",
+            Sold::WrongChannel(_) => "wrong_channel",
+            Sold::Forbidden(_) => "forbidden",
+            Sold::NoFinding(checked) => checked.code(),
+            Sold::ForHuman(_) => "for_human",
+            Sold::Approached { outcome, .. } => outcome.code(),
+        }
+    }
+
+    /// The finding this turn produced, when it produced one.
+    ///
+    /// Both arms that carry an [`Evidence`] file it: a finding a human may not
+    /// send is still a finding, and the one thing that must never happen to
+    /// either is that it is observed and then dropped.
+    pub fn evidence(&self) -> Option<&Evidence> {
+        match self {
+            Sold::ForHuman(evidence) | Sold::Approached { evidence, .. } => Some(evidence),
+            _ => None,
+        }
+    }
+}
+
 /// Run the sales vertical: check the prospect's flow, and approach only if
 /// there is something reproducible to say.
 ///
@@ -2102,6 +2135,725 @@ pub async fn follow_up(
     Ok(seller
         .campaign(sequences, approach.message(), TrustLabel::Untrusted, now)
         .await)
+}
+
+// ---------------------------------------------------------------------------
+// The selling turn
+// ---------------------------------------------------------------------------
+
+/// The Orizn binding, as an operator registers it.
+///
+/// ponytail: a constant, not a config key. `mcp_servers` names the binding and
+/// every fixture, doc and live test in this workspace calls it `orizn`; there is
+/// one deployment and one server. A wrong name here fails **safe** rather than
+/// loud, which is why it is allowed to be a constant at all — the gate refuses a
+/// tool nobody granted, [`sell`] reads that as no authority, and the check falls
+/// back to the three findings that stand on the prospect's own page. Make it a
+/// column the day a second tenant registers it under a different name.
+pub fn orizn_binding() -> Orizn {
+    // `"orizn"` is a literal this file controls and a valid slug; the unit test
+    // at the bottom is the proof, so the expect is unreachable rather than
+    // optimistic — the same argument `Orizn::on` makes about `TOOL`.
+    Orizn::on(Slug::parse("orizn").expect("orizn is a slug"))
+}
+
+/// The plain way out that every approach carries.
+///
+/// **Ours, and a constant.** It is the sentence a regulator reads and the
+/// sentence a prospect acts on, so it is not the model's to re-word and not a
+/// per-objective field: an opt-out re-phrased every cadence is an opt-out whose
+/// wording nobody has approved. It names a reply rather than a link because this
+/// employee has no link to give — there is no unsubscribe endpoint, and a link
+/// that goes nowhere is worse than no link.
+const OPT_OUT: &str = "If you would rather not hear from me again, reply with STOP and I will not write to you or \
+     anyone else at your company.";
+
+/// Where a probe's traveller is going.
+///
+/// **A guessed pair is safe and a guessed selector is not**, which is the whole
+/// reason this is a constant while [`Flow`] is a configured row. A selector
+/// points the probe at an element, so the wrong one reads the wrong thing and
+/// the two-run bar reproduces the wrong reading perfectly. A pair is only an
+/// *input*: whatever their flow says about it is compared against what Orizn
+/// says about the same pair, the pair is on the [`Evidence`] and in the
+/// reproduction steps the prospect follows, and the worst a badly-chosen one can
+/// do is find nothing.
+///
+/// Vietnam because the e-visa and the visa-on-arrival regimes coexist there,
+/// which is exactly the confusion [`Finding::Conflates`](crate::proof_of_need::Finding)
+/// is about, and because a booking flow that is going to be silent about
+/// anything is going to be silent about a destination it does not sell often.
+const PROBE_DESTINATION: &str = "VN";
+
+/// The destination for a seller whose own market *is* [`PROBE_DESTINATION`].
+///
+/// A citizen entering their own country needs no visa and every flow says so
+/// correctly, so the ordinary pair would spend a probe to learn nothing.
+const PROBE_DESTINATION_ALTERNATE: &str = "TR";
+
+/// How far ahead a probe books.
+///
+/// Entry rules are date-dependent, and a date in the past is a query most flows
+/// refuse outright. A month is what a real traveller has in the box.
+const PROBE_LEAD_TIME: TimeDelta = TimeDelta::days(30);
+
+/// How many prospects are looked at before a turn gives up on finding one to
+/// work.
+///
+/// Small on purpose: a scan that walks a whole imported list looking for the
+/// one account somebody wrote a [`Flow`] for is a scan that gets slower every
+/// time the list grows, and the honest answer for an employee whose first twenty
+/// prospects have no flow configured is "an operator has not configured any
+/// flows", not "keep looking".
+const PROSPECTS_SCANNED: i64 = 20;
+
+/// Why a selling turn did not reach an outcome.
+///
+/// Mirrors [`RoundError`]: the store was unreachable, or the check itself did
+/// not get as far as a verdict. Neither is a finding, and neither is a
+/// free-form string.
+#[derive(Debug, thiserror::Error)]
+pub enum SellError {
+    /// The store was unreachable, or a row will not come back out.
+    #[error(transparent)]
+    Unavailable(#[from] revenue_store::RevenueError),
+    /// The gate refused a step, or the browser failed.
+    #[error(transparent)]
+    Probe(#[from] ProbeError),
+}
+
+impl SellError {
+    /// Stable, low-cardinality metric label.
+    pub fn code(&self) -> &'static str {
+        match self {
+            // No `code` on the store's error and none added here: the same
+            // answer `RoundError` gives, for the same reason — a store that
+            // will not answer is one condition to an operator whatever the
+            // SQLSTATE was.
+            SellError::Unavailable(_) => "unavailable",
+            SellError::Probe(err) => err.code(),
+        }
+    }
+}
+
+/// One prospect this seller may work right now, and everything the check needs
+/// to run against it.
+///
+/// Resolved **before** the turn is reserved — see
+/// `loops::initiative::assignment_for` — because "there is nobody to work" is a
+/// reason not to start a turn rather than something to discover after paying for
+/// one.
+#[derive(Debug, Clone)]
+pub struct DueProspect {
+    /// The `accounts` row the finding will hang off.
+    pub account_id: Uuid,
+    /// The `contacts` row that gets written to, and that
+    /// [`mark_contacted`](agentos_store::revenue::mark_contacted) meters.
+    pub contact_id: Uuid,
+    /// Where the approach goes.
+    pub to: EmailAddress,
+    /// The flow an operator described for this prospect. Every selector in it
+    /// is ours.
+    pub flow: Flow,
+}
+
+/// One selling turn's vertical half: which prospect, and what came of it.
+///
+/// The sibling of [`Ran`], and the same contract — [`Worked::note`] is ours,
+/// byte for byte.
+#[derive(Debug)]
+pub struct Worked {
+    /// How we refer to the prospect, off the operator-configured [`Flow`].
+    pub prospect: String,
+    /// What the turn came to.
+    pub sold: Sold,
+    /// The `evidence` row, when the turn produced a finding and it landed.
+    ///
+    /// `None` covers both "there was no finding" and "there was one and the
+    /// write failed" — the second is logged loudly where it happens, and the
+    /// note says the finding is unfiled, because a finding an operator cannot
+    /// find is a finding nobody made.
+    pub filed: Option<Uuid>,
+}
+
+impl Worked {
+    /// What to tell the employee happened, as the turn's opening note.
+    ///
+    /// **Ours, all of it.** The prospect's name is off the operator's [`Flow`],
+    /// the address has been through [`EmailAddress::parse`], and every reason
+    /// code is a closed enum. Not one byte of the prospect's page is in it — the
+    /// panel text stays wrapped on the [`Evidence`] — so the initiative loop's
+    /// claim that its turn starts trusted by construction still holds.
+    pub fn note(&self) -> String {
+        let who = &self.prospect;
+        let filed = match self.filed {
+            Some(id) => format!("The finding is filed as evidence {id}."),
+            None => "**The finding is not filed** — the write failed, so it is in this note and \
+                     nowhere else. Say so."
+                .to_owned(),
+        };
+
+        match &self.sold {
+            Sold::Clarify(question) => question.clone(),
+
+            Sold::WrongChannel(channel) => format!(
+                "Nothing was checked and nobody was approached: {who} is reachable on {}, which \
+                 this system cannot send on. That is an operator's job, not yours — report it.",
+                channel.map_or("no permitted channel", Channel::as_str),
+            ),
+
+            Sold::Forbidden(kind) => format!(
+                "Approaching {who} needs a {} and your role may not propose one. Nothing was sent. \
+                 Say so and work whatever is not blocked.",
+                kind.as_str()
+            ),
+
+            Sold::NoFinding(checked) => format!(
+                "{who}'s own flow was run twice for you before you were asked to think, and there \
+                 is nothing honest to say about it: {}{}. Nobody was approached, and that is the \
+                 right outcome rather than a failure — do not go looking for a way to say \
+                 something anyway. Report it and move on.",
+                checked.code(),
+                checked
+                    .detail()
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default(),
+            ),
+
+            Sold::ForHuman(evidence) => format!(
+                "{who}'s flow was run twice and there is a real finding — {} — and **you may not \
+                 send it**. It rests on our own entry-requirements row being right about this \
+                 pair rather than on anything visible on their page, and a prospect rebuts that \
+                 with a free source. No email was sent and none may be. {filed} Hand it to a human \
+                 with the reproduction steps; that is the whole of what this finding is for.",
+                evidence.finding.code(),
+            ),
+
+            Sold::Approached { evidence, outcome } => {
+                let sent = if outcome.is_sent() {
+                    format!(
+                        "The approach has already gone out to {} before you were asked to think.",
+                        outcome.to()
+                    )
+                } else {
+                    format!(
+                        "**Nothing was sent.** The approach to {} came back {} — that is a \
+                         boundary, not a hiccup, and working around it is not one of your options. \
+                         Report it to your operator.",
+                        outcome.to(),
+                        outcome.code(),
+                    )
+                };
+                format!(
+                    "{who}'s flow was run twice and it reproduced: {}. {sent} {filed}\n\nDo not \
+                     approach them again this turn and do not re-word the finding — the message is \
+                     built from the evidence rather than written, so a second version of it is a \
+                     second claim about somebody else's product. What is yours is the conversation \
+                     after this: the reply, the qualification, and the handoff.",
+                    evidence.finding.code(),
+                )
+            }
+        }
+    }
+}
+
+/// Run the sales vertical for one employee, out of its own store.
+///
+/// **This is the wire**, and it is [`purchasing_turn`]'s sibling: [`sell`] is
+/// pure over the material it is handed, and this reads that material, runs it,
+/// and writes down the two things a check cannot recompute — that the finding
+/// was made, and that the person was written to.
+///
+/// # What a selling turn's job ends at, and why not further
+///
+/// **It ends at the filed finding.** The approach that [`sell`] makes on the way
+/// there is the same gated email an operator will switch on by raising
+/// `max_new_contacts_per_day`, and until they do it comes back refused and says
+/// so. What this deliberately does *not* do is reach [`crate::queue`]: a
+/// [`Lead`](crate::queue::Lead) has nowhere durable to live between this turn
+/// and the founder's Smartlead upload, so calling
+/// [`record_queued`](crate::queue::record_queued) here would mark a prospect
+/// contacted for a file that exists only in this process's memory — a person
+/// marked as approached who was never approached, which is the one bookkeeping
+/// error in this vertical that costs a real prospect. The export belongs to
+/// whoever the file reaches: one route, running
+/// [`plan`](crate::queue::plan) and `record_queued` in the same transaction as
+/// the bytes it hands back. That is a pull, not a cadence.
+///
+/// # Three transactions, and none of them spans the check
+///
+/// Read, mark, file. The read is rolled back before a page of the prospect's is
+/// loaded, because the check is several seconds of somebody else's website and a
+/// pooled connection held across it is a connection held across their latency —
+/// the same rule [`purchasing_turn`] follows.
+///
+/// **The mark commits before the finding is filed**, and that order is chosen.
+/// Both writes can fail and they fail differently: a lost mark mails a cold
+/// prospect twice, and a prospect who gets the same cold email twice reports it
+/// — a sending domain does not recover from that on a schedule. A lost
+/// *finding* costs one re-probe next cadence, because the account is still in
+/// [`accounts_without_evidence`](agentos_store::revenue::accounts_without_evidence)
+/// until the row lands. The cheap failure is the one this takes.
+///
+/// The residual is named rather than hidden: a crash between [`sell`]'s send and
+/// the mark below costs one duplicate approach on the next cadence. Nothing
+/// smaller is available while the send lives inside `sell`, and moving it out
+/// would mean two functions that both decide who gets written to.
+#[allow(clippy::too_many_arguments)]
+pub async fn selling_turn(
+    db: &Db,
+    prober: &Prober,
+    seller: &Seller,
+    orizn: &Orizn,
+    principal: &Principal,
+    pack: &rolepack_sales::RolePack,
+    objective: &rolepack_sales::Objective,
+    prospect: &DueProspect,
+    now: DateTime<Utc>,
+) -> Result<Worked, SellError> {
+    let who = prospect.flow.prospect.clone();
+
+    let Some(probe) = probe_for(objective, now) else {
+        // Unreachable through the loop — an objective with no market is a plan
+        // that is `Stage::Clarify` alone, and `assignment_for` stops there — but
+        // this function is public and the honest answer to "no market" is the
+        // question, not a guessed passport.
+        return Ok(Worked {
+            prospect: who,
+            sold: Sold::Clarify(clarification_sales(pack, objective)),
+            filed: None,
+        });
+    };
+
+    // A fresh sequence, and the spacing is enforced in the selection rather than
+    // here. `Sequence` keeps its touches in memory and has no constructor that
+    // takes a history, so one rebuilt per turn would say "due" about somebody
+    // written to an hour ago; `contactable` is what actually meters the
+    // 72 hours, out of `contacts.last_contacted_at`, which is the column the
+    // mark below writes. One rule, in the place that survives a restart.
+    let mut sequence = Sequence::new(prospect.to.clone());
+
+    let sold = sell(
+        prober,
+        seller,
+        orizn,
+        pack,
+        objective,
+        Prospect {
+            flow: &prospect.flow,
+            probe: &probe,
+            sequence: &mut sequence,
+        },
+        OPT_OUT,
+        now,
+    )
+    .await?;
+
+    // The mark, first and on its own. See the function docs on the order.
+    if matches!(&sold, Sold::Approached { outcome, .. } if outcome.is_sent()) {
+        let mut tx = db
+            .tenant_tx(principal.tenant_id)
+            .await
+            .map_err(|err| SellError::Unavailable(err.into()))?;
+        let marked = revenue_store::mark_contacted(
+            &mut tx,
+            prospect.contact_id,
+            now,
+            Some(now + crate::revenue::FOLLOW_UP_AFTER),
+        )
+        .await;
+        match marked {
+            Ok(()) => tx
+                .commit()
+                .await
+                .map_err(|err| SellError::Unavailable(err.into()))?,
+            // Returned rather than swallowed, and it is the one write here that
+            // is: the email has gone, and an unmarked contact is one this
+            // employee will approach again next cadence. Loud beats convenient
+            // when the quiet version mails a stranger twice.
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(SellError::Unavailable(err));
+            }
+        }
+    }
+
+    // And the finding, in its own transaction, so a row the `evidence` CHECKs
+    // refuse cannot take the mark down with it.
+    let filed = match sold.evidence() {
+        Some(evidence) => file_finding(db, principal, prospect, evidence).await,
+        None => None,
+    };
+
+    Ok(Worked {
+        prospect: who,
+        sold,
+        filed,
+    })
+}
+
+/// The next prospect this seller has work on, or `None`.
+///
+/// **`None` is not an error.** An employee whose prospects have no flow
+/// described yet, or whose whole list was written to inside the last three days,
+/// has nothing this vertical can do — and saying so costs one query, where
+/// discovering it inside a turn costs a turn.
+///
+/// The three filters are three different rules and each is somewhere else's:
+///
+/// * [`accounts_without_evidence`](agentos_store::revenue::accounts_without_evidence)
+///   is the store's — the queue that starts the pipeline, already excluding
+///   customers and disqualified accounts. A finding filed against an account
+///   takes it out, which is what stops this vertical probing the same site every
+///   cadence forever.
+/// * [`flow_for`] is the operator's. No flow, no check: a probe with a guessed
+///   selector reads the wrong element and reproduces the wrong reading
+///   perfectly.
+/// * [`contactable`] is the law's and the sequence's, in one predicate.
+pub async fn due_prospect(
+    tx: &mut TenantTx<'_>,
+    objective: &rolepack_sales::Objective,
+    now: DateTime<Utc>,
+) -> Result<Option<DueProspect>, revenue_store::RevenueError> {
+    let accounts = revenue_store::accounts_without_evidence(
+        tx,
+        segment_column(objective.segment),
+        PROSPECTS_SCANNED,
+    )
+    .await?;
+
+    for account in accounts {
+        let Some(flow) = flow_for(tx, &account).await? else {
+            continue;
+        };
+        let Some((contact_id, raw)) = contactable(tx, account.id, now).await? else {
+            continue;
+        };
+        let Ok(to) = EmailAddress::parse(&raw) else {
+            // The column has a CHECK and the importer parses, so this is a row
+            // written by something that did neither. Skipped rather than
+            // failed: one unparseable address must not stop the employee
+            // working the other 1,614.
+            tracing::warn!(
+                account_id = %account.id,
+                "a contact's address will not parse; this prospect is skipped"
+            );
+            continue;
+        };
+        return Ok(Some(DueProspect {
+            account_id: account.id,
+            contact_id,
+            to,
+            flow,
+        }));
+    }
+    Ok(None)
+}
+
+/// This prospect's booking flow, if a human has confirmed one.
+///
+/// Thin on purpose: the seal on [`Flow`] means this cannot *build* one out of a
+/// row, only hand the row to the constructor that checks it. That is the whole
+/// join between the operator's table and the prober — an unconfirmed row, one
+/// naming a domain the policy does not grant, or one that will not parse comes
+/// back an error rather than a `Flow`.
+///
+/// **Skipped rather than fatal, and that is the narrow choice.** One prospect
+/// nobody has opened yet must not stop the seller working the ones somebody
+/// has. `proof_of_need::next_flow` takes the opposite view on the
+/// operator-facing path and wedges on the head of the queue; that is right
+/// there, because that path exists so an operator *finds out*, and wrong here,
+/// where the employee has already picked an account and the alternative is a
+/// turn spent on nothing.
+async fn flow_for(
+    tx: &mut TenantTx<'_>,
+    account: &revenue_store::AccountSummary,
+) -> Result<Option<Flow>, revenue_store::RevenueError> {
+    let Some(row) = revenue_store::flow_of(tx, account.id).await? else {
+        return Ok(None);
+    };
+    match Flow::confirmed(row) {
+        Ok(flow) => Ok(Some(flow)),
+        Err(err) => {
+            tracing::info!(
+                account_id = %account.id,
+                code = err.code(),
+                "this prospect has no flow a probe may run; skipped until an operator writes one"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// The person at this account we may write to today, if there is one.
+///
+/// Three predicates, and the first two are the same legal boundary said twice.
+///
+/// * `active` — a suppression deactivates every contact row it names, in the
+///   same statement, by trigger. That covers a **global** opt-out, which no
+///   tenant can read directly and which
+///   [`suppression_for`] therefore cannot see either.
+/// * `revenue_suppression_of` — the schema's own lookup, `SECURITY DEFINER` so
+///   it sees the global rows, asked here because "the trigger already
+///   deactivated them" is a claim about a write that happened in the past and
+///   this is a legal boundary rather than a cache.
+/// * `last_contacted_at` — [`FOLLOW_UP_AFTER`](crate::revenue::FOLLOW_UP_AFTER),
+///   the same spacing [`Sequence::due`](crate::revenue::Sequence) meters, read
+///   off the column that survives a restart. `Sequence` cannot do it here: it
+///   holds its touches in memory and a fresh one says "due" about somebody
+///   written to an hour ago.
+async fn contactable(
+    tx: &mut TenantTx<'_>,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<(Uuid, String)>, revenue_store::RevenueError> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT c.id, c.email FROM contacts c \
+          WHERE c.account_id = $1 \
+            AND c.active \
+            AND c.email IS NOT NULL \
+            AND (c.last_contacted_at IS NULL OR c.last_contacted_at <= $2) \
+            AND revenue_suppression_of(c.email, null::text) IS NULL \
+          ORDER BY c.is_primary DESC, c.id \
+          LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(now - crate::revenue::FOLLOW_UP_AFTER)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+    Ok(row)
+}
+
+/// Everyone this employee may not write to, out of the addresses it is about to
+/// write to.
+///
+/// **This is the empty-suppression hole closed.** [`Seller::new`] takes a
+/// [`Suppression`] and every caller in the workspace used to pass
+/// [`Suppression::new`] — an empty list — which was survivable only while
+/// nothing reached [`Seller::touch`]. A dispatch that reaches it and passes the
+/// empty list is a system that mails people who asked it not to.
+///
+/// It is the one address this turn could send to rather than the whole list, and
+/// that is exact rather than lazy: a turn writes to one prospect, `touch`
+/// consults this set about exactly that address, and a set of one is the same
+/// answer as a set of thousands for the only question that gets asked. It is
+/// also the answer that stays right when the list is a hundred thousand rows.
+///
+/// **It fails closed.** A read that errors comes back with the address
+/// suppressed, so a database that will not answer costs one prospect a cadence
+/// instead of costing a person who opted out an email.
+pub async fn suppression_for(db: &Db, principal: &Principal, to: &EmailAddress) -> Suppression {
+    let refuse = || Suppression::new().with(to.clone());
+
+    let mut tx = match db.tenant_tx(principal.tenant_id).await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::warn!(error = %err, "no transaction to read the suppression list; refusing the send");
+            return refuse();
+        }
+    };
+    // The schema's own lookup and not a `SELECT` over `suppressions`: the table
+    // is under the ordinary per-tenant RLS policy, so a plain read cannot see a
+    // **global** suppression at all — deliberately, and this function is
+    // exactly the reader that would otherwise miss it. `revenue_suppression_of`
+    // is `SECURITY DEFINER` and takes no tenant argument for that reason.
+    let found: Result<Option<String>, _> =
+        sqlx::query_scalar("SELECT revenue_suppression_of($1, null::text)")
+            // `EmailAddress::parse` lower-cases both halves, and the column and
+            // the suppression row have CHECKs saying they are lower case, so
+            // this is an equality test on one spelling rather than three.
+            .bind(to.to_string())
+            .fetch_one(&mut **tx)
+            .await;
+    let _ = tx.rollback().await;
+
+    match found {
+        Ok(None) => Suppression::new(),
+        Ok(Some(reason)) => {
+            tracing::info!(
+                reason,
+                "this prospect is on the suppression list; nothing will be sent"
+            );
+            refuse()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "the suppression list could not be read; refusing the send");
+            refuse()
+        }
+    }
+}
+
+/// File the finding, whatever may be done with it.
+///
+/// `None` on failure, logged loudly and not returned: the check has already
+/// happened and the approach has already gone or been refused, so failing the
+/// turn here would throw away a note the employee is about to read for the sake
+/// of a row it can write again next cadence. The account keeps no evidence, so
+/// [`due_prospect`] offers it again — a retry with no retry logic in it.
+async fn file_finding(
+    db: &Db,
+    principal: &Principal,
+    prospect: &DueProspect,
+    evidence: &Evidence,
+) -> Option<Uuid> {
+    let id = Uuid::now_v7();
+    let steps = evidence.steps.join("\n");
+    // `observed_claim` is NOT NULL and non-empty, and a `SaysNothing` finding is
+    // frequently about a panel that really did contain nothing. Ours, in that
+    // one case, and it says which it is.
+    let observed = evidence.observed.expose_for_parsing().trim();
+    let observed = if observed.is_empty() {
+        "(their panel displayed nothing for this pair)"
+    } else {
+        observed
+    };
+    // The authority's own provenance travels in this column because there is
+    // nowhere else for it: `authority_url` has a CHECK for `^https?://` and
+    // `Answer::source` is a tool handle, not a page. It is
+    // `crate::orizn::SOURCE`, which is ours by construction.
+    let correct = evidence.authority.as_ref().map_or_else(
+        || {
+            "not established, and not needed: this finding stands on the prospect's own page"
+                .to_owned()
+        },
+        |answer| format!("{} — {}", answer.requirement.phrase(), answer.source),
+    );
+
+    let mut tx = match db.tenant_tx(principal.tenant_id).await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "no transaction to file the finding");
+            return None;
+        }
+    };
+    let written = revenue_store::insert_evidence(
+        &mut tx,
+        id,
+        &revenue_store::NewEvidence {
+            account_id: prospect.account_id,
+            employee_id: Some(principal.employee_id),
+            kind: evidence_kind(&evidence.finding),
+            passport_country: evidence.probe.passport.as_str(),
+            destination_country: evidence.probe.destination.as_str(),
+            travel_date: Some(evidence.probe.travel_date),
+            source_url: evidence.entry.as_str(),
+            reproduction: &steps,
+            // ponytail: the screenshot is on the `Evidence` and there is no
+            // object store to put it in, so the column stays null and the row
+            // is reproducible from `reproduction` alone — which is what its own
+            // comment says it is for. Wire it the day there is a bucket.
+            artifact_ref: None,
+            observed_claim: observed,
+            correct_claim: &correct,
+            authority_url: None,
+            checked_at: evidence.observed_at,
+        },
+    )
+    .await;
+
+    // Sequential rather than combinator-chained: a failed statement aborts a
+    // Postgres transaction outright, so the commit must not be attempted on one
+    // the insert has already poisoned.
+    let written = match written {
+        Ok(()) => tx.commit().await.map_err(revenue_store::RevenueError::from),
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    };
+
+    match written {
+        Ok(()) => Some(id),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                finding = evidence.finding.code(),
+                "the finding was not filed; it is in this turn's note and nowhere else"
+            );
+            None
+        }
+    }
+}
+
+/// `accounts.segment`, for a role pack's segment.
+///
+/// Two vocabularies, one column, and they are not the same list:
+/// [`Segment`] is the five this role sells to and `accounts.segment`'s CHECK is
+/// eight — it also has `tmc`, `relocation` and `other`, which no objective can
+/// name. The one that does not simply match is `cruise_line`, which the column
+/// spells `cruise`; [`Segment::code`] is a metric label and may not be bent to
+/// fit a column, so the translation lives here where both spellings are visible
+/// at once. A seller for a segment with no accounts imported gets an empty
+/// queue, which reads as no work.
+const fn segment_column(segment: Segment) -> &'static str {
+    match segment {
+        Segment::Airline => "airline",
+        Segment::Ota => "ota",
+        Segment::CorporateTravel => "corporate_travel",
+        Segment::Insurer => "insurer",
+        Segment::CruiseLine => "cruise",
+    }
+}
+
+/// The pair to run through the prospect's flow.
+///
+/// The passport is the objective's own market — the travellers a carrier or a
+/// platform in that market actually sells to — and the destination is
+/// [`PROBE_DESTINATION`]. `None` is an objective with no market, which is a
+/// plan that is `Clarify` alone and never reaches here through the loop.
+fn probe_for(objective: &rolepack_sales::Objective, now: DateTime<Utc>) -> Option<Probe> {
+    let passport = objective.market.clone()?;
+    let destination = if passport.as_str() == PROBE_DESTINATION {
+        PROBE_DESTINATION_ALTERNATE
+    } else {
+        PROBE_DESTINATION
+    };
+    Some(Probe {
+        passport,
+        // Both are literals this file controls; the unit test at the bottom is
+        // the proof.
+        destination: CountryCode::parse(destination).expect("a two-letter literal"),
+        travel_date: (now + PROBE_LEAD_TIME).date_naive(),
+    })
+}
+
+/// `evidence.kind`, for a finding.
+///
+/// The column's CHECK is eight kinds written before this vertical had five
+/// findings, and the mapping is lossy in one direction only: three findings
+/// share `wrong_requirement` because that is what they are — a statement about
+/// the requirement that is wrong, in three different ways. Which way is on the
+/// `reproduction` and in `observed_claim`, and the finding's own code is a
+/// metric label rather than a column. Widening the CHECK would be editing a
+/// schema this unit does not own.
+const fn evidence_kind(finding: &Finding) -> &'static str {
+    match finding {
+        Finding::SaysNothing => "missing_visa_info",
+        Finding::UnattributedFee => "wrong_cost",
+        Finding::Conflates | Finding::StayLength { .. } | Finding::Contradicts { .. } => {
+            "wrong_requirement"
+        }
+    }
+}
+
+/// The question a sales plan asks when it cannot be worked, collapsed to one
+/// string.
+///
+/// The sales twin of [`clarification`], and it is a separate function for the
+/// same reason `plan_of` writes its two role-pack arms out twice: the two packs
+/// share no `Task` and no `Stage`.
+fn clarification_sales(
+    pack: &rolepack_sales::RolePack,
+    objective: &rolepack_sales::Objective,
+) -> String {
+    pack.plan(objective)
+        .into_iter()
+        .find(|task| task.stage == rolepack_sales::Stage::Clarify)
+        .map_or_else(
+            || "this objective cannot be worked as stated".to_owned(),
+            |task| task.instruction,
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -3804,8 +4556,13 @@ mod tests {
     }
 
     /// Orizn as an operator would have bound it.
+    ///
+    /// The production spelling and not a copy of it: `permissive()` grants what
+    /// this returns, and the dispatch calls the same function, so a test that
+    /// passes here cannot be passing against a binding name the loop does not
+    /// use.
     fn orizn() -> Orizn {
-        Orizn::on(Slug::parse("orizn").expect("slug"))
+        orizn_binding()
     }
 
     struct SalesDesk {
@@ -3813,6 +4570,13 @@ mod tests {
         seller: Seller,
         email: Arc<MockEmailProvider>,
         orizn: Arc<StubOrizn>,
+        /// The employee behind the two, so a test can drive `selling_turn`,
+        /// which reads and writes this tenant's own rows.
+        principal: Principal,
+        /// Everything `Seller::new` was given, so a test can rebuild one with a
+        /// different suppression list without re-seeding a tenant.
+        effects: Effects,
+        gate: PolicyGate,
     }
 
     /// A sales employee that may read the prospect's domain and write to
@@ -3848,25 +4612,32 @@ mod tests {
             user_data_dir: None,
         };
 
+        let gate = gate(db, &principal, limits).await;
         SalesDesk {
             prober: Prober::new(
                 db.clone(),
-                gate(db, &principal, limits.clone()).await,
+                gate.clone(),
                 effects.clone(),
                 principal.clone(),
                 session,
             ),
             seller: Seller::new(
-                gate(db, &principal, limits).await,
-                effects,
-                principal,
-                "ines@orizn.example",
+                gate.clone(),
+                effects.clone(),
+                principal.clone(),
+                SENDER,
                 Suppression::new(),
             ),
             email,
             orizn: truth,
+            principal,
+            effects,
+            gate,
         }
     }
+
+    /// The employee's own envelope sender.
+    const SENDER: &str = "ines@orizn.example";
 
     /// Everything the sales path needs granted: the prospect's domain, the
     /// Orizn tool, email, and an outreach budget.
@@ -4565,5 +5336,531 @@ mod tests {
             note.contains("not slow, it is unmeasured"),
             "the note has to say what an absent record means: {note}"
         );
+    }
+
+    // -- the selling turn ---------------------------------------------------
+
+    /// One imported prospect, in the shape the two reads behind [`due_prospect`]
+    /// will find it: an account in the objective's segment, somebody to write
+    /// to, and a flow an operator described.
+    ///
+    /// The account's `domain` and `legal_name` are the [`flow`] fixture's,
+    /// because that is where [`flow_for`] gets them from — a `Flow` is the
+    /// account row plus the selectors, never a second copy of the domain.
+    async fn seed_prospect(db: &Db, principal: &Principal, email: &str) -> (Uuid, Uuid) {
+        let account = Uuid::now_v7();
+        let contact = Uuid::now_v7();
+        let flow = flow();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+
+        revenue_store::insert_account(
+            &mut tx,
+            account,
+            &revenue_store::NewAccount {
+                legal_name: &flow.prospect,
+                domain: flow.domain.as_str(),
+                // `accounts.segment`'s own spelling for `Segment::Airline`; see
+                // `segment_column`.
+                segment: "airline",
+                country: "FR",
+                location: None,
+                website: None,
+                employee_id: Some(principal.employee_id),
+            },
+        )
+        .await
+        .expect("insert account");
+
+        revenue_store::insert_contact(
+            &mut tx,
+            contact,
+            &revenue_store::NewContact {
+                account_id: account,
+                full_name: "Head of Digital",
+                email: Some(email),
+                phone: None,
+                role: Some("Head of Digital"),
+                language: Some("fr"),
+                is_primary: true,
+                lawful_basis: "legitimate_interest",
+                next_follow_up_at: None,
+            },
+        )
+        .await
+        .expect("insert contact");
+
+        tx.commit().await.expect("commit the prospect");
+        (account, contact)
+    }
+
+    /// The selectors an operator described for one account.
+    ///
+    /// Separate from [`seed_prospect`] because "imported" and "described" are
+    /// two different states of a prospect and the gap between them is the
+    /// ordinary one: the importer lands 1,615 accounts and a human writes the
+    /// flows one at a time. There is no DELETE on this table — see migration
+    /// 0032 — so a test that wants an undescribed prospect has to be one that
+    /// never described it.
+    async fn seed_flow(db: &Db, principal: &Principal, account: Uuid) {
+        let flow = flow();
+        // An **admin** transaction, and that is the fixture telling the truth:
+        // migration 0032 gives `app_role` no INSERT and no UPDATE here, because
+        // an employee that could write a selector could aim a probe at any
+        // element on a domain it may already read. A flow is written by an
+        // operator through `agentos-server flow`, and `confirmed_by` is the
+        // name of the human who opened the page — without it `Flow::confirmed`
+        // refuses the row and this prospect is skipped, which is the property
+        // `nothing_is_probed_until_a_human_has_opened_the_page` owns.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO prospect_flows \
+                 (tenant_id, account_id, entry_url, passport_field, destination_field, \
+                  date_field, submit, panel, confirmed_by, confirmed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'fixture', now())",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .bind(account)
+        .bind(flow.entry.as_str())
+        .bind(&flow.passport_field)
+        .bind(&flow.destination_field)
+        .bind(&flow.date_field)
+        .bind(&flow.submit)
+        .bind(&flow.panel)
+        .execute(&mut *tx)
+        .await
+        .expect("insert flow");
+        tx.commit().await.expect("commit the flow");
+    }
+
+    /// An imported prospect an operator has already described.
+    async fn seed_described_prospect(db: &Db, principal: &Principal, email: &str) -> (Uuid, Uuid) {
+        let (account, contact) = seed_prospect(db, principal, email).await;
+        seed_flow(db, principal, account).await;
+        (account, contact)
+    }
+
+    /// What the selection would offer this employee right now.
+    async fn next_prospect(
+        db: &Db,
+        principal: &Principal,
+        now: DateTime<Utc>,
+    ) -> Option<DueProspect> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let due = due_prospect(&mut tx, &sales_objective_value(), now)
+            .await
+            .expect("the prospect queue is readable");
+        tx.rollback().await.expect("rollback");
+        due
+    }
+
+    /// The findings filed against an account, and when the contact was last
+    /// written to.
+    async fn filed_and_marked(
+        db: &Db,
+        principal: &Principal,
+        account: Uuid,
+        contact: Uuid,
+    ) -> (Vec<String>, Option<DateTime<Utc>>) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let findings = revenue_store::evidence_for_account(&mut tx, account, 10)
+            .await
+            .expect("read the evidence");
+        let marked: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_contacted_at FROM contacts WHERE id = $1")
+                .bind(contact)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the contact");
+        tx.rollback().await.expect("rollback");
+        (
+            findings.into_iter().map(|finding| finding.kind).collect(),
+            marked,
+        )
+    }
+
+    fn sales_pack(limits: PolicyLimits) -> rolepack_sales::RolePack {
+        rolepack_sales::RolePack::sales_development().with_limits(limits)
+    }
+
+    const PROSPECT_EMAIL: &str = "head.of.digital@airline.example";
+
+    /// **The whole selling turn, through the real path.**
+    ///
+    /// An imported prospect with a described flow is selected, its own page is
+    /// run twice, the finding reproduces, the approach goes out through the
+    /// gate, the finding is filed, and the person is marked — and then the same
+    /// selection offers nobody, which is what stops this employee probing the
+    /// same site every cadence forever.
+    #[tokio::test]
+    async fn a_due_prospect_becomes_a_filed_finding_and_one_approach() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (account, contact) =
+            seed_described_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+
+        let prospect = next_prospect(&db, &desk.principal, now)
+            .await
+            .expect("an imported prospect with a flow is due");
+        assert_eq!(prospect.account_id, account);
+        assert_eq!(prospect.to, address(PROSPECT_EMAIL));
+        // The flow is the account row plus the operator's selectors.
+        assert_eq!(prospect.flow, flow());
+
+        let worked = selling_turn(
+            &db,
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &desk.principal,
+            &sales_pack(permissive()),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::Approached { evidence, outcome } = &worked.sold else {
+            panic!("a reproducible conflation should have been approached: {worked:?}");
+        };
+        assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
+        assert_eq!(evidence.finding, Finding::Conflates);
+        assert_eq!(desk.email.sent_count(), 1);
+
+        // The pair is the objective's market against `PROBE_DESTINATION`, and
+        // it is on the evidence where a prospect can repeat it.
+        assert_eq!(evidence.probe.passport.as_str(), "FR");
+        assert_eq!(evidence.probe.destination.as_str(), PROBE_DESTINATION);
+
+        // Filed, and the person is marked in the same turn.
+        assert!(worked.filed.is_some(), "the finding was not filed");
+        let (kinds, marked) = filed_and_marked(&db, &desk.principal, account, contact).await;
+        assert_eq!(kinds, vec!["wrong_requirement".to_owned()]);
+        assert!(marked.is_some(), "the person written to was not marked");
+
+        // And nobody is due any more: the account has evidence and the contact
+        // has three days to answer. Two locks on the same door — either alone
+        // stops a second approach.
+        assert!(
+            next_prospect(&db, &desk.principal, now).await.is_none(),
+            "the same prospect is offered again on the next cadence"
+        );
+
+        // The note is ours, and the prospect's page is not in it.
+        let note = worked.note();
+        assert!(note.contains("Airline Example"), "{note}");
+        assert!(note.contains("conflates"), "{note}");
+        assert!(
+            !note.contains(INJECTION),
+            "the panel reached the note: {note}"
+        );
+        assert!(
+            !note.contains("No visa required for this trip."),
+            "the panel reached the note: {note}"
+        );
+    }
+
+    /// **A finding this system may not assert reaches a human and not the
+    /// prospect.**
+    ///
+    /// Their checkout says no visa and our own row says one is required. It is
+    /// the highest-stakes discrepancy there is and it is made of nothing but
+    /// "our database disagrees with yours", so it is filed for a human, no email
+    /// is sent, and nobody is marked as contacted — the whole turn ends in a row
+    /// and a note.
+    #[tokio::test]
+    async fn a_finding_that_may_not_be_asserted_is_filed_and_never_sent() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &["No visa required for this trip."],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (account, contact) =
+            seed_described_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+        let prospect = next_prospect(&db, &desk.principal, now).await.expect("due");
+
+        let worked = selling_turn(
+            &db,
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &desk.principal,
+            &sales_pack(permissive()),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::ForHuman(evidence) = &worked.sold else {
+            panic!("a bare contradiction was not held back: {worked:?}");
+        };
+        assert_eq!(
+            evidence.finding,
+            Finding::Contradicts {
+                shown: Claim::NoVisa,
+                correct: Claim::VisaRequired,
+            }
+        );
+        assert_eq!(
+            desk.email.sent_count(),
+            0,
+            "a claim about our own row reached a prospect"
+        );
+
+        let (kinds, marked) = filed_and_marked(&db, &desk.principal, account, contact).await;
+        assert_eq!(
+            kinds,
+            vec!["wrong_requirement".to_owned()],
+            "the finding a human is supposed to read was not filed"
+        );
+        assert!(
+            marked.is_none(),
+            "nobody was written to, and somebody was marked"
+        );
+
+        let note = worked.note();
+        assert!(note.contains("you may not send it"), "{note}");
+        assert!(note.contains("Hand it to a human"), "{note}");
+    }
+
+    /// **The suppression list bites on the send path, not only on the
+    /// selection.**
+    ///
+    /// Two halves, and the second is the one that used to be a hole.
+    ///
+    /// The selection drops a suppressed person: recording an opt-out
+    /// deactivates their contact row by trigger, and `contactable` asks the
+    /// schema's own `SECURITY DEFINER` lookup as well.
+    ///
+    /// And the send refuses one that got past it — which is exactly what a
+    /// suppression recorded *between* the selection and the send looks like.
+    /// `Seller::new` used to be called only from tests, always with an empty
+    /// `Suppression`; a dispatch that reached `Seller::touch` with that empty
+    /// list is a system that mails people who asked it not to.
+    #[tokio::test]
+    async fn a_suppressed_prospect_is_neither_selected_nor_written_to() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (account, contact) =
+            seed_described_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+
+        // Held before the opt-out: this is the prospect the selection has
+        // already handed out, and the race the second half is about.
+        let prospect = next_prospect(&db, &desk.principal, now).await.expect("due");
+
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        revenue_store::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewSuppression {
+                channel: revenue_store::Channel::Email,
+                address: PROSPECT_EMAIL,
+                reason: "opt_out",
+                scope: revenue_store::Scope::Tenant,
+                contact_id: Some(contact),
+                note: Some("replied STOP"),
+                suppressed_at: now,
+            },
+        )
+        .await
+        .expect("record the opt-out");
+        tx.commit().await.expect("commit the opt-out");
+
+        assert!(
+            next_prospect(&db, &desk.principal, now).await.is_none(),
+            "a person who opted out is still in the queue"
+        );
+
+        // The send path's own check, from the list the dispatch actually loads.
+        let seller = Seller::new(
+            desk.gate.clone(),
+            desk.effects.clone(),
+            desk.principal.clone(),
+            SENDER,
+            suppression_for(&db, &desk.principal, &prospect.to).await,
+        );
+        let worked = selling_turn(
+            &db,
+            &desk.prober,
+            &seller,
+            &orizn(),
+            &desk.principal,
+            &sales_pack(permissive()),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::Approached { outcome, .. } = &worked.sold else {
+            panic!("the finding is real and should have reached the send: {worked:?}");
+        };
+        assert!(
+            matches!(outcome, Contacted::Suppressed { .. }),
+            "a person who opted out was written to: {outcome:?}"
+        );
+        assert_eq!(desk.email.sent_count(), 0);
+
+        // The finding is still worth having, and nobody is marked as written to.
+        let (kinds, marked) = filed_and_marked(&db, &desk.principal, account, contact).await;
+        assert_eq!(kinds.len(), 1);
+        assert!(marked.is_none());
+    }
+
+    /// **The contact budget bites, and it is the gate that applies it.**
+    ///
+    /// `sales_development()` ships `max_new_contacts_per_day: 0` deliberately —
+    /// cold outreach is off until an operator turns it on — so this is the
+    /// shipped configuration rather than a contrived one. The check still runs
+    /// and the finding is still filed: the budget stops the *approach*, not the
+    /// work.
+    #[tokio::test]
+    async fn the_contact_budget_refuses_the_approach_and_keeps_the_finding() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let broke = PolicyLimits {
+            max_new_contacts_per_day: 0,
+            ..permissive()
+        };
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            broke.clone(),
+        )
+        .await;
+        let (account, contact) =
+            seed_described_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+        let prospect = next_prospect(&db, &desk.principal, now).await.expect("due");
+
+        let worked = selling_turn(
+            &db,
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &desk.principal,
+            &sales_pack(broke),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+
+        let Sold::Approached { outcome, .. } = &worked.sold else {
+            panic!("the check should have produced a finding: {worked:?}");
+        };
+        assert_eq!(
+            outcome.code(),
+            DenyReason::ContactBudgetExhausted.code(),
+            "the approach was not refused by the budget: {outcome:?}"
+        );
+        assert_eq!(desk.email.sent_count(), 0);
+
+        let (kinds, marked) = filed_and_marked(&db, &desk.principal, account, contact).await;
+        assert_eq!(kinds.len(), 1, "a refused approach threw the finding away");
+        assert!(
+            marked.is_none(),
+            "a refused approach marked the person anyway"
+        );
+
+        let note = worked.note();
+        assert!(note.contains("Nothing was sent"), "{note}");
+        assert!(note.contains("boundary, not a hiccup"), "{note}");
+    }
+
+    /// A prospect nobody described a flow for is not work, and neither is one
+    /// this employee wrote to yesterday.
+    ///
+    /// Both are the same claim — [`due_prospect`] answering `None` — and it is
+    /// the claim the initiative loop turns into "no turn". Asserted here because
+    /// this is where the three predicates live.
+    #[tokio::test]
+    async fn a_prospect_with_no_flow_and_one_written_to_yesterday_are_both_no_work() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::unreachable(),
+            permissive(),
+        )
+        .await;
+        let (account, contact) = seed_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+
+        assert!(
+            next_prospect(&db, &desk.principal, now).await.is_none(),
+            "a prospect with no described flow was offered to a probe"
+        );
+
+        // Describe it, and write to them instead.
+        seed_flow(&db, &desk.principal, account).await;
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        revenue_store::mark_contacted(&mut tx, contact, now - TimeDelta::hours(1), None)
+            .await
+            .expect("mark");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            next_prospect(&db, &desk.principal, now).await.is_none(),
+            "somebody written to an hour ago is due again"
+        );
+        assert!(
+            next_prospect(&db, &desk.principal, now + crate::revenue::FOLLOW_UP_AFTER)
+                .await
+                .is_some(),
+            "the follow-up window never opens again"
+        );
+    }
+
+    /// The two literals this module builds a probe out of are valid, so the
+    /// `expect`s in [`probe_for`] and [`orizn_binding`] are unreachable rather
+    /// than optimistic.
+    #[test]
+    fn the_probe_pair_and_the_orizn_binding_are_spellable() {
+        let probe = probe_for(&sales_objective_value(), at(2026, 8, 23)).expect("a market");
+        assert_eq!(probe.passport.as_str(), "FR");
+        assert_eq!(probe.destination.as_str(), "VN");
+        assert_eq!(probe.travel_date.to_string(), "2026-09-22");
+
+        // A seller whose own market is the ordinary destination gets the other
+        // one: a citizen entering their own country is a probe that learns
+        // nothing.
+        let home = rolepack_sales::Objective {
+            market: Some(CountryCode::parse(PROBE_DESTINATION).expect("country")),
+            ..sales_objective_value()
+        };
+        let probe = probe_for(&home, at(2026, 8, 23)).expect("a market");
+        assert_eq!(probe.destination.as_str(), PROBE_DESTINATION_ALTERNATE);
+
+        // And an objective with no market asks rather than guessing a passport.
+        let vague = rolepack_sales::Objective {
+            market: None,
+            ..sales_objective_value()
+        };
+        assert!(probe_for(&vague, at(2026, 8, 23)).is_none());
+
+        assert_eq!(orizn_binding().tool().server.as_str(), "orizn");
     }
 }

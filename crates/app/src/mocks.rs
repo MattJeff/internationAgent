@@ -46,7 +46,7 @@ use agentos_domain::action::McpTool;
 use agentos_domain::ids::IdempotencyKey;
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::Untrusted;
-use agentos_providers::browser::{BrowserProvider, MockBrowser};
+use agentos_providers::browser::BrowserProvider;
 use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
@@ -71,6 +71,14 @@ use crate::provisioning::Adapters;
 // `ScriptedLlm` and friends come along so a test in the binary can script a
 // model without one either.
 pub use agentos_providers::llm::{Llm, LlmResponse, ScriptedLlm, Usage};
+
+// And the browser, for exactly the same reason as `ScriptedLlm` next door: the
+// sales vertical drives a prospect's page, so a test of the loop that dispatches
+// it has to be able to put text on one. The binary may not depend on
+// `agentos-providers` — see its manifest, where the absence is argued — and the
+// alternative to this line is a sales dispatch whose only end-to-end test lives
+// in the crate that cannot reach the loop.
+pub use agentos_providers::browser::MockBrowser;
 
 /// The signing secret the mock telephony adapter verifies callbacks against.
 /// Fixed and public, because a fake secret that has to be configured is a fake

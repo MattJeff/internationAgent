@@ -638,7 +638,7 @@ impl Effects {
         if !within(url.host_str(), allowed) {
             return Err(EffectError::OutOfScope(allowed.clone()));
         }
-        let session = self.session().await?;
+        let session = self.browser_session().await?;
         self.ports
             .browser
             .act(&session, BrowserStep::Goto(url))
@@ -676,7 +676,15 @@ impl Effects {
     /// `Effects` is built per turn and a turn browses once or twice; a cache
     /// here would be a copy of a row that provisioning can retire underneath it.
     /// Cache it the day a turn drives a ten-step plan.
-    async fn session(&self) -> Result<BrowserSession, EffectError> {
+    ///
+    /// Public because [`Prober`](crate::proof_of_need::Prober) is built around a
+    /// session rather than looking one up — it takes the handle in its
+    /// constructor precisely so that a browser context is a *provisioned
+    /// resource* and not something a module can conjure — and the caller that
+    /// builds a `Prober` for a self-started turn has an `Effects` and nothing
+    /// else. It widens nothing: the row is this principal's own, the query is a
+    /// read, and every step taken with the session still goes through the gate.
+    pub async fn browser_session(&self) -> Result<BrowserSession, EffectError> {
         let mut tx = self
             .db
             .tenant_tx(self.principal.tenant_id)
