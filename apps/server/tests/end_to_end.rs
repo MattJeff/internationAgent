@@ -529,9 +529,12 @@ fn bearer(secret: Option<&str>) -> Vec<(&'static str, String)> {
 /// `Arc<dyn Llm>` inside a process this test only has a socket to, and there is
 /// no route that hands a prompt back.
 ///
-/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude`, writes the whole
-/// rendered prompt to its **stdin** — never argv, deliberately, because a
-/// prompt carries a counterparty's words — and reads a JSON event array back.
+/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude` and reads a JSON
+/// event array back. The **conversation** goes to its stdin — never argv,
+/// deliberately, because a conversation carries a counterparty's words — and
+/// the **system prompt** goes to `--system-prompt`, which is where it has to be
+/// for it to be the model's system prompt rather than a user message. So the
+/// capture below is argv and stdin concatenated: that is the request, whole.
 /// `CliLlm::new()` takes the program off `PATH` and offers no variable to point
 /// it elsewhere, so shadowing `claude` with a directory of our own is the seam.
 ///
@@ -550,11 +553,13 @@ struct FakeModel {
 /// braces, and escaping every one of them to get four characters replaced is a
 /// worse trade than a placeholder.
 const FAKE_MODEL: &str = r#"#!/bin/sh
-# stdin is the whole prompt CliLlm rendered. Keep every one, in a file of its
-# own, because a turn is several round trips and which one said what matters.
+# argv carries the system prompt, stdin carries the conversation and the tool
+# schemas. Both, into one file, because the assertions below are about the
+# request and it is in two places. Keep every one, in a file of its own,
+# because a turn is several round trips and which one said what matters.
 d='@DIR@'
 p="$(mktemp "$d/prompt.XXXXXXXX")"
-cat > "$p"
+{ printf '%s\n' "$@"; cat; } > "$p"
 
 # Whose turn this is comes out of the prompt itself — the identity line the
 # server writes is `You are <slug>, an AI employee at ...`. Branching on it

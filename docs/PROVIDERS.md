@@ -137,10 +137,30 @@ It is lossier in ways that matter:
   numbers from this backend do not resemble production ones.
 * **One turn, no history reuse.** Every call is a fresh `claude -p`.
 
-Two things it does deliberately: the prompt goes in on **stdin**, never argv (a
-prompt is attacker-influenced text, and an argument starting with `--` is a
-flag); and the CLI's own tools are disabled with an empty `--allowed-tools`, so a
-text completion cannot read files or run bash on the host.
+The **conversation** goes in on stdin, never argv — it is attacker-influenced
+text, and an argument starting with `--` is a flag. The **system prompt** goes
+on argv as `--system-prompt`, which is the only way for it to be the model's
+system prompt rather than a user message; that is safe because a system prompt
+is assembled from the operator's own documents and a counterparty's words never
+reach it.
+
+`AGENTOS_LLM=cli` does not put an employee in front of a model — it puts one
+inside a Claude Code session. Four arguments and one environment variable are
+what stop that session from being the operator's, each of them measured against
+`claude` 2.1.231 by dropping it and re-running:
+
+| argument | drop it and the session gets back |
+|---|---|
+| `--system-prompt <system>` | Claude Code's own identity, ahead of ours |
+| `--tools ""` | 30 built-in tools — file and shell access on the host |
+| `--strict-mcp-config` | 5 MCP servers out of `~/.claude.json` |
+| `--setting-sources ""` | `permissionMode: plan` and the operator's settings |
+| `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` | the operator's private notes, quoted back |
+
+`--allowed-tools ""` used to stand in for all of this and never worked: it is an
+auto-approve list, not a registration list, and it left 122 tools live. About
+150 tokens of CLI context still get through — the operator's email address and
+today's date. See `crates/providers/src/llm_cli.rs` for the measurements.
 
 ### Default if you configure nothing
 
