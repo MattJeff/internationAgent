@@ -375,6 +375,7 @@ use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::org;
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
+use agentos_store::revenue as revenue_store;
 use agentos_store::turns;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1208,17 +1209,57 @@ pub async fn land(
     // `vertical::purchasing_turn` to decide whom to chase, and by nothing that
     // authorises anything. See `crate::psyche`.
     if message.direction == Direction::Inbound {
+        let from = contact_of(&message.from);
         let ours = preceded_by_our_message(tx, message.conversation_id, message_id).await?;
         psyche::observe_reply(
             tx,
             message.employee_id,
-            &contact_of(&message.from),
+            &from,
             message.conversation_id,
             message.channel.as_str(),
             ours,
             message.received_at,
         )
         .await?;
+
+        // **And where the chase stops.** `revenue::Ended::Replied` is the one
+        // that matters — anything further is a machine talking over a human —
+        // and until this line nothing in the running system could hear it: the
+        // `Sequence` that knows the reason lives in memory for the length of one
+        // turn, and `vertical::due_chase` reads `contacts`, which had no idea a
+        // reply had ever arrived. A chase loop that cannot hear "no" is worse
+        // than no chase loop.
+        //
+        // Here rather than in the sales loop for the reason every guard in this
+        // codebase is in the shared function: this is the *only* door inbound
+        // mail has, on every channel, so a reply stops the sequence whether it
+        // arrives by email or SMS and whether or not anybody ever takes the turn
+        // it enqueued. A check inside the seller's own cadence would miss the
+        // prospect who replies and is chased four minutes later by a cadence
+        // that had already selected them.
+        //
+        // `contact_of` lower-cases and drops the display name, which is exactly
+        // the spelling `contacts_email_lower` guarantees on the column — so this
+        // is an equality test on one spelling rather than a guess at three.
+        //
+        // Not a suppression: they replied, they did not opt out. STOP is
+        // `revenue_store::suppress`, and it deactivates the row.
+        match revenue_store::stop_follow_up(tx, &from).await {
+            Ok(0) => {}
+            Ok(stopped) => tracing::info!(
+                contacts = stopped,
+                "this person answered; their follow-up sequence is over"
+            ),
+            // Swallowed, and it is the one write here that is. The message has
+            // landed and the turn is enqueued; failing the whole ingest because
+            // a sales column would not update would dead-letter a human's reply
+            // over bookkeeping. Loud, because the cost of losing it is one
+            // unwanted chase in three days.
+            Err(err) => tracing::error!(
+                error = %err,
+                "a reply did not stop the follow-up sequence; this person may be chased again"
+            ),
+        }
     }
 
     Ok(Landed {

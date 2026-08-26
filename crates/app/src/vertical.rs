@@ -2649,6 +2649,302 @@ async fn contactable(
     Ok(row)
 }
 
+// ---------------------------------------------------------------------------
+// The chase
+// ---------------------------------------------------------------------------
+
+/// One person who was written to, did not answer, and is due the next touch.
+///
+/// Resolved **before** the turn is reserved, for the reason
+/// [`DueProspect`] is: "there is nobody to chase" is a reason not to start a
+/// turn rather than something to discover after paying for one.
+#[derive(Debug, Clone)]
+pub struct DueChase {
+    /// The `contacts` row [`mark_contacted`](agentos_store::revenue::mark_contacted)
+    /// meters and counts.
+    pub contact_id: Uuid,
+    /// Where the chase goes.
+    pub to: EmailAddress,
+    /// `contacts.last_contacted_at` — when the note this chases went out.
+    ///
+    /// **The only fact the second email states**, and it is ours: it comes off
+    /// our own outbox column, not off their page. See [`chase_message`].
+    pub wrote_at: DateTime<Utc>,
+    /// How many touches have already gone out. One or two, never three: the
+    /// selection filters at [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES).
+    pub touches: i32,
+}
+
+/// The next person this seller owes a chase, or `None`.
+///
+/// **`None` is not an error**, exactly as in [`due_prospect`]: a seller whose
+/// whole list was written to yesterday, or whose people have all had their
+/// three, has nothing to chase.
+///
+/// Five rules, and each is somewhere else's:
+///
+/// * [`contacts_due_for_follow_up`](agentos_store::revenue::contacts_due_for_follow_up)
+///   is the store's, and it carries four of them — `active` (a suppression
+///   deactivates by trigger), `next_follow_up_at <= now` (the spacing
+///   [`mark_contacted`](agentos_store::revenue::mark_contacted) primed, and the
+///   column [`crate::inbound::land`] clears when they reply), and the two ends
+///   of the touch range: at least one message has gone out, and fewer than
+///   [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) have.
+/// * the segment is this objective's, checked here. The queue is tenant-wide
+///   and an employee sells to one segment; a chase from a seller who did not
+///   write the first note is signed by the wrong person. It is the same rule
+///   [`due_prospect`] applies through
+///   [`accounts_without_evidence`](agentos_store::revenue::accounts_without_evidence),
+///   and it has the same known hole: two sellers on one segment are handed the
+///   same account by both queues. That is a pre-existing property of segment
+///   ownership rather than something this path introduces.
+///
+/// A contact nobody has written to yet is **not a chase**, whatever
+/// `next_follow_up_at` says about them — and the importer schedules every row it
+/// lands, so that is most of this table. The first touch is [`selling_turn`]'s
+/// and it has evidence to send; a chase there would be a message referring to an
+/// email that does not exist.
+pub async fn due_chase(
+    tx: &mut TenantTx<'_>,
+    objective: &rolepack_sales::Objective,
+    now: DateTime<Utc>,
+) -> Result<Option<DueChase>, revenue_store::RevenueError> {
+    // `1..` and not `0..`, and that lower bound is load-bearing rather than
+    // tidy. `prospects::import` writes `next_follow_up_at = now` on every row it
+    // lands, so the most-overdue end of this queue is the whole imported list —
+    // 1,615 people nobody has written to — and a bounded scan starting at zero
+    // would never reach the handful actually being chased. Those rows are a
+    // *first* touch, which is `selling_turn`'s and has evidence behind it.
+    let due = revenue_store::contacts_due_for_follow_up(
+        tx,
+        now,
+        PROSPECTS_SCANNED,
+        1..crate::revenue::MAX_TOUCHES as i64,
+    )
+    .await?;
+
+    for contact in due {
+        // `last_contacted_at` is not null for any row the query returned — only
+        // `mark_contacted` moves either column — so this is the unwrap and not a
+        // second predicate. The address can genuinely be absent: a contact is
+        // reachable by phone or by email, and this vertical sends email.
+        let (Some(raw), Some(wrote_at)) = (contact.email.as_deref(), contact.last_contacted_at)
+        else {
+            continue;
+        };
+        let Ok(to) = EmailAddress::parse(raw) else {
+            // Same argument as `due_prospect`'s: the column has a CHECK and the
+            // importer parses, so this row was written by something that did
+            // neither. One unparseable address must not stop the chase.
+            tracing::warn!(
+                contact_id = %contact.id,
+                "a contact's address will not parse; this chase is skipped"
+            );
+            continue;
+        };
+        let mine: Option<String> =
+            sqlx::query_scalar("SELECT segment FROM accounts WHERE id = $1 AND segment = $2")
+                .bind(contact.account_id)
+                .bind(segment_column(objective.segment))
+                .fetch_optional(&mut ***tx)
+                .await
+                .map_err(StoreError::from)?;
+        if mine.is_none() {
+            continue;
+        }
+        return Ok(Some(DueChase {
+            contact_id: contact.id,
+            to,
+            wrote_at,
+            touches: contact.touch_count,
+        }));
+    }
+    Ok(None)
+}
+
+/// The second email, and **it re-asserts nothing.**
+///
+/// # What it is allowed to say
+///
+/// A follow-up happens days after the note it chases, in another process, off a
+/// [`DueChase`] loaded out of `contacts`. There is no [`Approach`] in that row
+/// and there cannot be one: [`Approach::new`] takes an [`Evidence`], `Evidence`
+/// is sealed to [`Prober::check`] and deliberately not `Deserialize`, and it
+/// carries a PNG. So the question is not "how do we keep the first message's
+/// claim fresh across a restart" — it is **what may a message with no evidence
+/// behind it say**, and the answer is: what we did, not what their page shows.
+///
+/// So the body is one fact and two questions. The fact is that we wrote on a
+/// date, which is [`DueChase::wrote_at`] — our own `last_contacted_at` column,
+/// not their page. Everything is past tense and about the note. There is no
+/// claim, no requirement, no reproduction steps and no invitation to re-run
+/// them, and the opt-out every approach carries.
+///
+/// # The other two shapes, and why not
+///
+/// * **Re-probe, then chase.** The finding is re-established on today's page, so
+///   the claim is current. It costs a browser run — several seconds of somebody
+///   else's site, twice, for the reproduction bar — per chase, and that is the
+///   smaller objection. The larger one is that it does not produce a *chase*: if
+///   the page still fails, this is [`selling_turn`]'s first touch again, written
+///   to somebody who has already had it; if the prospect **fixed** it, the
+///   honest email is a different email nobody has written, and if the probe
+///   comes back [`Checked::NotReproducible`], [`Checked::Blocked`] or
+///   [`Checked::Agrees`] there is nothing to send and the turn has been spent.
+///   A chase's subject is "you did not answer", which needs no browser.
+/// * **Refuse to chase past [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE).**
+///   That is [`follow_up`]'s rule and it is the right rule *for a message that
+///   re-asserts a finding*. This one does not, so the bar has nothing to
+///   measure: the clause it protects is not in the body. It also fails in
+///   practice — [`FOLLOW_UP_AFTER`](crate::revenue::FOLLOW_UP_AFTER) is 72 hours
+///   and the bar is seven days, so the third touch lands on day 6 only if every
+///   cadence fires on time and this seller had no other prospect to work that
+///   day. A rule that silently drops the last touch of most sequences is a rule
+///   nobody can reason about.
+///
+/// # The mistake this exists to prevent
+///
+/// The briefing calls it out by name: *"Sending an unreproduced claim about
+/// another company's product is a false statement about their product, and it is
+/// the one mistake in this job that cannot be walked back."* A prospect who read
+/// the first note, **fixed the defect**, and then receives a second email
+/// asserting it is still there is exactly that — and it is the worst version,
+/// because they have already checked. A message that says nothing about their
+/// product cannot make it, whatever they did to the page in the meantime.
+///
+/// Not one byte of the prospect's page is in it, which is also what keeps the
+/// initiative loop's claim that its turn starts trusted by construction true on
+/// this path.
+fn chase_message(chase: &DueChase, opt_out: &str) -> crate::revenue::Outreach {
+    let when = chase.wrote_at.date_naive();
+    crate::revenue::Outreach {
+        subject: format!("Following up on my note of {when}"),
+        // Past tense throughout, and about the note rather than about the page.
+        // "what your entry-requirements step showed when we ran it" stays true
+        // after they deploy a fix; "what it shows" would not.
+        body: format!(
+            "I wrote to you on {when} about what your entry-requirements step showed when we ran \
+             it, and I have not heard back.\n\nIf that step is not yours, tell me who owns it and \
+             I will write to them instead. If it is and this is not worth your time, say so and I \
+             will leave it there.\n\n{opt_out}"
+        ),
+    }
+}
+
+/// What one chase came to.
+#[derive(Debug)]
+pub struct Chased {
+    /// Sent, suppressed, not due, or refused.
+    pub outcome: crate::revenue::Contacted,
+    /// Which touch this was, counting the first approach as one.
+    pub touches: i32,
+}
+
+impl Chased {
+    /// What to tell the employee happened, as the turn's opening note.
+    ///
+    /// **Ours, all of it** — a parsed address, an integer and closed reason
+    /// codes — for the same reason [`Worked::note`] is.
+    pub fn note(&self) -> String {
+        let who = self.outcome.to();
+        let last = if self.touches >= crate::revenue::MAX_TOUCHES as i32 {
+            " That was the last touch this sequence gets; they will not be chased again."
+        } else {
+            ""
+        };
+
+        if self.outcome.is_sent() {
+            format!(
+                "{who} was written to before and did not answer, so touch {} of {} has already \
+                 gone out before you were asked to think.{last}\n\nIt repeats nothing about their \
+                 product — it says when we wrote and asks whether the step is theirs — and that is \
+                 deliberate: days have passed and nobody has looked at their page since. Do not \
+                 re-state the finding, do not write a second version of it, and do not offer to \
+                 send it again. What is yours is the reply, if one comes.",
+                self.touches,
+                crate::revenue::MAX_TOUCHES,
+            )
+        } else {
+            format!(
+                "**Nothing was sent.** The follow-up to {who} came back {} — that is a boundary, \
+                 not a hiccup, and working around it is not one of your options. Report it to your \
+                 operator.",
+                self.outcome.code(),
+            )
+        }
+    }
+}
+
+/// Chase one person who did not answer, out of the employee's own store.
+///
+/// [`selling_turn`]'s sibling and deliberately the thin one: there is no check
+/// to run, no evidence to file and no authority to ask, because
+/// [`chase_message`] asserts nothing that would need any of them. What is left
+/// is the send and the mark.
+///
+/// The mark is the same shape and the same order as [`selling_turn`]'s — it
+/// commits on its own, after the send, and its failure is **returned** rather
+/// than swallowed. The trade is the same one: the email has gone, and an
+/// unmarked contact is one this employee chases again on the next cadence with
+/// its `touch_count` still short. Loud beats convenient when the quiet version
+/// mails a stranger twice.
+///
+/// The sequence is rebuilt fresh here and is not the thing that meters anything.
+/// `next_follow_up_at` is the spacing and `touch_count` is the limit, both read
+/// in [`due_chase`], both off columns that survive a restart — which is the
+/// whole reason `0036_contact_touches.sql` exists.
+pub async fn chasing_turn(
+    db: &Db,
+    seller: &Seller,
+    principal: &Principal,
+    chase: &DueChase,
+    now: DateTime<Utc>,
+) -> Result<Chased, revenue_store::RevenueError> {
+    let mut sequence = Sequence::new(chase.to.clone());
+
+    // Untrusted, exactly as `sell`'s approach is. The bytes are entirely ours —
+    // a date off our own column and a constant — but the *decision* to have
+    // written to this person came from reading their site, and labelling that
+    // trusted one touch later would be a laundering step that costs nothing to
+    // avoid. The gate grants an email either way.
+    let outcome = seller
+        .touch(
+            &mut sequence,
+            &chase_message(chase, OPT_OUT),
+            TrustLabel::Untrusted,
+            now,
+        )
+        .await;
+
+    if outcome.is_sent() {
+        let mut tx = db.tenant_tx(principal.tenant_id).await?;
+        // The next window is primed unconditionally, because the *limit* is not
+        // this column's job: `due_chase` filters on `touch_count`, so the touch
+        // this write counts is what takes an exhausted contact out of the queue.
+        // One rule, in one place, read by the selection rather than re-derived
+        // by every writer.
+        match revenue_store::mark_contacted(
+            &mut tx,
+            chase.contact_id,
+            now,
+            Some(now + crate::revenue::FOLLOW_UP_AFTER),
+        )
+        .await
+        {
+            Ok(()) => tx.commit().await?,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(Chased {
+        touches: chase.touches + i32::from(outcome.is_sent()),
+        outcome,
+    })
+}
+
 /// Everyone this employee may not write to, out of the addresses it is about to
 /// write to.
 ///
@@ -5880,6 +6176,523 @@ mod tests {
                 .await
                 .is_some(),
             "the follow-up window never opens again"
+        );
+    }
+
+    // -- the chase ----------------------------------------------------------
+
+    /// What the chase queue would offer this employee right now.
+    async fn next_chase(db: &Db, principal: &Principal, now: DateTime<Utc>) -> Option<DueChase> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let due = due_chase(&mut tx, &sales_objective_value(), now)
+            .await
+            .expect("the chase queue is readable");
+        tx.rollback().await.expect("rollback");
+        due
+    }
+
+    /// The two columns that decide whether somebody is chased again: how many
+    /// touches have gone out, and when the next one is due.
+    async fn touch_state(
+        db: &Db,
+        principal: &Principal,
+        contact: Uuid,
+    ) -> (i32, Option<DateTime<Utc>>) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let row: (i32, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT touch_count, next_follow_up_at FROM contacts WHERE id = $1")
+                .bind(contact)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the contact");
+        tx.rollback().await.expect("rollback");
+        row
+    }
+
+    /// Send the first approach the ordinary way, so the chase tests start where
+    /// production does: an account with evidence and somebody who was written
+    /// to and said nothing.
+    async fn approached(
+        db: &Db,
+        desk: &SalesDesk,
+        now: DateTime<Utc>,
+    ) -> (Uuid, Uuid, crate::revenue::Outreach) {
+        let (account, contact) = seed_described_prospect(db, &desk.principal, PROSPECT_EMAIL).await;
+        let prospect = next_prospect(db, &desk.principal, now).await.expect("due");
+        let worked = selling_turn(
+            db,
+            &desk.prober,
+            &desk.seller,
+            &orizn(),
+            &desk.principal,
+            &sales_pack(permissive()),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+        let Sold::Approached { evidence, outcome } = &worked.sold else {
+            panic!("a reproducible conflation should have been sent: {worked:?}");
+        };
+        assert!(outcome.is_sent(), "{outcome:?}");
+        let first = Approach::new(evidence, OPT_OUT)
+            .expect("the finding stands on their page")
+            .message()
+            .clone();
+        (account, contact, first)
+    }
+
+    /// **What the second email is allowed to say**, on its own and with no
+    /// database in it.
+    ///
+    /// The type already carries half the argument: a [`DueChase`] holds a
+    /// contact id, an address, a date off our own outbox column and an integer.
+    /// There is no [`Evidence`], no [`Probe`] and no page in it, so there is
+    /// nothing about the prospect's product available to say. This asserts the
+    /// other half — that what *is* available is used, and nothing that reads
+    /// like a claim is invented around it.
+    #[test]
+    fn the_second_email_states_one_fact_and_it_is_ours() {
+        let chase = DueChase {
+            contact_id: Uuid::nil(),
+            to: address(PROSPECT_EMAIL),
+            wrote_at: at(2026, 8, 12),
+            touches: 1,
+        };
+        let message = chase_message(&chase, OPT_OUT);
+
+        // The one fact, in both halves: the day we wrote, off
+        // `contacts.last_contacted_at`.
+        assert!(message.subject.contains("2026-08-12"), "{message:?}");
+        assert!(message.body.contains("2026-08-12"), "{message:?}");
+        // And the way out that every approach carries.
+        assert!(message.body.contains("reply with STOP"), "{message:?}");
+
+        // Every one of these is a clause the *first* message carried and this
+        // one may not: the reproduction steps, the pair, the page, and any
+        // present-tense statement about what their flow does.
+        for absent in [
+            "How to see it again",
+            "https://",
+            "1. ",
+            "visa",
+            "VN",
+            "shows",
+            "is wrong",
+        ] {
+            assert!(
+                !message.body.contains(absent),
+                "the chase re-asserts {absent:?}: {message:?}"
+            );
+        }
+    }
+
+    /// **The whole chase, through the real path — and it never opens their
+    /// page.**
+    ///
+    /// The first approach goes out and primes the follow-up window. Three days
+    /// later the same employee finds that person in the chase queue, writes
+    /// again, and the second message shares not one sentence with the first: no
+    /// claim, no reproduction steps, nothing that a deploy on their side could
+    /// have made false.
+    ///
+    /// The last assertion is the one this design exists for. A fortnight on,
+    /// [`Approach::still_true`] refuses the first message — the observation is
+    /// older than [`MAX_FINDING_AGE`](crate::proof_of_need::MAX_FINDING_AGE) —
+    /// and the chase still goes out, because there is nothing in it for a clock
+    /// to expire.
+    #[tokio::test]
+    async fn a_prospect_who_did_not_answer_is_chased_and_the_chase_re_asserts_nothing() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (account, contact, first) = approached(&db, &desk, now).await;
+        assert_eq!(desk.email.sent_count(), 1);
+        assert_eq!(touch_state(&db, &desk.principal, contact).await.0, 1);
+
+        // Not yet: the window `mark_contacted` primed has not come round.
+        assert!(
+            next_chase(&db, &desk.principal, now).await.is_none(),
+            "somebody written to a minute ago is already being chased"
+        );
+
+        let thursday = now + crate::revenue::FOLLOW_UP_AFTER;
+        let chase = next_chase(&db, &desk.principal, thursday)
+            .await
+            .expect("the second touch is due");
+        assert_eq!(chase.contact_id, contact);
+        assert_eq!(chase.touches, 1);
+
+        let chased = chasing_turn(&db, &desk.seller, &desk.principal, &chase, thursday)
+            .await
+            .expect("the chase reached an outcome");
+        assert!(chased.outcome.is_sent(), "{chased:?}");
+        assert_eq!(desk.email.sent_count(), 2);
+
+        let (touches, next) = touch_state(&db, &desk.principal, contact).await;
+        assert_eq!(touches, 2, "the chase did not count as a touch");
+        assert!(next.is_some(), "the third touch has no window");
+
+        // **And the queue is not starved by the importer.** `prospects::import`
+        // writes `next_follow_up_at = now` on every row it lands, so a freshly
+        // imported list is the most-overdue end of this queue and none of it is
+        // a chase. Twenty of them in front of the one real chase is the whole
+        // scan window, and without the range's lower bound the chase would
+        // never be found again.
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        for n in 0..PROSPECTS_SCANNED {
+            revenue_store::insert_contact(
+                &mut tx,
+                Uuid::now_v7(),
+                &revenue_store::NewContact {
+                    account_id: account,
+                    full_name: "Imported",
+                    email: Some(&format!("imported-{n}@airline.example")),
+                    phone: None,
+                    role: None,
+                    language: None,
+                    is_primary: false,
+                    lawful_basis: "legitimate_interest",
+                    // Exactly what the importer writes, and older than the real
+                    // chase so it sorts in front of it.
+                    next_follow_up_at: Some(now - TimeDelta::days(1)),
+                },
+            )
+            .await
+            .expect("import a contact");
+        }
+        tx.commit().await.expect("commit the import");
+
+        let still = next_chase(&db, &desk.principal, now + TimeDelta::days(6))
+            .await
+            .expect("the third touch is still due behind the imported list");
+        assert_eq!(
+            still.contact_id, contact,
+            "an imported list nobody has written to buried the chase"
+        );
+
+        // The claim is in the first message and in nothing else.
+        let second = chase_message(&chase, OPT_OUT);
+        assert!(first.body.contains("How to see it again"));
+        assert!(
+            !second.body.contains("How to see it again"),
+            "the chase repeated the reproduction steps: {second:?}"
+        );
+        // Every line of the first message except the opt-out, which both carry
+        // on purpose and which says nothing about anybody's product.
+        for line in first
+            .body
+            .lines()
+            .filter(|line| line.len() > 40 && !OPT_OUT.contains(*line))
+        {
+            assert!(
+                !second.body.contains(line),
+                "the chase repeats a sentence of the first message: {line:?}"
+            );
+        }
+
+        // And the clock the first message answers to, which this one does not.
+        let approach = Approach::filed(first, now);
+        assert!(!approach.still_true(now + TimeDelta::days(14)));
+        let fortnight = chase_message(
+            &DueChase {
+                wrote_at: now,
+                ..chase.clone()
+            },
+            OPT_OUT,
+        );
+        assert_eq!(
+            fortnight.body, second.body,
+            "the chase's words depend on something other than the day we wrote"
+        );
+    }
+
+    /// **The touch limit bites, and it bites in the selection.**
+    ///
+    /// [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) is three and `Sequence`
+    /// enforces it on a value rebuilt from nothing every turn — so before
+    /// `0036_contact_touches.sql` this loop was a machine for mailing a stranger
+    /// five times. The counter is on the row now, so the fourth chase is not
+    /// refused at the send: it is never offered, and no turn is spent on it.
+    #[tokio::test]
+    async fn the_touch_limit_bites_and_nobody_gets_a_fourth_email() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact, _) = approached(&db, &desk, now).await;
+
+        // Touches two and three, on their own cadence.
+        for day in [3, 6] {
+            let at = now + TimeDelta::days(day);
+            let chase = next_chase(&db, &desk.principal, at)
+                .await
+                .unwrap_or_else(|| panic!("touch on day {day} is not due"));
+            let chased = chasing_turn(&db, &desk.seller, &desk.principal, &chase, at)
+                .await
+                .expect("the chase reached an outcome");
+            assert!(chased.outcome.is_sent(), "day {day}: {chased:?}");
+        }
+
+        let (touches, _) = touch_state(&db, &desk.principal, contact).await;
+        assert_eq!(touches, crate::revenue::MAX_TOUCHES as i32);
+        assert_eq!(desk.email.sent_count(), 3);
+
+        // Day nine, and there is no fourth.
+        assert!(
+            next_chase(&db, &desk.principal, now + TimeDelta::days(9))
+                .await
+                .is_none(),
+            "a prospect who ignored three emails was offered a fourth"
+        );
+        assert_eq!(desk.email.sent_count(), 3);
+
+        // The last touch says so, which is the only thing the employee is told
+        // about the limit.
+        let note = Chased {
+            outcome: crate::revenue::Contacted::Sent {
+                to: address(PROSPECT_EMAIL),
+                message_id: agentos_providers::email::ProviderMessageId::new("m-1"),
+            },
+            touches: crate::revenue::MAX_TOUCHES as i32,
+        }
+        .note();
+        assert!(note.contains("last touch"), "{note}");
+    }
+
+    /// **A reply stops the sequence**, through the only door inbound mail has.
+    ///
+    /// This is the half that did not exist. `Ended::Replied` is the one that
+    /// matters — anything further is a machine talking over a human — and it
+    /// lived on a `Sequence` in memory, rebuilt empty every turn, while
+    /// `contacts` had no idea anybody had ever answered. So the chase queue
+    /// would have kept handing out a person who was already in a conversation.
+    #[tokio::test]
+    async fn a_reply_takes_a_prospect_out_of_the_chase_queue() {
+        use agentos_domain::message::{
+            CanonicalMessage, Channel as MessageChannel, Direction, ProviderRef,
+        };
+
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact, _) = approached(&db, &desk, now).await;
+
+        let thursday = now + crate::revenue::FOLLOW_UP_AFTER;
+        assert!(
+            next_chase(&db, &desk.principal, thursday).await.is_some(),
+            "the second touch was never due, so this test proves nothing"
+        );
+
+        // They answer. `inbound::land` is the production door and the only one.
+        let employee = desk.principal.employee_id;
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        let conversation = crate::inbound::conversation_for(
+            &mut tx,
+            employee,
+            MessageChannel::Email,
+            PROSPECT_EMAIL,
+            None,
+            now,
+        )
+        .await
+        .expect("conversation");
+        let provider_message_id = ProviderRef::new("msg-they-replied");
+        crate::inbound::land(
+            &mut tx,
+            &CanonicalMessage {
+                tenant_id: desk.principal.tenant_id,
+                employee_id: employee,
+                conversation_id: conversation,
+                idempotency_key: CanonicalMessage::dedupe_key(
+                    employee,
+                    MessageChannel::Email,
+                    &provider_message_id,
+                ),
+                provider_message_id,
+                channel: MessageChannel::Email,
+                direction: Direction::Inbound,
+                received_at: now + TimeDelta::hours(1),
+                // Display name and mixed case, because that is what a real
+                // reply carries and `contacts.email` is lower case.
+                from: Untrusted::new(
+                    "Head Of Digital <Head.Of.Digital@Airline.Example>".to_owned(),
+                ),
+                subject: None,
+                body_text: Untrusted::new(format!("who is this? {INJECTION}")),
+                attachments: Vec::new(),
+            },
+            now + TimeDelta::hours(1),
+        )
+        .await
+        .expect("land the reply");
+        tx.commit().await.expect("commit the reply");
+
+        let (touches, next) = touch_state(&db, &desk.principal, contact).await;
+        assert_eq!(touches, 1, "a reply invented a touch");
+        assert!(next.is_none(), "a reply left the follow-up window open");
+        assert!(
+            next_chase(&db, &desk.principal, thursday).await.is_none(),
+            "somebody who answered is still on the chase list"
+        );
+        assert!(
+            next_chase(&db, &desk.principal, now + TimeDelta::days(30))
+                .await
+                .is_none(),
+            "the chase came back later"
+        );
+    }
+
+    /// **Where each of the two boundaries actually bites on the chase**, which
+    /// is not the same place for both.
+    ///
+    /// The **suppression list** bites on the send, exactly as it does on the
+    /// first touch: an opt-out that arrives between the approach and the chase
+    /// deactivates the row and [`Seller::touch`] refuses the address before the
+    /// gate sees it. A refusal must also leave `touch_count` alone, or a
+    /// boundary would silently burn the touches it never sent.
+    ///
+    /// The **contact budget** bites *earlier*, and this test writes that down
+    /// rather than pretending otherwise. `max_new_contacts_per_day` is a cap on
+    /// **new counterparties**: `evaluate` only applies it when
+    /// [`ContactStanding`](agentos_domain::action::ContactStanding) is `New`,
+    /// and the gate reads that standing off the audit trail — so an address this
+    /// employee has already been allowed to write to is `Known` and a follow-up
+    /// to it is never refused for budget. That is the cap doing what it says,
+    /// and it is why the budget gates *entry into the sequence*: a first touch
+    /// the budget refused never reaches `mark_contacted`, so nobody who was
+    /// never approached can ever be chased. What bounds the rest is
+    /// [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES), which is the whole reason
+    /// `0036_contact_touches.sql` exists.
+    #[tokio::test]
+    async fn the_suppression_list_refuses_a_chase_and_the_budget_gates_the_sequence() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact, _) = approached(&db, &desk, now).await;
+        let thursday = now + crate::revenue::FOLLOW_UP_AFTER;
+        let chase = next_chase(&db, &desk.principal, thursday)
+            .await
+            .expect("the second touch is due");
+
+        // The suppression list, loaded the way the dispatch loads it — after an
+        // opt-out that arrived between the first touch and this one.
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        revenue_store::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewSuppression {
+                channel: revenue_store::Channel::Email,
+                address: PROSPECT_EMAIL,
+                reason: "opt_out",
+                scope: revenue_store::Scope::Tenant,
+                contact_id: Some(contact),
+                note: Some("replied STOP"),
+                suppressed_at: now,
+            },
+        )
+        .await
+        .expect("record the opt-out");
+        tx.commit().await.expect("commit the opt-out");
+
+        let seller = Seller::new(
+            desk.gate.clone(),
+            desk.effects.clone(),
+            desk.principal.clone(),
+            SENDER,
+            suppression_for(&db, &desk.principal, &chase.to).await,
+        );
+        let chased = chasing_turn(&db, &seller, &desk.principal, &chase, thursday)
+            .await
+            .expect("the chase reached an outcome");
+        assert!(
+            matches!(chased.outcome, Contacted::Suppressed { .. }),
+            "a person who opted out was chased: {chased:?}"
+        );
+        assert_eq!(desk.email.sent_count(), 1);
+        assert_eq!(
+            touch_state(&db, &desk.principal, contact).await.0,
+            1,
+            "a refused chase spent a touch"
+        );
+        assert!(
+            next_chase(&db, &desk.principal, thursday).await.is_none(),
+            "the opt-out deactivated the row and the queue still offers it"
+        );
+
+        let note = chased.note();
+        assert!(note.contains("Nothing was sent"), "{note}");
+
+        // And the budget, where it really bites: a first touch it refused never
+        // marks anybody, so the chase queue never sees them at all.
+        let broke = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            PolicyLimits {
+                max_new_contacts_per_day: 0,
+                ..permissive()
+            },
+        )
+        .await;
+        let (_, cold) = seed_described_prospect(&db, &broke.principal, PROSPECT_EMAIL).await;
+        let prospect = next_prospect(&db, &broke.principal, now)
+            .await
+            .expect("due");
+        let worked = selling_turn(
+            &db,
+            &broke.prober,
+            &broke.seller,
+            &orizn(),
+            &broke.principal,
+            &sales_pack(PolicyLimits {
+                max_new_contacts_per_day: 0,
+                ..permissive()
+            }),
+            &sales_objective_value(),
+            &prospect,
+            now,
+        )
+        .await
+        .expect("the check reached an outcome");
+        let Sold::Approached { outcome, .. } = &worked.sold else {
+            panic!("the finding is real and should have reached the send: {worked:?}");
+        };
+        assert_eq!(outcome.code(), DenyReason::ContactBudgetExhausted.code());
+        assert_eq!(
+            touch_state(&db, &broke.principal, cold).await,
+            (0, None),
+            "a refused first touch primed a follow-up window"
+        );
+        assert!(
+            next_chase(&db, &broke.principal, now + TimeDelta::days(30))
+                .await
+                .is_none(),
+            "somebody the budget never let us write to is on the chase list"
         );
     }
 

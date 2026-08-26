@@ -180,13 +180,24 @@
 //! match a number by equality. 584 of the 2,044 numbers in these lists are in
 //! some other shape and are not stored. They are still in the CSVs.
 //!
-//! And one rule does not survive the round trip: `contacts` has no touch
-//! counter, so [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) and
-//! [`Ended::Replied`](crate::revenue::Ended) — which
-//! [`Sequence::due`](crate::revenue::Sequence) enforces in memory — are not
-//! enforced on the export path. `opportunity_events` records `outreach_sent` but
-//! is keyed on an opportunity, and a cold prospect has none. A `touch_count` on
-//! `contacts`, or an events table keyed on the contact, is what would close it.
+//! **Both halves of that rule are enforced now, and neither was when this module
+//! was written.** `contacts` had no touch counter, so
+//! [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) and
+//! [`Ended::Replied`](crate::revenue::Ended) were held on a `Sequence` rebuilt
+//! empty every turn — a person could be mailed forever, and one who *replied*
+//! stayed in the queue. `0036_contact_touches.sql` put `touch_count` on the row
+//! and `mark_contacted` increments it, which is the one statement that means "we
+//! just wrote to this person" — so the selling turn, the chase and
+//! [`record_queued`] all count through it, and the limit bites in the
+//! **selection** rather than being discovered after a turn is spent. A reply
+//! clears `next_follow_up_at` from `inbound::land`, which is the only door
+//! inbound mail has on any channel.
+//!
+//! The range this module asks for is `0..MAX_TOUCHES` and the chase asks for
+//! `1..`, and the difference is not cosmetic: `prospects::import` writes
+//! `next_follow_up_at = now` on every row it lands, so the overdue end of that
+//! queue is the whole imported list with nobody written to yet. A bounded scan
+//! from zero never reaches a real chase.
 
 use std::collections::BTreeSet;
 
@@ -898,9 +909,14 @@ mod tests {
 
         // Run one: the contact is due, so it is exported and recorded.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let due = revenue_store::contacts_due_for_follow_up(&mut tx, now, 100)
-            .await
-            .expect("due");
+        let due = revenue_store::contacts_due_for_follow_up(
+            &mut tx,
+            now,
+            100,
+            0..crate::revenue::MAX_TOUCHES as i64,
+        )
+        .await
+        .expect("due");
         assert!(due.iter().any(|c| c.id == contact), "seeded contact is due");
 
         let mut candidate = ready(&email, "SafetyWing", an_approach());
@@ -912,9 +928,14 @@ mod tests {
 
         // Run two, same day, same clock.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let due = revenue_store::contacts_due_for_follow_up(&mut tx, now, 100)
-            .await
-            .expect("due");
+        let due = revenue_store::contacts_due_for_follow_up(
+            &mut tx,
+            now,
+            100,
+            0..crate::revenue::MAX_TOUCHES as i64,
+        )
+        .await
+        .expect("due");
         assert!(
             !due.iter().any(|c| c.id == contact),
             "the contact was queued once and must not come back due until \
@@ -957,9 +978,14 @@ mod tests {
         .await
         .expect("suppress");
 
-        let due = revenue_store::contacts_due_for_follow_up(&mut tx, now, 100)
-            .await
-            .expect("due");
+        let due = revenue_store::contacts_due_for_follow_up(
+            &mut tx,
+            now,
+            100,
+            0..crate::revenue::MAX_TOUCHES as i64,
+        )
+        .await
+        .expect("due");
         assert!(
             !due.iter().any(|c| c.id == contact),
             "an opt-out deactivates the contact, so the queue never sees it"

@@ -700,17 +700,43 @@ pub struct DueContact {
     pub last_contacted_at: Option<DateTime<Utc>>,
     /// The follow-up date that has come round.
     pub next_follow_up_at: DateTime<Utc>,
+    /// How many touches have actually gone out to this person — see
+    /// `0036_contact_touches.sql`. Always below the `max_touches` the caller
+    /// asked for, because that is the filter that produced this row.
+    pub touch_count: i32,
 }
 
-/// Active contacts whose follow-up is due at or before `as_of`, most overdue
-/// first.
+/// Active contacts whose next message is due at or before `as_of`, most overdue
+/// first, restricted to those who have had `touches` messages already.
 ///
 /// Suppressed people cannot appear: a suppression deactivates the contact rows
-/// it names, and the partial index this reads is `WHERE active`.
+/// it names, and the partial index this reads is `WHERE active`. Neither can
+/// somebody who replied — `app::inbound::land` clears `next_follow_up_at` when a
+/// contact writes back, and this reads `IS NOT NULL`.
+///
+/// # Why the range, and why the caller owns both ends
+///
+/// **Two different questions share this queue**, and they differ only in whether
+/// a first message counts.
+///
+/// * `app::queue`'s CSV export wants everybody with a message due, including
+///   somebody the importer scheduled and nobody has ever written to —
+///   `0..MAX_TOUCHES`.
+/// * `app::vertical::due_chase` wants only people who did not answer, so a first
+///   touch is not its work — `1..MAX_TOUCHES`. Without the lower bound it
+///   starves: `prospects::import` writes `next_follow_up_at = now` on every row
+///   it lands, so the most-overdue end of this queue is 1,615 people nobody has
+///   written to, and a bounded scan never reaches the handful who are actually
+///   being chased.
+///
+/// Both ends are the caller's for the same reason: `MAX_TOUCHES` lives in
+/// `agentos_app::revenue` beside the `Sequence` that enforces the same rule in
+/// memory, and two copies of a limit is how the two come to disagree.
 pub async fn contacts_due_for_follow_up(
     tx: &mut TenantTx<'_>,
     as_of: DateTime<Utc>,
     limit: i64,
+    touches: std::ops::Range<i64>,
 ) -> Result<Vec<DueContact>, RevenueError> {
     type Row = (
         Uuid,
@@ -721,18 +747,22 @@ pub async fn contacts_due_for_follow_up(
         Option<String>,
         Option<DateTime<Utc>>,
         DateTime<Utc>,
+        i32,
     );
 
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, account_id, full_name, email, phone, language, last_contacted_at, \
-                next_follow_up_at \
+                next_follow_up_at, touch_count \
            FROM contacts \
           WHERE active AND next_follow_up_at IS NOT NULL AND next_follow_up_at <= $1 \
+            AND touch_count >= $3 AND touch_count < $4 \
           ORDER BY next_follow_up_at, id \
           LIMIT $2",
     )
     .bind(as_of)
     .bind(limit)
+    .bind(touches.start)
+    .bind(touches.end)
     .fetch_all(&mut ***tx)
     .await?;
 
@@ -748,6 +778,7 @@ pub async fn contacts_due_for_follow_up(
                 language,
                 last_contacted_at,
                 next_follow_up_at,
+                touch_count,
             )| DueContact {
                 id,
                 account_id,
@@ -757,9 +788,40 @@ pub async fn contacts_due_for_follow_up(
                 language,
                 last_contacted_at,
                 next_follow_up_at,
+                touch_count,
             },
         )
         .collect())
+}
+
+/// **They answered. Stop chasing them.**
+///
+/// Clears `next_follow_up_at` for every active contact with this address, which
+/// is what takes them out of [`contacts_due_for_follow_up`] for good. It is
+/// `Ended::Replied` made durable, in the only sense anything asks about: the
+/// in-memory `Sequence` that knows the reason is rebuilt from nothing every
+/// turn, so the reason has nowhere to live and nothing to tell.
+///
+/// Keyed on the **address** rather than on a contact id because the caller is
+/// `app::inbound::land`, and what an inbound email carries is an address. RLS
+/// scopes it to the tenant, and `contacts_email_key` is unique per tenant, so
+/// this touches at most one row.
+///
+/// Returns how many rows it stopped, so a caller can log the interesting case
+/// and stay silent about the ordinary one — most inbound mail is from somebody
+/// nobody is chasing.
+///
+/// Not a suppression: they replied, they did not opt out. An opt-out is
+/// [`suppress`], which deactivates the row by trigger.
+pub async fn stop_follow_up(tx: &mut TenantTx<'_>, email: &str) -> Result<u64, RevenueError> {
+    Ok(sqlx::query(
+        "UPDATE contacts SET next_follow_up_at = NULL, updated_at = now() \
+          WHERE email = $1 AND active AND next_follow_up_at IS NOT NULL",
+    )
+    .bind(email)
+    .execute(&mut ***tx)
+    .await?
+    .rows_affected())
 }
 
 /// Move a contact through the follow-up queue: they were touched at
@@ -769,6 +831,14 @@ pub async fn contacts_due_for_follow_up(
 /// belonging to another tenant, because the caller may do the same thing with
 /// both. A contact who has opted out is inactive, and the trigger on the table
 /// refuses this write regardless, so there are two locks on the same door.
+///
+/// **`touch_count` goes up here, and here only.** This statement is what "we
+/// have just written to this person" means in this schema, and every path that
+/// writes to somebody runs it: the selling turn's first approach, the chase, and
+/// `app::queue::record_queued` on the CSV export. Counting in the callers
+/// instead would be three counters and a fourth caller that forgets — and the
+/// one that forgets is the one that mails a stranger a fourth time. See
+/// `0036_contact_touches.sql`.
 pub async fn mark_contacted(
     tx: &mut TenantTx<'_>,
     contact_id: Uuid,
@@ -777,7 +847,8 @@ pub async fn mark_contacted(
 ) -> Result<(), RevenueError> {
     let affected = sqlx::query(
         "UPDATE contacts \
-            SET last_contacted_at = $2, next_follow_up_at = $3, updated_at = now() \
+            SET last_contacted_at = $2, next_follow_up_at = $3, \
+                touch_count = touch_count + 1, updated_at = now() \
           WHERE id = $1 AND active",
     )
     .bind(contact_id)
@@ -2148,7 +2219,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(365), 10)
+            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(365), 10, 0..3)
                 .await
                 .expect("due")
                 .is_empty()
@@ -2386,7 +2457,7 @@ mod tests {
 
         // Before any of that, the follow-up loop works: they are due, chasing
         // them moves the date, and the queue respects the new one.
-        let due = contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10)
+        let due = contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10, 0..3)
             .await
             .expect("due");
         assert_eq!(due.len(), 1, "seeded three days out");
@@ -2394,13 +2465,13 @@ mod tests {
             .await
             .expect("chase");
         assert!(
-            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10)
+            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10, 0..3)
                 .await
                 .expect("due")
                 .is_empty(),
             "chasing them moved the date out"
         );
-        let rescheduled = contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(8), 10)
+        let rescheduled = contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(8), 10, 0..3)
             .await
             .expect("due");
         assert_eq!(rescheduled.len(), 1);
@@ -2432,7 +2503,7 @@ mod tests {
         // 1. The existing contact was deactivated by the write itself, so they
         //    have already dropped out of the follow-up queue.
         assert!(
-            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(365), 10)
+            contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(365), 10, 0..3)
                 .await
                 .expect("due")
                 .is_empty(),

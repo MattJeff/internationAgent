@@ -213,20 +213,38 @@ pub struct Assignment {
     /// an [`Outcome`] decided there. Resolving it later would mean spending a
     /// reserved turn to discover it.
     pub model: ModelId,
-    /// The prospect a sales charter works this turn, resolved here for exactly
-    /// the reason [`Assignment::model`] is: **an empty answer is a reason not to
-    /// start a turn.**
+    /// The one piece of work a sales charter does this turn, resolved here for
+    /// exactly the reason [`Assignment::model`] is: **an empty answer is a
+    /// reason not to start a turn.**
     ///
     /// `None` for every other role, and the asymmetry is the point rather than
     /// an omission. A buyer with no supplier on file still has a turn worth
     /// taking — mail to read, quotes to chase, a plan to report on — and
     /// [`vertical_step`] hands it `None` and lets it think. A seller with no
-    /// prospect due has *nothing*: the whole of its vertical is "run one
-    /// prospect's flow and say what it showed", and there is no prospect. So the
-    /// buyer's material is read inside the turn and the seller's is read before
-    /// it, and a seller whose operator has described no booking flows costs one
-    /// query per cadence rather than a model call.
-    pub prospect: Option<vertical::DueProspect>,
+    /// prospect due and nobody to chase has *nothing*: the whole of its vertical
+    /// is one prospect's flow or one unanswered note, and there is neither. So
+    /// the buyer's material is read inside the turn and the seller's is read
+    /// before it, and a seller whose operator has described no booking flows
+    /// costs one query per cadence rather than a model call.
+    pub sales: Option<SalesWork>,
+}
+
+/// The one thing a seller does this turn.
+///
+/// An enum and not two `Option`s, because it is a real either/or: a turn probes
+/// a prospect **or** chases somebody who did not answer, never both. Two
+/// `Option`s where exactly one may be `Some` is an invariant nobody can see, and
+/// the way it fails is a turn that browses a site *and* mails a second person
+/// while spending one reservation.
+pub enum SalesWork {
+    /// Somebody who was written to and did not answer. Cheaper than a probe —
+    /// no browser at all — and it is a promise already made, so it goes first.
+    Chase(vertical::DueChase),
+    /// A prospect nobody has proved anything about yet. Boxed because a
+    /// `DueProspect` carries the whole operator-written [`Flow`](agentos_app::proof_of_need::Flow)
+    /// and is four times the size of a chase, and every `Assignment` — six roles
+    /// out of six — would otherwise be padded to it.
+    Probe(Box<vertical::DueProspect>),
 }
 
 /// What the loop decided about one due employee. The `String`s are ours: a
@@ -651,20 +669,24 @@ async fn assignment_for(
     // same place: **a seller with nobody to work must not pay for a turn to find
     // that out.** `NoCharter`, `Clarify` and `NoModel` are all decided here
     // rather than inside `take_turn` precisely because the reservation is
-    // between the two, and this is a fourth reason of exactly that shape.
+    // between the two, and this is a fourth reason of exactly that shape. It
+    // covers the chase as well as the first touch: a follow-up whose contact
+    // turns out to have replied, opted out or had its three touches is a turn
+    // spent on nothing just as surely as a probe with no prospect.
     //
     // The buyer has no matching arm and does not want one. Its material is read
     // inside the turn because a buyer with no supplier still has a turn worth
-    // taking; a seller's whole vertical is one prospect's flow, and with no
-    // prospect there is nothing for the model to write about that it did not
-    // invent.
-    let prospect = match &charter {
-        Charter::Sales { objective, .. } => match prospect_for(db, due, objective, now).await? {
-            Some(prospect) => Some(prospect),
+    // taking; a seller's whole vertical is one prospect's flow or one unanswered
+    // note, and with neither there is nothing for the model to write about that
+    // it did not invent.
+    let sales = match &charter {
+        Charter::Sales { objective, .. } => match sales_work_for(db, due, objective, now).await? {
+            Some(work) => Some(work),
             None => {
                 return Err(Outcome::NoWork(
-                    "no prospect is due for this segment with a booking flow described for it; \
-                     import prospects, describe a flow, or wait for the follow-up window"
+                    "nobody is due: no prospect in this segment has a booking flow described for \
+                     it, and nobody who was written to is due a follow-up; import prospects, \
+                     describe a flow, or wait for the follow-up window"
                         .to_owned(),
                 ));
             }
@@ -685,38 +707,60 @@ async fn assignment_for(
         colleagues,
         policy,
         model,
-        prospect,
+        sales,
     }))
 }
 
-/// The prospect a sales charter would work now, in a read of its own.
+/// The one thing a sales charter would do now, in a read of its own.
 ///
 /// Its own short transaction rather than the one above: that one is already
 /// rolled back by the time the charter has been parsed, and re-opening it to
 /// carry a read that only one of six roles needs would make every other role pay
 /// for the shape of this one.
 ///
+/// **The chase is asked first.** Two reasons and they point the same way. It is
+/// a promise already made — somebody was written to and told, in effect, that
+/// they would hear again — where a new prospect is optional. And it is the
+/// cheaper turn by a wide margin: a probe is two full runs of somebody else's
+/// booking flow plus a screenshot, and a chase is one email built from our own
+/// columns. A backlog of chases starving new prospecting is the failure mode
+/// this ordering has, and it is self-limiting:
+/// [`MAX_TOUCHES`](agentos_app::revenue::MAX_TOUCHES) caps every sequence at
+/// three.
+///
 /// A store that will not answer is [`Outcome::Failed`] and no turn — not
 /// [`Outcome::NoWork`], which claims the queue is empty, and not a turn taken
 /// anyway. "We could not tell whether there is work" and "there is no work" are
 /// different sentences on an operator's status page, and only one of them is
 /// worth waking up for.
-async fn prospect_for(
+async fn sales_work_for(
     db: &Db,
     due: &Due,
     objective: &agentos_app::rolepack_sales::Objective,
     now: DateTime<Utc>,
-) -> Result<Option<vertical::DueProspect>, Outcome> {
+) -> Result<Option<SalesWork>, Outcome> {
     let mut tx = db
         .tenant_tx(due.tenant_id)
         .await
         .map_err(|err| Outcome::Failed(format!("no tenant transaction: {err}")))?;
-    let read = vertical::due_prospect(&mut tx, objective, now).await;
+
+    let read = async {
+        if let Some(chase) = vertical::due_chase(&mut tx, objective, now).await? {
+            return Ok(Some(SalesWork::Chase(chase)));
+        }
+        Ok(vertical::due_prospect(&mut tx, objective, now)
+            .await?
+            .map(|prospect| SalesWork::Probe(Box::new(prospect))))
+    }
+    .await;
+
     // Read-only, so the rollback is bookkeeping rather than a decision — but it
     // is awaited so the pooled connection goes back deliberately.
     let _ = tx.rollback().await;
 
-    read.map_err(|err| Outcome::Failed(format!("could not read this seller's prospects: {err}")))
+    read.map_err(|err: agentos_store::revenue::RevenueError| {
+        Outcome::Failed(format!("could not read this seller's prospects: {err}"))
+    })
 }
 
 /// Write the outcome down, in its own short transaction.
@@ -763,7 +807,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         colleagues,
         policy,
         model,
-        prospect,
+        sales,
     } = assignment;
     let role = charter.role();
 
@@ -798,7 +842,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         &principal,
         &charter,
         &address,
-        prospect.as_ref(),
+        sales.as_ref(),
     )
     .await;
 
@@ -1024,7 +1068,7 @@ async fn vertical_step(
     principal: &ActingAs,
     charter: &Charter,
     address: &str,
-    prospect: Option<&vertical::DueProspect>,
+    sales: Option<&SalesWork>,
 ) -> Option<String> {
     match charter {
         Charter::Purchasing { pack, objective } => {
@@ -1067,18 +1111,22 @@ async fn vertical_step(
             }
         }
 
-        // The prospect was resolved before the turn was reserved, so `None`
-        // here is not "nothing due" — that never got this far. It is the one
-        // race the split leaves: a prospect that was written to, suppressed or
-        // proved something about between `assignment_for` and now. One ordinary
-        // turn, and the next cadence reads the queue again.
-        Charter::Sales { pack, objective } => {
-            let prospect = prospect?;
-            selling_step(
-                agent, effects, principal, address, pack, objective, prospect,
-            )
-            .await
-        }
+        // The work was resolved before the turn was reserved, so `None` here is
+        // not "nothing due" — that never got this far. It is the one race the
+        // split leaves: a prospect that was written to, suppressed or proved
+        // something about between `assignment_for` and now. One ordinary turn,
+        // and the next cadence reads the queue again.
+        Charter::Sales { pack, objective } => match sales? {
+            SalesWork::Chase(chase) => {
+                chasing_step(agent, effects, principal, address, chase).await
+            }
+            SalesWork::Probe(prospect) => {
+                selling_step(
+                    agent, effects, principal, address, pack, objective, prospect,
+                )
+                .await
+            }
+        },
 
         // The four service packs. No vertical operation exists for any of them
         // — there is no `vertical::support_turn` to call, not a decision made
@@ -1183,6 +1231,71 @@ async fn selling_step(
                 code = err.code(),
                 error = %err,
                 "the sales vertical did not run; the employee takes an ordinary turn"
+            );
+            None
+        }
+    }
+}
+
+/// The chase, out of the same [`Effects`] the turn is built on.
+///
+/// [`selling_step`]'s sibling with two things missing, and both absences are the
+/// design rather than a shortcut.
+///
+/// **No browser.** `vertical::chase_message` asserts nothing about the
+/// prospect's product — see its docs for the argument against re-probing — so
+/// there is no page to load and no session to fail on. A seller whose browser
+/// context was never provisioned takes an ordinary turn on the probe path and
+/// still chases here, which is the right way round: the cheap honest message
+/// should not be blocked on the expensive one's tooling.
+///
+/// **No `Prober`, no Orizn and no evidence.** Nothing new is claimed, so nothing
+/// new is checked and there is nothing to file. The account already has the
+/// finding the first note was built on.
+///
+/// What is *not* missing is either legal boundary.
+/// [`vertical::suppression_for`] is asked exactly as it is next door — the
+/// schema's `SECURITY DEFINER` lookup, the only reader that can see a global
+/// opt-out — and the email goes through the same
+/// [`Seller::touch`](agentos_app::revenue::Seller::touch), so it is counted
+/// against the same `max_new_contacts_per_day` as a first approach. A follow-up
+/// is an email to a person; the budget does not get a discount for it being the
+/// second one.
+async fn chasing_step(
+    agent: &Agent,
+    effects: &Effects,
+    principal: &ActingAs,
+    address: &str,
+    chase: &vertical::DueChase,
+) -> Option<String> {
+    let seller = Seller::new(
+        agent.gate.clone(),
+        effects.clone(),
+        principal.clone(),
+        address.to_owned(),
+        vertical::suppression_for(&agent.db, principal, &chase.to).await,
+    );
+
+    match vertical::chasing_turn(&agent.db, &seller, principal, chase, Utc::now()).await {
+        Ok(chased) => {
+            // Two stable labels, and the recipient is on neither: a counter
+            // keyed by address is one time series per prospect and a leak in
+            // every collector that scrapes it.
+            tracing::info!(
+                chased = chased.outcome.code(),
+                touch = chased.touches,
+                "the chase ran before the turn"
+            );
+            Some(chased.note())
+        }
+        // Logged and swallowed, exactly as the other two verticals are. The mark
+        // is the only thing that can fail here and it fails *after* the send, so
+        // the cost is one duplicate chase on the next cadence — not a reason to
+        // spend the reserved turn on nothing.
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "the chase did not run; the employee takes an ordinary turn"
             );
             None
         }
@@ -2398,6 +2511,105 @@ pub(crate) mod tests {
             spent, 1,
             "one cadence must cost exactly one turn, vertical or no vertical"
         );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The chase, end to end through the loop — and it never opens their
+    /// page.**
+    ///
+    /// `vertical::follow_up` has existed since the sales vertical shipped and
+    /// nothing in the running system called it: `mark_contacted` primed
+    /// `contacts.next_follow_up_at` on every approach and no loop drained the
+    /// queue, so the second and third touches were a function nobody invoked.
+    /// This is the driver.
+    ///
+    /// Two ticks. The first is the ordinary selling turn: the prospect's flow is
+    /// run twice, the approach goes out, the finding is filed and the follow-up
+    /// window is primed. The second is three days later, when that account has
+    /// evidence and is therefore out of `due_prospect`'s queue entirely — so the
+    /// only thing this seller can be given is the chase, and it takes it.
+    ///
+    /// The browser assertion is the load-bearing one. Between the two ticks the
+    /// prospect **fixes their panel**, which is exactly the case a chase that
+    /// re-asserted the finding would get wrong in the direction that cannot be
+    /// walked back. The second turn reads their page zero times, so there is
+    /// nothing to get wrong: the read count is still the first turn's two.
+    #[tokio::test]
+    async fn a_prospect_due_for_a_chase_gets_one_through_the_loop_without_reading_their_page() {
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "chasing-seller", Some(selling())).await;
+        let account = seed_prospect(
+            &db,
+            tenant,
+            employee,
+            PROSPECT_DOMAIN,
+            "head.of.digital@airline.example",
+        )
+        .await;
+        sales_limits(&db, tenant, 5).await;
+
+        let cancel = CancellationToken::new();
+        let (agent, browser) = selling_agent(&db, &cancel);
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            async move { take_turn(agent, assignment).await }
+        };
+
+        let now = Utc::now();
+        assert_eq!(tick(&db, &take, &cancel, now).await.expect("tick"), 1);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "turn");
+        assert_eq!(emails_sent(&db, tenant, employee).await, 1);
+        let reads = |browser: &Arc<agentos_app::mocks::MockBrowser>| {
+            browser
+                .log()
+                .iter()
+                .filter(|line| line.contains(&format!("text {PANEL_SELECTOR}")))
+                .count()
+        };
+        assert_eq!(reads(&browser), 2, "the probe did not run twice");
+
+        // They fix it. A chase that re-established the claim would now be
+        // telling somebody a thing about their own product that they have
+        // already corrected — the one mistake in this job that cannot be walked
+        // back, and the worst version of it, because they have checked.
+        browser.set_text(PANEL_SELECTOR, &["A visa is required for this trip."]);
+
+        // Three days on. The account has evidence, so there is no prospect to
+        // probe; the only work is the chase.
+        let thursday = now + chrono::TimeDelta::hours(73);
+        assert_eq!(tick(&db, &take, &cancel, thursday).await.expect("tick"), 1);
+        assert_eq!(outcome_of(&db, tenant, employee).await.0, "turn");
+        assert_eq!(
+            emails_sent(&db, tenant, employee).await,
+            2,
+            "the second touch never left the building"
+        );
+        assert_eq!(
+            reads(&browser),
+            2,
+            "the chase opened the prospect's page: {:?}",
+            browser.log()
+        );
+        assert_eq!(
+            findings(&db, tenant, account).await.len(),
+            1,
+            "the chase filed a second finding"
+        );
+
+        // And the counter that stops it happening five times.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let touches: i32 =
+            sqlx::query_scalar("SELECT touch_count FROM contacts WHERE account_id = $1")
+                .bind(account)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the contact");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(touches, 2, "the chase did not count as a touch");
 
         drop_tenant(&db, tenant).await;
     }

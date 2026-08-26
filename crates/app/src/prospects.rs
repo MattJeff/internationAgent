@@ -853,9 +853,14 @@ mod tests {
 
         // And they are in the queue the seller reads, which is the whole point
         // of importing them.
-        let due = agentos_store::revenue::contacts_due_for_follow_up(&mut tx, now, 100)
-            .await
-            .expect("due");
+        let due = agentos_store::revenue::contacts_due_for_follow_up(
+            &mut tx,
+            now,
+            100,
+            0..crate::revenue::MAX_TOUCHES as i64,
+        )
+        .await
+        .expect("due");
         assert_eq!(due.len(), 3);
 
         tx.rollback().await.expect("rollback");
@@ -976,9 +981,14 @@ mod tests {
             "an import may not re-activate an opt-out or put it back in the queue"
         );
 
-        let due = agentos_store::revenue::contacts_due_for_follow_up(&mut tx, now, 100)
-            .await
-            .expect("due");
+        let due = agentos_store::revenue::contacts_due_for_follow_up(
+            &mut tx,
+            now,
+            100,
+            0..crate::revenue::MAX_TOUCHES as i64,
+        )
+        .await
+        .expect("due");
         assert_eq!(due.len(), 1, "only the one who never opted out");
 
         tx.rollback().await.expect("rollback");
