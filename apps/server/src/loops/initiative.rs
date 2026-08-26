@@ -1936,20 +1936,36 @@ pub(crate) mod tests {
         )
         .await
         .expect("insert contact");
+        // The account has to be visible before its flow can reference it, and
+        // the flow is written on a *different* connection — so this commits
+        // first rather than last.
+        tx.commit().await.expect("commit the prospect");
+
+        // A second transaction, and an **admin** one, because that is what the
+        // real path is: `agentos-server flow` writes this table on the
+        // operator's own database credential, and `app_role` is denied INSERT
+        // outright. A fixture that could write it as the application would be
+        // asserting a privilege the product deliberately withholds.
+        let mut operator = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        // `confirmed_by` is not decoration: migration 0032 gives `app_role` no
+        // INSERT here at all, and `Flow::confirmed` refuses a row nobody put a
+        // name on. A fixture that omitted it would seed a prospect this loop
+        // correctly skips, and the test would pass by finding nothing.
         sqlx::query(
             "INSERT INTO prospect_flows \
-                 (tenant_id, account_id, entry, passport_field, destination_field, date_field, \
-                  submit, panel) \
-             VALUES ($1, $2, $3, '#passport', '#destination', '#travel-date', '#check', $4)",
+                 (tenant_id, account_id, entry_url, passport_field, destination_field, \
+                  date_field, submit, panel, confirmed_by, confirmed_at) \
+             VALUES ($1, $2, $3, '#passport', '#destination', '#travel-date', '#check', $4, \
+                     'fixture', now())",
         )
         .bind(tenant.as_uuid())
         .bind(account)
         .bind(format!("https://{domain}/entry"))
         .bind(PANEL_SELECTOR)
-        .execute(&mut **tx)
+        .execute(&mut *operator)
         .await
         .expect("insert flow");
-        tx.commit().await.expect("commit the prospect");
+        operator.commit().await.expect("commit the flow");
         account
     }
 
