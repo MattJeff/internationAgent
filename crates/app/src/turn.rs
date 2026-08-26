@@ -344,8 +344,8 @@ fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 6] {
             Risk::Low,
             // The second sentence is a correction, like `pay`'s. A dry run
             // caught an employee escalating to a colleague by *inventing* that
-            // colleague's address — `founder@orizn.com` for a company whose real
-            // address is `founder@agents.orizn.com` — and everything downstream
+            // colleague's address — `founder@orizn.app` for a company whose real
+            // address is `founder@agents.orizn.app` — and everything downstream
             // behaved: the domain was on the allowlist, the gate allowed it, the
             // provider accepted it, and the employee reported the escalation as
             // done. Nothing had told the model that the names in its roster are

@@ -2726,7 +2726,7 @@ pub(crate) mod tests {
                 .expect("coherent"),
             ),
             allowed_channels: [Channel::Email, Channel::Internal].into(),
-            allowed_domains: [Domain::parse("orizn.com").expect("domain")].into(),
+            allowed_domains: [Domain::parse("orizn.app").expect("domain")].into(),
             max_new_contacts_per_day: 20,
             max_turns_per_day: 30,
             ..PolicyLimits::default()
@@ -2770,7 +2770,7 @@ pub(crate) mod tests {
             ]
             .into(),
             allowed_domains: [
-                Domain::parse("orizn.com").expect("domain"),
+                Domain::parse("orizn.app").expect("domain"),
                 Domain::parse("anything.example.net").expect("domain"),
             ]
             .into(),
@@ -2894,7 +2894,7 @@ pub(crate) mod tests {
         let (tenant, employee) = commissioned(&db, "undo").await;
 
         let email = Action::EmailSend {
-            to: EmailAddress::parse("buyer@orizn.com").expect("address"),
+            to: EmailAddress::parse("buyer@orizn.app").expect("address"),
         };
         let ctx = ActionCtx {
             trust: TrustLabel::Trusted,

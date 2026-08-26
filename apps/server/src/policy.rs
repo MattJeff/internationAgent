@@ -931,7 +931,7 @@ mod tests {
                 SpendLimits::try_new(usd(50_000), usd(200_000), usd(100)).expect("coherent"),
             ),
             allowed_channels: [Channel::Email, Channel::Internal, Channel::Web].into(),
-            allowed_domains: [domain("orizn.com")].into(),
+            allowed_domains: [domain("orizn.app")].into(),
             max_new_contacts_per_day: 20,
             max_turns_per_day: 30,
             ..PolicyLimits::default()
@@ -941,10 +941,10 @@ mod tests {
         let tenant = TenantId::new_v7(now);
         let employee = EmployeeId::new_v7(now);
         let browse = Action::BrowserRead {
-            domain: domain("docs.orizn.com"),
+            domain: domain("docs.orizn.app"),
         };
         let email = Action::EmailSend {
-            to: EmailAddress::parse("buyer@orizn.com").expect("address"),
+            to: EmailAddress::parse("buyer@orizn.app").expect("address"),
         };
         let ctx = ActionCtx {
             trust: TrustLabel::Trusted,

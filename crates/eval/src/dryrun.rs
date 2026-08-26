@@ -244,7 +244,7 @@ impl Company {
 async fn stand_up(db: Db) -> Company {
     let now = Utc::now();
     let tenant = TenantId::new_v7(now);
-    let domain = Domain::parse("agents.orizn.com").expect("the org document's domain");
+    let domain = Domain::parse("agents.orizn.app").expect("the org document's domain");
 
     // 2. the ceiling. Before this the gate refuses everything, which is the
     //    safe direction and the first thing an operator sees.

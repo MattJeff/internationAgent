@@ -133,7 +133,7 @@ const EXPECTED: &[Expected] = &[
         turns: 30,
         contacts: 0,
         channels: &[Channel::Email, Channel::Internal],
-        domains: &["orizn.com"],
+        domains: &["orizn.app"],
         spend: None,
     },
     // Not zero contacts, and the difference is the reason: standing is computed
@@ -145,7 +145,7 @@ const EXPECTED: &[Expected] = &[
         turns: 20,
         contacts: 20,
         channels: &[Channel::Email, Channel::Internal],
-        domains: &["orizn.com"],
+        domains: &["orizn.app"],
         spend: None,
     },
     // Internal only: no outward channel exists, so the zero means what it says.
@@ -155,7 +155,7 @@ const EXPECTED: &[Expected] = &[
         turns: 10,
         contacts: 0,
         channels: &[Channel::Internal],
-        domains: &["orizn.com"],
+        domains: &["orizn.app"],
         spend: None,
     },
     // The only function that may propose money, and the only row with spend
@@ -244,7 +244,7 @@ impl Orizn {
             ("PUBLIC_HOST", format!("http://127.0.0.1:{port}")),
             // The document's own domain, so the addresses this test mints are
             // the addresses the runbook says it mints.
-            ("AGENT_EMAIL_DOMAIN", "agents.orizn.com".to_owned()),
+            ("AGENT_EMAIL_DOMAIN", "agents.orizn.app".to_owned()),
             ("DATABASE_URL", database_url.clone()),
             ("AGENTOS_MASTER_KEY", "not-a-real-key".to_owned()),
             ("AGENTOS_ALLOW_MOCKS", "1".to_owned()),

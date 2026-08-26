@@ -180,7 +180,7 @@ that unions, so a lower layer can always add a block and never remove one.
 | `approval_above` | **$1** | The default ceiling ships $100, i.e. an unsupervised band under a hundred dollars. Orizn has exactly one function that may pay and it already sends every payment to a person; a band nobody at this company is entitled to should not exist at the top either. One dollar means no configuration mistake *below* the ceiling can produce an unsupervised payment. |
 | `allowed_channels` | `email`, `internal`, `web` | `web` is the operator console — inbound only, never gated as an outbound channel — so it grants nothing and is kept only to match the shipped default. |
 | `allowed_calling_codes` | **empty** | Orizn phones nobody. The `sales-development` pack lists thirteen calling codes and `Channel::Voice`; this empty set intersects all fourteen away before any role layer is read. That is the ceiling doing its job, and it is why the sales role layer below writes `{email,internal}` rather than restating a `voice` grant that cannot survive. |
-| `allowed_domains` | `orizn.com` | **This is where the prospect account list goes**, and it is the one genuinely awkward consequence of intersection: an allowlist entry can only be *removed* by a lower layer, so a domain that is not here is unreachable by everybody. `orizn.com` covers `docs.`, `status.` and every other subdomain — entries match themselves and everything beneath them. Adding an account to probe is a ceiling change: `policy install` again, and `/readyz` needs no restart. |
+| `allowed_domains` | `orizn.app` | **This is where the prospect account list goes**, and it is the one genuinely awkward consequence of intersection: an allowlist entry can only be *removed* by a lower layer, so a domain that is not here is unreachable by everybody. `orizn.app` covers `docs.`, `status.` and every other subdomain — entries match themselves and everything beneath them. Adding an account to probe is a ceiling change: `policy install` again, and `/readyz` needs no restart. |
 | `max_new_contacts_per_day` | 20 | The largest any function gets (customer success). |
 | `max_turns_per_day` | 30 | The largest any function gets (sales). This is the blast radius of a typo: a team pointed at an unwritten `role_name` runs on exactly this. Thirty turns a day is about **$21 a month** — a number you can afford to be wrong about. The shipped default is 200. |
 | the three booleans | `false` | Uploading, rotating a credential and deleting data are `AND`ed down the stack, so `false` here is `false` everywhere, forever, until the ceiling changes. |
@@ -224,7 +224,7 @@ layers, so a later document can add a block and nothing can remove one.
 > `agentos-server policy install` prints back: it is a whole layer, and every
 > layer here is a whole layer.
 
-#### `sales-development` — 30 turns, **0 new contacts**, `{email,internal}`, `orizn.com`
+#### `sales-development` — 30 turns, **0 new contacts**, `{email,internal}`, `orizn.app`
 
 The pack sets `max_new_contacts_per_day` to `0` and explains why: the gate reads
 zero as "every first contact is denied", on every channel, with no second flag,
@@ -270,7 +270,7 @@ about another company's booking flow is the one mistake in this job that cannot
 be walked back. Ten findings a day is already more than one founder can follow
 up on. The pack's default is 40; Orizn has one seller and no pipeline yet.
 
-#### `customer-success` — 20 turns, 20 new contacts, `{email,internal}`, `orizn.com`
+#### `customer-success` — 20 turns, 20 new contacts, `{email,internal}`, `orizn.app`
 
 **Twenty new contacts, not zero, and the reason is a subtlety worth knowing.**
 `ContactStanding` is computed from this employee's *own outbound trail*
@@ -288,7 +288,7 @@ queue. **This is the setting most likely to be wrong first** — the day an
 airline goes live, a wrong entry requirement is a denied boarding, and this is
 the number to raise.
 
-#### `growth` — 10 turns, 0 new contacts, `{internal}` only, `orizn.com`
+#### `growth` — 10 turns, 0 new contacts, `{internal}` only, `orizn.app`
 
 Zero contacts here means what it says rather than standing in for a policy
 decision: there is no outward channel for a contact to happen on. The pack omits
