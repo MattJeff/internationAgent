@@ -216,25 +216,25 @@ impl Sample {
 /// impossible.
 pub const RECORDED: &[Sample] = &[
     Sample {
-        calls_per_turn: 1.33,
-        input_tokens_per_call: 4598.5,
-        output_tokens_per_call: 618.5,
+        calls_per_turn: 1.67,
+        input_tokens_per_call: 4633.6,
+        output_tokens_per_call: 672.4,
     },
     Sample {
         calls_per_turn: 1.67,
-        input_tokens_per_call: 4525.8,
-        output_tokens_per_call: 832.2,
+        input_tokens_per_call: 4699.6,
+        output_tokens_per_call: 640.8,
     },
     Sample {
         calls_per_turn: 1.33,
-        input_tokens_per_call: 4129.0,
-        output_tokens_per_call: 641.5,
+        input_tokens_per_call: 4385.5,
+        output_tokens_per_call: 791.8,
     },
 ];
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "f9ad4a23a79221db";
+pub const DIGEST: &str = "f2db0d5b7e96f65b";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
