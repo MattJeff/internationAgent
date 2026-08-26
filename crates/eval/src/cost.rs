@@ -217,24 +217,24 @@ impl Sample {
 pub const RECORDED: &[Sample] = &[
     Sample {
         calls_per_turn: 1.33,
-        input_tokens_per_call: 4106.2,
-        output_tokens_per_call: 650.0,
+        input_tokens_per_call: 4598.5,
+        output_tokens_per_call: 618.5,
     },
     Sample {
-        calls_per_turn: 4.67,
-        input_tokens_per_call: 4407.4,
-        output_tokens_per_call: 328.3,
+        calls_per_turn: 1.67,
+        input_tokens_per_call: 4525.8,
+        output_tokens_per_call: 832.2,
     },
     Sample {
-        calls_per_turn: 2.00,
-        input_tokens_per_call: 4438.3,
-        output_tokens_per_call: 640.0,
+        calls_per_turn: 1.33,
+        input_tokens_per_call: 4129.0,
+        output_tokens_per_call: 641.5,
     },
 ];
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "2827a1a4bd32805d";
+pub const DIGEST: &str = "f9ad4a23a79221db";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
