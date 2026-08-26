@@ -27,4 +27,10 @@ fn a_prospect_cannot_be_approached_without_a_reproduced_finding() {
     // And the way round that: writing the finding out by hand. The seal has no
     // name outside `proof_of_need`.
     t.compile_fail("tests/ui/vertical_forged_evidence.rs");
+
+    // And one step earlier: writing the *selectors* out by hand, so that a real
+    // observation is made of the wrong element. `Flow` carries the same kind of
+    // seal for the same kind of reason — see the file for why a guessed selector
+    // is a different failure from a broken one.
+    t.compile_fail("tests/ui/proof_of_need_forged_flow.rs");
 }

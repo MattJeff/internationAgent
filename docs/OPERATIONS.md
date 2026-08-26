@@ -121,6 +121,54 @@ The document must be a **complete** `PolicyLimits` — the layers intersect, so 
 omitted field is *deny*, not "leave it alone", and the installer refuses a
 document that omits one. `docs/TEAMS.md` §2 has the shape and the warning.
 
+### 1.4c A prospect's booking flow, if you are running the seller
+
+The sales vertical probes a prospect's own booking page and reports what it
+said. It needs to know **where the fields are** — an entry URL and five CSS
+selectors — and there is no way to work that out safely: a selector aimed at an
+element that does not exist fails loudly, but one aimed at the *wrong* element
+resolves, reads the same text on both runs, passes the reproducibility bar and
+gets screenshotted into an email telling a company what its own checkout said.
+
+So a person writes them, and a person's name is what makes them usable:
+
+```bash
+agentos-server flow set --tenant $TENANT --account $ACCOUNT flow.json
+agentos-server flow confirm --tenant $TENANT --account $ACCOUNT --by "Your Name"
+```
+
+`$ACCOUNT` is `accounts.id`. `flow.json` is:
+
+```json
+{
+  "entry_url": "https://book.example.com/entry-requirements",
+  "passport_field": "#passport",
+  "destination_field": "#destination",
+  "date_field": "#travel-date",
+  "submit": "#check",
+  "panel": "#visa-info"
+}
+```
+
+`date_field` and `submit` are optional. `submit` is their **check requirements**
+button and never a booking or payment submit — nothing in this system can tell
+those apart. `entry_url` must be https and on the account's own domain.
+
+Three things follow from the confirmation being the point:
+
+* **`set` always leaves the row unconfirmed**, and re-running it on a confirmed
+  row clears the confirmation. A selector nobody has looked at is a selector
+  nobody has looked at.
+* **An unconfirmed flow is not skipped**, it is the head of the queue and the
+  seller returns `flow_unconfirmed` naming the account until somebody confirms
+  it. That is deliberate: a bulk-loaded guess that quietly waited its turn is
+  the guess that eventually gets probed.
+* **The domain has to be on the employee's `allowed_domains`** (§1.4b), or the
+  seller answers `domain_not_allowed` naming the domain. Also not a skip.
+
+Both verbs read `DATABASE_URL` and nothing else, for §1.4's reason. The running
+server has no INSERT or UPDATE on this table at all.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**

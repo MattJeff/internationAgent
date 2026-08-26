@@ -33,6 +33,7 @@ mod auth; // U30
 mod config; // U30
 mod doctor;
 mod error; // U30
+mod flow; // the selectors on a prospect's booking page, written by a human
 mod loops; // U35 U36 U37
 mod metrics;
 mod policy;
@@ -179,16 +180,19 @@ enum BootError {
 }
 
 fn main() -> ExitCode {
-    // Both subcommands run before `Config::from_env`, and for the same reason:
-    // `doctor` answers "what do I still need to make this work?" and `policy`
-    // installs the one thing it cannot answer for, so neither may require the
-    // configuration it exists to fix. `policy` reads `DATABASE_URL` itself and
-    // nothing else — see that module for why the ceiling is a subcommand and
-    // not a route.
+    // All three subcommands run before `Config::from_env`, and for the same
+    // reason: `doctor` answers "what do I still need to make this work?",
+    // `policy` installs the one thing it cannot answer for, and `flow` writes
+    // the one piece of material the sales vertical cannot invent — so none of
+    // them may require the configuration it exists to fix. Each reads
+    // `DATABASE_URL` itself and nothing else; see those modules for why writing
+    // a limit and writing a selector are proved by the operator's own database
+    // credential rather than by an API key.
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor::main(),
         Some("policy") => return policy::main(&args[1..]),
+        Some("flow") => return flow::main(&args[1..]),
         _ => {}
     }
 

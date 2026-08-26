@@ -1,0 +1,7 @@
+error: cannot construct `Flow` with struct literal syntax due to private fields
+  --> tests/ui/proof_of_need_forged_flow.rs:18:5
+   |
+18 |     Flow {
+   |     ^^^^
+   |
+   = note: ...and other private field `_confirmed` that was not provided

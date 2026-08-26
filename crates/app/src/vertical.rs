@@ -2125,7 +2125,6 @@ mod tests {
     use agentos_store::db::Db;
     use async_trait::async_trait;
     use chrono::{NaiveDate, TimeDelta};
-    use url::Url;
 
     use super::*;
     use crate::effects::{Effects, Ports};
@@ -3776,17 +3775,24 @@ mod tests {
 
     // -- sales -------------------------------------------------------------
 
+    /// A prospect's flow, through the only constructor there is: a stored row
+    /// with the name of the human who opened the page on it. See
+    /// [`Flow`](crate::proof_of_need::Flow) for why there is no second way.
     fn flow() -> Flow {
-        Flow {
+        Flow::confirmed(agentos_store::revenue::ProspectFlow {
+            account_id: Uuid::nil(),
             prospect: "Airline Example".to_owned(),
-            domain: Domain::parse("book.airline.example").expect("domain"),
-            entry: Url::parse("https://book.airline.example/entry").expect("url"),
+            domain: "book.airline.example".to_owned(),
+            entry_url: "https://book.airline.example/entry".to_owned(),
             passport_field: "#passport".to_owned(),
             destination_field: "#destination".to_owned(),
             date_field: Some("#travel-date".to_owned()),
             submit: Some("#check".to_owned()),
             panel: "#visa-info".to_owned(),
-        }
+            confirmed_by: Some("mathis".to_owned()),
+            confirmed_at: Some(Utc::now()),
+        })
+        .expect("a confirmed flow")
     }
 
     fn probe() -> Probe {

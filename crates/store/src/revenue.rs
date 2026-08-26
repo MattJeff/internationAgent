@@ -43,6 +43,14 @@
 //! carries the rules; `agentos_app::proof_of_need` carries how to read the
 //! number.
 //!
+//! **A prospect's booking flow is written by a human and only read by the
+//! application.** `0032_prospect_flows.sql` grants `app_role` no INSERT and no
+//! UPDATE on `prospect_flows`, so [`set_prospect_flow`] and
+//! [`confirm_prospect_flow`] are the only two functions in this file that take
+//! an admin transaction. A selector decides which element on somebody else's
+//! page a claim gets made about; see [`set_prospect_flow`] for why that is not
+//! a thing an employee may write.
+//!
 //! **Money is [`Money`] on the way in and on the way out**, never a bare
 //! integer: minor units plus a currency, converted at the boundary.
 //!
@@ -52,12 +60,12 @@
 //! `&str` for the same reason — the CHECK constraints in the migration are the
 //! authority, and the domain enums map onto them with `as_str()`.
 
-use agentos_domain::ids::EmployeeId;
+use agentos_domain::ids::{EmployeeId, TenantId};
 use agentos_domain::money::{Currency, Money, MoneyError};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
-use crate::db::{StoreError, TenantTx};
+use crate::db::{Db, StoreError, TenantTx};
 
 /// SQLSTATE raised by the suppression triggers in `0011_revenue.sql`. Nothing
 /// else in the workspace raises it.
@@ -219,6 +227,200 @@ pub async fn accounts_without_evidence(
             },
         )
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Prospect flows
+// ---------------------------------------------------------------------------
+
+/// One prospect's booking page, as a human wrote it down.
+///
+/// The schema and the argument are in `0032_prospect_flows.sql`. Three things
+/// are worth knowing here.
+///
+/// **It is a row, not a `Flow`.** `agentos_app::proof_of_need::Flow` is the
+/// value a probe runs on and it carries a private seal;
+/// `Flow::confirmed` is the only thing that turns one of these into one, and it
+/// refuses a row where [`ProspectFlow::confirmed_by`] is `None`. So the
+/// confirmation bar is enforced once, in the app crate, rather than half here
+/// and half there — the same discipline as suppression, which this file
+/// deliberately does not check either.
+///
+/// **`prospect` and `domain` are joined, not stored.** They are
+/// `accounts.legal_name` and `accounts.domain`. A flow does not get its own copy
+/// of where a prospect lives.
+///
+/// **Deliberately not `Deserialize`.** These selectors decide which element on
+/// somebody else's page a claim will be made about; a struct that can be parsed
+/// from JSON is a struct that will one day be parsed from model output.
+/// `FromRow` is not the same door: it needs a Postgres row, and the only query
+/// that produces one is [`next_flow_to_probe`], three functions down.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ProspectFlow {
+    /// The account this is the flow for.
+    pub account_id: Uuid,
+    /// `accounts.legal_name`, joined.
+    pub prospect: String,
+    /// `accounts.domain`, joined. The registrable domain the gate rules on.
+    pub domain: String,
+    /// The page the check starts on.
+    pub entry_url: String,
+    /// CSS selector of the passport / nationality field.
+    pub passport_field: String,
+    /// CSS selector of the destination field.
+    pub destination_field: String,
+    /// CSS selector of the travel-date field, when the flow has one.
+    pub date_field: Option<String>,
+    /// CSS selector of their "check requirements" button. Never a booking or
+    /// payment submit; see the migration.
+    pub submit: Option<String>,
+    /// CSS selector of the element that displays the answer.
+    pub panel: String,
+    /// The human who opened the page and checked these selectors point at what
+    /// they say. `None` is nobody having done that yet.
+    pub confirmed_by: Option<String>,
+    /// When they said so.
+    pub confirmed_at: Option<DateTime<Utc>>,
+}
+
+/// The selectors an operator writes. Everything else on the row is derived.
+#[derive(Debug, Clone, Copy)]
+pub struct NewProspectFlow<'a> {
+    /// Absolute `https://` URL on the account's own domain.
+    pub entry_url: &'a str,
+    /// CSS selector of the passport / nationality field.
+    pub passport_field: &'a str,
+    /// CSS selector of the destination field.
+    pub destination_field: &'a str,
+    /// CSS selector of the travel-date field, when the flow has one.
+    pub date_field: Option<&'a str>,
+    /// CSS selector of their "check requirements" button.
+    pub submit: Option<&'a str>,
+    /// CSS selector of the element that displays the answer.
+    pub panel: &'a str,
+}
+
+/// Write one prospect's selectors, unconfirmed.
+///
+/// **An admin transaction, and the only two functions in this file that take
+/// one.** `0032_prospect_flows.sql` grants `app_role` no INSERT and no UPDATE
+/// here, so this cannot run under [`Db::tenant_tx`] — deliberately. An employee
+/// that could write this table could point a selector at any element on a domain
+/// its policy lets it read, and then produce a screenshotted, reproducible
+/// finding about whatever that element happened to say. Writing a flow is an
+/// operator's act, proved by the operator's own database credential, exactly as
+/// `agentos-server policy` is.
+///
+/// A wrong `tenant_id` is not a write into somebody else's tenant: the composite
+/// foreign key to `accounts (tenant_id, id)` addresses an account that is simply
+/// not there, and this returns [`StoreError`]'s wrapping of that.
+///
+/// **It always writes an unconfirmed row**, and re-writing a confirmed one
+/// revokes the confirmation — in the application here and in a trigger there, so
+/// it is also true of a `psql` session. The value of a confirmation is that a
+/// named human looked at *these exact selectors*.
+pub async fn set_prospect_flow(
+    db: &Db,
+    tenant_id: TenantId,
+    account_id: Uuid,
+    flow: &NewProspectFlow<'_>,
+) -> Result<(), RevenueError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    sqlx::query(
+        "INSERT INTO prospect_flows (account_id, tenant_id, entry_url, passport_field, \
+                                     destination_field, date_field, submit, panel) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (account_id) DO UPDATE SET \
+           entry_url = excluded.entry_url, \
+           passport_field = excluded.passport_field, \
+           destination_field = excluded.destination_field, \
+           date_field = excluded.date_field, \
+           submit = excluded.submit, \
+           panel = excluded.panel, \
+           confirmed_by = NULL, \
+           confirmed_at = NULL",
+    )
+    .bind(account_id)
+    .bind(tenant_id.as_uuid())
+    .bind(flow.entry_url)
+    .bind(flow.passport_field)
+    .bind(flow.destination_field)
+    .bind(flow.date_field)
+    .bind(flow.submit)
+    .bind(flow.panel)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Record that `who` opened the page and checked these selectors.
+///
+/// `false` when there is no flow for that account in that tenant. An admin
+/// transaction for [`set_prospect_flow`]'s reason.
+pub async fn confirm_prospect_flow(
+    db: &Db,
+    tenant_id: TenantId,
+    account_id: Uuid,
+    who: &str,
+    at: DateTime<Utc>,
+) -> Result<bool, RevenueError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    let done = sqlx::query(
+        "UPDATE prospect_flows SET confirmed_by = $3, confirmed_at = $4 \
+          WHERE account_id = $1 AND tenant_id = $2",
+    )
+    .bind(account_id)
+    .bind(tenant_id.as_uuid())
+    .bind(who)
+    .bind(at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    tx.commit().await?;
+    Ok(done)
+}
+
+/// The next prospect in one segment that has a flow written down and nothing
+/// proved about it yet, oldest account first.
+///
+/// [`accounts_without_evidence`] is the same queue without the flow, and this is
+/// not a replacement for it: that one answers "who have we not proved anything
+/// about", which is a pipeline question, and this answers "who can be probed
+/// right now", which is a scheduling one.
+///
+/// **It does not filter on the confirmation, and that is the point.** An
+/// unconfirmed flow at the head of the queue comes back from here and is refused
+/// by `Flow::confirmed` with the account named, so the operator is told which
+/// prospect is waiting on them. Filtering here would make the same row disappear
+/// instead, which is the silent skip this whole mechanism exists to avoid — and
+/// it would put the confirmation bar in two places, one of which would
+/// eventually be the one that got relaxed.
+pub async fn next_flow_to_probe(
+    tx: &mut TenantTx<'_>,
+    segment: &str,
+) -> Result<Option<ProspectFlow>, RevenueError> {
+    // `FromRow`, so the eleven columns are matched by name rather than by
+    // position: the two joined ones are aliased to the fields they fill, and
+    // adding a column here cannot silently shift the rest by one.
+    let row: Option<ProspectFlow> = sqlx::query_as(
+        "SELECT f.account_id, a.legal_name AS prospect, a.domain AS domain, f.entry_url, \
+                f.passport_field, f.destination_field, f.date_field, f.submit, f.panel, \
+                f.confirmed_by, f.confirmed_at \
+           FROM prospect_flows f \
+           JOIN accounts a ON a.id = f.account_id \
+          WHERE a.segment = $1 \
+            AND a.state IN ('candidate', 'qualified') \
+            AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.account_id = a.id) \
+          ORDER BY a.created_at, a.id \
+          LIMIT 1",
+    )
+    .bind(segment)
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,10 +1497,11 @@ mod tests {
     use agentos_domain::ids::TenantId;
     use chrono::TimeDelta;
 
-    /// Every table the seller vertical adds — `0011_revenue.sql` plus
-    /// `0015_proof_of_need.sql`. A table that joins the vertical and not this
-    /// array is a table whose RLS nobody checked.
-    const REVENUE_TABLES: [&str; 7] = [
+    /// Every table the seller vertical adds — `0011_revenue.sql`,
+    /// `0015_proof_of_need.sql` and `0032_prospect_flows.sql`. A table that
+    /// joins the vertical and not this array is a table whose RLS nobody
+    /// checked.
+    const REVENUE_TABLES: [&str; 8] = [
         "accounts",
         "contacts",
         "evidence",
@@ -1306,6 +1509,7 @@ mod tests {
         "opportunity_events",
         "suppressions",
         "proof_of_need_attempts",
+        "prospect_flows",
     ];
 
     /// Connect and migrate, or `None` when there is no database.
@@ -1496,6 +1700,25 @@ mod tests {
         .expect("suppression");
         tx.commit().await.expect("commit graph");
 
+        // Outside the tenant transaction, because `app_role` may not write this
+        // table at all — see `set_prospect_flow`. Without a row here the count
+        // below would pass on an empty table and prove nothing.
+        set_prospect_flow(
+            &db,
+            a,
+            graph.account,
+            &NewProspectFlow {
+                entry_url: "https://lufthansa.com/entry",
+                passport_field: "#passport",
+                destination_field: "#destination",
+                date_field: None,
+                submit: None,
+                panel: "#visa-info",
+            },
+        )
+        .await
+        .expect("flow");
+
         let mut tx = db.tenant_tx(b).await.expect("tenant tx");
         for table in REVENUE_TABLES {
             let (enabled, forced, policies): (bool, bool, i64) = sqlx::query_as(
@@ -1595,6 +1818,102 @@ mod tests {
 
         drop_tenant(&db, a).await;
         drop_tenant(&db, b).await;
+    }
+
+    /// **The application cannot write a selector.**
+    ///
+    /// This is the grant that makes the whole confirmation bar mean anything.
+    /// An employee that could write `prospect_flows` could aim a selector at any
+    /// element on a domain its policy already lets it read, sign the row with a
+    /// name, and then produce a screenshotted, reproducible finding about
+    /// whatever that element happened to say — with the allowlist and the
+    /// two-run bar both satisfied, because both are downstream of the selector
+    /// being right. So `0032_prospect_flows.sql` revokes INSERT and UPDATE from
+    /// `app_role`, and the only writer is an operator with the database
+    /// credential.
+    ///
+    /// Asserted against Postgres rather than against the migration text: a
+    /// `grant` somebody adds later has to fail here, and reading the SQL file
+    /// would not notice.
+    #[tokio::test]
+    async fn the_application_role_cannot_write_a_prospects_selectors() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db, "revenue-flow-grants").await;
+
+        // An account and nothing else: `seed_graph` would file evidence against
+        // it, and `next_flow_to_probe` is the queue of prospects we have not
+        // proved anything about yet.
+        let account = Uuid::now_v7();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        insert_account(
+            &mut tx,
+            account,
+            &NewAccount {
+                legal_name: "Deutsche Lufthansa AG",
+                domain: "lufthansa.com",
+                segment: "airline",
+                country: "DE",
+                employee_id: None,
+            },
+        )
+        .await
+        .expect("account");
+        tx.commit().await.expect("commit account");
+
+        set_prospect_flow(
+            &db,
+            tenant,
+            account,
+            &NewProspectFlow {
+                entry_url: "https://lufthansa.com/entry",
+                passport_field: "#passport",
+                destination_field: "#destination",
+                date_field: None,
+                submit: None,
+                panel: "#visa-info",
+            },
+        )
+        .await
+        .expect("the operator may write one");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        // Reading is granted: this is how `next_flow_to_probe` works at all.
+        assert!(
+            next_flow_to_probe(&mut tx, "airline")
+                .await
+                .expect("read")
+                .is_some()
+        );
+
+        // Writing is not, in either direction.
+        let inserted = sqlx::query(
+            "INSERT INTO prospect_flows (account_id, tenant_id, entry_url, passport_field, \
+                                         destination_field, panel) \
+             VALUES ($1, $2, 'https://lufthansa.com/x', '#a', '#b', '#c')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect_err("app_role has no INSERT here");
+        assert!(
+            format!("{inserted}").contains("permission denied"),
+            "expected a privilege error, got: {inserted}"
+        );
+        tx.rollback().await.expect("rollback");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let updated = sqlx::query("UPDATE prospect_flows SET panel = '#anything'")
+            .execute(&mut **tx)
+            .await
+            .expect_err("app_role has no UPDATE here either");
+        assert!(
+            format!("{updated}").contains("permission denied"),
+            "expected a privilege error, got: {updated}"
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
     }
 
     /// Two customers may both be prospecting the same airline. Each holds its
