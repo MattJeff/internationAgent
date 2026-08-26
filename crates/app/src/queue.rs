@@ -16,17 +16,24 @@
 //! # Where the seam is, and why there
 //!
 //! **[`plan`] returns `Vec<Lead>` and knows nothing about files or HTTP.** That
-//! is the whole boundary. A sink is a plain function over `&[Lead]`:
-//! [`csv`] is the one that exists, and the September one is described below and
-//! is not built. There is deliberately **no `Sink` trait**: a trait with one
-//! implementation is a guess about the second, and the second one's real shape
-//! is `POST /campaigns/{id}/leads` with a JSON body — which shares no method
-//! signature with "write a string to a file" beyond the slice it reads.
-//! [`Lead::fields`] pairs index-for-index with [`COLUMNS`], so both sinks name
-//! the same ten things and neither can name an eleventh.
+//! is the whole boundary. A sink is a plain function over `&[Lead]`, and there
+//! are now two of them: [`csv`] and [`push`]. There is still deliberately **no
+//! `Sink` trait**, and writing the second one is what proved the point — they
+//! share no signature. [`csv`] returns a `String` and cannot fail; [`push`] is
+//! `async`, needs the gate and a principal, and returns one
+//! [`Contacted`](crate::revenue::Contacted) per recipient. A trait over that
+//! pair would have one method neither implements comfortably and a lowest
+//! common denominator that hides the gate.
 //!
-//! When the API key lands, the change is one new function in this file. Nothing
-//! in [`plan`] moves.
+//! What they *do* share is the two arrays: [`Lead::fields`] pairs
+//! index-for-index with [`COLUMNS`], and both sinks read exactly that pair —
+//! one with commas between the values, one with the names beside them. So both
+//! name the same ten things and neither can name an eleventh.
+//!
+//! **[`plan`] did not move**, and neither did [`csv`], [`record_queued`] or
+//! [`COLUMNS`]. The trait the API call lives behind is
+//! [`LeadSink`](agentos_providers::leads::LeadSink), in `agentos-providers`,
+//! reached through [`crate::effects`] like every other provider.
 //!
 //! # Nothing reaches a sink that could not be defended
 //!
@@ -112,9 +119,11 @@
 //! it; see `0035_evidence_opener.sql` for why it lives on the `evidence` row and
 //! not in a queue table.
 //!
-//! # The September sink: what it is and what it needs
+//! # The September sink: what is built, and what the founder still owes it
 //!
-//! Not built, by instruction. The shape, from the live tool schemas:
+//! [`push`] is built and wired; the **adapter behind the trait is not**, and the
+//! two open items at the end of this list are why. The shape, from the live tool
+//! schemas:
 //!
 //! * **Endpoint.** `POST /api/v1/campaigns/{campaign_id}/leads`, MCP
 //!   `add_leads_to_campaign`. Body is `{ lead_list: [...], settings: {...} }`,
@@ -157,6 +166,19 @@
 //!      strings are what the CSV upload sends today; whether the API accepts
 //!      them is one call to find out, and if it does not the fallback is a
 //!      decision about salutation, not a code change.
+//!   4. **Which read endpoint lists the people who unsubscribed.**
+//!      [`reconcile_opt_outs`] needs one and this codebase does not name it,
+//!      because nobody here has looked at the live API — deliberately. It is the
+//!      second of the two things an adapter cannot be written without, and it is
+//!      the more important one: a campaign that mails is recoverable, an
+//!      unsubscribe we never collected is not.
+//!
+//! Items 1 and 4 are what stand between
+//! [`LeadSink`](agentos_providers::leads::LeadSink) and a real adapter. Nothing
+//! above them is blocked on anything: [`push`] and [`reconcile_opt_outs`] are
+//! written, tested against the mock, and reached by
+//! `apps/server/src/routes/queue.rs` the moment an operator grants
+//! `allow_lead_upload`.
 //!
 //! # Fields the schema does not have
 //!
@@ -202,12 +224,15 @@
 use std::collections::BTreeSet;
 
 use agentos_domain::action::{ActionKind, Channel, EmailAddress};
-use agentos_store::db::TenantTx;
+use agentos_domain::ids::TenantId;
+use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::revenue::{self as revenue_store, RevenueError};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::revenue::{FOLLOW_UP_AFTER, Outreach, Suppression};
+use crate::effects::{Effects, EmailSend};
+use crate::gate::{PolicyGate, Principal};
+use crate::revenue::{Contacted, FOLLOW_UP_AFTER, Outreach, Suppression};
 use crate::rolepack_sales::RolePack;
 use crate::vertical::Approach;
 
@@ -541,6 +566,248 @@ pub fn csv(leads: &[Lead]) -> String {
         push_row(&mut out, lead.fields().iter().map(String::as_str));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Sink: the platform call, from 2026-09-01
+// ---------------------------------------------------------------------------
+
+/// Hand every lead to the sending platform, one gated call each.
+///
+/// **The second sink, and [`plan`] did not move.** It reads the same
+/// `&[Lead]` [`csv`] reads and the same two arrays [`csv`] reads —
+/// [`COLUMNS`] and [`Lead::fields`], zipped, which is literally what
+/// `push_row` does five lines further down with a comma instead of an HTTP
+/// request. Neither sink can name an eleventh column, because there is one
+/// array of names in this workspace and both borrow it.
+///
+/// There is still no `Sink` trait, and the reason the module docs gave has
+/// survived contact: these two functions share no signature. One returns a
+/// `String` and cannot fail; this one is `async`, needs the gate, needs a
+/// principal, and returns **one outcome per recipient** — the same
+/// [`Contacted`] [`Seller::campaign`](crate::revenue::Seller::campaign) returns,
+/// deliberately, so that an operator's dashboard counts `sent` / `refused` /
+/// the deny code in the same labels whichever sink ran. What they share is the
+/// slice, and the slice is the seam.
+///
+/// # The gate, per prospect, and which budget it spends
+///
+/// Every lead is authorised on its own as an [`ActionKind::EmailSend`] against
+/// its own address — not one ruling for the batch — because that is what makes
+/// the counterparty land in the audit payload, and the counterparty *is* the
+/// cold-outreach budget: [`PolicyGate`](crate::gate::PolicyGate) derives
+/// `new_contacts_today` by aggregating `audit_log` on it. A batch ruling would
+/// spend one contact for forty people.
+///
+/// **So this path spends two different counters and they are not the same
+/// number.** Worth stating plainly, because the export path spends only one:
+///
+/// * [`contacted_since`](agentos_store::revenue::contacted_since) — contacts
+///   *written to*, off the `last_contacted_at` column [`record_queued`] writes.
+///   This is what [`plan`]'s `spent_today` argument measures and what truncates
+///   the queue before anything reaches here.
+/// * the gate's own count over `audit_log`, which no `contacts` column feeds and
+///   which only ever advances when the gate allows something. The CSV export
+///   never touches it — the founder's upload is invisible to the audit trail —
+///   so before this sink exists the two disagree by exactly the size of every
+///   export ever run.
+///
+/// Neither of them is
+/// [`new_contacts_since`](agentos_store::revenue::new_contacts_since), which
+/// counts rows *created* in `contacts` and is what
+/// [`crate::prospects::import`] spends. Importing a list and writing to it are
+/// two different acts against one number, and this is the one that writes.
+///
+/// The two counters cannot double-charge one person on one day: `plan` offers
+/// nobody twice — `record_queued` moves them out of `queueable` for
+/// [`FOLLOW_UP_AFTER`] — and the gate charges only a
+/// [`ContactStanding::New`](agentos_domain::action::ContactStanding), so a
+/// prospect already in the trail is free forever after. What they *can* do is
+/// disagree in the safe direction, and only in it: a tenant that exported forty
+/// people this morning has `spent_today = 40` and an audit count of zero, so the
+/// afternoon's push is truncated by the larger number. Nothing here re-widens
+/// it.
+///
+/// # Marked before staged, which is the module's rule and not a new one
+///
+/// The caller commits [`record_queued`] **before** calling this, exactly as it
+/// commits before writing the file. That is forced rather than chosen:
+/// [`PolicyGate::authorize`](crate::gate::PolicyGate::authorize) opens and
+/// commits its own transaction, so no ruling can join the export's, and holding
+/// a transaction open across an HTTP call is the thing
+/// [`crate::effects`] refuses to do anyway.
+///
+/// What it costs is unchanged and already argued: a crash between the commit and
+/// the platform call loses a prospect for [`FOLLOW_UP_AFTER`]. What it buys is
+/// that the reverse — staging first — mails a stranger the same cold email
+/// twice, and a sending domain does not recover from that on a schedule.
+///
+/// A [`Contacted::Refused`] here is that same loss with a reason attached: the
+/// person is marked contacted and was not written to. It should be rare, because
+/// `plan` already truncated to the budget the gate is about to measure — and
+/// when it is not rare it is the two counters above having drifted, which is a
+/// number an operator can read off the response rather than a mystery.
+pub async fn push(
+    gate: &PolicyGate,
+    effects: &Effects,
+    principal: &Principal,
+    leads: &[Lead],
+) -> Vec<Contacted> {
+    let mut outcomes = Vec::with_capacity(leads.len());
+
+    for lead in leads {
+        let to = lead.email().clone();
+        // The seam, in one expression: the producer's names against the
+        // producer's values. Held in a local because `fields()` returns owned
+        // strings and the borrow has to outlive the call.
+        let values = lead.fields();
+        let row: Vec<(&str, &str)> = COLUMNS
+            .iter()
+            .copied()
+            .zip(values.iter().map(String::as_str))
+            .collect();
+
+        // Trusted, and this is the one place it differs from
+        // [`crate::vertical::sell`]. That path labels its approach untrusted
+        // because the *decision* to write came from reading the prospect's own
+        // site inside the same turn. Here the decision was made by a turn that
+        // is long over, filed on an `evidence` row, and re-selected by an
+        // operator pulling this route — the same authenticated request that
+        // authorises the export. A stranger's page cannot reach this call site,
+        // and labelling it untrusted anyway would put a taint in the trail that
+        // points at nothing.
+        let subject = EmailSend { to: to.clone() };
+        match gate.authorize(principal, subject).await {
+            Ok(ok) => match effects.stage_lead(ok, &row).await {
+                Ok(message_id) => outcomes.push(Contacted::Sent { to, message_id }),
+                Err(why) => outcomes.push(Contacted::Failed { to, why }),
+            },
+            Err(why) => outcomes.push(Contacted::Refused { to, why }),
+        }
+    }
+
+    outcomes
+}
+
+/// Bring the platform's unsubscribes home, and make them final.
+///
+/// **This is the half that makes the send path lawful**, and it is four
+/// statements because the schema already does the work. A person who clicks
+/// unsubscribe in a campaign mail told *the platform*; nothing about that click
+/// reaches `suppressions` unless something goes and asks.
+///
+/// What one row here does, by trigger, in the same statement
+/// (`suppressions_deactivate_contacts` in `0011_revenue.sql`):
+///
+/// * every matching `contacts` row goes `active = false` **and**
+///   `next_follow_up_at = NULL`. So they leave [`queueable`](agentos_store::revenue::queueable)
+///   — which filters on both — and they leave it for good;
+/// * `mark_contacted` refuses an inactive contact, so even a lead already in a
+///   half-built export cannot be marked;
+/// * `contacts_reject_suppressed` refuses to insert or reactivate them, so a
+///   re-import of the founder's CSV cannot bring them back;
+/// * `suppressions` is append-only for everybody including superusers
+///   (`suppressions_append_only`), so "for good" is enforced rather than
+///   promised.
+///
+/// # Every channel, not just email
+///
+/// The row is `channel = 'email'` because an address is what the platform
+/// knows, and [`revenue_suppression_of`] matches an email row against an email
+/// address only. That would be a hole if the suppression list were the only
+/// lock — somebody who unsubscribed by mail could still be called. It is not:
+/// the trigger deactivates the **contact**, and `contacts.phone` lives on that
+/// same row, so there is no route left to their number either. The contact row
+/// is the join every channel goes through, which is why deactivating it is a
+/// stronger statement than any per-channel list could be.
+///
+/// [`Scope::Tenant`](agentos_store::revenue::Scope) and not `Global`: they
+/// unsubscribed from *our* campaign, which is a sentence about this tenant.
+/// `Global` binds every tenant in the deployment forever and is what a
+/// "remove me from everything" request means — a strictly larger claim than the
+/// one the click made, and not ours to infer on somebody's behalf.
+///
+/// # Where it runs, and why not on a cadence
+///
+/// At the top of the export route, before [`due`] is asked anything. The moment
+/// the answer matters is the moment a file is about to be built, and a cadence
+/// that ran an hour ago is a cadence that can be an hour wrong — in the
+/// direction of mailing somebody who has already asked us not to. Running it
+/// here also means the export and the reconcile cannot get out of order,
+/// because there is only one order.
+///
+/// The read happens **outside** any transaction and the writes inside one: a
+/// database transaction must not be held open across a call to a third party.
+/// A platform that will not answer fails the whole pull rather than exporting
+/// against a stale list, which is the same "export nobody, mark nobody, commit
+/// nothing" [`suppression`] already chooses.
+///
+/// Returns how many addresses the platform named — not how many rows were new,
+/// because `suppress` is `ON CONFLICT DO NOTHING` and re-recording an opt-out we
+/// already hold is the ordinary case rather than a fact worth counting.
+pub async fn reconcile_opt_outs(
+    db: &Db,
+    effects: &Effects,
+    tenant: TenantId,
+    now: DateTime<Utc>,
+) -> Result<usize, RevenueError> {
+    let addresses = effects.opted_out().await.map_err(|err| {
+        StoreError::conflict(format!(
+            "the sending platform's opt-out list could not be read: {err}"
+        ))
+    })?;
+    if addresses.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = db.tenant_tx(tenant).await?;
+    let mut recorded = 0;
+    for raw in &addresses {
+        // Parsed rather than trusted: `suppressions_address_normalised` CHECKs
+        // the shape, so an address the platform spells differently would fail
+        // the INSERT and take the whole reconcile — and everybody else's
+        // opt-out — down with it. `EmailAddress::parse` lower-cases both
+        // halves, which is the spelling the column and the lookup agree on.
+        let Ok(address) = EmailAddress::parse(raw) else {
+            // Not fatal, and loud. One unparseable entry must not cost the
+            // other opt-outs their row; it also must not pass silently, because
+            // the person behind it is still on the platform's list and no
+            // longer on ours.
+            tracing::error!(
+                "the sending platform named an address we cannot parse; it is NOT suppressed \
+                 here and must be recorded by hand"
+            );
+            continue;
+        };
+        revenue_store::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewSuppression {
+                scope: revenue_store::Scope::Tenant,
+                channel: revenue_store::Channel::Email,
+                address: &address.to_string(),
+                reason: "opt_out",
+                // We know the address, not which `contacts` row it was — and
+                // the trigger does not need one: it matches on the address.
+                contact_id: None,
+                // The legal record of where this came from. This row is the
+                // audit line for `Effects::opted_out`, which writes none of its
+                // own; see that method.
+                note: Some("unsubscribed on the outbound sending platform"),
+                suppressed_at: now,
+            },
+        )
+        .await?;
+        recorded += 1;
+    }
+    tx.commit().await?;
+
+    tracing::info!(
+        addresses = recorded,
+        "the sending platform's unsubscribes are recorded here; those contacts are deactivated \
+         on every channel"
+    );
+    Ok(recorded)
 }
 
 fn push_row<'a>(out: &mut String, fields: impl Iterator<Item = &'a str>) {

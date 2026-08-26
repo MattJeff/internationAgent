@@ -556,6 +556,7 @@ mod tests {
             allow_file_upload: true,
             allow_credential_change: false,
             allow_data_delete: false,
+            allow_lead_upload: true,
         }
     }
 
@@ -987,6 +988,7 @@ mod tests {
             allow_file_upload,
             allow_credential_change,
             allow_data_delete,
+            allow_lead_upload,
         } = inner;
 
         let spend_ok = match (spend, outer.spend) {
@@ -1018,6 +1020,11 @@ mod tests {
             && (!*allow_file_upload || outer.allow_file_upload)
             && (!*allow_credential_change || outer.allow_credential_change)
             && (!*allow_data_delete || outer.allow_data_delete)
+            // A team whose seats mail strangers through the platform has to sit
+            // under a tenant that permits it. Same direction as the three
+            // above: a head may take the capability away from a team, never
+            // hand it one the tenant does not hold.
+            && (!*allow_lead_upload || outer.allow_lead_upload)
     }
 
     fn universe() -> (Vec<Channel>, Vec<CallingCode>, Vec<Domain>, Vec<McpTool>) {
@@ -1070,10 +1077,27 @@ mod tests {
             proptest::sample::subsequence(domains.clone(), 0..=domains.len()),
             0u32..500,
             0u32..500,
-            any::<(bool, bool, bool)>(),
+            // Four bools inside one element rather than four more elements:
+            // the outer tuple is at proptest's arity limit, and this is where a
+            // new flag goes without costing a strategy slot. `lead` is here and
+            // not pinned by an example precisely because it is the one flag
+            // whose failure mode is a stranger's inbox — the property should
+            // generate it.
+            any::<(bool, bool, bool, bool)>(),
         )
             .prop_map(
-                |(spend, ch, cc, ad, dd, mcp, peers, contacts, turns, (upload, cred, del))| {
+                |(
+                    spend,
+                    ch,
+                    cc,
+                    ad,
+                    dd,
+                    mcp,
+                    peers,
+                    contacts,
+                    turns,
+                    (upload, cred, del, lead),
+                )| {
                     PolicyLimits {
                         spend,
                         allowed_channels: ch.into_iter().collect(),
@@ -1093,6 +1117,7 @@ mod tests {
                         allow_file_upload: upload,
                         allow_credential_change: cred,
                         allow_data_delete: del,
+                        allow_lead_upload: lead,
                     }
                 },
             )

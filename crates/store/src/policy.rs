@@ -209,7 +209,8 @@ const SELECT_ACTIVE_LAYERS: &str = "\
            l.allowed_calling_codes, l.allowed_domains, l.denied_domains, \
            l.allowed_mcp_tools, l.allowed_a2a_peers, l.allowed_models, \
            l.max_new_contacts_per_day, l.max_turns_per_day, \
-           l.allow_file_upload, l.allow_credential_change, l.allow_data_delete \
+           l.allow_file_upload, l.allow_credential_change, l.allow_data_delete, \
+           l.allow_lead_upload \
     FROM policy_layers l \
     JOIN policy_versions v ON v.id = l.version_id \
     WHERE v.active AND ( \
@@ -483,6 +484,14 @@ pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), Sto
 ///   deleting one conversation is the one flag that makes erasing customer data
 ///   an *unattended* action. None of the three has a good reason to be on
 ///   before somebody asks for it.
+/// * **Lead upload off**, which is the fourth of those and the one with a
+///   stranger on the other end. With it off, `agentos_app::queue` hands its
+///   ten columns to `queue::csv` and a human uploads them; with it on, the same
+///   queue goes straight to the sending platform, one gated call per prospect.
+///   The refusals are identical either way — that is the whole point of the
+///   seam — but a file has a person in the loop and an API call does not, and
+///   which of those a deployment gets must be somebody's decision rather than a
+///   default.
 pub fn default_ceiling() -> PolicyLimits {
     // Infallible: `Money::new` rejects zero only, and none of these is zero.
     let usd = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
@@ -510,6 +519,12 @@ pub fn default_ceiling() -> PolicyLimits {
         allow_file_upload: false,
         allow_credential_change: false,
         allow_data_delete: false,
+        // Off, and it is the switch that decides whether the outreach queue is
+        // a file or a send. See the doc paragraph above and
+        // `0038_policy_lead_upload.sql`: a ceiling that shipped this `true`
+        // would be a deployment that starts mailing strangers because somebody
+        // installed a default.
+        allow_lead_upload: false,
     }
 }
 
@@ -667,9 +682,10 @@ pub async fn install_ceiling(
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
-                allow_file_upload, allow_credential_change, allow_data_delete) \
+                allow_file_upload, allow_credential_change, allow_data_delete, \
+                allow_lead_upload) \
              VALUES ($1, $2, NULL, 'platform', NULL, NULL, \
-                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(Uuid::now_v7())
         .bind(version),
@@ -785,6 +801,7 @@ struct Columns {
     file_upload: bool,
     credential_change: bool,
     data_delete: bool,
+    lead_upload: bool,
 }
 
 impl Columns {
@@ -839,10 +856,11 @@ impl Columns {
             file_upload: limits.allow_file_upload,
             credential_change: limits.allow_credential_change,
             data_delete: limits.allow_data_delete,
+            lead_upload: limits.allow_lead_upload,
         }
     }
 
-    /// Append all sixteen, in declaration order. Consumes `self` because sqlx
+    /// Append all seventeen, in declaration order. Consumes `self` because sqlx
     /// encodes on `bind`, so nothing here has to outlive the call.
     fn bind_to<'q>(
         self,
@@ -865,6 +883,7 @@ impl Columns {
             .bind(self.file_upload)
             .bind(self.credential_change)
             .bind(self.data_delete)
+            .bind(self.lead_upload)
     }
 }
 
@@ -1009,12 +1028,15 @@ pub async fn install(
             approval_above_minor, allowed_channels, allowed_calling_codes, \
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
-            allow_file_upload, allow_credential_change, allow_data_delete) \
+            allow_file_upload, allow_credential_change, allow_data_delete, \
+            allow_lead_upload) \
          VALUES \
            ($1, $2, NULL, 'platform', NULL, NULL, \
-            $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23, $24), \
+            $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23, $24, \
+            $25), \
            ($3, $4, $5, $6, $7, $8, \
-            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
+            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
+            $25) \
          ON CONFLICT (id) DO UPDATE SET \
            spend_currency = coalesce(policy_layers.spend_currency, excluded.spend_currency), \
            max_per_transaction_minor = \
@@ -1035,9 +1057,10 @@ pub async fn install(
            allow_file_upload = policy_layers.allow_file_upload OR excluded.allow_file_upload, \
            allow_credential_change = \
              policy_layers.allow_credential_change OR excluded.allow_credential_change, \
-           allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete",
+           allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete, \
+           allow_lead_upload = policy_layers.allow_lead_upload OR excluded.allow_lead_upload",
     );
-    // $9..=$24 are the sixteen limit columns, in `Columns` declaration order —
+    // $9..=$25 are the seventeen limit columns, in `Columns` declaration order —
     // the same order and the same mapping `install_ceiling` writes them with.
     let insert = Columns::from(limits).bind_to(
         statement
@@ -1335,13 +1358,15 @@ pub async fn install_layer(
             approval_above_minor, allowed_channels, allowed_calling_codes, \
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
-            allow_file_upload, allow_credential_change, allow_data_delete) \
+            allow_file_upload, allow_credential_change, allow_data_delete, \
+            allow_lead_upload) \
          SELECT gen_random_uuid(), $1, tenant_id, layer, role_name, employee_id, \
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
-                allow_file_upload, allow_credential_change, allow_data_delete \
+                allow_file_upload, allow_credential_change, allow_data_delete, \
+                allow_lead_upload \
            FROM policy_layers \
           WHERE version_id = $2 \
             AND NOT (layer = $3 AND role_name IS NOT DISTINCT FROM $4 \
@@ -1363,9 +1388,10 @@ pub async fn install_layer(
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
-                allow_file_upload, allow_credential_change, allow_data_delete) \
+                allow_file_upload, allow_credential_change, allow_data_delete, \
+                allow_lead_upload) \
              VALUES ($1, $2, $3, $4, $5, $6, \
-                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
         )
         .bind(Uuid::now_v7())
         .bind(next)
@@ -1457,6 +1483,7 @@ struct LayerRow {
     allow_file_upload: bool,
     allow_credential_change: bool,
     allow_data_delete: bool,
+    allow_lead_upload: bool,
 }
 
 impl LayerRow {
@@ -1566,6 +1593,7 @@ impl LayerRow {
                 allow_file_upload: self.allow_file_upload,
                 allow_credential_change: self.allow_credential_change,
                 allow_data_delete: self.allow_data_delete,
+                allow_lead_upload: self.allow_lead_upload,
             },
         ))
     }

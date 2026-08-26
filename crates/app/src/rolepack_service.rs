@@ -582,6 +582,7 @@ impl RolePack {
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,
+                allow_lead_upload: false,
             },
         }
     }
@@ -680,6 +681,7 @@ impl RolePack {
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,
+                allow_lead_upload: false,
             },
         }
     }
@@ -819,6 +821,7 @@ impl RolePack {
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,
+                allow_lead_upload: false,
             },
         }
     }
@@ -1005,6 +1008,7 @@ impl RolePack {
                 // says this role may not propose a deletion; this says its layer
                 // would refuse one anyway.
                 allow_data_delete: false,
+                allow_lead_upload: false,
             },
         }
     }

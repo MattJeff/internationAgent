@@ -1,0 +1,46 @@
+-- 0038_policy_lead_upload: the switch that turns the outreach queue from a file
+-- into a send.
+--
+-- `agentos_app::queue` produces the ten-column CSV the founder uploads to
+-- Smartlead by hand. From 2026-09-01 there is an API, and the same queue can
+-- drain into it instead — the producer is unchanged, the three refusals are
+-- unchanged, and what differs is only which sink the `Vec<Lead>` goes to.
+--
+-- That difference is a permission, so it is a column here rather than an
+-- environment variable, and the reason is the shape of the wrong answer. An
+-- `AGENTOS_SEND_LEADS=1` in a unit file is process-wide, invisible to an
+-- operator reading a policy, and — the part that actually matters — it composes
+-- by *replacement*. Every other permission in this table composes by
+-- intersection: `store::policy::load` ANDs the four layers, so a tenant that
+-- writes `true` under a platform layer that says `false` gets `false`, and there
+-- is no read path that skips the intersection. A capability whose failure mode
+-- is "a stranger receives mail nobody approved" belongs in the column family
+-- that cannot be widened from below.
+--
+-- DEFAULT FALSE, AND NO BACKFILL
+--
+-- The opposite of `0031_policy_models`, and deliberately: that migration
+-- backfilled every existing row with the full model set, because the fleet was
+-- already running those models and leaving the rows empty would have been a
+-- silent outage. Here the fleet is running *nothing* — no deployment has ever
+-- sent through the platform, because until this migration there was no code that
+-- could. So `false` on every existing row preserves exactly today's behaviour,
+-- which is the export path, and switching it on is an act an operator performs
+-- on purpose after the founder has decided which campaign the leads land in.
+--
+-- A backfill of `true` here would be the one migration in this tree that starts
+-- mailing strangers on deploy.
+--
+-- WHY THERE IS NO `smartlead_campaign_id` COLUMN BESIDE IT
+--
+-- Because that is configuration and this is permission, and the two have
+-- different lifetimes and different readers. Which campaign a segment's leads
+-- land in — and whether that campaign is paused or active, which is what decides
+-- if staging a lead is also sending it — is a fact about the sending account
+-- that the founder has not settled. It belongs where the API key belongs, in the
+-- adapter's construction at boot, next to `AGENT_EMAIL_DOMAIN`. Putting it in a
+-- policy layer would make an operator's permission grant fail closed for a
+-- reason that has nothing to do with permission.
+
+alter table policy_layers
+  add column if not exists allow_lead_upload boolean not null default false;

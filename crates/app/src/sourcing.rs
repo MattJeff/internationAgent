@@ -1507,6 +1507,7 @@ mod tests {
     use agentos_providers::ProviderError;
     use agentos_providers::browser::MockBrowser;
     use agentos_providers::email::MockEmailProvider;
+    use agentos_providers::leads::MockLeadSink;
     use agentos_providers::telephony::MockTelephony;
     use agentos_store::db::Db;
     use agentos_store::sourcing as sourcing_store;
@@ -1665,6 +1666,7 @@ mod tests {
             browser: Arc::new(MockBrowser::new()),
             mcp: Arc::new(StubMcp),
             payments: payments.clone(),
+            leads: Arc::new(MockLeadSink::new()),
         });
         let effects = Effects::new(db.clone(), ports, principal.clone());
 

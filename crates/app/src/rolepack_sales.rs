@@ -354,6 +354,23 @@ impl RolePack {
                 allow_file_upload: false,
                 allow_credential_change: false,
                 allow_data_delete: false,
+
+                // The seller is the one seat this flag is about, and the pack
+                // ships it off — the same answer, for the same reason, as
+                // `max_new_contacts_per_day: 0` above. What a pack states is
+                // what the *job* needs by default, and what this job needs by
+                // default is the file: `agentos_app::queue::csv`, uploaded by a
+                // human who looks at it. Handing the same ten columns straight
+                // to the sending platform is a thing an operator switches on in
+                // a policy layer once they have decided which campaign the
+                // leads land in — see `agentos_domain::policy::may_upload_leads`.
+                //
+                // Note that this being `false` costs nothing today and blocks
+                // nothing tomorrow: the pack's limits are *replaced* by the
+                // loaded policy on the export route (`with_limits`), so this
+                // number is the default for an employee nobody has provisioned
+                // rather than a ceiling on one who has.
+                allow_lead_upload: false,
             },
         }
     }
