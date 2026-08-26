@@ -20,14 +20,26 @@
 //! prefix began naming the tenant's MCP inventory the context went 4188 → 4639 →
 //! 4863 tokens at 2, 10 and 50 employees, and every token of that growth was the
 //! inventory: per tenant, filtered by risk and by nothing else. It now reads
-//! **4188 → 4611 → 4611**, because
+//! **4382 → 4805 → 4805**, because
 //! [`agentos_app::prompt::SystemPrompt::with_mcp_tools`] takes the employee's
 //! [`EffectivePolicy`] and names the tools `allowed_mcp_tools` lets it call —
-//! 105 → 105 → 105 tokens of prefix, against 105 → 133 → 357 for the same
-//! inventory named to everybody. The colleague roster contributes 137 → 191 →
-//! 191: it saturates with the employee's own team and then stops, which is what
-//! it was designed to do and what
+//! flat across all three sizes, against 209 → 237 → 461 for the same inventory
+//! named to everybody. The colleague roster contributes -5 → +49 → +49: it
+//! saturates with the employee's own team and then stops, which is what it was
+//! designed to do and what
 //! `the_roster_costs_the_same_in_a_company_of_fifty_as_in_one_of_ten` gates on.
+//!
+//! **Two of those figures are not company-shaped and are folded in anyway.** The
+//! MCP row is `McpOnly − Bare`, and only `McpOnly` carries a policy, so it also
+//! carries the third list the prefix names: the domains `read_page` may point
+//! at. That is 105 tokens of inventory plus 104 of "None." — the empty-allowlist
+//! paragraph every employee of a fresh deployment gets, because
+//! `store::policy::default_ceiling` grants no domain. An employee that *has*
+//! domains pays 140 for the heading instead, plus five to nine per domain
+//! named, and a long allowlist is linear in what an operator wrote rather than
+//! in the payroll — which is why it has no row of its own here. Nothing in this
+//! fixture varies it, and a row that cannot slope on this file's only axis
+//! measures nothing.
 //!
 //! **No new mechanism came out of that.** The scope is not "the role" and not
 //! "the team" as a thing this file invented: it is

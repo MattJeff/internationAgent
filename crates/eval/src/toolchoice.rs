@@ -88,18 +88,19 @@ const MAX_TOKENS: u32 = 4_096;
 /// makes a prompt edit visible, so that nobody quotes a tool-choice score
 /// measured against a prompt that no longer exists.
 ///
-/// Last moved by the empty-roster notice: [`prompt`] hands `SystemPrompt` no
-/// colleagues, and a prompt with no colleagues now renders one paragraph saying
-/// so rather than nothing at all. **The live scores below it are stale until
-/// somebody re-runs `--live`.** None of the five [`CASES`] is a
-/// `message_colleague` case, so the expected answers are unaffected — but the
-/// bytes the model was scored against are not the bytes it would be scored
-/// against now, and that is the only claim this pin makes.
-pub const TRUSTED_PROMPT: &str = "32dcf2c9e57a6a5b";
+/// Last moved by the domain allowlist: the prefix now says where `read_page`
+/// may point, from the policy, and [`prompt`] is built on `default_ceiling` —
+/// which grants no domain — so what it renders is the empty case, one paragraph
+/// saying so. **The live scores below it are stale until somebody re-runs
+/// `--live`.** None of the five [`CASES`] is a `read_page` case and this
+/// employee is not even offered the schema, so the expected answers are
+/// unaffected — but the bytes the model was scored against are not the bytes it
+/// would be scored against now, and that is the only claim this pin makes.
+pub const TRUSTED_PROMPT: &str = "679f2570cc557f13";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named. Differs from [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "28fa31bfd67192eb";
+pub const UNTRUSTED_PROMPT: &str = "ff91216af7f8dd9e";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.

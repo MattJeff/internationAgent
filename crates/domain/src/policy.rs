@@ -517,6 +517,66 @@ pub fn evaluate_mcp_call(policy: &EffectivePolicy, tool: &McpTool) -> Decision {
     mcp_rules(&policy.limits().allowed_mcp_tools, tool)
 }
 
+/// Is this host on a denylist, or beneath one that is?
+///
+/// Its own function because three rules read it: the domain rules below, and
+/// the email and A2A arms of [`evaluate_rules`], which check the denylist
+/// against a recipient's domain and a peer without consulting
+/// [`PolicyLimits::allowed_domains`] at all.
+fn is_denied(denied: &BTreeSet<Domain>, host: &Domain) -> bool {
+    denied.iter().any(|entry| host.is_within(entry))
+}
+
+/// **The domain rules**, written once because two callers ask them.
+///
+/// [`evaluate_rules`]' browser and upload arms call this, and so does
+/// [`evaluate_browser_read`] — the one `app::prompt` uses to decide which
+/// domains an employee is *told* about. `mcp_rules`' argument, one layer along:
+/// two spellings of one membership test is the copy that drifts.
+///
+/// **The denylist is checked first, always**, because it *unions* across layers
+/// where the allowlist intersects: a lower layer can add a block but never
+/// remove one, so an allowlist entry must never be able to resurrect a blocked
+/// host.
+fn domain_rules(allowed: &BTreeSet<Domain>, denied: &BTreeSet<Domain>, host: &Domain) -> Decision {
+    if is_denied(denied, host) {
+        Decision::deny(DenyReason::DomainDenied)
+    } else if allowed.iter().any(|entry| host.is_within(entry)) {
+        Decision::Allow
+    } else {
+        Decision::deny(no_match(allowed.is_empty(), DenyReason::DomainNotAllowed))
+    }
+}
+
+/// Whether this policy permits reading one domain, with no [`ActionCtx`] to
+/// assemble.
+///
+/// The same ruling [`evaluate`] gives an [`Action::BrowserRead`], minus the
+/// taint wire — which cannot fire for this action: a read is `Risk::Low` on the
+/// domain's own axis (see [`Action::risk`], and `app::turn`'s catalogue row,
+/// which must agree with it), because what makes a page dangerous is what comes
+/// *back*, and that is handled by fencing the answer rather than by withholding
+/// the tool. So there is no context this answer depends on: it is the
+/// intersected allowlist, the unioned denylist, and nothing else — which is what
+/// makes it safe to ask once when a prompt is built rather than once per action.
+///
+/// It exists so the system prompt can name exactly the domains the gate will
+/// allow. That is [`evaluate_mcp_call`]'s reason exactly, and it is the same bug
+/// one tool along: `read_page` takes a URL as a free string, a refused guess
+/// comes back `domain_not_allowed` — which cannot tell the model whether the
+/// host was wrong or merely not permitted — and a live run spent five of
+/// twenty-three model calls guessing.
+///
+/// [`Action::BrowserWrite`] and [`Action::FileUpload`] get the same ruling from
+/// the same function, because `PolicyLimits` has one `allowed_domains` set
+/// shared by reading and writing. This is spelled `browser_read` rather than
+/// `domain` because that is the question the prompt asks, and because the upload
+/// arm has a second half (`allow_file_upload`) that this does not answer.
+pub fn evaluate_browser_read(policy: &EffectivePolicy, domain: &Domain) -> Decision {
+    let limits = policy.limits();
+    domain_rules(&limits.allowed_domains, &limits.denied_domains, domain)
+}
+
 /// Does this policy deny **every** action of this kind, whatever its payload
 /// and whatever context it is ruled in?
 ///
@@ -657,21 +717,11 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
         allow_data_delete,
     } = policy.limits();
 
-    // Denylist first, always: an allowlist entry must never be able to
-    // resurrect a blocked host.
-    let blocked = |d: &Domain| denied_domains.iter().any(|entry| d.is_within(entry));
-    let domain_rules = |d: &Domain| -> Option<DenyReason> {
-        if blocked(d) {
-            Some(DenyReason::DomainDenied)
-        } else if allowed_domains.iter().any(|entry| d.is_within(entry)) {
-            None
-        } else {
-            Some(no_match(
-                allowed_domains.is_empty(),
-                DenyReason::DomainNotAllowed,
-            ))
-        }
-    };
+    // Both of these are free functions above rather than closures here, because
+    // `evaluate_browser_read` asks the same two questions and a second spelling
+    // of either is the copy that drifts.
+    let blocked = |d: &Domain| is_denied(denied_domains, d);
+    let domains = |d: &Domain| domain_rules(allowed_domains, denied_domains, d);
     let channel_rules = |channel: Channel| -> Option<DenyReason> {
         if !allowed_channels.contains(&channel) {
             Some(no_match(
@@ -730,26 +780,15 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
         }
 
-        Action::BrowserRead { domain } => match domain_rules(domain) {
-            Some(reason) => Decision::deny(reason),
-            None => Decision::Allow,
-        },
+        Action::BrowserRead { domain } => domains(domain),
 
-        Action::BrowserWrite { domain } => match domain_rules(domain) {
-            Some(reason) => Decision::deny(reason),
-            None => Decision::Allow,
-        },
+        Action::BrowserWrite { domain } => domains(domain),
 
-        Action::FileUpload { domain } => {
-            if let Some(reason) = domain_rules(domain) {
-                return Decision::deny(reason);
-            }
-            if *allow_file_upload {
-                Decision::Allow
-            } else {
-                Decision::deny(DenyReason::FileUploadNotAllowed)
-            }
-        }
+        Action::FileUpload { domain } => match domains(domain) {
+            Decision::Allow if *allow_file_upload => Decision::Allow,
+            Decision::Allow => Decision::deny(DenyReason::FileUploadNotAllowed),
+            refused => refused,
+        },
 
         Action::McpCall { tool } => mcp_rules(allowed_mcp_tools, tool),
 
@@ -1811,6 +1850,77 @@ mod tests {
         // tool failed to be on — the same distinction the gate reports.
         assert_eq!(
             evaluate_mcp_call(&silent, &granted),
+            Decision::Deny {
+                reason: DenyReason::NoRule
+            }
+        );
+    }
+
+    /// The same claim one tool along: `app::prompt` names the domains an
+    /// employee may read by calling [`evaluate_browser_read`], and the gate
+    /// rules on the read itself through [`evaluate`].
+    ///
+    /// The denylist is the half that makes this worth its own test.
+    /// `allowed_domains` intersects across layers and `denied_domains` unions,
+    /// so a host can be on the allowlist and still be refused — and a prompt
+    /// that read the allowlist instead of asking would name it and cost a turn.
+    #[test]
+    fn naming_a_domain_and_ruling_on_it_are_the_same_rule() {
+        let walled = effective(&PolicyLimits {
+            allowed_domains: [domain("example.com"), domain("banking.example.com")]
+                .into_iter()
+                .collect(),
+            denied_domains: [domain("banking.example.com")].into_iter().collect(),
+            ..permissive()
+        });
+        let silent = effective(&PolicyLimits {
+            allowed_domains: BTreeSet::new(),
+            denied_domains: BTreeSet::new(),
+            ..permissive()
+        });
+
+        for policy in [&walled, &silent] {
+            for host in [
+                "example.com",
+                "shop.example.com",
+                "banking.example.com",
+                "login.banking.example.com",
+                "alibaba.com",
+            ] {
+                let host = domain(host);
+                assert_eq!(
+                    evaluate_browser_read(policy, &host),
+                    evaluate(
+                        policy,
+                        &Action::BrowserRead {
+                            domain: host.clone()
+                        },
+                        &ActionCtx {
+                            // A read is Low, so neither answer may depend on the
+                            // trust wire — the prompt asks this once when it is
+                            // built and the turn's label moves under it.
+                            trust: TrustLabel::Untrusted,
+                            ..ctx()
+                        }
+                    ),
+                    "{host} was ruled on differently by the two callers"
+                );
+            }
+        }
+
+        // The allowlist alone would have named all three of these.
+        assert!(evaluate_browser_read(&walled, &domain("example.com")).is_allow());
+        assert!(evaluate_browser_read(&walled, &domain("shop.example.com")).is_allow());
+        assert_eq!(
+            evaluate_browser_read(&walled, &domain("banking.example.com")),
+            Decision::Deny {
+                reason: DenyReason::DomainDenied
+            }
+        );
+        // And an empty allowlist is nobody having written a rule, not a list
+        // this host failed to be on.
+        assert_eq!(
+            evaluate_browser_read(&silent, &domain("example.com")),
             Decision::Deny {
                 reason: DenyReason::NoRule
             }
