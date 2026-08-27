@@ -357,9 +357,13 @@ impl StepReport {
     }
 }
 
-// The server may not name `agentos-providers`, so the one release code it has
-// to branch on is re-exported here alongside the report that carries it.
-pub use agentos_providers::RELEASE_NOT_SUPPORTED;
+// The server may not name `agentos-providers`, so the two code facts its loops
+// have to branch on are re-exported here alongside the report that carries
+// them: the one release code the sweep never retries, and the closed set of
+// codes the converge claim still will. Re-exported rather than restated —
+// `agentos_providers` is where `is_retryable` lives and therefore the only
+// place either can be kept honest.
+pub use agentos_providers::{RELEASE_NOT_SUPPORTED, RETRYABLE_CODES};
 
 /// What one release came to.
 ///

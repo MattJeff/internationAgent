@@ -199,11 +199,21 @@ impl Verdict {
     /// [`Verdict::Unreachable`]: a code this build does not recognise came from
     /// a terminal branch of `ProviderError::from_status`, and telling somebody
     /// to retry a 402 forever is worse than telling them their key did not work.
+    ///
+    /// **There is no `"timeout"` arm**, and it is not an omission. A transport
+    /// timeout is `ProviderError::Retryable`, whose `code()` is `"retryable"`;
+    /// no `code()` in the workspace has ever returned `"timeout"`, so the arm
+    /// that used to sit here matched nothing and read like a rule. The two
+    /// spellings it names are the whole retryable set —
+    /// `agentos_providers::RETRYABLE_CODES` is the same pair, and
+    /// `every_provider_code_lands_somewhere_and_only_a_success_connects` holds
+    /// this arm to it in the one direction this crate can, which is that both
+    /// spellings still mean [`Verdict::Unreachable`].
     pub fn from_provider_code(code: &str) -> Self {
         match code {
             "unauthorized" | "forbidden" => Verdict::KeyRefused,
             "not_found" => Verdict::ModelNotAccessible,
-            "retryable" | "rate_limited" | "timeout" => Verdict::Unreachable,
+            "retryable" | "rate_limited" => Verdict::Unreachable,
             _ => Verdict::Unusable,
         }
     }
@@ -285,6 +295,12 @@ mod tests {
             ("not_found", Verdict::ModelNotAccessible),
             ("retryable", Verdict::Unreachable),
             ("rate_limited", Verdict::Unreachable),
+            // Pinned as *Unusable*, deliberately. `from_provider_code` used to
+            // have a `"timeout"` arm and nothing has ever produced the string —
+            // a transport timeout is `ProviderError::Retryable`, whose code is
+            // `"retryable"` above. This line is what makes re-adding the arm a
+            // red test rather than a plausible-looking two-word diff.
+            ("timeout", Verdict::Unusable),
             ("bad_request", Verdict::Unusable),
             ("invalid_response", Verdict::Unusable),
             ("something_new", Verdict::Unusable),

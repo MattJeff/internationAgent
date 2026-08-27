@@ -232,6 +232,25 @@ pub enum ProviderError {
 /// clearing the binding.
 pub const RELEASE_NOT_SUPPORTED: &str = "release_not_supported";
 
+/// Every [`ProviderError::code`] whose error [`ProviderError::is_retryable`]
+/// calls retryable — the same rule, in the one form SQL can read.
+///
+/// Two entries and not forty, and that asymmetry is the whole reason this
+/// exists. The terminal codes are open — any adapter may invent one — so a
+/// `NOT IN (…)` list would be wrong the day somebody adds a `Terminal` arm,
+/// and wrong in the expensive direction: an unknown code would read as
+/// retryable and buy five provider calls. The retryable ones are closed by
+/// `is_retryable`'s own `matches!`, so listing *those* is wrong only in the
+/// direction of one attempt instead of five, and
+/// `the_retryable_code_list_is_the_same_rule_as_is_retryable` fails the build
+/// if the two ever disagree.
+///
+/// The reader is `CLAIM_SQL` in `apps/server/src/loops/provisioning.rs`, which
+/// binds it rather than spelling it: a rule in two languages is a rule that
+/// diverges in silence, which is exactly what `RELEASE_NOT_SUPPORTED` above is
+/// bound for on the release side.
+pub const RETRYABLE_CODES: [&str; 2] = ["retryable", "rate_limited"];
+
 impl ProviderError {
     /// Default backoff when the provider gives no advice.
     const DEFAULT_BACKOFF: Duration = Duration::from_secs(1);
@@ -427,6 +446,55 @@ mod tests {
             }
         );
         assert_eq!(ProviderError::from_status(404, None).code(), "not_found");
+    }
+
+    /// [`RETRYABLE_CODES`] is a copy of [`ProviderError::is_retryable`] that a
+    /// `WHERE` clause can read, and a copy is a thing that drifts. This is the
+    /// test that makes drifting fail the build rather than quietly re-buying a
+    /// phone number four times.
+    ///
+    /// Every variant, both directions: a code in the list whose error is not
+    /// retryable would spend the budget it was added to save, and a retryable
+    /// error whose code is missing would be parked after one attempt — which is
+    /// the failure this whole change is about not causing.
+    #[test]
+    fn the_retryable_code_list_is_the_same_rule_as_is_retryable() {
+        let every_variant = [
+            ProviderError::timeout(),
+            ProviderError::from_status(429, None),
+            ProviderError::from_status(503, None),
+            ProviderError::from_status(400, None),
+            ProviderError::from_status(401, None),
+            ProviderError::from_status(404, None),
+            ProviderError::PendingExternal {
+                poll_ref: "BU123".into(),
+                expected_by: Utc::now(),
+            },
+            ProviderError::Terminal {
+                code: RELEASE_NOT_SUPPORTED,
+            },
+            // A code no adapter has invented yet. It must not be retryable,
+            // which is the direction an open `Terminal` set has to be wrong in.
+            ProviderError::Terminal {
+                code: "something_a_future_adapter_returns",
+            },
+        ];
+        for err in every_variant {
+            assert_eq!(
+                RETRYABLE_CODES.contains(&err.code()),
+                err.is_retryable(),
+                "{} is on the wrong side of RETRYABLE_CODES",
+                err.code()
+            );
+        }
+
+        // Both spellings are reachable, so neither is a typo nobody would
+        // notice: a list that matched nothing would pass the loop above.
+        assert_eq!(ProviderError::timeout().code(), RETRYABLE_CODES[0]);
+        assert_eq!(
+            ProviderError::from_status(429, None).code(),
+            RETRYABLE_CODES[1]
+        );
     }
 
     #[test]

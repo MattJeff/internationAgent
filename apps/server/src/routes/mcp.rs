@@ -2173,11 +2173,11 @@ async fn rebind_all(
 
 /// Renew this tenant's OAuth tokens that are close to expiring.
 ///
-/// Its own transaction, committed, and every failure inside it is already
-/// swallowed and logged by `agentos_app::oauth::refresh_due` — one provider
-/// being down must not stop the tenant's other bindings, or the other tenants,
-/// from being rebound. So this returns nothing: there is no outcome the caller
-/// could act on that the next tick will not act on anyway.
+/// Its own transaction, always committed, and every failure inside it is
+/// already swallowed and logged by `agentos_app::oauth::refresh_due` — one
+/// provider being down must not stop the tenant's other bindings, or the other
+/// tenants, from being rebound. So this returns nothing: there is no outcome the
+/// caller could act on that the next tick will not act on anyway.
 async fn refresh_tokens(
     db: &Db,
     credentials: &Credentials,
@@ -2191,20 +2191,29 @@ async fn refresh_tokens(
             return;
         }
     };
-    let refreshed = oauth::refresh_due(&mut tx, credentials, clients, Utc::now()).await;
-    if refreshed == 0 {
-        // Nothing was written, so there is nothing to commit and a rollback is
-        // the cheaper unwind — the same call `rebind` makes below.
-        let _ = tx.rollback().await;
-        return;
-    }
+    let written = oauth::refresh_due(&mut tx, credentials, clients, Utc::now()).await;
+    // Committed unconditionally, and the `if written == 0 { rollback }` that
+    // used to stand here is deleted rather than corrected.
+    //
+    // It was an optimisation — "nothing was written, so a rollback is the
+    // cheaper unwind" — resting on a count meaning exactly what the writer
+    // thought it meant. `refresh_due` now also *parks* a binding whose refresh
+    // token the provider refused, which is a write; a count that missed it
+    // would roll the park back every tick and the loop would go on presenting a
+    // dead credential to somebody else's authorization server forever. That is
+    // a seam where the bug is invisible on both sides: each function is right
+    // about itself.
+    //
+    // An empty COMMIT once per tenant per five-minute tick is not worth a
+    // second place for the two of them to disagree. `written` survives as a log
+    // field and nothing branches on it.
     if let Err(err) = tx.commit().await {
         // The tokens the provider issued are lost with the transaction, and the
         // old ones are still in the row and still valid until they expire. The
         // next tick tries again. What is NOT survivable is a provider that
         // rotated its refresh token, which is why this is an error and not a
         // warning: that binding is now on a countdown to needing a human.
-        tracing::error!(%tenant, refreshed, error = %err, "could not commit refreshed oauth tokens");
+        tracing::error!(%tenant, written, error = %err, "could not commit refreshed oauth tokens");
     }
 }
 

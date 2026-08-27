@@ -513,7 +513,25 @@ impl EffectError {
 
     /// Whether trying again could work. Only the provider knows; everything
     /// else here is a bug or an outage a retry will not fix.
-    pub fn is_retryable(&self) -> bool {
+    ///
+    /// # `pub(crate)`, and that is the answer to "who reads this"
+    ///
+    /// It had one caller outside its own tests — [`Effects::record`], writing
+    /// the `retryable` field of an audit row — and a `pub fn` with no caller
+    /// across the crate boundary reads like a decision something branches on.
+    /// Nothing branches on it, and nothing should: an effect happens inside a
+    /// turn, and a turn hands the failure to the model as
+    /// `failed (<code>)` — see [`crate::turn`]'s `performed`. The model is the
+    /// retrier, `code()` is what it reads, and `"retryable"` is one of the
+    /// codes. There is no loop between here and it to teach.
+    ///
+    /// So the classification stays — the audit column is a real reader, and it
+    /// is the one place an operator can ask "was that worth retrying" after the
+    /// fact — and the visibility shrinks to match. `ProviderError::is_retryable`
+    /// is the `pub` one, and it is `pub` because
+    /// `ProvisioningEngine::call_until` and `apps/server/src/loops` really do
+    /// branch on it.
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(self, EffectError::Provider(err) if err.is_retryable())
     }
 }
