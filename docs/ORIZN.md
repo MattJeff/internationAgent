@@ -1102,21 +1102,59 @@ when you are *editing* a company that exists; this is what you run to bring one
 into being, and it is what the product's own entry journey calls.
 
 ```sh
-python3 - <<'PY' > /tmp/orizn.json
-import json, pathlib
+# Step 8's answer — "2 days, one week, one month" — as the instant it works out
+# to. Write it down rather than computing it: it is a decision somebody made on
+# a day, and a script that recomputes `now + 30 days` on every run asks for a
+# different window each time, which is a `409` after the first (see below).
+WINDOW_ENDS_AT=2026-09-27T00:00:00Z
+
+python3 - "$WINDOW_ENDS_AT" <<'PY' > /tmp/orizn.json
+import json, pathlib, sys
 docs = pathlib.Path("docs")
 json.dump({
   "slug": "orizn", "name": "Orizn",
   "org": json.loads((docs / "orizn-org.json").read_text()),
   "roles": {p.stem: json.loads(p.read_text()) for p in (docs / "orizn-roles").glob("*.json")},
-}, __import__("sys").stdout)
+  "window_ends_at": sys.argv[1],
+}, sys.stdout)
 PY
 
 call -X POST $API/v1/companies -d @/tmp/orizn.json
 ```
 
-The body is the runbook's own documents with two keys around them. There is no
-third document in it, and that is the important part.
+The body is the runbook's own documents with two keys around them, plus the one
+answer that is not in any document. There is no third document in it, and that is
+the important part.
+
+**How long the agents run is required, and there is no default.** `window_ends_at`
+is step 8 of the entry journey — *choose how long the agents run: 2 days, one
+week, one month* — as the instant that answer works out to, and it is the one
+field here that belongs to a company rather than to a file: "one month" has no
+meaning without the moment it is counted from. Omit it and the call is a `400`
+that says so.
+
+It is required for the reason the ceiling is refused rather than defaulted, one
+level down. A company with no `company_windows` row runs *forever* — the
+initiative loop keeps taking turns, and every one of them is billed to the
+customer's own model credential on the customer's own key. Making the field
+optional means the caller in a hurry gets that by omission; picking a default
+means this runbook picks a price, and both numbers are wrong in a way somebody
+pays for: too short and a paying company stops in the night, too long and the
+runaway is merely slower. So the question is asked, once, of the person who can
+answer it. `migrations/0054_operating_window.sql` argues the same refusal in SQL.
+
+The window can be **created** here and never **extended** here: a second call
+naming a *later* instant is `409 window_exists` naming `PUT /v1/window`, which is
+the verb that gives a company more time and leaves a row saying who did. Writing
+the first window can only close — a company with no row runs forever — and moving
+it later can only open, which is why the two are different calls. Re-sending the
+*same* instant writes nothing at all, which is what keeps this file safe to
+re-run: pin `WINDOW_ENDS_AT` above and every replay is a repair, change it and
+you are told rather than obeyed.
+
+`GET /v1/halt` is where the remaining time is read back, and a company whose
+window has run out reports itself stopped there — with a sentence that says the
+time ran out rather than that somebody stopped it.
 
 **The ceiling is not in this call and no default is invented for it.** It is the
 one document here that belongs to no tenant, and `store::policy::default_ceiling`
@@ -1141,18 +1179,22 @@ empty, and leaving it out is now a `400` naming it rather than a company.
 **What is atomic and what is not.** The tenant row and its first
 `policy_versions` row are one transaction (the pair is the invariant — a tenant
 with no active version has *invisible* layers). Each role layer is one version,
-as in step 5. The whole org chart is one transaction, as in step 4. **The call is
-not**, and the guarantee is convergence rather than atomicity: re-send the same
-body and every step that already happened answers `unchanged`, so a call that
-died anywhere is repaired by replaying it. No `Idempotency-Key` — the tenant is
-the key's own, a layer is its `role_name` and a seat is its slug, so a retry
-converges by construction.
+as in step 5. The operating window and the whole org chart are one transaction,
+as in step 4. **The call is not**, and the guarantee is convergence rather than
+atomicity: re-send the same body and every step that already happened answers
+`unchanged`, so a call that died anywhere is repaired by replaying it. No
+`Idempotency-Key` — the tenant is the key's own, a layer is its `role_name`, a
+seat is its slug and the window is the tenant's one row, so a retry converges by
+construction.
 
 **And the order is the safety property.** The layers are written *before* the
 chart, always. A call that dies in the middle leaves limits with nobody bound by
 them; the other order would leave five employees on the platform ceiling with
 nothing anywhere reporting it. `apps/server/tests/orizn.rs` cuts the call in both
-places and asserts that neither one has hired.
+places and asserts that neither one has hired. The window needs no such argument
+because it is *in* the chart's transaction: a company has seats and a clock, or
+it has neither, and the test that cuts the call inside the chart asserts no
+window was left behind.
 
 **It still grants no money.** Step 6 is two more calls, deliberately: a budget is
 the thing that moves money, and `org::reserve` reads the absence of one as "may

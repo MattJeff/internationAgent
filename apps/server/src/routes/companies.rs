@@ -22,7 +22,7 @@
 //! |---|---|
 //! | the tenant | a tenant with no employees. Harmless. |
 //! | the layers | limits and nobody to bind. **Harmless — and this is why they go first.** |
-//! | the chart | employees. On whatever limits happen to exist. |
+//! | the chart | employees. On whatever limits happen to exist, for however long nobody said. |
 //!
 //! The third row is the one that matters and it is the whole reason for the
 //! order below. **The layers are written before the chart, always.** An absent
@@ -32,13 +32,21 @@
 //! anywhere reporting that it happened. Reverse the two and the same crash
 //! leaves rows that grant nobody anything, because there is no *body* yet.
 //!
+//! The operating window is the same sentence about time rather than authority —
+//! an absent `company_windows` row means *runs forever*
+//! (`migrations/0054_operating_window.sql`), so a chart standing without one is
+//! seats nobody has told to stop, spending the customer's own model budget. It
+//! does not need the ordering argument, because it does better: the window and
+//! the chart are written in **one** transaction, so that row cannot exist.
+//!
 //! # What is atomic, and what is deliberately not
 //!
 //! **Atomic:** the tenant row and its first `policy_versions` row
 //! (`store::policy::create_tenant`, one transaction, and the pair is an
 //! invariant — a tenant with no active version has *invisible* layers). Each
 //! role layer, individually: one new version, the previous one intact behind it.
-//! The whole org chart plus this route's own audit row, in one `TenantTx`.
+//! The operating window, the whole org chart and this route's own audit rows, in
+//! one `TenantTx`.
 //!
 //! **Not atomic:** the call. There are `2 + roles` commit points and no
 //! transaction spans them, because [`agentos_store::policy::install_layer`]
@@ -57,7 +65,15 @@
 //!   [`Installed::Unchanged`](agentos_store::policy::Installed::Unchanged) —
 //!   no row, no version;
 //! * a team is its slug and an employee is its slug, which is `apply_org`'s own
-//!   idempotence and the reason neither endpoint wants an `Idempotency-Key`.
+//!   idempotence and the reason neither endpoint wants an `Idempotency-Key`;
+//! * the window is the tenant's one row, and a replay carrying the same instant
+//!   writes neither the row nor an audit line — a company gets its window once,
+//!   from whichever run got there first, and a body naming a *different* instant
+//!   is refused rather than quietly extending it.
+//!
+//! An `Idempotency-Key` is still honoured if a client sends one — the layer in
+//! `main.rs` replays the recorded response without reaching this handler at all
+//! — but nothing here depends on that, which is the point.
 //!
 //! Replay any prefix and the second run finishes it. That is asserted, from a
 //! call cut in the middle, by `apps/server/tests/orizn.rs`.
@@ -100,7 +116,9 @@ use std::collections::BTreeMap;
 
 use agentos_domain::ids::Slug;
 use agentos_domain::policy::PolicyLimits;
+use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
+use agentos_store::halt;
 use agentos_store::policy::{self, Installed, Scope};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -108,12 +126,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::Principal;
 use crate::error::ApiError;
+use crate::routes::halt::must_end_in_the_future;
 use crate::routes::teams::{self, OrgChart};
 
 pub fn router(db: Db) -> Router {
@@ -140,6 +159,17 @@ struct NewCompany {
     name: String,
     /// The org chart, exactly as `POST /v1/org` takes it.
     org: OrgChart,
+    /// **When this company's agents stop.** Step 8 of the entry journey — "2
+    /// days, one week, one month" — as the instant that answer works out to,
+    /// which is the shape `PUT /v1/window` and `company_windows` already use and
+    /// for the reason `migrations/0054_operating_window.sql` gives: a duration
+    /// means nothing without the moment it counts from, and every reader would
+    /// redo that arithmetic.
+    ///
+    /// **Required.** It is an `Option` only so the missing case can be refused
+    /// in this route's own words instead of serde's — see [`create_company`],
+    /// which argues the requirement.
+    window_ends_at: Option<DateTime<Utc>>,
     /// One complete [`PolicyLimits`] per `role_name`, keyed by the name — which
     /// is the team slug, which is the role pack's name, which `docs/ORIZN.md`
     /// argues at length should be one string.
@@ -223,18 +253,82 @@ struct LayerView {
 /// the new layer is not intersected with the old — which is exactly the
 /// authority `install_layer` has and this route does not.
 ///
+/// # It says when the company stops, and refuses to be told "later"
+///
+/// `window_ends_at` is **required**, and the two alternatives are the same
+/// defect in different clothes.
+///
+/// *Optional* means the caller in a hurry leaves it out and gets the behaviour
+/// every company had before `0054`: one that runs until somebody notices, taking
+/// turns on the customer's own model with the customer's own credential. That is
+/// the most expensive defect this product can have, and it would arrive as the
+/// silent consequence of an omitted field — which is, word for word, the failure
+/// the missing-ceiling refusal above exists to prevent and the failure the
+/// empty-seat rule exists to prevent. Three omissions, one answer: **the
+/// expensive default is a refusal, named, before a row is written.**
+///
+/// *A default duration* is the same thing with a label on it, and it is worse
+/// here because the number would be a price: too short and a paying company
+/// stops in the night, too long and the runaway is merely slower. 0054 refused
+/// to pick it in SQL and `PUT /v1/window` refused to pick it in Rust; this
+/// refuses for the third time rather than being the one place it leaked in.
+///
+/// **What it costs, honestly.** Every caller of this route has to send a date, so
+/// this is a breaking change to a body — one call site in this workspace and one
+/// block in `docs/ORIZN.md`. It is not retroactive: a company that already
+/// exists has no `company_windows` row, `halt::window` answers `None`, and
+/// `halt::halted` answers `None` with it, so nothing that is running stops
+/// because a field became required. Those companies keep running forever until
+/// somebody calls `PUT /v1/window`, and no code here invents a date for them —
+/// see the note at the end of this comment.
+///
+/// **And it may create a window, never replace one**, which is the role-layer
+/// rule again and rests on the same arithmetic. No window at all means *runs
+/// forever*, so writing the first one can only ever close; replacing one with a
+/// later instant extends it, which widens. A body naming a different instant
+/// than the row already there is `409 window_exists`, naming `PUT /v1/window`,
+/// which is the verb that extends and leaves a `company_halt_changed` row saying
+/// who did. An identical instant writes nothing at all — that is what makes a
+/// replay a repair here, exactly as `Installed::Unchanged` does for a layer.
+///
+/// The refusal is on **difference and not on direction**, and an *earlier*
+/// instant is refused too even though shortening a window provably cannot widen
+/// anything. The rule could have been "later is a conflict, sooner is fine", and
+/// it is not, because the caller of this route is a provisioning script being
+/// re-run: a company that has been standing for a week should not have its clock
+/// moved by a date somebody left in a file. Sooner is still one call away, and
+/// that call says who did it.
+///
 /// # The refusals, and none of them is a 500
 ///
 /// | | |
 /// |---|---|
 /// | no platform ceiling installed | `409 no_platform_policy`, naming the command |
+/// | no `window_ends_at` | `400`, saying why there is no default, before any write |
+/// | a `window_ends_at` in the past | `400`, from `routes::halt`'s own guard, before any write |
 /// | a `roles` entry missing a field | `400`, naming the fields, before any write |
 /// | a team in `org.rows` with no layer | `400`, naming the teams, before any write |
 /// | this tenant is a different company | `409 tenant_mismatch` — the wrong API key |
 /// | a role layer exists and differs | `409 role_layer_exists`, naming the role |
+/// | a window exists and differs | `409 window_exists`, naming `PUT /v1/window` |
 ///
 /// Everything above the tenant row is a pure read of the body, so the common
 /// mistakes cost nothing and leave nothing.
+///
+/// # The hole this leaves, named rather than filled
+///
+/// **`POST /v1/org` still hires into a company with no window.** It is the
+/// *editing* door — `docs/ORIZN.md`'s nine steps, run against a company that
+/// exists — and every company stood up before this field existed came through
+/// it. Closing it means refusing to hire where there is no window, which is a
+/// second decision with a much larger blast radius (`end_to_end.rs`,
+/// `sourcing_e2e.rs` and the runbook path all hire without one) and is not this
+/// route's to make.
+///
+/// ponytail: no backfill and no sweep. Both need a default duration, which is
+/// the one thing nobody in this workspace is allowed to invent — it is a price.
+/// The founder answers it, and the honest interim is that `GET /v1/halt` reports
+/// `window_ends_at: null` for those companies and says nothing else.
 ///
 /// 202 when it hired somebody, 200 when it did not — `apply_org`'s rule, for
 /// `apply_org`'s reason: a replay that changed nothing has nothing outstanding.
@@ -246,6 +340,7 @@ async fn create_company(
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
 
     // --- everything that can be decided from the body, before any write -----
+    let now = Utc::now();
     let slug = Slug::parse(&body.slug)
         .map_err(|err| ApiError::bad_request(format!("slug: {err}")))?
         .as_str()
@@ -260,6 +355,24 @@ async fn create_company(
              platform ceiling, because an absent layer inherits the one above it",
         ));
     }
+
+    // **How long the agents run.** Required, with no default at any level; the
+    // doc comment above argues both halves.
+    let Some(window_ends_at) = body.window_ends_at else {
+        return Err(ApiError::bad_request(
+            "window_ends_at: say when this company's agents stop, as an RFC 3339 instant. The \
+             entry journey asks it as \"2 days, one week, one month\" and turns the answer into a \
+             date. There is deliberately no default: a company created without one runs until \
+             somebody notices, and every turn it takes on the way is billed to the customer's own \
+             model credential. An existing company's window is moved with PUT /v1/window.",
+        ));
+    };
+    // The same guard `PUT /v1/window` applies, from the same function so the two
+    // doors cannot come to disagree about what "in the past" means. A company
+    // created already out of time is stopped before it ever ran, with nobody's
+    // sentence on the record for why — worse here than there, because there is
+    // no earlier state to go back to.
+    must_end_in_the_future(window_ends_at, now)?;
 
     // The identical rule `agentos-server policy install` applies to a file, from
     // the same function — see `crate::policy::parse_limits`. An omitted field is
@@ -324,7 +437,6 @@ async fn create_company(
 
     // --- 1. the tenant row, which is this key's own and nobody else's -------
     let tenant = principal.tenant_id;
-    let now = Utc::now();
     adopt_or_create_tenant(&db, &principal, &slug, name).await?;
 
     // --- 2. the limits, BEFORE anybody exists to be bound by them -----------
@@ -375,12 +487,75 @@ async fn create_company(
         });
     }
 
-    // --- 3. the org chart, and this route's record of the whole act ---------
+    // --- 3. the window, the org chart, and this route's record of the act ---
     //
-    // One transaction for both, so a company whose chart committed and whose
-    // audit row did not is not reachable. The chart is `apply_org`'s own code
-    // path — same refusals, same `org.applied` row, same idempotence on slugs.
+    // One transaction for all three, so a company whose chart committed and
+    // whose audit row did not is not reachable. The chart is `apply_org`'s own
+    // code path — same refusals, same `org.applied` row, same idempotence on
+    // slugs.
+    //
+    // **The window shares that transaction, and that is the whole answer to
+    // "what if it dies halfway".** The layers go before the chart because a
+    // chart without limits is seats on the ceiling; a chart without a window is
+    // seats nobody has told to stop, which is the same failure spending the
+    // customer's money instead of widening their policy. Ordering alone would
+    // leave the gap open for one commit, and there is no reason to pay it: both
+    // rows are writable from this `TenantTx`, so this company has a window and
+    // employees, or it has neither.
+    //
+    // ponytail: the read and the write are not one locked statement, so two
+    // *simultaneous* first creations carrying **different** instants can leave
+    // the later writer's window with both callers told they got their own. It
+    // is the race `adopt_or_create_tenant` documents one screen down, in the one
+    // window where it is reachable — two operators standing the same company up
+    // in the same second with two different durations — and the outcome is still
+    // a window a real caller asked for. Closing it means `SELECT … FOR UPDATE`
+    // on the tenant row, which `halt::window` must not do because `GET /v1/halt`
+    // shares it: a second store function, the day this is worth one.
     let mut tx = db.tenant_tx(tenant).await?;
+    match halt::window(&mut tx).await? {
+        // A replay of the same body, and it writes nothing — not the row, whose
+        // `set_at` would move, and not the audit line, which would claim
+        // somebody chose a window when nobody did. Same rule as an identical
+        // role layer coming back `Installed::Unchanged`.
+        Some(existing) if existing == window_ends_at => {}
+        Some(existing) => {
+            return Err(ApiError::conflict(
+                "window_exists",
+                "this company already has an operating window, and it is not this one",
+            )
+            .with_extension("window_ends_at", json!(existing))
+            .with_detail(format!(
+                "`POST /v1/companies` may write an operating window where there is none — which \
+                 can only close, because a company with no window runs forever — and may not \
+                 replace one, which could extend it. This company's window ends at {existing}. \
+                 Move it deliberately with `PUT /v1/window`, which records who gave it more time. \
+                 Nothing was written by this call.",
+            )));
+        }
+        None => {
+            halt::set_window(&mut tx, window_ends_at, &principal.actor.label(), now).await?;
+            // `company_halt_changed`, the kind `PUT /v1/window` writes — not a
+            // field on the `company.created` row below. `company_windows` is one
+            // row overwritten in place, so this trail is the only thing that can
+            // ever answer "who decided when this company stops", and an answer
+            // whose first entry is filed under a different kind is an answer
+            // that needs two queries and the knowledge that one of them is
+            // special. That is the list-with-two-copies failure 0054 exists to
+            // refuse, arriving in the audit log instead of in the readers.
+            audit::append(
+                &mut tx,
+                &AuditEvent {
+                    payload: json!({
+                        "window_ends_at": window_ends_at,
+                        "previous_window_ends_at": Value::Null,
+                    }),
+                    ..AuditEvent::new(principal.actor.clone(), AuditKind::CompanyHaltChanged, now)
+                },
+            )
+            .await?;
+        }
+    }
     let chart = teams::apply_org_chart(&mut tx, &principal.actor, &body.org, now).await?;
     let hired = teams::hired_slugs(&chart);
     teams::record(
@@ -406,6 +581,7 @@ async fn create_company(
         roles = layers.len(),
         rows = chart.len(),
         hired = hired.len(),
+        window_ends_at = %window_ends_at,
         "company created"
     );
 
@@ -422,6 +598,9 @@ async fn create_company(
             "name": name,
             "roles": layers,
             "chart": chart,
+            // Named `window_ends_at` because that is what `GET /v1/halt` and the
+            // audit payload call it. One fact, one spelling, three surfaces.
+            "window_ends_at": window_ends_at,
         })),
     )
         .into_response())
