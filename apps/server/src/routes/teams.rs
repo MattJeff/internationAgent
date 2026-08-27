@@ -1726,7 +1726,11 @@ mod tests {
             .expect("keyring");
 
             Some(Self {
-                app: crate::with_api_stack(router(db.clone()), db.clone(), keys),
+                app: crate::with_api_stack(
+                    router(db.clone()),
+                    db.clone(),
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+                ),
                 db,
                 a,
                 b,
@@ -2686,9 +2690,11 @@ mod tests {
 
     /// **The first call on a first install, made one step too early.**
     ///
-    /// `AGENTOS_API_KEYS` names a tenant uuid; there is no endpoint that
-    /// creates a tenant; `docs/OPERATIONS.md` §1.4 is the `INSERT` an operator
-    /// runs by hand. Skip it and this is what happens — and until
+    /// `AGENTOS_API_KEYS` names a tenant uuid; no endpoint authorised by a
+    /// *tenant's* key creates a tenant; `docs/OPERATIONS.md` §1.4 is the two
+    /// things that do — `policy new-tenant` on the operator's own database
+    /// credential, or `POST /v1/platform/tenants` on a platform key. Skip both
+    /// and this is what happens — and until
     /// `StoreError::UnknownTenant` existed, what happened was `500 internal`
     /// with the cause only in the server's log, on the one call an operator
     /// makes at 2am on a machine they have not logged into yet.
@@ -2715,7 +2721,14 @@ mod tests {
         );
         assert_eq!(problem["code"], json!("unknown_tenant"), "{problem}");
         let detail = problem["detail"].as_str().unwrap_or_default();
-        for word in ["tenants", "INSERT", "OPERATIONS.md"] {
+        // Both remedies, by name: the operator reading this holds a tenant key
+        // and one of the two doors is open to whoever is standing next to them.
+        for word in [
+            "tenants",
+            "new-tenant",
+            "/v1/platform/tenants",
+            "OPERATIONS.md",
+        ] {
             assert!(
                 detail.contains(word),
                 "the refusal has to say what is missing and what to run; \

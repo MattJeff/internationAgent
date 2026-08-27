@@ -13,7 +13,10 @@
 //! *shape*, not a list: a loop that is cross-tenant by definition — outbox,
 //! inbound, initiative, provisioning, the MCP binder, `/metrics` — a read of
 //! the platform policy row, which belongs to no tenant, and the A2A ingress,
-//! which has to resolve a tenant *from* the request it is authenticating.
+//! which has to resolve a tenant *from* the request it is authenticating, and —
+//! the same shape, one layer earlier — the `api_keys` lookup, which is handed a
+//! bearer token and whose whole job is to say whose it is. [`crate::api_keys`]
+//! opens its transaction `READ ONLY` for that reason.
 //! `grep -rn admin_tx_bypassing_rls` is the current list; a number here is not,
 //! and the one that used to be here said "two callers: migrations, and the
 //! outbox poller" while there were seventeen — and migrations was never one of

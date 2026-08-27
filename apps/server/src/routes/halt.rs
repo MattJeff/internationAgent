@@ -311,7 +311,17 @@ mod tests {
             .expect("keyring");
 
             Some(Self {
-                app: crate::with_api_stack(router(db.clone()), db.clone(), keys),
+                // A `Keyring`, not the bare `ApiKeys` this used to pass:
+                // `waveJ-j1` made the environment keyring one half of a
+                // resolver whose other half is the `api_keys` table. These
+                // tests only ever present env keys, so the table half is never
+                // reached — but it has to exist, because the type is what
+                // proves every authenticated path can see both.
+                app: crate::with_api_stack(
+                    router(db.clone()),
+                    db.clone(),
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+                ),
                 db,
                 a,
                 b,

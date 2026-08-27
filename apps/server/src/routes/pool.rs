@@ -664,7 +664,11 @@ mod tests {
             let gate = PolicyGate::new(db.clone());
 
             let h = Self {
-                app: crate::with_api_stack(router(db.clone(), gate), db.clone(), keys),
+                app: crate::with_api_stack(
+                    router(db.clone(), gate),
+                    db.clone(),
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+                ),
                 db,
                 a,
                 b,

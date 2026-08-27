@@ -238,12 +238,18 @@ Ports are offset (Postgres `5442`, API `8090` if you set `APP_BIND` — the
 built-in default is `8080`) so the stack does not collide with other projects on
 the same machine.
 
-**There is no endpoint that creates a tenant** — deliberately: the credential
+**No endpoint authorised by a tenant's key creates a tenant** — the credential
 that would authorise the call is the one that names the tenant that does not
-exist yet. There is a *command*, on the operator's own database credentials:
+exist yet. Two things do create one, and neither is a tenant:
 
 ```bash
+# a. the operator's own database credentials
 agentos-server policy new-tenant acme Acme --id <the uuid in your API key>
+
+# b. a deployment holding AGENTOS_PLATFORM_KEYS — the tenant, its policy
+#    version and its first API key in one call, secret returned once
+curl -X POST $HOST/v1/platform/tenants -H "Authorization: Bearer $PLATFORM_KEY" \
+  -H 'Content-Type: application/json' -d '{"slug":"acme","name":"Acme"}'
 ```
 
 Skip it and the first write answers `400 unknown_tenant` naming what is missing,

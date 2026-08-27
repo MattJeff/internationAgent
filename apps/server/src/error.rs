@@ -188,11 +188,14 @@ impl From<StoreError> for ApiError {
                 )
                 .with_detail(
                     "This deployment has no `tenants` row for the tenant uuid in the API key \
-                     you presented, so nothing can be written against it. There is no endpoint \
-                     that creates a tenant: insert the row with psql — \
-                     `INSERT INTO tenants (id, slug, name) VALUES ('<the uuid in your key>', \
-                     'acme', 'Acme');` — see docs/OPERATIONS.md §1.4, \
-                     'The tenant you have to create yourself'.",
+                     you presented, so nothing can be written against it. No route authorised \
+                     by a *tenant* key can create one — the key for a tenant that does not \
+                     exist cannot authorise creating it. Create it with the operator's own \
+                     database credential — \
+                     `agentos-server policy new-tenant acme Acme --id <the uuid in your key>` \
+                     — or, on a deployment that holds a platform key, sign the customer up with \
+                     `POST /v1/platform/tenants`, which creates the tenant and issues its first \
+                     key in one call. See docs/OPERATIONS.md §1.4.",
                 )
             }
             StoreError::Conflict(what) => {

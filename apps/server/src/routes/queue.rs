@@ -542,7 +542,7 @@ mod tests {
                 app: crate::with_api_stack(
                     router(db.clone(), PolicyGate::new(db.clone()), ports),
                     db.clone(),
-                    keys,
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
                 db,
                 a,

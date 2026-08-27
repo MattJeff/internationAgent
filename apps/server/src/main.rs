@@ -87,7 +87,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::auth::{ApiKeys, Principal};
+use crate::auth::{Keyring, Principal};
 use crate::config::{Config, ConfigError};
 use crate::error::ApiError;
 use crate::loops::outbox::{Handled, Handlers};
@@ -498,6 +498,11 @@ fn app(
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
+    // Built once and shared: the platform surface issues keys with the same
+    // hashing key the authentication path verifies them with, and two
+    // derivations would be a deployment that mints credentials it cannot read
+    // back.
+    let keyring = Keyring::new(config.api_keys.clone(), db.clone(), &config.master_key);
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
@@ -565,7 +570,17 @@ fn app(
             ))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
-        config.api_keys.clone(),
+        keyring.clone(),
+    );
+
+    // The signup and key-issuance surface. Outside `with_api_stack` because
+    // that stack IS `require_api_key`, and a platform key is deliberately not a
+    // tenant key — `routes::platform` argues the whole split. Its own middleware
+    // and its own keyring; a tenant's credential gets a 401 here and a platform
+    // credential gets one everywhere else.
+    let platform = with_platform_stack(
+        routes::platform::router(db.clone(), keyring.hasher().clone()),
+        config.platform_keys.clone(),
     );
 
     // No credential, by design. See the doc comment. The key directory joins
@@ -602,7 +617,7 @@ fn app(
         })
         .merge(metrics::router(db));
 
-    with_outer_stack(health.merge(public).merge(api))
+    with_outer_stack(health.merge(public).merge(platform).merge(api))
 }
 
 fn a2a_state(db: &Db, gate: &PolicyGate, config: &Config) -> A2aState {
@@ -1576,13 +1591,23 @@ fn with_outer_stack(router: Router) -> Router {
 
 /// auth → rate limit → idempotency. Everything that needs to know who is
 /// calling, in the order it can know it.
-fn with_api_stack(router: Router, db: Db, keys: ApiKeys) -> Router {
+fn with_api_stack(router: Router, db: Db, keys: Keyring) -> Router {
     router.layer(
         ServiceBuilder::new()
             .layer(from_fn_with_state(keys, auth::require_api_key))
             .layer(from_fn_with_state(RateLimiter::default(), rate_limit))
             .layer(from_fn_with_state(db, replay_idempotent)),
     )
+}
+
+/// The platform credential, and nothing else.
+///
+/// No rate limit and no idempotency layer, because both are keyed on a tenant
+/// and this tier has none — `routes::platform` says what stands in for them
+/// (uniqueness on the two writes) and why that is enough for two endpoints that
+/// are called once per customer.
+fn with_platform_stack(router: Router, keys: auth::PlatformKeys) -> Router {
+    router.layer(from_fn_with_state(keys, auth::require_platform_key))
 }
 
 /// Which tenant this key speaks for.
@@ -2007,10 +2032,23 @@ mod tests {
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
-    fn keyring() -> (TenantId, ApiKeys) {
+    fn keyring() -> (TenantId, crate::auth::ApiKeys) {
         let tenant = TenantId::from_uuid(Uuid::from_u128(42));
         let raw = format!("ops:{}:{SECRET}", tenant.as_uuid());
-        (tenant, ApiKeys::parse(&raw).expect("valid"))
+        (tenant, crate::auth::ApiKeys::parse(&raw).expect("valid"))
+    }
+
+    /// A pool, or `None` when there is nothing to talk to.
+    ///
+    /// [`Keyring`] holds one because the second half of a lookup is a table.
+    async fn test_db() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the auth layer needs a real Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
     }
 
     // -- the stack ---------------------------------------------------------
@@ -2023,9 +2061,17 @@ mod tests {
             panic!("the handler ran without a credential")
         }
 
+        // No database: the credential is missing, so `Keyring::resolve` returns
+        // before it queries anything, and this test is about the layer running
+        // at all. A `Db` is still needed to build the state — it is never
+        // touched, which the assertion below is only true because of.
+        let Some(db) = test_db().await else { return };
         let (_, keys) = keyring();
         let router = Router::new().route("/employees/{id}", post(unreachable_handler));
-        let app = with_outer_stack(router.layer(from_fn_with_state(keys, auth::require_api_key)));
+        let app = with_outer_stack(router.layer(from_fn_with_state(
+            Keyring::new(keys, db, auth::TEST_MASTER_KEY),
+            auth::require_api_key,
+        )));
 
         let response = app
             .oneshot(
@@ -3190,8 +3236,11 @@ mod tests {
             llm: agentos_app::mocks::LlmBackend::Mock,
             anthropic_api_key: None,
             rust_log: "info".to_owned(),
-            api_keys: ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
+            api_keys: crate::auth::ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
                 .expect("keyring"),
+            // Empty: this config exists for `handlers`, which is the termination
+            // path, and no platform route is mounted from it.
+            platform_keys: crate::auth::PlatformKeys::default(),
             mock_adapters: Vec::new(),
             // Every adapter a mock, which is what this test's engine is built
             // with anyway.
@@ -3234,7 +3283,8 @@ mod tests {
             .expect("insert tenant");
         tx.commit().await.expect("commit");
 
-        let keys = ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid())).expect("keyring");
+        let keys = crate::auth::ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
+            .expect("keyring");
         let runs = Arc::new(AtomicUsize::new(0));
         let counter = runs.clone();
 
@@ -3250,7 +3300,7 @@ mod tests {
                 }),
             ),
             db.clone(),
-            keys,
+            Keyring::new(keys, db.clone(), auth::TEST_MASTER_KEY),
         );
 
         let send = |body: &'static str| {

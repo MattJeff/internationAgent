@@ -9,6 +9,7 @@ pub mod inventory;
 pub mod knowledge;
 pub mod mcp;
 pub mod model; // wave H: the tenant connects the model their employees think with
+pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
 pub mod pool;
 pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
 pub mod reports; // the manager's view of its own line

@@ -1705,7 +1705,7 @@ mod tests {
                         credentials.clone(),
                     )),
                     db.clone(),
-                    keys,
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
                 db,
                 fleets,

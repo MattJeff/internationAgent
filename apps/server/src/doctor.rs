@@ -301,21 +301,37 @@ pub fn inspect(get: &dyn Fn(&str) -> Option<String>) -> Report {
         );
     }
 
-    // Neither is required to boot, and both are outages that look like bugs:
-    // an empty keyring answers every request 401, an empty webhook registry
-    // 404s every provider callback and no inbound message can ever arrive.
+    // None of the three is required to boot, and each empty one is an outage
+    // that looks like a bug: no keyring at all answers every request 401, an
+    // empty webhook registry 404s every provider callback and no inbound
+    // message can ever arrive.
+    //
+    // `AGENTOS_API_KEYS` alone being empty is NOT reported as missing any more,
+    // and that is the point of `0044_api_keys`: a control plane holds only a
+    // platform key and issues every tenant credential over HTTP. What is worth
+    // reporting is having neither, because then nothing can authenticate and
+    // nothing can issue a key to change that.
+    let keyless = config.api_keys.is_empty() && config.platform_keys.is_empty();
     report.push(
         "AGENTOS_API_KEYS",
-        if config.api_keys.is_empty() {
-            Status::Missing
-        } else {
-            Status::Ok
-        },
-        if config.api_keys.is_empty() {
-            "not set — every request is answered 401. Set it to `label:tenant-uuid:secret[,…]`."
+        if keyless { Status::Missing } else { Status::Ok },
+        if keyless {
+            "not set, and neither is AGENTOS_PLATFORM_KEYS — every request is answered 401 and \
+             no key can be issued to change that. Set it to `label:tenant-uuid:secret[,…]`."
                 .to_owned()
         } else {
             format!("{} key(s) configured", config.api_keys.len())
+        },
+    );
+    report.push(
+        "AGENTOS_PLATFORM_KEYS",
+        if keyless { Status::Missing } else { Status::Ok },
+        if config.platform_keys.is_empty() {
+            "not set — POST /v1/platform/tenants is answered 401, so nobody can sign up and no \
+             API key can be issued or revoked without a redeploy. Set it to `label:secret`."
+                .to_owned()
+        } else {
+            format!("{} platform key(s) configured", config.platform_keys.len())
         },
     );
     report.push(
