@@ -910,6 +910,80 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     }
     eprintln!("--- the signed delivery became an inbound notice");
 
+    // -- a spam complaint is acted on rather than dead-lettered -------------
+    //
+    // **The message it is most expensive to lose.** The route files every
+    // verified delivery under `webhook.email.received` whatever the provider
+    // sent; `InboundNotice::parse` refuses anything but `email.received`; and
+    // the handler used to turn that refusal into an error. Three reasonable
+    // links, and together they meant a `email.complained` was received,
+    // verified, stored, retried eight times and thrown away — while the
+    // permanent stream of failures buried every outage that was real.
+    //
+    // Note the direction: `to` is the person who complained and `from` is our
+    // own employee address. A reader that took `from` would suppress the
+    // tenant's own sender and end their outbound mail entirely.
+    let complaint = r#"{"type":"email.complained","created_at":"2026-08-24T10:05:00Z","data":{"email_id":"email_e2e_2","from":"lena@agents.example.com","to":["AP@Supplier.Example"]}}"#;
+    let timestamp = Utc::now().timestamp().to_string();
+    let signature = agentos_app::inbound::sign_webhook(
+        &agentos_app::inbound::Secret::new(WEBHOOK_SECRET),
+        "msg_e2e_2",
+        &timestamp,
+        complaint.as_bytes(),
+    );
+    let (status, accepted) = server.curl(
+        "POST",
+        "/v1/webhooks/email",
+        &[
+            ("webhook-id", "msg_e2e_2".to_owned()),
+            ("webhook-timestamp", timestamp),
+            ("webhook-signature", signature),
+        ],
+        Some(complaint),
+    );
+    assert_eq!(status, 202, "a signed complaint: {accepted:#}");
+
+    // The poller reads it and puts it on the trail. Normalised to the shape
+    // `suppressions_address_normalised` demands, because that row is one call
+    // away from being the suppression itself.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let recorded = server
+            .count(
+                "SELECT count(*) FROM audit_log WHERE action_kind = 'mail_refused' \
+                   AND payload->>'reason' = 'complaint' \
+                   AND payload->'addresses' @> '[\"ap@supplier.example\"]'::jsonb",
+            )
+            .await;
+        if recorded > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a verified spam complaint left no trace: it is being retried and \
+             dead-lettered exactly as it was before"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // And it was *completed*, not merely attempted. This is the half that says
+    // the frontier moved: a published row with no failures behind it. A
+    // complaint that is retried is a complaint on its way to the dead-letter
+    // queue, and `last_error` is where the old behaviour would show up.
+    let retried = server
+        .count(
+            "SELECT count(*) FROM outbox_events \
+              WHERE payload->>'event_id' = 'msg_e2e_2' \
+                AND (published_at IS NULL OR attempt_count > 1 OR last_error IS NOT NULL)",
+        )
+        .await;
+    assert_eq!(
+        retried, 0,
+        "the stored complaint was retried or left unpublished; \
+         `Err` in on_webhook is eight attempts and then a dead letter"
+    );
+    eprintln!("--- the spam complaint was recorded on the trail, not dead-lettered");
+
     // -- readiness refuses a deployment that would deny everything ----------
     //
     // Nothing has installed a platform policy ceiling, and the gate is

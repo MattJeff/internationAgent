@@ -617,6 +617,55 @@ mod tests {
         assert!(stored(&db, tenant).await.is_empty());
     }
 
+    /// **An unsigned `email.complained` is refused like anything else, and that
+    /// matters more than it used to.**
+    ///
+    /// A refusal is no longer inert. `main::on_webhook` now reads one, and
+    /// `app::inbound::record_refusal` writes it to an append-only trail that is
+    /// one call short of `suppressions` — a table with no DELETE, for anybody,
+    /// by trigger. So a forged complaint that got past this door would be a way
+    /// for an unauthenticated stranger to have a tenant's own customers marked
+    /// do-not-contact, permanently, one address per request.
+    ///
+    /// The only thing standing between those two facts is this refusal, and
+    /// "nothing was queued" is the whole of it: `on_webhook` reads outbox rows
+    /// and nothing else, so a delivery that is never stored can never be read.
+    #[tokio::test]
+    async fn an_unsigned_complaint_reaches_neither_the_queue_nor_the_trail() {
+        let Some((db, tenant, router)) = harness().await else {
+            return;
+        };
+
+        let complaint = br#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z","data":{"email_id":"email_forged","from":"lena@agents.example.com","to":["victim@customer.example"]}}"#;
+
+        // Unsigned, then signed with a secret we do not hold. Both are the same
+        // answer, and neither leaves a row.
+        let naked = HttpRequest::post(format!("/v1/webhooks/{PROVIDER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(complaint.to_vec()))
+            .expect("request");
+        let (status, _) = call(&router, naked).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = call(
+            &router,
+            signed_to(PROVIDER, "whsec_notoursnotours", "msg_forged", complaint),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            stored(&db, tenant).await.is_empty(),
+            "a forged complaint was queued; it is one outbox drain away from \
+             suppressing somebody else's customer for good"
+        );
+
+        // The control: the same bytes, signed properly, are accepted — so the
+        // two refusals above were the signature and not the payload shape.
+        let (status, _) = call(&router, signed("msg_honest_complaint", complaint)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(stored(&db, tenant).await.len(), 1);
+    }
+
     /// A delivery signed with a secret we do not hold — the wrong provider
     /// account, or a rotation applied on one side only.
     #[tokio::test]

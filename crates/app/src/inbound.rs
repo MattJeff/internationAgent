@@ -368,7 +368,9 @@ use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, Tena
 use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
-use agentos_providers::email::{EmailProvider, InboundNotice, ParseError, Route};
+use agentos_providers::email::{
+    Delivery, EmailProvider, InboundNotice, ParseError, Refusal, Route,
+};
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
@@ -609,26 +611,193 @@ pub async fn record_notice(
     Ok((employee_id, id))
 }
 
-/// Turn one **verified** raw webhook body into a recorded notice.
+/// What a verified delivery turned out to be, once something read it.
+///
+/// Three outcomes and **none of them is an error**, which is the whole reason
+/// this type exists rather than a `Result<(EmployeeId, Uuid), _>`. See
+/// [`record_raw_email_delivery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recorded {
+    /// An inbound message, routed to an employee and queued for the inbound
+    /// loop.
+    Notice {
+        /// Who the envelope resolved to.
+        employee_id: EmployeeId,
+        /// The queued `email.received` event.
+        event_id: Uuid,
+    },
+
+    /// The far end refused our mail, and the trail now says so.
+    Refused(Refusal),
+
+    /// A verified webhook of a type this build has no reader for.
+    Unread {
+        /// The provider's own `type`, truncated. Third-party text: log it with
+        /// `?`, never `%`.
+        kind: String,
+    },
+}
+
+/// Read one **verified** raw webhook body and record whatever it turns out to
+/// be.
 ///
 /// The bridge between the HTTP edge and this module. `routes/webhooks.rs`
 /// stores the raw bytes and answers 202 without interpreting them — it cannot
-/// interpret them, because [`InboundNotice::parse`] lives in
-/// `agentos-providers` and the binary does not depend on it. So the parse
-/// happens here, later, driven by the outbox handler that claims the stored
-/// delivery.
+/// interpret them, because the parser lives in `agentos-providers` and the
+/// binary does not depend on it. So the read happens here, later, driven by the
+/// outbox handler that claims the stored delivery.
 ///
 /// `raw_body` must be the **exact bytes the signature was checked over**.
 /// Re-serialising them anywhere between the route and here would not break this
 /// function, but it would have broken the verification that makes calling it
 /// safe.
-pub async fn record_raw_email_notice(
+///
+/// # Why the return type is not a `Result` of a notice
+///
+/// It was, and that was a way to throw away a spam complaint. Three links, each
+/// defensible alone:
+///
+/// 1. `routes::webhooks` files **every** verified delivery under
+///    `webhook.{provider}.received`, whatever the provider actually sent — and
+///    that is right, because the edge must not deserialise a payload it is
+///    about to have verified, and an `event_type` nothing registered a handler
+///    for is retried eight times and dead-lettered;
+/// 2. [`InboundNotice::parse`] refuses anything but `email.received` with
+///    [`ParseError::WrongEvent`] — also right, since nothing should be able to
+///    build a notice out of a bounce;
+/// 3. this function turned that refusal into an `Err`, and its caller turns an
+///    `Err` into a failed outbox event.
+///
+/// So a `email.complained` was received, verified, stored, retried eight times
+/// and dead-lettered. The bytes survived; the act of reading them never
+/// happened. That is the worst message in the system to drop — an ignored
+/// complaint costs the sending domain's reputation and then the deliverability
+/// of every other tenant on it — and the permanent stream of failures it
+/// produced buried the outages that were real.
+///
+/// The fix is a frontier, not two more event types: `Err` now means **only**
+/// "trying again could work, or a human must look" — a body that is not a
+/// webhook, a provider that does not have the message yet, a database that said
+/// no. A delivery we understand and a delivery we have never heard of are both
+/// `Ok`, because no number of attempts turns either into something else.
+pub async fn record_raw_email_delivery(
     tx: &mut TenantTx<'_>,
     raw_body: &[u8],
     now: DateTime<Utc>,
-) -> Result<(EmployeeId, Uuid), InboundError> {
-    let notice = InboundNotice::parse(raw_body)?;
-    record_notice(tx, &notice, now).await
+) -> Result<Recorded, InboundError> {
+    match Delivery::parse(raw_body)? {
+        Delivery::Received(notice) => {
+            let (employee_id, event_id) = record_notice(tx, &notice, now).await?;
+            Ok(Recorded::Notice {
+                employee_id,
+                event_id,
+            })
+        }
+        Delivery::Refused(refusal) => {
+            record_refusal(tx, &refusal, now).await?;
+            Ok(Recorded::Refused(refusal))
+        }
+        // Nothing is written. The delivery's own bytes are already durable on
+        // the `webhook` outbox row that got us here, so the row plus the log
+        // line below it is the whole record — and a row per `email.opened`
+        // would be a table nobody reads.
+        Delivery::Unread { kind } => Ok(Recorded::Unread { kind }),
+    }
+}
+
+/// Put a refusal on the trail, in the caller's transaction.
+///
+/// [`audit_log`](agentos_store::audit) and not a table of its own, and the
+/// reasons are the ones that table already argues for itself: it is append-only
+/// under a trigger that binds superusers too, and it has **no foreign key to
+/// `tenants`** — so a record of "this person told us to stop" cannot be edited
+/// or deleted, and cannot be erased by deleting the tenant that received it.
+/// That is the same standard `migrations/0011_revenue.sql` holds `suppressions`
+/// to, which is not a coincidence: it is the next thing this row has to become.
+///
+/// # SEAM — this stops one call short of a `suppressions` row, deliberately
+///
+/// A complaint *should* produce a suppression. It does not yet, and the missing
+/// step is one statement, not a design:
+///
+/// ```ignore
+/// for address in &refusal.addresses {
+///     agentos_store::revenue::suppress(
+///         tx,
+///         Uuid::now_v7(),
+///         &revenue_store::NewSuppression {
+///             channel: revenue_store::Channel::Email,
+///             address,                       // already trimmed and lower-cased
+///             reason: refusal.reason,        // "complaint" | "bounce"
+///             scope: revenue_store::Scope::Tenant,
+///             contact_id: None,
+///             note: Some("resend webhook"),
+///             suppressed_at: refusal.at.unwrap_or(now),
+///         },
+///     )
+///     .await?;
+/// }
+/// ```
+///
+/// Everything it needs is already in place: `suppressions_reason`'s CHECK
+/// already accepts `'complaint'` and `'bounce'`, `suppress` is idempotent by
+/// `ON CONFLICT DO NOTHING`, and [`Refusal::addresses`] is normalised into the
+/// exact shape `suppressions_address_normalised` demands. **No migration is
+/// required** — `0056` was considered and is not needed.
+///
+/// It is left undone here because another wave is building the
+/// `reply STOP -> suppressions` writer at the same time, and two writers landing
+/// on one append-only table from two sides is precisely the seam that
+/// manufactures a bug. One writer, joined at the merge.
+///
+/// Two conditions the joining commit owes, neither of which is guesswork:
+///
+/// * **Gate the bounce branch on [`Refusal::permanent`].** A complaint is
+///   always final; a bounce is only final when the provider called it
+///   `Permanent`. `suppressions` takes no DELETE, so suppressing on a full
+///   mailbox removes a live customer with no way back.
+/// * **`refusal.addresses` may be empty**, and a suppression of nothing is not
+///   a failure — the trail row below is still the record.
+///
+/// # For the founder, and not answerable from this binary
+///
+/// **Is the Resend endpoint actually subscribed to `email.bounced` and
+/// `email.complained`?** Which events an endpoint sends is a checkbox in
+/// Resend's dashboard; nothing in this process can read it and nothing here
+/// should assume it. If those boxes are unticked, this path is correct and
+/// never runs, and the first thing to fix is the dashboard rather than any of
+/// this code.
+async fn record_refusal(
+    tx: &mut TenantTx<'_>,
+    refusal: &Refusal,
+    now: DateTime<Utc>,
+) -> Result<(), InboundError> {
+    audit::append(
+        tx,
+        &AuditEvent {
+            payload: json!({
+                "reason": refusal.reason,
+                "permanent": refusal.permanent,
+                // Matching metadata, written to jsonb and never rendered — the
+                // same standing `TelephonyRoute`'s numbers have. This is the
+                // column the joining commit reads to backfill the suppressions
+                // that were refused before it landed.
+                "addresses": refusal.addresses,
+                "channel": Channel::Email.as_str(),
+            }),
+            // The provider's own instant when it gave one; ours otherwise. A
+            // complaint's timestamp is part of a legal record, so it is taken
+            // from the payload rather than from whenever the poller happened to
+            // drain the row.
+            ..AuditEvent::new(
+                AuditActor::System,
+                AuditKind::MailRefused,
+                refusal.at.unwrap_or(now),
+            )
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// The employee whose address is among `to`, if any.
@@ -2805,6 +2974,203 @@ mod tests {
         assert!(!InboundError::UnknownRecipient.is_retryable());
         assert!(!InboundError::Normalize(ParseError::Malformed).is_retryable());
         assert_eq!(InboundError::NotReady.code(), "not_ready");
+    }
+
+    // -- the frontier: what a stored delivery turns out to be ----------------
+
+    /// One verified delivery through the bridge, in its own transaction, the way
+    /// the outbox handler runs it.
+    async fn read_delivery(
+        db: &Db,
+        tenant: TenantId,
+        raw_body: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Recorded, InboundError> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let read = record_raw_email_delivery(&mut tx, raw_body.as_bytes(), now).await;
+        match read.is_ok() {
+            true => tx.commit().await.expect("commit delivery"),
+            false => tx.rollback().await.expect("rollback delivery"),
+        }
+        read
+    }
+
+    /// Every `mail_refused` row this tenant holds, newest last.
+    async fn refusals(db: &Db, tenant: TenantId) -> Vec<Value> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM audit_log WHERE action_kind = 'mail_refused' \
+              ORDER BY occurred_at",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read the trail");
+        tx.commit().await.expect("commit read");
+        rows
+    }
+
+    /// **The claim this unit exists for.**
+    ///
+    /// A spam complaint arrives, verified, on the one door the provider knocks
+    /// on. Before this it was `WrongEvent` -> a handler error -> eight retries
+    /// -> a dead letter: the bytes survived and the act of reading them never
+    /// happened. It must now be recorded, once, and it must **not** be an error,
+    /// because an error here is the dead-letter queue and a complaint in the
+    /// dead-letter queue is a complaint nobody acts on.
+    ///
+    /// Note who complained: `data.to` is the counterparty and `data.from` is
+    /// *our own* employee address. A reader that took `from` would put the
+    /// tenant's own sender on the suppression list and end their outbound mail.
+    #[tokio::test]
+    async fn a_spam_complaint_is_recorded_once_and_is_never_a_handler_error() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let complaint = r#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_9","from":"lena@agents.example.com",
+                     "to":["AP@Supplier.Example"]}}"#;
+
+        let recorded = read_delivery(&db, tenant, complaint, now)
+            .await
+            .expect("a complaint must not be a handler error");
+        let Recorded::Refused(refusal) = recorded else {
+            panic!("a complaint was not read as a refusal: {recorded:?}");
+        };
+        assert_eq!(refusal.reason, "complaint");
+        assert!(refusal.permanent);
+
+        // On the trail, in the shape the suppression writer will read.
+        let rows = refusals(&db, tenant).await;
+        assert_eq!(rows.len(), 1, "the complaint left {} rows", rows.len());
+        assert_eq!(rows[0]["reason"], json!("complaint"));
+        assert_eq!(rows[0]["permanent"], json!(true));
+        assert_eq!(rows[0]["channel"], json!("email"));
+        assert_eq!(
+            rows[0]["addresses"],
+            json!(["ap@supplier.example"]),
+            "the recorded address must be the complainer, normalised the way \
+             `suppressions_address_normalised` demands"
+        );
+
+        // **No employee owns `ap@supplier.example`.** A complaint from a
+        // stranger is the ordinary case, and routing it like inbound mail would
+        // make `UnknownRecipient` the answer to almost every complaint — which
+        // is a handler error, which is the dead letter again by another route.
+        let (tenant_2, _) = seed(&db).await;
+        let stranger = r#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_10","from":"nobody@agents.example.com",
+                     "to":["someone@elsewhere.example"]}}"#;
+        read_delivery(&db, tenant_2, stranger, now)
+            .await
+            .expect("a complaint about an address we do not employ is still a complaint");
+        assert_eq!(refusals(&db, tenant_2).await.len(), 1);
+
+        // And it stayed in its own tenant: RLS answered, not a WHERE clause.
+        assert_eq!(refusals(&db, tenant).await.len(), 1);
+    }
+
+    /// A bounce is recorded too, and the trail keeps the provider's own verdict
+    /// on whether it was final — because that flag is what the suppression
+    /// writer must gate on. `suppressions` takes no DELETE, so a transient
+    /// bounce recorded as permanent is a live customer removed for good.
+    #[tokio::test]
+    async fn a_bounce_records_the_providers_own_verdict_on_whether_it_is_final() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+
+        for (declared, expected) in [("Permanent", true), ("Transient", false)] {
+            // A fresh tenant per case, so `rows.last()` is this case's row and
+            // not the previous one's.
+            let (tenant, _) = seed(&db).await;
+            let bounce = format!(
+                r#"{{"type":"email.bounced","created_at":"2026-08-24T10:00:00Z",
+                   "data":{{"email_id":"email_out_1","from":"lena@agents.example.com",
+                            "to":["ap@supplier.example"],
+                            "bounce":{{"type":"{declared}","subType":"General"}}}}}}"#
+            );
+            read_delivery(&db, tenant, &bounce, now)
+                .await
+                .expect("a bounce must not be a handler error");
+
+            let rows = refusals(&db, tenant).await;
+            let row = rows.last().expect("a bounce left no trail row");
+            assert_eq!(row["reason"], json!("bounce"));
+            assert_eq!(
+                row["permanent"],
+                json!(expected),
+                "a {declared} bounce was recorded permanent={}",
+                row["permanent"]
+            );
+        }
+    }
+
+    /// A type nobody here has read the docs for is a **novelty**: recorded in a
+    /// log, completed, and not retried. It writes no trail row — the delivery's
+    /// own bytes are already durable on the `webhook` outbox row — and above all
+    /// it is not an error, because eight attempts will not make it known.
+    #[tokio::test]
+    async fn an_unread_type_completes_without_a_trail_row_and_without_an_error() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let opened = r#"{"type":"email.opened","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_2","from":"lena@agents.example.com","to":[]}}"#;
+
+        assert_eq!(
+            read_delivery(&db, tenant, opened, now)
+                .await
+                .expect("an unknown type must not be a handler error"),
+            Recorded::Unread {
+                kind: "email.opened".to_owned()
+            }
+        );
+        assert!(refusals(&db, tenant).await.is_empty());
+    }
+
+    /// The other half of the frontier, and the half a looser fix would have
+    /// destroyed: an inbound message still routes, and a body that is **not** a
+    /// webhook is still an `Err` — so it is still retried and still lands in the
+    /// dead-letter queue where somebody has to look at it.
+    #[tokio::test]
+    async fn an_inbound_message_still_routes_and_a_non_webhook_is_still_an_error() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let now = Utc::now();
+
+        let inbound = r#"{"type":"email.received","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_in_1","from":"ap@supplier.example",
+                     "to":["lena@agents.example.com"]}}"#;
+        let recorded = read_delivery(&db, tenant, inbound, now)
+            .await
+            .expect("an inbound message still lands");
+        let Recorded::Notice {
+            employee_id,
+            event_id,
+        } = recorded
+        else {
+            panic!("an inbound message stopped becoming a notice: {recorded:?}");
+        };
+        assert_eq!(employee_id, employee);
+        assert_ne!(event_id, Uuid::nil());
+        // The inbound path writes no refusal, and the refusal path writes no
+        // notice. Nothing crossed.
+        assert!(refusals(&db, tenant).await.is_empty());
+
+        // Not a webhook at all: still an error, and still not retryable-looking
+        // for the wrong reason.
+        for body in [
+            "{",
+            r#"{"created_at":"2026-08-24T10:00:00Z","data":{}}"#,
+            r#"{"type":"email.received","created_at":"2026-08-24T10:00:00Z","data":{}}"#,
+        ] {
+            let err = read_delivery(&db, tenant, body, now)
+                .await
+                .expect_err("a body that is not a webhook must stay an error");
+            assert!(
+                matches!(err, InboundError::Normalize(_)),
+                "unexpected classification for {body}: {err}"
+            );
+        }
     }
 
     // -- the pipeline -------------------------------------------------------

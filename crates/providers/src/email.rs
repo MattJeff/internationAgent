@@ -140,6 +140,195 @@ impl InboundNotice {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound, phase 0: what kind of delivery is this at all
+// ---------------------------------------------------------------------------
+
+/// A delivery that says an address must not be mailed again.
+///
+/// Read off a **verified** payload by our own edge, so [`addresses`](Self::addresses)
+/// is matching metadata and not [`Untrusted`] — the same argument
+/// [`crate::telephony`]'s routing pair makes for `To` / `From`: it is compared
+/// against our own tables (`contacts.email`, `suppressions.address`) and never
+/// rendered into a prompt, a template or an outbound message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// Spelled the way `suppressions.reason`'s CHECK spells it — `"complaint"`
+    /// or `"bounce"` — so recording one is a field and not a translation table
+    /// somebody has to keep in step with a migration.
+    pub reason: &'static str,
+
+    /// **The counterparty.** Note the direction flip against [`InboundNotice`],
+    /// because getting it backwards is the expensive mistake here: on an
+    /// inbound message `data.from` is the stranger and `data.to` is us, while
+    /// on a bounce or a complaint `data.from` is *our own sending address* and
+    /// `data.to` is the person who refused. Suppressing `from` would suppress
+    /// ourselves and take the whole tenant's outbound mail down.
+    ///
+    /// Trimmed and lower-cased, because `suppressions_address_normalised`
+    /// requires exactly that shape and a suppression stored in another one is a
+    /// suppression that never fires. Empty entries are dropped, so the list can
+    /// be empty — a refusal naming nobody is still worth recording, and it is
+    /// the caller that decides what to do with no address.
+    pub addresses: Vec<String>,
+
+    /// Whether this is final.
+    ///
+    /// A complaint always is. A bounce is only when the provider itself called
+    /// it `Permanent`: a full mailbox or a greylisting is not consent
+    /// withdrawn, and suppressing on a transient bounce deletes a live customer
+    /// from the list with no way back — `suppressions` takes no DELETE, for
+    /// anybody, by trigger.
+    pub permanent: bool,
+
+    /// When the provider says it happened.
+    ///
+    /// `None` rather than a substituted clock. The caller has its own `now` and
+    /// is the one that should decide to fall back to it; inventing a timestamp
+    /// here would put a guess in a legal record.
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// What a verified email webhook body turns out to be.
+///
+/// # Why this exists beside [`InboundNotice::parse`]
+///
+/// That function answers one question — "is this an inbound message?" — and
+/// answers everything else with [`ParseError::WrongEvent`]. Correct for a
+/// caller that wants a notice; wrong for the caller that holds a *delivery* and
+/// does not yet know what it is, because `WrongEvent` collapses three
+/// unrelated facts into one refusal that reads like a fault:
+///
+/// * a **refusal** — `email.bounced`, `email.complained` — which is a fact
+///   about an address we have been mailing, and the single most expensive
+///   message in this system to lose. An ignored spam complaint costs the
+///   sending domain's reputation and then everybody's deliverability;
+/// * a type this build has **no reader for**, which is a fact about our
+///   documentation being behind the provider's, not about this delivery;
+/// * and, genuinely, a body that is not a webhook at all.
+///
+/// The first two are **terminal and not errors**. Neither becomes true on a
+/// ninth attempt, so handing either to a retrying caller buys nothing and costs
+/// a dead letter — which is how a complaint gets thrown away, and how the
+/// resulting permanent error stream hides the failures that are real.
+///
+/// That split is the same one [`crate::ProviderError::is_retryable`] draws, and
+/// it is drawn here for the same reason it had to be corrected there: a
+/// classification that calls something retryable when no amount of retrying can
+/// change it turns a standing misconfiguration into traffic, and hides a broken
+/// binding behind a status that reads like progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// An inbound message. Phase one of the two-phase path this module is
+    /// built around.
+    Received(InboundNotice),
+
+    /// The far end refused our mail.
+    Refused(Refusal),
+
+    /// A type this build has no reader for.
+    ///
+    /// **Not an error, and not to be dropped in silence either.** Retrying will
+    /// not make it known and discarding it loses the one signal that says an
+    /// endpoint is subscribed to something nobody here has read the docs for.
+    /// The caller records it once and completes.
+    Unread {
+        /// The provider's own `type`, truncated to [`Delivery::MAX_KIND`].
+        ///
+        /// The signature covers it, so it is the provider's own text rather
+        /// than a stranger's — but it is still third-party bytes headed for a
+        /// log line, so it is rendered with `?` (the escaping `Debug` form) and
+        /// never with `%`, exactly as `routes::webhooks` renders a probed path.
+        kind: String,
+    },
+}
+
+impl Delivery {
+    /// The `type` of a spam complaint. The one that must never be lost.
+    pub const COMPLAINED: &'static str = "email.complained";
+
+    /// The `type` of a bounce.
+    pub const BOUNCED: &'static str = "email.bounced";
+
+    /// Longest `type` string carried out of a payload and into a log.
+    ///
+    /// A bound rather than trust: this string ends up in a log field and a
+    /// metric label, and neither should be sized by whoever sent the webhook.
+    pub const MAX_KIND: usize = 64;
+
+    /// Read a webhook body that has **already** passed
+    /// [`EmailProvider::verify_webhook`].
+    ///
+    /// `Err` is reserved for a body that is not a webhook at all. A body that is
+    /// a perfectly good webhook of a kind we do not act on comes back `Ok` —
+    /// see the type's own note for why that distinction is the whole point.
+    ///
+    /// ponytail: the inbound branch re-parses the same bytes through
+    /// [`InboundNotice::parse`] rather than being handed a half-decoded
+    /// envelope. That is one extra `from_slice` over a payload
+    /// `routes::webhooks::MAX_WEBHOOK_BYTES` caps at 256 KB, once per inbound
+    /// email, and what it buys is that `InboundNotice::parse` is reached by
+    /// exactly the same path it always was — so nothing here can loosen what an
+    /// inbound notice is required to contain. Fold them together only if a
+    /// profiler ever names this, and keep a test that a notice missing
+    /// `email_id` is still refused.
+    pub fn parse(raw_body: &[u8]) -> Result<Self, ParseError> {
+        let body: serde_json::Value =
+            serde_json::from_slice(raw_body).map_err(|_| ParseError::Malformed)?;
+        let kind = body
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ParseError::Malformed)?;
+
+        let reason = match kind {
+            InboundNotice::EVENT => return InboundNotice::parse(raw_body).map(Self::Received),
+            Self::COMPLAINED => "complaint",
+            Self::BOUNCED => "bounce",
+            _ => {
+                return Ok(Self::Unread {
+                    kind: kind.chars().take(Self::MAX_KIND).collect(),
+                });
+            }
+        };
+
+        // `data.to`, and never `data.from` — see [`Refusal::addresses`].
+        let addresses = body
+            .pointer("/data/to")
+            .and_then(serde_json::Value::as_array)
+            .map(|to| {
+                to.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|address| address.trim().to_lowercase())
+                    .filter(|address| !address.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A complaint is always final. A bounce is final only if the provider
+        // said so itself; anything it did not call `Permanent` — `Transient`,
+        // `Undetermined`, or a payload with no bounce block at all — is left
+        // reversible, because the failure directions are not symmetric. Not
+        // suppressing a dead address costs a wasted send; suppressing a live
+        // one is a customer we can never mail again.
+        let permanent = reason == "complaint"
+            || body
+                .pointer("/data/bounce/type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("permanent"));
+
+        Ok(Self::Refused(Refusal {
+            reason,
+            addresses,
+            permanent,
+            at: body
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&Utc)),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inbound, phase 2: the fetched message
 // ---------------------------------------------------------------------------
 
@@ -235,6 +424,14 @@ pub enum ParseError {
     #[error("payload is not a well-formed webhook body")]
     Malformed,
     /// A webhook for something other than [`InboundNotice::EVENT`].
+    ///
+    /// Only [`InboundNotice::parse`] produces this, and it stays strict:
+    /// nothing may build a notice out of a bounce. It is **not** what a caller
+    /// holding an unclassified delivery should be reading, because it says
+    /// nothing about whether the event was a refusal we must act on or a type
+    /// we have simply never read the docs for — [`Delivery::parse`] is that
+    /// caller's entry point, and it exists because this variant answered both
+    /// with the same word.
     #[error("webhook is not an inbound-email event")]
     WrongEvent,
     /// A field we cannot proceed without was empty.
@@ -1350,6 +1547,205 @@ mod tests {
         .unwrap();
         assert_eq!(InboundNotice::parse(&body), Err(ParseError::WrongEvent));
         assert_eq!(InboundNotice::parse(b"{"), Err(ParseError::Malformed));
+    }
+
+    // -- Delivery: the frontier ---------------------------------------------
+
+    fn refusal_body(kind: &str, to: serde_json::Value, bounce: Option<&str>) -> Vec<u8> {
+        let mut data = serde_json::json!({
+            "email_id": "email_out_1",
+            // **Ours.** On a bounce or a complaint the sender is us; anything
+            // that suppressed `from` would suppress the tenant's own address.
+            "from": "lena@agents.example.com",
+            "to": to,
+        });
+        if let Some(kind) = bounce {
+            data["bounce"] = serde_json::json!({ "type": kind, "subType": "General" });
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "type": kind,
+            "created_at": "2026-08-24T10:00:00Z",
+            "data": data,
+        }))
+        .expect("serialize")
+    }
+
+    /// **The claim the whole change exists for.**
+    ///
+    /// A spam complaint is a webhook we understand. It must come back as
+    /// something the caller can act on — never as the `Err` that buys eight
+    /// retries and a dead letter, because a complaint that reaches the
+    /// dead-letter queue is a complaint nobody ever acts on, and the price of
+    /// that is the sending domain's reputation.
+    #[test]
+    fn a_complaint_is_a_refusal_naming_the_complainer_and_never_an_error() {
+        let body = refusal_body(
+            Delivery::COMPLAINED,
+            serde_json::json!(["  AP@Supplier.Example  "]),
+            None,
+        );
+
+        // The old reading of these same bytes, kept beside the new one so the
+        // two can never quietly become the same answer again.
+        assert_eq!(
+            InboundNotice::parse(&body),
+            Err(ParseError::WrongEvent),
+            "nothing may build an inbound notice out of a complaint"
+        );
+
+        let Delivery::Refused(refusal) =
+            Delivery::parse(&body).expect("a complaint is not an error")
+        else {
+            panic!("a complaint was not read as a refusal");
+        };
+        assert_eq!(
+            refusal.reason, "complaint",
+            "the spelling `suppressions.reason` takes"
+        );
+        assert!(
+            refusal.permanent,
+            "a complaint is consent withdrawn; there is no transient one"
+        );
+        // The direction flip, and the expensive mistake: `data.to` is the
+        // person who complained, `data.from` is our own sending address.
+        // Trimmed and lower-cased, which is the only shape
+        // `suppressions_address_normalised` accepts.
+        assert_eq!(refusal.addresses, vec!["ap@supplier.example".to_owned()]);
+        assert!(
+            !refusal
+                .addresses
+                .contains(&"lena@agents.example.com".to_owned()),
+            "the tenant's own sending address was recorded as the complainer, \
+             which would suppress their outbound mail entirely"
+        );
+        assert_eq!(
+            refusal.at,
+            Some("2026-08-24T10:00:00Z".parse::<DateTime<Utc>>().expect("ts")),
+            "the provider's own instant is part of a legal record"
+        );
+    }
+
+    /// A bounce is a refusal too, but only a **permanent** one is final.
+    /// `suppressions` takes no DELETE, so suppressing on a full mailbox removes
+    /// a live customer with no way back.
+    #[test]
+    fn only_a_permanent_bounce_is_final() {
+        let to = serde_json::json!(["ap@supplier.example"]);
+
+        for (declared, expected) in [
+            (Some("Permanent"), true),
+            // Casing is the provider's business, not a classification.
+            (Some("permanent"), true),
+            (Some("Transient"), false),
+            (Some("Undetermined"), false),
+            // No bounce block at all: we were not told it was final, so it is
+            // not. Silence must not read as consent withdrawn.
+            (None, false),
+        ] {
+            let body = refusal_body(Delivery::BOUNCED, to.clone(), declared);
+            let Delivery::Refused(refusal) = Delivery::parse(&body).expect("not an error") else {
+                panic!("a bounce was not read as a refusal ({declared:?})");
+            };
+            assert_eq!(refusal.reason, "bounce");
+            assert_eq!(
+                refusal.permanent, expected,
+                "bounce type {declared:?} was classified permanent={}",
+                refusal.permanent
+            );
+            assert_eq!(refusal.addresses, vec!["ap@supplier.example".to_owned()]);
+        }
+    }
+
+    /// A type we have no reader for is a **novelty**, not a fault: the provider
+    /// added an event, or the endpoint is subscribed to more than we read. Eight
+    /// retries will not make it known and dropping it loses the only signal that
+    /// says so — so it comes back `Ok`, named, and bounded.
+    #[test]
+    fn an_unknown_type_is_read_as_unread_rather_than_retried_or_dropped() {
+        for kind in ["email.opened", "email.clicked", "contact.deleted", "wat"] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": kind,
+                "created_at": "2026-08-24T10:00:00Z",
+                "data": {},
+            }))
+            .expect("serialize");
+            assert_eq!(
+                Delivery::parse(&body),
+                Ok(Delivery::Unread {
+                    kind: kind.to_owned()
+                }),
+                "{kind} was not classified as a novelty"
+            );
+        }
+
+        // The one thing carried out of the payload is bounded: it lands in a
+        // log field and a metric label, and neither is sized by the sender.
+        let long = "email.".to_owned() + &"z".repeat(500);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": long, "created_at": "2026-08-24T10:00:00Z", "data": {},
+        }))
+        .expect("serialize");
+        let Ok(Delivery::Unread { kind }) = Delivery::parse(&body) else {
+            panic!("an oversized type was not read as a novelty");
+        };
+        assert_eq!(kind.chars().count(), Delivery::MAX_KIND);
+    }
+
+    /// The frontier itself: what is still an `Err`, and therefore still worth a
+    /// retry and a dead letter, is only a body that is not a webhook. Everything
+    /// that *is* a webhook is `Ok` — and the inbound path is unchanged, which is
+    /// the half of this that must not have moved.
+    #[test]
+    fn only_a_body_that_is_not_a_webhook_is_an_error() {
+        // An inbound message still parses to a notice, through exactly the same
+        // function it always did.
+        let body = webhook_body("email_frontier", Utc::now());
+        let Ok(Delivery::Received(notice)) = Delivery::parse(&body) else {
+            panic!("an inbound message stopped being a notice");
+        };
+        assert_eq!(notice.provider_message_id.as_str(), "email_frontier");
+
+        // And it is still held to everything it always was: an inbound notice
+        // with no `email_id` cannot be fetched, so it is still refused rather
+        // than waved through by the new front door.
+        let no_id = serde_json::to_vec(&serde_json::json!({
+            "type": "email.received",
+            "created_at": Utc::now().to_rfc3339(),
+            "data": { "email_id": "", "from": "a@b.example", "to": ["lena@agents.example.com"] },
+        }))
+        .expect("serialize");
+        assert_eq!(
+            Delivery::parse(&no_id),
+            Err(ParseError::MissingField { field: "email_id" })
+        );
+
+        // Not JSON at all, and JSON that is not a webhook.
+        assert_eq!(Delivery::parse(b"{"), Err(ParseError::Malformed));
+        assert_eq!(Delivery::parse(b"[]"), Err(ParseError::Malformed));
+        assert_eq!(
+            Delivery::parse(br#"{"created_at":"2026-08-24T10:00:00Z"}"#),
+            Err(ParseError::Malformed),
+            "a body with no `type` is not a webhook"
+        );
+    }
+
+    /// A refusal that names nobody is still a refusal. The caller records the
+    /// trail row and has nothing to suppress; it is not an error and it is not
+    /// a panic.
+    #[test]
+    fn a_refusal_with_no_usable_recipient_is_still_a_refusal() {
+        for to in [
+            serde_json::json!([]),
+            serde_json::json!(["   "]),
+            serde_json::json!(null),
+        ] {
+            let body = refusal_body(Delivery::COMPLAINED, to.clone(), None);
+            let Ok(Delivery::Refused(refusal)) = Delivery::parse(&body) else {
+                panic!("a complaint with `to` = {to} was not read as a refusal");
+            };
+            assert!(refusal.addresses.is_empty());
+            assert!(refusal.permanent);
+        }
     }
 
     #[test]
