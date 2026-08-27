@@ -422,6 +422,11 @@ mod live {
             &bridge.url(),
             &declared,
             Reach::Private,
+            // The bridge inherits this process's environment, which is where the
+            // stdio package reads `ORIZN_API_KEY` from. No header is involved:
+            // `visa.orizn.app` ignores an API key in every header form, which
+            // is the whole reason this test goes through the bridge.
+            None,
             CancellationToken::new(),
         )
         .await
@@ -589,6 +594,11 @@ mod live {
             &bridge.url(),
             &declared,
             Reach::Private,
+            // The bridge inherits this process's environment, which is where the
+            // stdio package reads `ORIZN_API_KEY` from. No header is involved:
+            // `visa.orizn.app` ignores an API key in every header form, which
+            // is the whole reason this test goes through the bridge.
+            None,
             CancellationToken::new(),
         )
         .await

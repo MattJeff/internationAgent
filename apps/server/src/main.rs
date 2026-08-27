@@ -311,6 +311,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // `routes::mcp` for why binding is a loop and not a boot step.
     let (fleets, rebinds) = Fleets::new();
 
+    // The one cipher this process seals and opens MCP credentials with. Built
+    // once and cloned, never rebuilt: `identity::envelope` derives 32 bytes from
+    // `AGENTOS_MASTER_KEY`, and two of these would be a deployment where a token
+    // sealed by a handler cannot be opened by the loop that binds it. It is an
+    // `agentos_app` handle rather than the provider's cipher because this crate
+    // does not depend on `agentos-providers` — see `Cargo.toml`.
+    let credentials = agentos_app::mcp::Credentials::from_master_key(&config.master_key);
+
     // The agent runtime, wired once and shared by every turn the outbox
     // dispatches. It hangs off the same token, so SIGTERM ends an in-flight
     // turn between effects instead of mid-payment.
@@ -334,6 +342,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             tokio::spawn(routes::mcp::run(
                 db.clone(),
                 fleets.clone(),
+                credentials.clone(),
                 rebinds,
                 cancel.clone(),
             )),
@@ -377,7 +386,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
 
     let served = serve(
         listener,
-        app(db, &config, gate, fleets, ports.clone()),
+        app(db, &config, gate, fleets, credentials, ports.clone()),
         {
             let cancel = cancel.clone();
             async move {
@@ -438,7 +447,14 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
-fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets, ports: Arc<Ports>) -> Router {
+fn app(
+    db: Db,
+    config: &Config,
+    gate: PolicyGate,
+    fleets: Fleets,
+    credentials: agentos_app::mcp::Credentials,
+    ports: Arc<Ports>,
+) -> Router {
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -491,7 +507,11 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets, ports: Arc<Por
             // truth was "nobody could configure this". Both halves are gone:
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
-            .merge(routes::mcp::router(McpState::new(db.clone(), fleets)))
+            .merge(routes::mcp::router(McpState::new(
+                db.clone(),
+                fleets,
+                credentials,
+            )))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
         config.api_keys.clone(),
