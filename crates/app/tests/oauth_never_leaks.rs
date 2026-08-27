@@ -55,10 +55,43 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Distinctive on purpose, and each in three independent fragments, so a
 /// truncated or partial copy is caught as well as a whole one — a token with its
 /// last eight characters trimmed is still a token in a log.
-const CLIENT_SECRET: &str = "csec-DO-NOT-LEAK-8b21";
-const CODE: &str = "authcode-DO-NOT-LEAK-3f70";
-const ACCESS: &str = "at-DO-NOT-LEAK-9c4e";
-const REFRESH: &str = "rt-DO-NOT-LEAK-2a15";
+///
+/// # Why every tail carries a `.`
+///
+/// The four tails used to be four hex quads — `8b21`, `3f70`, `9c4e`, `2a15` —
+/// and that made this test **wrong about once in ten thousand runs**, which for
+/// a leak test is the worst failure it has. `refresh_due` logs `%tenant_id` on
+/// the refusal path this file deliberately drives, so the searched text always
+/// contains a fresh random uuid; a uuid is thirty-two hex digits; and a four-hex
+/// fragment therefore turns up in one by luck. It went red naming a log line
+/// that had leaked nothing.
+///
+/// Everything about that is the wrong way round. The whole value of this file is
+/// that nobody has ever learned to re-run it, and a test that cries wolf teaches
+/// exactly that — so the fragments have to be **impossible** in the text rather
+/// than merely unlikely.
+///
+/// A non-hex letter is not enough, and that is the trap in the obvious fix: the
+/// other random text in `everything` is the `state` and the `code_challenge`,
+/// base64url over `[A-Za-z0-9_-]`, which spells every letter and every digit. A
+/// `.` is in neither alphabet, so a chance match stops being improbable and
+/// becomes unspellable.
+///
+/// It also survives the wire, which is the second trap: `CLIENT_SECRET` and
+/// `CODE` are asserted **byte for byte** in the form-encoded body the token
+/// endpoint receives, so the character had to be one that form encoding leaves
+/// alone. `.` is unreserved and comes through untouched; `~`, `+` and `!` do
+/// not, and would have moved the failure into an assertion two hundred lines
+/// away from the reason.
+///
+/// Detection is unchanged, which is the bar this had to clear: still four
+/// characters, still the token's own tail, so the "log the last four for
+/// debugging" leak these catch is caught exactly as before — and lowercase, so a
+/// leak path that lowercases still matches, as it did.
+const CLIENT_SECRET: &str = "csec-DO-NOT-LEAK-8b.q";
+const CODE: &str = "authcode-DO-NOT-LEAK-3f.v";
+const ACCESS: &str = "at-DO-NOT-LEAK-9c.w";
+const REFRESH: &str = "rt-DO-NOT-LEAK-2a.k";
 
 /// Everything `tracing` emitted, as bytes.
 ///
@@ -410,11 +443,19 @@ async fn no_part_of_a_flow_is_findable_after_it_completes() {
         "DO-NOT-LEAK",
         "csec-",
         "authcode-",
-        "8b21",
-        "3f70",
-        "9c4e",
-        "2a15",
+        "8b.q",
+        "3f.v",
+        "9c.w",
+        "2a.k",
     ] {
+        // The constants' own docs carry the argument. This is the half of it a
+        // machine can hold: a fragment a uuid can spell will one day go red
+        // over a `%tenant_id` that leaked nothing, and the day it does somebody
+        // learns to re-run this file.
+        assert!(
+            !fragment.chars().all(|c| c.is_ascii_hexdigit()),
+            "{fragment:?} is spellable in a uuid, and this flow logs one"
+        );
         assert!(
             !everything.contains(fragment),
             "{fragment:?} leaked:\n{everything}"
