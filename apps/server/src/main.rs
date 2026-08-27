@@ -293,12 +293,13 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // provisioner cannot buy a number from Twilio that the effects path then
     // texts from a mock.
     let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
-    // **One vault per deployment, built here.** Two readers depend on it being
-    // one: the provisioner writes an employee's canary into it, and
-    // `routes::model` writes the *tenant's* model credential into it for every
-    // turn to read back. Two `MemorySecretStore::new()` calls would give a
-    // deployment two maps, and the symptom would be a tenant that connects a key
-    // and then cannot take a turn with it — with no error anywhere saying why.
+    // **One vault per deployment, built here**, and since
+    // `0050_tenant_model_key` it has exactly one reader: the provisioner's
+    // identity canary. The tenant's model credential used to live here too, and
+    // that is precisely what 0050 fixed — this map is process-local, so a
+    // restart emptied it while the `tenant_model_access` row went on reporting a
+    // connection, and the employees of that tenant then burned a whole day's
+    // turn budget on a key that was not there.
     let secrets = agentos_app::mocks::secret_store();
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
     let engine = ProvisioningEngine::new(
@@ -333,7 +334,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         db: db.clone(),
         llm: llm.clone(),
         backend: config.llm,
-        secrets: secrets.clone(),
+        credentials: credentials.clone(),
         gate: gate.clone(),
         ports: ports.clone(),
         fleets: fleets.clone(),
@@ -407,7 +408,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             fleets,
             credentials,
             ports.clone(),
-            ModelWiring { llm, secrets },
+            ModelWiring { llm },
         ),
         {
             let cancel = cancel.clone();
@@ -473,10 +474,16 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// does.
 ///
 /// **A struct because two branches added a parameter to `app` on the same day**
-/// and clippy counted eight. Grouping the three that travel together is the
-/// honest fix: `llm`, `secrets` and the host's backend are read by exactly one
-/// `.merge` below and by nothing else, so a bag of them is a fact about the
-/// wiring rather than a way to quiet a lint.
+/// and clippy counted eight. Grouping what travels together is the honest fix:
+/// the host's own `llm` is read by exactly the two `.merge` calls below and by
+/// nothing else, so a bag of it is a fact about the wiring rather than a way to
+/// quiet a lint.
+///
+/// It held the deployment's `SecretStore` too, until `0050_tenant_model_key`
+/// moved the tenant's model credential into the row that claims it. What both
+/// routes need now is the cipher — and that already arrives as `credentials`,
+/// for `routes::mcp`, so passing a second handle would have been the two-ciphers
+/// bug this file warns about one screen up.
 ///
 /// It is deliberately *not* `Ports`. `Ports` is what an employee acts through;
 /// this is what the operator's onboarding call uses to prove a tenant's key
@@ -487,8 +494,6 @@ struct ModelWiring {
     /// for a turn. `LlmBackend::pays_with_our_key` is what stops it becoming a
     /// tenant's model by accident.
     llm: Arc<dyn Llm>,
-    /// Where a proven key is sealed. The route never reads one back.
-    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
 }
 
 fn app(
@@ -518,7 +523,7 @@ fn app(
     let mcp_state = McpState::new(
         db.clone(),
         fleets,
-        credentials,
+        credentials.clone(),
         config.oauth_clients.clone(),
         &config.public_host,
     );
@@ -585,7 +590,7 @@ fn app(
                 db.clone(),
                 model.llm.clone(),
                 config.llm,
-                model.secrets.clone(),
+                credentials.clone(),
             ))
             // Straight after it, and that is the entry journey's order: connect
             // the model, then let it help finish the company. This is the first
@@ -599,7 +604,7 @@ fn app(
                 ports.clone(),
                 model.llm,
                 config.llm,
-                model.secrets,
+                credentials.clone(),
             ))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
@@ -991,9 +996,19 @@ struct Agent {
     /// the host's model be billed to *us*" — see
     /// `agentos_app::mocks::LlmBackend::pays_with_our_key`.
     backend: agentos_app::mocks::LlmBackend,
-    /// The deployment's one vault. Holds every tenant's model credential, read
-    /// once per turn and never handed to an employee.
-    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
+    /// The one cipher this process opens a tenant's model credential with.
+    ///
+    /// Not a store: since `0050_tenant_model_key` the sealed credential is a
+    /// column on `tenant_model_access`, read by the same SELECT as the proof, so
+    /// what a turn needs here is the master key and not a place to look. That
+    /// distinction is the fix — the thing this field used to hold was a
+    /// `HashMap` that a restart emptied while the row went on claiming a
+    /// connection.
+    ///
+    /// The same handle `routes::mcp` seals bearer tokens with, deliberately:
+    /// two ciphers over one `AGENTOS_MASTER_KEY` is a deployment where what one
+    /// half sealed the other cannot open.
+    credentials: agentos_app::mcp::Credentials,
     gate: PolicyGate,
     ports: Arc<Ports>,
     /// Every tenant's MCP bindings, kept current by the binder loop.
@@ -1239,7 +1254,7 @@ impl Agent {
             // argument exists and why this is not a place to read a variable.
             let (llm, access) = agentos_app::model_access::for_turn(
                 tx,
-                self.secrets.as_ref(),
+                &self.credentials,
                 &self.llm,
                 self.backend,
                 None,
@@ -2738,6 +2753,8 @@ mod tests {
                 model: agentos_domain::policy::ModelId::Opus5,
                 verified_at: now,
             },
+            // `cli`: no credential, and 0050's CHECK insists there is none.
+            None,
             now,
         )
         .await
@@ -2881,7 +2898,7 @@ mod tests {
                 db: self.db.clone(),
                 llm,
                 backend: agentos_app::mocks::LlmBackend::Mock,
-                secrets: agentos_app::mocks::secret_store(),
+                credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 gate: PolicyGate::new(self.db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
                 // No binder loop in this test, so every tenant's fleet is
@@ -3224,7 +3241,7 @@ mod tests {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
             backend: agentos_app::mocks::LlmBackend::Mock,
-            secrets: agentos_app::mocks::secret_store(),
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: Fleets::new().0,
@@ -3577,6 +3594,8 @@ mod tests {
                 model: brief.model,
                 verified_at: now,
             },
+            // `cli`: no credential, and 0050's CHECK insists there is none.
+            None,
             now,
         )
         .await
@@ -3881,7 +3900,7 @@ mod tests {
             db: db.clone(),
             llm: switchboard.clone(),
             backend: agentos_app::mocks::LlmBackend::Mock,
-            secrets: agentos_app::mocks::secret_store(),
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: fleets.clone(),

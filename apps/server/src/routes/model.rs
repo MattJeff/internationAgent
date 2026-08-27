@@ -47,7 +47,8 @@
 
 use std::sync::Arc;
 
-use agentos_app::mocks::{Llm, LlmBackend, SecretStore};
+use agentos_app::mcp::Credentials;
+use agentos_app::mocks::{Llm, LlmBackend};
 use agentos_app::model_access::{self, ConnectError, Outcome};
 use agentos_domain::model_access::ModelPath;
 use agentos_domain::policy::ModelId;
@@ -76,25 +77,24 @@ pub struct ModelState {
     host: Arc<dyn Llm>,
     /// Which backend that is — the input to "would this be billed to us".
     backend: LlmBackend,
-    /// Where a proven key is stored. The same vault every turn reads.
-    secrets: Arc<dyn SecretStore>,
+    /// The cipher a proven key is sealed with. **Not a store**: since
+    /// `0050_tenant_model_key` the credential is a column on the row this
+    /// handler writes, so what the route needs is the master key and not
+    /// somewhere to put things. The same handle `routes::mcp` uses, so a
+    /// deployment cannot end up with two ciphers over one `AGENTOS_MASTER_KEY`.
+    credentials: Credentials,
 }
 
 /// This unit's routes. Merged into the API router, so auth, the rate limit and
 /// the idempotency layer are already in front of it.
-pub fn router(
-    db: Db,
-    host: Arc<dyn Llm>,
-    backend: LlmBackend,
-    secrets: Arc<dyn SecretStore>,
-) -> Router {
+pub fn router(db: Db, host: Arc<dyn Llm>, backend: LlmBackend, credentials: Credentials) -> Router {
     Router::new()
         .route("/v1/model", post(connect).get(status))
         .with_state(ModelState {
             db,
             host,
             backend,
-            secrets,
+            credentials,
         })
 }
 
@@ -189,7 +189,7 @@ async fn connect(
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     let outcome = model_access::connect(
         &mut tx,
-        state.secrets.as_ref(),
+        &state.credentials,
         &state.host,
         state.backend,
         request.path,
@@ -219,16 +219,30 @@ async fn connect(
 /// 404 when nothing is: an unconnected tenant is a tenant with no such
 /// resource, which is the same answer the turn path gives and the same shape
 /// every other route in this surface uses for absence.
+///
+/// # This 200 is honest again, and it is the schema that made it so
+///
+/// It still reads only the row and still asks no credential store, exactly as
+/// before — but before `0050_tenant_model_key` that meant it answered 200 with a
+/// `verified_at` for keys that had evaporated with the last restart, against
+/// `agentos_app::model_access`'s stated invariant that no state exists where the
+/// row says connected and the credential does not work. The credential is now a
+/// column on this very row, so "a row exists" and "the credential exists" are
+/// the same observation and there is nothing left for this handler to check.
+///
+/// `.access` drops the sealed half on the floor. It could not be returned even
+/// by accident: `Connection` has no `Serialize`, which is why the type exists
+/// rather than a tuple.
 async fn status(
     State(state): State<ModelState>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
-    let access = agentos_store::model_access::load(&mut tx).await?;
+    let connection = agentos_store::model_access::load(&mut tx).await?;
     tx.commit().await?;
 
-    match access {
-        Some(access) => Ok(Json(access).into_response()),
+    match connection {
+        Some(connection) => Ok(Json(connection.access).into_response()),
         None => Err(ApiError::not_found().with_detail(
             "no model is connected for this tenant, so none of its employees can take a turn. \
              POST /v1/model with an Anthropic API key, or with this host's claude CLI",
@@ -238,7 +252,7 @@ async fn status(
 
 /// The failures that are not verdicts.
 ///
-/// [`ConnectError::Vault`] and [`ConnectError::Unavailable`] are ours and become
+/// [`ConnectError::Seal`] and [`ConnectError::Unavailable`] are ours and become
 /// a 500 with nothing about how — `error.rs`'s first rule. The other two are the
 /// caller's, and both name what to do instead.
 fn connect_error(err: ConnectError) -> ApiError {
@@ -251,8 +265,11 @@ fn connect_error(err: ConnectError) -> ApiError {
         )
         .with_detail(err.to_string())
         .with_extension("paths", json!([ModelPath::ApiKey.as_str()])),
-        ConnectError::Vault(inner) => {
-            tracing::error!(code = inner.code(), "the vault refused a model credential");
+        ConnectError::Seal(inner) => {
+            tracing::error!(
+                code = inner.code(),
+                "a model credential could not be sealed; check AGENTOS_MASTER_KEY"
+            );
             ApiError::internal()
         }
         ConnectError::Unavailable(inner) => inner.into(),

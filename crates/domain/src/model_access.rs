@@ -23,10 +23,13 @@
 //!   operator cannot type it, and a layer document that could would be a
 //!   document that asserts a key works.
 //!
-//! So it is a row the tenant owns, beside its secrets, and the two are kept
-//! together on purpose: [`ModelAccess::secret_ref`] derives the pointer rather
-//! than storing it, so there is no column anybody can edit to make one tenant's
-//! row point at another tenant's key.
+//! So it is a row the tenant owns, and since
+//! `migrations/0050_tenant_model_key.sql` the credential is a sealed column on
+//! that same row rather than an entry in a store somewhere else. There is no
+//! pointer at all — not a stored one and not a derived one — which is the
+//! strongest form of "no column anybody can edit to make one tenant's row reach
+//! another tenant's key". The AES-GCM additional data is the tenant's own id, so
+//! a blob moved between rows decrypts to nothing.
 //!
 //! # What this deliberately cannot do
 //!
@@ -45,9 +48,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::ids::{EmployeeId, SecretRef, SecretRefError, TenantId};
 use crate::policy::ModelId;
 
 // ---------------------------------------------------------------------------
@@ -120,19 +121,17 @@ impl std::fmt::Display for ModelPath {
 // The connection
 // ---------------------------------------------------------------------------
 
-/// The name every tenant's model credential is stored under.
-///
-/// A constant rather than a column: a stored pointer is a stored mistake, and
-/// the mistake it invites is one tenant's row pointing at another tenant's
-/// secret. Derived from the tenant id it belongs to, it cannot.
-pub const MODEL_SECRET_NAME: &str = "tenant-model-key";
-
 /// A tenant's model connection, as it was proven.
 ///
-/// There is **no key in here and no way to put one in**: the credential lives
-/// in the secret store and this names where. `Serialize` is therefore safe on
-/// the whole struct, which is what lets it be an HTTP response body without a
-/// second "public view" type that somebody has to remember to keep in sync.
+/// There is **no key in here and no way to put one in**, and no pointer to one
+/// either. `Serialize` is therefore safe on the whole struct, which is what lets
+/// it be an HTTP response body without a second "public view" type that somebody
+/// has to remember to keep in sync.
+///
+/// The sealed credential travels beside it in
+/// `agentos_store::model_access::Connection`, which is deliberately *not*
+/// `Serialize` — the split is what makes "the credential cannot reach a response
+/// body" a fact about the types rather than a rule four handlers follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelAccess {
     /// API key or host CLI.
@@ -148,27 +147,6 @@ pub struct ModelAccess {
     /// When the verification call returned success. A fact we observed, which
     /// is why no operator document can contain it.
     pub verified_at: DateTime<Utc>,
-}
-
-impl ModelAccess {
-    /// Where this tenant's model credential lives.
-    ///
-    /// The employee segment is the nil UUID, and that is load-bearing twice
-    /// over. No employee has the nil id, so
-    /// [`SecretStore::delete_prefix`](../../agentos_providers/secrets/trait.SecretStore.html)
-    /// with `Some(employee)` — offboarding — can never take the tenant's model
-    /// key with it, while `None` — tenant deletion — still does. And
-    /// `agentos_app::secrets::SecretResolver` compares a ref against the acting
-    /// principal, so an *employee* asking for this ref is refused and audited:
-    /// no seat can read the company's model key, only the connect path can,
-    /// and that one acts as the tenant.
-    pub fn secret_ref(tenant_id: TenantId) -> Result<SecretRef, SecretRefError> {
-        SecretRef::new(
-            tenant_id,
-            EmployeeId::from_uuid(Uuid::nil()),
-            MODEL_SECRET_NAME,
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +261,6 @@ mod tests {
     use super::*;
     use crate::policy::{EffectivePolicy, PolicyLimits, model_for};
 
-    fn tenant() -> TenantId {
-        TenantId::new_v7(Utc::now())
-    }
-
     #[test]
     fn a_path_round_trips_through_its_column_and_an_unknown_one_is_refused() {
         for path in ModelPath::ALL {
@@ -301,24 +275,6 @@ mod tests {
         assert!(!ModelPath::ApiKey.is_host());
         assert!(ModelPath::ApiKey.needs_secret());
         assert!(!ModelPath::Cli.needs_secret());
-    }
-
-    /// The ref is a pure function of the tenant, and no employee can be in it.
-    #[test]
-    fn the_secret_ref_is_derived_and_lands_outside_every_employee_subtree() {
-        let (a, b) = (tenant(), tenant());
-        let mine = ModelAccess::secret_ref(a).unwrap();
-
-        assert_eq!(mine, ModelAccess::secret_ref(a).unwrap());
-        assert_ne!(mine, ModelAccess::secret_ref(b).unwrap());
-        assert_eq!(mine.tenant_id(), a);
-        assert_eq!(mine.name(), MODEL_SECRET_NAME);
-        // Nil, so `delete_prefix(tenant, Some(employee))` can never match it:
-        // `EmployeeId::new_v7` cannot produce the nil uuid.
-        assert_eq!(mine.employee_id().as_uuid(), Uuid::nil());
-        assert!(mine.to_string().starts_with(&format!(
-            "secret://tenant/{a}/employee/00000000-0000-0000-0000-000000000000/"
-        )));
     }
 
     #[test]
