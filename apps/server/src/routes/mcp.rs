@@ -39,6 +39,16 @@
 //! [`connect`] is the route that does all of it in one request, and its own doc
 //! comment argues why one and not three.
 //!
+//! **There is now a third shape, and this surface refuses it.**
+//! [`catalog::Provision::Host`] is a connector whose server ships only as a
+//! stdio package, which we run for the tenant in a container this process does
+//! not own — [`agentos_app::hosted`] is the whole design. It is refused here,
+//! with a 503 and not a half-write, because no bridge runtime ships in this
+//! workspace: there is nothing to start, so there is nothing this route's own
+//! rule can be true of. The storage works and `app::mcp` binds such a row when
+//! it is handed a runtime; what is missing is the runtime, and saying so with a
+//! status code is more honest than storing what the customer typed.
+//!
 //! # 1. The digest is the operator's, and there is no verb that advances it
 //!
 //! [`Declaration::digest`](agentos_app::mcp::Declaration::digest) is what makes
@@ -360,7 +370,10 @@ struct DeclareTool {
 #[derive(Debug, FromRow)]
 struct ServerRow {
     server: String,
-    url: String,
+    /// `NULL` for a binding we host — `0043_mcp_hosted.sql`. An `Option` and not
+    /// a `String`, because a decode error here is a 500 on a listing for the
+    /// whole tenant, and the row shape that causes it is one the schema permits.
+    url: Option<String>,
     reach: String,
     connector: String,
     created_at: DateTime<Utc>,
@@ -381,7 +394,8 @@ struct ServerRow {
 /// No `Debug`: `tracing::debug!(?row)` is one keystroke.
 #[derive(FromRow)]
 struct BindingRow {
-    url: String,
+    /// `NULL` for a hosted binding — `0043_mcp_hosted.sql`.
+    url: Option<String>,
     reach: String,
     connector: String,
     sealed_token: Option<Vec<u8>>,
@@ -403,7 +417,11 @@ struct DeclarationView {
 #[derive(Debug, Serialize)]
 struct ServerView {
     server: String,
-    url: String,
+    /// `null` for a hosted binding, and that is the honest render: there is no
+    /// address, and the one it runs at belongs to our infrastructure rather than
+    /// to this tenant's configuration. `connector` is what says which server it
+    /// is; the catalogue is where a client looks that up.
+    url: Option<String>,
     reach: String,
     /// Which catalogue entry it came from, as stored. `custom` for anything
     /// declared through [`declare_server`] or written before 0040.
@@ -603,7 +621,9 @@ async fn declare_server(
         StatusCode::CREATED,
         Json(ServerView {
             server: server.as_str().to_owned(),
-            url: body.url,
+            // Always `Some` here: this route takes a URL and is the door for a
+            // server somebody else runs. Hosting has no door on this surface.
+            url: Some(body.url),
             reach: reach.code().to_owned(),
             connector: catalog::CUSTOM.key.to_owned(),
             has_credential: sealed.is_some(),
@@ -763,9 +783,20 @@ async fn catalog(_principal: Principal) -> Result<Response, ApiError> {
             json!({
                 "connector": c.key,
                 "label": c.label,
-                // `null` means "you supply it" — the `custom` case, and the only
-                // one where the connect body's `url` is read.
-                "url": c.url,
+                // Which of the three shapes this is, and the field a UI has to
+                // read before it decides what to render. `url` alone cannot
+                // answer it any more: it is `null` for `customer`, where the
+                // caller supplies an address, and `null` for `hosted`, where
+                // nobody may. Two opposite meanings behind one absent value is
+                // how a form ends up asking a customer for the address of a
+                // container that does not exist yet.
+                "provision": match c.provision {
+                    catalog::Provision::Dial(_) => "dial",
+                    catalog::Provision::Customer => "customer",
+                    catalog::Provision::Host(_) => "hosted",
+                },
+                // Present only for `dial`; see the doc comment above.
+                "url": c.url(),
                 "reach": c.reach.code(),
                 "credential": c.credential.code(),
                 "floor": c.floor.code(),
@@ -864,8 +895,8 @@ async fn connect(
     // from the request only for `custom`. This is most of what the catalogue is
     // worth: a customer who cannot mistype GitHub's host cannot be walked into
     // binding one that looks like it.
-    let (url, reach) = match connector.url {
-        Some(url) => {
+    let (url, reach) = match connector.provision {
+        catalog::Provision::Dial(url) => {
             if body.url.is_some() || body.reach.is_some() {
                 return Err(ApiError::bad_request(format!(
                     "url and reach are not yours to set for the {:?} connector",
@@ -874,7 +905,28 @@ async fn connect(
             }
             (url.to_owned(), connector.reach)
         }
-        None => {
+        // **The one branch that is not built, and it is refused rather than
+        // half-built.** A hosted connector has no endpoint until a bridge
+        // runtime starts one, and `agentos_app::hosted` deliberately ships no
+        // runtime — so there is nothing for this route's own rule to be true
+        // of: *a connection is validated only if it was tried*. Writing the row
+        // anyway would be storing what the customer typed and calling it
+        // connected, which is the meaning this route exists to refuse.
+        //
+        // A 503, not a 404 and not a 400: the connector is real, the request is
+        // well formed, and what is missing is on our side and is temporary in
+        // the only sense that matters — it is a deployment away. See
+        // `agentos_app::hosted` for what that deployment is. The row shape
+        // itself works and is exercised by
+        // `mcp::tests::a_hosted_binding_starts_a_bridge_and_never_names_its_address`.
+        catalog::Provision::Host(_) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosting_unavailable",
+                "this deployment runs no bridge runtime, so it cannot host this connector's server",
+            ));
+        }
+        catalog::Provision::Customer => {
             let url = body
                 .url
                 .take()
@@ -1312,7 +1364,14 @@ async fn rebind(
             return;
         }
     };
-    let fleet = Fleet::bind(&mut tx, credentials, ct).await;
+    // `None`: this deployment runs no bridge runtime, because none exists to
+    // run — `agentos_app::hosted` is the contract for one and deliberately
+    // ships no implementation. Every hosted binding therefore fails to bind
+    // with `hosting_unavailable`, which `list_servers` renders, and no tenant
+    // gets tools from a container nobody started. The day a runtime is
+    // deployed, this is the line that hands it in, and nothing else here
+    // changes.
+    let fleet = Fleet::bind(&mut tx, credentials, None, ct).await;
     // A read-only transaction either way; rolling back is the cheaper unwind.
     let _ = tx.rollback().await;
 
@@ -1412,7 +1471,9 @@ const SELECT_SERVERS: &str = "\
 /// Deliberately not `Debug` and not `Serialize`: it holds the sealed credential,
 /// and a type that can be rendered is a type that ends up in a log line.
 struct Binding {
-    url: String,
+    /// `None` for a hosted binding: there is no stored address, and
+    /// [`bind_now`] refuses rather than inventing one.
+    url: Option<String>,
     reach: Reach,
     /// The catalogue entry this binding was created from, resolved.
     ///
@@ -1489,17 +1550,49 @@ async fn load_binding(tx: &mut TenantTx<'_>, server: &Slug) -> Result<Binding, A
 /// or that the stored credential no longer opens. That is their own
 /// configuration reflected back, not a server-side error leaking: see `error.rs`
 /// on what `detail` is for.
+/// A hosted binding cannot be bound here at all, and the refusal is in this one
+/// function rather than in its two callers: [`discover`] and [`declare_tool`]
+/// both route through it, so a guard in either would leave the other reaching
+/// for a `url` that a hosted row does not have.
+///
+/// The connector decides, not the presence of the URL — the same authority
+/// `app::mcp::provisioned` uses, so the two readers cannot disagree about what a
+/// row is.
 async fn bind_now(
     credentials: &Credentials,
     tenant_id: TenantId,
     server: &Slug,
     binding: &Binding,
 ) -> Result<McpServer, ApiError> {
+    let url = match (binding.connector.package(), binding.url.as_deref()) {
+        // Hosted: binding it means starting a bridge, and this deployment runs
+        // no runtime to start one in. See `connect` for the whole argument and
+        // `agentos_app::hosted` for what a deployment has to add.
+        (Some(_), _) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosting_unavailable",
+                "this deployment runs no bridge runtime, so this server cannot be reached",
+            ));
+        }
+        (None, Some(url)) => url,
+        // A dialled binding with no address. Unreachable through any route
+        // here, and the honest answer if a hand-written row ever makes it
+        // reachable: there is nothing to contact, which is not the same failure
+        // as contacting it and being refused.
+        (None, None) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "binding_has_no_endpoint",
+                "this binding has no url and names no connector we host",
+            ));
+        }
+    };
     credentials
         .bind(
             tenant_id,
             server.clone(),
-            &binding.url,
+            url,
             &binding.declared,
             binding.reach,
             binding.sealed_token.as_deref(),
@@ -2406,6 +2499,7 @@ mod tests {
             .expect("the custom entry is always there");
         assert_eq!(custom["url"], Value::Null, "the customer supplies it");
         assert_eq!(custom["credential"], "bearer");
+        assert_eq!(custom["provision"], "customer");
 
         let github = connectors
             .iter()
@@ -2413,10 +2507,147 @@ mod tests {
             .expect("github is catalogued");
         assert_eq!(github["url"], "https://api.githubcopilot.com/mcp/");
         assert_eq!(github["reach"], "public");
+        assert_eq!(github["provision"], "dial");
         assert_eq!(
             github["floor"], "write",
             "the floor has to be visible or a UI cannot grey out what it must not offer"
         );
+
+        // **The hosted entry, and why `provision` had to exist.** Its `url` is
+        // null exactly like `custom`'s, and the two mean opposite things: one
+        // asks the customer for an address and the other refuses to let anybody
+        // name one. A UI that branched on `url == null` would put a text field
+        // in front of a customer for a container that does not exist yet.
+        let hosted = connectors
+            .iter()
+            .find(|c| c["connector"] == "orizn-visa")
+            .expect("the hosted entry is catalogued");
+        assert_eq!(hosted["url"], Value::Null);
+        assert_eq!(hosted["provision"], "hosted");
+        assert_eq!(
+            hosted["credential"], "bearer",
+            "the customer still pastes one string; where it goes is ours to know"
+        );
+
+        h.teardown().await;
+    }
+
+    /// **Hosting is refused until a runtime is deployed, and nothing is
+    /// written.**
+    ///
+    /// The customer-visible half of `agentos_app::hosted`'s "what has to be
+    /// deployed". The connector is real and catalogued, the request is well
+    /// formed, and the answer is a 503 with a stable code — not a stored row
+    /// that would list as `pending` forever and never bind.
+    ///
+    /// The second half of the assertion is the one that matters: a refusal that
+    /// still wrote the binding would be exactly the half-connected state
+    /// [`connect`] exists to prevent, and it would be invisible in the response.
+    #[tokio::test]
+    async fn hosting_is_refused_until_a_runtime_is_deployed_and_nothing_is_stored() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/mcp/connect",
+                Some(SECRET_A),
+                Some(json!({
+                    "connector": "orizn-visa",
+                    "server": "visa",
+                    "token": TOKEN,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "hosting_unavailable", "{body}");
+
+        let (status, body) = h.send("GET", "/v1/mcp/servers", Some(SECRET_A), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["servers"].as_array().map(Vec::len),
+            Some(0),
+            "a refused connect wrote a binding anyway: {body}"
+        );
+
+        // And the token it was handed did not survive the refusal anywhere a
+        // response can reach.
+        assert!(!body.to_string().contains(TOKEN), "{body}");
+
+        h.teardown().await;
+    }
+
+    /// **A hosted row written by hand still reads, lists and refuses cleanly.**
+    ///
+    /// Until a runtime is deployed, the only way a hosted binding exists is the
+    /// way every MCP binding existed before `0019_mcp_operator_writes.sql`: an
+    /// operator with psql. That makes this the *reachable* shape, not a
+    /// hypothetical one, and two things about it are easy to get wrong and both
+    /// were:
+    ///
+    /// * `url` is NULL, so a row type that reads it as `String` fails to decode
+    ///   — and it is the **listing** that reads it, so one hand-written row
+    ///   would 500 the whole tenant's server list.
+    /// * [`discover`] binds inline, and a hosted binding has no address to bind
+    ///   to. It has to refuse with the hosting code rather than reach for a URL
+    ///   that is not there.
+    #[tokio::test]
+    async fn a_hosted_row_lists_without_a_url_and_refuses_to_be_discovered() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector) \
+             VALUES ($1, 'visa', NULL, 'public', 'orizn-visa')",
+        )
+        .bind(h.a.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("a hosted row is storable");
+        tx.commit().await.expect("commit");
+
+        let (status, body) = h.send("GET", "/v1/mcp/servers", Some(SECRET_A), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = &body["servers"].as_array().expect("a list")[0];
+        assert_eq!(listed["server"], "visa");
+        assert_eq!(
+            listed["url"],
+            Value::Null,
+            "a hosted binding has no address of its own to render"
+        );
+        assert_eq!(listed["connector"], "orizn-visa");
+
+        // The binder reaches it and records why it is not bound, so the
+        // operator reading this list learns something they can act on.
+        rebind(
+            &h.db,
+            &h.fleets,
+            &h.credentials,
+            h.a,
+            &CancellationToken::new(),
+        )
+        .await;
+        let (_, body) = h.send("GET", "/v1/mcp/servers", Some(SECRET_A), None).await;
+        let listed = &body["servers"].as_array().expect("a list")[0];
+        assert_eq!(listed["status"], "failed", "{body}");
+        assert_eq!(listed["error"]["code"], "hosting_unavailable", "{body}");
+
+        // And the two routes that bind inline refuse the same way rather than
+        // dialling something that is not there.
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/mcp/servers/visa/discover",
+                Some(SECRET_A),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "hosting_unavailable", "{body}");
 
         h.teardown().await;
     }

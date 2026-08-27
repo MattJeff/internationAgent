@@ -11,6 +11,16 @@
 //! file is the list. It is not true for SSH, and the refusal is argued in
 //! [`Credential`] rather than papered over with an entry that cannot work.
 //!
+//! It is also not true for the ones that ship only as a **stdio package**, which
+//! is most of them — and that gap is what [`Provision::Host`] closes. Such an
+//! entry names a [`crate::hosted::Package`]: a program we agree to run, on a
+//! tenant's behalf, in a container this process does not own. The whole of the
+//! isolation argument is in [`crate::hosted`]; what belongs here is only that
+//! the program is written down in the same array, under the same rule, as
+//! everything else we make a claim about. A tenant never names a package, for
+//! exactly the reason `crate::mcp` gives for refusing a tenant-supplied command:
+//! the allowlist of permitted programs *is* the configuration.
+//!
 //! # Why this is a `const`, and not a table
 //!
 //! A catalogue entry says *what a connector is allowed to be*: which URL a
@@ -62,6 +72,7 @@
 //! existed: the address check at bind time, the digest pin, and
 //! undeclared-means-destructive.
 
+use crate::hosted::Package;
 use crate::mcp::{Reach, RiskClass};
 
 /// What a connector needs from the person connecting it.
@@ -77,15 +88,18 @@ use crate::mcp::{Reach, RiskClass};
 /// address it does not like, and the blast radius of a hostile answer is bounded
 /// by `Untrusted` and by the risk class of the tool that was called.
 ///
-/// An SSH key is a credential *for running programs*. There is no MCP server at
-/// the end of it. Making one appear means this process spawns something — either
-/// an `ssh` child or a bridge — and `crates/app/src/mcp.rs` spends ninety lines
-/// on why it will not: a spawned command runs in this process's tree with this
-/// process's environment, which holds `DATABASE_URL` and the master key that
-/// opens every tenant's sealed credentials, and *every* control in that module
-/// rules on calls rather than on process creation. The address check that stops
-/// an agent reading the cloud metadata endpoint is no defence against a child
-/// process, because a child process already has `/proc/self/environ`.
+/// An SSH key is a credential *for running programs on somebody else's box*.
+/// There is no MCP server at the end of it, and the program it would run is
+/// whatever the person holding the key decides — which is the property
+/// `crates/app/src/mcp.rs` spends ninety lines refusing, because a command
+/// nobody wrote down has no checkable property at all.
+///
+/// **[`Provision::Host`] is not the counter-example, and the difference is the
+/// whole of why it is safe.** Hosting runs a package *this binary names*, in a
+/// container *we* describe, on a network we allocated — see [`crate::hosted`].
+/// An SSH connector would run a command *the customer names*, in a shell on a
+/// machine we know nothing about, and the only thing the two share is the word
+/// "process". One is an allowlist; the other is an interpreter.
 ///
 /// So the honest answer is that SSH is not a connector, it is a *deployment*: the
 /// customer runs an MCP server on their own box — theirs, or one of the many
@@ -98,7 +112,16 @@ pub enum Credential {
     /// Nothing to send. The endpoint is open, or whatever grant it needs is
     /// already in the URL the customer pasted.
     None,
-    /// One opaque string, sent as `Authorization: Bearer <it>`.
+    /// One opaque string the customer pastes.
+    ///
+    /// Sent as `Authorization: Bearer <it>` for a connector we dial. For a
+    /// [`Provision::Host`] entry the string is the same shape and the customer's
+    /// experience is identical, but it goes into [`Package::env`] inside the
+    /// bridge instead of onto a header — which is not a second kind of
+    /// credential, it is the same one delivered where the package looks for it.
+    /// The destination is [`Connector::provision`]'s to say, and keeping it
+    /// there is what stops two fields disagreeing about whether a binding is
+    /// hosted.
     ///
     /// The whole of what this catalogue supports today. Every remote MCP server
     /// worth connecting either takes one of these or takes OAuth, and OAuth is
@@ -117,6 +140,35 @@ impl Credential {
     }
 }
 
+/// Where the server on the other end of a binding comes from.
+///
+/// The three answers are genuinely different subsystems, and the enum exists so
+/// that a caller cannot confuse them by looking at a `None`. Before it, "this
+/// connector has no URL" meant "the customer supplies one"; a hosted entry has
+/// no URL either, and a route that branched on `Option` would have asked a
+/// customer to type the address of a container we had not started yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provision {
+    /// A published endpoint we wrote down. We dial it and send a header.
+    ///
+    /// A fixed URL is most of the value of this file: a customer who cannot
+    /// mistype the host cannot be phished into binding one, and the entry is
+    /// the only thing in the system that can make that promise — the address
+    /// check refuses a *class* of destinations, never a wrong-but-routable one.
+    Dial(&'static str),
+    /// The customer's own server, at a URL only they know. [`CUSTOM`], and the
+    /// only variant that reads a URL out of a request body.
+    Customer,
+    /// A stdio package **we** run for the tenant, behind a bridge that speaks
+    /// Streamable HTTP, in a container this process does not own.
+    ///
+    /// The endpoint is minted per start by a [`crate::hosted::BridgeRuntime`]
+    /// and is never written to or read from a row — see [`crate::hosted`] for
+    /// the isolation boundary and for what a deployment has to add before an
+    /// entry like this can bind at all.
+    Host(Package),
+}
+
 /// One connector: everything needed to turn a name a customer clicked into a
 /// binding `mcp::McpServer::bind` will accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,19 +177,23 @@ pub struct Connector {
     pub key: &'static str,
     /// What to put on the button.
     pub label: &'static str,
-    /// The endpoint, or `None` when the customer supplies it ([`CUSTOM`]).
-    ///
-    /// A fixed URL is most of the value of this file: a customer who cannot
-    /// mistype the host cannot be phished into binding one, and the entry is
-    /// the only thing in the system that can make that promise — the address
-    /// check refuses a *class* of destinations, never a wrong-but-routable one.
-    pub url: Option<&'static str>,
-    /// The tightest [`Reach`] this connector can be bound at.
+    /// Where the server comes from, and therefore which of three paths a
+    /// connect takes.
+    pub provision: Provision,
+    /// The tightest [`Reach`] a **dialled** binding on this connector may be
+    /// made at.
     ///
     /// `Public` for everything we name, because a connector whose URL we wrote
     /// down is on the internet. `CUSTOM` is the one that may be `Private`, for
     /// the sidecar case `Reach::Private` exists for, and it is the customer's
     /// deliberate choice recorded in a row.
+    ///
+    /// A [`Provision::Host`] entry keeps the tight value and never uses it: a
+    /// hosted binding's address comes from [`crate::hosted::accept`], which is
+    /// narrower than either `Reach` — private space *and* inside the operator's
+    /// bridge network *and* an IP literal. `Public` is what its row stores, so
+    /// that a future reader who consults the column at all reads the refusing
+    /// answer rather than the permissive one.
     pub reach: Reach,
     /// What to ask the customer for.
     pub credential: Credential,
@@ -156,7 +212,7 @@ pub struct Connector {
 pub const CUSTOM: Connector = Connector {
     key: "custom",
     label: "Your own MCP server",
-    url: None,
+    provision: Provision::Customer,
     // The permissive one, and the only entry that gets it: this is the sidecar
     // and the on-premises case. `Reach::Private` still refuses link-local, so
     // the cloud metadata endpoint is out of reach here as it is everywhere else.
@@ -183,7 +239,7 @@ pub const CATALOG: &[Connector] = &[
         // personal access token as a bearer — which is why it is the first
         // entry: it is the one major connector that works today with a string
         // the customer can paste, with no OAuth dance to build first.
-        url: Some("https://api.githubcopilot.com/mcp/"),
+        provision: Provision::Dial("https://api.githubcopilot.com/mcp/"),
         reach: Reach::Public,
         credential: Credential::Bearer,
         // Nothing GitHub's server exposes is observation-only in the sense that
@@ -192,6 +248,37 @@ pub const CATALOG: &[Connector] = &[
         // employee then acts on. `Write` is the floor, so no customer can class
         // any of it `read` without an operator writing the row by hand.
         floor: RiskClass::Write,
+    },
+    Connector {
+        key: "orizn-visa",
+        label: "Orizn — visa rules and consular fees",
+        // **The first hosted entry, and the one this workspace has measured.**
+        //
+        // `crates/app/tests/orizn.rs` is the evidence and it points both ways:
+        // `https://visa.orizn.app/mcp` answers Streamable HTTP but serves one
+        // tool of six and ignores an API key in every header form, while the
+        // stdio package serves all six and reads `ORIZN_API_KEY` out of its
+        // environment. So a `Dial` entry for this vendor would be a connector
+        // that connects and cannot answer the question anybody is paying for —
+        // `check_visa_requirement`, the tool that prices a visa — and the
+        // credential field on it would do nothing at all.
+        //
+        // Pinned at 1.3.0: the version `crates/app/src/orizn.rs`'s fixture was
+        // captured from, so the tools this entry's declarations will be written
+        // against are the tools that were read.
+        provision: Provision::Host(Package {
+            spec: "orizn-visa-mcp@1.3.0",
+            env: Some("ORIZN_API_KEY"),
+        }),
+        // Unused on the hosted path and deliberately the tight one. See
+        // `Connector::reach`.
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Six tools, every one of them a lookup against a curated dataset:
+        // nothing on this server writes anything anywhere. `Read` is a claim we
+        // have actually checked rather than an absence of one, which is the
+        // difference between this and `CUSTOM`'s identical value.
+        floor: RiskClass::Read,
     },
     CUSTOM,
 ];
@@ -206,6 +293,28 @@ pub fn find(key: &str) -> Option<&'static Connector> {
 }
 
 impl Connector {
+    /// The endpoint we publish for this connector, if there is one.
+    ///
+    /// `None` for both [`Provision::Customer`] and [`Provision::Host`], which is
+    /// the *display* answer and deliberately not the *routing* one: a caller
+    /// deciding what to do must match on [`Connector::provision`], because those
+    /// two `None`s mean opposite things — one asks the customer for an address,
+    /// the other refuses to let anyone name one.
+    pub const fn url(&self) -> Option<&'static str> {
+        match self.provision {
+            Provision::Dial(url) => Some(url),
+            Provision::Customer | Provision::Host(_) => None,
+        }
+    }
+
+    /// The package this connector runs, if we run it.
+    pub const fn package(&self) -> Option<&Package> {
+        match &self.provision {
+            Provision::Host(package) => Some(package),
+            Provision::Dial(_) | Provision::Customer => None,
+        }
+    }
+
     /// Refuse a class below this connector's floor.
     ///
     /// `Ok(())` when `asked` is at least as strict as the floor. The comparison
@@ -260,31 +369,52 @@ mod tests {
         for asked in [RiskClass::Read, RiskClass::Write, RiskClass::Destructive] {
             assert_eq!(CUSTOM.admits(asked), Ok(()));
         }
-        assert!(CUSTOM.url.is_none(), "the customer supplies it");
+        assert_eq!(CUSTOM.provision, Provision::Customer);
+        assert!(CUSTOM.url().is_none(), "the customer supplies it");
     }
 
-    /// Every named entry is bindable by the client that will bind it.
+    /// Every entry is bindable by the client that will bind it, whichever way
+    /// it is provisioned.
     ///
     /// Not a style check: a URL in this array is one a customer cannot correct,
     /// so a typo here is a connector nobody can use and an error message that
     /// blames their network. `vet_url` is the same function `declare_server`
     /// runs on a customer's own string.
+    ///
+    /// The hosted arm is the one that matters most, because a hosted entry has
+    /// *no* URL for a customer to correct and no address anybody may name: what
+    /// it must not do is claim a `Reach` it does not use. See `Connector::reach`
+    /// for why the unused value is the refusing one.
     #[test]
-    fn every_catalogued_url_is_one_the_mcp_client_accepts() {
+    fn every_catalogued_entry_is_one_the_mcp_client_accepts() {
         for connector in CATALOG {
-            let Some(url) = connector.url else { continue };
-            crate::mcp::vet_url(url).unwrap_or_else(|err| panic!("{}: {err}", connector.key));
-            assert!(
-                url.starts_with("https://"),
-                "{}: a catalogued endpoint is on the internet and must be TLS",
-                connector.key
-            );
-            assert_eq!(
-                connector.reach,
-                Reach::Public,
-                "{}: a public endpoint has no business reaching private space",
-                connector.key
-            );
+            match connector.provision {
+                Provision::Dial(url) => {
+                    crate::mcp::vet_url(url)
+                        .unwrap_or_else(|err| panic!("{}: {err}", connector.key));
+                    assert!(
+                        url.starts_with("https://"),
+                        "{}: a catalogued endpoint is on the internet and must be TLS",
+                        connector.key
+                    );
+                    assert_eq!(
+                        connector.reach,
+                        Reach::Public,
+                        "{}: a public endpoint has no business reaching private space",
+                        connector.key
+                    );
+                }
+                Provision::Host(_) => {
+                    assert!(connector.url().is_none());
+                    assert_eq!(
+                        connector.reach,
+                        Reach::Public,
+                        "{}: a hosted binding never reads `reach`, so it stores the tight one",
+                        connector.key
+                    );
+                }
+                Provision::Customer => {}
+            }
         }
     }
 

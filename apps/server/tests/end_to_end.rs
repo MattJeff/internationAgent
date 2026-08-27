@@ -591,7 +591,22 @@ const FAKE_MODEL: &str = r#"#!/bin/sh
 # because a turn is several round trips and which one said what matters.
 d='@DIR@'
 p="$(mktemp "$d/prompt.XXXXXXXX")"
-{ printf '%s\n' "$@"; cat; } > "$p"
+# Written aside and renamed into place, never streamed into "$p" — and the
+# staging name deliberately does not begin with `prompt.`, which is what
+# `await_prompt` matches on.
+#
+# The bug this fixes: `printf` flushes the system prompt from argv *before*
+# `cat` has copied stdin, and the tool schemas are in stdin. `await_prompt`
+# polls this directory and returns the first file containing its needle — and
+# the needle ("You are head-of-growth,") is in the argv half. So under load
+# the reader could catch a file that already had the identity line and not yet
+# the `## tools` section, and return it; the assertion that then failed was
+# `split_once("\n## tools\n")`, which reads as "the server rendered no tool
+# schemas" and is not what happened. `mv` within one directory is atomic, so
+# every `prompt.*` a reader can see is either empty or whole.
+staging="$d/partial.$$"
+{ printf '%s\n' "$@"; cat; } > "$staging"
+mv "$staging" "$p"
 
 # Whose turn this is comes out of the prompt itself — the identity line the
 # server writes is `You are <slug>, an AI employee at ...`. Branching on it
