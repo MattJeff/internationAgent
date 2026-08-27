@@ -619,6 +619,85 @@ mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// **One company's event must not hold another company's event.**
+    ///
+    /// [`MAX_CONCURRENT_TENANTS`] shipped with no test at all, and its own
+    /// doc-comment states the outage it exists to end: `agent.turn.requested`
+    /// is in this table, a turn runs up to `TURN_DEADLINE`, and a batch of 32
+    /// drained by a plain `for` loop is an hour of every tenant behind the
+    /// first one waiting on work that is not theirs — with no error, no denial
+    /// and nothing in the trail. `outbox::claim_of` made the *queue order*
+    /// fair; only this constant stops one tenant's handler from holding the
+    /// worker.
+    ///
+    /// A counter cannot catch that, which is why there was no test worth
+    /// writing until this shape existed: the sequential drain starts every
+    /// tenant too, just later, so "both handlers ran" passes either way. So the
+    /// assertion is a **rendezvous** — two tenants, one event each, and a
+    /// handler that does not return until the *other* tenant's handler has also
+    /// started. Under a sequential drain the first handler waits for a second
+    /// that cannot begin, the pass never ends, and the timeout is the failure
+    /// this test exists to report.
+    ///
+    /// Ported from `loops::initiative`'s
+    /// `one_tenants_turn_does_not_hold_another_tenants_turn`, deliberately in
+    /// the same shape: the two loops make the same promise with the same
+    /// semaphore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_tenants_event_does_not_hold_another_tenants_event() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let first = seed_tenant(&db).await;
+        let second = seed_tenant(&db).await;
+
+        let now = Utc::now();
+        enqueue(&db, first, 1, now).await;
+        enqueue(&db, second, 2, now).await;
+
+        // Two arrivals, so neither handler can finish until both have started.
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let seen: Seen = Arc::default();
+        let recorder = seen.clone();
+        let handlers = Handlers::default().on(
+            EVENT,
+            Arc::new(move |event: &OutboxEvent, _tx: &mut TenantTx<'_>| {
+                let gate = gate.clone();
+                let recorder = recorder.clone();
+                let id = event.id;
+                Box::pin(async move {
+                    recorder.lock().expect("lock").push(id);
+                    gate.wait().await;
+                    Ok(())
+                })
+            }),
+        );
+
+        // Generous: this is not a latency assertion, it is the difference
+        // between "both handlers are in flight" and "one of them can never
+        // start".
+        let pass =
+            tokio::time::timeout(Duration::from_secs(20), tick(&db, &Arc::new(handlers), now))
+                .await;
+
+        let claimed = pass
+            .expect(
+                "the pass never finished: one tenant's handler is holding the other's, so a \
+                 batch of fair seats is still drained one company at a time and every \
+                 company after the first waits out TURN_DEADLINE for work that is not theirs",
+            )
+            .expect("tick");
+        assert_eq!(claimed, 2, "both tenants' events were claimed");
+        assert_eq!(
+            ids(&seen).len(),
+            2,
+            "both handlers started, which is what let the rendezvous complete"
+        );
+
+        drop_tenant(&db, first).await;
+        drop_tenant(&db, second).await;
+    }
+
     // -- failure -----------------------------------------------------------
 
     /// A handler that never succeeds must not spin: each attempt waits longer
