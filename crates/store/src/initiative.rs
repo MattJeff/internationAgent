@@ -322,6 +322,25 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 /// `MATERIALIZED` is stated rather than relied on: PostgreSQL 12 began inlining
 /// CTEs referenced once, and an inlined one is a subquery again.
 ///
+/// # `i3.next_at <= $1` is repeated inside `due`, and it is what keeps the
+/// claims disjoint at all
+///
+/// The paragraph above is about the *bound*; this one is about the thing that
+/// paragraph took for granted. `seated` reads `employee_initiative` **unlocked**
+/// under the statement's snapshot, and `due` is the only node that locks. A row
+/// that another poller claimed and committed in between is no longer locked, so
+/// `SKIP LOCKED` does not skip it — and `READ COMMITTED`'s recheck
+/// (`EvalPlanQual`) walks to the new version and re-runs only the quals that sit
+/// *under* the `LockRows` node. With `i3.employee_id = c.employee_id` alone that
+/// still passes, and the same employee is claimed twice within milliseconds of
+/// one claim that just pushed `next_at` a whole interval out. That is two turns,
+/// which is two model calls billed to the customer for one schedule tick.
+/// Repeating the predicate here makes the recheck read `next_at` from the
+/// version actually locked, and the second poller reads past to the next
+/// employee instead. `crate::outbox::claim_of` carries the same repeat for the
+/// same reason and was where it was measured; these two queries are one shape
+/// written twice, so a fix to either is a fix owed to both.
+///
 /// # Round-robin, and why FIFO was the wrong queue discipline here too
 ///
 /// This selection used to be `ORDER BY next_at, employee_id` over the whole
@@ -417,6 +436,7 @@ pub async fn claim_due(
              SELECT i3.employee_id \
                FROM shortlist c \
                JOIN employee_initiative i3 ON i3.employee_id = c.employee_id \
+              WHERE i3.next_at <= $1::timestamptz \
               ORDER BY c.seat, c.next_at, c.employee_id \
                 FOR UPDATE OF i3 SKIP LOCKED \
               LIMIT $2::bigint) \
@@ -600,6 +620,38 @@ mod tests {
         .expect("insert employee");
         tx.commit().await.expect("commit employee");
         id
+    }
+
+    /// `n` active employees, each already overdue, in two statements.
+    ///
+    /// [`seed_due`] is the honest path and every other test uses it; this one
+    /// exists because
+    /// [`a_claim_that_lands_mid_statement_is_not_handed_out_twice`] needs
+    /// thousands of rows and thousands of round trips is a slow test rather
+    /// than a careful one.
+    async fn seed_many_due(db: &Db, tenant: TenantId, n: i64) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "WITH new_employees AS ( \
+                 INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+                 SELECT gen_random_uuid(), $1, 'store-initiative-bulk-' || g || '-' || $1, \
+                        'bulk', $2 \
+                   FROM generate_series(1, $3::bigint) g \
+                 RETURNING id \
+             ) \
+             INSERT INTO employee_initiative \
+                 (employee_id, tenant_id, interval_secs, next_at) \
+             SELECT id, $1, $4::bigint, $5 FROM new_employees",
+        )
+        .bind(tenant.as_uuid())
+        .bind(Lifecycle::Active.as_str())
+        .bind(n)
+        .bind(HOUR as i64)
+        .bind(at(T0 - 10 * HOUR as i64))
+        .execute(&mut *tx)
+        .await
+        .expect("seed many");
+        tx.commit().await.expect("commit seed");
     }
 
     /// An employee with a schedule that is already overdue.
@@ -973,6 +1025,95 @@ mod tests {
             leftovers.is_empty(),
             "a claimed employee must not be re-claimable"
         );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The test above holds both claims open, so it cannot see the poller's
+    /// actual arrangement — and in that arrangement the same employee was
+    /// claimed twice.**
+    ///
+    /// `apps/server`'s loop commits the claim *before* the first turn, so in
+    /// production the first poller's row locks are gone within milliseconds and
+    /// `SKIP LOCKED` has nothing left to skip. What holds the employee from
+    /// there is `next_at`, a column the second poller has to re-read — and
+    /// `seated` reads `employee_initiative` unlocked under the statement's
+    /// snapshot while `due` was joining on `employee_id` and nothing else. When
+    /// `READ COMMITTED`'s recheck walked to the version the first poller had
+    /// just committed, that join still held, so the employee was claimed again
+    /// milliseconds into a schedule that had just moved an hour out. Two turns
+    /// for one slot is two model calls billed for one.
+    ///
+    /// This is the twin of `crate::outbox`'s
+    /// `a_claim_that_lands_mid_statement_is_not_handed_out_twice`, in the same
+    /// shape and for the same reason: the two claims are one query written
+    /// twice, and the mechanism was measured over there. The window is the
+    /// `seated`/`shortlist` phase, which is `MATERIALIZED` and complete before
+    /// `due` locks anything; the big claim's sort is what widens it and the
+    /// small claim commits inside. Rounds rather than one attempt because two
+    /// orderings assert nothing and neither is a failure — see the outbox test.
+    /// Measured: red on 19 runs of 20 with the predicate removed, green on 20
+    /// of 20 with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_claim_that_lands_mid_statement_is_not_handed_out_twice() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db, "midstatement").await;
+
+        const SLOW: i64 = 1_000;
+        const FAST: i64 = 8;
+        const ROUNDS: i64 = 5;
+        seed_many_due(&db, tenant, (SLOW + FAST) * ROUNDS + 500).await;
+
+        for round in 0..ROUNDS {
+            let ready = Arc::new(Barrier::new(2));
+            let slow = tokio::spawn({
+                let db = db.clone();
+                let ready = ready.clone();
+                async move {
+                    let mut tx: Transaction<'_, Postgres> =
+                        db.admin_tx_bypassing_rls().await.expect("admin tx");
+                    ready.wait().await;
+                    let got = claim_due(&mut tx, SLOW, at(T0)).await.expect("slow claim");
+                    tx.commit().await.expect("commit slow");
+                    got
+                }
+            });
+
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            ready.wait().await;
+            // Into the big claim's sort rather than alongside its snapshot.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let fast = claim_due(&mut tx, FAST, at(T0)).await.expect("fast claim");
+            tx.commit().await.expect("commit fast");
+
+            let slow = slow.await.expect("slow poller");
+
+            // The fingerprint, whichever poller won: an employee handed out
+            // twice comes back to the second claimer carrying the first
+            // claimer's increment.
+            let twice: Vec<EmployeeId> = slow
+                .iter()
+                .chain(fast.iter())
+                .filter(|d| d.claims != 1)
+                .map(|d| d.employee_id)
+                .collect();
+            assert!(
+                twice.is_empty(),
+                "round {round}: {} employees came back already claimed — the \
+                 lock re-read a version somebody else had rescheduled: {twice:?}",
+                twice.len()
+            );
+
+            let ids_slow: HashSet<Uuid> = slow.iter().map(|d| d.employee_id.as_uuid()).collect();
+            let ids_fast: HashSet<Uuid> = fast.iter().map(|d| d.employee_id.as_uuid()).collect();
+            assert!(
+                ids_slow.is_disjoint(&ids_fast),
+                "round {round}: the same employee was claimed by both pollers: {:?}",
+                &ids_slow & &ids_fast
+            );
+        }
 
         drop_tenant(&db, tenant).await;
     }
