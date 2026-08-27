@@ -313,6 +313,22 @@ pub enum Provision {
 /// asked: `reconcile_opt_outs` does not need to know which channel an
 /// unsubscribe arrived on, because the trigger deactivates the contact and
 /// takes every channel down at once.
+///
+/// # The other two doors this obligation had to be put on
+///
+/// A catalogue entry is not the only way a message reaches a stranger, and this
+/// field only closes the one. The other two are traits, one crate down, and
+/// they carry the same obligation in the shape a trait can carry it:
+///
+/// * [`agentos_providers::leads::LeadSink::opted_out`] — a required method,
+///   because the campaign platform holds the list and something of ours has to
+///   go and read it. `crate::queue::reconcile_opt_outs` is that reader.
+/// * [`agentos_providers::email::OptOuts`] — a required
+///   [`opt_outs`](agentos_providers::email::EmailProvider::opt_outs) on
+///   `EmailProvider`, with the catalogue's own two variants and **neither of
+///   its two cheap ones**: an adapter that sends mail has already answered
+///   "can this reach somebody who did not ask?", so there is no `NoStrangers`
+///   to reach for and no `Unseen` to hide behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptOuts {
     /// Nothing this server serves can put a message in front of a person who

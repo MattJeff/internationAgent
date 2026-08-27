@@ -418,11 +418,116 @@ fn strip_tags(html: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Opt-outs
+// ---------------------------------------------------------------------------
+
+/// Where a person who asks this adapter to stop is heard.
+///
+/// # The third telling of one story
+///
+/// `agentos_app::catalog::OptOuts` asks a question *of an MCP connector*: can
+/// any tool this server serves put a message in front of a person who did not
+/// ask for it? Its two cheap answers — `NoStrangers` and `Unseen` — are answers
+/// to that question, and **this trait has already answered it**. Putting a
+/// message in front of somebody who did not ask for it is the whole of what an
+/// email provider does. So there is no "reaches nobody" variant here and no
+/// "nobody has looked at this vendor yet": an adapter whose documentation
+/// nobody has read is an adapter that must not be written, and there is
+/// nothing left for a lazy answer to be lazy *about*.
+///
+/// [`crate::leads::LeadSink::opted_out`] is the second telling and has teeth of
+/// a different kind: a required method that goes and reads the list, because a
+/// campaign platform holds it. That is [`OptOuts::Pulled`] with the reader
+/// already written. This enum is the same obligation one step earlier — the
+/// declaration that has to exist *before* anybody writes a reader, so that the
+/// missing reader is a named gap rather than a thing somebody meant to ask
+/// about.
+///
+/// It is a separate type from the catalogue's rather than a shared one because
+/// it has to be: `agentos-app` depends on this crate and not the other way
+/// round. Pushing the enum down into `agentos-domain` to share it would put the
+/// catalogue's two connector-shaped variants in front of every adapter author
+/// here, which is three variants of invitation to pick the wrong one. The
+/// vocabulary is deliberately the catalogue's — `Pulled`, `Pushed` — because
+/// the work each one names is the same work.
+///
+/// # What this is not
+///
+/// Declarative, and read by nothing that decides anything. No gate consults it,
+/// no send path branches on it, and it must stay that way: a field that widens
+/// a policy is a field somebody will be tempted to write a convenient value
+/// into. Its only readers are [`contract_suite`] and a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptOuts {
+    /// The provider keeps the list and something of ours has to go and read it.
+    ///
+    /// `from` names the read concretely enough to be *wrong*: the REST path or
+    /// the API call that lists the addresses that came off. There is no way to
+    /// write it without having read the vendor's documentation, which is the
+    /// point.
+    Pulled {
+        /// The read. Never empty — see [`OptOuts::vetted`].
+        from: &'static str,
+    },
+    /// They arrive at a door this deployment owns.
+    ///
+    /// `at` is the `provider` handle in `webhook_endpoints`;
+    /// `0053_webhook_endpoints.sql`'s `webhook_endpoints_provider_is_wired`
+    /// CHECK restricts that column to handles an ingest actually reads, so a
+    /// name invented here fails at registration rather than silently accepting
+    /// callbacks nobody consumes.
+    Pushed {
+        /// The door. Never empty — see [`OptOuts::vetted`].
+        at: &'static str,
+    },
+}
+
+impl OptOuts {
+    /// The declaration, checked, returning itself so it can be written in a
+    /// `const` item.
+    ///
+    /// `agentos_app::catalog`'s `vet` is the model and the reason for the
+    /// shape: **one body that is a compile error in a `const` context and a
+    /// panic in [`contract_suite`]**, so the sentence a newcomer meets is the
+    /// sentence written here whichever way they meet it. Both adapters in this
+    /// crate declare through a `const OPT_OUTS`, so an empty string in either
+    /// is `error[E0080]` — **measured, and with one caveat worth the line:
+    /// `cargo check` does not evaluate it and `cargo build` does.** An adapter
+    /// that builds its answer in the method body instead is out of the
+    /// compiler's reach entirely and gets this same sentence from the suite it
+    /// has to pass anyway. `scripts/test.sh` runs both.
+    ///
+    /// The empty string is the only thing this can catch, and that is the whole
+    /// honest extent of it: it is the `Unwired` variant the enum refuses to
+    /// have. What is *unwritable* here is silence, not a lie — whether the door
+    /// named is a door anybody reads is not checkable from this crate, and
+    /// today, for the one real adapter, it is not read. See
+    /// [`ResendEmailProvider::OPT_OUTS`](crate::email_resend::ResendEmailProvider::OPT_OUTS).
+    pub const fn vetted(self) -> Self {
+        let source = match self {
+            Self::Pulled { from } | Self::Pushed { at: from } => from,
+        };
+        assert!(
+            !source.is_empty(),
+            "an email adapter declared its opt-outs and named nowhere for them to arrive. The \
+             empty string is the `Unwired` variant this enum refuses to have. Name the read \
+             (`OptOuts::Pulled {{ from }}` — the vendor endpoint that lists who came off) or name \
+             the door (`OptOuts::Pushed {{ at }}` — the `provider` handle in `webhook_endpoints`, \
+             which `0053_webhook_endpoints.sql` restricts to handles an ingest reads). There is \
+             no third answer: this trait sends mail to people who did not ask for it, so a \
+             refusal it cannot hear is one nobody hears. If you cannot name either, you have not \
+             read the vendor's documentation yet, and the adapter is not ready to be written."
+        );
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The trait
 // ---------------------------------------------------------------------------
 
-/// What an email provider must do. Implemented by [`MockEmailProvider`] now
-/// and by a Resend adapter later.
+/// What an email provider must do. Implemented by [`MockEmailProvider`] and by
+/// [`ResendEmailProvider`](crate::email_resend::ResendEmailProvider).
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
     /// Make the sending identity (domain + mailbox) exist, reconciling on
@@ -446,6 +551,24 @@ pub trait EmailProvider: Send + Sync {
         key: &IdempotencyKey,
         email: &OutboundEmail,
     ) -> Result<ProviderMessageId, ProviderError>;
+
+    /// Where the refusals arrive for the mail [`EmailProvider::send`] sends.
+    ///
+    /// **Required, with no default, no `Option` and no value meaning "not
+    /// wired".** The three ways to make this cheap are the three ways it stops
+    /// working: a default implementation is the answer a hurried author never
+    /// sees, an `Option` makes `None` compile, and a `todo!()` in a body is a
+    /// build that passes. A required method on a return type with no cheap
+    /// variant makes *saying nothing* unwritable — `error[E0046]`, missing
+    /// `opt_outs`, at the `impl` block — which is the shape
+    /// [`crate::leads::LeadSink::opted_out`] already uses one crate over. An
+    /// associated const would be stronger still and cannot be had: it takes
+    /// dyn compatibility with it, and `agentos_app::effects::Ports` holds an
+    /// `Arc<dyn EmailProvider>`.
+    ///
+    /// It answers a question, it does not grant anything: nothing on any
+    /// authorisation path may read it. See [`OptOuts`].
+    fn opt_outs(&self) -> OptOuts;
 
     /// Verify a webhook signature over the **raw** body bytes.
     ///
@@ -508,6 +631,25 @@ impl MockEmailProvider {
     pub const PROVIDER: &'static str = "mock-email";
     /// Fixed signing secret, so tests do not need to plumb one around.
     pub const TEST_SECRET: &'static str = "whsec_dGVzdC1zaWduaW5nLXNlY3JldA==";
+    /// Where this mock's opt-outs would arrive — the same door the adapter it
+    /// stands in for declares.
+    ///
+    /// **A test double does not get a cheaper answer than the thing it
+    /// doubles, and this enum does not offer it one.** "Nobody unsubscribes
+    /// from a mock" is true and is exactly the sentence that would be worth
+    /// nothing: every test that exercises the send path runs *this* object
+    /// through the code a real sender runs through, so a double that declares
+    /// an empty channel is a suite that proves the channel is never needed.
+    ///
+    /// This is also the honest limit of the whole mechanism, stated where it
+    /// bites: the compiler cannot tell a fake that reaches nobody from a real
+    /// adapter that claims the same door, because both are one `&'static str`.
+    /// What it *can* do is refuse the adapter that names none.
+    ///
+    /// ponytail: a constant, not a knob. Give the mock a seeded declaration the
+    /// day a test needs two adapters to disagree about their doors — nothing
+    /// does today.
+    pub const OPT_OUTS: OptOuts = OptOuts::Pushed { at: "email" }.vetted();
     /// What Resend gives an attachment URL.
     pub const URL_TTL_SECS: i64 = 3600;
 
@@ -628,6 +770,10 @@ impl EmailProvider for MockEmailProvider {
         Ok(id)
     }
 
+    fn opt_outs(&self) -> OptOuts {
+        Self::OPT_OUTS
+    }
+
     fn verify_webhook(&self, raw_body: &[u8], headers: &WebhookHeaders) -> Result<(), SigError> {
         verify_signature(&self.secret, headers, raw_body, Utc::now())
     }
@@ -742,6 +888,15 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
             "an account-wide identity must reconcile, not create a second one"
         ),
     }
+
+    // -- the declaration every sender owes ---------------------------------
+    // Before `send` in this suite, and that ordering is the argument: an
+    // adapter that cannot say where a refusal lands has no business proving it
+    // can put a message in front of a stranger. Both adapters in this crate
+    // declare through a const, so this line is already spent by the time it
+    // runs; it is here for the one that builds its answer in the method body,
+    // where the compiler cannot look.
+    let _ = p.opt_outs().vetted();
 
     // -- a timeout is Retryable and never Terminal -------------------------
     // The shared classifier is the contract; an adapter that re-classifies per
@@ -904,6 +1059,47 @@ mod tests {
         // The trait has to stay object-safe: the engine holds a `dyn`.
         let p: &dyn EmailProvider = &MockEmailProvider::new();
         contract_suite(p, IdentityScope::PerKey).await;
+    }
+
+    /// The empty declaration, refused by the same body that refuses it at
+    /// compile time in the two `const OPT_OUTS` above.
+    ///
+    /// `#[should_panic]` on a `const fn`: the assertion inside `vetted` is a
+    /// build failure when the value is a `const` and an ordinary panic when it
+    /// is not, and this is the half a test can watch. The other half is watched
+    /// by the constants themselves — replace either with `at: ""` and the crate
+    /// does not compile.
+    #[test]
+    #[should_panic(expected = "named nowhere for them to arrive")]
+    fn an_email_adapter_may_not_declare_a_door_of_nowhere() {
+        let _ = OptOuts::Pushed { at: "" }.vetted();
+    }
+
+    /// The other variant, because an or-pattern that binds the wrong arm would
+    /// pass the test above and let `Pulled { from: "" }` through.
+    #[test]
+    #[should_panic(expected = "named nowhere for them to arrive")]
+    fn the_same_refusal_for_a_read_nobody_named() {
+        let _ = OptOuts::Pulled { from: "" }.vetted();
+    }
+
+    /// A declaration that names something survives it — otherwise the two tests
+    /// above would pass against a `vetted` that panics unconditionally.
+    #[test]
+    fn a_named_door_is_accepted() {
+        assert_eq!(
+            OptOuts::Pushed { at: "email" }.vetted(),
+            MockEmailProvider::OPT_OUTS
+        );
+        assert_eq!(
+            OptOuts::Pulled {
+                from: "GET /suppressions"
+            }
+            .vetted(),
+            OptOuts::Pulled {
+                from: "GET /suppressions"
+            }
+        );
     }
 
     #[test]
