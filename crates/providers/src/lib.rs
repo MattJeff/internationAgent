@@ -296,8 +296,30 @@ impl ProviderError {
     /// Whether the engine should try this step again on a backoff.
     ///
     /// `PendingExternal` is not retryable: nothing is retried, the step waits.
+    ///
+    /// # A `match`, not a `matches!`, and the difference is a whole variant
+    ///
+    /// A `matches!` answers `false` for anything it was not told about, and
+    /// three seams read this answer as a decision:
+    /// `ProvisioningEngine::call_until` stops the step,
+    /// `agentos_app::inbound::InboundError::is_retryable` forwards it to both
+    /// inbound seams, which park the event on its first attempt, and
+    /// `apps/server/src/main.rs`'s `on_turn` — via `TurnError::Llm` — answers
+    /// `Ok(())`, which is `mark_done`: `published_at` set, `last_error`
+    /// cleared, and a customer's message answered by nobody with no dead
+    /// letter to alert on. That is the expensive direction, and a `matches!`
+    /// takes it silently.
+    ///
+    /// `code()` below is already exhaustive, so a new variant does fail the
+    /// build — *there*, in the metrics label, which is answered with one line
+    /// and does not ask the question this function asks. Being made to visit
+    /// the impl block is not being made to decide. Spelled out, both sides are
+    /// a decision somebody had to write down.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Retryable { .. } | Self::RateLimited { .. })
+        match self {
+            Self::Retryable { .. } | Self::RateLimited { .. } => true,
+            Self::PendingExternal { .. } | Self::Terminal { .. } => false,
+        }
     }
 
     /// Low-cardinality label for metrics. Never interpolate provider text here.

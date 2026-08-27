@@ -47,6 +47,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
+use chrono::Utc;
 use sqlx::Postgres;
 use sqlx::postgres::PgArguments;
 use sqlx::query::Query;
@@ -452,6 +453,35 @@ pub async fn role_layer(
 ///
 /// Confined to this tenant's versions by RLS *and* by the WHERE clause; the
 /// platform version is not a tenant's to activate.
+///
+/// # Why it also gives this tenant's dead letters their attempts back
+///
+/// Because there were two ways for an employee to have no model and only one
+/// resurrection. A tenant that has connected no model fails its turn with
+/// [`crate::model_access`]'s `NoModel`, and `model_access::connect` calls
+/// [`crate::outbox::requeue_dead_letters`] in the same transaction — so the
+/// customer who pastes their key ten minutes late gets their mail answered. A
+/// tenant whose four layers intersect `allowed_models` to the empty set fails
+/// the same turn, with the same remedy shape ("a person has to change a
+/// configuration"), and `apps/server/src/main.rs`'s `on_turn` parks it
+/// terminally — correctly, because the next seven attempts read the same rows.
+/// Granting the model afterwards then resurrected nothing at all: the turn was
+/// lost in silence, and the operator's only way back was `POST /v1/model`, a
+/// verb about a credential they had already given us.
+///
+/// Here rather than in [`install_layer`] and [`rollback_layer`] separately:
+/// this is the one statement that means "this tenant's effective policy is now
+/// something else", both of them go through it, and a third verb that names a
+/// version gets the same behaviour without anybody remembering this paragraph.
+/// It is in the caller's transaction, so the policy that justifies the revival
+/// and the revival cannot come apart.
+///
+/// Untargeted for the reason [`crate::outbox::requeue_dead_letters`] argues at
+/// length, and the same bound applies: a policy change that narrows rather than
+/// widens costs the parked rows eight more attempts and returns them to exactly
+/// where they were. It **cannot** widen anything — the revived turn re-reads
+/// the policy in its own transaction when it runs, so it comes back with the
+/// rights the new layers grant and not one more.
 pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), StoreError> {
     let tenant = tx.tenant_id().as_uuid();
 
@@ -472,6 +502,21 @@ pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), Sto
         // Either it does not exist or it belongs to someone else; RLS makes
         // those indistinguishable on purpose.
         return Err(StoreError::NotFound);
+    }
+
+    // `Utc::now()` and not a threaded clock: `available_at` is being set to
+    // "now, this row is claimable again", the two operator verbs above have no
+    // clock to thread, and giving them one would put a `now` argument in a CLI
+    // that has nothing to do with time.
+    let revived = crate::outbox::requeue_dead_letters(tx, Utc::now()).await?;
+    if revived > 0 {
+        tracing::info!(
+            tenant_id = %tenant,
+            %version_id,
+            revived,
+            "events that had exhausted their attempts under the previous policy are deliverable \
+             again"
+        );
     }
     Ok(())
 }
@@ -2911,6 +2956,114 @@ pub(crate) mod tests {
         assert!(!effective.limits().allow_credential_change);
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// A dead-lettered outbox event for `tenant`, made by the two verbs the
+    /// product uses: enqueue it, then park it the way the outbox loop parks a
+    /// handler's `Failure::Terminal`. Returns its id.
+    async fn park_one(db: &Db, tenant: TenantId) -> Uuid {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let id = crate::outbox::enqueue(
+            &mut tx,
+            &crate::outbox::NewEvent::new("conversation", Uuid::now_v7(), "agent.turn.requested"),
+            Utc::now(),
+        )
+        .await
+        .expect("enqueue the turn");
+        crate::outbox::park(
+            &mut tx,
+            id,
+            "this employee's policy permits no model at all",
+        )
+        .await
+        .expect("park the turn");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    /// One event's `attempt_count`. `MAX_ATTEMPTS` is a dead letter and `0` is
+    /// a row the poller will claim again — the whole difference this asserts.
+    async fn attempts(db: &Db, tenant: TenantId, event: Uuid) -> i32 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let count = sqlx::query_scalar("SELECT attempt_count FROM outbox_events WHERE id = $1")
+            .bind(event)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the event back");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// **Fixing the policy has to give the work back, not merely stop refusing
+    /// it.**
+    ///
+    /// A turn whose four layers intersect `allowed_models` to the empty set is
+    /// `Failure::Terminal` at both turn sites, so its outbox row is a dead
+    /// letter on its first attempt — which is right, because the next seven
+    /// attempts read the same rows. What was missing is the way back. The only
+    /// caller of `outbox::requeue_dead_letters` in this workspace was
+    /// `model_access::connect`, which answers the *other* way to have no model;
+    /// granting one in a policy layer resurrected nothing, so a customer's
+    /// message stayed parked forever and no assertion anywhere noticed.
+    ///
+    /// The bystander tenant is the half that matters more, and it is the
+    /// constraint this must never break: the revival is scoped by RLS to the
+    /// tenant whose policy changed. An operator fixing one customer must not
+    /// reach into another customer's queue.
+    #[tokio::test]
+    async fn granting_a_model_in_a_policy_layer_revives_only_that_tenants_dead_letters() {
+        let Some(db) = db().await else { return };
+        let _guard = no_ceiling(&db).await;
+        install_ceiling(&db, &tight_ceiling(), "tight")
+            .await
+            .expect("install the ceiling");
+
+        let (stuck, _) = commissioned(&db, "revive-mine").await;
+        let (bystander, _) = commissioned(&db, "revive-theirs").await;
+
+        let mine = park_one(&db, stuck).await;
+        let theirs = park_one(&db, bystander).await;
+        assert_eq!(
+            attempts(&db, stuck, mine).await,
+            crate::outbox::MAX_ATTEMPTS
+        );
+        assert_eq!(
+            attempts(&db, bystander, theirs).await,
+            crate::outbox::MAX_ATTEMPTS
+        );
+
+        // The operator's fix: a layer for the tenant that was stuck. Any layer
+        // — what the turn was refused for is `allowed_models`, but the
+        // resurrection is a property of the policy having changed at all, not
+        // of which column moved, and pattern-matching the reason out of
+        // `last_error` is the mistake `requeue_dead_letters` already refuses.
+        install_layer(
+            &db,
+            stuck,
+            Scope::Tenant,
+            &PolicyLimits {
+                max_turns_per_day: 7,
+                ..tight_ceiling()
+            },
+            "grants a model",
+        )
+        .await
+        .expect("install the layer");
+
+        assert_eq!(
+            attempts(&db, stuck, mine).await,
+            0,
+            "the turn parked under the old policy never comes back; granting a model in a \
+             policy layer resurrects nothing"
+        );
+        assert_eq!(
+            attempts(&db, bystander, theirs).await,
+            crate::outbox::MAX_ATTEMPTS,
+            "one tenant's policy change revived another tenant's dead letter"
+        );
+
+        drop_tenant(&db, stuck).await;
+        drop_tenant(&db, bystander).await;
     }
 
     /// Applying the same layer twice is not a change, and a deploy script that
