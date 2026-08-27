@@ -100,6 +100,43 @@
 //! `store::policy::install_layer` (which is already tenant-scoped, runs under
 //! RLS and refuses a tenant it cannot see), and give another tenant's id the
 //! repository's 404 rather than a 403, for the reason `routes/teams.rs` gives.
+//!
+//! # Both arguments survived, and it turned out they were about *replacing*
+//!
+//! `routes::companies` writes role layers over HTTP. That is not this module
+//! changing its mind; it is the two objections above being read more carefully
+//! than they were written, because both of them are objections to a **`PUT`**.
+//!
+//! An absent layer inherits the layer above (`store::policy::load` substitutes
+//! rather than defaulting), so the effective policy before an install is
+//! `above ∧ above` and after it is `above ∧ new`, and
+//! `EffectivePolicy::try_new` takes the minimum of every cap and the
+//! intersection of every allowlist. **Writing a layer where none existed is
+//! contained in what was already permitted, field by field** — it cannot widen
+//! even the *stored* row, let alone the ruling. Replacing one has no such
+//! property: the incoming layer is not intersected with the one it displaces,
+//! so `PUT /v1/policy/role/{name}` really is a way to raise a cap over HTTP and
+//! this module was right to refuse it.
+//!
+//! So `POST /v1/companies` may create a role layer and answers
+//! `409 role_layer_exists` for one that is already there and says something
+//! else. Both sentences above stay true on that line:
+//!
+//! * **"Two places to write a limit is one place to forget to tighten."** There
+//!   is still one place to *change* a limit, and it is this command. A route
+//!   that can only ever narrow-from-inheritance is not a second place to forget,
+//!   because there is nothing there yet to forget to tighten.
+//! * **"The premise is one variable wide."** The day something mints a per-seat
+//!   token, that token finds every role layer of a live company already written
+//!   and gets a `409`. It cannot rewrite its own limits up to its tenant's,
+//!   which is the escalation this module names — and it never could, since the
+//!   *employee* scope has no door at all.
+//!
+//! What is still only here: the platform ceiling (whose row belongs to no tenant
+//! and binds every other one — no route, ever, until there is a platform
+//! principal), and every *edit* to a layer that exists. [`rollback_layer`] too:
+//! a rollback removes a layer, and removing one is the one operation in this
+//! file that genuinely widens.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -486,6 +523,20 @@ const LAYER_FIELDS: [&str; 14] = [
 fn parse_limits_document(raw: &str) -> Result<PolicyLimits, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|err| format!("not JSON: {err}"))?;
+    parse_limits(&value)
+}
+
+/// [`parse_limits_document`] minus the file, so a layer that arrives inside a
+/// larger JSON body gets the identical rule.
+///
+/// **Split for `POST /v1/companies`, and the sharing is the point.** That route
+/// carries one of these per role, and a second parser there would be a second
+/// place for "an omitted field means inherit" to be true — which is the exact
+/// belief this function exists to refuse. Every argument in
+/// [`parse_limits_document`]'s docs is an argument about this body; the wrapper
+/// above only owns "the bytes were not JSON", which is a thing a file can be
+/// and a `serde_json::Value` cannot.
+pub(crate) fn parse_limits(value: &serde_json::Value) -> Result<PolicyLimits, String> {
     let object = value
         .as_object()
         .ok_or("a policy layer is a JSON object of limits")?;
@@ -525,7 +576,7 @@ fn parse_limits_document(raw: &str) -> Result<PolicyLimits, String> {
     // incoherent layer — an approval threshold above the per-transaction cap, a
     // zero amount, a domain that is not a host — before a row is written rather
     // than on every load afterwards.
-    serde_json::from_value(value).map_err(|err| format!("not a policy layer: {err}"))
+    serde_json::from_value(value.clone()).map_err(|err| format!("not a policy layer: {err}"))
 }
 
 // ---------------------------------------------------------------------------

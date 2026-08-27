@@ -1,6 +1,7 @@
 pub mod a2a; // U34
 pub mod approvals;
 pub mod autonomy;
+pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
 pub mod initiative;
 pub mod inventory;

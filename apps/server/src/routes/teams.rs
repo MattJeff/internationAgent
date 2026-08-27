@@ -24,12 +24,20 @@
 //! **It may not write a limit.** A team's policy lives in `policy_layers` under
 //! a `role_name`, which is where `store::policy::load` already reads it and
 //! already intersects it with the tenant's. [`set_policy_role`] moves a
-//! *pointer*; there is no endpoint that sets a cap, a channel or an allowlist,
+//! *pointer*; nothing on **this** surface sets a cap, a channel or an allowlist,
 //! because two places to write a limit is one place to forget to tighten. The
-//! place that *does* write one is `agentos-server policy install --tenant …
+//! place that writes one is `agentos-server policy install --tenant …
 //! --role <name>`, on the operator's own database credential — see
 //! `apps::server::policy` for why a route here would have been defensible on
-//! authorisation grounds and was still not built. The
+//! authorisation grounds and was still not built.
+//!
+//! The one exception is `routes::companies`, and it is drawn precisely so this
+//! sentence keeps its meaning: `POST /v1/companies` may write a role layer for a
+//! role that has **none**, which — because an absent layer inherits the layer
+//! above and the loader intersects — cannot widen anything, and it answers `409`
+//! for a role that already has one. There is still exactly one place to *change*
+//! a limit. What that route does that this one must not is stand a company up
+//! from nothing; editing one is still this surface, one field at a time. The
 //! direct consequence, and the thing to tell an operator once: **a team can only
 //! ever tighten.** The loader takes the minimum of each cap across platform ∧
 //! tenant ∧ role ∧ employee, so a role layer naming a wider number than the
@@ -165,9 +173,14 @@ pub fn router(db: Db) -> Router {
 // ---------------------------------------------------------------------------
 
 /// The operator's table, as a document. See [`apply_org`].
+///
+/// `pub(crate)` because `routes::companies` carries one of these verbatim as a
+/// field: standing a company up *is* this document plus the limits it runs
+/// under, and a second spelling of the org chart would be a second thing to
+/// keep in step with `docs/orizn-org.json`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OrgChart {
+pub(crate) struct OrgChart {
     /// The sending domain given to employees this call *hires*, e.g.
     /// `agents.example.com`. One per company, not one per row: it becomes the
     /// local part's host in `slug@domain`, and a company whose founder and
@@ -176,22 +189,22 @@ struct OrgChart {
     /// Ignored for an employee that already exists — its address was minted
     /// when it was created and re-addressing it would strand every reply in
     /// flight.
-    domain: String,
+    pub(crate) domain: String,
     /// One object per row of the table, in any order. The order of the rows is
     /// not the shape of the tree: [`apply_org`] resolves every seat before it
     /// draws a single line, so the CEO may be the last row.
-    rows: Vec<OrgRow>,
+    pub(crate) rows: Vec<OrgRow>,
 }
 
 /// One row: *Fonction, Responsable, Mission*, plus the line out of the box.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OrgRow {
+pub(crate) struct OrgRow {
     /// **Fonction**, as a handle — the team's slug, and the identity this row
     /// is matched on when the document is re-applied. Also the `role_name` the
     /// team's limits will be read under *if the team is new*; an existing
     /// team's pointer is never moved by this endpoint.
-    team: String,
+    pub(crate) team: String,
     /// **Fonction**, as the operator wrote it: "Produit et technologie".
     name: String,
     /// **Mission**: what this function is for. Prose, never a limit — see
@@ -211,13 +224,13 @@ struct OrgRow {
 
 /// One row of the chart as it now stands in the database.
 #[derive(Debug, Serialize)]
-struct SeatView {
-    team: String,
+pub(crate) struct SeatView {
+    pub(crate) team: String,
     team_id: Uuid,
     name: String,
     mission: String,
-    head: String,
-    employee_id: Uuid,
+    pub(crate) head: String,
+    pub(crate) employee_id: Uuid,
     title: String,
     /// The manager's *id*. The slug is in the document the caller just sent;
     /// the id is the thing they did not have.
@@ -225,7 +238,7 @@ struct SeatView {
     /// Whether this call minted the employee. `true` means eleven resources are
     /// `pending` and the provisioning loop is coming for them — which is the
     /// difference between the 202 and the 200 this endpoint answers with.
-    hired: bool,
+    pub(crate) hired: bool,
 }
 
 /// `deny_unknown_fields` throughout, so a client that misspells a field finds
@@ -499,6 +512,58 @@ async fn apply_org(
     body: Result<Json<OrgChart>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+
+    let now = Utc::now();
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let chart = apply_org_chart(&mut tx, &principal.actor, &body, now).await?;
+    tx.commit().await?;
+
+    let hired = hired_slugs(&chart);
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        rows = chart.len(),
+        hired = hired.len(),
+        "org chart applied"
+    );
+
+    let status = if hired.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(json!({ "chart": chart }))).into_response())
+}
+
+/// Who this apply actually minted. `hired` drives the 202/200 and it is the
+/// only thing either caller needs out of the chart beyond the chart itself.
+pub(crate) fn hired_slugs(chart: &[SeatView]) -> Vec<String> {
+    chart
+        .iter()
+        .filter(|seat| seat.hired)
+        .map(|seat| seat.head.clone())
+        .collect()
+}
+
+/// [`apply_org`]'s whole body, in a transaction the **caller** owns and commits.
+///
+/// Extracted for `routes::companies`, which applies the same document and then
+/// files one more audit row in the same transaction — so a company whose chart
+/// committed and whose record of it did not is not a state this system can
+/// reach. The two callers therefore differ in exactly what they commit and in
+/// nothing else: there is one implementation of "apply an org chart", one set
+/// of refusals, and one `org.applied` row.
+///
+/// The error paths no longer roll back explicitly, and that is the mechanical
+/// consequence of the caller owning the transaction: `tx.rollback()` consumes
+/// it. Returning `Err` drops the caller's `TenantTx` unbcommitted, which is a
+/// rollback — the same discipline every `agentos_store` function here already
+/// runs on.
+pub(crate) async fn apply_org_chart(
+    tx: &mut TenantTx<'_>,
+    actor: &AuditActor,
+    body: &OrgChart,
+    now: DateTime<Utc>,
+) -> Result<Vec<SeatView>, ApiError> {
     let domain = Domain::parse(&body.domain)
         .map_err(|err| ApiError::bad_request(format!("domain: {err}")))?;
     if body.rows.is_empty() {
@@ -542,17 +607,13 @@ async fn apply_org(
         }
     }
 
-    let now = Utc::now();
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
-
     // Pass one: every seat exists before any line is drawn.
     let mut built = Vec::with_capacity(rows.len());
     for row in &rows {
-        let team_id = upsert_team(&mut tx, &row.team, row.name).await?;
-        org::set_mission(&mut tx, team_id, &row.mission).await?;
-        let (employee_id, hired) =
-            seat_holder(&mut tx, &row.head, &domain, &principal.actor, now).await?;
-        org::set_member(&mut tx, employee_id, team_id, None).await?;
+        let team_id = upsert_team(tx, &row.team, row.name).await?;
+        org::set_mission(tx, team_id, &row.mission).await?;
+        let (employee_id, hired) = seat_holder(tx, &row.head, &domain, actor, now).await?;
+        org::set_member(tx, employee_id, team_id, None).await?;
         built.push(Built {
             team_id,
             employee_id,
@@ -572,7 +633,6 @@ async fn apply_org(
             None => None,
             Some(head) => {
                 let Some(idx) = rows.iter().position(|other| &other.head == head) else {
-                    tx.rollback().await?;
                     return Err(ApiError::bad_request(format!(
                         "reports_to: no row of this chart defines a seat for '{}'",
                         head.as_str()
@@ -582,11 +642,8 @@ async fn apply_org(
             }
         };
 
-        if let Err(err) =
-            org::set_position(&mut tx, seat.employee_id, Some(row.title), manager).await
-        {
+        if let Err(err) = org::set_position(tx, seat.employee_id, Some(row.title), manager).await {
             if org::is_reporting_cycle(&err) {
-                tx.rollback().await?;
                 return Err(ApiError::conflict(
                     "reporting_cycle",
                     "that reporting line closes a loop in the org chart",
@@ -627,14 +684,10 @@ async fn apply_org(
     // chart. The per-employee `employee_created` rows are filed separately by
     // `seat_holder`, because those are the durable record of who minted
     // something that will go on to buy a phone number.
-    let hired = chart
-        .iter()
-        .filter(|seat| seat.hired)
-        .map(|seat| seat.head.clone())
-        .collect::<Vec<_>>();
+    let hired = hired_slugs(&chart);
     record(
-        &mut tx,
-        &principal.actor,
+        tx,
+        actor,
         None,
         json!({
             "event": "org.applied",
@@ -645,21 +698,8 @@ async fn apply_org(
         now,
     )
     .await?;
-    tx.commit().await?;
 
-    tracing::info!(
-        tenant_id = %principal.tenant_id,
-        rows = chart.len(),
-        hired = hired.len(),
-        "org chart applied"
-    );
-
-    let status = if hired.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::ACCEPTED
-    };
-    Ok((status, Json(json!({ "chart": chart }))).into_response())
+    Ok(chart)
 }
 
 /// One row through the constructors. Every string a caller sent becomes a
@@ -1611,7 +1651,7 @@ fn trimmed_name(raw: &str) -> Result<&str, ApiError> {
 /// `decision_id` is `None` throughout, and that is the honest answer: no Policy
 /// Gate ruling authorised these. They are an operator's key acting directly,
 /// and `actor` is the key's label.
-async fn record(
+pub(crate) async fn record(
     tx: &mut TenantTx<'_>,
     actor: &AuditActor,
     employee_id: Option<EmployeeId>,

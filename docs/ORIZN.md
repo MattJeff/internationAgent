@@ -730,7 +730,7 @@ Every employee should reach `"lifecycle": "active"`. Until then the gate refuses
 its actions, and an employee the gate refuses everything for is a row, not a
 seat.
 
-### 5. Write the role layers — **this part is not an HTTP call**
+### 5. Write the role layers
 
 ```sh
 for f in docs/orizn-roles/*.json; do
@@ -743,15 +743,29 @@ The filename is the `role_name`, which is the team slug, which is the role
 pack's name — the one string the top of this document argues should be one
 string.
 
-**This used to be `psql`, and it is still not an endpoint.** No route writes a
-`policy_layers` row and none should: `apps/server/src/routes/teams.rs` moves a
-*pointer* at a `role_name` and never a cap, "because two places to write a limit
-is one place to forget to tighten". A route would actually be defensible here —
-these layers belong to a tenant and an API key proves exactly one tenant, and
-the intersection means such a route could not widen anything — but it would make
-that sentence false on the surface an operator reads next, and it would rest on
-"the API key is the operator", which is true only because nothing mints keys.
-`apps/server/src/policy.rs` argues both sides at length.
+**This step used to say "this part is not an HTTP call", and that is no longer
+true — for a company being *created*.** Steps 3, 4 and 5 are one request now;
+see "The whole company, in one call" below. What is still not an endpoint is
+**changing** a limit that already exists, and that is the line rather than an
+omission: `POST /v1/companies` writes a role layer where the tenant has none and
+refuses `409 role_layer_exists` where it has one.
+
+The asymmetry is arithmetic, not caution. An absent layer inherits the layer
+above, so the effective policy before an install is `above ∧ above` and after it
+is `above ∧ new` — and the loader takes the minimum of every cap and the
+intersection of every allowlist, so **writing a layer where none existed cannot
+widen anything, field by field.** Replacing one has no such property: the new
+layer is not intersected with the one it displaces. So creating is safe for a
+route to do and replacing stays here, on `DATABASE_URL`, which keeps two
+sentences true that this system leans on —
+`apps/server/src/routes/teams.rs`'s "two places to write a limit is one place to
+forget to tighten" (there is still exactly one place to *change* one) and
+`apps/server/src/policy.rs`'s warning that "the API key is the operator" is one
+variable wide (the day something mints a per-seat token, that token finds every
+role layer already written and can only be refused).
+
+Editing a number is therefore still the command above: a new policy version, the
+old one intact, `policy rollback --tenant $TENANT` to undo.
 
 **One command per layer, therefore one policy version per layer.** The SQL file
 this replaced was a single transaction: all five layers or none. That is gone,
@@ -1005,17 +1019,29 @@ identity string and the caller composes it, so putting the team's mission in
 front of a new employee is a `format!` at that call site. Until somebody makes
 that call, these five sentences are documentation for humans.
 
-**`POST /v1/org` 500s on a missing tenant row.** Step 3 now creates that row
+**`POST /v1/org` still 500s on a missing tenant row.** Step 3 creates that row
 with a command instead of a database console, so it is much harder to skip — but
-it is still *possible* to skip, and the symptom is unchanged. The fix would be a
-pre-flight check in `apply_org` that answers `400` naming the tenant instead of
-letting a foreign key answer `500` with an opaque body.
+it is still *possible* to skip, and the symptom is unchanged. `POST /v1/companies`
+does not have this failure, because it creates the tenant its own API key names
+before it applies anything; `POST /v1/org` on its own was not given the same
+pre-flight, and the fix there is still the `400` naming the tenant.
 
-**Five role layers are five policy versions, not one.** Step 5 trades the SQL
-file's "all five or none" for a re-run that is idempotent, which is the better
-trade for the failure that happens — but a loop that dies after three roles does
-leave two functions inheriting the tenant's limits until it is run again, and
-nothing warns you. Re-run the loop; `unchanged` five times is the all-clear.
+**Five role layers are five policy versions, not one**, whichever door writes
+them. Step 5 trades the SQL file's "all five or none" for a re-run that is
+idempotent, which is the better trade for the failure that happens — but a loop,
+or a call, that dies after three roles does leave two functions inheriting the
+tenant's limits until it is run again, and nothing warns you. Re-run it;
+`unchanged` five times is the all-clear. What the one-call form adds is that it
+cannot die with the *chart* applied and the layers missing, because the layers
+go first.
+
+**The one-call form creates limits and never changes them.** That is the line
+argued in step 5, and the cost is real: re-sending an edited `roles` map is a
+`409` rather than an edit, so correcting a number after the company exists is
+`agentos-server policy install --tenant`, one document at a time, exactly as it
+was. A console that wants to edit limits over HTTP needs the thing
+`apps/server/src/policy.rs` names as missing — a principal that *is* the
+operator, rather than a key assumed to be — and not a wider route.
 
 **`policy rollback --tenant` is a toggle, not a walk.** It moves to the most
 recent version that is not the active one, so rolling back twice returns to
@@ -1052,13 +1078,83 @@ field is a denial and the installer refuses a document that has one.
   was about.
 * nothing else. There is no write left in this runbook that is not a command.
 
-**What is still not a route, and why.** No endpoint writes a `policy_layers`
-row, before or after this change. The platform ceiling could not be one — it
-belongs to no tenant, and every route derives its tenant from the API key, so a
-platform write authorised by one tenant's key binds every other tenant. The
-tenant, role and employee layers are a genuinely different question: they belong
-to a tenant, and a tenant is exactly what an API key proves, so a route under
-`/v1/policy/…` would be defensible and could not widen anything. It is still not
-what was built, for two reasons that are about this codebase rather than about
-authorisation — `apps/server/src/policy.rs` makes the argument, and
-`apps/server/src/routes/teams.rs` makes the half of it that came first.
+**What is still not a route, and why.** The platform ceiling, and it never can
+be: it belongs to no tenant, and every route derives its tenant from the API
+key, so a platform write authorised by one tenant's key binds every other
+tenant. That is a privilege escalation with a JSON body and no header fixes it —
+the honest version of "prove you are the operator" is the database credential.
+`agentos-server policy install` with no `--tenant` stays the only writer.
+
+The tenant, role and employee layers were the same sentence until `POST
+/v1/companies` split it in two. They belong to a tenant, and a tenant is exactly
+what an API key proves — so *creating* one over HTTP is defensible and, because
+an absent layer inherits, provably cannot widen. *Replacing* one can, so it did
+not move. `apps/server/src/policy.rs` still argues both sides and both arguments
+still hold; what changed is that they turn out to be arguments about replacing
+rather than about writing.
+
+---
+
+## The whole company, in one call
+
+Steps 3, 4 and 5 above are one request. The nine-step sequence is what you run
+when you are *editing* a company that exists; this is what you run to bring one
+into being, and it is what the product's own entry journey calls.
+
+```sh
+python3 - <<'PY' > /tmp/orizn.json
+import json, pathlib
+docs = pathlib.Path("docs")
+json.dump({
+  "slug": "orizn", "name": "Orizn",
+  "org": json.loads((docs / "orizn-org.json").read_text()),
+  "roles": {p.stem: json.loads(p.read_text()) for p in (docs / "orizn-roles").glob("*.json")},
+}, __import__("sys").stdout)
+PY
+
+call -X POST $API/v1/companies -d @/tmp/orizn.json
+```
+
+The body is the runbook's own documents with two keys around them. There is no
+third document in it, and that is the important part.
+
+**The ceiling is not in this call and no default is invented for it.** It is the
+one document here that belongs to no tenant, and `store::policy::default_ceiling`
+— which exists, and is deliberately defensible *as* a policy — is 200 turns a
+day, 50 new contacts and a $100 band nobody looks at, against this company's 30,
+20 and **$1**. A route that filled a missing ceiling with the shipped default
+would hand every company created through it something six times wider than the
+one this document argues for, as the silent consequence of an omitted field. So
+step 2 stays step 2, and a deployment with no ceiling gets
+`409 no_platform_policy` naming the command — the same answer `/readyz` and the
+boot warning already give.
+
+**The empty seat cannot be forgotten.** Every `team` in `org.rows` must have an
+entry in `roles`, checked against the body before a row is written. That is the
+`direction` argument at the top of this document turned into a refusal: an
+absent role layer inherits the layer above, so a team whose `role_name` nobody
+wrote limits for runs on the ceiling — and the seat that would end up widest is
+the one at the *root* of the chart, which every head reports to.
+`docs/orizn-roles/direction.json` is every field present and every one of them
+empty, and leaving it out is now a `400` naming it rather than a company.
+
+**What is atomic and what is not.** The tenant row and its first
+`policy_versions` row are one transaction (the pair is the invariant — a tenant
+with no active version has *invisible* layers). Each role layer is one version,
+as in step 5. The whole org chart is one transaction, as in step 4. **The call is
+not**, and the guarantee is convergence rather than atomicity: re-send the same
+body and every step that already happened answers `unchanged`, so a call that
+died anywhere is repaired by replaying it. No `Idempotency-Key` — the tenant is
+the key's own, a layer is its `role_name` and a seat is its slug, so a retry
+converges by construction.
+
+**And the order is the safety property.** The layers are written *before* the
+chart, always. A call that dies in the middle leaves limits with nobody bound by
+them; the other order would leave five employees on the platform ceiling with
+nothing anywhere reporting it. `apps/server/tests/orizn.rs` cuts the call in both
+places and asserts that neither one has hired.
+
+**It still grants no money.** Step 6 is two more calls, deliberately: a budget is
+the thing that moves money, and `org::reserve` reads the absence of one as "may
+not spend". A company that stands up unable to pay anybody is the correct company
+to stand up.

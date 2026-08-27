@@ -394,6 +394,55 @@ pub async fn platform_ceiling_installed(db: &Db) -> Result<bool, StoreError> {
     Ok(installed)
 }
 
+/// This tenant's active **role** layer for `role_name`, exactly as it is
+/// stored — no ceiling intersected into it, no inheritance substituted for it.
+///
+/// [`load`] cannot answer this and is not meant to: it returns the intersection
+/// of four layers *after* substituting the layer above for every absent one, so
+/// "this role has no layer of its own" and "this role has a layer identical to
+/// the tenant's" come back the same. The difference is the whole question here.
+///
+/// # What it is for: telling *absent* from *written*
+///
+/// Installing a layer where none exists can only narrow. An absent layer
+/// inherits the layer above ([`load`]), so the effective policy before the
+/// install is `above ∧ above` and after it is `above ∧ new` — and
+/// [`EffectivePolicy::try_new`] takes the minimum of every cap and the
+/// intersection of every allowlist, so the second is contained in the first for
+/// every field. *Replacing* a layer has no such property: the new one is not
+/// intersected with the one it replaces, so it may be wider.
+///
+/// That asymmetry is why a caller that is only allowed to *create* limits — as
+/// `POST /v1/companies` is — has to ask this question before it writes, and why
+/// asking it is enough. [`install_layer`] deliberately does not: an operator on
+/// `DATABASE_URL` is entitled to replace a layer, and refusing there would leave
+/// a bad layer with no way out but `psql`.
+///
+/// A row that does not decode is a [`PolicyLoadError`] rather than `None`,
+/// because `None` here reads as "nothing is written" and would let a caller
+/// install over a row it could not see.
+pub async fn role_layer(
+    tx: &mut TenantTx<'_>,
+    role_name: &str,
+) -> Result<Option<PolicyLimits>, PolicyLoadError> {
+    // `v.tenant_id = $1` as well as RLS: `0006_policy.sql` lets every tenant
+    // *read* the platform rows because the loader needs the ceiling, so RLS
+    // alone does not confine this to the caller's own versions.
+    let row: Option<LayerRow> = sqlx::query_as(
+        "SELECT l.* FROM policy_layers l JOIN policy_versions v ON v.id = l.version_id \
+          WHERE v.active AND v.tenant_id = $1 AND l.layer = 'role' AND l.role_name = $2",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(role_name)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    row.map(LayerRow::into_limits)
+        .transpose()
+        .map(|found| found.map(|(_, limits)| limits))
+}
+
 /// Make `version_id` this tenant's active policy version — the rollback verb.
 ///
 /// Two statements rather than one `SET active = (id = $1)`: the partial unique

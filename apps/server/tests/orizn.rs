@@ -36,6 +36,23 @@
 //! an operator reads would no longer be the row the gate rules with, and the
 //! next person to open `psql` would believe a limit that does not exist.
 //!
+//! # Two ways in, one standard
+//!
+//! There are two of these tests now, because there are two ways to stand this
+//! company up: the runbook's nine steps, and `POST /v1/companies`, which is
+//! steps 3, 4 and 5 in one request. They share
+//! [`assert_the_company_is_orizn`] — **the same function, not a second list** —
+//! and that sharing is the whole proof that the route cannot build a wider
+//! company than the runbook does. Two copies of the expectations could drift
+//! apart and then agree with each other about the wrong thing; one cannot.
+//! Widening a number in `docs/orizn-roles/` fails both tests, on the same line.
+//!
+//! The route's own test owns what the runbook has no equivalent of: that no
+//! ceiling is a refusal rather than a permissive default, that a chart naming a
+//! team with no role layer is refused by name, that a call cut in the middle
+//! leaves limits without employees and never the reverse, and that replaying it
+//! repairs rather than duplicates.
+//!
 //! # What this test does not run
 //!
 //! No turn, no model call, no payment. `AGENTOS_LLM=mock` and the mock adapters
@@ -643,55 +660,26 @@ fn domains(of: &[&str]) -> BTreeSet<Domain> {
 }
 
 // ---------------------------------------------------------------------------
-// The test
+// The company, asserted — once, for however many ways there are to build one
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
-    let Some(mut server) = Orizn::boot().await else {
-        return;
-    };
-
-    // --- 2. the ceiling is what makes the deployment usable at all ----------
-    // Red before, green after. A replica with no platform layer has no ceiling
-    // and the gate refuses everything; that is the safe direction, and it is
-    // the first thing `docs/ORIZN.md` tells an operator to expect.
-    let (status, problem) = server.curl("GET", "/readyz", false, None);
-    assert_eq!(
-        status, 503,
-        "a fresh deployment must not be ready: {problem:#}"
-    );
-    assert_eq!(
-        problem["code"], "no_platform_policy",
-        "and it must say which of the three reasons: {problem:#}"
-    );
-
-    server.install_ceiling();
-
-    let (status, ready) = server.curl("GET", "/readyz", false, None);
-    assert_eq!(status, 200, "the ceiling did not make it ready: {ready:#}");
-    assert_eq!(ready["ready"], true, "{ready:#}");
-
-    // --- 3, 4. the tenant row, then the org chart ---------------------------
-    server.create_tenant();
-
-    let document: Value = serde_json::from_str(
-        &std::fs::read_to_string(docs("orizn-org.json")).expect("read the org document"),
-    )
-    .expect("the org document is JSON");
-    let (status, applied) = server.curl("POST", "/v1/org", true, Some(&document.to_string()));
-    assert_eq!(
-        status, 202,
-        "a first apply hires, and 202 says so: {applied:#}"
-    );
-
-    // Every row of the document, back out, in order. The document is the
-    // expectation — there is no second copy of the mission strings anywhere.
+/// Every row of `docs/orizn-org.json`, back out of an apply and out of
+/// `/v1/teams`. Returns *head slug → employee id* and *team slug → team id*,
+/// which is how every later assertion resolves a seat.
+///
+/// The document is the expectation: there is no second copy of the mission
+/// strings anywhere, which is what makes editing `docs/orizn-org.json` change
+/// this test rather than break it.
+fn assert_chart_matches_document(
+    server: &Orizn,
+    document: &Value,
+    applied: &Value,
+) -> (HashMap<String, String>, HashMap<String, String>) {
     let rows = document["rows"].as_array().expect("rows");
     let chart = applied["chart"].as_array().expect("chart");
     assert_eq!(chart.len(), rows.len(), "a row went missing: {applied:#}");
 
-    let mut seats: HashMap<&str, String> = HashMap::new();
+    let mut seats: HashMap<String, String> = HashMap::new();
     for (row, seat) in rows.iter().zip(chart) {
         let team = row["team"].as_str().expect("team");
         assert_eq!(seat["team"], row["team"], "row order changed: {seat:#}");
@@ -704,7 +692,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
             "{team}: nobody was hired for this seat"
         );
         seats.insert(
-            row["head"].as_str().expect("head"),
+            row["head"].as_str().expect("head").to_owned(),
             seat["employee_id"]
                 .as_str()
                 .expect("employee_id")
@@ -755,16 +743,30 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
         );
     }
 
-    // Provisioning has to finish before any of these seats is an employee the
-    // gate would rule for. Nothing here makes it happen.
-    for id in seats.values() {
-        server.await_active(id);
-    }
+    let team_ids = listed
+        .iter()
+        .map(|(slug, team)| {
+            (
+                (*slug).to_owned(),
+                team["id"].as_str().expect("team id").to_owned(),
+            )
+        })
+        .collect();
+    (seats, team_ids)
+}
 
-    // --- 5. the role layers -------------------------------------------------
-    server.install_role_layers();
-
-    let db = Db::connect(&server.database_url).await.expect("connect");
+/// **The standard**: is the company standing the one `docs/ORIZN.md` describes?
+///
+/// Every claim in [`EXPECTED`], asked of the loader on the hot path, plus the
+/// two claims that are not "the rows exist" — that a ruling follows from the
+/// columns, and that nothing this company wrote tries to widen.
+///
+/// It takes no view of *how* the company was built, and that is now the point.
+/// `docs/ORIZN.md`'s nine steps and `POST /v1/companies` both end here, so
+/// "the route cannot create a company more permissive than the runbook would"
+/// is not a second set of assertions that could drift from this one — it is
+/// this set, run twice.
+async fn assert_the_company_is_orizn(db: &Db, tenant: TenantId, seats: &HashMap<String, String>) {
     for expected in EXPECTED {
         let role = expected.role;
         let employee = EmployeeId::from_uuid(
@@ -776,7 +778,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
         // The loader, on the hot path, with `role: None` — so what resolves the
         // layer is the team membership and its `team_policy` pointer, exactly
         // as it will at decision time.
-        let mut tx = db.tenant_tx(server.tenant).await.expect("tenant tx");
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let effective = policy::load(&mut tx, employee)
             .await
             .unwrap_or_else(|e| panic!("{role}: load: {e}"));
@@ -819,7 +821,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
         let browses = |limits: &PolicyLimits, action| {
             let policy = EffectivePolicy::try_new(limits, limits, limits, limits)
                 .expect("one layer against itself");
-            evaluate(&policy, &action, &browse_ctx(server.tenant, employee))
+            evaluate(&policy, &action, &browse_ctx(tenant, employee))
         };
         let elsewhere = Domain::parse("condor.example").expect("a host nobody named");
         let elsewhere_write = elsewhere.clone();
@@ -897,7 +899,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
         // differ exactly when a layer named a number the ceiling had to clamp
         // — safe, because the loader takes the minimum, and misleading, because
         // the next person to open the table would believe the wider number.
-        let stored = stored_layer(&db, server.tenant, role).await;
+        let stored = stored_layer(db, tenant, role).await;
         assert_eq!(
             stored.max_turns_per_day, limits.max_turns_per_day,
             "{role}: the stored max_turns_per_day is not what binds"
@@ -919,12 +921,70 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
             "{role}: the ceiling clamped a spend cap this layer asked for"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
+    let Some(mut server) = Orizn::boot().await else {
+        return;
+    };
+
+    // --- 2. the ceiling is what makes the deployment usable at all ----------
+    // Red before, green after. A replica with no platform layer has no ceiling
+    // and the gate refuses everything; that is the safe direction, and it is
+    // the first thing `docs/ORIZN.md` tells an operator to expect.
+    let (status, problem) = server.curl("GET", "/readyz", false, None);
+    assert_eq!(
+        status, 503,
+        "a fresh deployment must not be ready: {problem:#}"
+    );
+    assert_eq!(
+        problem["code"], "no_platform_policy",
+        "and it must say which of the three reasons: {problem:#}"
+    );
+
+    server.install_ceiling();
+
+    let (status, ready) = server.curl("GET", "/readyz", false, None);
+    assert_eq!(status, 200, "the ceiling did not make it ready: {ready:#}");
+    assert_eq!(ready["ready"], true, "{ready:#}");
+
+    // --- 3, 4. the tenant row, then the org chart ---------------------------
+    server.create_tenant();
+
+    let document: Value = serde_json::from_str(
+        &std::fs::read_to_string(docs("orizn-org.json")).expect("read the org document"),
+    )
+    .expect("the org document is JSON");
+    let (status, applied) = server.curl("POST", "/v1/org", true, Some(&document.to_string()));
+    assert_eq!(
+        status, 202,
+        "a first apply hires, and 202 says so: {applied:#}"
+    );
+
+    let (seats, teams) = assert_chart_matches_document(&server, &document, &applied);
+
+    // Provisioning has to finish before any of these seats is an employee the
+    // gate would rule for. Nothing here makes it happen.
+    for id in seats.values() {
+        server.await_active(id);
+    }
+
+    // --- 5. the role layers -------------------------------------------------
+    server.install_role_layers();
+
+    let db = Db::connect(&server.database_url).await.expect("connect");
+    assert_the_company_is_orizn(&db, server.tenant, &seats).await;
 
     // --- 6. finance, and the two rows a spend layer does not give it --------
     // Three independent things must say yes before a euro moves. The layer
     // above is one; these are the other two, and forgetting either produces a
     // payment that passes the gate and is refused at the reservation.
-    let finance_team = listed["finance"]["id"].as_str().expect("finance team id");
+    let finance_team = &teams["finance"];
     let books = &seats["books"];
 
     let (status, budget) = server.curl(
@@ -953,7 +1013,7 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
     // `org::reserve` refuses a team with no budget row outright.
     let (status, none) = server.get(&format!(
         "/v1/teams/{}/budget?currency=USD",
-        listed["sales-development"]["id"].as_str().expect("id")
+        teams["sales-development"]
     ));
     assert_eq!(status, 200);
     assert!(
@@ -972,6 +1032,342 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
 
     server.stop();
     server.drop_database();
+}
+
+// ---------------------------------------------------------------------------
+// The same company, in one HTTP call
+// ---------------------------------------------------------------------------
+
+/// The runbook's three company documents as one `POST /v1/companies` body —
+/// `docs/orizn-org.json` under `org`, `docs/orizn-roles/*.json` under `roles`
+/// keyed by filename.
+///
+/// **Read off disk, not restated.** The point of the route is that the operator
+/// sends the files they already have, so a test that typed the numbers again
+/// would be testing a company nobody deployed. The ceiling is deliberately
+/// absent: it belongs to no tenant and stays `agentos-server policy install`.
+fn orizn_company_body() -> Value {
+    let read = |path: PathBuf| -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+        )
+        .unwrap_or_else(|e| panic!("{} is JSON: {e}", path.display()))
+    };
+
+    let roles: serde_json::Map<String, Value> = EXPECTED
+        .iter()
+        .map(|e| {
+            (
+                e.role.to_owned(),
+                read(docs(&format!("orizn-roles/{}.json", e.role))),
+            )
+        })
+        .collect();
+
+    serde_json::json!({
+        "slug": "orizn",
+        "name": "Orizn",
+        "org": read(docs("orizn-org.json")),
+        "roles": roles,
+    })
+}
+
+/// **`docs/ORIZN.md` steps 3, 4 and 5 in one request — and the same company on
+/// the other side.**
+///
+/// Step 5 carried the sentence *"this part is not an HTTP call"*, and while it
+/// did, no step after it had a client: a product whose entry journey is *name
+/// the project, connect your server, describe it* cannot ship one whose third
+/// step is a shell on the database box.
+///
+/// This asserts five things, in the order they can go wrong:
+///
+/// 1. **No ceiling is a refusal, not a default.** The most dangerous document in
+///    the system is not in this body and no permissive stand-in is invented for
+///    it.
+/// 2. **The empty seat is impossible.** A chart naming a team with no role layer
+///    is refused by name, because an absent layer inherits — so the seat at the
+///    root of the org chart would become the most permissive employee.
+/// 3. **A layer that omits a field is refused by name**, from the same rule
+///    `agentos-server policy install` applies to a file.
+/// 4. **A call cut in the middle is repaired by replaying it**, and the state it
+///    leaves has limits and no employees rather than employees and no limits.
+/// 5. **The company is the runbook's**, asserted by
+///    [`assert_the_company_is_orizn`] — the same function, not a copy of it,
+///    which is what makes "the route cannot build a wider company" a fact rather
+///    than a claim about two lists that could drift.
+///
+/// And one more, which is the line this route is drawn on: it may *create*
+/// limits and may never *replace* them. Creating can only narrow (an absent
+/// layer inherits, and intersection is monotone); replacing has no such
+/// property, so it stays the operator's command on the operator's credential.
+#[tokio::test]
+async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
+    let Some(mut server) = Orizn::boot().await else {
+        return;
+    };
+    let body = orizn_company_body();
+
+    // --- 1. no ceiling is a refusal ----------------------------------------
+    //
+    // Fail-closed either way — with no platform layer the gate denies every
+    // action — so what this asserts is that the operator is told *now*, and
+    // above all that no default is installed on their behalf. The shipped
+    // `default_ceiling` is 200 turns, 50 contacts and a $100 unsupervised band;
+    // Orizn's is 30, 20 and $1. A route that filled the gap would hand every
+    // company built through it the wider one as the consequence of an omission.
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&body.to_string()));
+    assert_eq!(
+        status, 409,
+        "no ceiling must not build a company: {refused:#}"
+    );
+    assert_eq!(refused["code"], "no_platform_policy", "{refused:#}");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("policy install"),
+        "and it must name the command that fixes it: {refused:#}"
+    );
+
+    server.install_ceiling();
+
+    // ...and a body that tries to *send* one is told so rather than ignored.
+    // Silently dropping the field would be the worst of the three answers: the
+    // caller believes they set the ceiling and the deployment's own is what
+    // binds, which is a disagreement nobody discovers until an action is
+    // refused for a reason the operator has already ruled out.
+    let mut with_ceiling = body.clone();
+    with_ceiling["ceiling"] = serde_json::json!({"max_turns_per_day": 200});
+    let (status, refused) = server.curl(
+        "POST",
+        "/v1/companies",
+        true,
+        Some(&with_ceiling.to_string()),
+    );
+    assert_eq!(
+        status, 400,
+        "the ceiling is the deployment's, and a body that names one must not be \
+         quietly accepted: {refused:#}"
+    );
+
+    // --- 2. the empty seat, refused by name --------------------------------
+    //
+    // `direction` is the emptiest document in the repository and the cheapest
+    // thing in the runbook: without it the founder's chair — every head's
+    // `reports_to` — inherits the ceiling and becomes the widest seat in the
+    // company. Dropping it here is the whole class of mistake, because
+    // `upsert_team` writes `team_policy.role_name = slug`, so any team whose
+    // slug has no layer is this same failure.
+    let mut chairless = body.clone();
+    chairless["roles"]
+        .as_object_mut()
+        .expect("roles")
+        .remove("direction")
+        .expect("direction was there");
+    let (status, refused) =
+        server.curl("POST", "/v1/companies", true, Some(&chairless.to_string()));
+    assert_eq!(
+        status, 400,
+        "a team with no limits must not be built: {refused:#}"
+    );
+    let detail = refused["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("direction"), "name the team: {refused:#}");
+    assert!(
+        detail.contains("INHERIT"),
+        "and say why an absent layer is the dangerous one: {refused:#}"
+    );
+
+    // --- 3. an incomplete layer, refused by name ---------------------------
+    //
+    // The trap `docs/ORIZN.md` exists to prevent, arriving over HTTP instead of
+    // in a file: `PolicyLimits` is `#[serde(default)]` and its default grants
+    // nothing, so a body that looks like an edit is a total replacement. The
+    // route must apply the installer's rule and not serde's.
+    let mut partial = body.clone();
+    partial["roles"]["growth"]
+        .as_object_mut()
+        .expect("growth")
+        .remove("allowed_channels")
+        .expect("it was there");
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&partial.to_string()));
+    assert_eq!(status, 400, "{refused:#}");
+    let detail = refused["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("allowed_channels") && detail.contains("DENY"),
+        "the refusal must name the field and say the omission is a denial: {refused:#}"
+    );
+
+    // Nothing above wrote a row: all three are decided from the body, or from
+    // the deployment, before the tenant exists.
+    let (status, teams) = server.get("/v1/teams");
+    assert_eq!(status, 200, "{teams:#}");
+    assert!(
+        teams["teams"].as_array().expect("teams").is_empty(),
+        "a refused call left a company behind: {teams:#}"
+    );
+
+    // --- 4. two cuts, and neither of them may hire ---------------------------
+    //
+    // Both are real half-way failures driven entirely over HTTP, and between
+    // them they pin the *order*: the layers go before the chart, so that a call
+    // that stops anywhere stops with limits and no employees rather than
+    // employees and no limits. An absent role layer inherits the layer above,
+    // so five seats hired ahead of their limits are five seats on the platform
+    // ceiling with nothing reporting it.
+    let db = Db::connect(&server.database_url).await.expect("connect");
+    let employees_now = |server: &Orizn| -> usize {
+        let (status, listed) = server.get("/v1/employees");
+        assert_eq!(status, 200, "{listed:#}");
+        listed["employees"].as_array().expect("employees").len()
+    };
+
+    // **Cut A: inside the layers.** A finance layer in EUR under a USD ceiling
+    // is unintersectable — `EffectivePolicy::try_new` answers `MixedCurrency`
+    // and the store refuses it before a row is written, naming both. `finance`
+    // is third of five in `role_name` order, so this stops the call in the
+    // middle of the loop. **Nobody may have been hired**, and if this assertion
+    // ever fires the chart has been moved ahead of the layers.
+    let mut euros = body.clone();
+    for field in ["max_per_transaction", "max_per_day", "approval_above"] {
+        euros["roles"]["finance"]["spend"][field]["currency"] = serde_json::json!("EUR");
+    }
+    let (status, cut) = server.curl("POST", "/v1/companies", true, Some(&euros.to_string()));
+    assert_eq!(status, 409, "two currencies cannot be intersected: {cut:#}");
+    assert_eq!(cut["code"], "policy_currency", "{cut:#}");
+    assert_eq!(
+        employees_now(&server),
+        0,
+        "a call that died writing the LIMITS had already hired: the chart is running \
+         ahead of the layers, and every one of those seats is inheriting the ceiling"
+    );
+    let partial = role_layer_names(&db, server.tenant).await;
+    assert!(
+        !partial.is_empty() && partial.len() < EXPECTED.len(),
+        "cut A was meant to stop in the middle of the loop, and left {partial:?}"
+    );
+
+    // **Cut B: past the layers, inside the chart.** `reports_to` naming a head
+    // no row defines is `apply_org`'s own documented 400, and by then all five
+    // layers are written. This is the safe half of a broken call: limits, and
+    // nobody bound by them.
+    let mut broken = body.clone();
+    broken["org"]["rows"][1]["reports_to"] = serde_json::json!("nobody");
+    let (status, cut) = server.curl("POST", "/v1/companies", true, Some(&broken.to_string()));
+    assert_eq!(status, 400, "{cut:#}");
+
+    let written = role_layer_names(&db, server.tenant).await;
+    assert_eq!(
+        written.len(),
+        EXPECTED.len(),
+        "the layers go first precisely so a cut past them leaves them: {written:?}"
+    );
+    assert_eq!(
+        employees_now(&server),
+        0,
+        "the chart is one transaction, so a bad line in row 2 must undo the team in row 1"
+    );
+
+    // --- 5. the replay repairs it ------------------------------------------
+    //
+    // No `Idempotency-Key` anywhere: the tenant is the key's own, a role layer
+    // is its `role_name` and a seat is its slug, so the second run converges by
+    // construction. The five layers it re-sends are already there and identical,
+    // which is `Installed::Unchanged` — no row and no version.
+    let (status, applied) = server.curl("POST", "/v1/companies", true, Some(&body.to_string()));
+    assert_eq!(status, 202, "the replay must finish the job: {applied:#}");
+    assert_eq!(applied["slug"], "orizn", "{applied:#}");
+    for layer in applied["roles"].as_array().expect("roles") {
+        assert_eq!(
+            layer["installed"], false,
+            "the cut already wrote this layer; re-writing it would be a second version: {layer:#}"
+        );
+    }
+    assert_eq!(
+        role_layer_names(&db, server.tenant).await.len(),
+        EXPECTED.len(),
+        "the replay duplicated a layer"
+    );
+
+    let (seats, _teams) = assert_chart_matches_document(&server, &body["org"], &applied);
+    for id in seats.values() {
+        server.await_active(id);
+    }
+
+    // --- and the company is the runbook's ----------------------------------
+    assert_the_company_is_orizn(&db, server.tenant, &seats).await;
+
+    // --- 6. it creates limits and never changes them ------------------------
+    //
+    // The line that keeps `routes/teams.rs`'s "two places to write a limit is
+    // one place to forget to tighten" true where it matters: there is still
+    // exactly one way to *change* one. Widening is the case that must not pass,
+    // so that is what is sent.
+    let mut wider = body.clone();
+    wider["roles"]["sales-development"]["max_turns_per_day"] = serde_json::json!(200);
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&wider.to_string()));
+    assert_eq!(status, 409, "a route must not replace a limit: {refused:#}");
+    assert_eq!(refused["code"], "role_layer_exists", "{refused:#}");
+    assert_eq!(refused["role"], "sales-development", "{refused:#}");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("policy install"),
+        "and it must name the command that does change one: {refused:#}"
+    );
+    assert_eq!(
+        stored_layer(&db, server.tenant, "sales-development")
+            .await
+            .max_turns_per_day,
+        30,
+        "the refusal wrote the wider number anyway"
+    );
+
+    // --- 7. and it will not build one company inside another ----------------
+    //
+    // The tenant is the API key's and never the body's, so a body naming a
+    // different company is a body sent with the wrong key — and quietly filing
+    // Acme's org chart inside Orizn is not something re-running anything
+    // undoes. Adopting is right; renaming is not.
+    let mut elsewhere = body.clone();
+    elsewhere["slug"] = serde_json::json!("acme");
+    let (status, refused) =
+        server.curl("POST", "/v1/companies", true, Some(&elsewhere.to_string()));
+    assert_eq!(
+        status, 409,
+        "a mismatched company must not be built: {refused:#}"
+    );
+    assert_eq!(refused["code"], "tenant_mismatch", "{refused:#}");
+    assert_eq!(
+        refused["slug"], "orizn",
+        "name the company the key is for: {refused:#}"
+    );
+
+    // A third apply of the *unchanged* documents is a no-op that hires nobody,
+    // which is the 200 rather than the 202 — the same rule `apply_org` follows,
+    // and the reason a provisioning script can run this on every deploy.
+    let (status, again) = server.curl("POST", "/v1/companies", true, Some(&body.to_string()));
+    assert_eq!(status, 200, "nothing was outstanding: {again:#}");
+
+    server.stop();
+    server.drop_database();
+}
+
+/// The `role_name`s this tenant has active role layers for.
+async fn role_layer_names(db: &Db, tenant: TenantId) -> Vec<String> {
+    let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+    let names: Vec<String> = sqlx::query_scalar(
+        "select l.role_name from policy_layers l join policy_versions v on v.id = l.version_id
+          where v.active and v.tenant_id = $1 and l.layer = 'role' order by l.role_name",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_all(&mut **tx)
+    .await
+    .expect("read the role layers");
+    tx.rollback().await.expect("rollback");
+    names
 }
 
 /// The monthly figure in `docs/ORIZN.md`, derived rather than quoted.

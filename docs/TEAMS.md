@@ -248,12 +248,13 @@ call $API/v1/teams
 ]}
 ```
 
-## 2. Write the limits — and this part is **not** an HTTP call
+## 2. Write the limits — and **changing** one is not an HTTP call
 
 The limits live in `policy_layers`, under the `role_name` the team points at, in
-the tenant's **active** `policy_versions` row. There is no endpoint for it, on
-purpose: two places to write a limit is one place to forget to tighten. There is
-a **command**, which runs on the operator's own `DATABASE_URL`:
+the tenant's **active** `policy_versions` row. No endpoint on *this* surface
+writes one, on purpose: two places to write a limit is one place to forget to
+tighten. There is a **command**, which runs on the operator's own
+`DATABASE_URL`:
 
 ```sh
 agentos-server policy install --tenant $TENANT --role purchasing purchasing.json
@@ -261,6 +262,16 @@ agentos-server policy install --tenant $TENANT --role purchasing purchasing.json
 
 `purchasing.json` is a complete layer. Every field, every time — see the warning
 below.
+
+> **The one exception, and the shape of it.** `POST /v1/companies` carries these
+> same documents and writes them, but only for a role that has **no** layer yet:
+> a role that already has one is `409 role_layer_exists`. That is not a second
+> place to write a limit, it is the place a company is *born*. An absent layer
+> inherits the layer above, so installing where none existed is `above ∧ new`
+> against `above ∧ above` and cannot widen any field; replacing one is not
+> intersected with what it displaces and can. So creation is a route and every
+> **edit** is still the command above, which is what the sentence in the heading
+> is protecting. See `docs/ORIZN.md`, "The whole company, in one call".
 
 ```json
 {
@@ -622,7 +633,8 @@ SELECT occurred_at, actor, payload ->> 'event' AS event, payload
 
 | `payload.event` | written by |
 |---|---|
-| `org.applied` | `POST /v1/org` — one row per call, carrying the whole chart and the slugs it hired |
+| `company.created` | `POST /v1/companies` — one row per call, carrying the tenant's slug, the role layers it installed and the version each one is now on |
+| `org.applied` | `POST /v1/org` **and** `POST /v1/companies` — one row per call, carrying the whole chart and the slugs it hired. One implementation, so the trail reads the same whichever door was used |
 | `team.created` | `POST /v1/teams` |
 | `section.created` | `POST /v1/teams/{id}/sections` |
 | `team.member_added` | `POST /v1/teams/{id}/members` |
