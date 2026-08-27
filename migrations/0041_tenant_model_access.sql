@@ -56,19 +56,8 @@
 -- b. NO `verified_by` OR REQUEST METADATA. The interesting question about a
 --    connection is whether it still works, and the answer to that is a fresh
 --    call, not an old row. Who pressed the button is in `audit_log`, which is
---    where the trail belongs — the `model_connected` row written by
---    `agentos_app::model_access` carries it.
---
---    This paragraph used to end "…and where a `secret_accessed` row already
---    lands for every read of the credential". That was false when it was
---    written and it is corrected rather than deleted, because the false half
---    was load-bearing for the argument above it. `SecretResolver` is the only
---    writer of that row and nothing outside `#[cfg(test)]` constructs one; the
---    live read goes straight to the store, and `crates/app/src/model_access.rs`
---    argues on purpose that a row per read would be noise. `SPEC.md` promised
---    the same thing and is now tagged NOT WIRED. So: who connected is on the
---    record, and every *read* after that is not — which is a smaller claim than
---    this file used to make, and the true one.
+--    where the trail belongs and where a `secret_accessed` row already lands for
+--    every read of the credential.
 --
 -- c. NO `status` COLUMN. The absence of a row IS "not connected", the same way
 --    an empty allowlist IS "denies" one table over. A nullable status invites a

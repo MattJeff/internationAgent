@@ -134,6 +134,29 @@
 -- NULL the constraint then forbids (so a second run matches nothing), and the
 -- duplicate_object catch 0040 uses for the constraint.
 
+-- ---------------------------------------------------------------------------
+-- WHAT 0041 SAYS THAT IS NOT TRUE, AND WHY THE CORRECTION IS HERE
+-- ---------------------------------------------------------------------------
+--
+-- `0041`'s decision (b) argues against a `verified_by` column and ends: "…and
+-- where a `secret_accessed` row already lands for every read of the
+-- credential". That clause is false and always was. `SecretResolver` is the
+-- only writer of that row, nothing outside `#[cfg(test)]` constructs one, and
+-- `crates/app/src/model_access.rs` argues on purpose that a row per read would
+-- be noise. `SPEC.md` promised the same thing and now carries its own NOT WIRED
+-- tag.
+--
+-- **It is corrected here rather than there, and that is the point of this
+-- paragraph.** An applied migration is immutable: `sqlx` checksums the file, so
+-- editing a comment in `0041` makes every database that already ran it refuse
+-- to migrate with `VersionMismatch(41)` — which is exactly what happened, once,
+-- and was caught by a test run against a database that was not freshly created.
+-- A correction that breaks every existing deployment is not a correction.
+--
+-- So: the true statement is that who *connected* is on the record, via the
+-- `model_connected` audit row, and every *read* after that is not. The rest of
+-- 0041's argument stands.
+--
 alter table tenant_model_access
   add column if not exists sealed_key bytea;
 
