@@ -286,7 +286,7 @@ pub async fn decide(
 mod tests {
     use agentos_domain::ids::TenantId;
     use agentos_domain::policy::Decision;
-    use chrono::TimeDelta;
+    use chrono::{SubsecRound, TimeDelta};
 
     use super::*;
     use crate::audit::{self, AuditActor, AuditEvent, AuditKind};
@@ -367,7 +367,18 @@ mod tests {
     async fn many_refusals_of_one_shape_are_one_request() {
         let Some(db) = db().await else { return };
         let (tenant, employee) = seed(&db).await;
-        let t0 = Utc::now() - TimeDelta::hours(2);
+        // `trunc_subsecs(6)` because the assertions below compare an instant
+        // this test made against the same instant after a round trip through
+        // `timestamptz`, which holds microseconds. A finer clock loses the last
+        // three digits on the way in, and the comparison then fails on a value
+        // nothing is wrong with.
+        //
+        // Not portability paranoia — a fact about this test's history. macOS
+        // hands out microseconds, so the nanoseconds are always a multiple of a
+        // thousand and this passed locally for as long as it existed. Linux
+        // hands out nanoseconds. This assertion has therefore never once been
+        // meaningful in CI: it was red, and the red was about the clock.
+        let t0 = (Utc::now() - TimeDelta::hours(2)).trunc_subsecs(6);
 
         // Two below the bar: not a request yet.
         for i in 0..2 {

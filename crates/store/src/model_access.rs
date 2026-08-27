@@ -208,6 +208,7 @@ pub async fn save(
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::TenantId;
+    use chrono::SubsecRound;
 
     use super::*;
     use crate::db::Db;
@@ -242,7 +243,11 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let now = Utc::now();
+        // `timestamptz` holds microseconds, and this compares a `verified_at`
+        // it made against the one it reads back, so the clock has to be one the
+        // column can hold. `capability.rs` carries why this was green on macOS
+        // and red on Linux for as long as it existed.
+        let now = Utc::now().trunc_subsecs(6);
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         assert!(load(&mut tx).await.expect("load").is_none());

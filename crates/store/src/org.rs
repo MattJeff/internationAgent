@@ -1188,13 +1188,34 @@ mod tests {
         tx.commit().await.expect("commit setup");
 
         let db = Arc::new(db);
+        // **The overlap is arranged, not hoped for.** Spawning twelve tasks and
+        // measuring how much they happened to overlap works on a laptop with
+        // cores to spare and fails on a two-core CI runner, where the tasks are
+        // simply run one after another — and the guard below then reports, with
+        // perfect accuracy, that the test proved nothing. It was red in CI for
+        // exactly that reason, which is a test that cannot run rather than a
+        // ledger that does not hold.
+        //
+        // Every task takes its transaction, waits here until all twelve have
+        // one, and only then reserves. Peak concurrency is therefore N by
+        // construction on any machine, and the guard below keeps its meaning:
+        // it now catches a barrier that was removed rather than a runner that
+        // was small.
+        //
+        // **This depends on `N` fitting in the pool** — `Db` opens sixteen
+        // connections and twelve tasks hold one each while they wait. Raise `N`
+        // past that and every task blocks on a connection nobody will release,
+        // which is a hang and not a failure.
+        let gate = Arc::new(tokio::sync::Barrier::new(N));
         let tasks: Vec<_> = employees
             .into_iter()
             .map(|employee| {
                 let db = Arc::clone(&db);
+                let gate = Arc::clone(&gate);
                 tokio::spawn(async move {
                     // A transaction per task, exactly as a real caller has.
                     let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+                    gate.wait().await;
                     let start = Instant::now();
                     let outcome = reserve(&mut tx, employee, DAY, usd(AMOUNT)).await;
                     let granted = match outcome {
@@ -1234,9 +1255,12 @@ mod tests {
             depth += delta;
             peak = peak.max(depth);
         }
-        assert!(
-            peak >= 4,
-            "reservations serialised (peak concurrency {peak}); this test proves nothing"
+        assert_eq!(
+            peak, N as i32,
+            "the barrier releases all {N} tasks together, so every reservation \
+             window has to overlap every other one. A lower peak means the \
+             rendezvous is gone, and without it this test passes on a machine \
+             that ran the tasks one at a time and proved nothing"
         );
 
         // The invariant. Not "roughly six", not "we logged the overage": the

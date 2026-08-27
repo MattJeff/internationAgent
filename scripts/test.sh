@@ -127,6 +127,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# --- what a green run here does NOT prove -----------------------------------
+# This machine is probably macOS, and macOS hands out a **microsecond** clock:
+# `Utc::now()`'s nanoseconds are always a multiple of a thousand. PostgreSQL's
+# `timestamptz` also holds microseconds, so an instant written and read back
+# comes home unchanged, and any test comparing the two passes.
+#
+# Linux hands out real nanoseconds. The same round trip drops the last three
+# digits, and the same assertion fails. Two tests lived that way for as long as
+# they existed — green on every laptop, red in CI, about the clock and nothing
+# else. They now build their instants with `trunc_subsecs(6)`.
+#
+# To find the next one without waiting for CI, give the tests a finer clock:
+#
+#   inside `mod tests`, replace `Utc::now()` with
+#   `(Utc::now() + chrono::TimeDelta::nanoseconds(1))`, run, and revert.
+#
+# Anything that compares an instant against its own round trip goes red. That
+# sweep found exactly two in `agentos-store`; it has not been run on the other
+# crates, because CI stops at the first failing package and has never reached
+# them.
+
 # --- guard: an applied migration is immutable, and only a long-lived database
 # can say so -------------------------------------------------------------------
 # Every database above is created fresh, so every migration is applied for the
