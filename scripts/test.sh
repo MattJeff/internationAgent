@@ -146,7 +146,14 @@ trap cleanup EXIT INT TERM
 # first time, and this guard proves nothing. It is vacant exactly once and
 # real from then on; there is no way to have it both ways, and saying so
 # beats a green run that looks like evidence.
-LEDGER=ci_migration_ledger
+# Per worktree, and that is the whole point of the hash. Three trees migrate
+# in parallel against one Postgres; a fixed name means the moment ANY of them
+# adds a migration the others fail on a file nobody in their tree touched --
+# the exact error this guard exists to raise, raised for the wrong reason. A
+# guard that cries wolf is worse than no guard. The ledger still has to
+# outlive the run (that is what makes it able to see an edit at all), so it is
+# keyed to the tree rather than to the run.
+LEDGER="ci_migration_ledger_$(printf '%s' "$PWD" | shasum | cut -c1-10)"
 echo "==> migrations against $LEDGER (kept between runs on purpose)"
 psql_admin -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '$LEDGER'" \
   | grep -q 1 || psql_admin -v ON_ERROR_STOP=1 -c "CREATE DATABASE $LEDGER"
