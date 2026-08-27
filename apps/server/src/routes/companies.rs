@@ -315,15 +315,22 @@ struct LayerView {
 /// Everything above the tenant row is a pure read of the body, so the common
 /// mistakes cost nothing and leave nothing.
 ///
-/// # The hole this leaves, named rather than filled
+/// # The hole this leaves, named — and since answered, elsewhere
 ///
-/// **`POST /v1/org` still hires into a company with no window.** It is the
-/// *editing* door — `docs/ORIZN.md`'s nine steps, run against a company that
-/// exists — and every company stood up before this field existed came through
-/// it. Closing it means refusing to hire where there is no window, which is a
-/// second decision with a much larger blast radius (`end_to_end.rs`,
-/// `sourcing_e2e.rs` and the runbook path all hire without one) and is not this
-/// route's to make.
+/// **`POST /v1/org` still hires into a company with no window, and that is now
+/// a decision rather than an omission.** It is the *editing* door —
+/// `docs/ORIZN.md`'s nine steps, run against a company that exists — and every
+/// company stood up before this field existed came through it. The question was
+/// whether to close it, and the answer is no, argued in
+/// [`teams::apply_org`](super::teams::apply_org) where the door is: an
+/// operator's own halt does not block a hire either, a company from before 0054
+/// has done nothing wrong, and where there is no window the seats that already
+/// exist are the runaway — refusing the next one stops none of them. Hiring is
+/// not acting, and every path that *acts* reads `halt::halted`.
+///
+/// So the requirement above is this route's and stays this route's: standing a
+/// company up from nothing is the one moment the question can be asked with
+/// nobody to punish for the answer.
 ///
 /// ponytail: no backfill and no sweep. Both need a default duration, which is
 /// the one thing nobody in this workspace is allowed to invent — it is a price.

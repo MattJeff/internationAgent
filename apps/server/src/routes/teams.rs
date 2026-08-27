@@ -502,6 +502,49 @@ struct Built {
 /// holds the rule for every writer, and all that happens here is that its
 /// SQLSTATE is rendered as a 409 instead of an opaque 500.
 ///
+/// # It hires into a stopped company, and into one with no window at all
+///
+/// `routes::companies` asks whether this door should be closed — it requires a
+/// `window_ends_at` and observes that this one never does. **It should not be,
+/// and no check is added here.** Three reasons, in the order that decides it.
+///
+/// **An operator's own halt does not block a hire.** Nothing on this surface
+/// reads `halt::halted`, and neither does `POST /v1/employees`: the readers of a
+/// stop are the gate, `model_access::connected`, the outbox claim and the
+/// initiative claim, every one of them on the *acting* path. So refusing to hire
+/// where a window has lapsed would make a schedule stricter than the emergency
+/// switch, which carries a human's sentence and no date. Whatever the right
+/// answer is, it cannot be one that arrives at the window first.
+///
+/// **A company from before 0054 has no `company_windows` row and has done
+/// nothing wrong.** Refusing its hires is punishing it for being old — the
+/// failure a new column must never cause. There is no backfill available to
+/// spare it either, because a backfill needs a default duration and a duration
+/// is a price; `0054` and `PUT /v1/window` both refuse to invent one and this
+/// route is not the place it leaks in.
+///
+/// **And where there is no window, the runaway is already running.** The seats
+/// that exist are taking turns; refusing the next one stops none of them. It
+/// would be a gesture at a symptom while the cause continues, and the cause has
+/// a one-call remedy that records who applied it: `PUT /v1/window`.
+///
+/// What makes leaving it open *safe* is that hiring is not acting. A seat hired
+/// into a company whose window has closed cannot take a turn, cannot be claimed
+/// off the outbox, cannot be claimed by the initiative loop and cannot mint an
+/// `Authorized` token — every one of those reads `halt::halted`, which reports
+/// an exhausted window as a halt. That is the inheritance `0054` was built on,
+/// and it is asserted against a database by
+/// `hiring_is_not_acting_so_a_stopped_company_still_edits_its_org_chart`.
+///
+/// **What is genuinely open, and it is not a window question.**
+/// `loops::provisioning`'s `CLAIM_SQL` filters on neither `company_halts` nor
+/// `company_windows` and runs on an admin transaction, so the eleven resources
+/// each hire leaves `pending` are bought — mailboxes, phone numbers, real money
+/// — for a company that is stopped. It is identical under an operator halt, so
+/// it is a gap in the halt and not in the window, and `routes::halt`'s module
+/// docs already argue why half-covering it is worse than not covering it.
+/// Closing it is that loop's decision to make, with the evidence above.
+///
 /// 202 when it hired somebody — eleven resources per new employee are pending
 /// and the loop is coming for them — and 200 when it did not, because a
 /// re-apply that changed a mission has nothing outstanding and saying
@@ -2549,6 +2592,149 @@ mod tests {
             h.counts(h.a).await,
             counts,
             "another tenant's chart leaked in"
+        );
+
+        h.teardown().await;
+    }
+
+    /// **Hiring is not acting, so a stop leaves this door open — and that is a
+    /// decision rather than an oversight.**
+    ///
+    /// `POST /v1/org` does not read `halt::halted`, and the question worth
+    /// pinning is whether it should. A seat hired into a company with no
+    /// operating window looks exactly like the runaway `0054` exists to stop, so
+    /// the obvious move is to refuse the hire. It is the wrong move, and this
+    /// test is the three reasons standing up.
+    ///
+    /// **An operator's own halt does not block a hire today.** That is the
+    /// symmetry that settles it: the emergency switch carries a human's sentence
+    /// and no date, and if refusing to hire were right anywhere it would be
+    /// righter there. A schedule stricter than the switch is a product whose
+    /// most deliberate stop is its weakest one.
+    ///
+    /// **A company from before 0054 has no `company_windows` row at all**, and
+    /// has done nothing wrong. Refusing to let it edit its org chart is
+    /// punishing it for being old, which is the one thing a new column may never
+    /// do.
+    ///
+    /// **And what comes through the door cannot spend.** The stop is enforced
+    /// where the money is — `model_access::connected` reads the halt before a
+    /// turn is reserved, and an exhausted window arrives there as one — so the
+    /// company that just hired is refused a model client in the same breath.
+    /// That is asserted here rather than assumed, because it is the entire
+    /// justification for leaving the door open.
+    ///
+    /// So this fails in two directions on purpose: close the door and the first
+    /// three assertions go red, remove the halt read that makes leaving it open
+    /// safe and the fourth does.
+    ///
+    /// What it deliberately does **not** cover: `loops::provisioning`, whose
+    /// `CLAIM_SQL` filters on neither `company_halts` nor `company_windows`, so
+    /// the eleven resources a hire makes pending are still bought for a stopped
+    /// company. That is real money and it is the same for an operator halt —
+    /// `routes::halt`'s module docs name it and argue that half-covering it is
+    /// worse than not. It is not a window question and no assertion here should
+    /// pretend it is.
+    #[tokio::test]
+    async fn hiring_is_not_acting_so_a_stopped_company_still_edits_its_org_chart() {
+        use agentos_app::model_access::{self, NoModel};
+        use chrono::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let now = Utc::now();
+
+        // -- 1. a company from before 0054: no `company_windows` row at all ---
+        let (status, applied) = h.apply(SECRET_A, seven_rows()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a company that predates the operating window must not lose the ability to hire \
+             because a column appeared: {applied}"
+        );
+
+        // It runs forever, which is what "no row" means. `NotConnected` and not
+        // `CompanyHalted`: the refusal it gets is about a model nobody
+        // connected, not about a stop — so the contrast in beat 3 is real.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        assert!(
+            matches!(
+                model_access::connected(&mut tx).await,
+                Err(NoModel::NotConnected)
+            ),
+            "a company with no window is a company nobody has stopped"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // -- 2. the window runs out, and the door stays open ------------------
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        agentos_store::halt::set_window(&mut tx, now - Duration::days(1), "operator:ops-a", now)
+            .await
+            .expect("set_window");
+        tx.commit().await.expect("commit");
+
+        let eighth = json!({
+            "domain": "agents.example.com",
+            "rows": [{
+                "team": "veille", "name": "Veille",
+                "mission": "Lire ce que le marché publie",
+                "head": "analyste", "title": "Analyste",
+            }],
+        });
+        let (status, hired) = h.apply(SECRET_A, eighth).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "an expired window must not refuse a hire that an operator's own halt allows: {hired}"
+        );
+        // Before anything is said about the seat being inert: prove there *is*
+        // a seat. An assertion about a hire that never happened would pass on
+        // an empty company and prove nothing at all.
+        assert_eq!(
+            hired["chart"][0]["hired"], true,
+            "this row matched somebody who already existed, so nothing below is about a \
+             hire: {hired}"
+        );
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let seats: i64 = sqlx::query_scalar("SELECT count(*) FROM employees WHERE slug = $1")
+            .bind("analyste")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        assert_eq!(seats, 1, "the hire this test is about was never written");
+
+        // -- 3. …and the company it was hired into may not take a turn --------
+        //
+        // `connected` is a question about the tenant, so this covers the seat
+        // just hired and every seat beside it: none of them is handed a model
+        // client while the window is shut. That is what makes beat 2 safe.
+        let Err(NoModel::CompanyHalted(reason)) = model_access::connected(&mut tx).await else {
+            panic!("a company whose window ran out must not be handed a model client");
+        };
+        assert!(
+            reason.contains("operating window"),
+            "and the sentence must say it was the clock and not a colleague: {reason}"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // -- 4. the emergency switch does not block a hire either -------------
+        //
+        // The comparison the decision rests on, against a database rather than
+        // against a reading of the routes.
+        let mut tx = h.db.tenant_tx(h.b).await.expect("tenant tx");
+        agentos_store::halt::place(&mut tx, "the CFO called", "operator:ops-b", now)
+            .await
+            .expect("place")
+            .expect("tenant b was running");
+        tx.commit().await.expect("commit");
+
+        let (status, under_halt) = h.apply(SECRET_B, seven_rows()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "an operator halt does not stop a hire, so a window must not be stricter than \
+             the switch: {under_halt}"
         );
 
         h.teardown().await;
