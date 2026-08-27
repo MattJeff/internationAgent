@@ -579,6 +579,20 @@ fn app(
             // customer's. See its module docs for why a refused key is a 200.
             .merge(routes::model::router(
                 db.clone(),
+                model.llm.clone(),
+                config.llm,
+                model.secrets.clone(),
+            ))
+            // Straight after it, and that is the entry journey's order: connect
+            // the model, then let it help finish the company. This is the first
+            // thing in the product that spends a *turn* on the tenant's own
+            // credential, and it does it as an ordinary `Turn` with the same
+            // gate and the same ports every other turn runs through — see its
+            // module docs on why there is no second way to call a model here.
+            .merge(routes::interview::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
                 model.llm,
                 config.llm,
                 model.secrets,
