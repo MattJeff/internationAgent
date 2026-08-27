@@ -13,6 +13,7 @@ pub mod identity;
 pub mod ids; // U1
 pub mod initiative;
 pub mod message; // U4
+pub mod model_access; // wave H: the tenant's own model, connected and proven
 pub mod money; // U2
 pub mod org; // wave 13: teams and sections
 pub mod phone_pool;

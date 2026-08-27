@@ -140,6 +140,19 @@ pub enum AuditKind {
     ProviderCallAttempted,
     SecretAccessed,
     PolicyChanged,
+    /// A tenant connected a model — their own API key, or this host's CLI —
+    /// and the verification call proved it. Written by
+    /// `agentos_app::model_access::connect`, in the transaction that stores the
+    /// row, so the trail cannot claim a connection the table does not have.
+    ///
+    /// Its own kind rather than [`AuditKind::SecretAccessed`], which is a
+    /// *read*: this is the one moment in the product where a customer's
+    /// credential enters the building, and the question somebody will ask of the
+    /// trail six months later — who pointed this company at whose bill, and when
+    /// — has no other row that answers it. The payload names the path and the
+    /// model that was proven, and never the credential; see that module's
+    /// `the_key_reaches_the_vault_and_appears_nowhere_else`.
+    ModelConnected,
 }
 
 impl AuditKind {
@@ -156,6 +169,7 @@ impl AuditKind {
             AuditKind::ProviderCallAttempted => "provider_call_attempted",
             AuditKind::SecretAccessed => "secret_accessed",
             AuditKind::PolicyChanged => "policy_changed",
+            AuditKind::ModelConnected => "model_connected",
         }
     }
 }

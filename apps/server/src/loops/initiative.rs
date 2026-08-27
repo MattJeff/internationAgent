@@ -149,6 +149,7 @@ use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
 use agentos_domain::ids::Slug;
+use agentos_domain::model_access::ModelAccess;
 use agentos_domain::policy::{EffectivePolicy, ModelId, model_for};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
@@ -213,6 +214,19 @@ pub struct Assignment {
     /// an [`Outcome`] decided there. Resolving it later would mean spending a
     /// reserved turn to discover it.
     pub model: ModelId,
+    /// **Whose credential this turn is billed to**, as it was proven.
+    ///
+    /// A different question from [`Assignment::model`] and answered by a
+    /// different table: that one is which model the operator *permits*, this is
+    /// which account the call is *charged to*. Resolved in [`assignment_for`]
+    /// for the same reason the model is — a tenant that has connected no model
+    /// takes no turn, so discovering it after the reservation would spend a
+    /// quarter of an employee's day on finding out.
+    ///
+    /// It does not name the model the turn runs: `model` above does, and
+    /// `agentos_domain::policy::model_for` is still the only thing that decides
+    /// it. See `agentos_domain::model_access::ModelAccess::model`.
+    pub access: ModelAccess,
     /// The one piece of work a sales charter does this turn, resolved here for
     /// exactly the reason [`Assignment::model`] is: **an empty answer is a
     /// reason not to start a turn.**
@@ -258,14 +272,21 @@ enum Outcome {
     NoCharter,
     /// The charter row will not parse back through its own constructors.
     Unreadable(String),
+    /// There is no model this employee may think with, for either of the two
+    /// reasons there are.
+    ///
     /// Platform ∧ tenant ∧ role ∧ employee intersected `allowed_models` to the
-    /// empty set, so there is no model this employee may think with.
+    /// empty set — nobody *permitted* a model — or this tenant has connected
+    /// none at all, so there is no credential to bill and we never provide one.
+    /// One code for both, because the operator's next move is the same shape in
+    /// both cases (write something down, once) and the sentence in
+    /// `last_outcome_detail` says which.
     ///
     /// **Its own code, not `Failed`.** The two are indistinguishable to the
     /// loop and completely different to the operator reading the column: this
-    /// one is a policy they wrote, it will produce the identical result on
-    /// every cadence until they change it, and no amount of retrying or
-    /// provider-status-checking will move it.
+    /// one is something they wrote or did not write, it will produce the
+    /// identical result on every cadence until they change it, and no amount of
+    /// retrying or provider-status-checking will move it.
     NoModel(String),
     /// The objective has gaps. Ask the operator, and start no turn.
     Clarify(String),
@@ -622,7 +643,17 @@ async fn assignment_for(
                 None
             }
         };
-        Ok((employee.employee, charter, colleagues, policy))
+        // And whose credential a turn would be billed to. One row by primary
+        // key, in the same read as everything else, and it is here rather than
+        // in `take_turn` for the reason `Assignment::access` states: an
+        // unconnected tenant must not spend a reserved turn discovering that it
+        // has no model. `model_access::connected` is the *row*; turning it into
+        // a client needs the host backend and the vault, which only the agent
+        // has, so that half happens in `take_turn`.
+        let access = agentos_app::model_access::connected(&mut tx)
+            .await
+            .map_err(|err| Outcome::NoModel(err.to_string()))?;
+        Ok((employee.employee, charter, colleagues, policy, access))
     }
     .await;
 
@@ -630,7 +661,7 @@ async fn assignment_for(
     // is awaited rather than dropped so a pooled connection is handed back
     // deliberately.
     let _ = tx.rollback().await;
-    let (employee, charter, colleagues, policy) = read?;
+    let (employee, charter, colleagues, policy, access) = read?;
 
     let Some(charter) = charter else {
         return Ok(None);
@@ -707,6 +738,7 @@ async fn assignment_for(
         colleagues,
         policy,
         model,
+        access,
         sales,
     }))
 }
@@ -807,9 +839,36 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         colleagues,
         policy,
         model,
+        access,
         sales,
     } = assignment;
     let role = charter.role();
+
+    // The tenant's own model, as a client. `assignment_for` already refused a
+    // tenant that has connected none — this is the other half, which needs the
+    // vault and the host backend and therefore needs the agent.
+    //
+    // The two failures left are misconfigurations of a connection that exists: a
+    // credential the vault no longer has, and a host whose `AGENTOS_LLM` became
+    // an API key of ours after the tenant connected to it. Both record as
+    // `error` rather than `no_model`, and that is a known rough edge rather than
+    // a judgement — `handle` maps every `Err` from here to `Outcome::Failed`,
+    // and giving it a second code would mean threading `LlmBackend` through
+    // `drain`, `tick` and `handle`, which are generic over the turn-taker
+    // precisely so they can be tested without an `Agent`. The operator still
+    // gets the whole sentence in `last_outcome_detail`, and both sentences name
+    // the remedy.
+    let llm = agentos_app::model_access::llm_for(
+        due.tenant_id,
+        access,
+        agent.secrets.as_ref(),
+        &agent.llm,
+        agent.backend,
+        // `None` is the real API. See `agentos_app::model_access::ApiBase`.
+        None,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
 
     // Cloned before `Effects` takes it: the token ledger below needs a
     // connection of its own, because unlike `Agent::on_turn` there is no
@@ -876,7 +935,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     .with_colleagues(colleagues);
 
     let turn = Turn::new(
-        agent.llm,
+        llm,
         agent.gate,
         effects,
         principal,
@@ -1376,7 +1435,37 @@ pub(crate) mod tests {
 
         tx.commit().await.expect("commit");
         turn_budget(db, tenant, 100).await;
+        connect_model(db, tenant).await;
         tenant
+    }
+
+    /// Point this tenant at the host's own model.
+    ///
+    /// **Every fixture that takes a turn needs one now.** After
+    /// `migrations/0041_tenant_model_access.sql` a tenant with no connection is
+    /// a tenant whose employees take no turn at all — `assignment_for` records
+    /// `no_model` and stops before the reservation. `ModelPath::Cli` means "the
+    /// model this host already has", and on a test host that is `agent.llm`,
+    /// i.e. whatever the test scripted.
+    ///
+    /// It sits beside `turn_budget` for the same reason that one exists: both
+    /// are fail-closed defaults doing their job, and a fixture that wants a turn
+    /// has to ask for one out loud.
+    async fn connect_model(db: &Db, tenant: TenantId) {
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &ModelAccess {
+                path: agentos_domain::model_access::ModelPath::Cli,
+                model: ModelId::Opus5,
+                verified_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("connect the model");
+        tx.commit().await.expect("commit the connection");
     }
 
     /// This tenant's turn budget, as a `tenant` policy layer.
@@ -1830,6 +1919,8 @@ pub(crate) mod tests {
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(ScriptedLlm::responses(script)),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            secrets: agentos_app::mocks::secret_store(),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
@@ -2063,6 +2154,8 @@ pub(crate) mod tests {
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::scripted_mock()),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            secrets: agentos_app::mocks::secret_store(),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             // No binder loop here, so every tenant's fleet is empty and every
@@ -2169,6 +2262,8 @@ pub(crate) mod tests {
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(ScriptedLlm::new(Vec::new())),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            secrets: agentos_app::mocks::secret_store(),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
@@ -2424,6 +2519,8 @@ pub(crate) mod tests {
             Agent {
                 db: db.clone(),
                 llm: Arc::new(agentos_app::mocks::scripted_mock()),
+                backend: agentos_app::mocks::LlmBackend::Mock,
+                secrets: agentos_app::mocks::secret_store(),
                 gate: PolicyGate::new(db.clone()),
                 ports: Arc::new(ports),
                 // No binder loop, so the fleet is empty and the Orizn lookup is

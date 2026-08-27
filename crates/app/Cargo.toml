@@ -60,6 +60,13 @@ live-orizn = []
 
 [dev-dependencies]
 trybuild.workspace = true
+# Tests only, and for one test: `model_access` must prove a customer's API key
+# reaches no log line. The only honest way to ask that is to install a
+# subscriber, render what `tracing` actually emits, and search the bytes — an
+# assertion about the *absence* of a string in a buffer nothing wrote to is an
+# assertion about nothing, so the same test also proves the log happened.
+# Already in the lock via apps/server.
+tracing-subscriber.workspace = true
 # `test-util` only, and only here: `mcp::CALL_TIMEOUT` is sixty seconds, and the
 # test that a quiet server is abandoned rather than waited on has to run those
 # sixty seconds on a virtual clock or not at all. tokio's `full` does not include

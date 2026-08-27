@@ -240,7 +240,39 @@ impl Server {
             reaped: false,
         };
         server.wait_until_live();
+        server.connect_the_model();
         Some(server)
+    }
+
+    /// Connect this tenant's model, over the real route, before anything asks
+    /// for a turn.
+    ///
+    /// **Not a fixture shortcut — the product's own first step.** After
+    /// `migrations/0041_tenant_model_access.sql` a tenant that has connected no
+    /// model takes no turn at all, and this harness is the only place in the
+    /// workspace where that step happens the way a customer does it: an HTTP
+    /// request to the running binary, answered by the real handler, proved by a
+    /// real `Llm::complete`.
+    ///
+    /// `cli` rather than `api_key`, because these tests must never carry a
+    /// credential and must never call a paid API. On this deployment
+    /// `AGENTOS_LLM` is the scripted mock or the fake `claude` script the tests
+    /// install, so "the model this host has" is exactly what the test scripted —
+    /// and `pays_with_our_key()` is false for both, which is what makes the path
+    /// legal here at all.
+    fn connect_the_model(&self) {
+        let (status, body) = self.post("/v1/model", Some(SECRET), r#"{"path":"cli"}"#);
+        assert_eq!(status, 200, "connecting the model: {body}");
+        assert_eq!(body["connected"], true, "{body}");
+        assert_eq!(body["verdict"], "connected", "{body}");
+        assert_eq!(body["access"]["path"], "cli", "{body}");
+        // The response carries the proof and nothing else — no credential, and
+        // on this path there was not one to leak.
+        assert!(body["access"].get("api_key").is_none(), "{body}");
+
+        let (status, connected) = self.get("/v1/model", Some(SECRET));
+        assert_eq!(status, 200, "{connected}");
+        assert_eq!(connected["path"], "cli", "{connected}");
     }
 
     /// Block until `/livez` answers, or give up and say so.

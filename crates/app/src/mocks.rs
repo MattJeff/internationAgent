@@ -87,6 +87,12 @@ pub use agentos_providers::browser::MockBrowser;
 // platform — which is the only thing those tests are about.
 pub use agentos_providers::leads::MockLeadSink;
 
+// And the vault, for the fourth time and the same reason: `routes::model` puts
+// a customer's API key into it and `Agent::on_turn` takes it back out, both in
+// the binary, which may not name `agentos-providers`. Only the trait — the
+// concrete stores stay behind `secret_store`, so the binary cannot pick one.
+pub use agentos_providers::secrets::SecretStore;
+
 /// The signing secret the mock telephony adapter verifies callbacks against.
 /// Fixed and public, because a fake secret that has to be configured is a fake
 /// secret that stops a development box from booting.
@@ -217,7 +223,23 @@ fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
 /// The vault (`secrets`) is still a plaintext map, and that is still fine: it
 /// holds a provisioning canary and nothing else in a mock deployment.
 pub fn adapters(master_key: &str) -> Adapters {
-    adapters_for(master_key, &Credentials::default())
+    adapters_for(master_key, &Credentials::default(), secret_store())
+}
+
+/// The vault this deployment stores credentials in.
+///
+/// Its own constructor, and the binary calls it *once*, because the store is now
+/// shared by two readers that must see the same map: `Step::Identity`'s
+/// provisioning canary through [`Adapters::secrets`], and
+/// [`crate::model_access`]'s tenant model key through `POST /v1/model` and every
+/// turn after it. Two `MemorySecretStore::new()` calls would give a deployment
+/// two vaults, and the symptom would be a tenant that connects a key and then
+/// cannot take a turn with it — a bug with no error message anywhere.
+///
+/// Still in memory, still named a permanent mock by `Config::adapter_summary`.
+/// The day it is KMS this signature does not change.
+pub fn secret_store() -> Arc<dyn SecretStore> {
+    Arc::new(MemorySecretStore::new())
 }
 
 /// The adapters this deployment's credentials actually select.
@@ -225,12 +247,19 @@ pub fn adapters(master_key: &str) -> Adapters {
 /// Real client per `Some` field, mock per `None`. Every other field is what
 /// [`adapters`] always gave: `secrets` is still a plaintext map, and `envelope`
 /// is still real crypto over the deployment's own master key.
-pub fn adapters_for(master_key: &str, credentials: &Credentials) -> Adapters {
+pub fn adapters_for(
+    master_key: &str,
+    credentials: &Credentials,
+    secrets: Arc<dyn SecretStore>,
+) -> Adapters {
     Adapters {
         email: email_provider(credentials),
         telephony: telephony_provider(credentials),
         browser: browser_provider(credentials),
-        secrets: Arc::new(MemorySecretStore::new()),
+        // Passed in rather than built here: see `secret_store`. One deployment,
+        // one vault, or a connected model key is invisible to the turn that
+        // needs it.
+        secrets,
         envelope: crate::identity::envelope(master_key),
     }
 }
@@ -333,6 +362,24 @@ impl LlmBackend {
             Self::Anthropic => Some(Self::API_KEY_VAR),
             Self::Mock | Self::Cli => None,
         }
+    }
+
+    /// Does a model call on this backend land on a bill **we** pay?
+    ///
+    /// The founder's rule — we never provide the model — turned into one
+    /// branch. `crate::model_access` reads it at both ends: a tenant may not
+    /// *connect* to a host whose own model is a key of ours, and a tenant
+    /// already connected that way stops taking turns the moment `AGENTOS_LLM`
+    /// becomes one. [`Self::Mock`] costs nothing and [`Self::Cli`] spends
+    /// whoever is logged in on the box, so neither is a bill of ours; only a key
+    /// this process holds is.
+    ///
+    /// Deliberately **not** `!mock_label().is_some()`, which is the same
+    /// partition today and answers a different question — that one is "should
+    /// the boot warn about this", and the day a fourth backend arrives the two
+    /// answers part company.
+    pub const fn pays_with_our_key(self) -> bool {
+        matches!(self, Self::Anthropic)
     }
 
     /// How this backend shows up in the "these adapters are not real" warning,
