@@ -2659,6 +2659,14 @@ pub async fn selling_turn(
             prospect.contact_id,
             now,
             Some(now + crate::revenue::FOLLOW_UP_AFTER),
+            // The same ceiling the selection filters on, now carried by the
+            // write. It cannot catch *this* path's own race — two workers both
+            // approaching somebody at `touch_count = 0` both pass `0 < 3` — and
+            // the thing that would is a claim before the send, which is
+            // `chasing_turn`'s shape and is not this unit. What it does catch is
+            // a first approach landing on somebody a chase has already
+            // exhausted.
+            crate::revenue::MAX_TOUCHES as i32,
         )
         .await;
         match marked {
@@ -3057,17 +3065,43 @@ impl Chased {
 /// [`chase_message`] asserts nothing that would need any of them. What is left
 /// is the send and the mark.
 ///
-/// The mark is the same shape and the same order as [`selling_turn`]'s — it
-/// commits on its own, after the send, and its failure is **returned** rather
-/// than swallowed. The trade is the same one: the email has gone, and an
-/// unmarked contact is one this employee chases again on the next cadence with
-/// its `touch_count` still short. Loud beats convenient when the quiet version
-/// mails a stranger twice.
+/// # The mark comes first, and it is a claim rather than a receipt
+///
+/// It used to come after the send, on the argument that an unmarked contact is
+/// only chased again next cadence with its `touch_count` still short — "loud
+/// beats convenient when the quiet version mails a stranger twice". The
+/// priority in that sentence is right and the order did not serve it.
+/// [`due_chase`] reads through
+/// `loops::initiative::sales_work_for`, which **rolls its transaction back
+/// before this function is called**, and
+/// [`contacts_due_for_follow_up`](agentos_store::revenue::contacts_due_for_follow_up)
+/// takes no lock — so the selection is a suggestion, not a claim, and two
+/// replicas holding the same suggestion both reached the send. Sending first
+/// and asking the ledger afterwards means the ledger's answer arrives one email
+/// too late; there is no answer it can give that un-sends anything.
+///
+/// So: mark, commit, then send. The `UPDATE`
+/// carries [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES) in its own `WHERE`, so
+/// the second worker's claim matches no row, this returns the error, and no
+/// second email is built. This is
+/// [`agentos_store::outbox::claim_of`]'s trade taken again for the same reason
+/// it was taken there — `attempt_count` is incremented at claim time, "so a
+/// worker that is killed mid-handler still burns an attempt". What it costs is
+/// the mirror image: a provider that fails after the claim burns a touch on an
+/// email that never went out, and that prospect gets two chases instead of
+/// three. Over-counting shortens a sequence; under-counting mails a stranger a
+/// fourth time. Only one of those is a person's inbox.
+///
+/// The failure is still **returned** rather than swallowed, and the refusal is
+/// now the ordinary case rather than a database fault: `NotFound` here means
+/// another worker has this person, and `loops::initiative::chasing_step` spends
+/// the turn on something else.
 ///
 /// The sequence is rebuilt fresh here and is not the thing that meters anything.
 /// `next_follow_up_at` is the spacing and `touch_count` is the limit, both read
-/// in [`due_chase`], both off columns that survive a restart — which is the
-/// whole reason `0036_contact_touches.sql` exists.
+/// in [`due_chase`] and now both re-asserted by the write — off columns that
+/// survive a restart, which is the whole reason `0036_contact_touches.sql`
+/// exists.
 pub async fn chasing_turn(
     db: &Db,
     seller: &Seller,
@@ -3075,6 +3109,57 @@ pub async fn chasing_turn(
     chase: &DueChase,
     now: DateTime<Utc>,
 ) -> Result<Chased, revenue_store::RevenueError> {
+    // The claim, committed before a byte leaves. Its own short transaction: the
+    // send that follows is the internet, and a pooled connection held across it
+    // is a connection held across somebody else's SMTP timeout.
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    match revenue_store::mark_contacted(
+        &mut tx,
+        chase.contact_id,
+        now,
+        Some(now + crate::revenue::FOLLOW_UP_AFTER),
+        crate::revenue::MAX_TOUCHES as i32,
+    )
+    .await
+    {
+        Ok(()) => tx.commit().await?,
+        Err(err) => {
+            // **Which guard refused, because they are not the same event.**
+            // The claim has two: `active`, and the touch ceiling. An opt-out is
+            // a fact about a person and the employee is owed the word for it —
+            // that is what `Contacted::Suppressed` is — where a ceiling refusal
+            // is a fact about the fleet and belongs in a log line.
+            //
+            // `contacts.active` has exactly one writer in the whole schema,
+            // `suppressions_deactivate_contacts` in `0011_revenue.sql`, so an
+            // inactive row **is** an opt-out and this needs no second table.
+            // `mark_contacted` refused on a row count rather than an error, so
+            // the transaction is still usable for the question.
+            //
+            // The shape is `store::approvals::redeem`'s and so is the reason:
+            // one guarded write, and a second read run **only** where it
+            // matched nothing, to say why.
+            let opted_out: Option<bool> =
+                sqlx::query_scalar("SELECT NOT active FROM contacts WHERE id = $1")
+                    .bind(chase.contact_id)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(StoreError::from)?;
+            let _ = tx.rollback().await;
+            if opted_out == Some(true) {
+                return Ok(Chased {
+                    // Nothing was claimed and nothing was sent, so the count is
+                    // the one the caller arrived with.
+                    touches: chase.touches,
+                    outcome: crate::revenue::Contacted::Suppressed {
+                        to: chase.to.clone(),
+                    },
+                });
+            }
+            return Err(err);
+        }
+    }
+
     let mut sequence = Sequence::new(chase.to.clone());
 
     // Untrusted, exactly as `sell`'s approach is. The bytes are entirely ours —
@@ -3091,31 +3176,11 @@ pub async fn chasing_turn(
         )
         .await;
 
-    if outcome.is_sent() {
-        let mut tx = db.tenant_tx(principal.tenant_id).await?;
-        // The next window is primed unconditionally, because the *limit* is not
-        // this column's job: `due_chase` filters on `touch_count`, so the touch
-        // this write counts is what takes an exhausted contact out of the queue.
-        // One rule, in one place, read by the selection rather than re-derived
-        // by every writer.
-        match revenue_store::mark_contacted(
-            &mut tx,
-            chase.contact_id,
-            now,
-            Some(now + crate::revenue::FOLLOW_UP_AFTER),
-        )
-        .await
-        {
-            Ok(()) => tx.commit().await?,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
-        }
-    }
-
     Ok(Chased {
-        touches: chase.touches + i32::from(outcome.is_sent()),
+        // The claim went through, so the touch is spent whatever the provider
+        // did with it — that is what claiming before sending means, and
+        // reporting the column's value is the only honest number here.
+        touches: chase.touches + 1,
         outcome,
     })
 }
@@ -6579,9 +6644,15 @@ mod tests {
         // Describe it, and write to them instead.
         seed_flow(&db, &desk.principal, account).await;
         let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
-        revenue_store::mark_contacted(&mut tx, contact, now - TimeDelta::hours(1), None)
-            .await
-            .expect("mark");
+        revenue_store::mark_contacted(
+            &mut tx,
+            contact,
+            now - TimeDelta::hours(1),
+            None,
+            crate::revenue::MAX_TOUCHES as i32,
+        )
+        .await
+        .expect("mark");
         tx.commit().await.expect("commit");
 
         assert!(
@@ -6887,6 +6958,84 @@ mod tests {
         }
         .note();
         assert!(note.contains("last touch"), "{note}");
+    }
+
+    /// **Two workers that read the same chase must not both send it.**
+    ///
+    /// The sibling above proves the limit bites *in the selection*, and that is
+    /// exactly what this one is about: a selection is not a claim. Nothing about
+    /// this is arranged. `loops::initiative::sales_work_for` reads the queue in a
+    /// transaction it **rolls back** before the send, and
+    /// `contacts_due_for_follow_up` takes no lock — so two replicas (a supported
+    /// configuration; `loops::initiative::run` says so) reading before either has
+    /// written both get the same row, and that is all this reproduces: two reads,
+    /// then two turns, in that order, with no threads and no timing.
+    ///
+    /// The counter is the honest witness. `MAX_TOUCHES` is three; before the
+    /// write carried the ceiling this ended with `touch_count = 4` and a fourth
+    /// email in a stranger's inbox, because [`chasing_turn`] sent first and asked
+    /// the ledger afterwards — and the ledger's `UPDATE` said only `active`.
+    ///
+    /// [`crate::revenue::Sequence`] cannot catch it either: it is rebuilt from
+    /// nothing every turn, which is the whole reason `0036_contact_touches.sql`
+    /// put the counter on the row.
+    #[tokio::test]
+    async fn two_workers_reading_one_chase_do_not_both_send_it() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact, _) = approached(&db, &desk, now).await;
+
+        // Touch two, on its own cadence, so the row sits one below the ceiling.
+        let day_three = now + TimeDelta::days(3);
+        let chase = next_chase(&db, &desk.principal, day_three)
+            .await
+            .expect("touch two is due");
+        chasing_turn(&db, &desk.seller, &desk.principal, &chase, day_three)
+            .await
+            .expect("the chase reached an outcome");
+        assert_eq!(touch_state(&db, &desk.principal, contact).await.0, 2);
+
+        // Day six. Both workers read before either writes — the read is rolled
+        // back, so there is nothing for the second to wait on.
+        let day_six = now + TimeDelta::days(6);
+        let first = next_chase(&db, &desk.principal, day_six)
+            .await
+            .expect("touch three is due");
+        let second = next_chase(&db, &desk.principal, day_six)
+            .await
+            .expect("and the queue offers it again, having been asked and not claimed");
+        assert_eq!(
+            first.contact_id, second.contact_id,
+            "the two reads have to be the same person or this proves nothing"
+        );
+
+        chasing_turn(&db, &desk.seller, &desk.principal, &first, day_six)
+            .await
+            .expect("the third touch is inside the limit");
+        let refused = chasing_turn(&db, &desk.seller, &desk.principal, &second, day_six).await;
+
+        assert!(
+            refused.is_err(),
+            "the fourth touch was allowed: {refused:?}"
+        );
+        let (touches, _) = touch_state(&db, &desk.principal, contact).await;
+        assert_eq!(
+            touches,
+            crate::revenue::MAX_TOUCHES as i32,
+            "the counter went past the ceiling the selection filters on"
+        );
+        assert_eq!(
+            desk.email.sent_count(),
+            crate::revenue::MAX_TOUCHES,
+            "a prospect who ignored three emails got a fourth"
+        );
     }
 
     /// **A reply stops the sequence**, through the only door inbound mail has.

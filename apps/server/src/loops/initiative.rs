@@ -1440,9 +1440,11 @@ async fn chasing_step(
             Some(chased.note())
         }
         // Logged and swallowed, exactly as the other two verticals are. The mark
-        // is the only thing that can fail here and it fails *after* the send, so
-        // the cost is one duplicate chase on the next cadence — not a reason to
-        // spend the reserved turn on nothing.
+        // is the only thing that can fail here and it now fails *before* the
+        // send — `chasing_turn` claims the touch and commits it first — so the
+        // ordinary reason to be here is that another replica holds this person,
+        // and the cost is nothing at all: no email, no touch spent. The employee
+        // takes an ordinary turn instead.
         Err(err) => {
             tracing::error!(
                 error = %err,

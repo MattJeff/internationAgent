@@ -1011,21 +1011,51 @@ pub async fn stop_follow_up(tx: &mut TenantTx<'_>, email: &str) -> Result<u64, R
 /// instead would be three counters and a fourth caller that forgets — and the
 /// one that forgets is the one that mails a stranger a fourth time. See
 /// `0036_contact_touches.sql`.
+///
+/// # `max_touches` is in the `WHERE`, and it is the whole point of the argument
+///
+/// The ceiling used to live only in the *selection* —
+/// [`contacts_due_for_follow_up`]'s `touch_count < $4` — and
+/// `app::vertical::chasing_turn` said so out loud: "the *limit* is not this
+/// column's job … one rule, in one place, read by the selection rather than
+/// re-derived by every writer". One rule in one place is right; the place was
+/// wrong. That selection is a plain `SELECT` in a transaction
+/// `loops::initiative::sales_work_for` **rolls back before the send**, so
+/// nothing is held and nothing is claimed. Two replicas — a supported
+/// configuration — read the same row at `touch_count = 2`, both pass `2 < 3`,
+/// both send, and both run an `UPDATE` whose only guard was `active`.
+/// Reproduced with no threads and no timing in
+/// `app::vertical::tests::two_workers_reading_one_chase_do_not_both_send_it`:
+/// two reads, two turns, `touch_count = 4` and a fourth email to somebody who
+/// ignored three.
+///
+/// So the ceiling travels with the write. The caller still owns the number, for
+/// the reason [`contacts_due_for_follow_up`] already gives — `MAX_TOUCHES` lives
+/// in `agentos_app::revenue` beside the `Sequence` enforcing the same rule in
+/// memory, and two copies of a limit is how the two come to disagree — and it is
+/// the *same* number both ends of the pair are handed, which is what makes
+/// "selected, therefore writable" true again.
+///
+/// A refusal is `NotFound`, the same answer as an inactive contact, because the
+/// caller does the same thing with both: it did not happen, and nobody should
+/// report that it did.
 pub async fn mark_contacted(
     tx: &mut TenantTx<'_>,
     contact_id: Uuid,
     contacted_at: DateTime<Utc>,
     next_follow_up_at: Option<DateTime<Utc>>,
+    max_touches: i32,
 ) -> Result<(), RevenueError> {
     let affected = sqlx::query(
         "UPDATE contacts \
             SET last_contacted_at = $2, next_follow_up_at = $3, \
                 touch_count = touch_count + 1, updated_at = now() \
-          WHERE id = $1 AND active",
+          WHERE id = $1 AND active AND touch_count < $4",
     )
     .bind(contact_id)
     .bind(contacted_at)
     .bind(next_follow_up_at)
+    .bind(max_touches)
     .execute(&mut ***tx)
     .await?
     .rows_affected();
@@ -2766,9 +2796,17 @@ mod tests {
             .await
             .expect("due");
         assert_eq!(due.len(), 1, "seeded three days out");
-        mark_contacted(&mut tx, graph.contact, now, Some(now + TimeDelta::days(7)))
-            .await
-            .expect("chase");
+        // Three, the same ceiling the selection above filters on. The store
+        // deliberately owns neither end — see `contacts_due_for_follow_up`.
+        mark_contacted(
+            &mut tx,
+            graph.contact,
+            now,
+            Some(now + TimeDelta::days(7)),
+            3,
+        )
+        .await
+        .expect("chase");
         assert!(
             contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10, 0..3)
                 .await
@@ -2816,7 +2854,7 @@ mod tests {
         );
         // Nor can they be chased directly: an inactive contact is not there to
         // be marked as contacted.
-        let err = mark_contacted(&mut tx, graph.contact, now, Some(now))
+        let err = mark_contacted(&mut tx, graph.contact, now, Some(now), 3)
             .await
             .expect_err("a suppressed contact cannot be chased");
         assert!(matches!(err, RevenueError::Store(StoreError::NotFound)));
