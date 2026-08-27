@@ -1910,9 +1910,15 @@ An employee can, today:
   a JWKS
 - ✅ send and receive email — the pipeline is complete end to end and
   `EMAIL_API_KEY` selects the real Resend client
-- ✅ obtain a phone number or expose a correct pending-compliance state —
-  `TELEPHONY_API_KEY` selects the real Twilio client; the pool and the routing
-  rules were already real
+- ⏸️ obtain a phone number — the machinery is real and **switched off**.
+  `TELEPHONY_API_KEY` selects the real Twilio client, acquisition and the
+  pending-compliance state and the pool and the routing rules all work, and
+  `EngineConfig::provision_phone` ships `false` so none of it runs: nothing in
+  this build can send or receive on a number (no `sms_send` or `call_place` in
+  `turn::catalogue`, and the ceiling grants neither `sms` nor `voice`), so
+  `Step::Phone` settles as `NotWired` in `disabled` rather than starting a
+  monthly bill per employee. Turning it on is a code change, and a test pins the
+  switch to the catalogue in both directions
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
 - ❌ place or receive voice calls — **NOT BUILT**
 - ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
@@ -1947,7 +1953,8 @@ An employee can, today:
 6. ✅ MCP
 7. ✅ A2A
 8. ✅ Browser *(Browserbase + CDP, selected by `BROWSER_API_KEY`)*
-9. ✅ Phone *(Twilio, selected by `TELEPHONY_API_KEY`; pool built)* / ❌ voice
+9. ⏸️ Phone *(Twilio + pool built and switched off: `EngineConfig::provision_phone`
+   ships `false`, because no tool can use a number)* / ❌ voice
 10. ❌ WhatsApp
 11. ❌ Wallet + x402
 12. ❌ MPP

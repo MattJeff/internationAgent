@@ -751,6 +751,13 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on("employee.step.ready", Arc::new(on_step_ready))
         .on("employee.step.pending_external", Arc::new(on_step_noted))
         .on("employee.step.failed", Arc::new(on_step_noted))
+        // Registered, and that is not a formality: `handle` fails an event with
+        // no handler, retries it eight times and then dead-letters it with an
+        // error reading "this side effect will not happen". A step that settles
+        // as `disabled` would produce one such event per employee per hire, so
+        // the *absence* of this line is a permanent error stream about a
+        // decision that is working exactly as designed.
+        .on("employee.step.disabled", Arc::new(on_step_disabled))
         .on(
             agentos_app::inbound::TURN_EVENT,
             Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
@@ -919,6 +926,34 @@ fn on_step_noted<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handl
             step,
             state,
             "a provisioning step did not reach ready"
+        );
+        Ok(())
+    })
+}
+
+/// `employee.step.disabled`: a capability that is off on purpose.
+///
+/// **A separate handler from [`on_step_noted`] because of the log level**, and
+/// the level is the deliverable. That one warns "a provisioning step did not
+/// reach ready", which is right for a failed step and for a bundle stuck in
+/// review, and wrong for `Step::Phone` on a build where nothing can dial: the
+/// step reached exactly the state it was meant to reach. Warning about it would
+/// put a line in every operator's log on every hire, for a decision that saved
+/// them money — and a warning that is always there is a warning nobody reads
+/// when it finally means something.
+///
+/// The reason travels in the payload's `error` field, which is the resource
+/// row's only text column and therefore where `finish_step` puts it. It is a
+/// reason rather than an error here, and the message says so.
+fn on_step_disabled<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let step = field(event, "step");
+        let reason = field(event, "error");
+        tracing::info!(
+            employee_id = %event.aggregate_id,
+            step,
+            reason,
+            "a provisioning step is off on purpose; nothing was bought for it"
         );
         Ok(())
     })
@@ -3390,6 +3425,121 @@ mod tests {
             "these resources are still bound, so still billed: {still_bound:?}"
         );
         assert_eq!(stored.employee.lifecycle(), Lifecycle::Terminated);
+
+        drop_database(db, admin_url, database).await;
+    }
+
+    /// **A step that is off on purpose has a handler**, so the saving does not
+    /// arrive as an error stream.
+    ///
+    /// `StepOutcome::Disabled` emits `employee.step.disabled`, and
+    /// `loops::outbox::handle` *fails* an event whose type is not in the table
+    /// [`handlers`] builds — eight retries, then a dead letter logged at error
+    /// as "this side effect will not happen". `Step::Phone` settles that way for
+    /// every employee on the shipped configuration, so a missing registration
+    /// would turn "we stopped buying numbers nobody can use" into a permanent
+    /// per-hire alarm, which is how a correct decision gets reverted by whoever
+    /// is on call.
+    ///
+    /// Through the real table and the real poller, because the bug is the
+    /// registration and a hand-called handler cannot see it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_that_is_off_on_purpose_has_a_handler_and_is_not_dead_lettered() {
+        use agentos_store::outbox::{self, NewEvent};
+
+        let Some((db, admin_url, database)) = own_database("disabled").await else {
+            return;
+        };
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::from_uuid(Uuid::now_v7());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("dis-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        // The event `store::provisioning::finish_step` writes for this outcome,
+        // payload and all — `error` carries the reason, because the resource
+        // row has one text column and that is it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        outbox::enqueue(
+            &mut tx,
+            &NewEvent {
+                payload: json!({
+                    "step": "phone",
+                    "state": "disabled",
+                    "error": "nothing in this build can send or receive on a phone number",
+                }),
+                ..NewEvent::new(
+                    routes::employees::AGGREGATE,
+                    employee_id.as_uuid(),
+                    "employee.step.disabled",
+                )
+            },
+            now,
+        )
+        .await
+        .expect("enqueue");
+        tx.commit().await.expect("commit the event");
+
+        let cancel = CancellationToken::new();
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            agentos_app::mocks::adapters("disabled-test-master-key"),
+            EngineConfig::default(),
+        );
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: Fleets::new().0,
+            cancel: cancel.clone(),
+        };
+        let poller = tokio::spawn(loops::outbox::run(
+            db.clone(),
+            handlers(&test_config(tenant), agent, engine),
+            cancel.clone(),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let (published, last_error): (i64, Option<String>) = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE published_at IS NOT NULL), max(last_error) \
+                   FROM outbox_events",
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+            tx.rollback().await.expect("rollback");
+
+            assert!(
+                !last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no handler"),
+                "`employee.step.disabled` is not in the dispatch table, so every employee's \
+                 phone step will retry eight times and dead-letter: {last_error:?}"
+            );
+            if published == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the disabled event was never handled: {last_error:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        poller.await.expect("the poller task");
 
         drop_database(db, admin_url, database).await;
     }

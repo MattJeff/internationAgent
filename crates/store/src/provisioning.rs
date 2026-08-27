@@ -349,6 +349,40 @@ pub enum StepOutcome {
         /// What went wrong, for the operator reading the row.
         error: String,
     },
+    /// **Nothing was provisioned, because nothing could use it.** Not a
+    /// success, not a failure, and — the whole point — not a purchase.
+    ///
+    /// A capability can be built into this workspace at the provider end and
+    /// wired to nothing at the product end: `Step::Phone` bought a number every
+    /// employee was billed for monthly while no tool in `turn::catalogue` could
+    /// send or receive on it. Reporting that as [`Self::Ready`] bills for a lie;
+    /// reporting it as [`Self::Failed`] makes every employee in every deployment
+    /// `Health::Degraded` forever over a channel nobody asked for. It is a third
+    /// thing and it needed a third word.
+    ///
+    /// Lands the resource in [`ResourceState::Disabled`], which
+    /// `Employee::resource_health` already reads as "off on purpose" — the one
+    /// state that neither degrades an employee nor claims a resource exists.
+    ///
+    /// # The binding is kept, exactly like [`Self::Failed`]
+    ///
+    /// This arm acquires no binding and clears none: the `coalesce` in
+    /// [`finish_step`] leaves whatever was already bought exactly where it is,
+    /// because the resource would still be real, still billed, and the external
+    /// id is the only thing that says what to cancel.
+    ///
+    /// `ProvisioningEngine` never actually reaches that case — a step holding a
+    /// binding is `Ready`, and `ensure_step` returns on `Ready` before it gets
+    /// here, deliberately, so that a build which forgets how to *use* a resource
+    /// cannot rewrite the record of having *bought* one. The property is stated
+    /// as a fact about this function rather than about the engine, and no test
+    /// exercises it, because no caller in this workspace can produce it.
+    Disabled {
+        /// Why nothing was provisioned, for the operator reading the row.
+        /// Lands in `last_error` — the only text column on the row — so it is
+        /// what `GET /v1/inventory/stranded` renders as `reason`.
+        reason: String,
+    },
 }
 
 /// Write the result of a step: resource state, provider binding, intent
@@ -402,6 +436,17 @@ pub async fn finish_step(
             None,
             Some(error.as_str()),
         ),
+        // No binding, for the same reason `Failed` has none: this arm never
+        // *acquires* one. It does not clear one either — `coalesce` below keeps
+        // whatever was already bought, which is what the operator has to go and
+        // cancel.
+        StepOutcome::Disabled { reason } => (
+            ResourceState::Disabled.as_str(),
+            None,
+            None,
+            None,
+            Some(reason.as_str()),
+        ),
     };
     let provider = binding.map(ProviderBinding::provider);
     let external_id = binding.map(ProviderBinding::external_id);
@@ -439,6 +484,15 @@ pub async fn finish_step(
         // did happen and returned. It is the resource that is still waiting.
         StepOutcome::Ready { .. } | StepOutcome::PendingExternal { .. } => IntentState::Succeeded,
         StepOutcome::Failed { .. } => IntentState::Failed,
+        // There is normally **no intent row at all** for this outcome:
+        // `ProvisioningEngine::claim` skips `begin_intent` for a step it is
+        // about to disable, because a write-ahead entry for a call that will
+        // not happen is what makes the recovery sweep file a reconciliation
+        // approval about a purchase nobody made. The UPDATE below therefore
+        // matches nothing, and this value is what it would be if some other
+        // caller ever did leave one: never `Succeeded`, because no resource
+        // came of it.
+        StepOutcome::Disabled { .. } => IntentState::Failed,
     };
     sqlx::query(
         "UPDATE provider_intents \

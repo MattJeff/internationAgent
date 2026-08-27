@@ -1252,8 +1252,35 @@ that returns a plausible payment id is a fake that will one day be believed.
 non-blocking, so the employee still reaches `active`, but its `health` never
 reaches `online`; `degraded` is the healthy steady state on this build.
 
-**Phone numbers are always bought in `US`.** Same reason: `EngineConfig::default()`
-hard-codes `Region::new("US")` and nothing overrides it.
+**No phone number is bought at all.** `EngineConfig::default()` sets
+`provision_phone: false`, so `Step::Phone` settles as `StepReport::NotWired` and
+the resource row lands in `disabled` with the reason on it — no provider call, no
+external id, no monthly invoice. It used to buy one per employee, and nothing in
+this build can send or receive on a number: no `sms_send` or `call_place` row in
+`turn::catalogue`, both listed in `turn::UNSERVED`, and the platform ceiling
+grants neither `sms` nor `voice`, which layers can only narrow.
+
+`disabled` does not degrade an optional channel, so this costs no health. The
+switch is Rust and reachable from no environment variable on purpose: turning it
+on starts a recurring bill, which is a code change and a deploy rather than an
+export. `the_shipped_default_matches_what_this_build_can_actually_use` pins it to
+the catalogue in both directions, so it cannot drift from what the binary can do.
+
+**Numbers bought before this are left exactly where they are.** A `ready` phone
+row keeps its state, its provider and its external id: the number is real, it is
+still billed, and that id is the only thing that says what to cancel. Nothing
+releases it automatically. They surface through
+`GET /v1/inventory/stranded` — but only once the employee is terminated, which is
+what that endpoint asks about. **A number held by an employee who is still active
+has no endpoint**; today it is a SQL question:
+
+```sql
+select employee_id, external_id, provider, state
+  from employee_resources where step = 'phone' and external_id is not null;
+```
+
+**Phone numbers, if ever bought again, are bought in `US`.**
+`EngineConfig::default()` hard-codes `Region::new("US")` and nothing overrides it.
 
 **One webhook signature scheme.** `/v1/webhooks/{provider}` verifies the
 Standard Webhooks / Svix scheme only. Twilio's HMAC-SHA1-over-the-callback-URL

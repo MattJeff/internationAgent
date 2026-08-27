@@ -34,6 +34,21 @@
 //! unbounded await is how a worker hangs forever holding a lease that nobody
 //! else may steal until it lapses.
 //!
+//! # Nothing is bought for a capability that reaches nothing
+//!
+//! A step can be finished four ways, not three. `Ready` and `Failed` and
+//! `PendingExternal` all assume somebody wanted the resource; the fourth,
+//! [`StepReport::NotWired`], is for a capability that is built at the provider
+//! end and connected to nothing at the product end. `Step::Phone` was exactly
+//! that — an E.164 number bought on every hire, billing monthly, with no tool in
+//! [`crate::turn::catalogue`] able to send or receive on it — and it had to be a
+//! fourth answer rather than a failure, because an optional step that fails
+//! leaves every employee in every deployment `Health::Degraded` forever over a
+//! channel nobody asked for. It settles in `ResourceState::Disabled`, which is
+//! the one state that means *off on purpose*, and the reason goes on the row.
+//! [`EngineConfig::provision_phone`] is the switch and carries the argument for
+//! why an operator does not get to flip it.
+//!
 //! # Two ways to have a phone number
 //!
 //! [`EngineConfig::number_strategy`] decides whether `Step::Phone` buys a
@@ -114,6 +129,18 @@ const LEASE_CONFLICT: &str = "employee_resources.lease_owner";
 /// deployment at a pool that was never bought.
 const EMPTY_POOL: &str = "empty_pool";
 
+/// **Why no phone number is bought**, written onto the resource row so the
+/// answer is wherever the operator is already looking rather than only in a log
+/// line nobody tailed.
+///
+/// The long form of each missing piece is in [`crate::turn::UNSERVED`], which is
+/// the table this sentence summarises and the one to delete an entry from on the
+/// day a phone tool ships. See [`EngineConfig::provision_phone`].
+const PHONE_NOT_WIRED: &str = "nothing in this build can send or receive on a phone number: `sms_send` and `call_place` \
+     are absent from `turn::catalogue` and listed in `turn::UNSERVED`, and the platform ceiling \
+     grants neither `sms` nor `voice`, which layers can only narrow. A number would bill every \
+     month and ring nowhere, so none was bought. `EngineConfig::provision_phone` is the switch.";
+
 // ---------------------------------------------------------------------------
 // Adapters
 // ---------------------------------------------------------------------------
@@ -188,6 +215,47 @@ pub struct EngineConfig {
     pub number_strategy: NumberStrategy,
     /// The company's verified WhatsApp sender, if it has one.
     pub whatsapp_sender: Option<String>,
+    /// **Whether this build provisions a phone number at all. Ships `false`.**
+    ///
+    /// `Step::Phone` bought an E.164 number for every employee ever created,
+    /// and nothing in this workspace can send or receive on one: no `SmsSend`
+    /// or `CallPlace` row in [`turn::catalogue`], both named in
+    /// [`turn::UNSERVED`] with the missing piece spelled out, and
+    /// `store::policy::default_ceiling` grants neither `sms` nor `voice` — so
+    /// no tenant, role or employee layer can widen into one, because layers
+    /// intersect. That is a monthly invoice per employee for a line that cannot
+    /// ring, and it repeated on every hire.
+    ///
+    /// # Why a field here and not a constant, and why not a setting
+    ///
+    /// Three places could own this and two of them are wrong.
+    ///
+    /// A `const` in this file would be honest and untestable: the engine's
+    /// exactly-once guarantees — the crash window, the orphan park, the two
+    /// workers that must not both buy — are all exercised through `Step::Phone`
+    /// precisely because it is the step that costs money, and a constant would
+    /// delete those tests rather than let them opt in.
+    ///
+    /// A **deployment setting** — an environment variable, a tenant row — is
+    /// the one that must not exist. It would let an operator start a recurring
+    /// bill by exporting a variable, against a capability whose absence is a
+    /// fact about the *binary* rather than about the deployment. This field is
+    /// reachable only from Rust: `main.rs` builds [`EngineConfig::default`] and
+    /// there is no path from configuration to here. Turning phones on is a code
+    /// change, a review and a deploy, which is the right price for a decision
+    /// that starts an invoice.
+    ///
+    /// # And it cannot drift from the truth
+    ///
+    /// `the_shipped_default_matches_what_this_build_can_actually_use` asserts
+    /// the **biconditional**: this default is `true` exactly when a phone tool
+    /// is in the catalogue. Ship a tool and the suite goes red until somebody
+    /// flips this; flip this without a tool and it goes red the same way. The
+    /// field is a switch, not a second opinion.
+    ///
+    /// [`turn::catalogue`]: crate::turn::catalogue
+    /// [`turn::UNSERVED`]: crate::turn::UNSERVED
+    pub provision_phone: bool,
 }
 
 impl Default for EngineConfig {
@@ -208,6 +276,8 @@ impl Default for EngineConfig {
             // better identity where it is free.
             number_strategy: NumberStrategy::Dedicated,
             whatsapp_sender: None,
+            // Nothing in this build can use a number. See the field.
+            provision_phone: false,
         }
     }
 }
@@ -239,6 +309,20 @@ pub enum StepReport {
     /// provisioned for it. Not a failure and not a wait: a refusal to spend
     /// money on an employee that is not going to use it.
     Inactive,
+    /// **The capability is connected to nothing, so nothing was bought.**
+    ///
+    /// The sibling of [`Self::Inactive`] from the other side: that one refuses
+    /// to spend on an employee who will not use the resource, this one refuses
+    /// to spend on a resource *no* employee could use. The row lands in
+    /// `ResourceState::Disabled`, which does not degrade an optional channel,
+    /// and the reason is written to `last_error` where an operator reads it.
+    ///
+    /// Distinct from [`Self::Failed`] on purpose, and the distinction is the
+    /// deliverable: a failure asks to be retried and drags an employee to
+    /// `Health::Degraded` for as long as it lasts, while this asks for nothing
+    /// and settles. The founder's page must not show the same thing for "your
+    /// phone could not be bought" and "you were never going to get one".
+    NotWired,
     /// Another worker holds the lease.
     Busy,
     /// Our lease lapsed and was stolen while we were talking to the provider,
@@ -265,6 +349,7 @@ impl StepReport {
             StepReport::Failed { code } => code,
             StepReport::Parked => "parked",
             StepReport::Inactive => "inactive",
+            StepReport::NotWired => "not_wired",
             StepReport::Busy => "busy",
             StepReport::LeaseLost => "lease_lost",
             StepReport::Blocked { .. } => "blocked",
@@ -422,7 +507,17 @@ impl ProvisioningEngine {
         if let Some(blocker) = first_unmet(employee, step) {
             return Ok(StepReport::Blocked { on: blocker });
         }
+        // Asked once and reused twice below, because it decides both whether
+        // this step settles here and whether the claim writes a write-ahead
+        // entry for a call that will not happen.
+        let not_wired = self.not_wired(step);
+
         match employee.resource(step).state() {
+            // Deliberately ahead of the `not_wired` arm: a resource that was
+            // already bought is not un-bought by this build forgetting how to
+            // use it. The number is real, the invoice is real, and the row
+            // keeps saying so — turning it off here would rewrite the only
+            // record of a purchase somebody has to go and cancel.
             ResourceState::Ready => return Ok(StepReport::Ready),
             // Only a provider callback moves this along; a worker that claimed
             // it would spin.
@@ -431,6 +526,11 @@ impl ProvisioningEngine {
                     poll_ref: poll_ref.clone(),
                 });
             }
+            // Already settled. `plan_wave` offers a disabled step on every
+            // pass — it is not `is_ready` — so without this the engine would
+            // re-claim, re-write and emit one outbox event per convergence for
+            // a decision that has not changed since the first one.
+            ResourceState::Disabled if not_wired.is_some() => return Ok(StepReport::NotWired),
             ResourceState::Pending
             | ResourceState::Provisioning
             | ResourceState::Failed
@@ -442,6 +542,29 @@ impl ProvisioningEngine {
             Claimed::Busy => return Ok(StepReport::Busy),
             Claimed::Parked => return Ok(StepReport::Parked),
         };
+
+        // **The purchase that does not happen.** Before the pooled branch as
+        // well as before the provider call: a slot on a shared number costs
+        // nothing, but taking one would still record that this employee has a
+        // phone channel, and it does not.
+        if let Some(reason) = not_wired {
+            tracing::info!(
+                tenant = %employee.tenant_id().as_uuid(),
+                employee = %employee.id().as_uuid(),
+                %step,
+                "not provisioned: the capability reaches nothing in this build"
+            );
+            return self
+                .finish(
+                    employee.tenant_id(),
+                    &claim,
+                    StepOutcome::Disabled {
+                        reason: reason.to_owned(),
+                    },
+                    StepReport::NotWired,
+                )
+                .await;
+        }
 
         // A pooled number is not bought, it is *joined*: the tenant already
         // owns it and this employee takes a slot on it. Handled before the
@@ -484,6 +607,25 @@ impl ProvisioningEngine {
         };
         self.finish(employee.tenant_id(), &claim, outcome, report)
             .await
+    }
+
+    /// **Why this step would provision something nothing can use**, or `None`
+    /// when it provisions something a tool can actually reach.
+    ///
+    /// One arm today, and deliberately not an eleven-way table: ten of the
+    /// steps are reachable — `Step::Email` carries every message an employee
+    /// sends, `Step::Vault` holds its secrets, `Step::Browser` is what
+    /// `proof_of_need` drives — and writing "wired" beside each of them would
+    /// be ten claims nobody checks in order to make one that is checked.
+    ///
+    /// The call sites are [`Self::ensure_step`], which settles the step here
+    /// instead of buying, and [`Self::claim`], which skips the write-ahead
+    /// entry because there is no call to be uncertain about.
+    ///
+    /// See [`EngineConfig::provision_phone`] for who gets to decide and why it
+    /// is not an operator.
+    fn not_wired(&self, step: Step) -> Option<&'static str> {
+        (step == Step::Phone && !self.cfg.provision_phone).then_some(PHONE_NOT_WIRED)
     }
 
     /// Put this employee on a number the tenant already owns.
@@ -939,6 +1081,19 @@ impl ProvisioningEngine {
             return Ok(Claimed::Mine(claim));
         };
 
+        // Same argument, arrived at from the product end rather than the
+        // adapter end: this step *has* an adapter and is not going to call it.
+        // An intent left `in_flight` by a crash in the microseconds before
+        // `ensure_step` disables the row would have the recovery sweep park the
+        // step and file an approval telling a human that Twilio may already
+        // have sold us a number — about a purchase that was never attempted.
+        // A false alarm about money is expensive in the currency this whole
+        // module is denominated in: attention.
+        if self.not_wired(step).is_some() {
+            tx.commit().await?;
+            return Ok(Claimed::Mine(claim));
+        }
+
         let intent = provisioning::begin_intent(
             &mut tx,
             &claim,
@@ -1156,18 +1311,18 @@ impl ProvisioningEngine {
             // nor `whatsapp` nor `voice`, so no tenant policy can widen into
             // one — layers intersect.
             //
-            // It is warned rather than skipped because skipping it honestly
-            // needs a state the step can *land* in: not `Failed` (`Step::Phone`
-            // is optional, so a failure makes every employee in every
-            // deployment `Health::Degraded` forever) and not absent (`Pending`
-            // degrades too). The one state `Employee::resource_health` reads as
-            // "off on purpose" is `ResourceState::Disabled`, and no
-            // `StepOutcome` writes it — `store::provisioning::finish_step` has
-            // `Ready`, `PendingExternal` and `Failed`. So the honest fix is a
-            // fourth outcome plus the `StepReport` that reports it, which is a
-            // change to the store's step state machine and not to this line.
-            // Until somebody makes it, the operator is told what the invoice is
-            // for.
+            // This used to be reached on every hire and warned about it. It is
+            // now reached only when `EngineConfig::provision_phone` is on,
+            // which the shipped default is not: `ensure_step` settles the step
+            // as `StepOutcome::Disabled` before the claim's crash window and
+            // this arm is never entered. The fix that note asked for — a
+            // fourth outcome plus the `StepReport` that reports it, because
+            // `Failed` would degrade every employee forever and `Pending`
+            // degrades too — is `StepOutcome::Disabled` / `StepReport::NotWired`.
+            //
+            // The warning stays, and it is not redundant: with the switch on,
+            // this line is a recurring invoice, and whoever turned it on should
+            // read that in the log of the first employee they hire.
             Step::Phone => {
                 tracing::warn!(
                     tenant = %employee.tenant_id().as_uuid(),
@@ -1554,12 +1709,26 @@ mod tests {
     /// One attempt, no waiting, one step at a time: every assertion below is
     /// about *what* happened, and a second attempt or a racing wave would only
     /// make the story harder to read.
+    ///
+    /// **`provision_phone` is on here and off in the shipped default**, which is
+    /// the one deliberate difference and it is worth the sentence. Almost every
+    /// engine test below drives its story through `Step::Phone` — the crash
+    /// window, the orphaned intent, the two workers that must not both buy, the
+    /// hung provider — for the single reason that it is the step that costs
+    /// money, and the whole exactly-once guarantee is about money. Turning the
+    /// capability off in `EngineConfig::default` must not delete those tests, so
+    /// they opt back into it here and say so. What that means when you read one:
+    /// it is a test about *the engine*, standing on a capability this build does
+    /// not ship. `the_shipped_default_matches_what_this_build_can_actually_use`
+    /// and `nothing_is_bought_for_a_capability_that_reaches_nothing` are the two
+    /// that run without this line.
     fn cfg() -> EngineConfig {
         EngineConfig {
             max_attempts: 1,
             concurrency: 1,
             backoff: Duration::from_millis(1),
             whatsapp_sender: Some("wa-company-sender".to_owned()),
+            provision_phone: true,
             ..EngineConfig::default()
         }
     }
@@ -2010,17 +2179,23 @@ mod tests {
         }
     }
 
-    /// **`Step::Phone` buys a number that bills every month and that no part of
-    /// this build can send or receive on**, and the warning in
-    /// [`ProvisioningEngine::call`] is the only thing telling the operator so.
+    /// **The switch and the build cannot disagree.**
     ///
-    /// This is the tripwire under that warning: both legs of the claim are
-    /// asserted here, so the sentence cannot quietly become false. It fails the
-    /// day somebody makes a phone channel real — which is the right day to go
-    /// back to that arm, delete the warning, and provision the number for
-    /// something.
+    /// `Step::Phone` used to buy a number that bills every month and that no
+    /// part of this build can send or receive on. It does not any more —
+    /// [`EngineConfig::provision_phone`] ships `false` — and this test is what
+    /// stops that default from becoming a lie in either direction:
     ///
-    /// The two legs, and why either alone is enough to make the number useless:
+    /// * ship an `sms_send` or `call_place` tool and leave the switch off, and
+    ///   employees have a channel with no number, which fails here;
+    /// * turn the switch on with no such tool, and every hire starts a monthly
+    ///   invoice for a line that cannot ring, which fails here too.
+    ///
+    /// That biconditional is the whole reason the decision may live in a config
+    /// field rather than a constant. A field that a test pins to a fact about
+    /// the binary is a switch; one that nothing pins is a second opinion.
+    ///
+    /// The two legs, and why either alone is enough to make a number useless:
     ///
     /// * **No policy can permit a phone channel.** `default_ceiling` is the
     ///   platform layer and layers *intersect* — `policy::evaluate` narrows,
@@ -2037,7 +2212,7 @@ mod tests {
     /// absences, and an absence has nothing to assert on. `docs/OPERATIONS.md`
     /// carries them.
     #[test]
-    fn a_bought_number_is_a_monthly_bill_for_a_channel_nobody_can_use() {
+    fn the_shipped_default_matches_what_this_build_can_actually_use() {
         use agentos_domain::action::ActionKind;
         use agentos_domain::message::Channel;
 
@@ -2049,9 +2224,7 @@ mod tests {
                 !ceiling.allowed_channels.contains(&channel),
                 "the shipped ceiling now grants {channel}, so a phone number can \
                  finally be authorised for something — go and read \
-                 `ProvisioningEngine::call`'s `Step::Phone` arm, which still \
-                 warns every operator that the number it is buying is dead \
-                 weight"
+                 `EngineConfig::provision_phone`, which is still off"
             );
         }
 
@@ -2062,16 +2235,30 @@ mod tests {
             ActionKind::CallPlace,
         ] {
             assert!(
-                !offered.contains(&kind),
-                "{kind:?} is a tool now, so something can finally use the number \
-                 `Step::Phone` buys — same instruction as above"
-            );
-            assert!(
                 turn::UNSERVED.iter().any(|(unserved, _)| *unserved == kind),
                 "{kind:?} is neither offered nor listed as withheld, so nothing \
                  in this workspace says why it is missing"
             );
         }
+
+        // **The biconditional.** A number is reachable by exactly these two —
+        // `WhatsappSend` is deliberately not among them, because a WhatsApp
+        // message goes out through the company's verified sender that
+        // `Step::Whatsapp` binds, and never through the E.164 number
+        // `Step::Phone` buys.
+        let usable = [ActionKind::SmsSend, ActionKind::CallPlace]
+            .iter()
+            .any(|kind| offered.contains(kind));
+        assert_eq!(
+            EngineConfig::default().provision_phone,
+            usable,
+            "`EngineConfig::provision_phone` is {} and a tool that can use a number {}. \
+             Buying a number nothing can reach is a monthly invoice for a line that never \
+             rings; not buying one a tool needs is a channel with no number. Move the switch \
+             to match the catalogue.",
+            EngineConfig::default().provision_phone,
+            if usable { "exists" } else { "does not exist" },
+        );
     }
 
     #[test]
@@ -2295,6 +2482,113 @@ mod tests {
         assert!(again.values().all(StepReport::is_ready));
         assert_eq!(telephony.number_count(), 1, "a re-run must buy nothing");
         assert_eq!(email.identity_count(), 1);
+    }
+
+    /// **The money that is not spent**, on the shipped configuration rather
+    /// than the one the rest of this module opts into.
+    ///
+    /// Every other engine test here sets `provision_phone: true` in `cfg()` so
+    /// it can keep telling its story through the step that costs money. This
+    /// one runs what a customer runs, and asserts the four things that make the
+    /// refusal real rather than cosmetic: the provider is never called, the row
+    /// says why, the employee is not sick because of it, and a second pass
+    /// writes nothing at all.
+    #[tokio::test]
+    async fn nothing_is_bought_for_a_capability_that_reaches_nothing() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(MockTelephony::new(Utc::now(), "tok"));
+        let email = Arc::new(MockEmailProvider::new());
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), email.clone()),
+            EngineConfig {
+                // The shipped answer. Everything else stays as `cfg()` has it
+                // so this test differs from its neighbours in one place only.
+                provision_phone: EngineConfig::default().provision_phone,
+                ..cfg()
+            },
+        );
+
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+
+        // 1. Nobody was billed.
+        assert_eq!(
+            telephony.number_count(),
+            0,
+            "a number was bought for a channel no tool in this build can reach"
+        );
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::NotWired));
+        // And the outcome has its own metric label — not `ready`, which would
+        // count a purchase that did not happen, and not a failure code, which
+        // would put a deliberate decision in the failure rate.
+        assert_eq!(StepReport::NotWired.code(), "not_wired");
+
+        // 2. The row says what happened and why, where an operator reads it.
+        let (state, lease, provider, external, reason) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "disabled", "the one state that means off on purpose");
+        assert_eq!(lease, None, "the lease was not left behind");
+        assert_eq!(provider, None);
+        assert_eq!(external, None);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ring nowhere"),
+            "the row does not say why nothing was provisioned: {reason:?}"
+        );
+
+        // No write-ahead entry either. One left `in_flight` would have the
+        // recovery sweep file an approval asking a human to reconcile a
+        // purchase that was never attempted.
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM provider_intents WHERE step = 'phone'"
+            )
+            .await,
+            0,
+            "an intent was written for a call that never happened"
+        );
+
+        // 3. **What the founder sees.** Not a failure and not a wait: every
+        //    other step is ready and the company is online. A `Failed` phone
+        //    would have parked this employee at `Degraded` forever.
+        for step in Step::ALL.into_iter().filter(|s| *s != Step::Phone) {
+            assert_eq!(
+                reports.get(&step),
+                Some(&StepReport::Ready),
+                "{step} did not become ready"
+            );
+        }
+        assert_eq!(
+            reload(&db, &employee).await.health(),
+            Health::Online,
+            "a channel that is off on purpose must not make an employee look ill"
+        );
+
+        // 4. Settled, not repeated. `plan_wave` offers a disabled step on every
+        //    pass, so without the early return this would claim, write and emit
+        //    an outbox event once per convergence for the life of the employee.
+        let events = count(&db, &employee, "SELECT count(*) FROM outbox_events").await;
+        let again = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge again");
+        assert_eq!(again.get(&Step::Phone), Some(&StepReport::NotWired));
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM outbox_events").await,
+            events,
+            "converging again re-announced a decision that had not changed"
+        );
+        assert_eq!(telephony.number_count(), 0);
     }
 
     /// CHAOS 1. The provider succeeds externally and *then* fails, which is the

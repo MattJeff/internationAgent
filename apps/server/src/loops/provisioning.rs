@@ -337,13 +337,21 @@ impl<C: Converge> ProvisioningLoop<C> {
                 // Every outcome, ready included: a `rate(ready)` that is flat
                 // is how you tell "no failures" from "no provisioning". Both
                 // labels are `&'static str` from a closed match, so eleven
-                // steps times eight codes is the whole series count, forever.
+                // steps times nine codes is the whole series count, forever.
                 for (step, report) in &reports {
                     crate::metrics::record_provisioning(*step, report);
                 }
+                // `NotWired` is left out, and it is the only outcome that is:
+                // it is not ready and never will be, so listing it under
+                // "steps did not reach ready" would print the same warning on
+                // every convergence of every employee for a capability that is
+                // deliberately off. The counter above still sees it — under its
+                // own `not_wired` label, which is the point of having one.
                 let unready: Vec<_> = reports
                     .iter()
-                    .filter(|(_, report)| !report.is_ready())
+                    .filter(|(_, report)| {
+                        !report.is_ready() && !matches!(report, StepReport::NotWired)
+                    })
                     .map(|(step, report)| format!("{step}={}", report.code()))
                     .collect();
                 if unready.is_empty() {
