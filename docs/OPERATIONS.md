@@ -466,7 +466,7 @@ That is deliberate.
 | `AGENTOS_ALLOW_MOCKS` | unset (false) | `1` / `true` / `yes` permits mock adapters. Anything else, plus any mock, is `refusing to start`. |
 | `AGENTOS_API_KEYS` | empty | The operators' keyring, consulted **before** the `api_keys` table so a row cannot shadow it. Empty is fine when `AGENTOS_PLATFORM_KEYS` is set; empty *and* no platform key means every request is 401 and nothing can issue one, which the server warns about at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
 | `AGENTOS_PLATFORM_KEYS` | empty | **`/v1/platform/*` is 401 to everybody**, so nobody can sign up and no key can be issued or revoked without a redeploy. Format: `label:secret[,…]` — no tenant uuid, deliberately. Secret ≥ 32 chars. |
-| `AGENTOS_WEBHOOK_SECRETS` | empty | **Every `/v1/webhooks/{provider}` is a 404 and no inbound message can ever arrive.** The server warns about this too. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). |
+| `AGENTOS_WEBHOOK_SECRETS` | empty | Empty **and** an empty `webhook_endpoints` table means every `/v1/webhooks/{path}` is a 404 and no inbound message can ever arrive. The server warns when the variable is empty. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). Consulted **before** the table so a row cannot shadow it. Holds **one tenant per provider** — two entries on one path is a boot failure; register the second customer with `POST /v1/platform/webhooks`. |
 | `EMAIL_API_KEY` | — | Unset runs `MockEmailProvider`. Set to the `re_…` key, it **builds the real Resend client**. |
 | `TELEPHONY_API_KEY` | — | Unset runs `MockTelephony`. Set to `ACxxxx:auth_token` — Twilio authenticates with both halves together — it **builds the real Twilio client**. Half of it is a boot failure. |
 | `BROWSER_API_KEY` | — | Unset runs `MockBrowser`. Set to `project-id:api-key`, it **builds the real Browserbase client with a live CDP driver**. Half of it is a boot failure. |
@@ -1131,7 +1131,16 @@ built in exactly one place, from the `Authorization` header, and is not
 `Deserialize`, so it cannot arrive in a body. An id belonging to another tenant
 is invisible to RLS, surfaces as `NotFound`, and is answered **404** — not 403,
 which would confirm the id exists. Webhook deliveries take their tenant from the
-registration in `AGENTOS_WEBHOOK_SECRETS`, never off the wire.
+`AGENTOS_WEBHOOK_SECRETS` registration or from the `webhook_endpoints` row,
+never off the wire.
+
+`webhook_endpoints` is the fourth caller of the escape hatch, and it is the one
+that is *unauthenticated*: `agentos_store::webhooks::lookup` runs before anybody
+knows who is asking, so it opens the transaction `READ ONLY`, its SQL is a
+`&'static str`, it projects three columns, and it returns ciphertext — the row
+only becomes a usable secret inside `agentos_app::webhooks`, under AAD
+`webhook://<tenant>`, so a blob lifted into another tenant's row opens as
+nothing. Same shape and same four defences as `agentos_store::api_keys::lookup`.
 
 **Deploying with a non-superuser login role:** that role must be a member of
 `app_role` (`GRANT app_role TO app_login`) or `SET LOCAL ROLE` fails and every

@@ -302,9 +302,15 @@ pub fn inspect(get: &dyn Fn(&str) -> Option<String>) -> Report {
     }
 
     // None of the three is required to boot, and each empty one is an outage
-    // that looks like a bug: no keyring at all answers every request 401, an
-    // empty webhook registry 404s every provider callback and no inbound
-    // message can ever arrive.
+    // that looks like a bug: no keyring at all answers every request 401, and an
+    // empty webhook registry means no provider callback is registered *here*.
+    //
+    // "*here*" is load-bearing since `0053_webhook_endpoints`. This whole module
+    // reads the environment and nothing else — that is its contract, it runs
+    // before `Config::from_env` can fail and it never opens a connection — so it
+    // cannot see the `webhook_endpoints` rows that are the other half of the
+    // answer. A `Missing` on that row therefore means "the environment
+    // registers nobody", not "no mail can arrive", and the message says so.
     //
     // `AGENTOS_API_KEYS` alone being empty is NOT reported as missing any more,
     // and that is the point of `0044_api_keys`: a control plane holds only a
@@ -342,8 +348,10 @@ pub fn inspect(get: &dyn Fn(&str) -> Option<String>) -> Report {
             Status::Ok
         },
         if config.webhooks.is_empty() {
-            "not set — every provider callback is answered 404, so no inbound message can arrive. \
-             Set it to `provider:tenant-uuid:signing-secret[,…]`, from the provider's webhook page."
+            "not set — no provider callback is registered in the environment. Set it to \
+             `provider:tenant-uuid:signing-secret[,…]`, from the provider's webhook page. This \
+             check reads the environment only: a deployment whose customers are registered in \
+             `webhook_endpoints` (POST /v1/platform/webhooks) receives mail with this unset."
                 .to_owned()
         } else {
             format!(

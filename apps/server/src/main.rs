@@ -94,7 +94,9 @@ use crate::loops::outbox::{Handled, Handlers};
 use crate::loops::provisioning::ProvisioningLoop;
 use crate::routes::a2a::A2aState;
 use crate::routes::mcp::{Fleets, McpState};
-use crate::routes::webhooks::{Endpoint, Webhooks};
+use agentos_app::webhooks::Endpoint;
+
+use crate::routes::webhooks::Webhooks;
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
@@ -617,7 +619,7 @@ fn app(
     // and its own keyring; a tenant's credential gets a 401 here and a platform
     // credential gets one everywhere else.
     let platform = with_platform_stack(
-        routes::platform::router(db.clone(), keyring.hasher().clone()),
+        routes::platform::router(db.clone(), keyring.hasher().clone(), credentials.clone()),
         config.platform_keys.clone(),
     );
 
@@ -625,7 +627,7 @@ fn app(
     // the agent card here for the same reason: a verifier who has never heard
     // of us has nothing to authenticate with, and a key nobody can fetch
     // verifies nothing.
-    let public = routes::webhooks::router(db.clone(), webhooks(config))
+    let public = routes::webhooks::router(db.clone(), credentials.clone(), webhooks(config))
         .merge(routes::a2a::card_router(a2a))
         // The OAuth callback belongs on this tier and could not be on the other:
         // a provider redirects a *browser* back to us, and a browser holds no
@@ -668,8 +670,18 @@ fn a2a_state(db: &Db, gate: &PolicyGate, config: &Config) -> A2aState {
     A2aState::new(db.clone(), gate.clone(), &config.public_host)
 }
 
-/// The provider callback endpoints this deployment accepts, from the one place
-/// that reads the environment.
+/// The provider callback endpoints `AGENTOS_WEBHOOK_SECRETS` registered, from
+/// the one place that reads the environment.
+///
+/// The `.collect()` into a `HashMap` is why `parse_webhooks` refuses two entries
+/// on one path: this is where the second would silently replace the first, and
+/// nothing downstream would have a record that there was a first. That refusal
+/// is unchanged by `webhook_endpoints`; the table is how a *second tenant* gets
+/// an endpoint, not how this map stops collapsing.
+///
+/// An environment entry's path segment *is* its provider name, which is what it
+/// has always been and what the runbook documents. Stored endpoints separate the
+/// two — see `migrations/0053`.
 fn webhooks(config: &Config) -> Webhooks {
     Webhooks::new(
         config
@@ -680,6 +692,7 @@ fn webhooks(config: &Config) -> Webhooks {
                     hook.provider.clone(),
                     Endpoint {
                         tenant_id: hook.tenant_id,
+                        provider: hook.provider.clone(),
                         secret: Secret::new(&hook.secret),
                     },
                 )
@@ -719,8 +732,22 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
             Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
         );
 
-    // One per registered provider: the event type carries the provider's name,
-    // so the table cannot be keyed on a wildcard.
+    // `email` unconditionally, because a `webhook_endpoints` row does not exist
+    // at boot and the loop below cannot see one. There is exactly one wired
+    // ingest — `on_webhook` parses the body as Resend JSON whatever the provider
+    // is called — and `0053`'s `webhook_endpoints_provider_is_wired` CHECK is
+    // the pair of this line: a stored endpoint cannot name a provider whose
+    // event type nothing here registers, which would be eight retries and a dead
+    // letter per delivered message.
+    handlers = handlers.on(
+        routes::webhooks::received_event("email"),
+        Arc::new(on_webhook),
+    );
+
+    // Then one per environment registration, whose path segment is its provider
+    // name and need not be `email` — `resend:<tenant>:<secret>` is a legitimate
+    // entry and files under `webhook.resend.received`. `Handlers::on` overwrites
+    // by key, so the `email` line above is idempotent under this loop.
     for hook in &config.webhooks {
         handlers = handlers.on(
             routes::webhooks::received_event(&hook.provider),

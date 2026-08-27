@@ -131,13 +131,25 @@ pub enum ConfigError {
     /// matches the address's local part inside that company, and two customers
     /// who both hired a `sales` is the first two customers.
     ///
+    /// # Why this survived `migrations/0053_webhook_endpoints`
+    ///
+    /// Because the table did not touch this map. `webhook_endpoints` gives a
+    /// second tenant an endpoint of its own, on a path of its own, read at
+    /// request time; `main::webhooks` is still a `.collect()` into a `HashMap`
+    /// and still drops the first of two entries on one path without a trace.
+    /// The refusal therefore still guards exactly what it always guarded — one
+    /// silent replacement in one data structure — and what changed is only the
+    /// remedy it can offer, which is now "register the second tenant in the
+    /// table" instead of "serve one tenant per provider".
+    ///
     /// Names the provider and never the value: the variable holds signing
     /// secrets.
     #[error(
         "AGENTOS_WEBHOOK_SECRETS registers two tenants on the provider path {provider:?}, and \
-         the registry can only hold one — the second silently replaces the first and one of \
-         those customers' inbound deliveries is then refused as a forgery or filed against the \
-         other's company. Register one tenant per provider on this deployment"
+         that map can only hold one — the second silently replaces the first and one of those \
+         customers' inbound deliveries is then refused as a forgery or filed against the \
+         other's company. Keep one tenant per provider in this variable and register the \
+         others with POST /v1/platform/webhooks, which gives each one an endpoint of its own"
     )]
     WebhookProviderTwice {
         /// The path segment registered twice.
@@ -534,9 +546,11 @@ impl Config {
         }
         if self.webhooks.is_empty() {
             tracing::warn!(
-                "AGENTOS_WEBHOOK_SECRETS is empty: every provider callback will be answered \
-                 404 and no inbound message can arrive. Set it to \
-                 `provider:tenant-uuid:signing-secret[,…]`."
+                "AGENTOS_WEBHOOK_SECRETS is empty: no provider callback is registered in the \
+                 environment. Set it to `provider:tenant-uuid:signing-secret[,…]` — or, for a \
+                 deployment whose customers each hold their own provider account, register them \
+                 with POST /v1/platform/webhooks, which is the other half of this and is not \
+                 visible from here."
             );
         }
     }

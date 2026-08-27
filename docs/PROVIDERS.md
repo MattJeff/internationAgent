@@ -40,6 +40,12 @@ The email adapter's third input, the `whsec_…` signing secret, comes from the
 `email` entry of `AGENTOS_WEBHOOK_SECRETS`, where you have already pasted it.
 Its sending domain is `AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
 
+That variable holds **one tenant per provider** and always has. A deployment
+with a second customer registers theirs in `webhook_endpoints` instead — see
+"More than one customer on one provider account" below — and the *outbound*
+adapter still takes its signing secret from here, because the adapter is one per
+deployment.
+
 `EMBEDDER_API_KEY` is **no longer read**. It used to satisfy the boot guard
 while selecting nothing, because `Embedder` has one variant and it is a hash. A
 credential that cannot change what runs must not be able to quiet an alarm.
@@ -200,14 +206,50 @@ Where each goes:
 | Credential | Goes into | What it does |
 |---|---|---|
 | `re_…` API key | `EMAIL_API_KEY` | **builds the adapter** — set it and mail is really sent |
-| `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…` | verifies inbound deliveries, **and** is handed to the adapter as its own webhook secret — one paste, not two |
+| `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…`, or `POST /v1/platform/webhooks` for a second customer | verifies inbound deliveries, **and** (from the variable) is handed to the adapter as its own webhook secret — one paste, not two |
 | the sending domain | `AGENT_EMAIL_DOMAIN` | the one domain this adapter owns |
 
 The webhook half works even with the mock adapter: the route verifies the
 signature against the configured secret and stores the raw bytes. The path
-segment (`email`) is the `{provider}` in `/v1/webhooks/{provider}` and must match
-the label in `AGENTOS_WEBHOOK_SECRETS`. An unregistered provider is a **404**,
-and an empty registry means no inbound message can arrive at all.
+segment (`email`) is the `{path}` in `/v1/webhooks/{path}` and must match the
+label in `AGENTOS_WEBHOOK_SECRETS`. An unregistered path is a **404**, and an
+empty registry with an empty `webhook_endpoints` table means no inbound message
+can arrive at all.
+
+### More than one customer on one provider account
+
+`AGENTOS_WEBHOOK_SECRETS` is keyed on the path segment, so it holds one endpoint
+per path for the whole deployment — two entries on `email` is a boot failure, not
+two customers. The second customer onwards gets a row instead:
+
+```bash
+curl -sS -X POST http://localhost:8090/v1/platform/webhooks \
+  -H "Authorization: Bearer $AGENTOS_PLATFORM_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"<tenant-uuid>","secret":"whsec_…"}'
+# -> 201 {"path":"whe_…","route":"/v1/webhooks/whe_…","rotated":false}
+```
+
+Then paste `https://<your-host>/v1/webhooks/whe_…` into **that customer's own
+webhook** in the provider's dashboard. The path is opaque on purpose: two
+customers behind one Resend account share a signing secret, so the signature
+cannot tell them apart and the address is the only thing that can — a
+`/{tenant}/{provider}` URL would be derivable from a uuid either customer can
+already see. It is still not a credential; the signature is checked either way.
+
+**What this needs from the provider.** Resend delivers a webhook to every
+endpoint configured on the account, so two endpoints on one account means both
+customers receive both events — a per-customer endpoint only separates the
+*queues* if the provider can scope deliveries. In practice that means one Resend
+account (or one Resend *domain* with its own webhook) per customer, and the
+endpoint URL is what you paste into each. When two customers really do share one
+account and one inbox domain, nothing at this layer can separate their mail,
+because the provider is not separating it either.
+
+**Rotating.** Post the same call again with the new `whsec_…`: the response is
+`200` with `"rotated":true` and **the same path**, so the URL at the provider
+does not move and the old secret stops verifying at the moment the row commits.
+There is no `DELETE`; to retire an endpoint entirely, remove the row with `psql`.
 
 ### Four Resend facts encoded in the adapter
 
