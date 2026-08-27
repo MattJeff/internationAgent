@@ -1986,6 +1986,108 @@ pub(crate) mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// **A stopped company's employees keep their slot, and their status page
+    /// keeps telling the truth.**
+    ///
+    /// What this is *not*: the customer's Anthropic bill. That was the reported
+    /// defect and it does not hold — `agentos_app::model_access::connected` is
+    /// called by [`assignment_for`] **before** [`reserve_a_turn`], reads the same
+    /// `company_halts` row, and returns `NoModel::CompanyHalted`, so a halted
+    /// company's turn never reaches `turns::reserve` and never reaches the model.
+    /// Asserting `turn_buckets` or `model_usage_daily` here would pass with the
+    /// halt clause taken straight back out of `claim_due` — measured, not
+    /// assumed — and an assertion that cannot move is decoration that reads
+    /// exactly like proof.
+    ///
+    /// What the missing clause really cost is the **slot**. `claim_due`
+    /// reschedules in the same statement, so claiming a stopped company's
+    /// employee spends its cadence on a refusal: `next_at` jumps a whole
+    /// interval out, `claims` moves, and `last_outcome` is overwritten with
+    /// `no_model` — a status page telling an operator their model is not
+    /// connected when the only thing wrong is the switch they threw themselves.
+    /// A one-hour halt on a five-minute cadence is twelve slots, and the release
+    /// does not give them back: the employee waits out another cadence before it
+    /// acts. Not selecting the row costs nothing and the release resumes it at
+    /// once, which is the same property `outbox::claim_of` defends.
+    #[tokio::test]
+    async fn a_halted_company_s_employee_spends_no_slot_and_keeps_its_status() {
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let stopped = seed_tenant(&db).await;
+        let running = seed_tenant(&db).await;
+        let waiting = seed_due(&db, stopped, "waiting", Some(workable())).await;
+        let working = seed_due(&db, running, "working", Some(workable())).await;
+
+        // The deadline before anybody claimed, so "not pushed out" is asserted
+        // against a number this test did not invent.
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        let before = schedule::get(&mut tx, waiting).await.expect("get");
+        agentos_store::halt::place(&mut tx, "card compromised", "operator:ops", Utc::now())
+            .await
+            .expect("place")
+            .expect("it was running");
+        tx.commit().await.expect("commit halt");
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let counter = started.clone();
+        let take = move |_: Assignment| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+
+        let cancel = CancellationToken::new();
+        let claimed = tick(&db, &take, &cancel, Utc::now()).await.expect("tick");
+
+        // The halted company's employee, after a whole pass: untouched.
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        let after = schedule::get(&mut tx, waiting).await.expect("get");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            after.claims, 0,
+            "the halted company's employee spent a slot on a turn that could not \
+             happen; a long halt burns its whole cadence and the release gives \
+             none of it back"
+        );
+        assert_eq!(
+            after.last_outcome, None,
+            "the halt overwrote the employee's status with {:?}, so the operator's \
+             page blames the model connection for a switch they threw themselves",
+            after.last_outcome
+        );
+        assert_eq!(
+            after.next_at, before.next_at,
+            "and its deadline was pushed a whole cadence out, so it stays silent \
+             for another interval after the release rather than acting at once"
+        );
+
+        // One tenant may not stop another: the running company is untouched by
+        // its neighbour's halt, on this path as on every other.
+        let (outcome, _, claims) = outcome_of(&db, running, working).await;
+        assert_eq!(
+            outcome, "turn",
+            "the running company took its turn as usual"
+        );
+        assert_eq!(claims, 1);
+
+        assert_eq!(
+            claimed, 1,
+            "only the running company's employee was claimed"
+        );
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "and exactly one turn ran"
+        );
+
+        drop_tenant(&db, stopped).await;
+        drop_tenant(&db, running).await;
+    }
+
     /// One supplier who sells what the charter is for, with somebody on file
     /// to write to.
     async fn seed_supplier(db: &Db, tenant: TenantId, category: &str, email: &str) {

@@ -248,6 +248,40 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 /// employee to one worker is that the same `UPDATE` pushed `next_at` into the
 /// future.
 ///
+/// # A stopped company's employees are not claimed at all
+///
+/// `NOT EXISTS (… company_halts …)` on `tenants`, exactly as
+/// [`crate::outbox::claim_of`] spells it and in the same place — on the
+/// **driver**, so a stopped company never becomes a seat and its schedules are
+/// never read.
+///
+/// **It is not the model bill, and the difference is worth writing down
+/// because the obvious reading is wrong.** This clause was added on a report
+/// that a halted company's turns "burn the customer's model tokens", and that
+/// does not hold: `agentos_app::model_access::connected` reads the same
+/// `company_halts` row and returns `NoModel::CompanyHalted`, and
+/// `apps/server`'s initiative loop calls it in `assignment_for` — **before**
+/// `turns::reserve` and before any credential is decrypted. A halted company's
+/// turn already reached neither the budget nor the model. Measured, by taking
+/// this clause back out: `turn_buckets` and `model_usage_daily` do not move.
+///
+/// What the missing clause really cost is the **slot**. `employee_initiative`
+/// has no attempt cap and no dead letter — `claims` is bookkeeping, never
+/// compared to anything, so there is no `MAX_ATTEMPTS` here to burn through,
+/// which is the mechanism [`crate::outbox::claim_of`] defers for and it does
+/// not apply. What this statement destroys instead is the schedule: it
+/// reschedules in the same breath, so claiming a stopped company's employee
+/// spends its cadence on a refusal — `next_at` jumps a whole interval out,
+/// "a week of missed slots is missed rather than owed", and the release does
+/// not give them back. One hour of halt on the five-minute floor is twelve
+/// slots, and `last_outcome` is left saying `no_model` at an operator whose
+/// model is connected perfectly well.
+///
+/// So it **defers** rather than refuses, which is the same property
+/// [`crate::outbox::claim_of`] holds by a different road: not selecting the row
+/// leaves `next_at` in the past, so the release makes every stopped employee
+/// due at once and costs nothing to replay.
+///
 /// # `WITH … AS MATERIALIZED`, and why it is not decoration
 ///
 /// The obvious spelling of the selection is
@@ -363,6 +397,8 @@ pub async fn claim_due(
                             ORDER BY i2.next_at, i2.employee_id \
                             LIMIT $2::bigint * $4::bigint) top \
                ) q \
+              WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
+                                 WHERE h.tenant_id = t.id) \
          ), shortlist AS MATERIALIZED ( \
              SELECT employee_id, seat, next_at FROM seated \
               ORDER BY seat, next_at, employee_id \
@@ -1053,6 +1089,94 @@ mod tests {
         assert_eq!(stored.last_claimed_at, Some(at(T0)));
 
         drop_tenant(&db, tenant).await;
+    }
+
+    // -- the company-wide stop ---------------------------------------------
+
+    /// **A stopped company's employees wait; their slots are not spent.**
+    ///
+    /// "Not claimed" is only half the assertion, and the other half is not the
+    /// model bill — see [`claim_due`] for why that reading is wrong and what
+    /// holds it instead. `employee_initiative` has no attempt cap to burn, but
+    /// this statement reschedules in the same breath: a claim-then-refuse
+    /// pushes `next_at` a whole interval out and the employee stays silent for
+    /// another cadence after the release. Hence `claims` unmoved, `next_at`
+    /// unmoved, and the release resuming the same overdue row at the same
+    /// instant.
+    #[tokio::test]
+    async fn a_stopped_company_s_employees_are_not_claimed_and_spend_no_slot() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let stopped = seed_tenant(&db, "halt-stopped").await;
+        let running = seed_tenant(&db, "halt-running").await;
+
+        let waiting = seed_due(&db, stopped, "waiting", Lifecycle::Active).await;
+        let working = seed_due(&db, running, "working", Lifecycle::Active).await;
+
+        // What `next_at` was before anybody claimed, so the deferral can be
+        // asserted against a number this test did not invent.
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        let before = get(&mut tx, waiting).await.expect("get");
+        crate::halt::place(&mut tx, "stop everything", "operator:ops", at(T0))
+            .await
+            .expect("place")
+            .expect("it was running");
+        tx.commit().await.expect("commit halt");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim_due(&mut tx, 100, at(T0)).await.expect("claim");
+        tx.commit().await.expect("commit claim");
+
+        assert_eq!(
+            claimed.iter().map(|d| d.employee_id).collect::<Vec<_>>(),
+            vec![working],
+            "only the running company's employee may be claimed: {claimed:?}"
+        );
+
+        // The load-bearing half: the deferred employee is untouched, so the
+        // halt costs its cadence nothing and there is nothing to replay.
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        let after = get(&mut tx, waiting).await.expect("get");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            after.claims, 0,
+            "a deferred employee burns no claim, so the halt spent none of its \
+             cadence"
+        );
+        assert_eq!(after.last_claimed_at, None, "and it was never taken up");
+        assert_eq!(
+            after.next_at, before.next_at,
+            "and its deadline was not pushed out either: it is due the instant \
+             the company is released, not one whole cadence later"
+        );
+
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        crate::halt::release(&mut tx)
+            .await
+            .expect("release")
+            .expect("it was halted");
+        tx.commit().await.expect("commit release");
+
+        // The same instant as the first claim, so the running company's
+        // employee — rescheduled an hour out by the claim that took it — is
+        // deterministically not due and this assertion is about the deferred
+        // one alone.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let resumed = claim_due(&mut tx, 100, at(T0)).await.expect("claim");
+        tx.commit().await.expect("commit claim");
+        assert_eq!(
+            resumed.iter().map(|d| d.employee_id).collect::<Vec<_>>(),
+            vec![waiting],
+            "the release resumes exactly the employee that was waiting"
+        );
+        assert_eq!(
+            resumed[0].claims, 1,
+            "and it is on its FIRST claim, not its second: the halt cost it nothing"
+        );
+
+        drop_tenant(&db, stopped).await;
+        drop_tenant(&db, running).await;
     }
 
     // -- isolation ---------------------------------------------------------
