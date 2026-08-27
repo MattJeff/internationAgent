@@ -786,7 +786,34 @@ async fn record_refusal(
     // either way, and a provider that named nobody has told us nothing to act
     // on rather than something to fail on.
     if refusal.permanent {
+        let mut suppressed = 0usize;
         for address in &refusal.addresses {
+            // **The two steps the STOP door takes, for the reason it states.**
+            // `Delivery::parse` trims and lower-cases and stops there;
+            // `suppressions_address_normalised` wants a bare `local@domain`,
+            // so a `to` carrying a display name — the shape `contact_of`
+            // exists for, and the one this crate's own fixtures send — trips
+            // the CHECK. The `?` below would then roll back the audit row
+            // written above with it, and `on_webhook` would retry eight times
+            // and dead-letter the one message that must never be lost. Which
+            // is the failure the complaint path was rewritten to prevent,
+            // arriving through the door the join opened.
+            //
+            // Unparseable even with the display name off is logged and
+            // skipped, never failed — the same arm the STOP door has, and for
+            // the same reason: the trail row already holds the evidence, and
+            // no number of retries turns an address this table refuses into
+            // one it accepts.
+            let Ok(address) = EmailAddress::parse(&contact_of(&Untrusted::new(address.clone())))
+            else {
+                // No address in the line: it is on the trail, behind RLS.
+                tracing::error!(
+                    reason = refusal.reason,
+                    "a permanent refusal named an address `suppressions` cannot store; it is \
+                     NOT suppressed here and must be recorded by hand"
+                );
+                continue;
+            };
             revenue_store::suppress(
                 tx,
                 Uuid::now_v7(),
@@ -798,10 +825,11 @@ async fn record_refusal(
                     // take.
                     scope: revenue_store::Scope::Tenant,
                     channel: revenue_store::Channel::Email,
-                    // Already trimmed and lower-cased by `Delivery::parse`,
-                    // which is the exact shape
-                    // `suppressions_address_normalised` CHECKs.
-                    address,
+                    // Parsed above, so this is exactly the shape
+                    // `suppressions_address_normalised` CHECKs — and exactly
+                    // the spelling the STOP door writes, so the same person
+                    // arriving by both doors is one row rather than two.
+                    address: &address.to_string(),
                     // `"complaint"` or `"bounce"`, spelled by the parser the way
                     // `suppressions_reason`'s CHECK spells it, so this is a
                     // field rather than a translation table to keep in step.
@@ -820,11 +848,15 @@ async fn record_refusal(
                 revenue_store::RevenueError::Store(err) => InboundError::Store(err),
                 _ => InboundError::Store(StoreError::conflict("the refusal could not be recorded")),
             })?;
+            suppressed += 1;
         }
         // No address and no reason text: who it was is in `suppressions`, behind
         // RLS, and the count is what an operator watching deliverability needs.
+        // Counted rather than `addresses.len()`, so a line reading "2
+        // suppressed" cannot be printed for a refusal where one of them was
+        // skipped above.
         tracing::info!(
-            suppressed = refusal.addresses.len(),
+            suppressed,
             "a provider reported a permanent refusal; those addresses are suppressed"
         );
     }
@@ -3381,6 +3413,53 @@ mod tests {
         );
         // It is still on the trail — recorded, just not acted on.
         assert_eq!(refusals(&db, transient_tenant).await.len(), 1);
+    }
+
+    /// **The two doors do not spell an address the same way, and one of them
+    /// hands the difference straight to a CHECK constraint.**
+    ///
+    /// The STOP door runs `contact_of` then [`EmailAddress::parse`] before it
+    /// writes, and says why in its own comment: *"so this INSERT cannot fail
+    /// that constraint, and the `?` below cannot dead-letter a human's reply
+    /// forever on a malformed address"*. The refusal door was joined to the
+    /// same writer without either step — `Delivery::parse` only trims and
+    /// lower-cases, and never checks the shape `suppressions_address_normalised`
+    /// actually demands.
+    ///
+    /// So a verified complaint whose `data.to` carries a display name — the
+    /// shape this crate's own `contact_of` exists for, and the one
+    /// `loops::inbound`'s fixture sends — violates the CHECK, rolls the whole
+    /// transaction back, and takes the `mail_refused` trail row with it. Eight
+    /// retries and a dead letter: the exact failure the complaint path was
+    /// rewritten to prevent, arriving through the door the join opened.
+    ///
+    /// Two assertions and both are the point. It must not be a handler error,
+    /// and the address must still reach the table — a complaint we cannot
+    /// spell is a complaint we go on mailing.
+    #[tokio::test]
+    async fn a_complaint_naming_a_display_name_address_is_suppressed_not_dead_lettered() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let complaint = r#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_31","from":"lena@agents.example.com",
+                     "to":["Angry Prospect <Angry@Prospect.Example>"]}}"#;
+
+        read_delivery(&db, tenant, complaint, now)
+            .await
+            .expect("a complaint is never a handler error, whatever shape the address arrived in");
+
+        assert_eq!(
+            refusals(&db, tenant).await.len(),
+            1,
+            "the trail row is the record either way and must survive the address"
+        );
+        assert_eq!(
+            suppressed(&db, tenant).await,
+            vec![("angry@prospect.example".to_owned(), "complaint".to_owned())],
+            "the same person, in the same spelling the STOP door would have written — \
+             `contact_of` drops the display name and the two doors are one story"
+        );
     }
 
     #[tokio::test]

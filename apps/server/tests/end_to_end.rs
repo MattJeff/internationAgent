@@ -71,7 +71,15 @@ const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 /// How long the provisioning loop gets to converge eleven steps against mock
 /// adapters. It normally takes well under a second; this is the "it is wedged"
 /// deadline, not the expected one.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(30);
+///
+/// Raised from 30s after it fired for real on 2026-08-28, with three sibling
+/// worktrees compiling on the same machine: 31s under load against 5s isolated.
+/// Nothing was wedged. A deadline that only holds on an idle machine is worse
+/// than a slow one — it fails where the work is, teaches whoever sees it to
+/// re-run without reading, and the day it means something nobody believes it.
+/// Since this bound is never reached when the loop is healthy, making it
+/// generous costs a green run nothing and costs a wedged one only patience.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Harness

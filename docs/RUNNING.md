@@ -1,6 +1,6 @@
 # The company, running
 
-*Last walked: 2026-08-28 (second pass, after wave O).*
+*Last walked: 2026-08-28 (third pass, after waves O, P and Q).*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -75,12 +75,14 @@ expensive defect available in this product.
 | Duration → forecast | built | `/v1/forecast`, `forecast.rs` |
 | Duration → enforced stop | built | `company_windows` (0054), `halt.rs`, `PUT /v1/window` |
 | A new company gets one | built, **required** | `POST /v1/companies` refuses without `window_ends_at` |
-| **Hiring into a company with no window** | **still open** | `POST /v1/org` does not ask; every company built before today came through it |
+| Hiring into a company with no window | allowed, on purpose | hiring is not acting: the seat is inert until a window exists |
+| **Provisioning during a stop** | **open, and it spends money** | `loops/provisioning.rs` filters neither halts nor windows |
 | Initiatives | built | `initiative.rs`, `loops/initiative.rs` |
 | Employees talk to each other | built | `a2a.rs` |
 | Browser | built | `browser.rs`, `effects.rs` |
 | Email | built | `providers/src/email.rs`, `email_resend.rs` |
-| **Inbound STOP → suppression** | **absent** | nothing reads the reply we ask for |
+| Inbound STOP → suppression | built | `inbound.rs::land`, and the quote is cut first |
+| Provider refusal → suppression | built | `inbound.rs::record_refusal`, gated on `permanent` |
 | Work queues | built | `outbox.rs`, `queue.rs` |
 | Chases (follow-ups) | built | `vertical.rs`, `due_chase` |
 | New turns | built | `turn.rs` |
@@ -97,12 +99,31 @@ without one** — optional would have handed the hurried caller the pre-0054
 behaviour as the silent consequence of a missing field, and a default duration
 would be a price nobody here may invent.
 
-What is still open is `POST /v1/org`, the *editing* door: it hires into a
-company that has no window and does not ask for one. Every company standing
-today came through it. Closing it means deciding that hiring is forbidden where
-there is no clock, which is a wider blast radius than one route — and there is
-still no backfill, because a backfill needs a default duration, which is the one
-thing that is the founder's to choose.
+`POST /v1/org`, the *editing* door, still hires into a company with no window,
+and that is now a decision rather than an oversight. **Hiring is not acting.** No
+route reads `halt::halted` before hiring — not even under a manual stop — so
+refusing a hire on an expired window would make a calendar stricter than the
+emergency switch, which carries a human's sentence and no date. And the seat is
+inert anyway: it cannot take a turn, be claimed by the outbox or the initiative
+loop, or have a token minted for it, because all four read `halted()`.
+
+**What is genuinely open is provisioning, and it spends real money.**
+`loops/provisioning.rs`'s claim filters neither `company_halts` nor
+`company_windows`, and runs on `admin_tx_bypassing_rls`. So the eleven resources
+a hire leaves `pending` — mailboxes, phone numbers — are bought for a company
+that is stopped. This module argues, correctly, that half-covering convergence
+is worse than not covering it: interrupting one leaves resources bought and
+unbound, which is what `GET /v1/inventory/stranded` exists to find.
+
+That argument was written when a stop was rare, brief, and thrown by a human who
+meant to lift it. Since `0054` a company stops **by itself, on a date, and can
+stay stopped for weeks**, which turns "we buy anyway" from an hour's tolerance
+into a standing bill. The wedge the old argument misses: *not starting* a
+convergence that has bought nothing yet strands nothing at all, and is not the
+same act as interrupting one in flight.
+
+There is still no backfill for companies that predate `0054`, because a backfill
+needs a default duration, and a duration is a price.
 
 The shape it shipped in: **an expired window IS a halt.** It surfaces through
 `halt::halted()` with its own sentence, so every place that already respects the
@@ -126,11 +147,27 @@ a `const` block makes the lazy answer a compile error), and `EmailProvider` on
 variant — an email adapter's whole job is putting mail in front of people, so
 there is nothing left to be lazy about).
 
-What none of that fixes: **the only production writer of a `suppressions` row is
-`queue::reconcile_opt_outs`, which reads the campaign platform.** Every outbound
-message carries `vertical::OPT_OUT` inviting the recipient to reply STOP, and no
-production path turns that reply into a suppression. The declarations are now
-mandatory; the readers behind them are not built.
+There are now **three** production writers of a `suppressions` row: the campaign
+platform's own list (`queue::reconcile_opt_outs`), a reply that asks not to be
+contacted (`inbound.rs::land`), and a provider reporting a permanent refusal
+(`record_refusal`). Every outbound message carries `vertical::OPT_OUT` inviting
+the recipient to reply STOP, and that word finally does something.
+
+Two details worth keeping, because both were nearly wrong:
+
+* **The quotation cut is what makes a bare STOP work at all.** Our own footer
+  contains the word and every mail client re-quotes it, so a rule that searches
+  the whole message silences everyone who replies, and a length-bounded one
+  never fires.
+* **A bounce only counts when the provider itself calls it permanent.**
+  `suppressions` takes no DELETE, so a full mailbox or a weekend outage read as
+  a refusal removes a live customer with no way back — and nobody would find
+  out, because the mail simply stops and the trail says it was asked for.
+
+Third writer, third guard: `record_refusal` shipped without the
+`EmailAddress::parse` its two siblings run first, so a complaint whose address
+carried a display name rolled its own audit row back and dead-lettered. Found by
+a pass whose only job was to look at the seams.
 
 **There is no ready-made org chart.** `POST /v1/companies` stands a whole
 company from one call, but the founder describes every team in it. Nothing
