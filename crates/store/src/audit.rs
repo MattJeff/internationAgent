@@ -141,6 +141,21 @@ pub enum AuditKind {
     EmployeeLifecycleChanged,
     ResourceStateChanged,
     ApprovalDecided,
+    /// A human answered a capability request — see [`crate::capability`].
+    /// Written by `routes::approvals::decide_capability`, in the transaction
+    /// that writes the `capability_decisions` row.
+    ///
+    /// Its own kind rather than [`AuditKind::ApprovalDecided`], because the two
+    /// are not the same event and the difference is the one somebody will be
+    /// checking: an approval decision **released an effect** — an
+    /// `Authorized` was minted and a payment moved — while this one released
+    /// nothing at all. It is a recorded intention about a policy an operator
+    /// still has to install by hand. Sharing a kind would make "how many
+    /// approvals did we grant last month" count sentences alongside payments.
+    ///
+    /// Nor [`AuditKind::PolicyChanged`], for the mirror reason: no policy
+    /// changed. That is the whole design of the surface.
+    CapabilityDecided,
     /// A message arrived. Written by `app::inbound::land`, in the transaction
     /// that inserts the `messages` row and wakes the agent, so the trail cannot
     /// claim a message the conversation does not have.
@@ -207,6 +222,7 @@ impl AuditKind {
             AuditKind::EmployeeLifecycleChanged => "employee_lifecycle_changed",
             AuditKind::ResourceStateChanged => "resource_state_changed",
             AuditKind::ApprovalDecided => "approval_decided",
+            AuditKind::CapabilityDecided => "capability_decided",
             AuditKind::MessageReceived => "message_received",
             AuditKind::MessageSigned => "message_signed",
             AuditKind::ProviderCallAttempted => "provider_call_attempted",

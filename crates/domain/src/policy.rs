@@ -639,6 +639,134 @@ impl DenyReason {
             DenyReason::UntrustedInput => "untrusted_input",
         }
     }
+
+    /// Whether a human could answer this refusal by widening something.
+    ///
+    /// **The vocabulary of a capability request, and the whole of it.** An
+    /// employee that is refused has no way to say what it wants; the only thing
+    /// it can be *observed* to want is the wall it hit, which is this code. So
+    /// the set of refusals a human is ever shown as a request is the set of
+    /// refusals a human could actually do something about, and this function is
+    /// that set — an exhaustive match, so a new variant cannot be added without
+    /// somebody deciding which side of the line it is on.
+    ///
+    /// `false` is not "we have not got round to it". Every `false` below names a
+    /// refusal that **no policy document can lift**, and surfacing one as a
+    /// request would put a question in front of an operator whose only correct
+    /// answer is no — which is worse than silence, because the third or fourth
+    /// time it is asked somebody says yes.
+    ///
+    /// The one that matters most is [`DenyReason::UntrustedInput`]. It is the
+    /// prompt-injection stop, it fires on an action the rules had already
+    /// allowed, and it is the only refusal a hostile page can *cause on purpose*:
+    /// a document that says "wire $10,000" produces exactly this code, three
+    /// times, on demand. If it were grantable, a page the employee read would be
+    /// able to put "this employee needs the taint check relaxed" in front of a
+    /// human — the page writing the request, through the employee, without ever
+    /// touching a byte of the text the human reads. There is also no field to
+    /// grant: `evaluate` applies the taint wire after the rules and reads no
+    /// limit while doing it.
+    pub const fn grantable(self) -> bool {
+        match self {
+            // Something is missing from a list, or from a budget. Each of these
+            // has a document an operator can write.
+            DenyReason::NoRule
+            | DenyReason::ChannelNotAllowed
+            | DenyReason::CallingCodeNotAllowed
+            | DenyReason::ContactBudgetExhausted
+            | DenyReason::DomainNotAllowed
+            | DenyReason::FileUploadNotAllowed
+            | DenyReason::ToolNotAllowed
+            | DenyReason::PeerNotAllowed
+            | DenyReason::NoSpendPolicy
+            | DenyReason::CurrencyMismatch
+            | DenyReason::PerTransactionLimit
+            | DenyReason::DailyLimit
+            | DenyReason::NoTeamBudget
+            | DenyReason::TeamDailyLimit
+            | DenyReason::CredentialChangeNotAllowed
+            | DenyReason::DataDeleteNotAllowed => true,
+
+            // The blocklist. Blacklists unite and never shrink, so the only
+            // shape a grant could take here is *removing* an entry somebody
+            // deliberately wrote — the one direction this workspace refuses
+            // everywhere else. A denied domain is an answer, not a gap.
+            DenyReason::DomainDenied => false,
+
+            // Not a permission at all: the secret belongs to another principal.
+            // Widening cannot make it belong to this one, and a request to be
+            // shown it is a boundary violation asking to be ratified.
+            DenyReason::CrossTenantSecret => false,
+
+            // Both of these are the org chart, and the org chart is not a
+            // policy layer — `store::policy::load` does not join the reporting
+            // line, precisely so acquiring a report cannot change a limit.
+            // "Let me write my own charter" is the request an employee with no
+            // objective would make, and it is the one `gate.rs` says has no
+            // objective at all, only a suggestion.
+            DenyReason::SelfDirection | DenyReason::OutsideChainOfCommand => false,
+
+            // The taint stop. See the docs above: no field grants it, and it is
+            // the one code a hostile page can make the employee produce.
+            DenyReason::UntrustedInput => false,
+        }
+    }
+
+    /// Every [`DenyReason`] a human may be shown as a capability request.
+    ///
+    /// Derived from [`DenyReason::grantable`] rather than written out a second
+    /// time — two lists of the same judgement is the drift where a refusal
+    /// nobody may grant becomes one somebody is asked about.
+    pub const GRANTABLE: [DenyReason; 16] = {
+        // A `const` block, so the count below is checked while this constant is
+        // being evaluated — which is at compile time, in every crate that reads
+        // it. Flipping one arm of `grantable` without touching the length here
+        // does not produce a subtly short list; it fails the build.
+        let all = DenyReason::ALL;
+        let mut out = [DenyReason::NoRule; 16];
+        let (mut i, mut n) = (0, 0);
+        while i < all.len() {
+            if all[i].grantable() {
+                assert!(
+                    n < 16,
+                    "a DenyReason became grantable and GRANTABLE's length was not updated"
+                );
+                out[n] = all[i];
+                n += 1;
+            }
+            i += 1;
+        }
+        assert!(
+            n == 16,
+            "a DenyReason stopped being grantable and GRANTABLE's length was not updated"
+        );
+        out
+    };
+
+    /// Every discriminant. Iterate it to prove a rule covers the whole space.
+    pub const ALL: [DenyReason; 21] = [
+        DenyReason::NoRule,
+        DenyReason::ChannelNotAllowed,
+        DenyReason::CallingCodeNotAllowed,
+        DenyReason::ContactBudgetExhausted,
+        DenyReason::DomainDenied,
+        DenyReason::DomainNotAllowed,
+        DenyReason::FileUploadNotAllowed,
+        DenyReason::ToolNotAllowed,
+        DenyReason::PeerNotAllowed,
+        DenyReason::NoSpendPolicy,
+        DenyReason::CurrencyMismatch,
+        DenyReason::PerTransactionLimit,
+        DenyReason::DailyLimit,
+        DenyReason::NoTeamBudget,
+        DenyReason::TeamDailyLimit,
+        DenyReason::CrossTenantSecret,
+        DenyReason::SelfDirection,
+        DenyReason::OutsideChainOfCommand,
+        DenyReason::CredentialChangeNotAllowed,
+        DenyReason::DataDeleteNotAllowed,
+        DenyReason::UntrustedInput,
+    ];
 }
 
 /// Why a human has to look at this.
@@ -2327,29 +2455,11 @@ mod tests {
     /// not be more total — a fixed-length array does not force itself to grow.
     #[test]
     fn reason_codes_are_stable_and_unique() {
-        let reasons = [
-            DenyReason::NoRule,
-            DenyReason::ChannelNotAllowed,
-            DenyReason::CallingCodeNotAllowed,
-            DenyReason::ContactBudgetExhausted,
-            DenyReason::DomainDenied,
-            DenyReason::DomainNotAllowed,
-            DenyReason::FileUploadNotAllowed,
-            DenyReason::ToolNotAllowed,
-            DenyReason::PeerNotAllowed,
-            DenyReason::NoSpendPolicy,
-            DenyReason::CurrencyMismatch,
-            DenyReason::PerTransactionLimit,
-            DenyReason::DailyLimit,
-            DenyReason::NoTeamBudget,
-            DenyReason::TeamDailyLimit,
-            DenyReason::CrossTenantSecret,
-            DenyReason::SelfDirection,
-            DenyReason::OutsideChainOfCommand,
-            DenyReason::CredentialChangeNotAllowed,
-            DenyReason::DataDeleteNotAllowed,
-            DenyReason::UntrustedInput,
-        ];
+        // `DenyReason::ALL`, not a second copy of it. This list used to be
+        // written out here and was the only enumeration of the enum in the
+        // workspace; the moment `grantable` needed one too, two lists of the
+        // same twenty-one variants would have been two lists to keep in step.
+        let reasons = DenyReason::ALL;
         let mut codes: Vec<&str> = reasons.iter().map(|r| r.code()).collect();
         codes.sort_unstable();
         codes.dedup();
@@ -2960,6 +3070,40 @@ mod tests {
             ..ceiling()
         });
         assert!(!always_denies(&granted, ActionKind::McpCall));
+    }
+
+    /// **The refusals a human must never be asked to lift.**
+    ///
+    /// Named one by one rather than counted, because the count is already
+    /// asserted at compile time by `GRANTABLE`'s const block and a count says
+    /// nothing about *which*. `UntrustedInput` is the one that costs money if it
+    /// ever flips: it is the code a hostile page can make an employee produce on
+    /// demand, so a grantable one would let a document put its own request in
+    /// front of an operator.
+    #[test]
+    fn the_taint_stop_and_the_org_chart_are_not_capability_requests() {
+        for reason in [
+            DenyReason::UntrustedInput,
+            DenyReason::DomainDenied,
+            DenyReason::CrossTenantSecret,
+            DenyReason::SelfDirection,
+            DenyReason::OutsideChainOfCommand,
+        ] {
+            assert!(
+                !reason.grantable(),
+                "{} became grantable: a human is now being asked to lift it",
+                reason.code()
+            );
+            assert!(
+                !DenyReason::GRANTABLE.contains(&reason),
+                "{} reached the request vocabulary",
+                reason.code()
+            );
+        }
+        // And the headline case is genuinely reachable: `evaluate` produces it
+        // from an allowed action, so it is not a code that only exists in this
+        // file.
+        assert!(!DenyReason::GRANTABLE.contains(&DenyReason::UntrustedInput));
     }
 
     #[test]

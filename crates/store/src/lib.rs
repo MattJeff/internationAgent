@@ -6,6 +6,7 @@ pub mod a2a; // U28
 pub mod api_keys; // wave J: a keyring that outlives the deployment that made it
 pub mod approvals; // U13
 pub mod audit; // U11
+pub mod capability; // wave K: the tool an employee is missing, derived from the refusals
 pub mod db; // U6
 pub mod employee; // U7
 pub mod halt; // wave J: the switch that stops a whole company
