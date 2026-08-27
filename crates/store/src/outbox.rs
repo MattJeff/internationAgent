@@ -67,6 +67,55 @@ use crate::db::{StoreError, TenantTx};
 /// short enough that a genuinely poisoned event reaches a human the same day.
 pub const MAX_ATTEMPTS: i32 = 8;
 
+/// The floor under a claim's `available_at`, in seconds: how long a claimed
+/// event is guaranteed to stay off the queue before any other poller may take
+/// it.
+///
+/// # The bug it closes
+///
+/// The backoff *is* the lease — see [`claim`] — and on the first attempt the
+/// backoff was `2^0 = 1` second times a jitter factor in `[0.5, 1.5)`: between
+/// half a second and a second and a half. One of the rows in this table is a
+/// requested agent turn, and `apps/server`'s `TURN_DEADLINE` gives a turn **120
+/// seconds**. So a second replica reclaimed the row about a second into a
+/// two-minute turn and took the same turn again: two model calls billed to the
+/// customer's own key for one event, with nothing failed, nothing denied and no
+/// row out of place. The only trace is the bill. This is not hypothetical
+/// either — [`POLLER_HEADROOM`] sizes this very query for four replicas.
+///
+/// # Added to the backoff, not `greatest`-ed with it
+///
+/// `greatest(120s, 2^n)` is the obvious spelling and it deletes the schedule it
+/// is protecting. [`MAX_ATTEMPTS`] is 8, so the largest exponential term an
+/// event ever reaches is `2^7 = 128` seconds: seven of the eight attempts would
+/// land on *exactly* 120, with no growth and — worse — **no jitter**, which is
+/// the property that stops a thousand events queued by one provider outage from
+/// coming back as one herd. Adding keeps every property the schedule had. Still
+/// jittered, still doubling, still capped (now at `120s + 1h`), and never
+/// shorter than the work it protects.
+///
+/// # One number for every event type, deliberately
+///
+/// The outbox also carries mail, webhooks and provisioning, whose handlers are
+/// nowhere near two minutes, and a lease per event type would let each of them
+/// retry sooner. It would also have to be *updated by whoever adds the next
+/// event type*, and the failure of forgetting is silent: it is this exact
+/// double-charge, back again, on the row nobody thought about. A single global
+/// floor cannot be forgotten. What it costs is that every retry of every kind is
+/// two minutes later than it was, and that eight attempts now take about twenty
+/// minutes rather than four — which this table wanted anyway; see
+/// [`requeue_dead_letters`] on how little four minutes is worth to a tenant who
+/// is still pasting in an API key.
+///
+// ponytail: the ceiling is a poller holding many leases at once.
+// `apps/server/src/loops/outbox.rs` claims a batch of 32 and runs one tenant's
+// events one after another, so a tenant that fills a batch alone can still have
+// its last event's lease expire while its first event is running. The upgrade is
+// to make this an argument each poller sizes from its own batch shape rather
+// than a constant; it is the same double-run one order of magnitude rarer, and
+// a floor that covers the common case is not the place to solve it.
+pub const LEASE_SECS: i64 = 120;
+
 /// The key the W3C `traceparent` is carried under inside `payload`.
 ///
 /// It rides in the payload rather than in a column of its own so that it
@@ -260,10 +309,13 @@ pub async fn enqueue(
 /// * `attempt_count + 1` — counted at claim time, not at failure time, so a
 ///   worker that is *killed* mid-handler still burns an attempt. Counting on
 ///   failure would let a poison event that segfaults the handler retry forever.
-/// * `available_at` pushed out by an exponential backoff with jitter — the
-///   lease. `2^attempt` seconds, capped at an hour, multiplied by a random
-///   factor in `[0.5, 1.5)` so that a thousand events queued by one outage do
-///   not come back in a thundering herd.
+/// * `available_at` pushed out by [`LEASE_SECS`] **plus** an exponential
+///   backoff with jitter — the lease. `2^attempt` seconds, capped at an hour,
+///   multiplied by a random factor in `[0.5, 1.5)` so that a thousand events
+///   queued by one outage do not come back in a thundering herd, all of it on
+///   top of a floor long enough to outlast the longest handler this table
+///   feeds. [`LEASE_SECS`] argues why the two terms are added rather than
+///   `greatest`-ed.
 ///
 /// Rows that have reached [`MAX_ATTEMPTS`] are not selected. See
 /// [`dead_letters`].
@@ -358,13 +410,18 @@ pub enum Aggregates<'a> {
 /// candidate set actually contains. At 1 the second replica would come back
 /// empty — a throughput cliff that appears the day someone adds a pod.
 ///
+/// [`crate::initiative::claim_due`] is the same query shape over
+/// `employee_initiative` and reads this rather than declaring a second four:
+/// the number answers "how many replicas may fill a batch from one tenant", and
+/// a deployment does not run two different counts of itself.
+///
 /// ponytail: four, so four replicas can each fill a batch from a single tenant
 /// before the fifth comes back short. The ceiling is real and it is a *rate*
 /// limit, not a correctness one — nothing is lost, the next tick takes it. The
 /// upgrade, if a deployment ever runs more pollers than this, is to raise the
 /// number; it costs one index range scan of `limit` more rows per tenant per
 /// tick, against an index that exists for exactly this scan.
-const POLLER_HEADROOM: i64 = 4;
+pub(crate) const POLLER_HEADROOM: i64 = 4;
 
 /// [`claim`], restricted to one side of the aggregate partition.
 ///
@@ -435,8 +492,10 @@ const POLLER_HEADROOM: i64 = 4;
 ///   claiming 13, then 16, against a limit of 10.
 /// * `attempt_count + 1` — counted at claim time, so a worker that is *killed*
 ///   mid-handler still burns an attempt.
-/// * `available_at` pushed out by an exponential backoff with jitter — the
-///   lease, which expires by itself.
+/// * `available_at` pushed out by [`LEASE_SECS`] plus an exponential backoff
+///   with jitter — the lease, which expires by itself. The floor is what makes
+///   it a lease rather than a coin toss: without it the first claim held the row
+///   for about a second against a handler that may run for two minutes.
 pub async fn claim_of(
     conn: &mut PgConnection,
     aggregates: Aggregates<'_>,
@@ -508,6 +567,7 @@ pub async fn claim_of(
          UPDATE outbox_events AS e \
          SET attempt_count = e.attempt_count + 1, \
              available_at = $1::timestamptz \
+                 + interval '1 second' * $7::bigint \
                  + least(interval '1 second' \
                          * power(2::double precision, e.attempt_count::double precision), \
                          interval '1 hour') \
@@ -522,6 +582,7 @@ pub async fn claim_of(
     .bind(only)
     .bind(except)
     .bind(POLLER_HEADROOM)
+    .bind(LEASE_SECS)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -1043,6 +1104,75 @@ mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// **Two pollers must not take the same turn, and the lease is the only
+    /// thing stopping them.**
+    ///
+    /// `apps/server` puts a requested agent turn in this table and gives it
+    /// `TURN_DEADLINE` — 120 seconds — to finish, and [`claim`] deliberately
+    /// commits before the handler runs, so once the claiming transaction is gone
+    /// `available_at` is the whole of what holds the row. Until [`LEASE_SECS`]
+    /// existed the first claim pushed it out by `2^0` seconds times a jitter
+    /// factor — between half a second and a second and a half. A second replica
+    /// therefore took the row about a second into the turn and ran the same turn
+    /// again, on the customer's own model key, for one event. No error, no
+    /// denial, no row out of place; the only trace is a bill that is twice what
+    /// it should be.
+    ///
+    /// So this asserts two claims of one row while a turn is in flight, not a
+    /// number of seconds: a **second poller on its own committed transaction**,
+    /// coming back empty at every instant the first one may still be thinking.
+    /// And then finding the row again once no turn could still be running,
+    /// because a lease that does not expire is a queue that loses work.
+    #[tokio::test]
+    async fn a_second_poller_cannot_reclaim_an_event_while_the_first_is_still_handling_it() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let tenant = seed_tenant(&db, "lease").await;
+
+        let id = enqueue_committed(&db, tenant, &event(1), at(T0)).await;
+
+        // Replica A claims and commits, which is exactly what
+        // `loops::outbox::tick` does before it calls the first handler. From
+        // here on nothing but `available_at` is between this row and anyone
+        // else, and A is going to be busy for `TURN_DEADLINE`.
+        let mut a = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let taken = claim(&mut a, 10, at(T0)).await.expect("claim");
+        a.commit().await.expect("commit the lease");
+        assert_eq!(taken.iter().map(|e| e.id).collect::<Vec<_>>(), vec![id]);
+
+        // Replica B, across the whole window A's turn may occupy. Three seconds
+        // rather than one: the old backoff was jittered up to 1.5s, so at one
+        // second this would have been a coin toss instead of a failure.
+        for elapsed in [3, 30, LEASE_SECS - 1, LEASE_SECS] {
+            let mut b = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            let stolen = claim(&mut b, 10, at(T0 + elapsed)).await.expect("claim");
+            b.rollback().await.expect("rollback");
+            assert!(
+                stolen.is_empty(),
+                "a second poller reclaimed the event {elapsed}s into a turn that \
+                 gets {LEASE_SECS}s: both replicas run it, and the customer is \
+                 billed twice on their own model key for one event"
+            );
+        }
+
+        // A lease, not a grave. A replica that died mid-turn must not take the
+        // event with it, so past the floor plus its backoff the row is due again.
+        let mut c = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let back = claim(&mut c, 10, at(T0 + LEASE_SECS + 2))
+            .await
+            .expect("claim");
+        c.rollback().await.expect("rollback");
+        assert_eq!(
+            back.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![id],
+            "the lease never expired: a poller that dies mid-handler takes the \
+             event with it and the side effect never happens"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
     // -- backoff and dead-lettering ---------------------------------------
 
     /// A handler that never succeeds must not spin. Each claim waits longer
@@ -1084,22 +1214,30 @@ mod tests {
             now += TimeDelta::hours(2);
         }
 
-        // 2^(attempt-1) seconds with jitter in [0.5, 1.5), capped at an hour.
+        // `LEASE_SECS`, then 2^(attempt-1) seconds with jitter in [0.5, 1.5),
+        // the exponential capped at an hour. The floor is *added* to the
+        // backoff rather than max'd with it exactly so that this assertion
+        // still has a schedule to make: `greatest(120s, 2^n)` would flatten
+        // seven of these eight to precisely 120 and take the jitter with them.
+        let floor = LEASE_SECS as f64;
         for (i, delay) in delays.iter().enumerate() {
             let base = 2f64.powi(i as i32).min(3600.0);
             let secs = delay.as_seconds_f64();
             assert!(
-                secs >= base * 0.5 && secs < base * 1.5,
+                secs >= floor + base * 0.5 && secs < floor + base * 1.5,
                 "attempt {} backed off {secs}s, expected [{}, {})",
                 i + 1,
-                base * 0.5,
-                base * 1.5
+                floor + base * 0.5,
+                floor + base * 1.5
             );
         }
-        // It really did grow — the first wait is about a second, the last is
-        // minutes. (Jitter overlaps between adjacent attempts, so compare ends.)
+        // It really did grow, and the growth is measured *above* the lease —
+        // that part is the backoff, the floor below it is the turn it protects.
+        // The first wait is about a second of it and the last is over a minute.
+        // (Jitter overlaps between adjacent attempts, so compare the ends.)
+        let backoff_of = |d: &TimeDelta| d.as_seconds_f64() - floor;
         assert!(
-            delays[delays.len() - 1] > delays[0] * 10,
+            backoff_of(&delays[delays.len() - 1]) > backoff_of(&delays[0]) * 10.0,
             "backoff did not grow: {delays:?}"
         );
 
@@ -1401,9 +1539,9 @@ mod tests {
         tx.commit().await.expect("commit release");
 
         // Claimed at the same instant as the first claim, so the running
-        // company's row — pushed at least half a second out by its own backoff
-        // — is deterministically not due and this assertion is about the
-        // deferred row alone.
+        // company's row — pushed `LEASE_SECS` plus its own backoff out by the
+        // claim that took it — is deterministically not due and this assertion
+        // is about the deferred row alone.
         let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
         let after = claim(&mut conn, 10, at(T0 + 1)).await.expect("claim");
         conn.commit().await.expect("commit claim");

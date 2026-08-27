@@ -278,21 +278,101 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 /// A CTE is evaluated exactly once, whatever else is happening on the table.
 /// `MATERIALIZED` is stated rather than relied on: PostgreSQL 12 began inlining
 /// CTEs referenced once, and an inlined one is a subquery again.
+///
+/// # Round-robin, and why FIFO was the wrong queue discipline here too
+///
+/// This selection used to be `ORDER BY next_at, employee_id` over the whole
+/// table, across every tenant. Nothing leaks that way and no lock is held — and
+/// a customer's employees still stop acting because *another* customer has more
+/// of them. There is no ceiling on how many employees a tenant may schedule, a
+/// tenant on the five-minute floor has one due every five minutes per employee,
+/// `apps/server`'s initiative loop drains four at a time and each of those may
+/// be a model turn up to `TURN_DEADLINE`. So the position of a customer's
+/// employee in this queue is a function of how many employees the other
+/// customers have, and the symptom is that the company quietly does not act.
+///
+/// [`crate::outbox::claim_of`] found and fixed exactly this in the queue every
+/// *inbound* effect passes through; this is the queue every effect an employee
+/// starts **by itself** passes through, and the shape of the fix is the shape of
+/// that one, deliberately: `tenants` drives the selection, one `LATERAL` per
+/// tenant takes that tenant's earliest due employees, `row_number()` numbers the
+/// seats within a tenant, and the outer order is seat-first. A tenant with
+/// nobody due contributes nothing and costs one index probe. A tenant alone on
+/// the deployment still fills the whole batch — round-robin is not equal shares
+/// of a queue nobody else is using.
+///
+/// `0052_initiative_fair_claim` is the index the lateral reads, and it argues
+/// why it also drops the one this ordering used to need.
+///
+/// # `shortlist`, and why the lock is not taken in the lateral
+///
+/// The same two spellings [`crate::outbox::claim_of`] measured, with the same
+/// answer, and its doc comment carries the `EXPLAIN` numbers. In short: locking
+/// **inside** the lateral needs no shortlist, but takes a row lock on
+/// `tenants × limit` candidates to claim `limit` of them, which is a write
+/// amplification on the hottest statement here. Locking **once over a
+/// shortlist** takes exactly `limit` locks — but only if the candidates are cut
+/// down first, or the planner joins every seat back to `employee_initiative` and
+/// picks a hash join over a sequential scan of it, which is the one plan this
+/// change must not produce. Measured here, `due` is a nested loop on the primary
+/// key over four candidates.
+///
+/// # The `LIMIT` inside the lateral does not push down, and that is survivable
+///
+/// Measured, not assumed: `EXPLAIN (ANALYZE)` against 10 000 due schedules
+/// across 52 tenants shows the lateral hash-joining `employees` to that tenant's
+/// due rows and *then* taking the top 16 — 192 rows read per tenant, not 16. The
+/// lifecycle predicate lives on `employees`, so PostgreSQL has to satisfy it
+/// before it may stop, and rewriting the join as an `EXISTS` semi-join changes
+/// nothing: the planner turns it straight back into the same hash semi-join.
+///
+/// [`crate::outbox::claim_of`] gets the pushdown because its lateral touches one
+/// table. It also *needs* it, and this does not, because the two tables are not
+/// the same kind of thing. `outbox_events` is a queue with no ceiling on what
+/// one tenant may put in it; `employee_initiative` holds **exactly one row per
+/// employee, permanently**, so the scan is bounded by the deployment's headcount
+/// rather than by a backlog, and only the rows that are actually due are read.
+/// The measurement above is the worst case that shape allows — every employee of
+/// every tenant overdue at the same instant — and it is index scans throughout,
+/// four rows locked, about 7 ms, with no sequential scan of either table.
+///
+/// ponytail: so the ceiling is one tenant's own due headcount per tick, and the
+/// upgrade if a deployment ever gets big enough to feel it is to denormalise
+/// `lifecycle` onto this table and put it in the index — which costs a column
+/// that can go stale, and the module docs above explain why that trade is
+/// currently refused.
 pub async fn claim_due(
     conn: &mut PgConnection,
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<Due>, StoreError> {
     let rows = sqlx::query(
-        "WITH due AS MATERIALIZED ( \
-             SELECT i2.employee_id \
-               FROM employee_initiative i2 \
-               JOIN employees e2 ON e2.id = i2.employee_id \
-                                AND e2.tenant_id = i2.tenant_id \
-              WHERE e2.lifecycle = $3::text \
-                AND i2.next_at <= $1::timestamptz \
-              ORDER BY i2.next_at, i2.employee_id \
-                FOR UPDATE OF i2 SKIP LOCKED \
+        "WITH seated AS MATERIALIZED ( \
+             SELECT q.employee_id, q.next_at, q.seat \
+               FROM tenants t \
+               CROSS JOIN LATERAL ( \
+                   SELECT top.employee_id, top.next_at, \
+                          row_number() OVER (ORDER BY top.next_at, top.employee_id) AS seat \
+                     FROM (SELECT i2.employee_id, i2.next_at \
+                             FROM employee_initiative i2 \
+                             JOIN employees e2 ON e2.id = i2.employee_id \
+                                              AND e2.tenant_id = i2.tenant_id \
+                            WHERE i2.tenant_id = t.id \
+                              AND e2.lifecycle = $3::text \
+                              AND i2.next_at <= $1::timestamptz \
+                            ORDER BY i2.next_at, i2.employee_id \
+                            LIMIT $2::bigint * $4::bigint) top \
+               ) q \
+         ), shortlist AS MATERIALIZED ( \
+             SELECT employee_id, seat, next_at FROM seated \
+              ORDER BY seat, next_at, employee_id \
+              LIMIT $2::bigint * $4::bigint \
+         ), due AS MATERIALIZED ( \
+             SELECT i3.employee_id \
+               FROM shortlist c \
+               JOIN employee_initiative i3 ON i3.employee_id = c.employee_id \
+              ORDER BY c.seat, c.next_at, c.employee_id \
+                FOR UPDATE OF i3 SKIP LOCKED \
               LIMIT $2::bigint) \
          UPDATE employee_initiative AS i \
             SET next_at         = \
@@ -311,6 +391,7 @@ pub async fn claim_due(
     // `Lifecycle::as_str` and a rename is a compile error somewhere rather
     // than a poller that silently claims nothing.
     .bind(Lifecycle::Active.as_str())
+    .bind(crate::outbox::POLLER_HEADROOM)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -848,6 +929,72 @@ mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **One company's headcount must not decide when another company's
+    /// employees act.**
+    ///
+    /// Not a leak and not a lock: two tenants that never see a byte of each
+    /// other's data still share one schedule table, and this claim used to order
+    /// it `next_at, employee_id` across every tenant at once. So a customer's
+    /// employee is claimed at a position that is a function of *how many
+    /// employees the other customers have*, with no ceiling on that number —
+    /// while `apps/server`'s initiative loop drains four at a time and each of
+    /// those may be a full model turn. The company on the small plan watches its
+    /// one employee sit unclaimed because the company on the large plan hired.
+    ///
+    /// The numbers are the smallest that make the point: one tenant with more
+    /// overdue employees than a batch holds, another with one, scheduled so that
+    /// FIFO puts it behind all of them. What the claim owes the second tenant is
+    /// a seat, not a place in line.
+    #[tokio::test]
+    async fn one_tenants_headcount_does_not_push_another_tenant_out_of_the_batch() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let big = seed_tenant(&db, "fair-big").await;
+        let small = seed_tenant(&db, "fair-small").await;
+
+        const BATCH: i64 = 4;
+        const HEADCOUNT: usize = 20;
+
+        // `seed_due` backdates by ten hours, so every one of these is long
+        // overdue and they all sort ahead of anything scheduled later.
+        for n in 0..HEADCOUNT {
+            seed_due(&db, big, &format!("crowd{n}"), Lifecycle::Active).await;
+        }
+        // The small tenant's only employee, deliberately the *least* overdue row
+        // in the table: under FIFO it is last of twenty-one and a batch of four
+        // never reaches it.
+        let alone = seed_employee(&db, small, "alone", Lifecycle::Active).await;
+        let mut tx = db.tenant_tx(small).await.expect("tenant tx");
+        set(&mut tx, alone, hourly(), at(T0 - 2 * HOUR as i64))
+            .await
+            .expect("set");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim_due(&mut tx, BATCH, at(T0)).await.expect("claim");
+        tx.commit().await.expect("commit");
+
+        let ids: Vec<EmployeeId> = claimed.iter().map(|d| d.employee_id).collect();
+        assert_eq!(ids.len(), BATCH as usize, "the batch is still bounded");
+        assert!(
+            ids.contains(&alone),
+            "the small tenant's only employee was not claimed: another company's \
+             headcount decides when this company's employees get to act, and the \
+             customer sees nothing but silence"
+        );
+        // And the big tenant is not punished for being big — it fills every seat
+        // the others left. Fair is round-robin, not equal shares of a queue
+        // nobody else is using.
+        assert_eq!(
+            claimed.iter().filter(|d| d.tenant_id == big).count(),
+            BATCH as usize - 1
+        );
+
+        drop_tenant(&db, big).await;
+        drop_tenant(&db, small).await;
     }
 
     /// The poller is cross-tenant, and that is the feature. It must see both

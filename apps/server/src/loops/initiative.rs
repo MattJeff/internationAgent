@@ -1,11 +1,12 @@
 //! The initiative loop: an employee's own cadence becomes an agent turn.
 //!
 //! ```text
-//! admin tx:   claim_due(BATCH, now) ; COMMIT     <- cross-tenant, SKIP LOCKED
-//!   per employee:
-//!     tenant tx: load employee + Charter          <- no charter / gaps -> no turn
-//!     take_turn                                   <- gate, run, log
-//!     admin tx:  record_outcome ; COMMIT
+//! admin tx:   claim_due(BATCH, now) ; COMMIT     <- round-robin over tenants
+//!   per tenant, concurrently (MAX_CONCURRENT_TENANTS):
+//!     per employee of that tenant, in deadline order:
+//!       tenant tx: load employee + Charter        <- no charter / gaps -> no turn
+//!       take_turn                                 <- gate, run, log
+//!       admin tx:  record_outcome ; COMMIT
 //! sleep(IDLE) unless the batch came back full
 //! ```
 //!
@@ -133,6 +134,7 @@
 //! Nothing here escalates on exhaustion: `reserve` already raised the operator
 //! alert on the reservation that crossed the line, once, by construction.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -148,7 +150,7 @@ use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
-use agentos_domain::ids::Slug;
+use agentos_domain::ids::{Slug, TenantId};
 use agentos_domain::policy::{EffectivePolicy, ModelId, model_for};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
@@ -158,6 +160,8 @@ use agentos_store::model_usage::{self, Consumed};
 use agentos_store::policy as policy_store;
 use agentos_store::turns;
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -441,8 +445,8 @@ pub async fn run(db: Db, agent: Agent, cancel: CancellationToken) {
 /// production implementation and it is in [`run`].
 async fn drain<H, F>(db: &Db, take: &H, cancel: CancellationToken)
 where
-    H: Fn(Assignment) -> F,
-    F: Future<Output = Result<(), String>>,
+    H: Fn(Assignment) -> F + Clone + Send + Sync + 'static,
+    F: Future<Output = Result<(), String>> + Send,
 {
     tracing::info!("initiative loop started");
 
@@ -475,7 +479,42 @@ where
     tracing::info!("initiative loop stopped");
 }
 
+/// How many tenants' turns this loop runs at once.
+///
+/// **One, until this constant existed, and the customer's only symptom was
+/// silence.** The batch was drained with a plain `for` loop, so a tenant whose
+/// employee sat in front of yours held the worker for up to [`TURN_DEADLINE`] —
+/// and four of those is eight minutes during which this replica starts nothing
+/// else, for work that has nothing to do with you. `initiative::claim_due` now
+/// hands out one seat per tenant before any tenant gets a second, so a batch of
+/// four is typically four *different* companies queued behind each other; making
+/// the queue fair and then serving it one at a time fixes who is first and not
+/// how long anybody waits.
+///
+/// **Concurrent across tenants, sequential within one**, exactly as
+/// [`crate::loops::outbox`] drains its batch, and for the same reason: two
+/// employees of one company touch the same rows and the same per-day budget, and
+/// racing those buys latency and pays in write conflicts. Two different
+/// companies have no rows in common by construction.
+///
+/// ponytail: two, not the outbox poller's four, and the ceiling is the
+/// connection pool. `Db::connect` opens sixteen for the whole process; the
+/// outbox poller's four tenants hold up to two each across a turn, and the other
+/// loops and every HTTP handler draw from the same sixteen. A self-started turn
+/// is cheaper than an inbound one — `take_turn` deliberately has no transaction
+/// spanning it, so it takes short connections rather than holding one — but two
+/// is what fits without moving anybody else's headroom. It halves the worst-case
+/// pass from eight minutes to four; raise it and raise `max_connections` in the
+/// same commit, or the symptom is a pool acquire timeout that reads like a
+/// database problem and is not.
+const MAX_CONCURRENT_TENANTS: usize = 2;
+
 /// One pass: claim a batch of due employees and give each one its turn.
+///
+/// One task per tenant in the batch, that tenant's employees in order inside it,
+/// at most [`MAX_CONCURRENT_TENANTS`] running at once. The pass does not return
+/// until every one of them has finished, which is what keeps the next claim from
+/// overlapping the last — see [`drain`].
 ///
 /// Returns how many were claimed, so the caller can tell a quiet schedule from a
 /// busy one.
@@ -486,8 +525,12 @@ async fn tick<H, F>(
     now: DateTime<Utc>,
 ) -> Result<usize, StoreError>
 where
-    H: Fn(Assignment) -> F,
-    F: Future<Output = Result<(), String>>,
+    // `Clone + Send + 'static` is the price of a task per tenant, and it is paid
+    // by the closure rather than by the loop: `tokio::spawn` cannot borrow, so
+    // each task needs its own copy of whatever takes turns. Production's is
+    // [`run`]'s, which clones an `Agent` it already clones per turn.
+    H: Fn(Assignment) -> F + Clone + Send + Sync + 'static,
+    F: Future<Output = Result<(), String>> + Send,
 {
     let mut tx = db.admin_tx_bypassing_rls().await?;
     let batch = initiative::claim_due(&mut tx, BATCH, now).await?;
@@ -495,25 +538,66 @@ where
     // the claiming transaction is open, and holding one across a turn is holding
     // a row lock across the internet for two minutes.
     tx.commit().await?;
+    let claimed = batch.len();
 
-    for due in &batch {
-        // Shutdown does not have to wait out three more turns to notice. The
-        // employees not started here are not lost — they are rows whose deadline
-        // has passed, and the next tick or the next replica takes them.
-        if cancel.is_cancelled() {
-            tracing::info!("initiative loop cancelled mid-batch; the rest stay due");
-            break;
-        }
-
-        let span = tracing::info_span!(
-            "initiative_turn",
-            employee_id = %due.employee_id,
-            tenant_id = %due.tenant_id,
-            claims = due.claims,
-        );
-        handle(db, take, due, now).instrument(span).await;
+    // Grouped rather than sorted: a `HashMap` keyed on the tenant keeps each
+    // tenant's employees in the order the claim returned them, which is deadline
+    // order, and that ordering is the whole of what "sequential within a tenant"
+    // has to preserve.
+    let mut by_tenant: HashMap<TenantId, Vec<Due>> = HashMap::new();
+    for due in batch {
+        by_tenant.entry(due.tenant_id).or_default().push(due);
     }
-    Ok(batch.len())
+
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_TENANTS));
+    let mut running = JoinSet::new();
+    for employees in by_tenant.into_values() {
+        let db = db.clone();
+        let take = take.clone();
+        let cancel = cancel.clone();
+        let permits = Arc::clone(&permits);
+        running.spawn(async move {
+            // Taken inside the task rather than before the spawn, so the queue
+            // of waiting tenants is the semaphore's and not this function's.
+            // `expect`: the semaphore is never closed, it is dropped with this
+            // pass.
+            let _permit = permits.acquire_owned().await.expect("never closed");
+            for due in &employees {
+                // Shutdown does not have to wait out three more turns to notice.
+                // The employees not started here are not lost — they are rows
+                // whose deadline has passed, and the next tick or the next
+                // replica takes them.
+                if cancel.is_cancelled() {
+                    tracing::info!("initiative loop cancelled mid-batch; the rest stay due");
+                    break;
+                }
+
+                // `instrument`, not `span.enter()`: a guard held across an await
+                // is on whatever task the executor resumes next.
+                let span = tracing::info_span!(
+                    "initiative_turn",
+                    employee_id = %due.employee_id,
+                    tenant_id = %due.tenant_id,
+                    claims = due.claims,
+                );
+                handle(&db, &take, due, now).instrument(span).await;
+            }
+        });
+    }
+
+    // Drained rather than abandoned. A pass that returned early would let the
+    // next claim run beside turns that are still going, and the batch bound this
+    // loop is built around would stop bounding anything.
+    while let Some(finished) = running.join_next().await {
+        if let Err(err) = finished {
+            // `handle` itself cannot panic — every failure path in it records
+            // and returns — so this is a bug in whatever takes turns. The
+            // employees behind it keep their already-advanced deadline and come
+            // back on their next cadence rather than taking the loop down.
+            tracing::error!(error = %err, "an initiative turn task panicked; its tenant's remaining employees wait for their next cadence");
+        }
+    }
+    Ok(claimed)
 }
 
 /// Decide what one claimed employee's turn is, take it, and write down what
@@ -1795,6 +1879,73 @@ pub(crate) mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **One company's turn must not hold another company's turn.**
+    ///
+    /// `initiative::claim_due` made the *queue order* fair — every tenant is
+    /// offered a seat before any tenant is offered a second one — and that is
+    /// only half of it. A batch of four fair seats drained by a `for` loop is
+    /// four companies queued behind each other, each waiting up to
+    /// [`TURN_DEADLINE`] for turns that have nothing to do with them. Eight
+    /// minutes, with no error, no denial and nothing in the trail: the customer
+    /// sees an employee that did not act on its cadence.
+    ///
+    /// A counter cannot catch that — the sequential loop starts every employee
+    /// too, just later — so the assertion is a **rendezvous**. Two tenants, one
+    /// employee each, and a turn that does not return until the *other* tenant's
+    /// turn has also started. Under a sequential drain the first turn waits for a
+    /// second that cannot begin, and the only observable is that the pass never
+    /// ends; hence the timeout, which is the failure this test exists to report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_tenants_turn_does_not_hold_another_tenants_turn() {
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let first = seed_tenant(&db).await;
+        let second = seed_tenant(&db).await;
+        seed_due(&db, first, "alpha", Some(workable())).await;
+        seed_due(&db, second, "beta", Some(workable())).await;
+
+        // Two arrivals, so neither turn can finish until both have started.
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let started = Arc::new(AtomicUsize::new(0));
+        let counter = started.clone();
+        let take = move |_: Assignment| {
+            let gate = gate.clone();
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gate.wait().await;
+                Ok(())
+            }
+        };
+
+        let cancel = CancellationToken::new();
+        // Generous: this is not a latency assertion, it is the difference
+        // between "both turns are in flight" and "one of them can never start".
+        let pass = tokio::time::timeout(
+            Duration::from_secs(20),
+            tick(&db, &take, &cancel, Utc::now()),
+        )
+        .await;
+
+        let claimed = pass
+            .expect(
+                "the pass never finished: one tenant's turn is holding the other's, so a \
+                 batch of fair seats is still drained one company at a time and every \
+                 company after the first waits out TURN_DEADLINE for work that is not theirs",
+            )
+            .expect("tick");
+        assert_eq!(claimed, 2, "both tenants were claimed");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "both turns started, which is what let the rendezvous complete"
+        );
+
+        drop_tenant(&db, first).await;
+        drop_tenant(&db, second).await;
     }
 
     /// A suspended employee is not the loop's business, however overdue. Belt to
