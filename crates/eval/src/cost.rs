@@ -14,7 +14,9 @@
 //! prose cannot be re-run, so it is right on the day it is written and drifts
 //! silently forever after. This module is the fix, and it is small:
 //!
-//! * the arithmetic is [`Sample::monthly_usd`], one function, unit-tested;
+//! * the arithmetic is [`Sample::usd`], one function, unit-tested — and it lives
+//!   in [`agentos_domain::forecast`] now, because `apps/server`'s `/v1/forecast`
+//!   prices the asking tenant's own seats with the same one;
 //! * the inputs are [`RECORDED`] — the samples a real `--dry-run` printed;
 //! * the turns column is read out of `docs/orizn-roles/*.json`, the operator's
 //!   own documents, rather than restated;
@@ -68,53 +70,55 @@ use crate::{Row, Surface, Truth};
 // The rate card and the two ends of the range
 // ---------------------------------------------------------------------------
 
-/// USD per million tokens, in and out, for one model.
+/// **The rate card, the samples and the one multiplication now live in
+/// [`agentos_domain::forecast`]**, and this re-export is what keeps every name
+/// in this file — and in [`crate::dryrun`] — spelled the way it always was.
 ///
-/// **The one thing in this crate that comes from outside the repository**, and
-/// it is now four rows rather than one because seats no longer share a model.
-/// Published Anthropic first-party API list prices, read 2026-08-26:
+/// They moved because a second caller appeared: `apps/server`'s `/v1/forecast`
+/// prices *the asking tenant's* seats over *the window the founder picked*, and
+/// it cannot reach this crate — `agentos-eval` reads `docs/orizn-*.json` off the
+/// filesystem and exists to measure the server, not to be linked into it. Two
+/// implementations of one bill is two things that drift, which is the failure
+/// this whole module was written to end; one implementation in the crate both
+/// can see is not.
 ///
-/// | model | in | out |
-/// |---|---|---|
-/// | `claude-haiku-4-5` | $1.00 | $5.00 |
-/// | `claude-sonnet-5` | $3.00 | $15.00 |
-/// | `claude-opus-5` | $5.00 | $25.00 |
-/// | `claude-fable-5` | $10.00 | $50.00 |
+/// What did **not** move is anything about Orizn: [`seats`], [`charters`],
+/// [`PROSPECT`], [`DIGEST`] and [`headline`] are still here, because they are
+/// facts about one company rather than arithmetic.
+pub use agentos_domain::forecast::{FLOOR_CALLS_PER_TURN, RECORDED, Sample, rate_card};
+
+use agentos_domain::forecast::{MONTH_DAYS, spread};
+
+/// Dollars a month for **one seat**, at `calls_per_turn` model calls for each of
+/// `turns_per_day` reserved turns, billed at `model`'s rates.
 ///
-/// Every row is sourced. Nothing here is interpolated, averaged or guessed: a
-/// model with no published price would have no arm below and the build would
-/// stop, which is the same reason `ModelId` is a closed enum.
-///
-/// # Two things these prices are not
-///
-/// **They are not what a subscription costs.** Under the local `claude` CLI —
-/// which is what `--dry-run` and `--live` actually drive — no per-token invoice
-/// exists at all: the currency is a monthly seat and the binding constraint is
-/// *throughput*, not dollars. Every figure this module publishes is therefore
-/// the metered-API reading of a run that was not metered. See the `unmeasured`
-/// entry that says so.
-///
-/// **They are not the price on the day.** `claude-sonnet-5` is at an
-/// introductory $2.00/$10.00 through 2026-08-31, so the three seats on Sonnet
-/// bill about a third less than the arithmetic below says until then. The
-/// standard rate is used deliberately: a bill quoted at a rate that expires in
-/// five days is the kind of number `docs/ORIZN.md` published once already.
-pub const fn rate_card(model: ModelId) -> (f64, f64) {
-    match model {
-        ModelId::Haiku45 => (1.0, 5.0),
-        ModelId::Sonnet5 => (3.0, 15.0),
-        ModelId::Opus5 => (5.0, 25.0),
-        ModelId::Fable5 => (10.0, 50.0),
-    }
+/// A month of [`Sample::usd`], and nothing else: the arithmetic is one function
+/// and this only fixes its window at thirty days, which is what a *monthly*
+/// headline means and what an operator budgets in. `/v1/forecast` calls
+/// [`Sample::usd`] directly with the window it was asked about.
+pub fn monthly_usd(sample: Sample, model: ModelId, calls_per_turn: f64, turns_per_day: f64) -> f64 {
+    sample.usd(model, calls_per_turn, turns_per_day * MONTH_DAYS)
 }
 
-/// Days billed. A month, rounded the way an operator budgets one.
-const DAYS: f64 = 30.0;
+/// The whole company for a month, at a given rate: every seat at its own model,
+/// its own turn budget, summed.
+///
+/// **This is the function the old `measured_usd(turns_per_day)` became.** The old
+/// one took the sum of the turn budgets and multiplied once, which was exactly
+/// right while one model served every seat and is a category error now: five
+/// seats on three models is five multiplications, and the mix is most of the
+/// answer.
+pub fn company_usd(sample: Sample, calls_per_turn: f64) -> f64 {
+    seats()
+        .iter()
+        .map(|seat| monthly_usd(sample, seat.model, calls_per_turn, f64::from(seat.turns)))
+        .sum()
+}
 
-/// The floor: every reserved turn answered in a single round trip. This is what
-/// `docs/ORIZN.md` published as its estimate, and it is the cheapest arithmetic
-/// the system can produce rather than a prediction of anything.
-pub const FLOOR_CALLS_PER_TURN: f64 = 1.0;
+/// The same, at the calls-per-turn this sample recorded.
+pub fn measured_usd(sample: Sample) -> f64 {
+    company_usd(sample, sample.calls_per_turn)
+}
 
 /// The ceiling: every reserved turn running the loop to its budget.
 ///
@@ -128,109 +132,30 @@ pub fn ceiling_calls_per_turn() -> f64 {
 // What one run measured
 // ---------------------------------------------------------------------------
 
-/// One pass of the dry run, reduced to the three numbers the bill is made of.
-///
-/// Input tokens are `scoping::tokens` over the bytes **we** send — not the CLI's
-/// `input_tokens`, which bills the CLI's own system prompt and cache and is
-/// therefore a number about the CLI. Output tokens are the CLI's, because there
-/// is nothing else: the completion has not been weighed by anything of ours.
-#[derive(Debug, Clone, Copy)]
-pub struct Sample {
-    /// Model calls per reserved turn. Between 1 and [`ceiling_calls_per_turn`].
-    pub calls_per_turn: f64,
-    /// Prompt tokens per model call, by `scoping::tokens` (±20%).
-    pub input_tokens_per_call: f64,
-    /// Completion tokens per model call, as the CLI reported them.
-    pub output_tokens_per_call: f64,
-}
-
-impl Sample {
-    /// Dollars a month for **one seat**, at `calls_per_turn` model calls for
-    /// each of `turns_per_day` reserved turns, billed at `model`'s rates.
-    ///
-    /// The whole arithmetic, in one place, so that nothing anywhere else has to
-    /// restate it. Linear in every argument, which is what
-    /// `the_arithmetic_is_one_multiplication_anybody_can_redo` checks.
-    ///
-    /// `model` is the seat's, not [`Sample::model`]: the token counts come from
-    /// the recorded run and the *price* comes from whatever that seat runs
-    /// today. Those are two different facts and conflating them is how a
-    /// per-seat bill would silently stay a single-model one.
-    pub fn monthly_usd(self, model: ModelId, calls_per_turn: f64, turns_per_day: f64) -> f64 {
-        let (per_m_in, per_m_out) = rate_card(model);
-        let calls = calls_per_turn * turns_per_day * DAYS;
-        calls * (self.input_tokens_per_call * per_m_in + self.output_tokens_per_call * per_m_out)
-            / 1_000_000.0
-    }
-
-    /// The whole company for a month, at the rate this sample actually ran at:
-    /// every seat at its own model, its own turn budget, summed.
-    ///
-    /// **This is the function the old `measured_usd(turns_per_day)` became.**
-    /// The old one took the sum of the turn budgets and multiplied once, which
-    /// was exactly right while one model served every seat and is a category
-    /// error now: five seats on three models is five multiplications, and the
-    /// mix is most of the answer.
-    pub fn company_usd(self, calls_per_turn: f64) -> f64 {
-        seats()
-            .iter()
-            .map(|seat| self.monthly_usd(seat.model, calls_per_turn, f64::from(seat.turns)))
-            .sum()
-    }
-
-    /// The same, at the calls-per-turn this sample recorded.
-    pub fn measured_usd(self) -> f64 {
-        self.company_usd(self.calls_per_turn)
-    }
-}
-
-/// **The record.** One entry per pass of `--dry-run`, pasted from what it
-/// printed under `RECORD`.
-///
-/// Three, not one: one run of a language model is an anecdote, and the spread
-/// between these is itself a finding — see the row that prints it.
-/// `one_run_is_an_anecdote` refuses to let this shrink below three.
-///
-/// **Re-paste these together with [`DIGEST`], never separately.** A sample and a
-/// digest that came from different runs is exactly the lie this module was built
-/// to stop.
-/// Recorded 2026-08-26, each seat on its own model through the local `claude`
-/// CLI, one invocation of `--dry-run 3` against an empty database. All nine
-/// turns reached the model, all nine were intact, and every structural row
-/// passed.
-///
-/// # These are the first samples taken with the seller actually selling
-///
-/// The three before them were taken while `dryrun::take_turn` omitted the
-/// vertical step entirely — the sales seat had no prospect, so
-/// `vertical::due_prospect` would have answered `None`, and what the sample
-/// recorded for that seat was an ordinary conversational turn. The seller now
-/// runs a confirmed prospect's booking flow twice, files a finding and has its
-/// approach refused by `max_new_contacts_per_day` before the model generates a
-/// token. See [`Prospect`] and `dryrun`'s module docs.
-///
-/// So the figures below are not a drift from the ones above them. They are
-/// about a different measurement of a company that did not change — which is
-/// why [`DIGEST`] had to grow the prospect: without it, the two sets of numbers
-/// would sit under the same pin, and the pin's whole job is to make that
-/// impossible.
-pub const RECORDED: &[Sample] = &[
-    Sample {
-        calls_per_turn: 1.67,
-        input_tokens_per_call: 4633.6,
-        output_tokens_per_call: 672.4,
-    },
-    Sample {
-        calls_per_turn: 1.67,
-        input_tokens_per_call: 4699.6,
-        output_tokens_per_call: 640.8,
-    },
-    Sample {
-        calls_per_turn: 1.33,
-        input_tokens_per_call: 4385.5,
-        output_tokens_per_call: 791.8,
-    },
-];
+// `RECORDED` is `agentos_domain::forecast::RECORDED`, re-exported at the top of
+// this file, and the sentence that governs it moved with it: **re-paste the
+// samples together with `DIGEST` below, never separately.**
+//
+// That instruction got weaker when the array moved, and pretending otherwise
+// would be the failure this file exists to prevent — it is now possible to edit
+// the samples without opening this file at all. What still holds is the half
+// that was ever mechanical: `digest` fails the suite when the *company* those
+// samples measured changes. Nothing anywhere catches a hand-typed sample, and
+// nothing ever did.
+//
+// The samples in it are the first taken with the seller actually selling. The
+// three before them were taken while `dryrun::take_turn` omitted the vertical
+// step entirely — the sales seat had no prospect, so `vertical::due_prospect`
+// would have answered `None`, and what the sample recorded for that seat was an
+// ordinary conversational turn. The seller now runs a confirmed prospect's
+// booking flow twice, files a finding and has its approach refused by
+// `max_new_contacts_per_day` before the model generates a token. See `Prospect`
+// and `dryrun`'s module docs.
+//
+// So those figures are not a drift from the ones before them. They are about a
+// different measurement of a company that did not change — which is why
+// `DIGEST` had to grow the prospect: without it, the two sets of numbers would
+// sit under the same pin, and the pin's whole job is to make that impossible.
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
@@ -687,13 +612,6 @@ pub fn digest() -> String {
 // The sentence
 // ---------------------------------------------------------------------------
 
-/// Smallest and largest of a projection over [`RECORDED`].
-fn spread(of: impl Fn(Sample) -> f64) -> (f64, f64) {
-    RECORDED.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &s| {
-        (lo.min(of(s)), hi.max(of(s)))
-    })
-}
-
 /// The seat mix, as a phrase: `3 on claude-sonnet-5, 1 on claude-opus-5, …`,
 /// cheapest model first and seats that take no turns left out.
 ///
@@ -724,9 +642,9 @@ fn mix() -> String {
 /// figures moved.
 pub fn headline() -> String {
     let turns = f64::from(turns_per_day());
-    let (lo, hi) = spread(Sample::measured_usd);
-    let (floor, _) = spread(|s| s.company_usd(FLOOR_CALLS_PER_TURN));
-    let (_, ceiling) = spread(|s| s.company_usd(ceiling_calls_per_turn()));
+    let (lo, hi) = spread(measured_usd);
+    let (floor, _) = spread(|s| company_usd(s, FLOOR_CALLS_PER_TURN));
+    let (_, ceiling) = spread(|s| company_usd(s, ceiling_calls_per_turn()));
     format!(
         "${lo:.0}–${hi:.0} a month over {} measured runs at {turns} reserved turns a day \
          ({}); ${floor:.0} floor at {FLOOR_CALLS_PER_TURN:.2} model calls per turn, \
@@ -941,60 +859,30 @@ mod tests {
     use super::*;
 
     /// The bill, by hand: one turn a day, one call each, a round million input
-    /// tokens and nothing out, on Opus, is 30 × $5 = $150. If this ever
-    /// disagrees, the arithmetic has grown a term nobody can check.
+    /// tokens and nothing out, on Opus, is 30 × $5 = $150.
+    ///
+    /// **The arithmetic itself is tested where it lives** — see
+    /// `agentos_domain::forecast`, which owns [`Sample::usd`] and the rate card
+    /// and checks both against four models. What is left here is the only claim
+    /// [`monthly_usd`] adds on top of it, and it is the one this crate cares
+    /// about: a *month* is thirty days of that function and nothing else. If
+    /// somebody changes what a month means, the headline moves and this is
+    /// where it shows.
     #[test]
-    fn the_arithmetic_is_one_multiplication_anybody_can_redo() {
+    fn a_month_is_thirty_days_of_the_shared_arithmetic() {
         let round = Sample {
             calls_per_turn: 1.0,
             input_tokens_per_call: 1_000_000.0,
             output_tokens_per_call: 0.0,
         };
-        assert!((round.monthly_usd(ModelId::Opus5, 1.0, 1.0) - 150.0).abs() < 1e-9);
-        // And output is priced five times higher, which is the rate card.
-        let out = Sample {
-            input_tokens_per_call: 0.0,
-            output_tokens_per_call: 1_000_000.0,
-            ..round
-        };
-        assert!((out.monthly_usd(ModelId::Opus5, 1.0, 1.0) - 750.0).abs() < 1e-9);
-        // Linear in calls per turn: this is the whole reason the range is a
-        // range, and a non-linear term here would make the ceiling a guess.
+        assert!((monthly_usd(round, ModelId::Opus5, 1.0, 1.0) - 150.0).abs() < 1e-9);
         assert!(
-            (round.monthly_usd(ModelId::Opus5, 2.0, 1.0)
-                - 2.0 * round.monthly_usd(ModelId::Opus5, 1.0, 1.0))
+            (monthly_usd(round, ModelId::Opus5, 1.0, 1.0)
+                - 30.0 * round.usd(ModelId::Opus5, 1.0, 1.0))
             .abs()
-                < 1e-9
+                < 1e-9,
+            "a month here is no longer thirty days of `Sample::usd`"
         );
-    }
-
-    /// **The per-seat claim.** The same seat, the same turns, the same sample,
-    /// priced on four models, is four different bills in the published ratios —
-    /// and the ratios are the rate card, so a row typed wrong shows up here.
-    #[test]
-    fn the_bill_follows_the_seats_model_and_not_a_single_rate() {
-        let seat = Sample {
-            calls_per_turn: 1.0,
-            input_tokens_per_call: 1_000_000.0,
-            output_tokens_per_call: 1_000_000.0,
-        };
-        let on = |model| seat.monthly_usd(model, 1.0, 1.0);
-        // $6, $18, $30, $60 per call-day; ×30 days.
-        assert!((on(ModelId::Haiku45) - 180.0).abs() < 1e-9);
-        assert!((on(ModelId::Sonnet5) - 540.0).abs() < 1e-9);
-        assert!((on(ModelId::Opus5) - 900.0).abs() < 1e-9);
-        assert!((on(ModelId::Fable5) - 1_800.0).abs() < 1e-9);
-        // Strictly increasing along `ModelId`'s order, which is what makes
-        // `model_for`'s cheapest-first fallback a cost guarantee rather than an
-        // implementation detail.
-        for pair in ModelId::ALL.windows(2) {
-            assert!(
-                on(pair[0]) < on(pair[1]),
-                "{} is not cheaper than {}: `ModelId`'s ordering is not the price list",
-                pair[0],
-                pair[1]
-            );
-        }
     }
 
     /// The company bill is the sum of its seats, each at its own model — not the
@@ -1007,10 +895,15 @@ mod tests {
         let by_hand: f64 = seats()
             .iter()
             .map(|seat| {
-                sample.monthly_usd(seat.model, sample.calls_per_turn, f64::from(seat.turns))
+                monthly_usd(
+                    sample,
+                    seat.model,
+                    sample.calls_per_turn,
+                    f64::from(seat.turns),
+                )
             })
             .sum();
-        assert!((sample.measured_usd() - by_hand).abs() < 1e-9);
+        assert!((measured_usd(sample) - by_hand).abs() < 1e-9);
 
         // And the seats really do differ, or the sum proves nothing. Orizn runs
         // Sonnet seats and an Opus seat side by side.
@@ -1030,7 +923,12 @@ mod tests {
         let all_opus: f64 = seats()
             .iter()
             .map(|seat| {
-                sample.monthly_usd(ModelId::Opus5, sample.calls_per_turn, f64::from(seat.turns))
+                monthly_usd(
+                    sample,
+                    ModelId::Opus5,
+                    sample.calls_per_turn,
+                    f64::from(seat.turns),
+                )
             })
             .sum();
         assert!(
@@ -1063,9 +961,9 @@ mod tests {
     #[test]
     fn every_measurement_sits_inside_its_own_range() {
         for sample in RECORDED {
-            let floor = sample.company_usd(FLOOR_CALLS_PER_TURN);
-            let ceiling = sample.company_usd(ceiling_calls_per_turn());
-            let measured = sample.measured_usd();
+            let floor = company_usd(*sample, FLOOR_CALLS_PER_TURN);
+            let ceiling = company_usd(*sample, ceiling_calls_per_turn());
+            let measured = measured_usd(*sample);
             assert!(
                 floor <= measured && measured <= ceiling,
                 "{measured:.2} is outside {floor:.2}..{ceiling:.2}, so {sample:?} claims a \

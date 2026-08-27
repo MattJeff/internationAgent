@@ -3,6 +3,10 @@ pub mod approvals;
 pub mod autonomy;
 pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
+// wave K: the founder picks a window and gets a quote — effort and money, never
+// a chance of success. Beside `usage` and `turns` in spirit: those two report
+// what already happened, this one is the same arithmetic pointed forwards.
+pub mod forecast;
 pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod initiative;
 pub mod inventory;

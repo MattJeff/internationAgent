@@ -1417,24 +1417,24 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
     );
 
     // --- sampled: the money -------------------------------------------------
-    // A sum over seats, each at its own model's rates — `Sample::company_usd`
-    // owns that arithmetic and this row is a reader of it. It used to be one
+    // A sum over seats, each at its own model's rates — `cost::company_usd` owns
+    // that arithmetic and this row is a reader of it. It used to be one
     // multiplication by the summed turn budget, which was right while one model
     // served every seat and is a category error now.
     let day = f64::from(cost::turns_per_day());
-    let bill: Vec<f64> = samples.iter().map(|s| s.measured_usd()).collect();
+    let bill: Vec<f64> = samples.iter().map(|s| cost::measured_usd(*s)).collect();
     let (bill_lo, bill_hi) = spread(&bill);
     let floor = spread(
         &samples
             .iter()
-            .map(|s| s.company_usd(cost::FLOOR_CALLS_PER_TURN))
+            .map(|s| cost::company_usd(*s, cost::FLOOR_CALLS_PER_TURN))
             .collect::<Vec<_>>(),
     )
     .0;
     let ceiling = spread(
         &samples
             .iter()
-            .map(|s| s.company_usd(cost::ceiling_calls_per_turn()))
+            .map(|s| cost::company_usd(*s, cost::ceiling_calls_per_turn()))
             .collect::<Vec<_>>(),
     )
     .1;
