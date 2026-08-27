@@ -1,4 +1,15 @@
-//! `/v1/halt`: stop the whole company, and let it go again.
+//! `/v1/halt`: stop the whole company, and let it go again. `/v1/window`: say
+//! in advance when it stops by itself.
+//!
+//! **The two are one feature.** An operating window that has run out is a halt
+//! — `agentos_store::halt::halted` reports it as one — so everything the next
+//! seventy lines promise about a halt is promised about a window that ended,
+//! by the same code, with nothing added. What differs is the sentence a founder
+//! reads back and the verb that ends it: a halt is released, a window is
+//! extended. `migrations/0054_operating_window.sql` argues why that is one
+//! mechanism rather than two, and the short version is that "everywhere a stop
+//! is respected" is a list of five call sites in three crates that has already
+//! been out of date once.
 //!
 //! **The call this exists for is somebody saying "stop everything, now".**
 //! Before this file the answer was a loop over `POST /v1/employees/{id}/suspend`
@@ -74,9 +85,9 @@ use agentos_store::db::Db;
 use agentos_store::halt::{self, Halt};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -97,9 +108,20 @@ const HALTED: &str = "halted";
 /// `PUT /v1/halt {"halted": false}` would make "stop the company" and "start it
 /// again" the same call with a different body, which is one typo away from the
 /// wrong one.
+///
+/// `/v1/window` is here rather than in a unit of its own because an exhausted
+/// window *is* a halt — `agentos_store::halt::halted` returns one — so the two
+/// paths write the same audit kind, are read back by the same `GET /v1/halt`,
+/// and would otherwise be two files that have to be edited together.
+///
+/// It is a `PUT` and it has no `DELETE`, unlike the halt above, and the
+/// asymmetry is the feature: a window can be replaced but not removed, so there
+/// is no verb here that makes a stopped company run again without leaving a row
+/// saying when its new time runs out.
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/halt", get(status).post(place).delete(release))
+        .route("/v1/window", put(set_window))
         .with_state(db)
 }
 
@@ -127,9 +149,14 @@ async fn status(State(db): State<Db>, principal: Principal) -> Result<Response, 
         Some(halt) => Some(halt::refused_since(&mut tx, halt.halted_at).await?),
         None => None,
     };
+    // Read whether or not the company is stopped, and in the same transaction:
+    // a founder looking at a running company needs to know it has eleven hours
+    // left rather more than one looking at a stopped one needs to know it ran
+    // out. This is the only place the number is visible before it bites.
+    let window = halt::window(&mut tx).await?;
     tx.rollback().await?;
 
-    Ok(Json(view(halt.as_ref(), refused)).into_response())
+    Ok(Json(view(halt.as_ref(), refused, window)).into_response())
 }
 
 /// `POST /v1/halt` — stop everything.
@@ -162,6 +189,7 @@ async fn place(
             "this company is already stopped; release it before stopping it for another reason",
         ));
     };
+    let window = halt::window(&mut tx).await?;
 
     // Same transaction as the row it describes, so the trail can never claim a
     // halt the table does not have — nor miss one it does. This is the row that
@@ -191,7 +219,7 @@ async fn place(
         "the company has been STOPPED: no turn will start and no effect will be authorised \
          until DELETE /v1/halt"
     );
-    Ok(Json(view(Some(&halt), Some(0))).into_response())
+    Ok(Json(view(Some(&halt), Some(0), window)).into_response())
 }
 
 /// `DELETE /v1/halt` — let it run again.
@@ -205,9 +233,18 @@ async fn release(State(db): State<Db>, principal: Principal) -> Result<Response,
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
 
     let Some(lifted) = halt::release(&mut tx).await? else {
+        // "no halt to release" and not "not stopped", because since 0054 the
+        // second sentence can be false while this branch is taken: a company
+        // whose operating window ran out is stopped, and there is no
+        // `company_halts` row to delete. Telling that operator their company is
+        // running would send them looking for a problem that is a date.
         return Err(ApiError::conflict(
             "not_halted",
-            "this company is not stopped",
+            "this company has no operator halt to release",
+        )
+        .with_detail(
+            "nothing was released. If the company is nonetheless stopped, its operating window \
+             has ended — GET /v1/halt shows the date, and PUT /v1/window gives it more time",
         ));
     };
     // Counted before the commit, inside the transaction that deletes the row, so
@@ -256,7 +293,17 @@ async fn release(State(db): State<Db>, principal: Principal) -> Result<Response,
 
 /// One shape for `GET` and `POST`, so a client branches on `halted` and finds
 /// the same field names either way.
-fn view(halt: Option<&Halt>, refused: Option<i64>) -> serde_json::Value {
+///
+/// `window_ends_at` is on both branches and is `null` when nobody has answered
+/// step 8 for this company. It is beside `halted` rather than under it because
+/// the two are independent: a running company can have a window, and a stopped
+/// one can be stopped by its window, by an operator, or by both — in which case
+/// `reason` is the operator's, and this field is still the date to read.
+fn view(
+    halt: Option<&Halt>,
+    refused: Option<i64>,
+    window: Option<DateTime<Utc>>,
+) -> serde_json::Value {
     match halt {
         Some(halt) => json!({
             "halted": true,
@@ -264,9 +311,111 @@ fn view(halt: Option<&Halt>, refused: Option<i64>) -> serde_json::Value {
             "halted_by": halt.halted_by,
             "halted_at": halt.halted_at,
             "refused_while_halted": refused,
+            "window_ends_at": window,
         }),
-        None => json!({ "halted": false }),
+        None => json!({ "halted": false, "window_ends_at": window }),
     }
+}
+
+/// How long the agents run. **Step 8 of the entry journey, and until now it had
+/// no implementation at all** — a company created this morning ran until
+/// somebody noticed, taking turns on the customer's own model with the
+/// customer's own credential, because no code anywhere had been told to stop.
+///
+/// An instant, not a duration. The founder's screen offers "2 days / 1 week /
+/// 1 month"; turning that into a timestamp is arithmetic somebody has to do
+/// once, and doing it here would mean this handler deciding what a month is —
+/// and then `halt::halted`, the outbox claim and every future reader deciding
+/// it again, from a start date none of them can see.
+#[derive(Deserialize)]
+struct WindowRequest {
+    ends_at: DateTime<Utc>,
+}
+
+/// `PUT /v1/window` — say when this company's agents stop.
+///
+/// Idempotent by shape: the same body twice leaves the same row, and a
+/// different body replaces it. There is no `POST`/`DELETE` pair here because
+/// there is nothing to conflict over — a window is a setting, not evidence of
+/// an emergency, and 0054 argues the difference where the `UPDATE` grant is.
+///
+/// # It cannot widen anything, and that is structural
+///
+/// The only thing this writes is `company_windows`. It cannot touch
+/// `company_halts`, so no window — however far in the future — lifts an
+/// operator's stop; `halt::halted` prefers the operator's row when both exist,
+/// and `crates/store/src/halt.rs` holds it to that. And a company with no row
+/// here behaves exactly as it did before this feature shipped, so the whole
+/// feature can only ever *add* a stop.
+///
+/// # Two questions this does not answer, on purpose
+///
+/// **There is no default.** A missing or absent window is not filled in with
+/// "one month" by this handler or by anything below it, because the number
+/// would be a price and a promise chosen by whoever wrote the line: too short
+/// and a paying company stops in the night, too long and the runaway is merely
+/// slower. The entry journey has to ask.
+///
+/// **Extending a window that already ran out restarts the company**, here and
+/// with one call, and whether that is right is a founder's decision rather than
+/// a handler's. The safe alternative is to make a lapsed company need the same
+/// deliberate two steps a halted one needs; the argument against is that a
+/// customer who has just paid for another month should not need a second call
+/// to get what they paid for. Nothing downstream depends on which way it goes:
+/// `halt::halted` reads whatever row is here.
+async fn set_window(
+    State(db): State<Db>,
+    principal: Principal,
+    Json(body): Json<WindowRequest>,
+) -> Result<Response, ApiError> {
+    let now = Utc::now();
+    // A window in the past is an instant stop with nobody's sentence attached
+    // to it, and the product has a verb for stopping now that insists on the
+    // sentence. Refused here rather than in the store, where there is no
+    // operator left to tell — see `halt::set_window`.
+    if body.ends_at <= now {
+        return Err(ApiError::bad_request(
+            "an operating window has to end in the future; a date in the past would stop the \
+             company immediately with no reason recorded. To stop it now, POST /v1/halt with the \
+             reason",
+        ));
+    }
+
+    let who = principal.actor.label();
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let previous = halt::set_window(&mut tx, body.ends_at, &who, now).await?;
+
+    // Same transaction as the row, same kind as the switch. `company_windows`
+    // is one row that is overwritten, so this trail is the only thing that can
+    // ever answer "who gave this company another month, and when" — and it
+    // shares `company_halt_changed` with the switch because choosing when a
+    // company stops is the same *kind* of fact as stopping it, not a
+    // configuration change. `/v1/autonomy` should count it with the one and not
+    // with the spend-cap tweaks.
+    audit::append(
+        &mut tx,
+        &AuditEvent {
+            payload: json!({
+                "window_ends_at": body.ends_at,
+                "previous_window_ends_at": previous,
+            }),
+            ..AuditEvent::new(principal.actor.clone(), AuditKind::CompanyHaltChanged, now)
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        tenant_id = %principal.tenant_id.as_uuid(),
+        actor = %who,
+        window_ends_at = %body.ends_at,
+        "this company's agents will stop when its operating window ends"
+    );
+    Ok(Json(json!({
+        "window_ends_at": body.ends_at,
+        "previous_window_ends_at": previous,
+    }))
+    .into_response())
 }
 
 #[cfg(test)]
@@ -334,9 +483,19 @@ mod tests {
             secret: &str,
             body: Option<Value>,
         ) -> (StatusCode, Value) {
+            self.send_to(method, "/v1/halt", secret, body).await
+        }
+
+        async fn send_to(
+            &self,
+            method: &str,
+            uri: &str,
+            secret: &str,
+            body: Option<Value>,
+        ) -> (StatusCode, Value) {
             let req = HttpRequest::builder()
                 .method(method)
-                .uri("/v1/halt")
+                .uri(uri)
                 .header(header::AUTHORIZATION, format!("Bearer {secret}"))
                 .header("idempotency-key", Uuid::now_v7().to_string());
             let req = match &body {
@@ -371,6 +530,14 @@ mod tests {
             tx.rollback().await.expect("rollback");
             rows
         }
+    }
+
+    /// An instant `offset` from now, truncated to the microsecond Postgres
+    /// stores — so a timestamp that goes out in a request body and comes back
+    /// out of the database compares equal to itself.
+    fn instant(offset: chrono::Duration) -> chrono::DateTime<Utc> {
+        use chrono::SubsecRound;
+        (Utc::now() + offset).trunc_subsecs(6)
     }
 
     async fn new_tenant(db: &Db) -> TenantId {
@@ -523,5 +690,173 @@ mod tests {
         }
         let (_, body) = h.send("GET", SECRET_A, None).await;
         assert_eq!(body["halted"], json!(false), "and nothing was stopped");
+    }
+
+    // -- the operating window ----------------------------------------------
+
+    /// **Step 8 of the entry journey, end to end**: choose how long the agents
+    /// run, read it back, and watch the company stop by itself when the time is
+    /// up — with a sentence that is not the emergency one.
+    ///
+    /// The middle assertion is the whole product claim: nothing is called at the
+    /// deadline, no loop ticks, no row is written. `halt::halted` simply starts
+    /// answering differently, and every reader of it — the gate, the turn's
+    /// pre-flight check, the outbox claim — refuses from that instant.
+    #[tokio::test]
+    async fn a_window_is_chosen_read_back_and_stops_the_company_by_itself() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, body) = h.send("GET", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["window_ends_at"],
+            Value::Null,
+            "no default duration is invented for a company nobody has answered step 8 for"
+        );
+
+        let ends_at = instant(chrono::Duration::days(30));
+        let (status, body) = h
+            .send_to(
+                "PUT",
+                "/v1/window",
+                SECRET_A,
+                Some(json!({"ends_at": ends_at})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["previous_window_ends_at"], Value::Null);
+
+        let (_, body) = h.send("GET", SECRET_A, None).await;
+        assert_eq!(
+            body["halted"],
+            json!(false),
+            "a month in hand is not a stop: {body}"
+        );
+        assert_eq!(body["window_ends_at"], json!(ends_at));
+
+        // The clock runs out. Nothing else happens — this moves the row rather
+        // than waiting a month, and that is the only thing it fakes.
+        let past = instant(-chrono::Duration::minutes(1));
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+        halt::set_window(&mut tx, past, "operator:ops-a", Utc::now())
+            .await
+            .expect("set");
+        tx.commit().await.expect("commit");
+
+        let (status, body) = h.send("GET", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["halted"],
+            json!(true),
+            "the company stopped with nobody touching it: {body}"
+        );
+        assert_eq!(
+            body["halted_by"],
+            json!("operator:ops-a"),
+            "and the stop names the human who chose the window, not `system`"
+        );
+        let reason = body["reason"].as_str().expect("a reason");
+        assert!(
+            reason.contains("operating window") && reason.contains("nobody stopped it"),
+            "a founder must read this as a schedule, not an emergency: {reason}"
+        );
+
+        // The switch's own verb is honest about what it did not do. Telling this
+        // operator "this company is not stopped" would send them looking for a
+        // problem that is a date.
+        let (status, body) = h.send("DELETE", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("not_halted"));
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("PUT /v1/window")),
+            "and it names the verb that would help: {body}"
+        );
+    }
+
+    /// **A window can only ever add a stop.** It cannot lift an operator's halt
+    /// however wide it is, it cannot be set into the past, and one company's
+    /// window is invisible to another.
+    ///
+    /// Three refusals in one test because they are one property: nothing here
+    /// widens. The first is the constraint the whole feature turns on — a
+    /// schedule must never be able to restart a company a human stopped, nor
+    /// replace that human's sentence with its own.
+    #[tokio::test]
+    async fn a_window_never_widens_and_never_crosses_a_tenant() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        h.send("POST", SECRET_A, Some(json!({"reason": "the CFO called"})))
+            .await;
+
+        let wide_open = instant(chrono::Duration::days(365));
+        let (status, body) = h
+            .send_to(
+                "PUT",
+                "/v1/window",
+                SECRET_A,
+                Some(json!({"ends_at": wide_open})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, body) = h.send("GET", SECRET_A, None).await;
+        assert_eq!(
+            body["halted"],
+            json!(true),
+            "a year of window does not lift an emergency stop: {body}"
+        );
+        assert_eq!(
+            body["reason"],
+            json!("the CFO called"),
+            "and the operator's own sentence is still the one on the record"
+        );
+        assert_eq!(body["window_ends_at"], json!(wide_open));
+
+        // A window in the past would be a stop with nobody's reason on it.
+        // `POST /v1/halt` is the verb that stops now, and it insists on one.
+        let (status, body) = h
+            .send_to(
+                "PUT",
+                "/v1/window",
+                SECRET_A,
+                Some(json!({"ends_at": instant(-chrono::Duration::seconds(1))})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // B cannot reach into A. There is no tenant in the path and none in the
+        // body, and `company_windows` has RLS forced with `with check`.
+        let (status, body) = h
+            .send_to(
+                "PUT",
+                "/v1/window",
+                SECRET_B,
+                Some(json!({"ends_at": instant(chrono::Duration::days(2))})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = h.send("GET", SECRET_A, None).await;
+        assert_eq!(
+            body["window_ends_at"],
+            json!(wide_open),
+            "A's window is untouched by B's: {body}"
+        );
+
+        // One `company_halt_changed` row per window write, in A's trail and in
+        // B's, and neither in the other's. `company_windows` is overwritten in
+        // place, so this trail is the only thing that can say who gave which
+        // company more time.
+        let trail = h.trail(h.a).await;
+        assert_eq!(trail.len(), 2, "the halt and the window: {trail:?}");
+        assert_eq!(trail[1].0, "operator:ops-a");
+        assert_eq!(trail[1].1["window_ends_at"], json!(wide_open));
+        assert_eq!(trail[1].1["previous_window_ends_at"], Value::Null);
+        assert_eq!(h.trail(h.b).await.len(), 1, "and B's write is B's alone");
     }
 }

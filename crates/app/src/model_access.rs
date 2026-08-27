@@ -529,10 +529,16 @@ pub enum NoModel {
     /// halted company loses no turns out of anybody's daily budget. A check
     /// added one line later in the initiative loop would be a check the
     /// message-driven path in `apps/server/src/main.rs` does not have.
+    /// Since 0054 the sentence in `{0}` is also how an *operating window* that
+    /// ran out arrives here — `halt::halted` reports one as a halt, so this
+    /// variant needed no sibling and this function needed no second check. The
+    /// remedy differs and the reason string says which one applies, which is
+    /// why the last clause names both.
     #[error(
         "this company has been stopped by an operator ({0}), so none of its employees will take \
          a turn. Nothing about this is a provider failure and retrying will not fix it — release \
-         it with DELETE /v1/halt"
+         it with DELETE /v1/halt, or, if the sentence above is about an operating window, give \
+         it more time with PUT /v1/window"
     )]
     CompanyHalted(String),
 

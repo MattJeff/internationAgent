@@ -350,7 +350,9 @@ pub async fn claim(
 ///
 /// # A stopped company's rows are not claimed at all
 ///
-/// Both spellings skip any tenant with a row in `company_halts`, and the
+/// Both spellings skip any tenant that is stopped — a row in `company_halts`,
+/// or a `company_windows` row whose `ends_at` has passed, which is the same
+/// refusal by the same argument (`migrations/0054_operating_window.sql`). The
 /// **not** in "not claimed" is the whole point: a deferred row burns no
 /// attempt, so a halt costs the customer nothing. Refusing the work inside the
 /// handler instead would look identical for four minutes and then destroy
@@ -535,6 +537,26 @@ pub async fn claim_of(
         // eight attempts and dead-letter every pending piece of the customer's
         // work — an emergency stop destroying exactly what it exists to
         // protect. Not selecting the row costs it nothing.
+        //
+        // **The second predicate is the same refusal, and it is the one place
+        // in the workspace where a window had to be spelled out.** Every other
+        // reader of a stop calls `halt::halted`, which reports an exhausted
+        // operating window as a halt and needed no edit
+        // (`migrations/0054_operating_window.sql` argues why). This query
+        // cannot: it is cross-tenant SQL driven by `tenants`, with a clock the
+        // caller injects, so it reads the row itself against `$1` rather than
+        // the `now()` that function uses. The two must agree, and the cost of
+        // them disagreeing is stated exactly by the paragraph above — a company
+        // whose month ran out would have every queued piece of its work claimed,
+        // refused by the gate, and dead-lettered inside five minutes. A window
+        // ending is not a reason to destroy the mail.
+        //
+        // FOUNDER'S QUESTION, LEFT OPEN: these rows then wait forever, because
+        // a window that ended has no release verb the way a halt does. Deferred
+        // is the conservative half — nothing is lost and extending the window
+        // drains them all — but "what happens to a finished company's queue"
+        // is a product decision (drain once? export? expire?) and this file
+        // will not invent one.
         "WITH seated AS MATERIALIZED ( \
              SELECT q.id, q.available_at, q.seat \
                FROM tenants t \
@@ -554,6 +576,9 @@ pub async fn claim_of(
                ) q \
               WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
                                  WHERE h.tenant_id = t.id) \
+                AND NOT EXISTS (SELECT 1 FROM company_windows w \
+                                 WHERE w.tenant_id = t.id \
+                                   AND w.ends_at <= $1::timestamptz) \
          ), shortlist AS MATERIALIZED ( \
              SELECT id, seat, available_at FROM seated \
               ORDER BY seat, available_at, id \
@@ -1557,5 +1582,87 @@ mod tests {
 
         drop_tenant(&db, stopped).await;
         drop_tenant(&db, running).await;
+    }
+
+    /// **A company whose operating window ran out defers its queue too**, and a
+    /// company still inside its window is not touched.
+    ///
+    /// The same support incident as the test above, arriving by the one door
+    /// that had to be opened by hand. Every other reader of a stop asks
+    /// `halt::halted`, which reports an exhausted window as a halt and needed no
+    /// edit; this query cannot, because it is cross-tenant and runs on the
+    /// clock its caller injects. So the predicate is written here against `$1`,
+    /// and if it is ever dropped a company whose month ended has every queued
+    /// piece of its work claimed, refused by the gate, and dead-lettered inside
+    /// five minutes — the customer's unanswered mail destroyed by a schedule.
+    ///
+    /// Both tenants have a window, and that is the half that makes the test
+    /// worth writing: one ended a second before the claim, one has an hour
+    /// left. A predicate that skipped every tenant with a window at all, or one
+    /// that compared against the wall clock instead of `$1`, would fail here and
+    /// pass a test with only the expired one in it.
+    #[tokio::test]
+    async fn a_company_out_of_time_defers_its_queue_and_burns_no_attempt() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let expired = seed_tenant(&db, "window-expired").await;
+        let inside = seed_tenant(&db, "window-inside").await;
+
+        let waiting = enqueue_committed(&db, expired, &event(1), at(T0)).await;
+        enqueue_committed(&db, inside, &event(2), at(T0)).await;
+
+        set_window_committed(&db, expired, at(T0)).await;
+        set_window_committed(&db, inside, at(T0 + 3600)).await;
+
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim(&mut conn, 10, at(T0 + 1)).await.expect("claim");
+        conn.commit().await.expect("commit claim");
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the company with time left: {claimed:?}"
+        );
+        assert_eq!(claimed[0].tenant_id, inside);
+
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let (attempts, available): (i32, DateTime<Utc>) =
+            sqlx::query_as("SELECT attempt_count, available_at FROM outbox_events WHERE id = $1")
+                .bind(waiting)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read the deferred row");
+        conn.commit().await.expect("commit read");
+        assert_eq!(attempts, 0, "a deferred row burns no attempt");
+        assert_eq!(available, at(T0), "and its backoff was not pushed out");
+
+        // Given more time, the same row is claimed in the state it was left in.
+        // Extending is the window's only release verb — there is no
+        // `DELETE /v1/window`, by 0054.
+        set_window_committed(&db, expired, at(T0 + 7200)).await;
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let after = claim(&mut conn, 10, at(T0 + 1)).await.expect("claim");
+        conn.commit().await.expect("commit claim");
+        assert_eq!(
+            after.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![waiting],
+            "more time resumes exactly the work that was waiting"
+        );
+        assert_eq!(
+            after[0].attempt_count, 1,
+            "on its FIRST attempt: running out of time cost it nothing"
+        );
+
+        drop_tenant(&db, expired).await;
+        drop_tenant(&db, inside).await;
+    }
+
+    async fn set_window_committed(db: &Db, tenant: TenantId, ends_at: DateTime<Utc>) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        crate::halt::set_window(&mut tx, ends_at, "operator:ops", at(T0))
+            .await
+            .expect("set the window");
+        tx.commit().await.expect("commit window");
     }
 }
