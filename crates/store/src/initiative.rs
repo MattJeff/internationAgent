@@ -250,10 +250,20 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 ///
 /// # A stopped company's employees are not claimed at all
 ///
-/// `NOT EXISTS (… company_halts …)` on `tenants`, exactly as
-/// [`crate::outbox::claim_of`] spells it and in the same place — on the
-/// **driver**, so a stopped company never becomes a seat and its schedules are
-/// never read.
+/// `NOT EXISTS (… company_halts …)` **and** `NOT EXISTS (… company_windows …
+/// ends_at <= $1)` on `tenants`, exactly as [`crate::outbox::claim_of`] spells
+/// them and in the same place — on the **driver**, so a stopped company never
+/// becomes a seat and its schedules are never read.
+///
+/// Two clauses rather than a call to [`crate::halt::halted`], which knows both
+/// stops and would keep them in one place: this is cross-tenant SQL driven by
+/// `tenants` with an injected clock, and it cannot ask a per-tenant reader.
+/// That is the whole cost of the shape, and it has already been paid once —
+/// the halt clause landed here while the window clause landed in the outbox
+/// only, and for a while a company whose month had ended still had its
+/// employees claimed and their cadence spent. A predicate spelled out is a
+/// predicate that can be spelled out incompletely. Anything added to
+/// [`crate::halt::halted`] has to be added here and there by hand.
 ///
 /// **It is not the model bill, and the difference is worth writing down
 /// because the obvious reading is wrong.** This clause was added on a report
@@ -399,6 +409,9 @@ pub async fn claim_due(
                ) q \
               WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
                                  WHERE h.tenant_id = t.id) \
+                AND NOT EXISTS (SELECT 1 FROM company_windows w \
+                                 WHERE w.tenant_id = t.id \
+                                   AND w.ends_at <= $1::timestamptz) \
          ), shortlist AS MATERIALIZED ( \
              SELECT employee_id, seat, next_at FROM seated \
               ORDER BY seat, next_at, employee_id \
@@ -1092,6 +1105,75 @@ mod tests {
     }
 
     // -- the company-wide stop ---------------------------------------------
+
+    /// **A company whose window ran out is stopped too, and by the same SQL.**
+    ///
+    /// This exists because the two fixes crossed. [`crate::halt::halted`] was
+    /// taught that an expired `company_windows` row is a halt, which covers
+    /// every caller that asks it — and this statement does not ask it. It is
+    /// cross-tenant SQL driven by `tenants` with an injected clock, so it
+    /// spells the predicate out, and a predicate spelled out is one that can be
+    /// spelled out incompletely. It was: the halt clause landed here first and
+    /// the window clause landed in `outbox::claim_of` only, so a company whose
+    /// month ended kept having its employees claimed and their cadence spent.
+    ///
+    /// The clock is `$1`, not `now()`, or a window that ends between the test's
+    /// instant and the server's would decide the outcome.
+    #[tokio::test]
+    async fn a_company_out_of_time_is_not_claimed_either() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let expired = seed_tenant(&db, "window-expired").await;
+        let running = seed_tenant(&db, "window-running").await;
+
+        let waiting = seed_due(&db, expired, "waiting", Lifecycle::Active).await;
+        let working = seed_due(&db, running, "working", Lifecycle::Active).await;
+
+        // Both tenants carry a window, so a predicate that skipped every tenant
+        // *having* one rather than every tenant *out of* one would still pass.
+        let mut tx = db.tenant_tx(expired).await.expect("tenant tx");
+        crate::halt::set_window(
+            &mut tx,
+            at(T0) - TimeDelta::seconds(1),
+            "operator:ops",
+            at(T0),
+        )
+        .await
+        .expect("set window");
+        tx.commit().await.expect("commit expired window");
+
+        let mut tx = db.tenant_tx(running).await.expect("tenant tx");
+        crate::halt::set_window(
+            &mut tx,
+            at(T0) + TimeDelta::days(30),
+            "operator:ops",
+            at(T0),
+        )
+        .await
+        .expect("set window");
+        tx.commit().await.expect("commit open window");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim_due(&mut tx, 100, at(T0)).await.expect("claim");
+        tx.commit().await.expect("commit claim");
+
+        assert_eq!(
+            claimed.iter().map(|d| d.employee_id).collect::<Vec<_>>(),
+            vec![working],
+            "a company still inside its window works; one out of time does \
+             not: {claimed:?}"
+        );
+
+        let mut tx = db.tenant_tx(expired).await.expect("tenant tx");
+        let after = get(&mut tx, waiting).await.expect("get");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            after.claims, 0,
+            "the window spent none of the employee's cadence, so extending it \
+             resumes the same overdue row"
+        );
+    }
 
     /// **A stopped company's employees wait; their slots are not spent.**
     ///

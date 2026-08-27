@@ -2281,6 +2281,27 @@ pub async fn sell(
 /// that can only be met by never restarting the process is not a bar. Copying
 /// one `DateTime` off the evidence at construction is what makes the check
 /// available where the send is.
+/// **NOT WIRED — and this paragraph is the finding, not the function.**
+///
+/// Nothing outside `#[cfg(test)]` calls this. That was true for a long time and
+/// nothing said so, which is the same defect `SPEC.md`'s `secret_accessed`
+/// promise had and `metrics::record_llm_usage` had: code a reader assumes runs
+/// because it is `pub`, tested, and argued at length.
+///
+/// It is kept rather than deleted because it is not a mistake — it is the road
+/// not taken, and the road that *was* taken is documented against it. This
+/// re-sends a message that **carries the claim**, so it needs
+/// `Approach::still_true`. [`due_chase`] and [`chase_message`] ship instead, and
+/// they need no such bar because they make no claim at all: a chase says "we
+/// wrote to you on this date", off our own `last_contacted_at` column, past
+/// tense, with nothing about the prospect's page in it. There is nothing there
+/// to go stale.
+///
+/// So the freshness check below is not a guard production is missing. It is the
+/// price of a shape production declined to pay. Wire this only if "re-send the
+/// finding itself" becomes a feature somebody asked for — and read
+/// [`chase_message`]'s own argument first, because it explains why the claimless
+/// shape won.
 pub async fn follow_up(
     seller: &Seller,
     sequences: &mut [Sequence],

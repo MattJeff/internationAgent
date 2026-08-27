@@ -761,7 +761,6 @@ async fn take_turn(
         llm.clone(),
         PolicyGate::new(company.db.clone()),
         effects,
-        principal,
         prompt,
         model.as_str(),
         stored.employee.address().to_string(),

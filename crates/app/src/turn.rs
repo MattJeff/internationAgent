@@ -133,7 +133,7 @@ use crate::effects::{
     BrowserRead, EffectError, Effects, EmailSend, InternalNote, InternalSend, McpCall,
     PaymentCreate, PaymentInstruction, RenderedEmail,
 };
-use crate::gate::{Denied, PolicyGate, Principal};
+use crate::gate::{Denied, PolicyGate};
 use crate::inbound::{Briefing, Delivered, Errand, Thread};
 use crate::prompt::{SystemPrompt, render_fenced};
 
@@ -1217,14 +1217,18 @@ fn performed<T>(
 macro_rules! gated {
     ($self:ident, $trust:expr, $subject:expr, |$ok:ident| $effect:expr) => {
         match $trust {
-            TrustLabel::Trusted => match $self.gate.authorize(&$self.principal, $subject).await {
+            TrustLabel::Trusted => match $self
+                .gate
+                .authorize($self.effects.principal(), $subject)
+                .await
+            {
                 Ok($ok) => $effect,
                 Err(denied) => return refusal(denied),
             },
             TrustLabel::Untrusted => {
                 match $self
                     .gate
-                    .authorize(&$self.principal, Untrusted::new($subject))
+                    .authorize($self.effects.principal(), Untrusted::new($subject))
                     .await
                 {
                     Ok($ok) => $effect,
@@ -1245,7 +1249,6 @@ pub struct Turn {
     llm: Arc<dyn Llm>,
     gate: PolicyGate,
     effects: Effects,
-    principal: Principal,
     prompt: SystemPrompt,
     model: String,
     from: String,
@@ -1267,7 +1270,6 @@ impl Turn {
         llm: Arc<dyn Llm>,
         gate: PolicyGate,
         effects: Effects,
-        principal: Principal,
         prompt: SystemPrompt,
         model: impl Into<String>,
         from: impl Into<String>,
@@ -1276,7 +1278,6 @@ impl Turn {
             llm,
             gate,
             effects,
-            principal,
             prompt,
             model: model.into(),
             from: from.into(),
@@ -1723,7 +1724,7 @@ impl Turn {
                         for to in line {
                             match self
                                 .gate
-                                .authorize(&self.principal, InternalSend { to })
+                                .authorize(self.effects.principal(), InternalSend { to })
                                 .await
                             {
                                 Ok(ok) => tokens.push(ok),
@@ -1737,7 +1738,10 @@ impl Turn {
                         for to in line {
                             match self
                                 .gate
-                                .authorize(&self.principal, Untrusted::new(InternalSend { to }))
+                                .authorize(
+                                    self.effects.principal(),
+                                    Untrusted::new(InternalSend { to }),
+                                )
                                 .await
                             {
                                 Ok(ok) => tokens.push(ok),
@@ -1834,7 +1838,7 @@ mod tests {
 
     use super::*;
     use crate::effects::{McpCaller, PaymentProvider, Ports};
-    use crate::gate::PolicyGate;
+    use crate::gate::{PolicyGate, Principal};
     use crate::vertical::Charter;
 
     /// The classic, straight out of an inbound email.
@@ -2096,7 +2100,6 @@ mod tests {
                 llm,
                 gate(db),
                 effects,
-                principal.clone(),
                 // Lena is a buyer, so she is given a buyer's floor. Without one
                 // a `SystemPrompt` is `UNCHARTERED` — the internal channel and
                 // nothing else — and every assertion below about `pay` being
@@ -3079,7 +3082,6 @@ mod tests {
                     Arc::new(crate::mocks::ports()),
                     principal.clone(),
                 ),
-                principal.clone(),
                 charter.system_prompt("You are an AI employee of Fabrikam."),
                 model.as_str(),
                 "seat@fabrikam.example",

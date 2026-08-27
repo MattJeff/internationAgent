@@ -46,6 +46,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+die() { echo >&2; echo "FATAL: $*" >&2; exit 1; }
+
 # --- formatting, before anything is compiled ---------------------------------
 echo "==> cargo fmt --check"
 cargo fmt --all --check || die "the tree is not formatted; run \`cargo fmt --all\`"
@@ -58,7 +60,6 @@ PACKAGES=(agentos-domain agentos-providers agentos-store agentos-app agentos-ser
 
 psql_admin() { PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -q "$@"; }
 
-die() { echo >&2; echo "FATAL: $*" >&2; exit 1; }
 
 # --- guard 1: a database has to be there before anything is worth running ----
 command -v psql >/dev/null 2>&1 ||

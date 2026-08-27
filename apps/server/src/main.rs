@@ -1429,8 +1429,7 @@ impl Agent {
             let turn = Turn::new(
                 llm,
                 self.gate,
-                Effects::new(self.db.clone(), ports, principal.clone()),
-                principal,
+                Effects::new(self.db.clone(), ports, principal),
                 prompt,
                 model.as_str(),
                 employee.address().to_string(),

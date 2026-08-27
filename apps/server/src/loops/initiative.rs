@@ -1034,15 +1034,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     }
     .with_colleagues(colleagues);
 
-    let turn = Turn::new(
-        llm,
-        agent.gate,
-        effects,
-        principal,
-        prompt,
-        model.as_str(),
-        address,
-    );
+    let turn = Turn::new(llm, agent.gate, effects, prompt, model.as_str(), address);
 
     // `Charter::brief` is the plan, recomputed this turn and stored nowhere. It
     // is a message rather than part of the prompt because it varies per

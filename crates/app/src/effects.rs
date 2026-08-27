@@ -635,6 +635,16 @@ impl Effects {
         }
     }
 
+    /// The identity every effect performed here is attributed to.
+    ///
+    /// Exposed so that a caller holding an `Effects` cannot also be asked for
+    /// the principal separately and hand over a different one. `Turn` used to
+    /// take both; the gate authorised as one and the trail recorded the other,
+    /// and nothing but the caller's care kept them equal.
+    pub const fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
     /// Send the rendered email to the address on the token.
     pub async fn send_email<A: Subject<Of = EmailSend>>(
         &self,

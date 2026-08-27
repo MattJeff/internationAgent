@@ -1012,7 +1012,6 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
             llm,
             gate.clone(),
             effects_facade.clone(),
-            principal.clone(),
             pack.system_prompt(),
             "scripted-mock",
             "lena@agents.example.com",

@@ -699,8 +699,7 @@ async fn answer(
     let turn = Turn::new(
         llm,
         state.gate.clone(),
-        Effects::new(state.db.clone(), state.ports.clone(), acting.clone()),
-        acting,
+        Effects::new(state.db.clone(), state.ports.clone(), acting),
         prompt,
         model.as_str(),
         stored.employee.address().to_string(),
