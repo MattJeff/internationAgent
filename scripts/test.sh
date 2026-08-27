@@ -145,17 +145,17 @@ trap cleanup EXIT INT TERM
 # On the very first run it is created empty, every migration applies for the
 # first time, and this guard proves nothing. It is vacant exactly once per
 # checkout and real from then on; there is no way to have it both ways, and
-# saying so beats a green run that looks like evidence. Per *checkout* is the
-# expensive half: waves of agents each work in a fresh worktree, so a blind
-# first run is the common case rather than a one-off. That is the price of the
-# hash below, and it is the right price, but it is not nothing.
-# Per worktree, and that is the whole point of the hash. Three trees migrate
-# in parallel against one Postgres; a fixed name means the moment ANY of them
-# adds a migration the others fail on a file nobody in their tree touched --
-# the exact error this guard exists to raise, raised for the wrong reason. A
-# guard that cries wolf is worse than no guard. The ledger still has to
-# outlive the run (that is what makes it able to see an edit at all), so it is
-# keyed to the tree rather than to the run.
+# saying so beats a green run that looks like evidence.
+#
+# Keyed to the tree rather than to the run, and both halves of that matter. It
+# has to outlive the run, or it could never see an edit at all. And it has to
+# be per tree, because several worktrees migrate in parallel against one
+# Postgres: a fixed name means the moment any of them adds a migration the
+# others fail on a file nobody in their tree touched — the exact error this
+# guard exists to raise, raised for the wrong reason, and a guard that cries
+# wolf is worse than none. The price is that a fresh worktree is blind on its
+# first run, which for waves of agents is the common case rather than a
+# one-off. It is the right price; it is not nothing.
 LEDGER="ci_migration_ledger_$(printf '%s' "$PWD" | shasum | cut -c1-10)"
 echo "==> migrations against $LEDGER (kept between runs on purpose)"
 psql_admin -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '$LEDGER'" \
