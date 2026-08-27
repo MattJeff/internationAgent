@@ -1,6 +1,9 @@
 pub mod a2a; // U34
 pub mod approvals;
 pub mod autonomy;
+// wave M: what we may charge for — seats and connectors, by the day, derived
+// from the trail. The counter, deliberately not the collection.
+pub mod billing;
 pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
 // wave K: the founder picks a window and gets a quote — effort and money, never

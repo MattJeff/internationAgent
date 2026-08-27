@@ -134,10 +134,23 @@ pub enum AuditKind {
     /// An employee was accepted. Written by `routes::employees::create`, in the
     /// transaction that inserts the row and enqueues its provisioning event.
     EmployeeCreated,
-    /// An employee was suspended or terminated. Written by
-    /// `routes::employees::set_lifecycle`. The gate refuses a non-active
+    /// An employee moved between lifecycle states. The gate refuses a non-active
     /// employee before it reads any policy, so who moved it and when is a
     /// security fact and not an operational one.
+    ///
+    /// **Two writers, and the second one used to be missing.** This said
+    /// "written by `routes::employees::set_lifecycle`", which covered every move
+    /// a human makes — suspend, resume, terminate — and silently omitted the one
+    /// nobody makes: `draft → active`, performed by `main::on_step_ready` when
+    /// the last blocking resource lands. The `employees` row holds only the
+    /// current lifecycle, so that transition left no trace at all, and a seat's
+    /// history began at whatever a human did to it next.
+    ///
+    /// Both writers put `from` and `to` in the payload, spelled with
+    /// [`Lifecycle::as_str`](agentos_domain::employee::Lifecycle::as_str), and
+    /// they have to keep agreeing: [`crate::billing`] replays these rows to work
+    /// out what a tenant owes, and a second spelling would be a seat that
+    /// vanishes from an invoice.
     EmployeeLifecycleChanged,
     ResourceStateChanged,
     ApprovalDecided,

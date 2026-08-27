@@ -1287,6 +1287,7 @@ not a tenant's key, and a tenant's key is refused here:**
 | `PUT`, `GET` | `/v1/teams/{team_id}/budget` |
 | `GET` | `/v1/autonomy` |
 | `GET` | `/v1/usage` |
+| `GET` | `/v1/billing` |
 | `GET` | `/v1/inventory/stranded` |
 | `POST` | `/v1/knowledge/documents` |
 | `GET`, `POST` | `/v1/pool/numbers` |

@@ -62,6 +62,7 @@ use agentos_domain::employee::{Lifecycle, Step};
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
 use agentos_domain::policy::{ModelId, model_for};
 use agentos_domain::untrusted::Untrusted;
+use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, TenantTx};
 use agentos_store::employee as employee_store;
 use agentos_store::idempotency::{self, Begin};
@@ -545,6 +546,10 @@ fn app(
             // asked twice, they share a window parser, and an operator reading
             // one without the other is reading half of it.
             .merge(routes::usage::router(db.clone()))
+            // Beside `usage` on purpose and sharing its window: that one is the
+            // customer's bill from Anthropic, this one is ours. Keeping them
+            // adjacent is what stops the two ever being folded into one number.
+            .merge(routes::billing::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
@@ -776,6 +781,36 @@ fn on_created<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
 ///
 /// Only from `draft`. Re-activating a suspended employee because a late
 /// provisioning callback landed would be a webhook un-suspending someone.
+///
+/// # It leaves a mark, and until wave M it did not
+///
+/// `AuditKind::EmployeeLifecycleChanged`'s own documentation named
+/// `routes::employees::set_lifecycle` as its writer, and that was true of every
+/// *operator* move — suspend, resume, terminate. It was never true of this one,
+/// which is the move that matters most: **`draft → active` is the moment a seat
+/// starts being able to act at all**, and it is made here, by a handler, with
+/// nobody logged in.
+///
+/// The `employees` row only ever holds the *current* lifecycle, so a transition
+/// with no audit row is a transition that leaves no trace anywhere once the next
+/// one overwrites it. Two readers needed the one that was missing:
+///
+/// * **Security.** The gate refuses everything for a non-active principal, so
+///   "when did this seat become able to send mail, and what turned it on" is the
+///   same class of question the suspend row already answers. It had no answer.
+/// * **The bill.** `agentos_store::billing` derives what a tenant owes by
+///   replaying lifecycle marks off the trail rather than by keeping a counter
+///   somebody has to remember to increment. Without this row every seat reads as
+///   permanently `draft` and the whole invoice is zero — which is exactly the
+///   failure that module refuses to paper over with a guess.
+///
+/// It is written in *this* transaction, beside the `employees` update and inside
+/// the outbox handler's own commit, for `agentos_store::audit`'s reason: a trail
+/// that commits separately is a trail that can claim an activation that rolled
+/// back, or miss one that did not.
+///
+/// The actor is [`AuditActor::System`] because it is: no human asked for this
+/// tick. The operator who hired the seat is in the `employee_created` row.
 fn on_step_ready<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
     Box::pin(async move {
         let id = EmployeeId::from_uuid(event.aggregate_id);
@@ -792,12 +827,29 @@ fn on_step_ready<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handle
             return Ok(());
         }
 
+        let now = Utc::now();
         employee
-            .set_lifecycle(Lifecycle::Active, Utc::now())
+            .set_lifecycle(Lifecycle::Active, now)
             .map_err(|err| format!("could not activate the employee: {err}"))?;
         employee_store::update(tx, &employee, stored.version)
             .await
             .map_err(|err| format!("could not record the activation: {err}"))?;
+        // The same `from` / `to` payload `set_lifecycle` writes, deliberately:
+        // one reader replays both, and a second spelling of "it became active"
+        // would be a seat the bill cannot see.
+        audit::append(
+            tx,
+            &AuditEvent {
+                employee_id: Some(id),
+                payload: json!({
+                    "from": Lifecycle::Draft.as_str(),
+                    "to": Lifecycle::Active.as_str(),
+                }),
+                ..AuditEvent::new(AuditActor::System, AuditKind::EmployeeLifecycleChanged, now)
+            },
+        )
+        .await
+        .map_err(|err| format!("could not record the activation on the trail: {err}"))?;
 
         tracing::info!(employee_id = %event.aggregate_id, "every blocking step is ready; active");
         Ok(())
@@ -3294,6 +3346,127 @@ mod tests {
         assert_eq!(stored.employee.lifecycle(), Lifecycle::Terminated);
 
         drop_database(db, admin_url, database).await;
+    }
+
+    /// **The activation the trail used to lose, and the invoice that depends on
+    /// it.**
+    ///
+    /// `draft -> active` is made by [`on_step_ready`] and by nothing else, and
+    /// until wave M it wrote no audit row. That was invisible while the only
+    /// reader was a human scrolling a trail; it stopped being invisible when
+    /// `agentos_store::billing` started replaying lifecycle marks to work out
+    /// what a tenant owes. Without the row every seat reads as permanently
+    /// `draft`, and the whole invoice is zero.
+    ///
+    /// So this asserts the two halves together rather than the row on its own: a
+    /// row nobody bills from is a row somebody deletes as unused. Empty before,
+    /// one seat-day after, out of the real query.
+    #[tokio::test]
+    async fn activation_leaves_a_mark_and_the_invoice_can_see_it() {
+        use agentos_domain::employee::ResourceState;
+        use agentos_store::billing;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the activation mark is a SQL question");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::from_uuid(Uuid::now_v7());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("act-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        // A seat the provisioning loop has just finished: still `draft`, every
+        // blocking step ready. This is exactly the state the handler fires on.
+        let mut employee = Employee::new(
+            employee_id,
+            tenant,
+            Slug::parse("lena").expect("slug"),
+            Domain::parse("agents.example.com").expect("domain"),
+            now,
+        );
+        for step in Step::ALL {
+            employee
+                .set_resource(step, ResourceState::Provisioning, now)
+                .expect("pending -> provisioning");
+        }
+        for _ in 0..Step::ALL.len() {
+            for step in Step::ALL {
+                let _ = employee.set_resource(step, ResourceState::Ready, now);
+            }
+        }
+        assert_eq!(employee.lifecycle(), Lifecycle::Draft);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        employee_store::insert(&mut tx, &employee)
+            .await
+            .expect("insert employee");
+        tx.commit().await.expect("commit employee");
+
+        let today = now.date_naive();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let before = billing::billed_days(&mut tx, today, today)
+            .await
+            .expect("billed_days");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            before.is_empty(),
+            "a seat still in draft is a seat the gate refuses; it must not bill: {before:?}"
+        );
+
+        // The handler, called the way the poller calls it — its own claim, its
+        // own transaction, and the audit row has to commit inside it.
+        let event = OutboxEvent {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            aggregate_type: routes::employees::AGGREGATE.to_owned(),
+            aggregate_id: employee_id.as_uuid(),
+            event_type: "employee.step.ready".to_owned(),
+            payload: json!({ "step": "email" }),
+            attempt_count: 1,
+            available_at: now,
+            last_error: None,
+        };
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        on_step_ready(&event, &mut tx).await.expect("activate");
+        tx.commit().await.expect("commit activation");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let stored = employee_store::load(&mut tx, employee_id)
+            .await
+            .expect("load");
+        let after = billing::billed_days(&mut tx, today, today)
+            .await
+            .expect("billed_days");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(stored.employee.lifecycle(), Lifecycle::Active);
+        assert_eq!(
+            after.len(),
+            1,
+            "the activation left no mark the bill can replay, so this seat is free forever: \
+             {after:?}"
+        );
+        assert_eq!(after[0].meter, billing::EMPLOYEE);
+        assert_eq!(after[0].subject, "lena");
+        assert_eq!(after[0].day, today);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit");
     }
 
     /// A [`Config`] with nothing in it but what [`handlers`] reads.
