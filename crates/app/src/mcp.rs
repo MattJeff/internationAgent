@@ -1103,6 +1103,46 @@ impl Credentials {
             .map_err(|err| McpError::Credential { code: err.code() })
     }
 
+    /// Seal one string under an encryption context this module did not choose.
+    ///
+    /// `pub(crate)`, and the visibility is the whole design. [`crate::oauth`]
+    /// has two more things to seal than a bearer token — a PKCE verifier and a
+    /// refresh token — and each needs an AAD of its own so that two blobs in two
+    /// columns of one row cannot be swapped for each other. Giving it a context
+    /// parameter is how those live here, under one cipher, instead of a second
+    /// `LocalEnvelopeSecretStore` built somewhere else from the same master key.
+    ///
+    /// It stays inside the crate because the promise this type makes is about
+    /// the *crate boundary*: `apps/server` cannot name a [`Secret`], so it
+    /// cannot call this, so the promise holds without this function having to
+    /// keep it.
+    pub(crate) fn seal_as(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        context: &str,
+        value: &Secret,
+    ) -> Result<Vec<u8>, McpError> {
+        self.cipher
+            .seal_in(tenant_id, context, value)
+            .map(|sealed| sealed.to_bytes())
+            .map_err(|err| McpError::Credential { code: err.code() })
+    }
+
+    /// The other half of [`seal_as`](Self::seal_as). Same visibility, same
+    /// reason.
+    pub(crate) fn open_as(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        context: &str,
+        sealed: &[u8],
+    ) -> Result<Secret, McpError> {
+        let envelope = agentos_providers::secrets::Envelope::from_bytes(sealed)
+            .map_err(|err| McpError::Credential { code: err.code() })?;
+        self.cipher
+            .open_in(tenant_id, context, &envelope)
+            .map_err(|err| McpError::Credential { code: err.code() })
+    }
+
     /// Open a stored credential.
     ///
     /// Private: the plaintext exists inside this module, for the length of a

@@ -352,6 +352,11 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 db.clone(),
                 fleets.clone(),
                 credentials.clone(),
+                // The same registrations the routes hold. One `Arc`, not two
+                // registries: a token obtained by the callback with one client
+                // registration and renewed by the loop with another is a binding
+                // that connects once and dies at its first expiry.
+                config.oauth_clients.clone(),
                 rebinds,
                 cancel.clone(),
             )),
@@ -498,6 +503,19 @@ fn app(
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
+    // One state, cloned into both tiers. The OAuth flow is split across them —
+    // `POST /v1/mcp/oauth/start` needs an API key and the provider's callback
+    // cannot have one — and both halves have to reach the same cipher, the same
+    // client registrations and the same fleet registry. Two states built side by
+    // side is a flow started under one and completed under another, which fails
+    // as `secret_decrypt_failed` on a verifier that was sealed correctly.
+    let mcp_state = McpState::new(
+        db.clone(),
+        fleets,
+        credentials,
+        config.oauth_clients.clone(),
+        &config.public_host,
+    );
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
@@ -548,11 +566,7 @@ fn app(
             // truth was "nobody could configure this". Both halves are gone:
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
-            .merge(routes::mcp::router(McpState::new(
-                db.clone(),
-                fleets,
-                credentials,
-            )))
+            .merge(routes::mcp::router(mcp_state.clone()))
             // The step that changes whose bill this is. Before it, no tenant has
             // a model and no employee takes a turn; after it, every token is the
             // customer's. See its module docs for why a refused key is a 200.
@@ -573,6 +587,12 @@ fn app(
     // verifies nothing.
     let public = routes::webhooks::router(db.clone(), webhooks(config))
         .merge(routes::a2a::card_router(a2a))
+        // The OAuth callback belongs on this tier and could not be on the other:
+        // a provider redirects a *browser* back to us, and a browser holds no
+        // API key, so behind `with_api_stack` every real callback is a 401. What
+        // stands in for the credential is the `state` parameter, and
+        // `routes::mcp::public_router` is where that argument lives.
+        .merge(routes::mcp::public_router(mcp_state))
         .merge(routes::well_known::router(db.clone()));
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
@@ -3195,6 +3215,7 @@ mod tests {
             // Every adapter a mock, which is what this test's engine is built
             // with anyway.
             credentials: agentos_app::mocks::Credentials::default(),
+            oauth_clients: std::sync::Arc::default(),
             // No provider callbacks registered, so no webhook handlers. The
             // termination entry does not depend on any of it.
             webhooks: Vec::new(),

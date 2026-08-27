@@ -155,15 +155,16 @@ use std::time::Duration;
 
 use agentos_app::catalog::{self, Connector, Credential};
 use agentos_app::mcp::{BindFailure, Credentials, Declaration, Fleet, McpServer, Reach, RiskClass};
+use agentos_app::oauth::{self, Claimed, OauthClients};
 use agentos_domain::ids::{Slug, TenantId};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{post, put};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -269,19 +270,84 @@ pub struct McpState {
     /// one the loop can open. Two of these built independently is a deployment
     /// where every credential seals and none of them opens.
     credentials: Credentials,
+    /// The OAuth applications *this deployment* registered, one per connector.
+    ///
+    /// Deployment scope, not tenant scope — `agentos_app::oauth` argues the
+    /// whole split. Shared with the binder loop for the same reason
+    /// [`McpState::credentials`] is: the loop refreshes with the same client
+    /// registration the callback exchanged with, and two of them is a deployment
+    /// where a token can be obtained and never renewed.
+    clients: Arc<OauthClients>,
+    /// Where a provider sends the browser back, built once from `PUBLIC_HOST`.
+    ///
+    /// **One string, produced in one place**, because RFC 6749 requires the
+    /// token request to repeat byte-for-byte the redirect URI the authorization
+    /// request used, and it must also equal what is registered with the
+    /// provider. Three copies of a URL that must be identical is two chances to
+    /// get an `invalid_grant` whose message names nothing on our side.
+    redirect_uri: Arc<str>,
+    /// The connectors this process offers.
+    ///
+    /// [`catalog::CATALOG`] in every build that runs, threaded through rather
+    /// than read from the `const` at four call sites — see
+    /// [`catalog::find_in`] for why. It is a `&'static [Connector]` set once at
+    /// wiring: nothing reachable from a request can name it, and every handler
+    /// reads it the same way in every build.
+    catalog: &'static [Connector],
 }
 
 impl McpState {
     /// Wire the routes to the pool, the registry `main` also gives the loop,
-    /// and the cipher it also gives the loop.
-    pub const fn new(db: Db, fleets: Fleets, credentials: Credentials) -> Self {
+    /// the cipher it also gives the loop, and the OAuth registrations it also
+    /// gives the loop.
+    ///
+    /// `public_host` is the deployment's origin. The callback path is appended
+    /// here and nowhere else — see [`McpState::redirect_uri`].
+    pub fn new(
+        db: Db,
+        fleets: Fleets,
+        credentials: Credentials,
+        clients: Arc<OauthClients>,
+        public_host: &str,
+    ) -> Self {
         Self {
             db,
             fleets,
             credentials,
+            clients,
+            redirect_uri: Arc::from(format!(
+                "{}{CALLBACK_PATH}",
+                public_host.trim_end_matches('/')
+            )),
+            catalog: catalog::CATALOG,
         }
     }
+
+    /// The same state over a different catalogue.
+    ///
+    /// Tests only, and it is a *builder* rather than a branch: every handler
+    /// still reads one field, identically, in both builds. What differs is the
+    /// array, not the code — which is the distinction `agentos_app::mcp`'s
+    /// module docs draw when they refuse a test-only path through a module.
+    ///
+    /// It exists because the routes below cannot otherwise be exercised at all:
+    /// an OAuth connector's authorization server is a `&'static str` naming
+    /// somebody else's host, so without this the callback's most dangerous line
+    /// — the one that decides whose tenant a token is stored under — has no test
+    /// that can reach it.
+    #[cfg(test)]
+    const fn over(mut self, catalog: &'static [Connector]) -> Self {
+        self.catalog = catalog;
+        self
+    }
 }
+
+/// Where a provider redirects the browser back to.
+///
+/// A `const` and not configuration: it is registered with every provider by
+/// hand, and a deployment that could change it would be a deployment whose
+/// registrations silently stop matching.
+const CALLBACK_PATH: &str = "/v1/mcp/oauth/callback";
 
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
@@ -302,6 +368,41 @@ pub fn router(state: McpState) -> Router {
         )
         .route("/v1/mcp/servers/{server}/discover", post(discover))
         .route("/v1/mcp/servers/{server}/tools/{tool}", put(declare_tool))
+        // The half of the OAuth dance that *does* have a tenant. The other half
+        // is [`public_router`], and the split is the whole security story.
+        .route("/v1/mcp/oauth/start", post(oauth_start))
+        .with_state(state)
+}
+
+/// The one route here that a stranger may call, mounted **outside** the API
+/// stack.
+///
+/// # Why it cannot be in [`router`]
+///
+/// The provider redirects a *browser* back to us and a browser holds no API
+/// key. Putting this behind `with_api_stack` would answer every real callback
+/// 401. So it sits beside `routes::webhooks` and the A2A agent card, in
+/// `main.rs`'s `public` tier — request id, trace, body limit, timeout, and no
+/// credential.
+///
+/// # What replaces the credential
+///
+/// The `state` query parameter, and nothing else. It selects one row of
+/// `mcp_oauth_flows`, that row carries the tenant, and every other fact this
+/// handler uses comes out of the same row. `agentos_app::oauth`'s module docs
+/// enumerate the five properties that makes that safe — 256 bits of entropy,
+/// stored only as a hash, single use by an atomic claim, ten-minute expiry, and
+/// a tenant that is read and never written by anything on this path.
+///
+/// ponytail: no rate limit of its own, the same call and the same argument as
+/// `routes::webhooks` — the limiter in `main.rs` is keyed on the tenant from an
+/// API key and there is no key here. What this route does have is a body-less
+/// GET, a lookup by primary key, and a 404 for every state that is not live. A
+/// per-source limit belongs at the ingress, which is the only thing that can see
+/// a client address.
+pub fn public_router(state: McpState) -> Router {
+    Router::new()
+        .route(CALLBACK_PATH, axum::routing::get(oauth_callback))
         .with_state(state)
 }
 
@@ -756,9 +857,23 @@ async fn delete_server(
 /// `url` is deliberately included. It is not a secret — it is a vendor's
 /// published endpoint — and showing it is how a customer verifies they are about
 /// to hand a token to GitHub rather than to us guessing.
-async fn catalog(_principal: Principal) -> Result<Response, ApiError> {
-    let connectors: Vec<Value> = catalog::CATALOG
+async fn catalog(
+    State(state): State<McpState>,
+    _principal: Principal,
+) -> Result<Response, ApiError> {
+    let connectors: Vec<Value> = state
+        .catalog
         .iter()
+        // An OAuth connector this deployment has no client registration for is
+        // **not offered**. It is not greyed out and it does not answer 422 after
+        // a click: it is absent, because a button that cannot work is worse than
+        // no button, and the customer has no way to fix it — the missing thing is
+        // an environment variable of ours. `agentos_app::oauth::OauthClients` is
+        // the registry and `AGENTOS_OAUTH_CLIENTS` is where it comes from.
+        //
+        // This is also what makes adding a catalogue entry safe: an entry whose
+        // application nobody has registered yet is invisible until somebody does.
+        .filter(|c| offered(c, &state.clients))
         .map(|c| {
             json!({
                 "connector": c.key,
@@ -768,6 +883,10 @@ async fn catalog(_principal: Principal) -> Result<Response, ApiError> {
                 "url": c.url,
                 "reach": c.reach.code(),
                 "credential": c.credential.code(),
+                // What the consent screen will ask the customer to approve, so a
+                // UI can say it before they click rather than after. `null` for
+                // everything that is not OAuth.
+                "scopes": c.credential.oauth().map(|o| o.scopes),
                 "floor": c.floor.code(),
             })
         })
@@ -858,7 +977,8 @@ async fn connect(
 ) -> Result<Response, ApiError> {
     let Json(mut body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
     let server = handle(&body.server)?;
-    let connector = catalog::find(&body.connector).ok_or_else(ApiError::not_found)?;
+    let connector =
+        catalog::find_in(state.catalog, &body.connector).ok_or_else(ApiError::not_found)?;
 
     // The URL and the reach come from the catalogue for everything we named, and
     // from the request only for `custom`. This is most of what the catalogue is
@@ -930,7 +1050,19 @@ async fn connect(
         (Credential::Bearer, false) => {
             return Err(ApiError::bad_request("token: required for this connector"));
         }
-        _ => {}
+        // **Not a wildcard.** An OAuth connector reached through this route would
+        // accept a pasted string as though it were the token a consent flow
+        // issues — and then store it in the column `oauth::refresh_due` reads,
+        // with no refresh token and no expiry beside it. It would bind, once,
+        // and stop working at a moment nobody could predict, with a 401 from a
+        // third party as the only symptom. `POST /v1/mcp/oauth/start` is the
+        // door for these, and saying so is more useful than a 401 later.
+        (Credential::OAuth(_), _) => {
+            return Err(ApiError::bad_request(
+                "connector: this one connects by consent — start at /v1/mcp/oauth/start",
+            ));
+        }
+        (Credential::None, false) | (Credential::Bearer, true) => {}
     }
 
     // --- the round trip that decides whether this is a connection ----------
@@ -1247,6 +1379,574 @@ async fn declare_tool(
 }
 
 // ---------------------------------------------------------------------------
+// OAuth: a consent page instead of a pasted token
+// ---------------------------------------------------------------------------
+
+/// What starting a flow takes. Two fields, and neither of them is a URL.
+///
+/// There is deliberately no `scope`, no `redirect_uri` and no `authorize_url`
+/// here. All three come from the catalogue entry and the deployment, and
+/// `agentos_app::catalog::OAuth` argues why: the consent page is the screen a
+/// person is *expected* to approve access on, so the address the browser is sent
+/// to must come from this binary, and the scope string is the only thing that
+/// bounds what the resulting token can do at the provider.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OauthStart {
+    /// A key from [`catalog`] whose credential is OAuth.
+    connector: String,
+    /// The handle the binding will be stored under, exactly as [`connect`]
+    /// takes one.
+    server: String,
+}
+
+/// `POST /v1/mcp/oauth/start` — mint a consent URL for this tenant.
+///
+/// Writes one row and contacts nobody. The row is what the public callback will
+/// later find, and it is the only thing that will connect that callback to this
+/// tenant — so everything about it that matters is in `agentos_app::oauth`'s
+/// module docs and in `0042_mcp_oauth`'s header.
+///
+/// # The response carries a capability
+///
+/// `authorize_url` has the `state` in it. Whoever holds that URL can complete
+/// this flow. It goes to the tenant that asked for it, over TLS, in one
+/// response — and into no log line and no audit payload, which is why the audit
+/// row below records the *hash* instead. That hash is also what joins this row
+/// to the one the callback writes, so "who asked for this connection" is
+/// answerable without ever having stored the answer's key.
+async fn oauth_start(
+    State(state): State<McpState>,
+    principal: Principal,
+    body: Result<Json<OauthStart>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let server = handle(&body.server)?;
+    // 404 and never a fallback, the same rule [`connect`] follows: a typo in a
+    // connector name must not become "start a flow against something else".
+    let connector =
+        catalog::find_in(state.catalog, &body.connector).ok_or_else(ApiError::not_found)?;
+    let now = Utc::now();
+    let started = oauth::start(
+        &state.clients,
+        &state.credentials,
+        principal.tenant_id,
+        connector,
+        &state.redirect_uri,
+        now,
+    )
+    .map_err(|err| oauth_failed(&server, err))?;
+
+    // **After `oauth::start`, and the order is the message.** A connector whose
+    // URL the *customer* supplies cannot connect by consent — the flow row
+    // carries no URL, so the callback would have nothing to put in
+    // `mcp_servers.url`, which is `NOT NULL`, and the honest value would be the
+    // empty string. But `catalog::CUSTOM` fails that test *and* is not an OAuth
+    // connector at all, and "this one takes a pasted token" is the sentence that
+    // tells a caller what to do instead. `oauth::start` produces that one, so it
+    // goes first; this check is for the case it does not cover, which is an
+    // OAuth entry with no endpoint of its own. `start` writes nothing, so
+    // running it and then refusing costs one hash.
+    if connector.url.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "connector_has_no_endpoint",
+            "this connector has no endpoint of its own to connect by consent",
+        ));
+    }
+
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    // The reaper, and the reason there is no job for one. RLS has already
+    // narrowed this to the tenant's own rows, and a tenant's dead flows are
+    // collected the next time that tenant starts one. See `0042_mcp_oauth`.
+    sqlx::query("DELETE FROM mcp_oauth_flows WHERE expires_at < $1")
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+    sqlx::query(
+        "INSERT INTO mcp_oauth_flows \
+           (state_hash, tenant_id, connector, server, sealed_verifier, redirect_uri, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(started.state_hash.as_slice())
+    .bind(principal.tenant_id.as_uuid())
+    .bind(connector.key)
+    .bind(server.as_str())
+    .bind(started.sealed_verifier.as_slice())
+    .bind(state.redirect_uri.as_ref())
+    .bind(started.expires_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    record(
+        &mut tx,
+        &principal.actor,
+        json!({
+            "event": "mcp.oauth.started",
+            "server": server.as_str(),
+            "connector": connector.key,
+            // The hash, never the state, and never the URL that carries it.
+            // This is the join key to the row the callback writes: it is what
+            // makes "an operator asked for this, and it completed" one story
+            // without storing the capability that completes it.
+            "flow": to_hex(&started.state_hash),
+        }),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        server = server.as_str(),
+        connector = connector.key,
+        // Not the URL. It has the state in it.
+        flow = %to_hex(&started.state_hash),
+        "mcp oauth flow started"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "server": server.as_str(),
+            "connector": connector.key,
+            // Send the browser here. Treat it as a secret until it is used.
+            "authorize_url": started.authorize_url,
+            "expires_at": started.expires_at,
+        })),
+    )
+        .into_response())
+}
+
+/// What a provider puts in the redirect.
+///
+/// **No `deny_unknown_fields`, and that is the one place on this surface where
+/// it would be wrong.** Providers append their own parameters to a callback —
+/// Google alone sends `scope`, `authuser`, `prompt` and sometimes `hd` — and
+/// refusing them would refuse every real callback while passing every test
+/// written against a fake one.
+#[derive(Debug, Deserialize)]
+struct CallbackParams {
+    /// The authorization code, present when the human approved.
+    code: Option<String>,
+    /// The value [`oauth_start`] minted. The only thing tying this request to a
+    /// tenant.
+    state: String,
+    /// The provider's refusal code when they did not. Read only to distinguish
+    /// "declined" from "malformed"; **never rendered back**, because it is a
+    /// stranger's string on a page a person is looking at.
+    error: Option<String>,
+}
+
+/// One claimed flow, straight out of `mcp_oauth_flows`.
+///
+/// No `Debug` and no `Serialize`: it holds the sealed verifier, and the rule
+/// [`BindingRow`] states applies unchanged — a row type that can be rendered is
+/// a row type that ends up in a log line.
+#[derive(FromRow)]
+struct FlowRow {
+    tenant_id: uuid::Uuid,
+    connector: String,
+    server: String,
+    sealed_verifier: Vec<u8>,
+    redirect_uri: String,
+}
+
+/// Claim a flow, once, or find nothing.
+///
+/// **The atomic single-use claim.** `consumed_at IS NULL` inside the `UPDATE`
+/// means two callbacks racing on one state produce one winner; the loser sees no
+/// row and is indistinguishable from an expired one, which is deliberate.
+///
+/// `admin_tx_bypassing_rls` is legitimate here for the same reason `rebind_all`
+/// gives: the tenant is what this query is *for*, so there is nothing to scope
+/// to until it answers. It is the narrowest possible use of that hatch — one
+/// lookup, by primary key, over a table whose only other reader is scoped.
+const CLAIM_FLOW: &str = "\
+    UPDATE mcp_oauth_flows \
+       SET consumed_at = now() \
+     WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now() \
+ RETURNING tenant_id, connector, server, sealed_verifier, redirect_uri";
+
+/// `GET /v1/mcp/oauth/callback` — the provider sends the browser here.
+///
+/// Public. See [`public_router`] for what stands in for a credential.
+///
+/// # The order, and why the claim commits before the exchange
+///
+/// ```text
+///   hash the state -> claim the row (commit) -> exchange -> store -> bind -> page
+/// ```
+///
+/// The claim is its own transaction and it commits first. If the exchange then
+/// fails — the provider is down, the code was already redeemed, the clock is
+/// wrong — the state is spent anyway and the customer clicks connect again. The
+/// alternative is one transaction around the whole thing, and its failure mode is
+/// a state that survives a crash mid-exchange and can be replayed. Burning a flow
+/// costs one click; leaving one replayable costs the property this route is built
+/// on.
+///
+/// # What is stored even when the bind fails
+///
+/// The tokens, always. This is the one place this module deliberately disagrees
+/// with [`connect`], which throws away everything when the server exposes no
+/// tools — and the difference is that an authorization code cannot be presented
+/// twice. Discarding a successful exchange would cost the customer a second trip
+/// through a consent screen to recover from a third party being briefly slow.
+/// A pasted token has no such cost, which is why `connect` can afford to be
+/// strict and this cannot.
+///
+/// The bind still happens, and the page still says what it found, so "connected"
+/// means the same thing on both routes: somebody proved the endpoint answered.
+async fn oauth_callback(
+    State(state): State<McpState>,
+    Query(params): Query<CallbackParams>,
+) -> Response {
+    let state_hash = oauth::state_hash(&params.state);
+
+    // --- claim, and commit before anything else can fail --------------------
+    let claimed: Option<FlowRow> = match state.db.admin_tx_bypassing_rls().await {
+        Ok(mut tx) => {
+            let row = sqlx::query_as(CLAIM_FLOW)
+                .bind(state_hash.as_slice())
+                .fetch_optional(&mut *tx)
+                .await;
+            match row {
+                Ok(row) => {
+                    if tx.commit().await.is_err() {
+                        return page(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Something went wrong",
+                            "The connection could not be recorded. Please try again.",
+                        );
+                    }
+                    row
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "could not claim an mcp oauth flow");
+                    let _ = tx.rollback().await;
+                    return page(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Something went wrong",
+                        "The connection could not be recorded. Please try again.",
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "could not open a transaction to claim an mcp oauth flow");
+            return page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "The connection could not be recorded. Please try again.",
+            );
+        }
+    };
+
+    let Some(row) = claimed else {
+        // Expired, already used, or never existed — one answer for all three,
+        // deliberately. Distinguishing them would tell whoever is guessing which
+        // states have ever been real.
+        tracing::warn!(
+            flow = %to_hex(&state_hash),
+            "an mcp oauth callback named no live flow"
+        );
+        return page(
+            StatusCode::NOT_FOUND,
+            "This link is no longer valid",
+            "It may have already been used, or it may have expired. Start the connection again.",
+        );
+    };
+
+    let tenant_id = TenantId::from_uuid(row.tenant_id);
+    let Ok(server) = Slug::parse(&row.server) else {
+        tracing::error!(%tenant_id, server = row.server, "an mcp oauth flow has no policy handle");
+        return page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong",
+            "This connection was recorded under a name we cannot use.",
+        );
+    };
+    // Exact, never `connector_or_custom`: the floor is a coarse guard and may
+    // fall back, but the *token endpoint* may not. An unknown key here means the
+    // catalogue changed under a live flow, and the honest answer is to refuse.
+    let Some(connector) = catalog::find_in(state.catalog, &row.connector) else {
+        tracing::error!(%tenant_id, connector = row.connector, "an mcp oauth flow names no connector");
+        return page(
+            StatusCode::NOT_FOUND,
+            "This connector is no longer available",
+            "Nothing was changed. Please start the connection again.",
+        );
+    };
+    // `oauth_start` refuses a connector with no endpoint, so this is only
+    // reachable if the catalogue changed under a live flow. A refusal rather
+    // than an empty string: `mcp_servers.url` is `NOT NULL`, and a binding
+    // stored against `""` is a row that can never bind and that nothing would
+    // ever explain.
+    let Some(endpoint) = connector.url else {
+        tracing::error!(%tenant_id, connector = connector.key, "an oauth flow names a connector with no endpoint");
+        return page(
+            StatusCode::NOT_FOUND,
+            "This connector is no longer available",
+            "Nothing was changed. Please start the connection again.",
+        );
+    };
+
+    // --- the human said no --------------------------------------------------
+    let Some(code) = params.code else {
+        // `params.error` is a stranger's string and is not rendered. It is worth
+        // one log line at a bounded length, because "the customer keeps
+        // declining" and "the provider keeps rejecting our client" look
+        // identical from here otherwise.
+        tracing::warn!(
+            %tenant_id,
+            server = server.as_str(),
+            connector = connector.key,
+            declined = params.error.as_deref().map(|e| e.chars().take(64).collect::<String>()),
+            "an mcp oauth flow came back without a code"
+        );
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Not connected",
+            "Access was not granted, so nothing was stored. You can close this window.",
+        );
+    };
+
+    // --- exchange -----------------------------------------------------------
+    let now = Utc::now();
+    let flow = Claimed {
+        tenant_id,
+        connector,
+        server: server.clone(),
+        state_hash,
+        sealed_verifier: row.sealed_verifier,
+    };
+    let sealed = match oauth::complete(
+        &state.clients,
+        &state.credentials,
+        &flow,
+        code,
+        &row.redirect_uri,
+        now,
+    )
+    .await
+    {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            tracing::warn!(
+                %tenant_id,
+                server = server.as_str(),
+                connector = connector.key,
+                code = err.code(),
+                "an mcp oauth exchange failed: {err}"
+            );
+            return page(
+                StatusCode::BAD_GATEWAY,
+                "Not connected",
+                "The provider did not issue a token. Nothing was stored — please start again.",
+            );
+        }
+    };
+
+    // --- store --------------------------------------------------------------
+    //
+    // The same upsert `connect` writes, plus the two columns 0042 added. The
+    // declarations survive by primary key, and if this connector's endpoint
+    // moved their digests will not match what it serves — which `app::mcp`
+    // demotes to destructive, needing a human, with no code here.
+    let stored = store_oauth_binding(
+        &state, tenant_id, &server, connector, endpoint, &sealed, now,
+    )
+    .await;
+    if let Err(err) = stored {
+        tracing::error!(
+            %tenant_id,
+            server = server.as_str(),
+            // `?`, not `%`: `ApiError` is a problem document, not a `Display`.
+            // Its own `Debug` carries the status and the stable code, which is
+            // the pair an operator needs, and it holds nothing from the flow.
+            error = ?err,
+            "could not store an mcp oauth binding"
+        );
+        return page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong",
+            "The provider granted access but we could not record it. Please start again.",
+        );
+    }
+    state.fleets.ask_for_rebind(tenant_id);
+
+    // --- and prove it, because "connected" has to mean the same thing here ---
+    //
+    // `connect` refuses to say the word without a round trip, and two routes
+    // that both say "connected" must mean it the same way. The difference is
+    // only what happens on failure: there, nothing is stored; here, the tokens
+    // are already safe and this is a report.
+    let bound = state
+        .credentials
+        .bind(
+            tenant_id,
+            server.clone(),
+            endpoint,
+            &std::collections::BTreeMap::new(),
+            connector.reach,
+            Some(sealed.access.as_slice()),
+            CancellationToken::new(),
+        )
+        .await;
+    let tools = match bound {
+        Ok(bound) => {
+            let count = bound.tools().len();
+            let _ = bound.close().await;
+            count
+        }
+        Err(err) => {
+            tracing::warn!(
+                %tenant_id,
+                server = server.as_str(),
+                code = err.code(),
+                "an mcp oauth binding was stored but did not bind: {err}"
+            );
+            return page(
+                StatusCode::OK,
+                "Connected, but not answering yet",
+                "Access was granted and stored. The server has not answered yet — \
+                 it will be retried automatically.",
+            );
+        }
+    };
+
+    tracing::info!(
+        %tenant_id,
+        server = server.as_str(),
+        connector = connector.key,
+        tools,
+        "mcp server connected over oauth and verified"
+    );
+    page(
+        StatusCode::OK,
+        "Connected",
+        "Access was granted and the server answered. You can close this window.",
+    )
+}
+
+/// Write the binding and its audit row, in one transaction.
+///
+/// A function because [`oauth_callback`] is already long and this is the part
+/// that must be all-or-nothing: a stored token with no audit row is a credential
+/// nobody recorded arriving.
+#[allow(clippy::too_many_arguments)]
+async fn store_oauth_binding(
+    state: &McpState,
+    tenant_id: TenantId,
+    server: &Slug,
+    connector: &'static Connector,
+    endpoint: &str,
+    sealed: &oauth::Sealed,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let mut tx = state.db.tenant_tx(tenant_id).await?;
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+           (tenant_id, server, url, reach, connector, sealed_token, \
+            sealed_refresh_token, token_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (tenant_id, server) DO UPDATE \
+           SET url = excluded.url, reach = excluded.reach, \
+               connector = excluded.connector, sealed_token = excluded.sealed_token, \
+               sealed_refresh_token = excluded.sealed_refresh_token, \
+               token_expires_at = excluded.token_expires_at, \
+               updated_at = now()",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(server.as_str())
+    .bind(endpoint)
+    .bind(connector.reach.code())
+    .bind(connector.key)
+    .bind(sealed.access.as_slice())
+    .bind(sealed.refresh.as_deref())
+    .bind(sealed.expires_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    record(
+        &mut tx,
+        // Nobody is authenticated here — the caller is a browser following a
+        // provider's redirect. `System` is the honest actor, and the operator
+        // who asked for this is in the `mcp.oauth.started` row that carries the
+        // same `flow`.
+        &AuditActor::System,
+        json!({
+            "event": "mcp.oauth.connected",
+            "server": server.as_str(),
+            "connector": connector.key,
+            // Whether, never what — and the same three facts 0040 argued for.
+            "credential": true,
+            "refreshable": sealed.refresh.is_some(),
+            "token_expires_at": sealed.expires_at,
+        }),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// One page for a person, in a browser, with no stylesheet and no script.
+///
+/// # Why this is HTML and not a `303` back to an application
+///
+/// Because there is no application to go back to. This deployment serves an API;
+/// the customer arrived from whatever front end sent them to `authorize_url`, and
+/// this server does not know what that was and must not learn it from a
+/// parameter — a redirect target taken from a request is an open redirect, and an
+/// open redirect on the one route that handles authorization codes is the exact
+/// place not to have one.
+///
+/// ponytail: four lines of HTML, no template engine, no `<style>`. The ceiling is
+/// that it looks like 1994. The upgrade is a `303` to a configured
+/// `AGENTOS_OAUTH_RETURN_TO` — one variable, checked at boot against a fixed
+/// origin — the day there is a front end to return to.
+///
+/// **Nothing dynamic reaches this function.** Every string it is called with is a
+/// literal in this file. That is not a convention, it is why there is no escaping
+/// here: a provider's `error`, a server's description and a token are all things
+/// that would need it, and none of them can get here.
+fn page(status: StatusCode, headline: &'static str, detail: &'static str) -> Response {
+    (
+        status,
+        Html(format!(
+            "<!doctype html><meta charset=utf-8><title>{headline}</title>\
+             <h1>{headline}</h1><p>{detail}</p>"
+        )),
+    )
+        .into_response()
+}
+
+/// How a flow failure reads to the tenant that asked for one.
+///
+/// Only [`oauth_start`] uses it: the callback answers a browser with a page, not
+/// a problem document. The stable code goes in the body — `connector_is_not_oauth`
+/// and `connector_not_registered` are different problems with different fixes,
+/// and only the second one is ours.
+fn oauth_failed(server: &Slug, err: oauth::OauthError) -> ApiError {
+    tracing::warn!(
+        server = server.as_str(),
+        code = err.code(),
+        "mcp oauth start failed: {err}"
+    );
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        err.code(),
+        "this connector cannot be connected by oauth here",
+    )
+    .with_detail(err.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // The binder loop
 // ---------------------------------------------------------------------------
 
@@ -1267,12 +1967,13 @@ pub async fn run(
     db: Db,
     fleets: Fleets,
     credentials: Credentials,
+    clients: Arc<OauthClients>,
     mut rebinds: mpsc::Receiver<TenantId>,
     ct: CancellationToken,
 ) {
     // Startup: every tenant that has configured anything. Not gated on the
     // listener, so a slow MCP server delays tool availability and nothing else.
-    rebind_all(&db, &fleets, &credentials, &ct).await;
+    rebind_all(&db, &fleets, &credentials, &clients, &ct).await;
 
     let mut refresh = tokio::time::interval(REFRESH);
     refresh.tick().await; // The first tick is immediate; we just did it.
@@ -1280,9 +1981,9 @@ pub async fn run(
     loop {
         tokio::select! {
             () = ct.cancelled() => break,
-            _ = refresh.tick() => rebind_all(&db, &fleets, &credentials, &ct).await,
+            _ = refresh.tick() => rebind_all(&db, &fleets, &credentials, &clients, &ct).await,
             received = rebinds.recv() => match received {
-                Some(tenant) => rebind(&db, &fleets, &credentials, tenant, &ct).await,
+                Some(tenant) => rebind(&db, &fleets, &credentials, &clients, tenant, &ct).await,
                 // Every sender is gone, which means the router that holds the
                 // other half is gone, which means the process is on its way
                 // down. Nothing left to keep current.
@@ -1302,9 +2003,26 @@ async fn rebind(
     db: &Db,
     fleets: &Fleets,
     credentials: &Credentials,
+    clients: &OauthClients,
     tenant: TenantId,
     ct: &CancellationToken,
 ) {
+    // **Before the bind, in its own committed transaction, and on this tick.**
+    //
+    // An OAuth access token expires and a refresh token does not, so something
+    // has to swap one for the other before an employee needs it — and this loop
+    // is already awake for exactly this tenant, exactly this often. A second
+    // timer over the same rows is how a token gets renewed by one task while
+    // another binds with the copy it read a moment earlier, and the symptom is a
+    // 401 nobody can reproduce.
+    //
+    // It is a separate transaction because `Fleet::bind` runs read-only and
+    // rolls back: a refresh *writes*, and a write that is rolled back is a
+    // provider round trip whose result was thrown away — with, for a provider
+    // that rotates its refresh tokens, the stored one now dead. Refresh, commit,
+    // then read.
+    refresh_tokens(db, credentials, clients, tenant).await;
+
     let mut tx = match db.tenant_tx(tenant).await {
         Ok(tx) => tx,
         Err(err) => {
@@ -1340,7 +2058,13 @@ async fn rebind(
 /// third legitimate `admin_tx_bypassing_rls` in the codebase: there is no
 /// tenant to scope to until this query answers. It reads one column of one
 /// table and writes nothing.
-async fn rebind_all(db: &Db, fleets: &Fleets, credentials: &Credentials, ct: &CancellationToken) {
+async fn rebind_all(
+    db: &Db,
+    fleets: &Fleets,
+    credentials: &Credentials,
+    clients: &OauthClients,
+    ct: &CancellationToken,
+) {
     let tenants: Vec<TenantId> = match db.admin_tx_bypassing_rls().await {
         Ok(mut tx) => {
             let ids: Result<Vec<uuid::Uuid>, _> =
@@ -1378,7 +2102,44 @@ async fn rebind_all(db: &Db, fleets: &Fleets, credentials: &Credentials, ct: &Ca
         if ct.is_cancelled() {
             return;
         }
-        rebind(db, fleets, credentials, tenant, ct).await;
+        rebind(db, fleets, credentials, clients, tenant, ct).await;
+    }
+}
+
+/// Renew this tenant's OAuth tokens that are close to expiring.
+///
+/// Its own transaction, committed, and every failure inside it is already
+/// swallowed and logged by `agentos_app::oauth::refresh_due` — one provider
+/// being down must not stop the tenant's other bindings, or the other tenants,
+/// from being rebound. So this returns nothing: there is no outcome the caller
+/// could act on that the next tick will not act on anyway.
+async fn refresh_tokens(
+    db: &Db,
+    credentials: &Credentials,
+    clients: &OauthClients,
+    tenant: TenantId,
+) {
+    let mut tx = match db.tenant_tx(tenant).await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(%tenant, error = %err, "could not open a transaction to refresh oauth tokens");
+            return;
+        }
+    };
+    let refreshed = oauth::refresh_due(&mut tx, credentials, clients, Utc::now()).await;
+    if refreshed == 0 {
+        // Nothing was written, so there is nothing to commit and a rollback is
+        // the cheaper unwind — the same call `rebind` makes below.
+        let _ = tx.rollback().await;
+        return;
+    }
+    if let Err(err) = tx.commit().await {
+        // The tokens the provider issued are lost with the transaction, and the
+        // old ones are still in the row and still valid until they expire. The
+        // next tick tries again. What is NOT survivable is a provider that
+        // rotated its refresh token, which is why this is an error and not a
+        // warning: that binding is now on a countdown to needing a human.
+        tracing::error!(%tenant, refreshed, error = %err, "could not commit refreshed oauth tokens");
     }
 }
 
@@ -1533,6 +2294,17 @@ fn bind_failed(server: &Slug) -> impl FnOnce(agentos_app::mcp::McpError) -> ApiE
     }
 }
 
+/// Whether this deployment can actually offer this connector.
+///
+/// A named function and not an inline closure, because it is the whole of the
+/// rule and the rule is worth a test of its own: a connector that needs no OAuth
+/// registration is always offered, and one that does is offered only where the
+/// registration exists. There is no third answer and no "offer it and fail
+/// later".
+fn offered(connector: &Connector, clients: &OauthClients) -> bool {
+    connector.credential.oauth().is_none() || clients.has(connector.key)
+}
+
 /// Resolve a stored connector key, falling back to [`catalog::CUSTOM`].
 ///
 /// The fallback is argued in `0040_mcp_credentials`: the catalogue is code, so a
@@ -1656,6 +2428,12 @@ mod tests {
     const METADATA: &str = "http://169.254.169.254/mcp";
 
     struct Harness {
+        /// The unauthenticated tier: the provider's callback and nothing else.
+        public: Router,
+        /// The deployment's OAuth registrations, shared with the state.
+        clients: Arc<OauthClients>,
+        /// Kept so a test can stand the same routes up over another catalogue.
+        keys: ApiKeys,
         app: Router,
         db: Db,
         fleets: Fleets,
@@ -1697,24 +2475,126 @@ mod tests {
             // only where a test asks for one and nothing races the assertions.
             let (fleets, _rebinds) = Fleets::new();
             let credentials = Credentials::from_master_key(MASTER_KEY);
+            // One registration, for a connector that does not use OAuth. It is
+            // there so `has` answers something, and its uselessness is the
+            // point: `CATALOG` holds no OAuth entry to register for, which
+            // `agentos_app::catalog` argues at length. The predicate itself is
+            // tested directly in `an_unregistered_oauth_connector_is_not_offered`.
+            let clients = Arc::new(
+                OauthClients::parse("github:cid:csecret,acme:acme-client-id:acme-client-secret")
+                    .expect("clients"),
+            );
+            let state = McpState::new(
+                db.clone(),
+                fleets.clone(),
+                credentials.clone(),
+                clients.clone(),
+                "https://agentos.test",
+            );
             Some(Self {
-                app: crate::with_api_stack(
-                    router(McpState::new(
-                        db.clone(),
-                        fleets.clone(),
-                        credentials.clone(),
-                    )),
-                    db.clone(),
-                    keys,
-                ),
+                app: crate::with_api_stack(router(state.clone()), db.clone(), keys.clone()),
+                // The public tier, with no API key layer over it — exactly how
+                // `main.rs` mounts it, because a callback that needed one could
+                // never arrive.
+                public: public_router(state),
                 db,
                 fleets,
                 credentials,
+                clients,
+                keys,
                 a,
                 b,
             })
         }
 
+        /// Hit the **public** tier, the way a provider's redirect does: a `GET`,
+        /// no API key, no `Content-Type`.
+        async fn callback(&self, query: &str) -> (StatusCode, String) {
+            let req = HttpRequest::builder()
+                .method("GET")
+                .uri(format!("{CALLBACK_PATH}?{query}"))
+                .body(Body::empty())
+                .expect("request");
+            let response = self.public.clone().oneshot(req).await.expect("service");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        /// Plant a flow row the way [`oauth_start`] would have.
+        ///
+        /// Directly, because the route cannot start a real one: `CATALOG` holds
+        /// no OAuth entry (its own docs argue why), and these tests are about
+        /// what the *callback* does with a row — the claim, the replay, the
+        /// tenant — every one of which happens before a connector is contacted.
+        async fn plant_flow(
+            &self,
+            tenant: TenantId,
+            connector: &str,
+            server: &str,
+            expires_at: DateTime<Utc>,
+        ) -> String {
+            let state = format!("state-{}", uuid::Uuid::new_v4().simple());
+            let sealed = self
+                .credentials
+                .seal(
+                    tenant,
+                    &Slug::parse(server).expect("slug"),
+                    Some("v".to_owned()),
+                )
+                .expect("seal")
+                .expect("some");
+            let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
+            sqlx::query(
+                "INSERT INTO mcp_oauth_flows                    (state_hash, tenant_id, connector, server, sealed_verifier, redirect_uri, expires_at)                  VALUES ($1, $2, $3, $4, $5, 'https://agentos.test/v1/mcp/oauth/callback', $6)",
+            )
+            .bind(oauth::state_hash(&state).as_slice())
+            .bind(tenant.as_uuid())
+            .bind(connector)
+            .bind(server)
+            .bind(sealed.as_slice())
+            .bind(expires_at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert flow");
+            tx.commit().await.expect("commit");
+            state
+        }
+
+        /// `consumed_at` for one flow, by its state.
+        async fn consumed(&self, tenant: TenantId, state: &str) -> Option<DateTime<Utc>> {
+            let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
+            let at =
+                sqlx::query_scalar("SELECT consumed_at FROM mcp_oauth_flows WHERE state_hash = $1")
+                    .bind(oauth::state_hash(state).as_slice())
+                    .fetch_one(&mut **tx)
+                    .await
+                    .expect("flow row");
+            tx.rollback().await.expect("rollback");
+            at
+        }
+
+        /// The same routes, over a catalogue this test wrote.
+        ///
+        /// Returns the authenticated tier and the public one, exactly as
+        /// `main.rs` mounts them — the OAuth flow is split across the two and a
+        /// test that only had one of them could not follow it.
+        fn over(&self, catalog: &'static [Connector]) -> (Router, Router) {
+            let state = McpState::new(
+                self.db.clone(),
+                self.fleets.clone(),
+                self.credentials.clone(),
+                self.clients.clone(),
+                "https://agentos.test",
+            )
+            .over(catalog);
+            (
+                crate::with_api_stack(router(state.clone()), self.db.clone(), self.keys.clone()),
+                public_router(state),
+            )
+        }
         async fn send(
             &self,
             method: &str,
@@ -2004,6 +2884,7 @@ mod tests {
             &h.db,
             &h.fleets,
             &h.credentials,
+            &h.clients,
             h.a,
             &CancellationToken::new(),
         )
@@ -2067,6 +2948,7 @@ mod tests {
             &h.db,
             &h.fleets,
             &h.credentials,
+            &h.clients,
             h.a,
             &CancellationToken::new(),
         )
@@ -2316,6 +3198,7 @@ mod tests {
             &h.db,
             &h.fleets,
             &h.credentials,
+            &h.clients,
             h.a,
             &CancellationToken::new(),
         )
@@ -2327,7 +3210,14 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        rebind_all(&h.db, &h.fleets, &h.credentials, &CancellationToken::new()).await;
+        rebind_all(
+            &h.db,
+            &h.fleets,
+            &h.credentials,
+            &h.clients,
+            &CancellationToken::new(),
+        )
+        .await;
         let fleet = h.fleets.for_tenant(h.a);
         assert!(fleet.failures().is_empty(), "{:?}", fleet.failures());
         assert!(fleet.inventory().is_empty());
@@ -2510,6 +3400,7 @@ mod tests {
             &h.db,
             &h.fleets,
             &h.credentials,
+            &h.clients,
             h.a,
             &CancellationToken::new(),
         )
@@ -2600,6 +3491,7 @@ mod tests {
             &h.db,
             &h.fleets,
             &h.credentials,
+            &h.clients,
             h.a,
             &CancellationToken::new(),
         )
@@ -3056,7 +3948,15 @@ mod tests {
 
         // A different deployment's master key: same rows, new cipher.
         let rotated = Credentials::from_master_key("a-different-master-key-entirely");
-        rebind(&h.db, &h.fleets, &rotated, h.a, &CancellationToken::new()).await;
+        rebind(
+            &h.db,
+            &h.fleets,
+            &rotated,
+            &h.clients,
+            h.a,
+            &CancellationToken::new(),
+        )
+        .await;
 
         let fleet = h.fleets.for_tenant(h.a);
         assert!(
@@ -3086,5 +3986,734 @@ mod tests {
         assert!(!listed.to_string().contains(TOKEN), "{listed}");
 
         h.teardown().await;
+    }
+
+    // -- OAuth: the public callback and what ties it to a tenant -------------
+
+    /// A connector this deployment has not registered is not on the menu.
+    ///
+    /// The predicate directly, because `CATALOG` has no OAuth entry to filter —
+    /// see its own docs. This is the rule that makes adding one safe: it is
+    /// invisible until an application is registered, so nobody ever clicks a
+    /// button that cannot work.
+    #[test]
+    fn an_unregistered_oauth_connector_is_not_offered() {
+        const ENDPOINTS: catalog::OAuth = catalog::OAuth {
+            authorize: "https://accounts.example.com/authorize",
+            token: "https://accounts.example.com/token",
+            scopes: "read",
+            auth: catalog::ClientAuth::Basic,
+        };
+        let entry = Connector {
+            key: "example",
+            credential: Credential::OAuth(&ENDPOINTS),
+            ..catalog::CUSTOM
+        };
+        let registered = OauthClients::parse("example:id:secret").expect("parse");
+
+        assert!(offered(&entry, &registered));
+        assert!(!offered(&entry, &OauthClients::default()));
+        // A connector that needs no registration is always offered — including
+        // in a deployment that has registered nothing at all.
+        for connector in catalog::CATALOG {
+            assert!(
+                offered(connector, &OauthClients::default()),
+                "{}",
+                connector.key
+            );
+        }
+    }
+
+    /// The route is on the tier a browser can reach, and only that one.
+    #[tokio::test]
+    async fn the_callback_is_reachable_without_a_credential_and_only_there() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        // No API key, and it is not a 401. It is the route's own answer.
+        let (status, _) = h.callback("state=nothing-was-ever-minted").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no key must not mean 401");
+
+        // And it is NOT on the authenticated tier: mounting it there would
+        // answer every real callback 401, because a provider's redirect is a
+        // browser and a browser has no key.
+        let (status, _) = h
+            .send(
+                "GET",
+                &format!("{CALLBACK_PATH}?state=x"),
+                Some(SECRET_A),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the api tier must not serve the callback"
+        );
+    }
+
+    /// **The replay mutation.** One state, two callbacks, one winner — and the
+    /// claim commits before anything that can fail.
+    ///
+    /// The first call gets past the claim and then fails at the exchange, which
+    /// is exactly the shape being asserted: `consumed_at` is set even though the
+    /// request did not succeed. Delete `AND consumed_at IS NULL` from
+    /// [`CLAIM_FLOW`] and the second call stops being a 404, which is a state
+    /// that can be presented forever.
+    #[tokio::test]
+    async fn a_state_is_spent_the_first_time_it_is_presented() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let state = h
+            .plant_flow(
+                h.a,
+                "github",
+                "gh",
+                Utc::now() + chrono::TimeDelta::minutes(5),
+            )
+            .await;
+
+        assert!(h.consumed(h.a, &state).await.is_none(), "not yet");
+
+        // `github` is a real catalogue entry that takes a pasted bearer, so the
+        // exchange refuses — after the claim, which is the point.
+        let (first, body) = h.callback(&format!("state={state}&code=whatever")).await;
+        assert_eq!(first, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            h.consumed(h.a, &state).await.is_some(),
+            "the claim must commit before the exchange, or a crash mid-exchange \
+             leaves a replayable state"
+        );
+
+        let (second, body) = h.callback(&format!("state={state}&code=whatever")).await;
+        assert_eq!(
+            second,
+            StatusCode::NOT_FOUND,
+            "a state must not be presentable twice: {body}"
+        );
+    }
+
+    /// An expired flow is the same 404 as one that never existed.
+    #[tokio::test]
+    async fn an_expired_flow_and_an_invented_one_are_the_same_answer() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let stale = h
+            .plant_flow(
+                h.a,
+                "github",
+                "gh",
+                Utc::now() - chrono::TimeDelta::seconds(1),
+            )
+            .await;
+
+        let (expired, expired_body) = h.callback(&format!("state={stale}&code=c")).await;
+        let (invented, invented_body) = h.callback("state=never-minted&code=c").await;
+        assert_eq!(expired, StatusCode::NOT_FOUND);
+        assert_eq!(invented, StatusCode::NOT_FOUND);
+        assert_eq!(
+            expired_body, invented_body,
+            "telling the two apart tells whoever is guessing which states were real"
+        );
+        assert!(
+            h.consumed(h.a, &stale).await.is_none(),
+            "an expired flow is not claimed, so it can still be reaped"
+        );
+    }
+
+    /// **The tenant mutation.** The callback reads its tenant from the row it
+    /// found, and nothing in the request can move it.
+    ///
+    /// Two tenants hold a flow each. One state is presented, with the *other*
+    /// tenant's API key on the request and its id in the query string — the two
+    /// shapes a "take the tenant from the request" bug takes. Only the tenant
+    /// whose row was found is touched.
+    #[tokio::test]
+    async fn a_callback_names_no_tenant_and_cannot_choose_one() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let mine = h
+            .plant_flow(
+                h.a,
+                "github",
+                "gh",
+                Utc::now() + chrono::TimeDelta::minutes(5),
+            )
+            .await;
+        let theirs = h
+            .plant_flow(
+                h.b,
+                "github",
+                "gh",
+                Utc::now() + chrono::TimeDelta::minutes(5),
+            )
+            .await;
+
+        // Tenant B's key, tenant B's id, tenant A's state. Extra parameters are
+        // accepted on purpose — providers append their own — so this is exactly
+        // what an attacker would send.
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri(format!(
+                "{CALLBACK_PATH}?state={mine}&code=c&tenant_id={}&tenant={}",
+                h.b.as_uuid(),
+                h.b.as_uuid()
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {SECRET_B}"))
+            .body(Body::empty())
+            .expect("request");
+        let response = h.public.clone().oneshot(req).await.expect("service");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        assert!(
+            h.consumed(h.a, &mine).await.is_some(),
+            "the row that was found is the one that was spent"
+        );
+        assert!(
+            h.consumed(h.b, &theirs).await.is_none(),
+            "the tenant named in the request must have had nothing happen to it"
+        );
+    }
+
+    /// A human who declines leaves nothing behind but a spent state.
+    #[tokio::test]
+    async fn a_refused_consent_stores_nothing() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let state = h
+            .plant_flow(
+                h.a,
+                "github",
+                "declined",
+                Utc::now() + chrono::TimeDelta::minutes(5),
+            )
+            .await;
+
+        let (status, body) = h
+            .callback(&format!("state={state}&error=access_denied"))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Not connected"), "{body}");
+        assert!(
+            !body.contains("access_denied"),
+            "a provider's error string is a stranger's text and is not rendered: {body}"
+        );
+
+        let (listed, _) = h.send("GET", "/v1/mcp/servers", Some(SECRET_A), None).await;
+        assert_eq!(listed, StatusCode::OK);
+        assert!(
+            h.consumed(h.a, &state).await.is_some(),
+            "declining still spends the state"
+        );
+    }
+
+    /// The upsert the callback writes, on its own.
+    ///
+    /// Called directly because the exchange in front of it needs an
+    /// authorization server, and this is the half with eight bound parameters in
+    /// it. What it has to get right: the access token in the column
+    /// `Fleet::bind` reads, the refresh token in the one only
+    /// `oauth::refresh_due` reads, an expiry the refresh query can select on,
+    /// and an audit row that says *whether*, never *what*.
+    #[tokio::test]
+    async fn a_stored_oauth_binding_lands_in_the_columns_that_read_it() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let state = McpState::new(
+            h.db.clone(),
+            h.fleets.clone(),
+            h.credentials.clone(),
+            h.clients.clone(),
+            "https://agentos.test",
+        );
+        let server = Slug::parse("gh-oauth").expect("slug");
+        let expires_at = Utc::now() + chrono::TimeDelta::hours(1);
+        let sealed = oauth::Sealed {
+            access: h
+                .credentials
+                .seal(h.a, &server, Some("the-access-token".to_owned()))
+                .expect("seal")
+                .expect("some"),
+            refresh: Some(
+                h.credentials
+                    .seal(h.a, &server, Some("the-refresh-token".to_owned()))
+                    .expect("seal")
+                    .expect("some"),
+            ),
+            expires_at,
+        };
+
+        store_oauth_binding(
+            &state,
+            h.a,
+            &server,
+            catalog::find("github").expect("github"),
+            "https://api.githubcopilot.com/mcp/",
+            &sealed,
+            Utc::now(),
+        )
+        .await
+        .expect("store");
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let row: (String, String, bool, bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT url, connector, sealed_token IS NOT NULL, \
+                    sealed_refresh_token IS NOT NULL, token_expires_at \
+               FROM mcp_servers WHERE server = $1",
+        )
+        .bind(server.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(row.0, "https://api.githubcopilot.com/mcp/");
+        assert_eq!(row.1, "github", "the floor is enforced against this key");
+        assert!(row.2 && row.3, "both envelopes are stored");
+        assert_eq!(row.4, Some(expires_at), "the refresh loop selects on this");
+
+        // The listing says a credential exists and cannot say more: the query it
+        // reads does not project either column.
+        let (status, body) = h.send("GET", "/v1/mcp/servers", Some(SECRET_A), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rendered = body.to_string();
+        assert!(rendered.contains("\"has_credential\":true"), "{rendered}");
+        for secret in ["the-access-token", "the-refresh-token"] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+
+        let trail = h.audit_text(h.a).await;
+        assert!(trail.contains("mcp.oauth.connected"), "{trail}");
+        assert!(trail.contains("\"refreshable\": true"), "{trail}");
+        for secret in ["the-access-token", "the-refresh-token"] {
+            assert!(
+                !trail.contains(secret),
+                "{secret} leaked into the trail: {trail}"
+            );
+        }
+    }
+
+    /// Starting a flow refuses the two connectors that cannot have one, and the
+    /// refusals are different sentences because the fixes are different.
+    #[tokio::test]
+    async fn a_flow_can_only_start_for_a_connector_that_has_one() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/mcp/oauth/start",
+                Some(SECRET_A),
+                Some(json!({"connector": "not-a-connector", "server": "erp"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // `custom` takes a pasted token and has no authorization server.
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/mcp/oauth/start",
+                Some(SECRET_A),
+                Some(json!({"connector": "custom", "server": "erp"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "connector_is_not_oauth", "{body}");
+
+        // And nothing was written for a refusal.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let flows: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_oauth_flows")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(flows, 0, "a refused start leaves no flow behind");
+    }
+
+    // -- OAuth, end to end, against an authorization server we stand up -------
+    //
+    // The catalogue is a `const` of `&'static str`s naming other people's hosts,
+    // so the only way to exercise these routes at all is to hand them one that
+    // names a loopback port. `McpState::over` is that seam and its doc comment
+    // argues it; what follows is what the seam buys, which is a test for the
+    // line that decides whose tenant a third party's token is stored under.
+
+    /// A token endpoint on a loopback port, recording what it was sent.
+    async fn fake_authorization_server(
+        access: &str,
+        refresh: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let payload = format!(
+            r#"{{"access_token":"{access}","refresh_token":"{refresh}","expires_in":3600}}"#
+        );
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    while let Ok(n) = stream.read(&mut chunk).await {
+                        if n == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..n]);
+                        if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    recorded
+                        .lock()
+                        .expect("not poisoned")
+                        .push(String::from_utf8_lossy(&buffer).into_owned());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (origin, seen)
+    }
+
+    /// A catalogue with exactly one OAuth entry, pointed at `origin`.
+    ///
+    /// Leaked, because `Connector` is `&'static` on purpose: production entries
+    /// are literals in a `const` array and the type says so.
+    fn oauth_catalog(origin: &str) -> &'static [Connector] {
+        let endpoints: &'static catalog::OAuth = Box::leak(Box::new(catalog::OAuth {
+            authorize: Box::leak(format!("{origin}/authorize").into_boxed_str()),
+            token: Box::leak(format!("{origin}/token").into_boxed_str()),
+            scopes: "read:things write:things",
+            auth: catalog::ClientAuth::Post,
+        }));
+        Box::leak(Box::new([Connector {
+            key: "acme",
+            label: "Acme",
+            // A host that does not answer, deliberately: the callback's final
+            // bind is a *report*, and the branch worth covering is the one where
+            // the tokens are kept anyway.
+            url: Some("https://mcp.acme.invalid/mcp"),
+            reach: Reach::Public,
+            credential: Credential::OAuth(endpoints),
+            floor: RiskClass::Write,
+        }]))
+    }
+
+    /// The `state` out of a consent URL.
+    fn state_of(authorize_url: &str) -> String {
+        authorize_url
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("state="))
+            .expect("the consent url carries a state")
+            .to_owned()
+    }
+
+    async fn get(app: &Router, uri: &str, secret: Option<&str>) -> (StatusCode, String) {
+        let mut req = HttpRequest::builder().method("GET").uri(uri);
+        if let Some(secret) = secret {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::empty()).expect("request"))
+            .await
+            .expect("service");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn post_json(app: &Router, uri: &str, secret: &str, body: Value) -> (StatusCode, Value) {
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let response = app.clone().oneshot(req).await.expect("service");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// One click, one consent, one binding — and the tokens land sealed.
+    #[tokio::test]
+    async fn a_consent_becomes_a_binding_and_the_tokens_are_never_readable_again() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (origin, seen) = fake_authorization_server("acme-at-secret", "acme-rt-secret").await;
+        let (api, public) = h.over(oauth_catalog(&origin));
+
+        // The connector is offered, because this deployment has a registration
+        // for it. `Harness` registers `acme`.
+        let (status, body) = get(&api, "/v1/mcp/catalog", Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"connector\":\"acme\""), "{body}");
+        assert!(
+            body.contains("read:things write:things"),
+            "a UI has to be able to say what the consent screen will ask for: {body}"
+        );
+
+        let (status, started) = post_json(
+            &api,
+            "/v1/mcp/oauth/start",
+            SECRET_A,
+            json!({"connector": "acme", "server": "acme-erp"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let authorize_url = started["authorize_url"].as_str().expect("a url").to_owned();
+        assert!(
+            authorize_url.starts_with(&format!("{origin}/authorize?")),
+            "{authorize_url}"
+        );
+        assert!(
+            authorize_url.contains("code_challenge_method=S256"),
+            "{authorize_url}"
+        );
+        assert!(
+            authorize_url
+                .contains("redirect_uri=https%3A%2F%2Fagentos.test%2Fv1%2Fmcp%2Foauth%2Fcallback"),
+            "the redirect uri is ours and is escaped: {authorize_url}"
+        );
+
+        // The state is a capability. It is in the response, because that is the
+        // response's job, and in nothing else.
+        let state = state_of(&authorize_url);
+        let trail = h.audit_text(h.a).await;
+        assert!(trail.contains("mcp.oauth.started"), "{trail}");
+        assert!(
+            !trail.contains(&state),
+            "the state must not be in the audit trail: {trail}"
+        );
+
+        // …and now the browser comes back.
+        let (status, page) = get(
+            &public,
+            &format!("{CALLBACK_PATH}?state={state}&code=the-code&scope=read%3Athings"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        // The MCP endpoint in this catalogue does not resolve, so the honest
+        // page is the one that says the tokens are stored and the server has not
+        // answered — and that branch is exactly what must not throw the tokens
+        // away, because an authorization code cannot be presented twice.
+        assert!(page.contains("Connected"), "{page}");
+
+        // The exchange really happened, with PKCE and the client secret.
+        let requests = seen.lock().expect("not poisoned").clone();
+        assert_eq!(requests.len(), 1, "one exchange");
+        assert!(requests[0].contains("code_verifier="), "{}", requests[0]);
+        assert!(requests[0].contains("code=the-code"), "{}", requests[0]);
+
+        // The binding is stored, sealed, with an expiry the refresh loop reads.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let row: (String, bool, bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT connector, sealed_token IS NOT NULL, sealed_refresh_token IS NOT NULL, \
+                    token_expires_at FROM mcp_servers WHERE server = 'acme-erp'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(row.0, "acme");
+        assert!(row.1 && row.2 && row.3.is_some());
+
+        // And nothing anybody can read holds either token.
+        let (_, listed) = get(&api, "/v1/mcp/servers", Some(SECRET_A)).await;
+        let trail = h.audit_text(h.a).await;
+        for surface in [&listed, &trail, &page] {
+            for secret in ["acme-at-secret", "acme-rt-secret", "the-code", &state] {
+                assert!(
+                    !surface.contains(secret),
+                    "{secret} leaked into:\n{surface}"
+                );
+            }
+        }
+        assert!(listed.contains("\"has_credential\":true"), "{listed}");
+        assert!(trail.contains("mcp.oauth.connected"), "{trail}");
+    }
+
+    /// **The tenant mutation.** The binding lands under the tenant that started
+    /// the flow, and nothing in the callback request can move it.
+    ///
+    /// Tenant B holds an API key and knows its own id. It sends both, alongside
+    /// tenant A's state — the exact shape of "take the tenant from the request".
+    /// Replace `TenantId::from_uuid(row.tenant_id)` in [`oauth_callback`] with
+    /// anything read off `params` and this goes red.
+    #[tokio::test]
+    async fn a_binding_lands_under_the_tenant_that_started_the_flow() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (origin, _) = fake_authorization_server("at-x", "rt-x").await;
+        let (api, public) = h.over(oauth_catalog(&origin));
+
+        let (status, started) = post_json(
+            &api,
+            "/v1/mcp/oauth/start",
+            SECRET_A,
+            json!({"connector": "acme", "server": "acme-erp"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let state = state_of(started["authorize_url"].as_str().expect("a url"));
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri(format!(
+                "{CALLBACK_PATH}?state={state}&code=c&tenant_id={b}&tenant={b}",
+                b = h.b.as_uuid()
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {SECRET_B}"))
+            .body(Body::empty())
+            .expect("request");
+        let response = public.clone().oneshot(req).await.expect("service");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let count = async |tenant: TenantId| -> i64 {
+            let mut tx = h.db.tenant_tx(tenant).await.expect("tenant tx");
+            let n =
+                sqlx::query_scalar("SELECT count(*) FROM mcp_servers WHERE server = 'acme-erp'")
+                    .fetch_one(&mut **tx)
+                    .await
+                    .expect("count");
+            tx.rollback().await.expect("rollback");
+            n
+        };
+        assert_eq!(count(h.a).await, 1, "the tenant whose row was found");
+        assert_eq!(
+            count(h.b).await,
+            0,
+            "the tenant the request named must have had nothing happen to it"
+        );
+    }
+
+    /// A deployment with no registration does not offer the connector, and does
+    /// not let a caller start a flow for it either.
+    #[tokio::test]
+    async fn an_oauth_connector_with_no_registration_is_invisible_and_unstartable() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (origin, _) = fake_authorization_server("at", "rt").await;
+        // A catalogue whose single entry is keyed `acme`, against a harness that
+        // registered `acme` — then the same thing with the registration removed.
+        let entries = oauth_catalog(&origin);
+        let unregistered: &'static [Connector] = Box::leak(Box::new([Connector {
+            key: "unregistered",
+            ..entries[0]
+        }]));
+        let (api, _) = h.over(unregistered);
+
+        let (status, body) = get(&api, "/v1/mcp/catalog", Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("unregistered"),
+            "a button that cannot work must not be rendered: {body}"
+        );
+
+        let (status, body) = post_json(
+            &api,
+            "/v1/mcp/oauth/start",
+            SECRET_A,
+            json!({"connector": "unregistered", "server": "acme-erp"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "connector_not_registered", "{body}");
+    }
+
+    /// The two doors do not overlap: a connector that connects by consent
+    /// cannot be connected by pasting a string at it.
+    ///
+    /// Without this, `connect`'s `match` fell through a wildcard and stored the
+    /// pasted value in `sealed_token` — the column `oauth::refresh_due` reads —
+    /// with no refresh token and no expiry beside it. It would bind once and
+    /// stop at a moment nobody could predict.
+    #[tokio::test]
+    async fn a_consent_connector_is_not_connectable_by_pasting_a_token() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (origin, _) = fake_authorization_server("at", "rt").await;
+        let (api, _) = h.over(oauth_catalog(&origin));
+
+        for body in [
+            json!({"connector": "acme", "server": "acme-erp", "token": "pasted"}),
+            json!({"connector": "acme", "server": "acme-erp"}),
+        ] {
+            let (status, answered) = post_json(&api, "/v1/mcp/connect", SECRET_A, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{answered}");
+            assert!(
+                answered["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("/v1/mcp/oauth/start")),
+                "the refusal has to name the door that works: {answered}"
+            );
+        }
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_servers")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(rows, 0, "a refused connect stores nothing");
+    }
+
+    /// A connector whose URL the customer supplies cannot connect by consent:
+    /// the flow row carries no URL, so the callback would have nothing to store
+    /// in a `NOT NULL` column.
+    #[tokio::test]
+    async fn a_consent_connector_has_to_own_its_endpoint() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (origin, _) = fake_authorization_server("at", "rt").await;
+        let entries = oauth_catalog(&origin);
+        let endpointless: &'static [Connector] = Box::leak(Box::new([Connector {
+            url: None,
+            ..entries[0]
+        }]));
+        let (api, _) = h.over(endpointless);
+
+        let (status, body) = post_json(
+            &api,
+            "/v1/mcp/oauth/start",
+            SECRET_A,
+            json!({"connector": "acme", "server": "acme-erp"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "connector_has_no_endpoint", "{body}");
     }
 }

@@ -100,10 +100,86 @@ pub enum Credential {
     None,
     /// One opaque string, sent as `Authorization: Bearer <it>`.
     ///
-    /// The whole of what this catalogue supports today. Every remote MCP server
-    /// worth connecting either takes one of these or takes OAuth, and OAuth is
-    /// not here — see this module's tests and the report for what that costs.
+    /// A customer pastes it. It is the cheapest credential to support and the
+    /// only one GitHub's remote server needs, which is why it was the first.
     Bearer,
+    /// The authorization code flow: a consent page, a redirect back, and a token
+    /// this deployment exchanged for.
+    ///
+    /// What comes out is still sent as `Authorization: Bearer <it>` — the access
+    /// token goes in the same column and down the same header as a pasted one,
+    /// and `mcp::McpServer::bind` cannot tell the two apart. That is the whole
+    /// reason this variant is cheap: OAuth is a way of *obtaining* the string in
+    /// [`Credential::Bearer`], not a second way of using one.
+    ///
+    /// What it costs, and it is the honest half: an access token expires, so a
+    /// binding that carries one has to be refreshed by something before it does
+    /// — `crate::oauth::refresh_due`, driven by the binder loop that was already
+    /// rebinding every five minutes. See that module for why it is that loop and
+    /// not a clock of its own.
+    OAuth(&'static OAuth),
+}
+
+/// Where one connector's authorization server lives, and what we ask it for.
+///
+/// # These three strings are ours and the customer never sees a field for them
+///
+/// Same argument as [`Connector::url`], one level up: a customer who cannot
+/// mistype an authorization endpoint cannot be walked into consenting at one
+/// that looks like it. An OAuth consent page is the single most valuable phishing
+/// target this product has — it is the screen where a person is *expected* to
+/// approve access to their company's data — so the URL the browser is sent to
+/// must come from this binary and from nowhere else.
+///
+/// `scopes` is here for the same reason, pointed the other way: it is the
+/// **only** thing that bounds what the token we end up holding can do at the
+/// provider, and letting a request name it would let a caller ask for more than
+/// the connector needs. A tenant cannot widen it because there is no field to
+/// widen it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuth {
+    /// Where the browser is sent to ask a human. `https`, always.
+    pub authorize: &'static str,
+    /// Where a code is exchanged for a token, server to server. `https`, always.
+    ///
+    /// This one is never in a browser: it carries the deployment's client secret
+    /// and the PKCE verifier, and both are ours.
+    pub token: &'static str,
+    /// What we ask for, space separated, exactly as the provider spells it.
+    ///
+    /// Narrow is the job. This is a claim about the least a connector can work
+    /// with, and it is the one place in the system where "we asked for less" is
+    /// a defence that holds even after every other control has failed.
+    pub scopes: &'static str,
+    /// How this provider wants the client secret presented at the token
+    /// endpoint.
+    ///
+    /// A field and not a constant, and it is the one piece of flexibility in
+    /// this struct that had to be argued rather than assumed. RFC 6749 §2.3.1
+    /// makes HTTP Basic mandatory for a server to *support* and the form body
+    /// optional — and then several of the largest providers document the form
+    /// body as their only example, while others (Notion is the one everybody
+    /// meets first) accept nothing but Basic. There is no choice here that is
+    /// right for both, the wrong one is an `invalid_client` with no diagnosis,
+    /// and this is not something the code can discover: it is a fact about a
+    /// provider, written down beside the other three facts about that provider,
+    /// by the same person reading the same page.
+    pub auth: ClientAuth,
+}
+
+/// Which of RFC 6749 §2.3.1's two schemes a token endpoint wants.
+///
+/// Never both in one request — the RFC forbids it, and a server that sees two
+/// answers `invalid_client`. [`crate::oauth::post_token`] is where that is one
+/// `match` and cannot be forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// `Authorization: Basic base64(client_id:client_secret)`. The one the RFC
+    /// says every authorization server must support, and the default to reach
+    /// for when a provider's documentation does not say.
+    Basic,
+    /// `client_id` and `client_secret` as form fields in the token request.
+    Post,
 }
 
 impl Credential {
@@ -113,6 +189,20 @@ impl Credential {
         match self {
             Credential::None => "none",
             Credential::Bearer => "bearer",
+            Credential::OAuth(_) => "oauth",
+        }
+    }
+
+    /// The endpoints, for the connectors that have them.
+    ///
+    /// A method rather than a `matches!` at four call sites: the OAuth routes
+    /// all begin by asking this question, and a `let else` on one `Option` is
+    /// the shape that makes "this connector does not do OAuth" a single refusal
+    /// instead of four.
+    pub const fn oauth(self) -> Option<&'static OAuth> {
+        match self {
+            Credential::OAuth(endpoints) => Some(endpoints),
+            Credential::None | Credential::Bearer => None,
         }
     }
 }
@@ -173,8 +263,36 @@ pub const CUSTOM: Connector = Connector {
 /// checked is worse than an absent entry, because an absent entry sends the
 /// customer to [`CUSTOM`] where they paste a URL they looked up themselves.
 ///
-/// Each entry below carries the reason it is a static bearer token rather than
-/// OAuth, because that is the question every one of them raises.
+/// # Why there is still no OAuth entry here, now that OAuth works
+///
+/// [`Credential::OAuth`] is built, tested end to end against a provider in
+/// `crate::oauth`'s own tests, and reachable from the two routes in
+/// `apps/server/src/routes/mcp.rs`. No entry uses it, and that is a refusal
+/// rather than an omission — the rule two paragraphs up is the one being kept.
+///
+/// An entry is a claim, and an OAuth entry is **four** claims: the MCP endpoint,
+/// the authorization URL, the token URL, and the scope spelling. Every one of
+/// them is a string that fails silently-ish if wrong — a bad scope is a consent
+/// screen that grants too much, a bad authorize host is a phishing page we
+/// shipped ourselves — and none of them can be checked from here, because
+/// checking them means registering an application with that provider and making
+/// a real call. Neither has happened.
+///
+/// The second half is sharper and is the reason this is not merely caution.
+/// **An OAuth connector needs a client registration that only the deployment can
+/// obtain**, and `apps/server/src/routes/mcp.rs`'s catalogue handler only
+/// advertises an entry whose client credentials this deployment actually holds.
+/// So an entry added before somebody registers the application is a button that
+/// is either invisible or broken; adding one is the *second* step, and the first
+/// one is not code.
+///
+/// What is written down instead is what registering takes, in this unit's
+/// report, so the person with the accounts can do it and add the literal. The
+/// literal is four lines, the test below vets it, and it is a deploy — which is
+/// the price this file has charged for a security default since it was written.
+///
+/// Each token entry below carries the reason it is a static bearer token, because
+/// that is the question every one of them raises.
 pub const CATALOG: &[Connector] = &[
     Connector {
         key: "github",
@@ -202,7 +320,27 @@ pub const CATALOG: &[Connector] = &[
 /// would mean a typo in the connector name silently becomes "bind whatever URL
 /// was in the body", which is the one substitution this file exists to prevent.
 pub fn find(key: &str) -> Option<&'static Connector> {
-    CATALOG.iter().find(|c| c.key == key)
+    find_in(CATALOG, key)
+}
+
+/// The same lookup, over a catalogue somebody named.
+///
+/// # Why this exists, when there is only one catalogue
+///
+/// Because `apps/server` has to be able to prove what its routes do with an
+/// OAuth connector, and an OAuth connector is by definition one whose
+/// authorization server is somebody else's — a `&'static str` this file will
+/// never point at a loopback port. Handing the array in makes the route
+/// testable against a provider a test can stand up, with **the same code path**:
+/// there is no branch here that behaves differently for one catalogue than for
+/// another, and the production wiring passes [`CATALOG`] in one place.
+///
+/// It is the same shape `model_access::connect` uses for its probe origin, and
+/// the same argument: a value threaded through beats a `#[cfg(test)]` branch,
+/// because a branch that only exists in a test build is a branch the shipped
+/// binary has never run.
+pub fn find_in<'a>(catalog: &'a [Connector], key: &str) -> Option<&'a Connector> {
+    catalog.iter().find(|c| c.key == key)
 }
 
 impl Connector {
@@ -286,6 +424,63 @@ mod tests {
                 connector.key
             );
         }
+    }
+
+    /// An OAuth entry's three URLs are held to the same bar as the MCP one.
+    ///
+    /// **This test is written for an array it does not yet cover**, which is the
+    /// unusual half and the deliberate half: [`CATALOG`]'s docs argue why no
+    /// OAuth entry is here yet, and the entry that arrives will be four string
+    /// literals typed by somebody reading a provider's documentation at the time.
+    /// A typo in `authorize` is a consent page we sent a customer to, so the
+    /// check has to already exist when the literal lands rather than be
+    /// remembered alongside it. The loop below is empty today and costs nothing;
+    /// the day it is not, it is the only thing standing between a slipped
+    /// character and a browser.
+    ///
+    /// `oauth_endpoints_are_vetted_the_same_way` proves it bites on a bad entry
+    /// without waiting for a real one.
+    #[test]
+    fn every_catalogued_oauth_endpoint_is_https_and_parseable() {
+        for connector in CATALOG {
+            let Some(endpoints) = connector.credential.oauth() else {
+                continue;
+            };
+            assert_oauth_is_usable(connector.key, endpoints);
+        }
+    }
+
+    /// The body of the check above, so a synthetic entry can run it.
+    fn assert_oauth_is_usable(key: &str, endpoints: &OAuth) {
+        for url in [endpoints.authorize, endpoints.token] {
+            crate::mcp::vet_url(url).unwrap_or_else(|err| panic!("{key}: {url:?}: {err}"));
+            assert!(
+                url.starts_with("https://"),
+                "{key}: {url:?} — an authorization server is on the internet and \
+                 a consent page over http is a credential handed to whoever is \
+                 on the wire"
+            );
+        }
+        assert!(
+            !endpoints.scopes.trim().is_empty(),
+            "{key}: an empty scope string asks a provider for its default grant, \
+             which is the widest one it has"
+        );
+    }
+
+    /// The loop above is empty; this is the proof it would refuse a bad entry.
+    #[test]
+    #[should_panic(expected = "an authorization server is on the internet")]
+    fn oauth_endpoints_are_vetted_the_same_way() {
+        assert_oauth_is_usable(
+            "pretend",
+            &OAuth {
+                authorize: "http://accounts.example.com/authorize",
+                token: "https://accounts.example.com/token",
+                scopes: "read",
+                auth: ClientAuth::Basic,
+            },
+        );
     }
 
     /// Keys are the API. Two entries under one key is a lookup that silently
