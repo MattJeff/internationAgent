@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
 use agentos_app::inbound::{
-    self, BlobStore, Errand, InMemoryBlobs, Secret, Thread, record_raw_email_notice,
+    self, BlobStore, Errand, InMemoryBlobs, Recorded, Secret, Thread, record_raw_email_delivery,
 };
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
@@ -1078,7 +1078,7 @@ fn on_terminated<'a>(
     })
 }
 
-/// `webhook.{provider}.received`: the raw delivery becomes an inbound notice.
+/// `webhook.{provider}.received`: the raw delivery is read and acted on.
 ///
 /// The missing joint. The webhook route stores the bytes it verified and
 /// answers 202 without interpreting them — it cannot interpret them, because
@@ -1087,6 +1087,32 @@ fn on_terminated<'a>(
 /// 'inbound'` and an `email.received` payload it can read. Nothing wrote one.
 /// This does, through `agentos_app`, in the transaction that publishes the
 /// delivery — so a crash between the two re-runs both.
+///
+/// # `received` in the event type is a filing name, not a claim
+///
+/// The route files every verified delivery under `webhook.{provider}.received`
+/// whatever the provider actually sent, and that is deliberate rather than
+/// sloppy: the edge must not deserialise a body before it has finished
+/// verifying it, and an `event_type` with no handler in [`handlers`] is retried
+/// eight times and dead-lettered — which is exactly what `0053`'s
+/// `webhook_endpoints_provider_is_wired` CHECK exists to prevent. So one event
+/// type, one handler, and **this** is where a delivery finds out what it is.
+///
+/// ponytail: the name still reads like a claim about the payload. Renaming it
+/// to `.delivered` would be honest and would also strand every unpublished
+/// `webhook.*.received` row in every running deployment behind an event type
+/// nothing handles — the eight-retries-and-a-dead-letter failure, applied to
+/// the whole inbound queue at once. Rename it in a commit that registers both
+/// names and drops the old one a release later, or leave it.
+///
+/// # What is an error here, and what is merely not a message
+///
+/// Only the first kind returns `Err`, because `Err` is eight attempts and then
+/// a dead letter. A refusal (`email.bounced`, `email.complained`) and a type
+/// this build has never read the docs for are both `Ok`: no number of retries
+/// turns either into something else, and treating them as failures is how a
+/// spam complaint got thrown away. See
+/// [`record_raw_email_delivery`](agentos_app::inbound::record_raw_email_delivery).
 fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
     Box::pin(async move {
         let body = event
@@ -1096,11 +1122,42 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
             .ok_or_else(|| "this stored delivery has no body".to_owned())?;
 
         // Exactly the bytes the signature was checked over at the edge.
-        let (employee_id, notice) = record_raw_email_notice(tx, body.as_bytes(), Utc::now())
+        let recorded = record_raw_email_delivery(tx, body.as_bytes(), Utc::now())
             .await
             .map_err(|err| format!("{}: {err}", err.code()))?;
 
-        tracing::info!(%employee_id, %notice, "webhook delivery queued for the inbound loop");
+        match recorded {
+            Recorded::Notice {
+                employee_id,
+                event_id,
+            } => {
+                tracing::info!(
+                    %employee_id,
+                    %event_id,
+                    "webhook delivery queued for the inbound loop"
+                );
+            }
+            // `warn`, not `error`: nothing is broken, and a stream of errors
+            // about the system working is what buried the last real one. The
+            // addresses are deliberately absent from the line — the count says
+            // whether the row is worth opening, and the trail holds the rest.
+            Recorded::Refused(refusal) => {
+                tracing::warn!(
+                    reason = refusal.reason,
+                    permanent = refusal.permanent,
+                    recipients = refusal.addresses.len(),
+                    "the far end refused our mail; recorded on the audit trail"
+                );
+            }
+            // `?` and never `%`: third-party text, headed for a log line.
+            Recorded::Unread { kind } => {
+                tracing::warn!(
+                    kind = ?kind,
+                    "a verified webhook of a type this build has no reader for; \
+                     read the provider's docs or unsubscribe the endpoint from it"
+                );
+            }
+        }
         Ok(())
     })
 }

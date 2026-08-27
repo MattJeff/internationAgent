@@ -176,6 +176,25 @@ pub enum AuditKind {
     /// An employee signed a payload with its own key. A signature is an
     /// assertion made in the company name, so it leaves a row like any other.
     MessageSigned,
+    /// The far end refused our mail: a spam complaint, or a bounce. Written by
+    /// `app::inbound::record_raw_email_delivery`, in the transaction that
+    /// publishes the stored webhook delivery, so the trail cannot claim a
+    /// refusal the queue then rolled back.
+    ///
+    /// Its own kind rather than [`AuditKind::MessageReceived`], and the
+    /// difference is the one somebody will be checking: that row is a stranger
+    /// reaching an employee, this one is a person telling us to stop. Sharing a
+    /// kind would bury every complaint under the ordinary inbound traffic — and
+    /// a complaint is the row this table's append-only trigger and its missing
+    /// foreign key to `tenants` exist for, since a record of "they asked us to
+    /// stop" that a tenant can erase is not a record.
+    ///
+    /// The payload carries `reason` (`complaint` / `bounce`, spelled as
+    /// `suppressions.reason` spells it), `permanent`, `channel`, and the
+    /// normalised `addresses`. **It is not yet a `suppressions` row** — see the
+    /// seam named on `app::inbound::record_refusal`, which is the one call this
+    /// stops short of.
+    MailRefused,
     ProviderCallAttempted,
     SecretAccessed,
     PolicyChanged,
@@ -258,6 +277,7 @@ impl AuditKind {
             AuditKind::CapabilityDecided => "capability_decided",
             AuditKind::MessageReceived => "message_received",
             AuditKind::MessageSigned => "message_signed",
+            AuditKind::MailRefused => "mail_refused",
             AuditKind::ProviderCallAttempted => "provider_call_attempted",
             AuditKind::SecretAccessed => "secret_accessed",
             AuditKind::PolicyChanged => "policy_changed",

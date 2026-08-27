@@ -107,27 +107,35 @@ impl ResendEmailProvider {
     /// # What this claim does NOT say, and nobody should read into it
     ///
     /// **Nothing on this deployment turns a Resend complaint into a
-    /// `suppressions` row.** The door is real and the reader is missing, in
-    /// three separate places, and none of them is fixed by this constant:
+    /// `suppressions` row.** That is still true, and it is now the *only* thing
+    /// left of a gap that used to be three:
     ///
     /// * `apps/server/src/routes/webhooks.rs` files every verified delivery
     ///   under `received_event(provider)` — literally
     ///   `webhook.email.received`, whatever event Resend actually sent.
-    /// * [`crate::email::InboundNotice::parse`] refuses anything that is not
-    ///   `email.received` with [`crate::email::ParseError::WrongEvent`], and
-    ///   `main::on_webhook` turns that refusal into a handler error — so a
-    ///   `email.bounced` or `email.complained` delivery is retried eight times
-    ///   and dead-lettered. The bytes survive in the outbox; the suppression
-    ///   never happens.
+    ///   **Unchanged, and deliberately so**: the edge must not deserialise a
+    ///   body before it has verified it, and an `event_type` no handler is
+    ///   registered for is the eight-retries-and-a-dead-letter failure applied
+    ///   to every message at once. The name is a filing name, not a claim.
+    /// * [`crate::email::InboundNotice::parse`] still refuses anything that is
+    ///   not `email.received` with [`crate::email::ParseError::WrongEvent`] —
+    ///   also unchanged, because nothing should be able to build an inbound
+    ///   notice out of a bounce. What changed is that it is no longer the front
+    ///   door: [`crate::email::Delivery::parse`] classifies a delivery first,
+    ///   and `main::on_webhook` no longer turns "not an inbound message" into a
+    ///   handler error. A `email.bounced` or `email.complained` is now read,
+    ///   recorded on the audit trail as `mail_refused`, and **completed** —
+    ///   where before it was retried eight times and dead-lettered.
     /// * `agentos_app::queue::reconcile_opt_outs` — the one thing in this
     ///   workspace that writes an opt-out home — reads
     ///   `agentos_providers::leads::LeadSink`, which is the *campaign*
     ///   platform. It has never had anything to say about direct mail.
     ///
-    /// So the honest reading of this declaration is "the refusals arrive here
-    /// and are stored raw", not "the refusals are recorded". That is a gap this
-    /// unit deliberately did not close, because closing it is a handler and a
-    /// migration and not a trait obligation.
+    /// So the honest reading of this declaration is now "the refusals arrive
+    /// here, are read, and are recorded on an append-only trail", and still not
+    /// "the person is suppressed". The remaining step is one call, it needs no
+    /// migration, and it is named in full on
+    /// `agentos_app::inbound::record_refusal`.
     ///
     /// # The two questions only the founder can answer
     ///
