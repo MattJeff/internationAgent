@@ -9,6 +9,7 @@ pub mod catalog; // the connectors we wrote down, so a customer clicks instead o
 pub mod effects; // U21
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them
 pub mod gate; // U20
+pub mod hosted; // running somebody else's stdio server, outside our process tree
 pub mod http_signature;
 pub mod identity;
 pub mod inbound; // U29

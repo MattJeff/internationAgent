@@ -1,0 +1,74 @@
+-- 0043_mcp_hosted: a binding whose server we run, and therefore has no URL.
+--
+-- `0013_mcp` gave a binding a URL because every binding had one: somebody else
+-- ran the server and we dialled it. `agentos_app::hosted` adds the other kind —
+-- a stdio package this binary names, started for one tenant by a bridge runtime
+-- that is not this process, reached at an address that runtime mints per start.
+--
+-- The whole schema change is that `url` becomes nullable. Three decisions got
+-- it down to that, and each of them is a column that is NOT here.
+--
+-- 1. NO `hosted_package` COLUMN. `0040_mcp_credentials` already added
+--    `connector`, which is "which catalogue entry this binding came from", and
+--    the catalogue entry is what carries the package. A second column naming
+--    the package would be a second source of truth about the same fact, and two
+--    columns that can disagree are worse than one that has to be looked up:
+--    the disagreement is silent, it is per row, and the row that has it is by
+--    definition one nobody is looking at. `app::mcp::provisioned` reads
+--    `connector`, asks `app::catalog`, and that is the only place the question
+--    is answered.
+--
+--    The consequence is deliberate and is the fail-closed direction: a
+--    connector this build does not recognise is not hosted (`catalog::find`
+--    returns nothing), so removing an entry in a deploy turns its bindings into
+--    rows that bind nothing, rather than rows that start a program nobody can
+--    name any more. `0040`'s "the reader must tolerate a value it does not
+--    recognise" still holds; this is that reading pointed at the answer that
+--    refuses.
+--
+-- 2. NO CHECK THAT A HOSTED ROW HAS NO URL, and none that a dialled row has
+--    one. SQL cannot see the catalogue — it is a `const` in a binary, which is
+--    `app::catalog`'s own decision and a good one — so the constraint that
+--    would express "hosted rows have no URL" is not writable here. What IS
+--    writable is a constraint that would look right and enforce nothing, and
+--    that is worse than an absent one: it would read, to the next person, as
+--    the guarantee that the reader in `app::mcp` actually provides.
+--
+--    The reader provides it without help. A hosted binding never consults `url`
+--    — the address comes from the runtime and goes through
+--    `hosted::accept` — and a dialled binding with a NULL `url` has nothing to
+--    dial and is skipped with its reason logged. Neither branch can be steered
+--    by a value in this column that the other branch was supposed to own.
+--
+-- 3. NO NEW COLUMN FOR THE HOSTED CREDENTIAL. `sealed_token` is already the
+--    right shape and already has the right AAD: `0040_mcp_credentials` seals it
+--    under `mcp://<tenant>/<server>` so that a blob copied to another handle or
+--    another tenant does not open. What changes for a hosted binding is only
+--    where the plaintext goes after `Credentials::open` — into the package's
+--    environment variable inside the bridge, instead of onto an `Authorization`
+--    header — and "where does the plaintext go" is not a property of a row. The
+--    variable's NAME is in the binary, next to the package, so this table still
+--    holds one opaque blob and nothing that describes it.
+--
+-- And no new GRANT: `0019_mcp_operator_writes` gave `app_role` insert/update/
+-- delete on this table and a nullable column inherits the table's privileges,
+-- exactly as `0040`'s two columns did. The `tenant_isolation` policy from
+-- `0013_mcp` covers this column on USING and on WITH CHECK as it covers `url`.
+--
+-- ---------------------------------------------------------------------------
+-- What a NULL url means, and why it is not an empty string
+-- ---------------------------------------------------------------------------
+--
+-- "There is no address, and there is not supposed to be one." An empty string
+-- would be storable today without this migration, and that is exactly the
+-- argument against it: `''` is a value that every reader has to remember to
+-- treat as absent, one `LIKE` away from being dialled, and indistinguishable
+-- from a form that posted an untouched field. `0040_mcp_credentials` decision 3
+-- makes the same call about an empty credential for the same reason.
+--
+-- Existing rows are untouched and stay dialled: every one of them has a URL,
+-- which is what NOT NULL guaranteed up to now, and dropping a NOT NULL cannot
+-- invalidate a row that satisfies it.
+
+alter table mcp_servers
+  alter column url drop not null;

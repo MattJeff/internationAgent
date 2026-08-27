@@ -123,6 +123,18 @@
 //! bad, but that *spawning* is a different privilege from *dialling*, and this
 //! process should only ever do the second one.
 //!
+//! **Where that argument now stands.** It stands, unchanged, and
+//! [`crate::hosted`] is what it invited: the last sentence above is the load
+//! bearing one, and the way to serve a customer who cannot run a bridge is not
+//! to weaken it but to move the spawning somewhere this process has no
+//! privilege at all. A hosted binding is a [`Package`](crate::hosted::Package)
+//! this binary names — never a tenant's command line, which is the objection
+//! above and is not answered, only avoided — started by a
+//! [`BridgeRuntime`](crate::hosted::BridgeRuntime) that is a different process
+//! on a different network, and reached from here as a URL like any other. Every
+//! control in this file still rules on calls, and now nothing in this file has
+//! to rule on process creation, because this process still creates none.
+//!
 //! # Risk classes are declared, not discovered
 //!
 //! Every discovered tool gets a [`RiskClass`]. It comes from the operator's
@@ -396,8 +408,13 @@ impl Reach {
 }
 
 /// Where one resolved address sits.
+///
+/// `pub(crate)` for [`crate::hosted`], which has to run this *before* its own
+/// narrower check and must not restate it: a bridge network that happens to
+/// contain the metadata endpoint still does not get it, and the only way to
+/// promise that is for both callers to ask the same function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Placement {
+pub(crate) enum Placement {
     /// Routable on the public internet.
     Global,
     /// Reachable but internal: loopback, RFC 1918, unique-local.
@@ -407,7 +424,7 @@ enum Placement {
     Forbidden,
 }
 
-fn placement(ip: IpAddr) -> Placement {
+pub(crate) fn placement(ip: IpAddr) -> Placement {
     match ip {
         IpAddr::V4(v4) => placement_v4(v4),
         // `::1` first: it sits inside the IPv4-compatible range and would
@@ -550,6 +567,27 @@ pub enum McpError {
         code: &'static str,
     },
 
+    /// A [`crate::hosted`] binding has no bridge to talk to.
+    ///
+    /// One variant for the whole hosting path, carrying a `&'static str`, and
+    /// both halves of that are the design: this is rendered into
+    /// [`BindFailure::detail`] and from there into a JSON response, so a
+    /// runtime's own words must not be able to reach it. See
+    /// [`crate::hosted::BridgeError`].
+    ///
+    /// The codes: `hosting_unavailable` (this deployment runs no bridge
+    /// runtime), `bridge_endpoint_refused` (the address it answered with is not
+    /// one we may dial), `bridge_endpoint_not_an_address` (it answered with a
+    /// name), or whatever code the runtime itself returned. A row naming a
+    /// connector this build does not host is not in here on purpose: it is not
+    /// a hosted binding at all, so it is skipped by [`provisioned`] like any
+    /// other row that names nothing.
+    #[error("no bridge for this hosted server: {code}")]
+    Hosting {
+        /// Stable and low cardinality, by construction.
+        code: &'static str,
+    },
+
     /// The server was reached and the exchange failed.
     #[error(transparent)]
     Transport(#[from] ServiceError),
@@ -573,6 +611,9 @@ impl McpError {
             // `secret_decrypt_failed` are already stable, low-cardinality, and
             // they say which of the two things went wrong.
             McpError::Credential { code } => code,
+            // Same pass-through, same reason: `hosted::BridgeError` is a
+            // `&'static str` precisely so that it already is a metric label.
+            McpError::Hosting { code } => code,
             McpError::Transport(_) => "transport",
         }
     }
@@ -1207,6 +1248,65 @@ impl Credentials {
         };
         McpServer::bind(server, url, declared, reach, token.as_ref(), ct).await
     }
+
+    /// The same, for a server we run ourselves: start the bridge, then bind to
+    /// the address it answered with.
+    ///
+    /// # The credential goes somewhere else, and that is the only difference
+    ///
+    /// It is opened by the same [`open`](Self::open), from the same column,
+    /// under the same AAD — and then it is handed to
+    /// [`Bridges::endpoint`](crate::hosted::Bridges::endpoint) to be placed in
+    /// the package's environment instead of onto a header. The plaintext lives
+    /// for this function and nothing else: the [`Secret`] is a local, and
+    /// [`crate::hosted::BridgeSpec`] borrows it rather than owning it, so there
+    /// is no copy that outlives the call.
+    ///
+    /// **The token is deliberately `None` on the [`McpServer::bind`] below.**
+    /// Sending the same secret a second time as `Authorization: Bearer` would
+    /// put a tenant's credential on a hop that does not need it, and the bridge
+    /// is not the thing being authenticated — it is a process we started for
+    /// this tenant, reachable only on the operator's bridge network.
+    ///
+    /// **And `Reach::Private` there is not the check.** The check already
+    /// happened in `endpoint`, which is stricter than any `Reach`: an IP
+    /// literal, in private space, inside the operator's bridge network. What
+    /// `McpServer::bind` does with it is re-resolve a literal to itself, which
+    /// is why the contract says an address and not a name — there is no second
+    /// lookup that could answer differently.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_hosted(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        server: Slug,
+        package: &crate::hosted::Package,
+        declared: &BTreeMap<Slug, Declaration>,
+        sealed: Option<&[u8]>,
+        bridges: &crate::hosted::Bridges,
+        ct: CancellationToken,
+    ) -> Result<McpServer, McpError> {
+        let secret = match sealed {
+            None => None,
+            Some(sealed) => Some(self.open(tenant_id, &server, sealed)?),
+        };
+        let endpoint = bridges
+            .endpoint(crate::hosted::BridgeSpec {
+                tenant: tenant_id,
+                server: &server,
+                package,
+                secret: secret.as_ref(),
+            })
+            .await?;
+        McpServer::bind(
+            server,
+            endpoint.as_str(),
+            declared,
+            Reach::Private,
+            None,
+            ct,
+        )
+        .await
+    }
 }
 
 /// The encryption context one binding's credential is sealed under.
@@ -1316,8 +1416,15 @@ pub struct BindFailure {
 #[derive(sqlx::FromRow)]
 struct ConfigRow {
     server: String,
-    url: String,
+    /// `NULL` for a binding we host: there is no address for anybody to write
+    /// down, and `0043_mcp_hosted.sql` is the column becoming nullable so that
+    /// the absence is storable rather than faked with an empty string.
+    url: Option<String>,
     reach: String,
+    /// The catalogue entry this binding came from (`0040_mcp_credentials.sql`),
+    /// and the only thing that says whether it is dialled or hosted. One column
+    /// answering that, not two, because two can disagree.
+    connector: String,
     /// The envelope from `providers::secrets`, or `NULL` for a binding that
     /// sends no credential. Opaque here until [`Fleet::bind`] opens it.
     sealed_token: Option<Vec<u8>>,
@@ -1332,7 +1439,7 @@ struct ConfigRow {
 /// tool on it is undeclared, which is [`RiskClass::Destructive`], which is the
 /// honest state of a server nobody has vetted yet.
 const SELECT_BINDINGS: &str = "\
-    SELECT s.server, s.url, s.reach, s.sealed_token, d.tool, d.risk, d.digest \
+    SELECT s.server, s.url, s.reach, s.connector, s.sealed_token, d.tool, d.risk, d.digest \
       FROM mcp_servers s \
       LEFT JOIN mcp_tool_declarations d \
              ON d.tenant_id = s.tenant_id AND d.server = s.server \
@@ -1387,9 +1494,17 @@ impl Fleet {
     /// A credential that will not open is a **binding that is skipped**, with
     /// the reason recorded, exactly like a URL that will not resolve — see
     /// [`McpError::Credential`] for why the alternative is worse than useless.
+    ///
+    /// `bridges` is what a hosted binding needs and a dialled one ignores.
+    /// `None` means this deployment runs no bridge runtime, which is every
+    /// deployment today: hosted rows then fail to bind with
+    /// `hosting_unavailable` and their tenant has no tools on them, which is the
+    /// same fail-closed shape as a server that is down. See [`crate::hosted`]
+    /// for what has to be deployed to change that.
     pub async fn bind(
         tx: &mut TenantTx<'_>,
         credentials: &Credentials,
+        bridges: Option<&crate::hosted::Bridges>,
         ct: &CancellationToken,
     ) -> Result<Self, StoreError> {
         let tenant_id = tx.tenant_id();
@@ -1403,13 +1518,17 @@ impl Fleet {
                 tracing::warn!(server = %row.server, "mcp binding has no policy handle; skipping");
                 continue;
             };
+            let Some(how) = provisioned(&row) else {
+                tracing::warn!(
+                    server = %row.server,
+                    connector = %row.connector,
+                    "mcp binding has neither a url to dial nor a package we host; skipping"
+                );
+                continue;
+            };
             let sealed = row.sealed_token.clone();
             let entry = configured.entry(server).or_insert_with(|| Binding {
-                url: row.url.clone(),
-                // An unrecognised spelling is the tight one. `mcp_servers_reach_known`
-                // makes it unreachable; if that CHECK is ever dropped, this is
-                // still the answer that refuses loopback.
-                reach: Reach::parse(&row.reach).unwrap_or_default(),
+                how,
                 sealed_token: sealed,
                 declared: BTreeMap::new(),
             });
@@ -1421,18 +1540,45 @@ impl Fleet {
         let mut servers = BTreeMap::new();
         let mut failures = BTreeMap::new();
         for (name, binding) in configured {
-            match credentials
-                .bind(
-                    tenant_id,
-                    name.clone(),
-                    &binding.url,
-                    &binding.declared,
-                    binding.reach,
-                    binding.sealed_token.as_deref(),
-                    ct.clone(),
-                )
-                .await
-            {
+            let sealed = binding.sealed_token.as_deref();
+            let bound = match &binding.how {
+                Provisioned::Dial { url, reach } => {
+                    credentials
+                        .bind(
+                            tenant_id,
+                            name.clone(),
+                            url,
+                            &binding.declared,
+                            *reach,
+                            sealed,
+                            ct.clone(),
+                        )
+                        .await
+                }
+                // A hosted binding on a deployment with no runtime is a
+                // *failure*, recorded and rendered, not a binding quietly
+                // missing from the list: the operator connected something and
+                // has to be told why it has no tools.
+                Provisioned::Hosted { package } => match bridges {
+                    None => Err(McpError::Hosting {
+                        code: "hosting_unavailable",
+                    }),
+                    Some(bridges) => {
+                        credentials
+                            .bind_hosted(
+                                tenant_id,
+                                name.clone(),
+                                package,
+                                &binding.declared,
+                                sealed,
+                                bridges,
+                                ct.clone(),
+                            )
+                            .await
+                    }
+                },
+            };
+            match bound {
                 Ok(server) => {
                     servers.insert(name, server);
                 }
@@ -1510,12 +1656,56 @@ impl Fleet {
 /// `sealed_token`, which is a ciphertext today and one refactor away from being
 /// the thing it protects.
 struct Binding {
-    url: String,
-    reach: Reach,
+    how: Provisioned,
     /// The envelope blob straight out of the column, still sealed.
     /// [`Credentials::bind`] is the only thing that opens it.
     sealed_token: Option<Vec<u8>>,
     declared: BTreeMap<Slug, Declaration>,
+}
+
+/// Which of the two ways this binding reaches a server.
+///
+/// The distinction is not a flag on the row, it is what the *catalogue* says
+/// about the row's connector — see [`provisioned`].
+enum Provisioned {
+    /// An address somebody else operates, and the [`Reach`] the row allows.
+    Dial { url: String, reach: Reach },
+    /// A package we run for this tenant. No URL: the address is minted per
+    /// start by the bridge runtime and vetted by [`crate::hosted::accept`].
+    Hosted {
+        package: &'static crate::hosted::Package,
+    },
+}
+
+/// Decide how one row is provisioned, or `None` for a row that cannot be.
+///
+/// **The connector decides, and the URL does not get a vote.** A row whose
+/// connector names a hosted package is hosted even if some past write left a URL
+/// in the column, and that ordering is the safe one: the alternative — "dial the
+/// URL if there is one" — would make a stray value in a tenant-writable column
+/// into an address this process connects to, which is the whole class of thing
+/// `resolve_and_vet` exists to bound.
+///
+/// Every `None` is a binding that is skipped: a connector we do not host, with
+/// no URL of its own, is a row that names nothing. Skipping is the same
+/// fail-closed answer the rest of this loop gives, and a `None` here can never
+/// widen anything because it removes a binding rather than adding one.
+///
+/// An unrecognised connector is not hosted — `catalog::find` returns `None` —
+/// which is the reading `0040_mcp_credentials.sql` asks for ("the reader must
+/// tolerate a value it does not recognise") pointed in the direction that
+/// refuses: an unknown name cannot cause us to start a program.
+fn provisioned(row: &ConfigRow) -> Option<Provisioned> {
+    match crate::catalog::find(&row.connector).and_then(crate::catalog::Connector::package) {
+        Some(package) => Some(Provisioned::Hosted { package }),
+        None => row.url.clone().map(|url| Provisioned::Dial {
+            url,
+            // An unrecognised spelling is the tight one. `mcp_servers_reach_known`
+            // makes it unreachable; if that CHECK is ever dropped, this is
+            // still the answer that refuses loopback.
+            reach: Reach::parse(&row.reach).unwrap_or_default(),
+        }),
+    }
 }
 
 /// One declaration out of a joined row, or `None` when the row carries none or
@@ -2747,7 +2937,9 @@ mod tests {
         let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([3u8; 32])));
         let bind = async || {
             let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-            let fleet = Fleet::bind(&mut tx, &credentials, &CancellationToken::new())
+            // `None`: this tenant's binding is dialled, so a bridge runtime is
+            // not part of the question. The hosted path has its own test below.
+            let fleet = Fleet::bind(&mut tx, &credentials, None, &CancellationToken::new())
                 .await
                 .expect("the configuration is readable");
             tx.commit().await.expect("commit read");
@@ -2783,6 +2975,175 @@ mod tests {
         assert_eq!(failure.code, "blocked_address");
         assert!(failure.detail.contains("127.0.0.1"), "{failure:?}");
         assert!(!refused.is_bound(&erp()));
+    }
+
+    /// **A hosted binding, end to end, against a fake runtime.**
+    ///
+    /// The row has no URL — nobody may name a bridge's address, which is
+    /// `hosted`'s central claim — so everything about where this connection goes
+    /// comes from the runtime's answer and from the operator's network. What is
+    /// asserted, in order: hosting off refuses and *says so*; hosting on binds
+    /// the tools; the runtime received this tenant's own credential and nothing
+    /// else; and a runtime answering with an address outside the operator's
+    /// network is refused exactly as a customer's URL would be.
+    ///
+    /// The bridge is a [`FakeMcp`] on loopback, which is what a bridge is: a
+    /// Streamable HTTP endpoint on a private address that this process did not
+    /// start. `crates/app/tests/orizn.rs` runs the same arrangement against the
+    /// real `supergateway` and the real `orizn-visa-mcp`, so the shape here is
+    /// the shape that has been proven to work with a genuine stdio package.
+    #[tokio::test]
+    async fn a_hosted_binding_starts_a_bridge_and_never_names_its_address() {
+        use crate::hosted::{BridgeNetwork, Bridges, tests::FakeRuntime};
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; mcp binding tests need a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // `FakeMcpServer` and not this module's `FakeMcp`, for one reason: it
+        // records the `Authorization` headers it was sent, and "the tenant's
+        // credential went into the package's environment and onto no wire" is
+        // half of what this test is for.
+        let bridge = crate::mocks::FakeMcpServer::start(&["lookup", "write_note"]).await;
+        let tenant = TenantId::new_v7(Utc::now());
+        let label = format!("mcp-hosted-{}", tenant.as_uuid().simple());
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([7u8; 32])));
+
+        // The credential the package will read out of its own environment. It
+        // is sealed by the same call `routes::mcp` makes, under the same AAD:
+        // the storage of a hosted credential is not a new thing, only its
+        // destination is.
+        const TENANT_KEY: &str = "sk-live-this-tenants-own-key";
+        let sealed = credentials
+            .seal(tenant, &erp(), Some(TENANT_KEY.to_owned()))
+            .expect("seals")
+            .expect("a credential was given");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        // **No url.** `0043_mcp_hosted.sql` is what makes this row storable, and
+        // the NULL is the whole design: there is no address in this tenant's
+        // configuration for anybody — a customer, a compromised handler, an
+        // employee who talked somebody into an UPDATE — to point at us.
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector, sealed_token) \
+             VALUES ($1, 'erp', NULL, 'public', 'orizn-visa', $2)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(&sealed)
+        .execute(&mut *tx)
+        .await
+        .expect("insert hosted binding");
+        sqlx::query(
+            "INSERT INTO mcp_tool_declarations (tenant_id, server, tool, risk) VALUES \
+               ($1, 'erp', 'lookup', 'read'), \
+               ($1, 'erp', 'write-note', 'write')",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert declarations");
+        tx.commit().await.expect("commit configuration");
+
+        let bind = async |bridges: Option<&Bridges>| {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let fleet = Fleet::bind(&mut tx, &credentials, bridges, &CancellationToken::new())
+                .await
+                .expect("the configuration is readable");
+            tx.commit().await.expect("commit read");
+            fleet
+        };
+
+        // 1. No runtime deployed. The binding fails, it is *recorded* as a
+        //    failure rather than silently missing, and the tenant has no tools.
+        let unhosted = bind(None).await;
+        assert!(
+            unhosted.inventory().is_empty(),
+            "a hosted binding produced tools on a deployment that runs no bridge"
+        );
+        assert_eq!(
+            unhosted.failures().get(&erp()).map(|failure| failure.code),
+            Some("hosting_unavailable"),
+            "a binding that cannot be hosted must be a recorded failure, not a \
+             binding that quietly is not there: {:?}",
+            unhosted.failures()
+        );
+
+        // 2. A runtime, answering with the bridge it started, on the network the
+        //    operator allocated.
+        let runtime = Arc::new(FakeRuntime::answering(bridge.url()));
+        let bridges = Bridges::new(
+            Arc::clone(&runtime) as Arc<dyn crate::hosted::BridgeRuntime>,
+            BridgeNetwork::parse("127.0.0.0/8").expect("a valid network"),
+        );
+        let hosted = bind(Some(&bridges)).await;
+        assert_eq!(
+            hosted.inventory(),
+            vec![(call("lookup"), Risk::Low), (call("write-note"), Risk::Low)],
+            "a hosted binding's tools are classed exactly like a dialled one's"
+        );
+
+        // 3. What the runtime was asked for: this tenant, this handle, the
+        //    package the catalogue names — and this tenant's own credential,
+        //    opened from its own row. Nothing else was in the spec, because
+        //    `BridgeSpec` has no other field.
+        let seen = runtime.seen.lock().expect("not poisoned").clone();
+        assert_eq!(
+            seen,
+            vec![(
+                tenant,
+                "erp".to_owned(),
+                "orizn-visa-mcp@1.3.0",
+                Some(TENANT_KEY.to_owned())
+            )]
+        );
+
+        // 4. **The bridge was never sent the credential.** It went into the
+        //    package's environment, which is where the package reads it, and a
+        //    second copy on an `Authorization` header would be a tenant's secret
+        //    on a hop that does not need it and cannot use it.
+        assert!(
+            bridge.authorizations().is_empty(),
+            "the tenant's credential was also put on the wire to the bridge: {:?}",
+            bridge.authorizations()
+        );
+
+        // 5. The same runtime, the same answer, an operator network that does
+        //    not contain it. Refused — which is what stops a runtime that is
+        //    wrong (or lying) about an address from making this process read
+        //    something on its own private network.
+        let elsewhere = Bridges::new(
+            Arc::new(FakeRuntime::answering(bridge.url())),
+            BridgeNetwork::parse("10.42.0.0/16").expect("a valid network"),
+        );
+        let refused = bind(Some(&elsewhere)).await;
+        assert!(
+            refused.inventory().is_empty(),
+            "an endpoint the operator's network does not contain was bound anyway"
+        );
+        let failure = refused
+            .failures()
+            .get(&erp())
+            .expect("a refused endpoint is a recorded failure");
+        assert_eq!(
+            failure.code, "bridge_endpoint_refused",
+            "an endpoint outside the operator's bridge network is not a bridge"
+        );
+        // And the refusal names no address, unlike `blocked_address` above: the
+        // operator did not choose this one and cannot correct it, so the detail
+        // would be our infrastructure's shape in a tenant's API response.
+        assert!(
+            !failure.detail.contains("127.0.0.1"),
+            "a refusal named our own infrastructure's address: {failure:?}"
+        );
     }
 
     /// **The pin outranks the gate.** A tool whose digest no longer matches is
