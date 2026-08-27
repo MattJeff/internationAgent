@@ -543,6 +543,10 @@ fn app(
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
+            // Beside `turns`, which reports the budget a seat has today: this
+            // is the same company read forwards over a window the founder
+            // picks, and the last screen of the setup flow.
+            .merge(routes::forecast::router(db.clone()))
             // Beside `turns`, and reading the same four names for the same
             // numbers: this is that endpoint for a whole line at once, plus the
             // spending, the tokens and the unanswered questions. One link down

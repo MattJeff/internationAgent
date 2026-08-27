@@ -9,6 +9,7 @@
 
 pub mod action; // U5
 pub mod employee; // U3
+pub mod forecast; // wave K: what a window of time costs, and how much work fits in it
 pub mod identity;
 pub mod ids; // U1
 pub mod initiative;
