@@ -552,8 +552,18 @@ pub async fn record_queued(
     now: DateTime<Utc>,
 ) -> Result<(), RevenueError> {
     for lead in leads {
-        revenue_store::mark_contacted(tx, lead.contact_id(), now, Some(now + FOLLOW_UP_AFTER))
-            .await?;
+        revenue_store::mark_contacted(
+            tx,
+            lead.contact_id(),
+            now,
+            Some(now + FOLLOW_UP_AFTER),
+            // The ceiling [`plan`] already selected on, re-asserted by the
+            // write. Belt and braces here rather than the fix it is elsewhere:
+            // `queueable` locks the rows it returns and this runs in that same
+            // transaction, so nothing can move `touch_count` in between.
+            crate::revenue::MAX_TOUCHES as i32,
+        )
+        .await?;
     }
     Ok(())
 }
