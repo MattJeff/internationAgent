@@ -211,8 +211,10 @@ use rmcp::model::{
     Implementation, JsonObject, ProtocolVersion, Tool, ToolAnnotations,
 };
 use rmcp::service::{ClientLifecycleMode, RunningService, serve_client_with_lifecycle_and_ct};
-use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::streamable_http_client::{
+    AuthRequiredError, InsufficientScopeError, StreamableHttpClientTransportConfig,
+};
+use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -1785,17 +1787,87 @@ fn declaration(row: &ConfigRow) -> Option<(Slug, Declaration)> {
 
 /// How a failure to call one tool reads to the effect layer.
 ///
-/// Only the two that mean "the network was unlucky" are retryable. A refusal —
+/// Only the ones that mean "the network was unlucky" are retryable. A refusal —
 /// a destructive class, an unknown tool, a second round trip nobody authorised
 /// — is [`ProviderError::Terminal`], because retrying a refusal is how a loop
 /// spends its whole budget being told no.
+///
+/// [`McpError::Transport`] used to sit in the retryable arm with the other two,
+/// and it does not belong there: it is `rmcp`'s box for *everything that
+/// happened after the connection was made*, which is both sentences at once —
+/// a socket that died halfway, and a server that answered `401`. See
+/// [`reached_the_server`] for the split and for what the second one costs.
 fn as_provider_error(err: &McpError) -> ProviderError {
     match err {
-        McpError::Connect(_) | McpError::TimedOut { .. } | McpError::Transport(_) => {
-            ProviderError::timeout()
-        }
+        McpError::Connect(_) | McpError::TimedOut { .. } => ProviderError::timeout(),
+        McpError::Transport(exchange) => reached_the_server(exchange),
         other => ProviderError::Terminal { code: other.code() },
     }
+}
+
+/// Which of its two meanings [`McpError::Transport`] is carrying this time.
+///
+/// **"The server did not answer" and "the server said no" are the same
+/// [`ServiceError`] to `rmcp` and must not be the same [`ProviderError`] to
+/// us.** The second one is what a revoked token looks like: the binding came up
+/// when the credential was live, the customer rotated it, and now every
+/// `tools/call` is a `401`. Classified as retryable, that is `Reply::Error`
+/// telling the model `retryable` — so it asks again inside the turn — plus an
+/// audit row that says `retryable: true` and an operator whose binding page
+/// reads "in progress" forever. The dead credential is hammered at somebody
+/// else's server and nothing anywhere says the connection is broken.
+///
+/// So the retryable side is enumerated and everything else is terminal,
+/// including whatever `#[non_exhaustive]` adds next: a variant this build has
+/// never seen is not evidence that asking again helps.
+fn reached_the_server(err: &ServiceError) -> ProviderError {
+    match err {
+        // Nothing came back. The peer hung up, the wait was cut short, the
+        // subscription fell behind — the same "we were unlucky" as a connect
+        // failure, and worth the same backoff.
+        ServiceError::TransportClosed
+        | ServiceError::Timeout { .. }
+        | ServiceError::Cancelled { .. }
+        | ServiceError::SubscriptionLagged { .. } => ProviderError::timeout(),
+        // The send failed. Usually the wire — but a `401`/`403` is delivered
+        // through here too, and that one is the server refusing the credential.
+        ServiceError::TransportSend(sent) => {
+            refused_the_credential(sent).unwrap_or_else(ProviderError::timeout)
+        }
+        // The server answered, and the answer was an error. It will be the same
+        // error next time: `tools/call` carries no state that a second attempt
+        // changes.
+        _ => ProviderError::Terminal {
+            code: "server_refused",
+        },
+    }
+}
+
+/// The terminal ruling behind a failed send, when what failed it was an
+/// authorization challenge rather than the wire.
+///
+/// `rmcp` knows how to answer this — `DynamicTransportError::is_authorization_
+/// required` is the same walk — but keeps it `pub(crate)`, and the transport
+/// error it wraps is generic over `reqwest::Error`, which this crate may not
+/// name. What *is* public is the cause: [`AuthRequiredError`] and
+/// [`InsufficientScopeError`] are plain structs on the source chain, so
+/// downcasting for them costs six lines and no dependency.
+///
+/// The codes are [`ProviderError::from_status`]'s own, so a refused MCP
+/// credential reads in an audit row exactly like a refused HTTP one — one
+/// vocabulary for "the far side would not take this token", not two.
+fn refused_the_credential(sent: &DynamicTransportError) -> Option<ProviderError> {
+    let mut cause = Some(sent.error.as_ref() as &(dyn std::error::Error + 'static));
+    while let Some(err) = cause {
+        if err.is::<AuthRequiredError>() {
+            return Some(ProviderError::from_status(401, None));
+        }
+        if err.is::<InsufficientScopeError>() {
+            return Some(ProviderError::from_status(403, None));
+        }
+        cause = err.source();
+    }
+    None
 }
 
 #[async_trait]
@@ -1882,20 +1954,35 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
+    /// What [`FakeMcp`] does with a `tools/call`. Everything before the call —
+    /// the handshake, the paginated `tools/list` — is the ordinary path in all
+    /// three, which is what makes the two unhappy ones say something about the
+    /// *call* and not about binding.
+    #[derive(Clone, Copy)]
+    enum Calls {
+        /// Answer it.
+        Answer,
+        /// Accept it and never answer — the shape [`CALL_TIMEOUT`] exists for.
+        Swallow,
+        /// Answer `401` with a challenge, the way a server whose token was
+        /// revoked after the binding came up does.
+        Refuse,
+    }
+
     impl FakeMcp {
         async fn start(pages: Vec<Vec<Tool>>) -> Self {
-            Self::start_with(pages, false).await
+            Self::start_with(pages, Calls::Answer).await
         }
 
-        /// The same server, except that it accepts a `tools/call` and never
-        /// answers it — the shape [`CALL_TIMEOUT`] exists for. It still binds,
-        /// still lists its tools, and still records the method, so everything
-        /// before the call is the ordinary path.
         async fn start_swallowing_calls(pages: Vec<Vec<Tool>>) -> Self {
-            Self::start_with(pages, true).await
+            Self::start_with(pages, Calls::Swallow).await
         }
 
-        async fn start_with(pages: Vec<Vec<Tool>>, swallow_calls: bool) -> Self {
+        async fn start_refusing_calls(pages: Vec<Vec<Tool>>) -> Self {
+            Self::start_with(pages, Calls::Refuse).await
+        }
+
+        async fn start_with(pages: Vec<Vec<Tool>>, calls: Calls) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr: SocketAddr = listener.local_addr().expect("addr");
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1907,7 +1994,7 @@ mod tests {
                     let seen = Arc::clone(&accepted);
                     let pages = Arc::clone(&pages);
                     tokio::spawn(async move {
-                        serve_connection(stream, seen, pages, swallow_calls).await;
+                        serve_connection(stream, seen, pages, calls).await;
                     });
                 }
             });
@@ -1933,7 +2020,7 @@ mod tests {
         mut stream: TcpStream,
         seen: Arc<Mutex<Vec<String>>>,
         pages: Arc<Vec<Vec<Tool>>>,
-        swallow_calls: bool,
+        calls: Calls,
     ) {
         let mut buffer = Vec::new();
         loop {
@@ -1948,8 +2035,20 @@ mod tests {
 
             // Took the request, will not answer. The socket stays open, so this
             // is the failure a connect timeout cannot see.
-            if swallow_calls && method == "tools/call" {
+            if matches!(calls, Calls::Swallow) && method == "tools/call" {
                 std::future::pending::<()>().await;
+            }
+
+            // Took the request and refused it. The `WWW-Authenticate` header is
+            // not decoration: `rmcp` only reads a 401 as an authorization
+            // challenge when the challenge is there, and a bearer token a
+            // server has stopped accepting is answered exactly like this.
+            if matches!(calls, Calls::Refuse) && method == "tools/call" {
+                let refusal = "HTTP/1.1 401 Unauthorized\r\n\
+                     WWW-Authenticate: Bearer realm=\"mcp\", error=\"invalid_token\"\r\n\
+                     Content-Length: 0\r\n\r\n";
+                let _ = stream.write_all(refusal.as_bytes()).await;
+                return;
             }
 
             let response = match request.get("id") {
@@ -2545,6 +2644,69 @@ mod tests {
         // "the network was unlucky" — a quiet server is not a reason to stop
         // asking, unlike a refusal.
         assert!(as_provider_error(&err).is_retryable(), "{err}");
+    }
+
+    /// **A credential the server refused is not a credential to try again
+    /// with**, and the test above is the other half of the same sentence.
+    ///
+    /// The two failures are one variant to `rmcp`: a socket that died halfway
+    /// and a `401` both arrive as [`McpError::Transport`], and that variant used
+    /// to sit in the retryable arm with the connect failures. So a customer who
+    /// rotated the token behind a live binding got, for every tool call: the
+    /// model told `retryable` and asking again inside the same turn; an audit
+    /// row saying `retryable: true`; a binding page that reads "in progress"
+    /// forever; and a dead bearer token replayed at a third party's server as
+    /// fast as the turn loop goes round. Nothing in that says "your connection
+    /// is broken", which is the one thing the customer needed to be told.
+    ///
+    /// The bind is the ordinary path — this server hands out its tools happily
+    /// — which is what makes the refusal a statement about the *call*: a token
+    /// that was good when the binding came up and is not good now.
+    #[tokio::test]
+    async fn a_credential_the_server_refused_is_terminal_and_a_silent_server_is_not() {
+        let server = FakeMcp::start_refusing_calls(two_pages()).await;
+        let bound = bound(&server).await;
+        let tool = McpTool::new(erp(), slug("lookup"));
+
+        let err = bound
+            .call(&tool, None)
+            .await
+            .expect_err("a 401 is not a result");
+
+        assert_eq!(
+            server.count("tools/call"),
+            1,
+            "the refusal was replayed before anyone classified it"
+        );
+
+        let verdict = as_provider_error(&err);
+        assert!(
+            !verdict.is_retryable(),
+            "a token this server has already refused was classified {} — retrying \
+             it hammers somebody else's server with a dead credential and hides \
+             a broken binding behind a status that reads like progress ({err})",
+            verdict.code()
+        );
+        // Not merely "not retryable": the code is what an operator reads in the
+        // audit row, and `unauthorized` is the one word that sends them to the
+        // credential instead of to the network.
+        assert_eq!(
+            verdict,
+            ProviderError::Terminal {
+                code: "unauthorized"
+            },
+            "{err}"
+        );
+
+        // And the distinction is real, not an artefact of this fixture: the same
+        // client, against a server that says nothing at all, still comes back
+        // retryable — see
+        // [`a_server_that_never_answers_is_abandoned_rather_than_waited_for`]
+        // for that half. Here is the cheap end of it, so the two live together.
+        assert!(
+            as_provider_error(&McpError::Connect("no route".to_owned())).is_retryable(),
+            "a server that was never reached must still be worth another go"
+        );
     }
 
     /// **A server that accepts the connection and then says nothing must not
