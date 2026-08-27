@@ -32,6 +32,16 @@
 //! reach: the server's log, the `api_keys` row, the `audit_log` rows, and the
 //! *second* response — `GET /v1/platform/keys`, which is the endpoint somebody
 //! will eventually be tempted to add a `secret` field to.
+//!
+//! # And the third test, which follows a secret the other way
+//!
+//! [`a_providers_signing_secret_is_usable_and_findable_nowhere`] registers two
+//! customers' webhook endpoints on one deployment with the **same** `whsec_…` —
+//! the shape two tenants behind one provider account actually have — delivers to
+//! each, and asserts that neither queue holds the other's message and that the
+//! secret is in none of seven surfaces. It shares this harness deliberately: the
+//! process boundary that makes the log honest is the same one, and a second
+//! binary would be a second copy of it.
 
 mod common;
 
@@ -54,6 +64,11 @@ const PLATFORM_SECRET: &str = "0123456789abcdef0123456789abcdef";
 /// restated here because a test that imported the constant would agree with a
 /// change to it rather than notice one.
 const ISSUED_PREFIX: &str = "aos_";
+
+/// The provider's signing secret, in the one test where a secret travels
+/// *inwards*. Distinctive on purpose, and in three independent fragments, so a
+/// partial or truncated copy is caught as well as a whole one.
+const WEBHOOK_SECRET: &str = "whsec_DO-NOT-LEAK-ME-4a9f2c-webhook";
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -579,4 +594,225 @@ async fn the_issued_secret_appears_in_exactly_one_response_and_nowhere_else() {
         "something is carrying a value shaped like a key:\n{}",
         redact(&everything)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The other direction: a secret that arrives
+// ---------------------------------------------------------------------------
+
+/// **Two customers behind one provider account, over HTTP, against the real
+/// binary — and the signing secret they share is findable nowhere.**
+///
+/// The other tests in this file follow a secret *out*: minted here, shown once,
+/// never again. This one follows one *in*. The `whsec_…` belongs to the
+/// provider, arrives in a request body, and must appear in no response, no log
+/// line, no audit payload and no column a `pg_dump` would carry — while still
+/// being usable, which is the half a test that simply dropped it would also
+/// pass.
+///
+/// Mutations this catches, with the message each produces:
+///
+/// * echo the secret back in the registration response → `the response that
+///   registered it`;
+/// * log it beside the path → `the server log`;
+/// * put it in the audit payload → `the audit trail`;
+/// * store it unsealed in `webhook_endpoints.sealed_secret` → `the stored row`;
+/// * key the endpoint on the provider rather than the path, or resolve the
+///   tenant from anywhere but the row → the two `202`s land in one tenant and
+///   the queue-depth assertions fail;
+/// * skip verification on a stored endpoint → the forged delivery is `202`.
+#[tokio::test]
+async fn a_providers_signing_secret_is_usable_and_findable_nowhere() {
+    use agentos_app::inbound::{Secret, sign_webhook};
+
+    let Some(server) = Server::start().await else {
+        return;
+    };
+
+    // Two customers of one deployment, both behind the same provider account —
+    // which is what makes them share a secret, and what made this whole surface
+    // necessary.
+    let mut tenants = Vec::new();
+    for slug in ["alpha", "beta"] {
+        let (status, body) = server.post(
+            "/v1/platform/tenants",
+            Some(PLATFORM_SECRET),
+            &format!(r#"{{"slug":"{slug}","name":"{slug}"}}"#),
+        );
+        assert_eq!(status, 201, "{body}");
+        let tenant_id = body["tenant_id"].as_str().expect("tenant_id").to_owned();
+
+        let (status, registered) = server.post(
+            "/v1/platform/webhooks",
+            Some(PLATFORM_SECRET),
+            &format!(r#"{{"tenant_id":"{tenant_id}","secret":"{WEBHOOK_SECRET}"}}"#),
+        );
+        assert_eq!(status, 201, "{registered}");
+        assert_eq!(registered["rotated"], false);
+        let path = registered["path"].as_str().expect("path").to_owned();
+        assert!(path.starts_with("whe_"), "{path}");
+        tenants.push((tenant_id, path, registered));
+    }
+    assert_ne!(
+        tenants[0].1, tenants[1].1,
+        "two customers were given one address"
+    );
+
+    // A delivery each, with the same provider event id — the shape a shared
+    // provider account produces. Signed with the shared secret, so the signature
+    // cannot be what separates them.
+    for (index, (_, path, _)) in tenants.iter().enumerate() {
+        let body = format!(
+            "{{\"type\":\"email.received\",\"created_at\":\"2026-08-24T10:00:00Z\",\
+              \"data\":{{\"email_id\":\"email_{index}\",\"from\":\"ap@supplier.example\",\
+              \"to\":[\"lena@agents.example.com\"]}}}}"
+        );
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let signature = sign_webhook(
+            &Secret::new(WEBHOOK_SECRET),
+            "msg_shared",
+            &timestamp,
+            body.as_bytes(),
+        );
+        let status = Command::new("curl")
+            .args([
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                "-H",
+                "webhook-id: msg_shared",
+                "-H",
+                &format!("webhook-timestamp: {timestamp}"),
+                "-H",
+                &format!("webhook-signature: {signature}"),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body,
+                &format!("{}/v1/webhooks/{path}", server.base),
+            ])
+            .output()
+            .expect("curl");
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout),
+            "202",
+            "a genuine delivery to a registered endpoint was refused; the sealed \
+             secret does not round-trip through the database"
+        );
+    }
+
+    // The refusal paths, so they have run with the secret in hand and had their
+    // chance to render it.
+    let (status, unverified) = server.post(
+        &format!("/v1/webhooks/{}", tenants[0].1),
+        None,
+        r#"{"type":"email.received"}"#,
+    );
+    assert_eq!(status, 401, "{unverified}");
+    let (status, missing) = server.post("/v1/webhooks/whe_no_such_endpoint_at_all", None, "{}");
+    assert_eq!(status, 404, "{missing}");
+
+    // The rows: what a database dump holds.
+    let db = Db::connect(&server.database_url).await.expect("connect");
+    let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+    let endpoints =
+        sqlx::query("SELECT path, tenant_id, provider, sealed_secret FROM webhook_endpoints")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("webhook_endpoints");
+    let sealed: Vec<Vec<u8>> = endpoints
+        .iter()
+        .map(|row| row.get::<Vec<u8>, _>("sealed_secret"))
+        .collect();
+    let audit: Vec<(String, String, Value)> = sqlx::query_as(
+        "SELECT actor, action_kind, payload FROM audit_log \
+          WHERE action_kind = 'webhook_endpoint_registered' ORDER BY occurred_at",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("audit_log");
+    // Each tenant's own queue, read with RLS on — the isolation claim, asked of
+    // the database rather than of a WHERE clause this test wrote.
+    let mut depths = Vec::new();
+    for (tenant_id, _, _) in &tenants {
+        let mut tenant_tx = db
+            .tenant_tx(agentos_domain::ids::TenantId::from_uuid(
+                tenant_id.parse().expect("uuid"),
+            ))
+            .await
+            .expect("tenant tx");
+        let depth: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_type = 'webhook'",
+        )
+        .fetch_one(&mut **tenant_tx)
+        .await
+        .expect("count");
+        tenant_tx.commit().await.expect("commit");
+        depths.push(depth);
+    }
+    tx.rollback().await.expect("rollback");
+    drop(db);
+
+    // The surfaces are not empty — otherwise every assertion below is vacuous.
+    assert_eq!(endpoints.len(), 2, "two registrations, two rows");
+    assert!(sealed.iter().all(|blob| blob.len() > 32), "{sealed:?}");
+    assert_eq!(audit.len(), 2, "two registrations, two audit rows");
+    assert_eq!(audit[0].0, "operator:signup", "the platform key's label");
+    assert_eq!(
+        depths,
+        vec![1, 1],
+        "one delivery each: {depths:?} — a customer is holding the other's mail, \
+         or has lost their own to a dedupe key that forgot the tenant"
+    );
+
+    let logs = server.shutdown();
+    assert!(
+        logs.contains("webhook endpoint registered") && logs.contains(&tenants[0].1),
+        "the log must actually record the registration, or searching it proves nothing"
+    );
+
+    // Whole, and in fragments: a truncated secret in a log is still a secret in
+    // a log.
+    let fragments = [
+        WEBHOOK_SECRET,
+        "DO-NOT-LEAK-ME",
+        "4a9f2c",
+        &WEBHOOK_SECRET[WEBHOOK_SECRET.len() - 12..],
+    ];
+    for (name, surface) in [
+        ("the server log", logs.clone()),
+        (
+            "the response that registered it",
+            format!("{}", tenants[0].2),
+        ),
+        (
+            "the second registration's response",
+            format!("{}", tenants[1].2),
+        ),
+        ("the 401 a bad signature produces", format!("{unverified}")),
+        ("the 404 an unknown path produces", format!("{missing}")),
+        ("the audit trail", format!("{audit:?}")),
+        (
+            "the stored row",
+            format!(
+                "{sealed:?} {}",
+                sealed
+                    .iter()
+                    .map(|blob| String::from_utf8_lossy(blob).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+    ] {
+        for fragment in fragments {
+            assert!(
+                !surface.contains(fragment),
+                "the provider's signing secret leaked into {name} (fragment {fragment:?})"
+            );
+        }
+    }
 }

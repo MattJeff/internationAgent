@@ -1,4 +1,4 @@
-//! `POST /v1/webhooks/{provider}` — the one door third parties knock on.
+//! `POST /v1/webhooks/{path}` — the one door third parties knock on.
 //!
 //! # The order is the unit
 //!
@@ -41,19 +41,41 @@
 //! handler that is one INSERT — add a limiter here when a provider is
 //! observed to hammer it, not before.
 //!
+//! # Two registries, and the path is what tells them apart
+//!
+//! `AGENTOS_WEBHOOK_SECRETS` is a `HashMap` keyed on the path segment, so it
+//! holds **one endpoint per path for the whole deployment** — that is what
+//! `ConfigError::WebhookProviderTwice` refuses at boot, and it is why it is not
+//! multi-tenancy. `webhook_endpoints` (`migrations/0053`) is the other half: one
+//! row per `(tenant, provider)`, addressed by an opaque minted path, read
+//! through `admin_tx_bypassing_rls` because the lookup precedes knowing the
+//! tenant. Read that migration for why the path is opaque rather than
+//! `/{tenant}/{provider}`.
+//!
+//! **The environment is consulted first, and a row cannot shadow it.** Same rule
+//! and same reason as `auth::Keyring`: a variable cannot be rewritten by
+//! anything that is running, so if a row could win, any bug that writes this
+//! table would be able to move a deployment's configured inbound mail into
+//! another tenant's queue. The failure direction is also the right one — an
+//! operator who registers a row on a legacy path finds that mail keeps arriving
+//! where it always did, rather than finding out that it silently moved.
+//!
 //! ponytail: one signature scheme — the Standard Webhooks / Svix one, which is
 //! what `agentos_providers::email` signs and what Resend sends. Twilio's
 //! HMAC-SHA1-over-the-callback-URL scheme lives in
 //! `agentos_providers::telephony::verify_twilio_signature` and is not wired
 //! here, because there is no telephony ingest on the other end of the queue to
 //! read the row. When there is: [`Endpoint`] grows a `scheme` field, the
-//! `verify` call below grows a `match`, and nothing else changes.
+//! `verify` call below grows a `match`, `0053`'s
+//! `webhook_endpoints_provider_is_wired` grows a value, and nothing else
+//! changes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agentos_app::inbound::{Secret, WebhookHeaders, verify_signature};
-use agentos_domain::ids::TenantId;
+use agentos_app::inbound::{WebhookHeaders, verify_signature};
+use agentos_app::mcp::Credentials;
+use agentos_app::webhooks::{self, Endpoint};
 use agentos_domain::untrusted::Untrusted;
 use agentos_store::db::Db;
 use agentos_store::outbox::{self, NewEvent};
@@ -86,26 +108,11 @@ pub fn received_event(provider: &str) -> String {
     format!("webhook.{provider}.received")
 }
 
-/// One registered provider endpoint.
+/// The endpoints `AGENTOS_WEBHOOK_SECRETS` registered, keyed by path segment.
 ///
-/// ponytail: registrations are process configuration, not a table, because
-/// there is no migration for one and the secret has no business being in the
-/// database next to the data it protects. The ceiling is real and worth naming:
-/// one endpoint per provider per deployment, so a deployment whose tenants each
-/// hold their own provider account needs a `webhook_endpoints (path,
-/// tenant_id, secret_ref)` table read through `admin_tx_bypassing_rls` — the
-/// lookup precedes knowing the tenant, so it cannot be tenant-scoped. Only
-/// [`Webhooks::endpoint`] changes.
-pub struct Endpoint {
-    /// The tenant the delivery is filed against. From the registration, never
-    /// from the path and never from the payload — a body that could name its
-    /// own tenant is a body that can write into someone else's queue.
-    pub tenant_id: TenantId,
-    /// The signing secret this provider's deliveries are MACed with.
-    pub secret: Secret,
-}
-
-/// The registered endpoints, keyed by the `{provider}` path segment.
+/// Still a `HashMap`, so it still holds one endpoint per path and
+/// `ConfigError::WebhookProviderTwice` still has something to refuse. The table
+/// is what serves a second tenant; see the module docs on which wins.
 #[derive(Clone, Default)]
 pub struct Webhooks(Arc<HashMap<String, Endpoint>>);
 
@@ -116,23 +123,49 @@ impl Webhooks {
     }
 
     /// The endpoint registered under this path segment, if any.
-    fn endpoint(&self, provider: &str) -> Option<&Endpoint> {
-        self.0.get(provider)
+    fn endpoint(&self, path: &str) -> Option<&Endpoint> {
+        self.0.get(path)
     }
 }
 
-/// What the handler needs: somewhere to write, and the secrets to check with.
+/// Where a resolved endpoint came from.
+///
+/// Two owners and one borrow: the environment registry *lends* its `Endpoint`
+/// for the length of the request and the table hands over a fresh one. A
+/// `clone()` to unify the two would be a second copy of a signing secret in the
+/// heap for no reason.
+enum Resolved<'a> {
+    Registered(&'a Endpoint),
+    Stored(Endpoint),
+}
+
+impl Resolved<'_> {
+    fn get(&self) -> &Endpoint {
+        match self {
+            Self::Registered(endpoint) => endpoint,
+            Self::Stored(endpoint) => endpoint,
+        }
+    }
+}
+
+/// What the handler needs: somewhere to write, the deployment's cipher, and the
+/// endpoints the environment registered.
 #[derive(Clone)]
 struct Ingress {
     db: Db,
+    credentials: Credentials,
     webhooks: Webhooks,
 }
 
 /// The webhook surface. Merge this **outside** `with_api_stack`.
-pub fn router(db: Db, webhooks: Webhooks) -> Router {
+pub fn router(db: Db, credentials: Credentials, webhooks: Webhooks) -> Router {
     Router::new()
-        .route("/v1/webhooks/{provider}", post(ingest))
-        .with_state(Ingress { db, webhooks })
+        .route("/v1/webhooks/{path}", post(ingest))
+        .with_state(Ingress {
+            db,
+            credentials,
+            webhooks,
+        })
 }
 
 /// Verify, store, 202.
@@ -141,17 +174,53 @@ pub fn router(db: Db, webhooks: Webhooks) -> Router {
 /// the *only* body extractor in this file — see the module docs.
 async fn ingest(
     State(ingress): State<Ingress>,
-    Path(provider): Path<String>,
+    Path(path): Path<String>,
     req: Request,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // Before the body, so an unregistered path costs no memory. 404 rather
     // than 401: there is no secret to check a signature against, and telling
-    // an unauthenticated prober which providers we have integrated is telling
-    // it which secrets are worth guessing.
-    let Some(endpoint) = ingress.webhooks.endpoint(&provider) else {
-        tracing::warn!(%provider, "webhook for an unregistered provider");
-        return Err(ApiError::not_found());
+    // an unauthenticated prober which endpoints exist is telling it which
+    // secrets are worth guessing — which is exactly what an opaque path is
+    // there to withhold.
+    //
+    // The environment first and the table second. See the module docs: a row
+    // must not be able to shadow a variable.
+    //
+    // ponytail: a path that is in neither registry costs one primary-key
+    // lookup, so an unauthenticated flood costs one round trip per request.
+    // Same ceiling and same upgrade path as `auth::require_api_key`, which pays
+    // it on every request rather than only on the unregistered ones: a
+    // connection-limited ingress, which is also the only place that can see the
+    // client address. Not a cache — a cache here would have to be measured in
+    // "how long a deleted endpoint still accepts a customer's mail".
+    let resolved = match ingress.webhooks.endpoint(&path) {
+        Some(endpoint) => Resolved::Registered(endpoint),
+        None => match webhooks::resolve(&ingress.db, &ingress.credentials, &path).await {
+            Ok(Some(endpoint)) => Resolved::Stored(endpoint),
+            Ok(None) => {
+                // The path is third-party-controlled text. `path` is bound by
+                // the route to one segment and the table's own CHECK keeps a
+                // stored one to `[A-Za-z0-9_-]{16,64}`, but a *probe* is under
+                // no such rule, so it is logged with `?` (the `Debug`
+                // rendering, which escapes) and never with `%`.
+                tracing::warn!(path = ?path, "webhook for an unregistered path");
+                return Err(ApiError::not_found());
+            }
+            Err(err) => {
+                // The row is there and we cannot read it: our master key, not
+                // their signature. A 404 or a 401 here would send an operator
+                // to the provider's dashboard to chase a fault on our side.
+                tracing::error!(
+                    path = ?path,
+                    code = err.code(),
+                    "a registered endpoint could not be opened"
+                );
+                return Err(ApiError::internal());
+            }
+        },
     };
+    let endpoint = resolved.get();
+    let provider = endpoint.provider.as_str();
 
     let (parts, body) = req.into_parts();
     // Bytes, before anything looks at them. `to_bytes` refuses a declared
@@ -198,9 +267,16 @@ async fn ingest(
         // precisely what the loop works out from the payload; nil is the
         // stable placeholder the dedupe id derivation needs.
         aggregate_id: Uuid::nil(),
-        event_type: received_event(&provider),
+        // From the endpoint, never from the URL. A minted path is opaque and
+        // cannot name the ingest that reads the row, and an `event_type` with no
+        // handler in `main::handlers` is not skipped — it is retried eight times
+        // and dead-lettered, which is a quiet way to stop receiving email.
+        event_type: received_event(provider),
         // The provider's own event id, from the header the signature covers.
         // A redelivery reuses it, so the second copy collapses onto the first.
+        // Two tenants behind one provider account see the same id: the derived
+        // outbox id mixes the tenant in, so those are two rows and not a
+        // collision — `outbox::dedupe_keys_do_not_collide_across_tenants`.
         dedupe_key: Some(format!("{provider}:{}", headers.id)),
         payload: json!({
             "provider": provider,
@@ -250,7 +326,8 @@ fn signature_headers(headers: &HeaderMap) -> WebhookHeaders {
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::inbound::sign_webhook;
+    use agentos_app::inbound::{Secret, sign_webhook};
+    use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
@@ -259,19 +336,19 @@ mod tests {
 
     const PROVIDER: &str = "email";
     const SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    const MASTER: &str = "webhook-route-tests-master-key";
 
-    /// A tenant, its registered endpoint, and the router in front of it.
-    ///
-    /// Needs a real Postgres: the claim under test is a row, and a mock of the
-    /// row would be a mock of the test.
-    async fn harness() -> Option<(Db, TenantId, Router)> {
+    async fn connect() -> Option<Db> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; webhook ingress needs a real Postgres");
             return None;
         };
         let db = Db::connect(&url).await.expect("connect");
         db.migrate().await.expect("migrate");
+        Some(db)
+    }
 
+    async fn seed_tenant(db: &Db) -> TenantId {
         let tenant = TenantId::new_v7(Utc::now());
         let label = format!("hook-{}", tenant.as_uuid().simple());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
@@ -283,29 +360,49 @@ mod tests {
             .await
             .expect("insert tenant");
         tx.commit().await.expect("commit");
+        tenant
+    }
+
+    /// A tenant, its `AGENTOS_WEBHOOK_SECRETS` endpoint, and the router in front
+    /// of it.
+    ///
+    /// Needs a real Postgres: the claim under test is a row, and a mock of the
+    /// row would be a mock of the test.
+    async fn harness() -> Option<(Db, TenantId, Router)> {
+        let db = connect().await?;
+        let tenant = seed_tenant(&db).await;
 
         let endpoints = HashMap::from([(
             PROVIDER.to_owned(),
             Endpoint {
                 tenant_id: tenant,
+                provider: PROVIDER.to_owned(),
                 secret: Secret::new(SECRET),
             },
         )]);
-        let router = router(db.clone(), Webhooks::new(endpoints));
+        let router = router(
+            db.clone(),
+            Credentials::from_master_key(MASTER),
+            Webhooks::new(endpoints),
+        );
         Some((db, tenant, router))
     }
 
-    /// A delivery signed the way the provider signs it.
-    fn signed(id: &str, body: &[u8]) -> HttpRequest<Body> {
+    /// A delivery signed the way the provider signs it, to any path.
+    fn signed_to(path: &str, secret: &str, id: &str, body: &[u8]) -> HttpRequest<Body> {
         let timestamp = Utc::now().timestamp().to_string();
-        let signature = sign_webhook(&Secret::new(SECRET), id, &timestamp, body);
-        HttpRequest::post(format!("/v1/webhooks/{PROVIDER}"))
+        let signature = sign_webhook(&Secret::new(secret), id, &timestamp, body);
+        HttpRequest::post(format!("/v1/webhooks/{path}"))
             .header("webhook-id", id)
             .header("webhook-timestamp", timestamp)
             .header("webhook-signature", signature)
             .header("content-type", "application/json")
             .body(Body::from(body.to_vec()))
             .expect("request")
+    }
+
+    fn signed(id: &str, body: &[u8]) -> HttpRequest<Body> {
+        signed_to(PROVIDER, SECRET, id, body)
     }
 
     fn payload(email_id: &str) -> Vec<u8> {
@@ -594,5 +691,199 @@ mod tests {
         tx.commit().await.expect("commit");
         assert_eq!(owner, tenant.as_uuid());
         assert_ne!(owner, other.as_uuid());
+    }
+
+    // -- two customers, one provider account ---------------------------------
+
+    /// **The claim this whole wave exists for.**
+    ///
+    /// Two tenants behind one provider account, so they hold the **same signing
+    /// secret** — which means the signature cannot tell them apart and the
+    /// endpoint is the only thing that can. Two registrations, two deliveries,
+    /// and each queue holds its own and only its own.
+    ///
+    /// The same `webhook-id` on both deliveries, deliberately. The outbox
+    /// derives a row id from `md5(tenant : … : dedupe_key)`, so if the tenant
+    /// came from anywhere but the row the two would collapse onto one id and
+    /// one of the customers would silently lose the message.
+    ///
+    /// What this would catch: keying the registry on the provider again,
+    /// resolving the tenant from the payload, opening a row under a tenant that
+    /// is not its own, or writing through anything but `tenant_tx(row.tenant_id)`.
+    #[tokio::test]
+    async fn two_tenants_behind_one_provider_account_do_not_receive_each_others_mail() {
+        let Some(db) = connect().await else { return };
+        let credentials = Credentials::from_master_key(MASTER);
+        let (a, b) = (seed_tenant(&db).await, seed_tenant(&db).await);
+
+        // One account, one secret, two endpoints.
+        let now = Utc::now();
+        let (path_a, _) = agentos_app::webhooks::register(
+            &db,
+            &credentials,
+            a,
+            PROVIDER,
+            SECRET.to_owned(),
+            &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+            now,
+        )
+        .await
+        .expect("register a");
+        let (path_b, _) = agentos_app::webhooks::register(
+            &db,
+            &credentials,
+            b,
+            PROVIDER,
+            SECRET.to_owned(),
+            &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+            now,
+        )
+        .await
+        .expect("register b");
+        assert_ne!(path_a, path_b, "two customers were given one address");
+
+        // No environment registry at all: this is the deployment the table is
+        // for, where every endpoint is a row.
+        let router = router(db.clone(), credentials, Webhooks::default());
+
+        let for_a = payload("email_for_a");
+        let for_b = payload("email_for_b");
+        let (status, _) = call(&router, signed_to(&path_a, SECRET, "msg_shared", &for_a)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _) = call(&router, signed_to(&path_b, SECRET, "msg_shared", &for_b)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Read through `tenant_tx`, so RLS is answering the question and not a
+        // WHERE clause this test wrote.
+        let mine = stored(&db, a).await;
+        let theirs = stored(&db, b).await;
+        assert_eq!(mine.len(), 1, "tenant A holds {} rows", mine.len());
+        assert_eq!(theirs.len(), 1, "tenant B holds {} rows", theirs.len());
+        // The event type follows the endpoint's `provider`, not the URL. A
+        // minted path in the event type is an event type `main::handlers`
+        // registered nothing for — eight retries and a dead letter per message,
+        // which is silence and not an error.
+        assert_eq!(mine[0].0, "webhook.email.received", "{:?}", mine[0].0);
+        assert_eq!(theirs[0].0, "webhook.email.received", "{:?}", theirs[0].0);
+        assert_eq!(
+            mine[0].1["body"].as_str().expect("body"),
+            String::from_utf8(for_a).expect("utf8"),
+            "tenant A is holding the other customer's mail"
+        );
+        assert_eq!(
+            theirs[0].1["body"].as_str().expect("body"),
+            String::from_utf8(for_b).expect("utf8"),
+            "tenant B is holding the other customer's mail"
+        );
+    }
+
+    /// A stored endpoint is verified like any other, and a bad signature writes
+    /// nothing — including no row saying somebody knocked.
+    #[tokio::test]
+    async fn a_stored_endpoint_refuses_a_forgery_before_anything_is_written() {
+        let Some(db) = connect().await else { return };
+        let credentials = Credentials::from_master_key(MASTER);
+        let tenant = seed_tenant(&db).await;
+        let (path, _) = agentos_app::webhooks::register(
+            &db,
+            &credentials,
+            tenant,
+            PROVIDER,
+            SECRET.to_owned(),
+            &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+            Utc::now(),
+        )
+        .await
+        .expect("register");
+        let router = router(db.clone(), credentials, Webhooks::default());
+
+        let body = payload("email_stored_forgery");
+        let (status, _) = call(
+            &router,
+            signed_to(&path, "whsec_notoursnotours", "msg_forged", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(stored(&db, tenant).await.is_empty(), "a forgery was queued");
+
+        // The control: the same path with the right secret is accepted, so the
+        // refusal above was the signature and not a broken endpoint.
+        let (status, _) = call(&router, signed_to(&path, SECRET, "msg_honest", &body)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(stored(&db, tenant).await.len(), 1);
+    }
+
+    /// **The environment wins.** One path, two homes, two different tenants —
+    /// and the variable's answer is the one that counts, for
+    /// `auth::Keyring`'s reason: a variable cannot be rewritten by anything that
+    /// is running, so a row that could shadow one would be a way for any write
+    /// to this table to move a deployment's configured inbound mail into another
+    /// tenant's queue.
+    #[tokio::test]
+    async fn a_row_cannot_shadow_an_environment_registration() {
+        let Some(db) = connect().await else { return };
+        let credentials = Credentials::from_master_key(MASTER);
+        let (configured, intruder) = (seed_tenant(&db).await, seed_tenant(&db).await);
+
+        // A path both registries can hold. An ordinary environment entry is a
+        // provider name — `email`, five characters — which
+        // `webhook_endpoints_path_shape` refuses outright, so the collision this
+        // test is about needs a path long enough to be a legal row. That is
+        // itself worth knowing: for every realistic value of
+        // `AGENTOS_WEBHOOK_SECRETS` a shadowing row is not merely refused, it is
+        // unrepresentable.
+        let contested = format!("collide_{}", intruder.as_uuid().simple());
+
+        // **The intruder's row holds a real, openable secret — the same one.**
+        // Bytes that were not an envelope would make a table-first order fail
+        // with a 500 and fall back to the environment anyway, so the test would
+        // pass against the very ordering it exists to forbid. Registered
+        // properly and then moved onto the contested path, which the AAD permits
+        // because it binds the tenant and not the path.
+        agentos_app::webhooks::register(
+            &db,
+            &Credentials::from_master_key(MASTER),
+            intruder,
+            PROVIDER,
+            SECRET.to_owned(),
+            &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+            Utc::now(),
+        )
+        .await
+        .expect("register the intruder");
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("UPDATE webhook_endpoints SET path = $1 WHERE tenant_id = $2")
+            .bind(&contested)
+            .bind(intruder.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("move the row onto the contested path");
+        tx.commit().await.expect("commit");
+
+        let endpoints = HashMap::from([(
+            contested.clone(),
+            Endpoint {
+                tenant_id: configured,
+                provider: PROVIDER.to_owned(),
+                secret: Secret::new(SECRET),
+            },
+        )]);
+        let router = router(db.clone(), credentials, Webhooks::new(endpoints));
+
+        let (status, _) = call(
+            &router,
+            signed_to(&contested, SECRET, "msg_shadow", &payload("email_shadow")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            stored(&db, configured).await.len(),
+            1,
+            "the environment's tenant did not receive its own delivery"
+        );
+        assert!(
+            stored(&db, intruder).await.is_empty(),
+            "a row shadowed the deployment's own registration"
+        );
     }
 }

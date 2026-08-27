@@ -1184,16 +1184,37 @@ nobody what to cancel.
 
 ## 19. Webhook ingress
 
-**One route: `POST /v1/webhooks/{provider}`**
+**One route: `POST /v1/webhooks/{path}`**
 (`apps/server/src/routes/webhooks.rs`), outside the API-key stack — a provider
 has a signature, not an API key.
 
-`{provider}` must match a label in `AGENTOS_WEBHOOK_SECRETS`
-(`provider:tenant-uuid:signing-secret`). An unregistered provider is **404**,
-deliberately not 401. An empty registry means no inbound message can arrive at
-all.
+`{path}` is resolved against **two registries, environment first**:
 
-The tenant comes from the registration, never off the wire.
+1. `AGENTOS_WEBHOOK_SECRETS` (`provider:tenant-uuid:signing-secret`), where the
+   path segment *is* the provider name. A `HashMap`, so it holds one endpoint
+   per path for the whole deployment — `ConfigError::WebhookProviderTwice`
+   refuses a boot that registers two tenants on one path, because the second
+   would silently replace the first.
+2. `webhook_endpoints` (`migrations/0053`), one row per `(tenant, provider)`,
+   addressed by an **opaque minted path** (`whe_` + 128 bits of base64url) and
+   read through `Db::admin_tx_bypassing_rls` — the lookup precedes knowing the
+   tenant, so it cannot be tenant-scoped. Registered with
+   `POST /v1/platform/webhooks`.
+
+A row cannot shadow a variable, for `auth::Keyring`'s reason: a variable cannot
+be rewritten by anything that is running.
+
+The path is opaque and not `/{tenant}/{provider}` because two tenants behind one
+provider account hold the **same** signing secret — the signature cannot
+separate them, so the address is what does, and a derivable address separates
+nothing. The path is still not a credential: the signature is checked either way.
+
+An unregistered path is **404**, deliberately not 401. An empty registry and an
+empty table mean no inbound message can arrive at all.
+
+The tenant comes from the registration or the row, never off the wire. The
+`event_type` comes from the endpoint's `provider`, never from the path — a
+minted path in an event type is an event type nothing registered a handler for.
 
 **One signature scheme is reachable: Standard Webhooks / Svix.** Headers
 `webhook-id` / `svix-id`, `webhook-timestamp`, `webhook-signature`

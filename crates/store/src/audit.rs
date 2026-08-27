@@ -224,6 +224,19 @@ pub enum AuditKind {
     /// in the same transaction as the DELETE, so the trail cannot claim a
     /// revocation that did not take.
     ApiKeyRevoked,
+    /// A provider callback endpoint was registered for this tenant, or its
+    /// signing secret was rotated. Written by
+    /// `agentos_store::webhooks::register`, in the same admin transaction as the
+    /// upsert.
+    ///
+    /// **This is the row that says whose mail goes where.**
+    /// `webhook_endpoints` holds one row per `(tenant, provider)` and a rotation
+    /// is an UPDATE, so the table cannot answer "when did this endpoint appear,
+    /// and how many times has its secret been replaced" — and that question is
+    /// the first one asked after a provider account is compromised. The payload
+    /// names the path and the provider, never the secret and nothing derived
+    /// from one; see `webhooks::the_trail_names_the_path_and_never_the_secret`.
+    WebhookEndpointRegistered,
 }
 
 impl AuditKind {
@@ -245,6 +258,7 @@ impl AuditKind {
             AuditKind::CompanyHaltChanged => "company_halt_changed",
             AuditKind::ApiKeyIssued => "api_key_issued",
             AuditKind::ApiKeyRevoked => "api_key_revoked",
+            AuditKind::WebhookEndpointRegistered => "webhook_endpoint_registered",
         }
     }
 }

@@ -103,16 +103,30 @@ use crate::error::ApiError;
 pub struct PlatformState {
     db: Db,
     hasher: agentos_app::api_keys::Hasher,
+    /// The deployment's cipher, for sealing a signing secret into
+    /// `webhook_endpoints`. The same handle `routes::mcp` and the agent hold:
+    /// two ciphers over one `AGENTOS_MASTER_KEY` is a deployment where what one
+    /// half sealed the other cannot open.
+    credentials: agentos_app::mcp::Credentials,
 }
 
 /// This unit's routes. Mounted with `auth::require_platform_key` in front and
 /// nothing else.
-pub fn router(db: Db, hasher: agentos_app::api_keys::Hasher) -> Router {
+pub fn router(
+    db: Db,
+    hasher: agentos_app::api_keys::Hasher,
+    credentials: agentos_app::mcp::Credentials,
+) -> Router {
     Router::new()
         .route("/v1/platform/tenants", post(create_tenant))
         .route("/v1/platform/keys", post(issue_key).get(list_keys))
         .route("/v1/platform/keys/{id}", delete(revoke_key))
-        .with_state(PlatformState { db, hasher })
+        .route("/v1/platform/webhooks", post(register_webhook))
+        .with_state(PlatformState {
+            db,
+            hasher,
+            credentials,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +394,150 @@ async fn revoke_key(
         "tenant_id": tenant_id.as_uuid(),
         "revoked": true,
     })))
+}
+
+/// `POST /v1/platform/webhooks` — the URL to paste into a provider's dashboard,
+/// and the secret that dashboard gave you, in one call.
+///
+/// # Why this is on the platform surface and not a subcommand
+///
+/// The same argument as the rest of this file, and it lands harder here. An
+/// endpoint is registered *per customer*, at signup, by whoever is doing the
+/// signup — so "the founder runs a command on the box per new customer" is the
+/// ceiling `AGENTOS_WEBHOOK_SECRETS` already had, wearing a different hat. And
+/// it is a platform act and not a tenant act for the reason `webhook_endpoints`
+/// exists at all: the row says whose mail this is, and a tenant that could write
+/// its own row could name a path and start collecting somebody else's
+/// deliveries. **No handler in this server accepts an `auth::Principal` for this
+/// table**, which is the enforcement rather than the convention.
+///
+/// # The secret goes in and never comes back
+///
+/// The mirror image of [`IssuedKeyBody`], and the asymmetry is the point. There
+/// the secret is ours and is shown once; here the secret is the *provider's* and
+/// is shown never — it is sealed under `webhook://<tenant>` before the
+/// transaction opens and this response carries the path, which is an address and
+/// not a credential. The search for a place that forgot is
+/// `apps/server/tests/platform_signup.rs`, third test.
+///
+/// # Registering twice rotates
+///
+/// One row per `(tenant, provider)`, and a second call replaces the secret **and
+/// keeps the path**, so rotating at the provider does not mean re-pasting a URL
+/// and — the half that matters — does not leave the old secret verifying on a
+/// second endpoint nobody remembers. `200`, not `201`, when that happens: the
+/// body says `rotated`, and a caller that treats a rotation as a creation would
+/// be a caller storing two URLs for one customer.
+#[derive(Deserialize)]
+struct RegisterWebhookRequest {
+    /// Whose deliveries these are. Named by the platform, never by the request
+    /// that later arrives on the endpoint.
+    tenant_id: Uuid,
+    /// Which ingest reads them. `email` is the only one wired — the table's
+    /// `webhook_endpoints_provider_is_wired` CHECK is what says so, and it is
+    /// paired with the one `on_webhook` registration in `main::handlers`.
+    #[serde(default = "default_provider")]
+    provider: String,
+    /// The `whsec_…` signing secret from the provider's dashboard.
+    secret: String,
+}
+
+fn default_provider() -> String {
+    "email".to_owned()
+}
+
+async fn register_webhook(
+    State(state): State<PlatformState>,
+    who: PlatformPrincipal,
+    body: Result<Json<RegisterWebhookRequest>, JsonRejection>,
+) -> AxumResult<Response, ApiError> {
+    let Json(request) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let tenant_id = TenantId::from_uuid(request.tenant_id);
+
+    // Trimmed and refused when blank, before anything is sealed. A form that
+    // posts `""` for an untouched field is the single most common way an
+    // endpoint ends up rejecting every genuine delivery, and an empty secret
+    // seals and stores perfectly well — see `Credentials::seal`, which makes
+    // the same check for the same reason.
+    let secret = request.secret.trim().to_owned();
+    if secret.is_empty() {
+        return Err(ApiError::bad_request("secret: must not be blank"));
+    }
+
+    let (path, rotated) = agentos_app::webhooks::register(
+        &state.db,
+        &state.credentials,
+        tenant_id,
+        &request.provider,
+        secret,
+        &AuditActor::Operator(who.label.clone()),
+        Utc::now(),
+    )
+    .await
+    .map_err(|err| match err {
+        // The tenant uuid was made up. A 404, not the `400 unknown_tenant`
+        // `ApiError::from` produces — that message is addressed to the holder of
+        // a *tenant* key and tells them their own key names a tenant that was
+        // never created, which this caller cannot act on.
+        agentos_app::webhooks::EndpointError::Store(StoreError::UnknownTenant(_)) => {
+            ApiError::new(StatusCode::NOT_FOUND, "unknown_tenant", "no such tenant").with_detail(
+                format!(
+                    "There is no tenant {}. Create one with `POST /v1/platform/tenants`.",
+                    request.tenant_id
+                ),
+            )
+        }
+        // A provider with no ingest is refused by the table, not by a list in
+        // this file: one place to widen, and it is the same place as the CHECK.
+        agentos_app::webhooks::EndpointError::Store(StoreError::Database(_)) => {
+            ApiError::bad_request(
+                "provider: no ingest reads this provider's deliveries on this build",
+            )
+        }
+        agentos_app::webhooks::EndpointError::Store(err) => err.into(),
+        // Ours, not theirs: the master key. The cipher's code goes to the log
+        // and never into the body.
+        agentos_app::webhooks::EndpointError::Cipher { code } => {
+            tracing::error!(code, "a webhook signing secret could not be sealed");
+            ApiError::internal()
+        }
+    })?;
+
+    // The path and the tenant. **Never the secret**, and nothing derived from
+    // it — this line is what an operator greps, and a grep-able log is a log
+    // somebody ships to a third party.
+    tracing::info!(
+        tenant_id = %tenant_id.as_uuid(),
+        provider = %request.provider,
+        %path,
+        rotated,
+        by = %who.label,
+        "webhook endpoint registered"
+    );
+
+    Ok((
+        if rotated {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(json!({
+            "tenant_id": tenant_id.as_uuid(),
+            "provider": request.provider,
+            "path": path,
+            // The caller cannot work this out from the path alone, and the two
+            // outcomes ask for different next acts: paste a URL, or do nothing
+            // because the URL did not move.
+            "rotated": rotated,
+            // Said in the body because the operator's next act is to paste this
+            // somewhere, and a path without its route is a support ticket. Not
+            // an absolute URL: this server does not know what is in front of it,
+            // and `config.public_host` is the agent card's answer to a different
+            // question.
+            "route": format!("/v1/webhooks/{path}"),
+        })),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
