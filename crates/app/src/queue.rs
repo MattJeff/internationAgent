@@ -173,6 +173,15 @@
 //!      the more important one: a campaign that mails is recoverable, an
 //!      unsubscribe we never collected is not.
 //!
+//!      **This one no longer depends on anybody remembering it.**
+//!      [`crate::catalog::OptOuts`] is a mandatory field on every catalogue
+//!      entry, so a Smartlead connector cannot be added without naming where its
+//!      opt-outs come in — and there is no "not wired yet" value to put there.
+//!      The endpoint is still missing; what has changed is that the missing
+//!      endpoint is now a build failure rather than a thing somebody meant to
+//!      ask about. See that enum for where the line "this connector sends" falls
+//!      and why the catalogue is what draws it.
+//!
 //! Items 1 and 4 are what stand between
 //! [`LeadSink`](agentos_providers::leads::LeadSink) and a real adapter. Nothing
 //! above them is blocked on anything: [`push`] and [`reconcile_opt_outs`] are

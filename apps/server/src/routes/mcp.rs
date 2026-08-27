@@ -4678,6 +4678,7 @@ mod tests {
             reach: Reach::Public,
             credential: Credential::OAuth(endpoints),
             floor: RiskClass::Write,
+            opt_outs: agentos_app::catalog::OptOuts::NoStrangers,
         }]))
     }
 

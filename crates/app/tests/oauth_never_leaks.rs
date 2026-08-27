@@ -190,6 +190,9 @@ fn connector_for(origin: &str) -> &'static Connector {
         reach: Reach::Public,
         credential: Credential::OAuth(endpoints),
         floor: RiskClass::Write,
+        // A fixture for a token that must not be logged, not a claim about a
+        // real vendor. It reaches nobody because it does not exist.
+        opt_outs: agentos_app::catalog::OptOuts::NoStrangers,
     }))
 }
 
