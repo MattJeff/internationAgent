@@ -293,10 +293,17 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // provisioner cannot buy a number from Twilio that the effects path then
     // texts from a mock.
     let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
+    // **One vault per deployment, built here.** Two readers depend on it being
+    // one: the provisioner writes an employee's canary into it, and
+    // `routes::model` writes the *tenant's* model credential into it for every
+    // turn to read back. Two `MemorySecretStore::new()` calls would give a
+    // deployment two maps, and the symptom would be a tenant that connects a key
+    // and then cannot take a turn with it — with no error anywhere saying why.
+    let secrets = agentos_app::mocks::secret_store();
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
     let engine = ProvisioningEngine::new(
         db.clone(),
-        agentos_app::mocks::adapters_for(&config.master_key, &config.credentials),
+        agentos_app::mocks::adapters_for(&config.master_key, &config.credentials, secrets.clone()),
         EngineConfig::default(),
     );
 
@@ -316,7 +323,9 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // turn between effects instead of mid-payment.
     let agent = Agent {
         db: db.clone(),
-        llm,
+        llm: llm.clone(),
+        backend: config.llm,
+        secrets: secrets.clone(),
         gate: gate.clone(),
         ports: ports.clone(),
         fleets: fleets.clone(),
@@ -377,7 +386,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
 
     let served = serve(
         listener,
-        app(db, &config, gate, fleets, ports.clone()),
+        app(db, &config, gate, fleets, ports.clone(), llm, secrets),
         {
             let cancel = cancel.clone();
             async move {
@@ -438,7 +447,15 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
-fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets, ports: Arc<Ports>) -> Router {
+fn app(
+    db: Db,
+    config: &Config,
+    gate: PolicyGate,
+    fleets: Fleets,
+    ports: Arc<Ports>,
+    llm: Arc<dyn Llm>,
+    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
+) -> Router {
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -492,6 +509,10 @@ fn app(db: Db, config: &Config, gate: PolicyGate, fleets: Fleets, ports: Arc<Por
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
             .merge(routes::mcp::router(McpState::new(db.clone(), fleets)))
+            // The step that changes whose bill this is. Before it, no tenant has
+            // a model and no employee takes a turn; after it, every token is the
+            // customer's. See its module docs for why a refused key is a 200.
+            .merge(routes::model::router(db.clone(), llm, config.llm, secrets))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
         config.api_keys.clone(),
@@ -853,7 +874,22 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
 #[derive(Clone)]
 struct Agent {
     db: Db,
+    /// **This host's own model, not the tenant's.**
+    ///
+    /// Which one a turn actually runs on is decided per tenant by
+    /// `agentos_app::model_access::for_turn`: a tenant on the API-key path gets
+    /// a client built around their stored credential, and only a tenant on the
+    /// CLI path spends this one. It is still here because that path needs
+    /// something to hand back, and because `AGENTOS_LLM=mock` is what a
+    /// development box runs.
     llm: Arc<dyn Llm>,
+    /// What `llm` actually is, i.e. `AGENTOS_LLM`. The input to "would a turn on
+    /// the host's model be billed to *us*" — see
+    /// `agentos_app::mocks::LlmBackend::pays_with_our_key`.
+    backend: agentos_app::mocks::LlmBackend,
+    /// The deployment's one vault. Holds every tenant's model credential, read
+    /// once per turn and never handed to an employee.
+    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
     gate: PolicyGate,
     ports: Arc<Ports>,
     /// Every tenant's MCP bindings, kept current by the binder loop.
@@ -1082,6 +1118,38 @@ impl Agent {
                 );
             }
 
+            // **And whose credential pays for it.** Two different questions, and
+            // this is the second one: `model_for` above says *which* model the
+            // operator permits, this says *whose account* the call is billed to.
+            // Read in the same transaction as the policy, so what bounds the
+            // turn and what pays for it come from one snapshot.
+            //
+            // A tenant with no connection takes no turn at all. It is the same
+            // shape of refusal as the empty `allowed_models` immediately above —
+            // named, non-retryable, naming the remedy — because it is the same
+            // kind of fact: a person has to do something, and no amount of
+            // waiting or provider-status-checking changes it. We never provide
+            // the model, so an unconnected tenant has nothing to think with.
+            //
+            // `None` for the API origin: `model_access::ApiBase` says why that
+            // argument exists and why this is not a place to read a variable.
+            let (llm, access) = agentos_app::model_access::for_turn(
+                tx,
+                self.secrets.as_ref(),
+                &self.llm,
+                self.backend,
+                None,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            tracing::debug!(
+                employee_id = %employee_id.as_uuid(),
+                path = %access.path,
+                proven = %access.model,
+                running = %model,
+                "the tenant's own model connection is what this turn is billed to"
+            );
+
             // The counterparty wrote all four of these — who it is from
             // included — so they travel together inside one frame rather than
             // being spliced into a sentence of ours.
@@ -1107,7 +1175,7 @@ impl Agent {
                 ..(*self.ports).clone()
             });
             let turn = Turn::new(
-                self.llm,
+                llm,
                 self.gate,
                 Effects::new(self.db.clone(), ports, principal.clone()),
                 principal,
@@ -2504,6 +2572,27 @@ mod tests {
             .expect("insert tenant");
         tx.commit().await.expect("commit tenant");
 
+        // Whose model this tenant thinks with. **Required now**: after
+        // `migrations/0041_tenant_model_access.sql` a tenant that has connected
+        // none takes no turn at all, and `Agent::on_turn` refuses before it
+        // assembles one. `ModelPath::Cli` is "the model this host has", and this
+        // host's is whatever the test scripted — `Agent::backend` is
+        // `LlmBackend::Mock` here, which is not a bill of ours, so the path is
+        // legal. See `agentos_app::model_access`.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &agentos_domain::model_access::ModelAccess {
+                path: agentos_domain::model_access::ModelPath::Cli,
+                model: agentos_domain::policy::ModelId::Opus5,
+                verified_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("connect the model");
+        tx.commit().await.expect("commit the connection");
+
         // Active, because the gate refuses every action for an employee that is
         // not — and a denial for the wrong reason would prove nothing.
         let mut employee = Employee::new(
@@ -2640,6 +2729,8 @@ mod tests {
             let agent = Agent {
                 db: self.db.clone(),
                 llm,
+                backend: agentos_app::mocks::LlmBackend::Mock,
+                secrets: agentos_app::mocks::secret_store(),
                 gate: PolicyGate::new(self.db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
                 // No binder loop in this test, so every tenant's fleet is
@@ -2981,6 +3072,8 @@ mod tests {
         let agent = Agent {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            secrets: agentos_app::mocks::secret_store(),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: Fleets::new().0,

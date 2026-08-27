@@ -641,11 +641,21 @@ fn llm(config: &Config, blessed: bool, get: &dyn Fn(&str) -> Option<String>) -> 
         // Presence and shape, never a call: verifying this key costs a token,
         // and the realistic mistake is pasting the wrong secret, which shape
         // catches for free.
+        //
+        // **And since 0041 this key can no longer serve a tenant**, which is the
+        // more useful thing to say. Every turn runs on the credential the tenant
+        // connected through `POST /v1/model`, and a tenant on the `cli` path — the
+        // one that spends whatever this host has — is refused outright when this
+        // host's model is a key we pay for. So a correctly shaped key here is a
+        // key that is now doing nothing, and an operator who thinks it is
+        // powering their fleet has the wrong picture of their own bill.
         LlmBackend::Anthropic => match config.anthropic_api_key.as_deref() {
             Some(key) if key.starts_with("sk-ant-") => (
                 Status::Ok,
                 "AGENTOS_LLM=anthropic, key present and correctly shaped. Not called: a live \
-                 check would cost a token."
+                 check would cost a token. NOTE: no tenant can spend this key — every turn runs \
+                 on the credential its tenant connected with POST /v1/model, and the `cli` path \
+                 is refused while this key is configured, because we never provide the model."
                     .to_owned(),
             ),
             Some(_) => (
