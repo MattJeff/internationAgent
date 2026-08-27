@@ -113,14 +113,35 @@
 //!
 //! # What a halt deliberately does not stop
 //!
-//! **Provisioning.** `apps/server/src/loops/provisioning.rs` converges an
-//! employee somebody already asked for towards mailboxes and phone numbers, with
-//! no policy gate anywhere on its path. It is not covered here, and the honest
-//! reason is that half-covering it is worse than not: interrupting convergence
-//! leaves resources bought and unbound, which is what
-//! `GET /v1/inventory/stranded` exists to find. Stopping it properly means a
-//! resumable state machine that knows how to be paused, and that is not this
-//! unit.
+//! **Finishing a convergence that had already started.**
+//! `apps/server/src/loops/provisioning.rs` converges an employee somebody
+//! already asked for towards mailboxes and phone numbers, with no policy gate
+//! anywhere on its path. This paragraph used to say the whole loop was
+//! uncovered, on the grounds that half-covering it is worse than not:
+//! interrupting a convergence leaves resources bought and unbound, which is what
+//! `GET /v1/inventory/stranded` exists to find, and stopping it properly means a
+//! resumable state machine that knows how to be paused.
+//!
+//! That argument is sound and it only ever covered half the ground. *Not
+//! starting* a convergence is not *interrupting* one, and it strands nothing,
+//! because there is nothing yet to strand. So the loop's claim now skips a
+//! stopped company's rows that have not begun — `pending`, `failed`, and a
+//! `pending_external` wait nothing on our side can move — and still claims the
+//! one row that has: a `provisioning` row whose lease lapsed is a provider call
+//! whose outcome nobody knows, and the only reconciler of one is inside
+//! `converge`. `CLAIM_SQL`'s doc comment carries the table.
+//!
+//! What moved this over the line is that the ceiling of the old argument was
+//! crossed without anybody touching it: it was written when a halt was rare,
+//! short, and placed by a human who was coming back to lift it. Since
+//! `migrations/0054_operating_window.sql` a company stops **by itself, on a
+//! date, and may stay stopped for weeks**. "We buy anyway during a halt" was an
+//! hour's tolerance; it had become a recurring invoice.
+//!
+//! Still uncovered, and named rather than implied: an employee exempted for its
+//! one lapsed lease has all eleven of its steps converged, pending ones
+//! included, because `converge` takes an employee and not a step list. That last
+//! gap *is* the resumable state machine, and it is still not this unit.
 //!
 //! # Who may throw it
 //!

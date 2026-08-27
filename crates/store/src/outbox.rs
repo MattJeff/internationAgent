@@ -557,7 +557,14 @@ pub async fn claim_of(
         // drains them all — but "what happens to a finished company's queue"
         // is a product decision (drain once? export? expire?) and this file
         // will not invent one.
-        "WITH seated AS MATERIALIZED ( \
+        //
+        // The two clauses are now `crate::not_stopped!`, pasted here at compile
+        // time from `crate::halt` — same tokens, same plan, one definition. The
+        // paragraph above explains why this query cannot simply call
+        // `halt::halted`; the macro is what stops the workaround being copied a
+        // fourth time by hand.
+        concat!(
+            "WITH seated AS MATERIALIZED ( \
              SELECT q.id, q.available_at, q.seat \
                FROM tenants t \
                CROSS JOIN LATERAL ( \
@@ -574,11 +581,9 @@ pub async fn claim_of(
                             ORDER BY e.available_at, e.id \
                             LIMIT $3::bigint * $6::bigint) top \
                ) q \
-              WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
-                                 WHERE h.tenant_id = t.id) \
-                AND NOT EXISTS (SELECT 1 FROM company_windows w \
-                                 WHERE w.tenant_id = t.id \
-                                   AND w.ends_at <= $1::timestamptz) \
+              WHERE ",
+            crate::not_stopped!("t.id"),
+            " \
          ), shortlist AS MATERIALIZED ( \
              SELECT id, seat, available_at FROM seated \
               ORDER BY seat, available_at, id \
@@ -600,6 +605,7 @@ pub async fn claim_of(
          WHERE e.id IN (SELECT id FROM due) \
          RETURNING e.id, e.tenant_id, e.aggregate_type, e.aggregate_id, e.event_type, \
                    e.payload, e.attempt_count, e.available_at, e.last_error",
+        ),
     )
     .bind(now)
     .bind(MAX_ATTEMPTS)
