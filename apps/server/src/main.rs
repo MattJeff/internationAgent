@@ -56,7 +56,7 @@ use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::prompt::SystemPrompt;
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
-use agentos_app::turn::{Context, Failed, Turn, TurnError};
+use agentos_app::turn::{Budget, Context, Failed, Turn, TurnError};
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::{Lifecycle, Step};
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, TenantId};
@@ -1707,16 +1707,66 @@ impl Agent {
                         err.code()
                     )));
                 }
-                // Acknowledged. A budget that ran out, a refusal, a bad API
-                // key: eight more attempts cost eight more model calls and end
-                // the same way, and dead-lettering every inbound message is how
-                // one broken employee takes `/readyz` down for the deployment.
+                // **The deadline is not the employee's fault and not final.**
+                // `Budgets::check` reports `Budget::Deadline` for
+                // `cancel.is_cancelled()`, and this turn's token is a child of
+                // the *process* token — so every in-flight turn takes this arm
+                // on every SIGTERM, which is to say on every deploy. Retrying
+                // is exactly right there: another replica answers the same
+                // message, and the `TURN_DEADLINE <= LEASE_SECS` assertion
+                // above is what keeps the two from overlapping. A turn that
+                // genuinely needs more than `TURN_DEADLINE` every time still
+                // ends in the dead-letter queue, after `MAX_ATTEMPTS` said so
+                // rather than after one restart guessed it.
+                Err(Failed {
+                    error: TurnError::BudgetExceeded(Budget::Deadline),
+                    ..
+                }) => {
+                    return Err(Failure::Retry(
+                        "the turn ran out of wall clock, or this replica is shutting down"
+                            .to_owned(),
+                    ));
+                }
+                // Terminal. A ceiling that ran out, a refusal, a bad API key.
+                //
+                // **The original argument here was right and has been
+                // overtaken.** It said: eight more attempts cost eight more
+                // model calls and end the same way — true, and still true, of
+                // `max_turns`, `max_tool_calls` and `max_tokens`, which are
+                // constants in `turn::Budgets` and not policy an operator can
+                // raise between attempts. It then said dead-lettering every
+                // inbound message is how one broken employee takes `/readyz`
+                // down for the deployment — and *that* half was a dilemma with
+                // only two branches, because when it was written "not `Ok`"
+                // could only mean `Failure::Retry`: eight attempts, and a row
+                // `lag_secs` counted as backlog the whole way.
+                //
+                // `Failure::Terminal` is the third branch and it costs neither.
+                // It parks on the first attempt, so no further model call is
+                // bought — which is what the original argument was protecting.
+                // And a parked row carries `attempt_count = MAX_ATTEMPTS`,
+                // which `lag_secs` filters out by that exact predicate, so it
+                // cannot move `/readyz`: readiness asks whether the poller is
+                // behind, and `outbox::dead_letters` — read by the metrics
+                // gauge, by nothing else — asks whether an effect will never
+                // happen. Different questions, different surfaces.
+                //
+                // What `Ok(())` bought instead was `mark_done`: `published_at`
+                // set, `last_error` cleared, and a customer's message recorded
+                // as handled by an employee that never answered it. One
+                // `tracing::error!` was the entire trace. The way back is
+                // `outbox::requeue_dead_letters`, which both
+                // `model_access::connect` and `policy::activate` already call.
                 Err(Failed { error: err, .. }) => {
                     tracing::error!(
                         %conversation_id, %employee_id, code = err.code(), error = %err,
-                        "the agent turn did not finish; the message is answered by nobody"
+                        "the agent turn did not finish; parking the message rather than \
+                         recording it as answered"
                     );
-                    return Ok(());
+                    return Err(Failure::Terminal(format!(
+                        "the turn cannot finish and retrying will not change it: {}",
+                        err.code()
+                    )));
                 }
             };
 
@@ -3214,6 +3264,64 @@ mod tests {
             consumed
         }
 
+        /// The real `agent.turn.requested` row `land` left behind, shaped the
+        /// way `loops::outbox::handle` hands one to a handler.
+        ///
+        /// Read back rather than hand-rolled, for the reason [`Landed`]'s own
+        /// docs give: a lookalike payload is a test that passes when the
+        /// producer's field names change.
+        async fn turn_event(&self) -> OutboxEvent {
+            let mut tx = self.db.tenant_tx(self.tenant).await.expect("tx");
+            let (id, aggregate_type, aggregate_id, event_type, payload, attempt_count) =
+                sqlx::query_as::<_, (Uuid, String, Uuid, String, serde_json::Value, i32)>(
+                    "SELECT id, aggregate_type, aggregate_id, event_type, payload, attempt_count \
+                   FROM outbox_events WHERE event_type = $1",
+                )
+                .bind(agentos_app::inbound::TURN_EVENT)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("the turn event `land` enqueued");
+            tx.rollback().await.expect("rollback");
+            OutboxEvent {
+                id,
+                tenant_id: self.tenant,
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload,
+                // As `claim` hands it over: the first attempt, already burned.
+                attempt_count: attempt_count + 1,
+                available_at: Utc::now(),
+                last_error: None,
+            }
+        }
+
+        /// Run one turn through the real handler and give the verdict back.
+        ///
+        /// The transaction is rolled back either way: this asks what `on_turn`
+        /// *decides*, and `loops::outbox::handle` rolls back on `Err` too.
+        async fn take_turn(
+            &self,
+            event: &OutboxEvent,
+            llm: Arc<dyn Llm>,
+            cancel: CancellationToken,
+        ) -> Result<(), Failure> {
+            let agent = Agent {
+                db: self.db.clone(),
+                llm,
+                backend: agentos_app::mocks::LlmBackend::Mock,
+                credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+                gate: PolicyGate::new(self.db.clone()),
+                ports: Arc::new(agentos_app::mocks::ports()),
+                fleets: Fleets::new().0,
+                cancel,
+            };
+            let mut tx = self.db.tenant_tx(self.tenant).await.expect("tx");
+            let handled = agent.on_turn(event, &mut tx).await;
+            let _ = tx.rollback().await;
+            handled
+        }
+
         async fn teardown(self) {
             drop_database(self.db, self.admin_url, self.database).await;
         }
@@ -3221,6 +3329,113 @@ mod tests {
 
     fn done(text: &str) -> LlmResponse {
         LlmResponse::text(text, Usage::new(50, 10, 0))
+    }
+
+    /// **A turn whose model call cannot be retried is parked, not swallowed.**
+    ///
+    /// `on_turn` used to answer `Ok(())` for every failure that was not a
+    /// store outage and not a retryable provider error, and `Ok` is what
+    /// `loops::outbox::handle` turns into `mark_done`: `published_at` set,
+    /// `last_error` cleared. A customer's message was recorded as handled by
+    /// an employee that never answered it, with one `tracing::error!` as the
+    /// whole trace and nothing in `outbox::dead_letters` to alert on.
+    ///
+    /// # What this asserts, and what it composes with
+    ///
+    /// This asserts the **classification** — the half that was wrong. The
+    /// other half, that a `Failure::Terminal` really does leave the row
+    /// unpublished with `attempt_count = MAX_ATTEMPTS`, `last_error` set and
+    /// visible in `outbox::dead_letters`, is
+    /// `loops::outbox::a_terminal_failure_is_dead_lettered_on_the_first_attempt`,
+    /// which asserts all four against a fabricated handler. Both green is the
+    /// property; asserting the four columns a second time here would be a
+    /// second copy of that test wearing an agent costume.
+    ///
+    /// # Why the deadline is the other half of *this* test
+    ///
+    /// Because a blanket `Terminal` would have been a new bug of the same
+    /// shape. `Budgets::check` reports `Budget::Deadline` for
+    /// `cancel.is_cancelled()`, and a turn's token is a child of the process
+    /// token — so **every in-flight turn takes that arm on every SIGTERM**.
+    /// Parking those would mean a rolling deploy silently retires whatever
+    /// mail was mid-flight, permanently, and neither caller of
+    /// `outbox::requeue_dead_letters` is a verb an operator runs after a
+    /// restart. So the two arms are asserted together: the pair is what says
+    /// the handler distinguishes "this cannot work" from "not on this
+    /// replica".
+    #[tokio::test]
+    async fn a_turn_whose_model_call_cannot_be_retried_is_parked_and_not_swallowed() {
+        let Some(landed) = land_a_message("What is your best price on the bolts?").await else {
+            return;
+        };
+        let event = landed.turn_event().await;
+
+        // A bad API key, as a provider reports one. `ProviderError::Terminal`
+        // is the variant `is_retryable` calls false, so this lands on the arm
+        // that used to return `Ok(())`.
+        let verdict = landed
+            .take_turn(
+                &event,
+                Arc::new(agentos_app::mocks::ScriptedLlm::new(vec![Err(
+                    agentos_app::mocks::ProviderError::Terminal {
+                        code: "invalid_api_key",
+                    },
+                )])),
+                CancellationToken::new(),
+            )
+            .await;
+
+        let Err(failure) = verdict else {
+            panic!(
+                "a turn whose model refused the credential reported success; \
+                 `loops::outbox::handle` will call `mark_done` and the customer's \
+                 message is published, unanswered, with `last_error` cleared"
+            );
+        };
+        let Failure::Terminal(why) = &failure else {
+            panic!(
+                "a bad API key is being retried, and the retry cannot work: eight more \
+                 attempts buy eight more refusals from the same credential: {failure:?}"
+            );
+        };
+        // The reason travels, because a dead letter nobody can diagnose is a
+        // row an operator deletes. And it is the provider's stable *code*, not
+        // its prose: this string becomes `last_error`, which is ours.
+        assert!(
+            why.contains("invalid_api_key"),
+            "the parked row does not say why: {why}"
+        );
+
+        // -- and the deadline is not terminal -------------------------------
+        //
+        // An already-cancelled token is exactly what an in-flight turn sees
+        // when the process catches SIGTERM: `Budgets::check` tests
+        // `is_cancelled` before any other ceiling, so this fails before the
+        // model is called at all.
+        //
+        // The empty script is the tripwire that says so. `ScriptedLlm::new`
+        // with nothing in it answers `EXHAUSTED` — `ProviderError::Terminal`,
+        // which `is_retryable` calls false — so a turn that *did* reach the
+        // model would take the terminal arm and fail the assertion below. The
+        // arm under test is therefore the only way this passes.
+        let shutting_down = CancellationToken::new();
+        shutting_down.cancel();
+        let verdict = landed
+            .take_turn(
+                &event,
+                Arc::new(agentos_app::mocks::ScriptedLlm::new(vec![])),
+                shutting_down,
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(Failure::Retry(_))),
+            "a turn cut short by this replica shutting down was not handed back: a \
+             rolling deploy would park every message that happened to be in flight, \
+             and no operator verb brings those back: {verdict:?}"
+        );
+
+        landed.teardown().await;
     }
 
     /// The link that was missing: a message lands, the outbox dispatches the

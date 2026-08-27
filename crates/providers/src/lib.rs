@@ -304,11 +304,20 @@ impl ProviderError {
     /// `ProvisioningEngine::call_until` stops the step,
     /// `agentos_app::inbound::InboundError::is_retryable` forwards it to both
     /// inbound seams, which park the event on its first attempt, and
-    /// `apps/server/src/main.rs`'s `on_turn` — via `TurnError::Llm` — answers
-    /// `Ok(())`, which is `mark_done`: `published_at` set, `last_error`
-    /// cleared, and a customer's message answered by nobody with no dead
-    /// letter to alert on. That is the expensive direction, and a `matches!`
-    /// takes it silently.
+    /// `apps/server/src/main.rs`'s `on_turn` — via `TurnError::Llm` — parks the
+    /// customer's message as a dead letter rather than retrying it.
+    ///
+    /// Every one of those three is a door that only swings one way per answer,
+    /// and `false` is the side that stops work: a `matches!` would hand a new
+    /// variant a permanent park by default, which is the expensive direction
+    /// and the one nobody would see happen.
+    ///
+    /// It used to be more expensive still. `on_turn` answered `Ok(())` here,
+    /// which is `mark_done`: `published_at` set, `last_error` cleared, and a
+    /// customer's message recorded as handled by an employee that never
+    /// answered it, with no dead letter to alert on. That silence is gone —
+    /// the answer is now a park, which is visible in `outbox::dead_letters` —
+    /// but the reason to spell this `match` out has not changed.
     ///
     /// `code()` below is already exhaustive, so a new variant does fail the
     /// build — *there*, in the metrics label, which is answered with one line
