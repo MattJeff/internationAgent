@@ -318,6 +318,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // `routes::mcp` for why binding is a loop and not a boot step.
     let (fleets, rebinds) = Fleets::new();
 
+    // The one cipher this process seals and opens MCP credentials with. Built
+    // once and cloned, never rebuilt: `identity::envelope` derives 32 bytes from
+    // `AGENTOS_MASTER_KEY`, and two of these would be a deployment where a token
+    // sealed by a handler cannot be opened by the loop that binds it. It is an
+    // `agentos_app` handle rather than the provider's cipher because this crate
+    // does not depend on `agentos-providers` — see `Cargo.toml`.
+    let credentials = agentos_app::mcp::Credentials::from_master_key(&config.master_key);
+
     // The agent runtime, wired once and shared by every turn the outbox
     // dispatches. It hangs off the same token, so SIGTERM ends an in-flight
     // turn between effects instead of mid-payment.
@@ -343,6 +351,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             tokio::spawn(routes::mcp::run(
                 db.clone(),
                 fleets.clone(),
+                credentials.clone(),
                 rebinds,
                 cancel.clone(),
             )),
@@ -386,7 +395,15 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
 
     let served = serve(
         listener,
-        app(db, &config, gate, fleets, ports.clone(), llm, secrets),
+        app(
+            db,
+            &config,
+            gate,
+            fleets,
+            credentials,
+            ports.clone(),
+            ModelWiring { llm, secrets },
+        ),
         {
             let cancel = cancel.clone();
             async move {
@@ -447,14 +464,36 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
 /// per-source limit belongs at the ingress proxy, which is also the only thing
 /// that can see the real client address.
+/// Everything the model-connection route needs, and nothing any other route
+/// does.
+///
+/// **A struct because two branches added a parameter to `app` on the same day**
+/// and clippy counted eight. Grouping the three that travel together is the
+/// honest fix: `llm`, `secrets` and the host's backend are read by exactly one
+/// `.merge` below and by nothing else, so a bag of them is a fact about the
+/// wiring rather than a way to quiet a lint.
+///
+/// It is deliberately *not* `Ports`. `Ports` is what an employee acts through;
+/// this is what the operator's onboarding call uses to prove a tenant's key
+/// before any employee exists — see `routes::model` for why that ordering is
+/// the whole point.
+struct ModelWiring {
+    /// The host's own client, used for one verification round trip and never
+    /// for a turn. `LlmBackend::pays_with_our_key` is what stops it becoming a
+    /// tenant's model by accident.
+    llm: Arc<dyn Llm>,
+    /// Where a proven key is sealed. The route never reads one back.
+    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
+}
+
 fn app(
     db: Db,
     config: &Config,
     gate: PolicyGate,
     fleets: Fleets,
+    credentials: agentos_app::mcp::Credentials,
     ports: Arc<Ports>,
-    llm: Arc<dyn Llm>,
-    secrets: Arc<dyn agentos_app::mocks::SecretStore>,
+    model: ModelWiring,
 ) -> Router {
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
@@ -509,11 +548,20 @@ fn app(
             // truth was "nobody could configure this". Both halves are gone:
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
-            .merge(routes::mcp::router(McpState::new(db.clone(), fleets)))
+            .merge(routes::mcp::router(McpState::new(
+                db.clone(),
+                fleets,
+                credentials,
+            )))
             // The step that changes whose bill this is. Before it, no tenant has
             // a model and no employee takes a turn; after it, every token is the
             // customer's. See its module docs for why a refused key is a 200.
-            .merge(routes::model::router(db.clone(), llm, config.llm, secrets))
+            .merge(routes::model::router(
+                db.clone(),
+                model.llm,
+                config.llm,
+                model.secrets,
+            ))
             .merge(routes::a2a::router(a2a.clone())),
         db.clone(),
         config.api_keys.clone(),

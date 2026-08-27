@@ -155,6 +155,14 @@ pub struct Config {
     /// the 32 bytes the cipher takes and documents why that is a hash and not a
     /// KDF. Every employee's private signing key is sealed under it, so
     /// changing it in place orphans every identity this deployment has issued.
+    ///
+    /// **And every tenant's MCP credential**, since `0040_mcp_credentials`. The
+    /// failure mode there is gentler and much more visible: a binding whose
+    /// `sealed_token` no longer opens is left out of the fleet with
+    /// `secret_decrypt_failed` on `GET /v1/mcp/servers`, rather than binding
+    /// without the header and collecting a 401 that blames the customer's token.
+    /// Re-connecting the server through `POST /v1/mcp/connect` repairs it, which
+    /// is the same request that proves the replacement works before it is stored.
     pub master_key: String,
     /// `AGENTOS_ALLOW_MOCKS` — `1`/`true` permits mock adapters.
     pub allow_mocks: bool,

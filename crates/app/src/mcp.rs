@@ -188,7 +188,8 @@ use agentos_domain::action::{McpTool, Risk};
 use agentos_domain::ids::Slug;
 use agentos_domain::policy::{ApprovalReason, Decision, DenyReason};
 use agentos_domain::untrusted::Untrusted;
-use agentos_providers::ProviderError;
+use agentos_providers::secrets::LocalEnvelopeSecretStore;
+use agentos_providers::{ProviderError, Secret};
 use agentos_store::db::{StoreError, TenantTx};
 use async_trait::async_trait;
 use rmcp::RoleClient;
@@ -199,6 +200,7 @@ use rmcp::model::{
 };
 use rmcp::service::{ClientLifecycleMode, RunningService, serve_client_with_lifecycle_and_ct};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -487,6 +489,25 @@ pub enum McpError {
         secs: u64,
     },
 
+    /// The stored credential could not be read.
+    ///
+    /// Its own variant rather than a [`Self::Connect`], because it is the one
+    /// failure in this enum that is **ours**: the endpoint is fine, the address
+    /// is fine, and what changed is the deployment's master key or the row. The
+    /// alternative — binding without the header — produces a 401 from a
+    /// stranger's server, which is the single most misleading answer this
+    /// subsystem can give, because it points an operator at the customer's token
+    /// when the fault is on our side of the wire.
+    ///
+    /// Carries the cipher's own code and **nothing else**: no blob, no context,
+    /// no length. This error is rendered into `BindFailure::detail`, which
+    /// `apps/server` puts in a JSON response.
+    #[error("the stored credential for this server could not be read: {code}")]
+    Credential {
+        /// `envelope_malformed` or `secret_decrypt_failed`.
+        code: &'static str,
+    },
+
     /// The server was reached and the exchange failed.
     #[error(transparent)]
     Transport(#[from] ServiceError),
@@ -505,6 +526,10 @@ impl McpError {
             McpError::MoreRoundsRequired(_) => "more_rounds_required",
             McpError::Connect(_) => "connect_failed",
             McpError::TimedOut { .. } => "timed_out",
+            // The cipher's own code passes through: `envelope_malformed` and
+            // `secret_decrypt_failed` are already stable, low-cardinality, and
+            // they say which of the two things went wrong.
+            McpError::Credential { code } => code,
             McpError::Transport(_) => "transport",
         }
     }
@@ -620,6 +645,20 @@ impl McpServer {
     /// [`RiskClass::Destructive`]; anything in there that the server does not
     /// offer is ignored.
     ///
+    /// `token` is sent as `Authorization: Bearer <it>` on every request this
+    /// binding makes, and `None` sends no header at all — not an empty one. It
+    /// is borrowed rather than owned so the plaintext is alive for the length of
+    /// this call and not for the length of the binding: what the transport keeps
+    /// is a header value it built, and [`Secret`] zeroizes when the caller's
+    /// copy drops. See [`crate::secrets::SecretResolver::with_secret`], which is
+    /// the same shape.
+    ///
+    /// **The credential does not widen anything.** It is read *after*
+    /// [`vet_url`] and [`resolve_and_vet`], so there is no token that buys a
+    /// binding to an address the SSRF check refuses; and `rmcp`'s reqwest client
+    /// is built with `redirect::Policy::none()`, so the header cannot be
+    /// replayed to a host that never passed the check.
+    ///
     /// Every side effect that matters happens here, once, under operator
     /// control: the DNS lookup, the address check, and the tool inventory.
     /// Nothing at call time takes a string from anywhere but this struct.
@@ -628,9 +667,13 @@ impl McpServer {
         url: &str,
         declared: &BTreeMap<Slug, Declaration>,
         reach: Reach,
+        token: Option<&Secret>,
         ct: CancellationToken,
     ) -> Result<Self, McpError> {
         let url = vet_url(url)?;
+        // Before the credential is touched, and the order is the property: a
+        // token is not a key to an address, and there is no arrangement of this
+        // function in which one becomes one.
         let pinned = resolve_and_vet(&url, reach).await?;
 
         // ponytail: the resolved addresses are recorded, not forced onto the
@@ -640,7 +683,15 @@ impl McpServer {
         // request. Closing it is one line (`reqwest::Client::builder()
         // .resolve(host, addr)` fed to `StreamableHttpClientTransport::
         // with_client`) the day `reqwest` is a direct dependency of this crate.
-        let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+        if let Some(token) = token {
+            // `auth_header` takes the token WITHOUT the `Bearer ` prefix; rmcp
+            // writes the scheme itself. Prefixing it here would send
+            // `Bearer Bearer …`, which every server answers 401 to and no error
+            // message explains.
+            config = config.auth_header(token.expose_for_transport());
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
         let info = ClientInfo::new(
             ClientCapabilities::default(),
             Implementation::new(CLIENT_NAME, CLIENT_VERSION),
@@ -957,6 +1008,167 @@ pub fn vet_url(raw: &str) -> Result<Url, McpError> {
     Ok(url)
 }
 
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+/// The deployment's cipher, and the only two things an MCP binding does with it.
+///
+/// # Why this type exists at all
+///
+/// `apps/server/Cargo.toml` says it out loud: *"agentos-providers is
+/// deliberately absent: the server may not touch a provider directly."* The
+/// credential path needs a cipher and a [`Secret`], both of which live in
+/// `agentos-providers`, so the naive shape — `apps/server` holding an
+/// `Arc<LocalEnvelopeSecretStore>` — would have deleted that rule to add a
+/// header. This type is what keeps it: `apps/server` holds a `Credentials`,
+/// which is an `agentos-app` type, and never names a provider.
+///
+/// The layering is not the only thing it buys, and the second thing is bigger.
+/// **A plaintext credential never crosses the crate boundary in either
+/// direction.** The HTTP layer hands a `String` in ([`seal`](Self::seal),
+/// which takes it by value) and hands sealed bytes back in
+/// ([`bind`](Self::bind)); there is no signature here that returns a
+/// [`Secret`], so "the token is never in a response, a log or an error" is a
+/// property of the API rather than a discipline in four handlers.
+///
+/// # And it makes the connect path bind the way the loop binds
+///
+/// [`bind`](Self::bind) takes the **sealed** form, so the route that verifies a
+/// brand-new credential seals it first and binds from the ciphertext — exactly
+/// the input `Fleet::bind` will use five minutes later. A seal/open bug
+/// therefore fails in front of the customer who is watching, instead of
+/// silently five minutes after they were told "connected".
+#[derive(Clone)]
+pub struct Credentials {
+    cipher: std::sync::Arc<LocalEnvelopeSecretStore>,
+}
+
+// Hand-written. A derived one would reach into the cipher, which holds the
+// master key; `LocalEnvelopeSecretStore`'s own `Debug` redacts it, and this
+// does not depend on that staying true.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credentials")
+    }
+}
+
+impl Credentials {
+    /// Build from the deployment's `AGENTOS_MASTER_KEY`.
+    ///
+    /// Goes through [`crate::identity::envelope`] rather than deriving the key
+    /// again here, and that is the whole point of the call: two spellings of the
+    /// text-to-32-bytes bridge are two deployments that cannot read each other's
+    /// rows, and this one would only be discovered by an operator whose MCP
+    /// credentials stopped opening after a restart.
+    pub fn from_master_key(master_key: &str) -> Self {
+        Self {
+            cipher: crate::identity::envelope(master_key),
+        }
+    }
+
+    /// Wrap a cipher that already exists. For tests, and for a caller that
+    /// shares one with [`crate::identity`].
+    pub const fn new(cipher: std::sync::Arc<LocalEnvelopeSecretStore>) -> Self {
+        Self { cipher }
+    }
+
+    /// Seal a token a customer typed, for storage in `mcp_servers.sealed_token`.
+    ///
+    /// **Takes the `String` by value and never gives it back.** `String ->
+    /// String` is the identity conversion, so the buffer the request body
+    /// allocated becomes the one `SecretString` zeroizes on drop; taking a `&str`
+    /// would copy it and leave the original in the heap.
+    ///
+    /// A token that is empty or all whitespace is `None`, not an empty
+    /// credential. A form that posts `""` for an untouched field is the single
+    /// most common way a binding ends up sending `Authorization: Bearer ` and
+    /// getting a 401 nobody can explain.
+    pub fn seal(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        server: &Slug,
+        token: Option<String>,
+    ) -> Result<Option<Vec<u8>>, McpError> {
+        let Some(raw) = token.filter(|t| !t.trim().is_empty()) else {
+            return Ok(None);
+        };
+        self.cipher
+            .seal_in(
+                tenant_id,
+                &credential_context(tenant_id, server),
+                &Secret::new(raw),
+            )
+            .map(|sealed| Some(sealed.to_bytes()))
+            .map_err(|err| McpError::Credential { code: err.code() })
+    }
+
+    /// Open a stored credential.
+    ///
+    /// Private: the plaintext exists inside this module, for the length of a
+    /// [`bind`](Self::bind), and nowhere else. Making this `pub` would be the
+    /// one change that undoes what this type is for.
+    fn open(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        server: &Slug,
+        sealed: &[u8],
+    ) -> Result<Secret, McpError> {
+        let envelope = agentos_providers::secrets::Envelope::from_bytes(sealed)
+            .map_err(|err| McpError::Credential { code: err.code() })?;
+        self.cipher
+            .open_in(tenant_id, &credential_context(tenant_id, server), &envelope)
+            .map_err(|err| McpError::Credential { code: err.code() })
+    }
+
+    /// Open the credential and bind, in one expression, so the plaintext lives
+    /// for one statement.
+    ///
+    /// The [`Secret`] is a local that drops when this function returns. What the
+    /// transport keeps is a header value it built from it.
+    ///
+    /// `sealed` is `None` for a binding that sends no credential, which is the
+    /// ordinary case for a server that needs none — not an error, and not an
+    /// empty header.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind(
+        &self,
+        tenant_id: agentos_domain::ids::TenantId,
+        server: Slug,
+        url: &str,
+        declared: &BTreeMap<Slug, Declaration>,
+        reach: Reach,
+        sealed: Option<&[u8]>,
+        ct: CancellationToken,
+    ) -> Result<McpServer, McpError> {
+        let token = match sealed {
+            None => None,
+            Some(sealed) => Some(self.open(tenant_id, &server, sealed)?),
+        };
+        McpServer::bind(server, url, declared, reach, token.as_ref(), ct).await
+    }
+}
+
+/// The encryption context one binding's credential is sealed under.
+///
+/// **One function, because an AAD that two call sites spell differently is a
+/// credential that seals and never opens** — and the failure is a
+/// `secret_decrypt_failed` that looks exactly like a corrupted master key. The
+/// sealer (`routes::mcp`) and the opener ([`Fleet::bind`]) both call this.
+///
+/// It names the server handle, not only the tenant, and that is the useful half:
+/// a `sealed_token` blob copied from one row to another inside one tenant will
+/// not open. The handle is what selects the URL, so without it a customer could
+/// point a credential at an endpoint it was never issued for by editing one
+/// column.
+///
+/// The `mcp://` scheme keeps this key space disjoint from `secret://`, which is
+/// what [`SecretRef`](agentos_domain::ids::SecretRef) renders and what
+/// [`LocalEnvelopeSecretStore::seal`] uses.
+pub fn credential_context(tenant_id: agentos_domain::ids::TenantId, server: &Slug) -> String {
+    format!("mcp://{tenant_id}/{}", server.as_str())
+}
+
 /// Resolve the host and refuse every address `reach` does not permit.
 ///
 /// *Every* address, not the first one: a host that resolves to one public
@@ -1035,11 +1247,20 @@ pub struct BindFailure {
 /// cannot read is a binding that is *skipped*, and skipping is the fail-closed
 /// answer. A hard error would let one malformed row take a tenant's whole turn
 /// down with it.
+///
+/// Deliberately not `Serialize`, and it is the one type in this module that
+/// would be tempting to make so: it carries `sealed_token`. Same rule as
+/// `store::signing::StoredKey` — a row type that can be serialised is a row type
+/// that ends up in a response body. The blob is useless without the master key,
+/// which is exactly the argument somebody makes right before it is in a log.
 #[derive(sqlx::FromRow)]
 struct ConfigRow {
     server: String,
     url: String,
     reach: String,
+    /// The envelope from `providers::secrets`, or `NULL` for a binding that
+    /// sends no credential. Opaque here until [`Fleet::bind`] opens it.
+    sealed_token: Option<Vec<u8>>,
     tool: Option<String>,
     risk: Option<String>,
     digest: Option<Vec<u8>>,
@@ -1051,7 +1272,7 @@ struct ConfigRow {
 /// tool on it is undeclared, which is [`RiskClass::Destructive`], which is the
 /// honest state of a server nobody has vetted yet.
 const SELECT_BINDINGS: &str = "\
-    SELECT s.server, s.url, s.reach, d.tool, d.risk, d.digest \
+    SELECT s.server, s.url, s.reach, s.sealed_token, d.tool, d.risk, d.digest \
       FROM mcp_servers s \
       LEFT JOIN mcp_tool_declarations d \
              ON d.tenant_id = s.tenant_id AND d.server = s.server \
@@ -1103,7 +1324,15 @@ impl Fleet {
     /// day the latency shows up in a trace, and not before — a cache here holds
     /// a *risk classification*, and a stale one of those is the bug this module
     /// spends 200 lines preventing.
-    pub async fn bind(tx: &mut TenantTx<'_>, ct: &CancellationToken) -> Result<Self, StoreError> {
+    /// A credential that will not open is a **binding that is skipped**, with
+    /// the reason recorded, exactly like a URL that will not resolve — see
+    /// [`McpError::Credential`] for why the alternative is worse than useless.
+    pub async fn bind(
+        tx: &mut TenantTx<'_>,
+        credentials: &Credentials,
+        ct: &CancellationToken,
+    ) -> Result<Self, StoreError> {
+        let tenant_id = tx.tenant_id();
         let rows: Vec<ConfigRow> = sqlx::query_as(SELECT_BINDINGS)
             .fetch_all(&mut ***tx)
             .await?;
@@ -1114,12 +1343,14 @@ impl Fleet {
                 tracing::warn!(server = %row.server, "mcp binding has no policy handle; skipping");
                 continue;
             };
+            let sealed = row.sealed_token.clone();
             let entry = configured.entry(server).or_insert_with(|| Binding {
                 url: row.url.clone(),
                 // An unrecognised spelling is the tight one. `mcp_servers_reach_known`
                 // makes it unreachable; if that CHECK is ever dropped, this is
                 // still the answer that refuses loopback.
                 reach: Reach::parse(&row.reach).unwrap_or_default(),
+                sealed_token: sealed,
                 declared: BTreeMap::new(),
             });
             if let Some((handle, declaration)) = declaration(&row) {
@@ -1130,14 +1361,17 @@ impl Fleet {
         let mut servers = BTreeMap::new();
         let mut failures = BTreeMap::new();
         for (name, binding) in configured {
-            match McpServer::bind(
-                name.clone(),
-                &binding.url,
-                &binding.declared,
-                binding.reach,
-                ct.clone(),
-            )
-            .await
+            match credentials
+                .bind(
+                    tenant_id,
+                    name.clone(),
+                    &binding.url,
+                    &binding.declared,
+                    binding.reach,
+                    binding.sealed_token.as_deref(),
+                    ct.clone(),
+                )
+                .await
             {
                 Ok(server) => {
                     servers.insert(name, server);
@@ -1211,9 +1445,16 @@ impl Fleet {
 }
 
 /// One server's configuration, before it is bound.
+///
+/// No `Debug`, and that is not an oversight: a derived one would print
+/// `sealed_token`, which is a ciphertext today and one refactor away from being
+/// the thing it protects.
 struct Binding {
     url: String,
     reach: Reach,
+    /// The envelope blob straight out of the column, still sealed.
+    /// [`Credentials::bind`] is the only thing that opens it.
+    sealed_token: Option<Vec<u8>>,
     declared: BTreeMap<Slug, Declaration>,
 }
 
@@ -1588,10 +1829,24 @@ mod tests {
             &server.url,
             &declared,
             Reach::Private,
+            None,
             CancellationToken::new(),
         )
         .await
         .expect("bind to the fake server")
+    }
+
+    /// The two credential shapes every bind-time refusal below is run through.
+    ///
+    /// Not decoration. Adding a credential added an argument to the one function
+    /// that performs the address check, and the failure this guards against is
+    /// the obvious refactor: read the token first, build the transport, *then*
+    /// vet. Every SSRF test therefore runs twice, and a token that bought an
+    /// address would fail half of them.
+    const CREDENTIALS: [Option<&str>; 2] = [None, Some("ghp_a_real_looking_token")];
+
+    fn credential(raw: Option<&str>) -> Option<Secret> {
+        raw.map(Secret::new)
     }
 
     // -- SSRF --------------------------------------------------------------
@@ -1599,51 +1854,106 @@ mod tests {
     #[tokio::test]
     async fn the_cloud_metadata_endpoint_is_refused_at_bind_time() {
         for reach in [Reach::Public, Reach::Private] {
-            let err = McpServer::bind(
-                erp(),
-                "http://169.254.169.254/",
-                &BTreeMap::new(),
-                reach,
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("169.254.169.254 is never an mcp server");
+            for raw in CREDENTIALS {
+                let token = credential(raw);
+                let err = McpServer::bind(
+                    erp(),
+                    "http://169.254.169.254/",
+                    &BTreeMap::new(),
+                    reach,
+                    token.as_ref(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("169.254.169.254 is never an mcp server");
 
-            assert!(
-                matches!(err, McpError::Blocked { ip, .. } if ip.to_string() == "169.254.169.254"),
-                "{reach:?} let the metadata endpoint through: {err}"
-            );
-            assert_eq!(err.code(), "blocked_address");
+                assert!(
+                    matches!(err, McpError::Blocked { ip, .. } if ip.to_string() == "169.254.169.254"),
+                    "{reach:?} with credential={} let the metadata endpoint through: {err}",
+                    raw.is_some()
+                );
+                assert_eq!(err.code(), "blocked_address");
+            }
         }
     }
 
     #[tokio::test]
     async fn loopback_needs_an_explicit_opt_in() {
-        let err = McpServer::bind(
-            erp(),
-            "http://127.0.0.1:1/",
-            &BTreeMap::new(),
-            Reach::Public,
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("loopback is not public");
-        assert!(matches!(err, McpError::Blocked { .. }));
+        for raw in CREDENTIALS {
+            let token = credential(raw);
+            let err = McpServer::bind(
+                erp(),
+                "http://127.0.0.1:1/",
+                &BTreeMap::new(),
+                Reach::Public,
+                token.as_ref(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("loopback is not public");
+            assert!(
+                matches!(err, McpError::Blocked { .. }),
+                "credential={}: {err}",
+                raw.is_some()
+            );
+        }
     }
 
     #[tokio::test]
     async fn only_http_and_https_may_be_bound() {
         for url in ["file:///etc/passwd", "gopher://example.com/", "not a url"] {
+            for raw in CREDENTIALS {
+                let token = credential(raw);
+                let err = McpServer::bind(
+                    erp(),
+                    url,
+                    &BTreeMap::new(),
+                    Reach::Public,
+                    token.as_ref(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("only http(s)");
+                assert!(
+                    matches!(err, McpError::BadUrl(_)),
+                    "{url} was accepted with credential={}",
+                    raw.is_some()
+                );
+            }
+        }
+    }
+
+    /// **A credential is not a key to an address**, and the refusal carries none
+    /// of it.
+    ///
+    /// The message of every bind-time refusal is rendered into `BindFailure`,
+    /// which `routes::mcp::list_servers` puts in a JSON response. So the string
+    /// an operator reads is checked here, at the source, rather than at the one
+    /// route that happens to render it today.
+    #[tokio::test]
+    async fn a_refused_bind_never_carries_the_credential_in_its_message() {
+        const TOKEN: &str = "ghp_leaked_if_this_test_fails";
+        let token = Secret::new(TOKEN);
+
+        for url in [
+            "http://169.254.169.254/",
+            "http://127.0.0.1:1/",
+            "file:///etc/passwd",
+            "http://this-host-does-not-resolve.invalid/mcp",
+        ] {
             let err = McpServer::bind(
                 erp(),
                 url,
                 &BTreeMap::new(),
                 Reach::Public,
+                Some(&token),
                 CancellationToken::new(),
             )
             .await
-            .expect_err("only http(s)");
-            assert!(matches!(err, McpError::BadUrl(_)), "{url} was accepted");
+            .expect_err("none of these bind");
+
+            let rendered = format!("{err} {err:?} {}", err.code());
+            assert!(!rendered.contains(TOKEN), "{url}: {rendered}");
         }
     }
 
@@ -1959,6 +2269,194 @@ mod tests {
         bound.close().await.expect("close");
     }
 
+    // -- the credential ----------------------------------------------------
+
+    /// **The token reaches the wire, exactly once, in the header the server
+    /// expects** — and it is not on the wire when there is no token.
+    ///
+    /// This is the whole reason the credential exists, and it is the assertion
+    /// nothing else in the workspace can make: every other test here proves a
+    /// refusal, and a refusal proves nothing about what a *successful* bind
+    /// sends. `rmcp`'s `auth_header` takes the token *without* the `Bearer `
+    /// prefix and writes the scheme itself, so `Bearer Bearer …` is one line of
+    /// misreading away and every server on earth answers it with a 401 that
+    /// explains nothing.
+    #[tokio::test]
+    async fn a_bearer_token_is_sent_on_every_request_and_never_doubled() {
+        const TOKEN: &str = "ghp_sixteen_chars_of_token";
+        let server = crate::mocks::FakeMcpServer::start(&["lookup"]).await;
+
+        let bound = McpServer::bind(
+            erp(),
+            server.url(),
+            &BTreeMap::new(),
+            Reach::Private,
+            Some(&Secret::new(TOKEN)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the fake server binds");
+
+        let sent = server.authorizations();
+        assert!(
+            !sent.is_empty(),
+            "the client bound without sending the credential at all"
+        );
+        for value in &sent {
+            // Lowercased by the fixture's header reader; the *value* is not.
+            assert_eq!(
+                value,
+                &format!("Bearer {TOKEN}"),
+                "the credential is not the exact header the server expects: {sent:?}"
+            );
+        }
+
+        // The binding itself does not carry the plaintext anywhere printable.
+        let rendered = format!("{bound:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        bound.close().await.expect("close");
+
+        // And the control: no token, no header. Not an empty one — a
+        // `Authorization: Bearer ` is a 401 nobody can debug.
+        let bare = crate::mocks::FakeMcpServer::start(&["lookup"]).await;
+        McpServer::bind(
+            erp(),
+            bare.url(),
+            &BTreeMap::new(),
+            Reach::Private,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an unauthenticated server binds")
+        .close()
+        .await
+        .expect("close");
+        assert!(
+            bare.authorizations().is_empty(),
+            "a binding with no credential sent one anyway: {:?}",
+            bare.authorizations()
+        );
+    }
+
+    /// A sealed credential opens for the binding it was sealed for, and for no
+    /// other one — not another tenant's, not the next server handle along.
+    ///
+    /// The second half is the one that needs a test. Tenant separation comes
+    /// free from the wrap AAD that `providers::secrets` already had; binding the
+    /// payload to the *server handle* is what [`credential_context`] added, and
+    /// it is what stops a `sealed_token` blob being copied one row sideways onto
+    /// a binding that points somewhere else.
+    #[test]
+    fn a_credential_opens_only_for_the_binding_it_was_sealed_for() {
+        const TOKEN: &str = "a-token-that-must-not-travel";
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([5u8; 32])));
+        let (tenant, other_tenant) = (TenantId::new_v7(Utc::now()), TenantId::new_v7(Utc::now()));
+
+        let sealed = credentials
+            .seal(tenant, &erp(), Some(TOKEN.to_owned()))
+            .expect("seal")
+            .expect("a token was given");
+
+        assert_eq!(
+            credentials
+                .open(tenant, &erp(), &sealed)
+                .expect("its own binding")
+                .expose_for_transport(),
+            TOKEN
+        );
+
+        // The row, lifted one column sideways inside one tenant.
+        assert_eq!(
+            credentials
+                .open(tenant, &slug("crm"), &sealed)
+                .expect_err("a credential is not portable between handles")
+                .code(),
+            "secret_decrypt_failed"
+        );
+        // ...and lifted into another tenant.
+        assert_eq!(
+            credentials
+                .open(other_tenant, &erp(), &sealed)
+                .expect_err("nor between tenants")
+                .code(),
+            "secret_decrypt_failed"
+        );
+
+        // The stored form carries no plaintext, and neither does the handle.
+        let rendered = format!("{sealed:?} {credentials:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+
+        // An absent or blank token is no credential, never an empty one.
+        for blank in [None, Some(String::new()), Some("   \n".to_owned())] {
+            assert_eq!(
+                credentials
+                    .seal(tenant, &erp(), blank.clone())
+                    .expect("seal"),
+                None,
+                "{blank:?} became a credential"
+            );
+        }
+    }
+
+    /// A stored credential that will not open is a binding that is **skipped**,
+    /// carrying a code that says whose fault it is.
+    #[tokio::test]
+    async fn a_credential_that_will_not_open_refuses_the_bind_rather_than_dropping_the_header() {
+        let server = crate::mocks::FakeMcpServer::start(&["lookup"]).await;
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([5u8; 32])));
+        let tenant = TenantId::new_v7(Utc::now());
+        let sealed = credentials
+            .seal(tenant, &erp(), Some("a-token".to_owned()))
+            .expect("seal")
+            .expect("given");
+
+        // A different deployment's master key: the row is intact and unopenable,
+        // which is what a rotated `AGENTOS_MASTER_KEY` looks like.
+        let stranger = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([6u8; 32])));
+        let err = stranger
+            .bind(
+                tenant,
+                erp(),
+                server.url(),
+                &BTreeMap::new(),
+                Reach::Private,
+                Some(&sealed),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a credential that will not open is not a bind without one");
+        assert_eq!(err.code(), "secret_decrypt_failed");
+
+        // The point of refusing: the server was never contacted, so the operator
+        // is not chasing a 401 that blames the customer's token.
+        assert!(
+            server.authorizations().is_empty(),
+            "it connected anyway: {:?}",
+            server.authorizations()
+        );
+
+        // A blob that is not an envelope at all is the other half, and it is a
+        // different code so an operator can tell a corrupted row from a rotated
+        // key.
+        assert_eq!(
+            stranger
+                .bind(
+                    tenant,
+                    erp(),
+                    server.url(),
+                    &BTreeMap::new(),
+                    Reach::Private,
+                    Some(b"not an envelope"),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("garbage is not a credential")
+                .code(),
+            "envelope_malformed"
+        );
+    }
+
     // -- the fleet ---------------------------------------------------------
 
     /// The list the model is given names what an operator wrote down, and
@@ -2119,9 +2617,10 @@ mod tests {
             tx.commit().await.expect("commit configuration");
         };
 
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([3u8; 32])));
         let bind = async || {
             let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-            let fleet = Fleet::bind(&mut tx, &CancellationToken::new())
+            let fleet = Fleet::bind(&mut tx, &credentials, &CancellationToken::new())
                 .await
                 .expect("the configuration is readable");
             tx.commit().await.expect("commit read");

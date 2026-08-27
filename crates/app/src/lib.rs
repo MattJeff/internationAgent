@@ -4,6 +4,7 @@
 //! a code-review obligation into a compile error.
 
 pub mod a2a; // U28
+pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
 pub mod effects; // U21
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them
 pub mod gate; // U20

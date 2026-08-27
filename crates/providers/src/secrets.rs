@@ -269,19 +269,55 @@ impl LocalEnvelopeSecretStore {
     /// Public so a test can prove that an envelope produced for one tenant does
     /// not open under another's context.
     pub fn seal(&self, secret_ref: &SecretRef, value: &Secret) -> Result<Envelope, ProviderError> {
+        self.seal_in(secret_ref.tenant_id(), &payload_aad(secret_ref), value)
+    }
+
+    /// Encrypt a value under an encryption context this type does not own.
+    ///
+    /// # Why this exists next to [`seal`](Self::seal)
+    ///
+    /// [`SecretRef`] is `(tenant, employee, name)`, and it is the right key for
+    /// a *credential an employee holds*. Not everything sealed with this cipher
+    /// is one. An MCP binding is `(tenant, server)` — `mcp_servers`' primary key
+    /// — and there is no employee in it: the binder loop reads one tenant's
+    /// whole configuration with no seat in hand, and a per-employee binding
+    /// would be a different product.
+    ///
+    /// The three shapes that were rejected. *A nil `EmployeeId`* — a UUID that
+    /// names nothing, in an AAD, forever, and one that would read as a real
+    /// employee in every trail that ever printed it. *Widening `SecretRef`* — it
+    /// is a parsed, traversal-proof string the model is allowed to emit, and
+    /// giving it an optional field means every `mismatch` check in
+    /// `app::secrets` grows a branch on the `None` case. *A second cipher* — two
+    /// places where AES-GCM is called is one place where the nonce discipline
+    /// can drift.
+    ///
+    /// So the context is a string the caller names, and `seal`/`open` become the
+    /// `SecretRef` spelling of it. Both AADs are still bound: the data key under
+    /// the tenant, the payload under whatever `context` says. The KMS swap the
+    /// module docs promise is unaffected — this is still the body of two
+    /// functions, and `context` is literally what KMS calls an encryption
+    /// context.
+    ///
+    /// `context` must be unambiguous across callers or two key spaces collide.
+    /// The two in this workspace are `secret://…` (from [`SecretRef`]) and
+    /// `mcp://…` (from `app::mcp`), which is why both carry a scheme.
+    pub fn seal_in(
+        &self,
+        tenant_id: TenantId,
+        context: &str,
+        value: &Secret,
+    ) -> Result<Envelope, ProviderError> {
         let mut data_key = Zeroizing::new([0u8; KEY_LEN]);
         rand::rng().fill_bytes(data_key.as_mut());
 
         let (nonce, ciphertext) = encrypt(
             &data_key,
-            payload_aad(secret_ref).as_bytes(),
+            context.as_bytes(),
             value.expose_for_transport().as_bytes(),
         )?;
-        let (key_nonce, wrapped_key) = encrypt(
-            &self.master_key,
-            wrap_aad(secret_ref).as_bytes(),
-            &*data_key,
-        )?;
+        let (key_nonce, wrapped_key) =
+            encrypt(&self.master_key, wrap_aad(tenant_id).as_bytes(), &*data_key)?;
 
         Ok(Envelope {
             wrapped_key,
@@ -301,9 +337,23 @@ impl LocalEnvelopeSecretStore {
         secret_ref: &SecretRef,
         envelope: &Envelope,
     ) -> Result<Secret, ProviderError> {
+        self.open_in(secret_ref.tenant_id(), &payload_aad(secret_ref), envelope)
+    }
+
+    /// Decrypt an envelope sealed by [`seal_in`](Self::seal_in).
+    ///
+    /// Opening with the wrong tenant or the wrong context fails authentication
+    /// rather than returning the plaintext, which is the whole reason the AAD is
+    /// chosen rather than derived.
+    pub fn open_in(
+        &self,
+        tenant_id: TenantId,
+        context: &str,
+        envelope: &Envelope,
+    ) -> Result<Secret, ProviderError> {
         let unwrapped = Zeroizing::new(decrypt(
             &self.master_key,
-            wrap_aad(secret_ref).as_bytes(),
+            wrap_aad(tenant_id).as_bytes(),
             &envelope.key_nonce,
             &envelope.wrapped_key,
         )?);
@@ -318,7 +368,7 @@ impl LocalEnvelopeSecretStore {
 
         let plain = Zeroizing::new(decrypt(
             &data_key,
-            payload_aad(secret_ref).as_bytes(),
+            context.as_bytes(),
             &envelope.nonce,
             &envelope.ciphertext,
         )?);
@@ -334,8 +384,8 @@ impl LocalEnvelopeSecretStore {
 }
 
 /// The encryption context that binds a ciphertext to its tenant.
-fn wrap_aad(secret_ref: &SecretRef) -> String {
-    format!("tenant={}", secret_ref.tenant_id())
+fn wrap_aad(tenant_id: TenantId) -> String {
+    format!("tenant={tenant_id}")
 }
 
 /// The encryption context that binds a payload to its exact slot.
