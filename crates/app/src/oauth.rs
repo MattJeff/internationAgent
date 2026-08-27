@@ -1187,6 +1187,10 @@ mod tests {
             reach: Reach::Public,
             credential: Credential::OAuth(endpoints),
             floor: RiskClass::Write,
+            // A fake authorisation server has no strangers to reach. `vet` runs
+            // over `CATALOG`, not over fixtures, so this is only the field the
+            // struct literal owes.
+            opt_outs: catalog::OptOuts::NoStrangers,
         }))
     }
 

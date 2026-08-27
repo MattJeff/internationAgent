@@ -259,6 +259,111 @@ pub enum Provision {
     Host(Package),
 }
 
+/// Where this connector's unsubscribes are read from.
+///
+/// # The gap this closes, which is an entrance and not a mechanism
+///
+/// The machinery that makes an opt-out final is built and is good: one row in
+/// `suppressions` deactivates the **contact**, which is the join every channel
+/// goes through, so the phone falls with the mail; the table is append-only for
+/// everybody including superusers; and `crate::queue::reconcile_opt_outs` runs
+/// before a queue is planned rather than on a cadence. Read
+/// `migrations/0011_revenue.sql` around `suppressions_deactivate_contacts`.
+///
+/// What that machinery has no opinion about is **where the opt-outs come in**,
+/// and that is per sender: Smartlead keeps its own unsubscribe list and
+/// somebody has to go and read it; a mail provider we drive directly pushes
+/// bounces, complaints and `List-Unsubscribe` clicks at a path that is ours; an
+/// SMS gateway posts a `STOP` keyword. So the number of readers to write grows
+/// with the number of connectors that can send, and today that growth is held
+/// by somebody remembering to ask a vendor for an endpoint. `crate::queue`'s
+/// module docs record that nobody has asked Smartlead yet, which is the first
+/// connector and already the first miss.
+///
+/// This field is the memory. It is not `Option`, it has no default, and there
+/// is **no `Unwired` variant**: a variant that compiles is a variant that ships,
+/// and the one thing this file must not let somebody ship is a connector that
+/// mails strangers with nowhere for their refusal to land.
+///
+/// # Where the line "this connector sends" falls, and who draws it
+///
+/// **The catalogue draws it, per entry, in this field.** One sentence, narrow
+/// enough to be read off a vendor's own tool list rather than argued: *can any
+/// tool this server serves put a message in front of a person who did not ask
+/// for it?* GitHub cannot — its whole audience already has an account on a
+/// repository they already have. `orizn-visa` cannot — six lookups against a
+/// dataset. Smartlead can, and that is the entire difference between them.
+///
+/// Two other places could have held it and both are wrong:
+///
+/// * **[`RiskClass`] cannot.** `floor` answers a different question and answers
+///   it coarsely: `Write` covers "opens an issue" and "adds two thousand
+///   strangers to a campaign" with one value. Deriving "sends" from it would
+///   exempt every `Read` connector — a lookup server with one notify tool is
+///   not a contradiction — and catch GitHub, which reaches nobody. Two
+///   judgements that move independently do not share a field.
+/// * **Policy cannot.** A policy document is a tenant's, an operator writes it,
+///   and `max_new_contacts_per_day` is already the tenant-side lever for how
+///   many strangers a seat may approach. This is the deployment-side claim
+///   *underneath* that lever — the same thing `url` and `floor` are, unwritable
+///   by anyone but a deploy, for the reason the module docs give.
+///
+/// And there is deliberately no taxonomy of channels here. "Email, SMS,
+/// WhatsApp, voice" is a second list to maintain that answers a question nobody
+/// asked: `reconcile_opt_outs` does not need to know which channel an
+/// unsubscribe arrived on, because the trigger deactivates the contact and
+/// takes every channel down at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptOuts {
+    /// Nothing this server serves can put a message in front of a person who
+    /// did not ask for it, so there is no list anywhere to bring home.
+    ///
+    /// A claim, like `floor` is a claim, and checked the same way: by reading
+    /// the vendor's tool list. It is the cheap answer and therefore the one the
+    /// const block below charges for — see [`NO_OUTREACH`].
+    NoStrangers,
+    /// The platform sends on the tenant's behalf and keeps the unsubscribes.
+    /// Something of ours has to go and ask.
+    ///
+    /// `from` names the read, concretely enough to be *wrong*: the MCP tool or
+    /// the REST path that lists the people who came off the list. It is what
+    /// [`crate::queue::reconcile_opt_outs`] would be pointed at, and there is no
+    /// way to write it without having read the vendor's documentation — which
+    /// is the point.
+    Pulled { from: &'static str },
+    /// They arrive here instead, at a path this deployment owns.
+    ///
+    /// `at` is the `provider` handle in `webhook_endpoints`;
+    /// `0053_webhook_endpoints.sql`'s `webhook_endpoints_provider_is_wired`
+    /// CHECK already refuses a handle no ingest reads, so a name invented here
+    /// fails at registration rather than silently accepting callbacks nobody
+    /// consumes.
+    ///
+    /// **"We own this channel, so there is nothing to read" is not a fourth
+    /// variant, it is the reason this one applies.** A direct mail provider's
+    /// `List-Unsubscribe` link resolves to a route of ours and its complaints
+    /// arrive on its webhook; owning the channel is *why* the opt-out is pushed
+    /// rather than pulled, and the path it is pushed to is still a string
+    /// somebody has to name. An entry that named none would be a click with
+    /// nowhere to go.
+    Pushed { at: &'static str },
+    /// Nobody here has ever seen this server.
+    ///
+    /// [`Provision::Customer`] and nothing else — asserted at compile time by
+    /// [`NO_OUTREACH`]'s const block, so this cannot become the lazy answer for
+    /// a vendor somebody could not be bothered to look up. It is the same
+    /// refusal-to-claim that makes [`CUSTOM`]'s floor [`RiskClass::Read`]: we
+    /// have not read this server's tool list, so `NoStrangers` would be a
+    /// fabrication, and we cannot name a read endpoint for a server whose
+    /// address the customer supplies at connect time.
+    ///
+    /// What it does not do is excuse anybody: a customer who stands up their own
+    /// sender is the sender of record, and the suppression machinery is
+    /// unchanged for them — `suppressions` still deactivates the contact, and
+    /// `crate::queue` still refuses to queue one.
+    Unseen,
+}
+
 /// One connector: everything needed to turn a name a customer clicked into a
 /// binding `mcp::McpServer::bind` will accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +397,13 @@ pub struct Connector {
     /// Only ever tightens. See the module docs for why it is one class per
     /// connector and not a table of tools.
     pub floor: RiskClass,
+    /// Where this connector's unsubscribes come in, or the claim that it can
+    /// reach nobody who would need to send one.
+    ///
+    /// No default and no `Option`: a struct literal cannot omit it, so "we
+    /// forgot to ask the vendor for their opt-out endpoint" is not a state this
+    /// array can be in. [`OptOuts`] is the whole argument.
+    pub opt_outs: OptOuts,
 }
 
 /// The entry for a server the customer runs or already knows the URL of.
@@ -310,6 +422,9 @@ pub const CUSTOM: Connector = Connector {
     credential: Credential::Bearer,
     // No claim. We have not seen this server. See the module docs.
     floor: RiskClass::Read,
+    // The same refusal to claim, one field down, and the only entry that may
+    // make it — `NO_OUTREACH`'s const block fails the build for any other.
+    opt_outs: OptOuts::Unseen,
 };
 
 /// Every connector we have written down.
@@ -366,6 +481,15 @@ pub const CATALOG: &[Connector] = &[
         // employee then acts on. `Write` is the floor, so no customer can class
         // any of it `read` without an operator writing the row by hand.
         floor: RiskClass::Write,
+        // Read off the server's tool list rather than assumed. Every tool on
+        // GitHub's remote server acts inside repositories, issues, pull requests
+        // and Actions — surfaces whose entire audience already holds an account
+        // and already watches the repository. An issue comment notifies a
+        // subscriber; it does not reach a stranger, and there is no tool there
+        // that takes an address of somebody who has not asked for anything. So
+        // there is no unsubscribe list at GitHub for us to bring home, which is
+        // a different sentence from "we did not look".
+        opt_outs: OptOuts::NoStrangers,
     },
     Connector {
         key: "orizn-visa",
@@ -397,9 +521,122 @@ pub const CATALOG: &[Connector] = &[
         // have actually checked rather than an absence of one, which is the
         // difference between this and `CUSTOM`'s identical value.
         floor: RiskClass::Read,
+        // The same six tools, read the same way: `check_visa_requirement` and
+        // its five siblings take a nationality, a destination and a purpose, and
+        // answer out of a curated dataset. None of them takes an address, a
+        // number or a recipient of any kind, so there is nobody it could reach
+        // and nothing anybody could unsubscribe from.
+        opt_outs: OptOuts::NoStrangers,
     },
     CUSTOM,
 ];
+
+/// Every connector we have claimed can reach nobody who would need to
+/// unsubscribe — and the length that makes claiming it cost a deliberate edit.
+///
+/// # Why the pinned list is this side of the partition
+///
+/// `DenyReason::GRANTABLE` in `agentos_domain::policy` is the mechanism being
+/// copied: a `const` derived from a judgement, whose length is asserted *while
+/// the constant is evaluated*, so changing the judgement without touching the
+/// count fails the build rather than producing a quietly wrong list. Both of its
+/// assertions are here, pointed at the claim that cannot be checked by machine.
+///
+/// Which side to pin is the whole design. [`OptOuts::Pulled`] and
+/// [`OptOuts::Pushed`] already cost the person adding an entry something real —
+/// a string they can only get by reading a vendor's documentation, and one this
+/// block refuses to accept empty. [`OptOuts::NoStrangers`] costs nothing, is
+/// true of the two entries here, and is the answer somebody in a hurry reaches
+/// for. So it is the one that has to be paid for twice, and the second payment
+/// is this length, whose failure message says what reading is owed.
+///
+/// The other assertion is the trapdoor: [`OptOuts::Unseen`] is pinned to
+/// [`Provision::Customer`], so the "we have not looked yet" answer is
+/// **inexpressible** for any connector this file names. There is no `Unwired`
+/// variant to leave in place, and no way to borrow the one variant that sounds
+/// like it.
+///
+/// It is `pub` because it is the artifact the obligation actually needs: the
+/// list of connectors this deployment asserts have no unsubscribe list
+/// anywhere, in one place, readable by whoever has to answer for it.
+pub const NO_OUTREACH: [&str; 2] = {
+    let mut out = [""; 2];
+    let (mut i, mut n) = (0, 0);
+    while i < CATALOG.len() {
+        vet(&CATALOG[i]);
+        if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
+            assert!(
+                n < 2,
+                "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
+                 NO_OUTREACH's length was not updated. That claim is read off the vendor's \
+                 own tool list — every tool this server serves, and not one of them can put \
+                 a message in front of a person who did not ask for it. If you have read it \
+                 and it holds, bump the length. If you have not, this connector's opt-outs \
+                 arrive somewhere, and `OptOuts::Pulled` or `OptOuts::Pushed` is where you \
+                 name where."
+            );
+            out[n] = CATALOG[i].key;
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        n == 2,
+        "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
+         not updated"
+    );
+    out
+};
+
+/// The per-entry half of [`NO_OUTREACH`]'s judgement, in a `const fn` so the
+/// same code runs at compile time over [`CATALOG`] and at run time over a
+/// synthetic entry.
+///
+/// The pattern is `catalog`'s own: `oauth_endpoints_are_vetted_the_same_way`
+/// proves a check bites without waiting for a real entry to be wrong. A `const
+/// fn` that panics is a compile error in the const block and an ordinary panic
+/// in a test, so one body carries both — and the `#[should_panic]` tests below
+/// are the evidence that the compile error a newcomer meets is the one written
+/// here.
+const fn vet(connector: &Connector) {
+    // `Provision::Customer` is the one entry whose server nobody here has seen.
+    // The two directions of this are different mistakes and get different
+    // sentences, because the person making each is looking at a different thing.
+    let unseen_server = matches!(connector.provision, Provision::Customer);
+    match connector.opt_outs {
+        OptOuts::Unseen => assert!(
+            unseen_server,
+            "`OptOuts::Unseen` says nobody here has ever seen this server, which is true of \
+             `Provision::Customer` and of nothing else. A connector we wrote down is one \
+             somebody read the documentation of: if it can put a message in front of a \
+             person who did not ask for it, name where its opt-outs come in with \
+             `OptOuts::Pulled` or `OptOuts::Pushed`; if it cannot, say `NoStrangers` and \
+             bump NO_OUTREACH. There is no third answer, and there is deliberately no \
+             `Unwired` — an entry whose opt-outs nobody can name is one that must not be \
+             added at all."
+        ),
+        OptOuts::NoStrangers => assert!(
+            !unseen_server,
+            "`Provision::Customer` is a server nobody here has seen, so `NoStrangers` is a \
+             claim about a tool list nobody has read. `OptOuts::Unseen`, for the same reason \
+             this entry's floor is `RiskClass::Read`."
+        ),
+        OptOuts::Pulled { from: source } | OptOuts::Pushed { at: source } => {
+            assert!(
+                !unseen_server,
+                "`Provision::Customer` takes its address from the connect request, so no \
+                 string in this binary can say where its opt-outs come in. `OptOuts::Unseen`."
+            );
+            assert!(
+                !source.is_empty(),
+                "an empty opt-out source is the `Unwired` variant this enum refuses to have. \
+                 Name the read, or do not add the entry: a connector that can reach a \
+                 stranger with nowhere for their refusal to land is the one thing this array \
+                 must never hold."
+            );
+        }
+    }
+}
 
 /// Look one up by the name a customer clicked.
 ///
@@ -611,6 +848,81 @@ mod tests {
                 auth: ClientAuth::Basic,
             },
         );
+    }
+
+    /// A connector that can reach a stranger, added the way somebody in a hurry
+    /// would add it.
+    ///
+    /// This is the entry `crate::queue`'s module docs say is blocked: Smartlead
+    /// mails on the tenant's behalf, its unsubscribe list lives over there, and
+    /// **nobody here has asked which endpoint lists it** — deliberately, because
+    /// nobody has looked at the live API. So there is no value of [`OptOuts`]
+    /// this entry can carry, and the four tests below are the four ways somebody
+    /// would try to write one anyway.
+    ///
+    /// Synthetic, not in [`CATALOG`], and it must stay that way: the package
+    /// name and the environment variable below are the shape such an entry
+    /// takes, not values anybody has verified.
+    fn a_sender_nobody_has_looked_up(opt_outs: OptOuts) -> Connector {
+        Connector {
+            key: "a-sender",
+            label: "A platform that mails strangers",
+            provision: Provision::Host(Package {
+                spec: "unverified@0.0.0",
+                env: Some("UNVERIFIED_API_KEY"),
+            }),
+            reach: Reach::Public,
+            credential: Credential::Bearer,
+            floor: RiskClass::Write,
+            opt_outs,
+        }
+    }
+
+    /// The lazy answer, refused: `Unseen` is pinned to the one provision whose
+    /// server nobody here has read.
+    #[test]
+    #[should_panic(expected = "there is deliberately no `Unwired`")]
+    fn a_sender_cannot_borrow_the_variant_that_means_we_never_looked() {
+        vet(&a_sender_nobody_has_looked_up(OptOuts::Unseen));
+    }
+
+    /// The other lazy answer: a string that is present and says nothing.
+    #[test]
+    #[should_panic(expected = "an empty opt-out source")]
+    fn a_named_source_that_names_nothing_is_the_unwired_variant_again() {
+        vet(&a_sender_nobody_has_looked_up(OptOuts::Pulled { from: "" }));
+        vet(&a_sender_nobody_has_looked_up(OptOuts::Pushed { at: "" }));
+    }
+
+    /// And the one the const block charges for rather than forbids: claiming a
+    /// server reaches nobody compiles, and costs an edit to [`NO_OUTREACH`]
+    /// whose failure message says what reading is owed. That half is a compile
+    /// error and cannot be asserted from here; what *can* be is that the claim
+    /// is at least well-formed for a connector we wrote down.
+    #[test]
+    fn the_claim_that_costs_an_edit_is_the_only_one_that_compiles_unchallenged() {
+        vet(&a_sender_nobody_has_looked_up(OptOuts::NoStrangers));
+        vet(&a_sender_nobody_has_looked_up(OptOuts::Pulled {
+            from: "list_unsubscribed",
+        }));
+        assert_eq!(
+            NO_OUTREACH.len(),
+            CATALOG.len() - 1,
+            "the roster is every entry but `CUSTOM`; if that changed, one of them \
+             can now reach a stranger and this array is the audit line for it"
+        );
+    }
+
+    /// [`CUSTOM`] cannot make the claim either, from the other direction: a
+    /// server whose address arrives in a request body is one nobody here has
+    /// read a tool list for.
+    #[test]
+    #[should_panic(expected = "a claim about a tool list nobody has read")]
+    fn the_custom_entry_cannot_claim_it_reaches_nobody() {
+        vet(&Connector {
+            opt_outs: OptOuts::NoStrangers,
+            ..CUSTOM
+        });
     }
 
     /// Keys are the API. Two entries under one key is a lookup that silently
