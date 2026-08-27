@@ -481,6 +481,26 @@ pub(crate) const POLLER_HEADROOM: i64 = 4;
 ///   in-flight rows instead of blocking on them. It sits on the `due` CTE
 ///   rather than on `seated` because PostgreSQL will not lock a select that
 ///   has a window function in it.
+/// * **The due-ness predicate is repeated inside `due`, and deleting it as a
+///   duplicate re-opens a double-charge.** `seated` reads `outbox_events`
+///   *unlocked*, under the statement's snapshot; `due` is the only node that
+///   takes a lock. When a row it reaches has meanwhile been claimed and
+///   committed by another poller, `SKIP LOCKED` does not skip it — nothing
+///   holds it any more — and PostgreSQL's `READ COMMITTED` recheck
+///   (`EvalPlanQual`) walks to the new row version and re-runs *only the quals
+///   present under the `LockRows` node*. With the join condition alone, `e.id =
+///   c.id` still holds on the new version and the row is claimed a second time,
+///   inside a lease that has just been pushed 120 seconds out. Measured, not
+///   argued: two sessions, ten due rows, the second session's snapshot taken
+///   before the first committed — every one of the first session's five rows
+///   came back to the second as well, with `attempt_count = 2`. In
+///   `apps/server`'s two-poller test that is 24 of 60 events handled twice, 2.2
+///   ms apart, and one of the rows in this table is `agent.turn.requested`: a
+///   model call the customer is billed for. Repeating the three columns here
+///   makes the recheck evaluate them against the version actually locked, and
+///   the second poller reads past to the next rows instead. The `seated` copy
+///   still earns its place — it is what the index scan in the lateral uses, and
+///   removing it would shortlist the whole table.
 /// * `AS MATERIALIZED` on **every** CTE, and it is not a hint. Written the
 ///   obvious way — `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` —
 ///   the subplan can be re-executed per outer row, and each re-execution steps
@@ -591,6 +611,9 @@ pub async fn claim_of(
          ), due AS MATERIALIZED ( \
              SELECT e.id \
                FROM shortlist c JOIN outbox_events e ON e.id = c.id \
+              WHERE e.published_at IS NULL \
+                AND e.available_at <= $1::timestamptz \
+                AND e.attempt_count < $2::int \
               ORDER BY c.seat, c.available_at, c.id \
                 FOR UPDATE OF e SKIP LOCKED \
               LIMIT $3::bigint) \
@@ -916,6 +939,32 @@ mod tests {
         e
     }
 
+    /// `rows` due events for one tenant, in one statement.
+    ///
+    /// [`enqueue_committed`] is the honest path and every other test uses it;
+    /// this one exists because
+    /// [`a_claim_that_lands_mid_statement_is_not_handed_out_twice`] needs a few
+    /// thousand rows and a few thousand round trips is a slow test rather than
+    /// a careful one. Same columns [`enqueue`] writes, defaults for the rest.
+    async fn seed_due(db: &Db, tenant: TenantId, rows: i64, now: DateTime<Utc>) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outbox_events \
+                 (id, tenant_id, aggregate_type, aggregate_id, event_type, payload, \
+                  created_at, available_at) \
+             SELECT gen_random_uuid(), $1, 'employee', gen_random_uuid(), \
+                    'employee.provisioned', '{}'::jsonb, $2, $2 \
+               FROM generate_series(1, $3::bigint)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(now)
+        .bind(rows)
+        .execute(&mut *tx)
+        .await
+        .expect("seed");
+        tx.commit().await.expect("commit seed");
+    }
+
     // -- enqueue ----------------------------------------------------------
 
     /// The invariant the outbox exists for: a business transaction that is
@@ -1066,6 +1115,133 @@ mod tests {
             leftovers.is_empty(),
             "a claimed row must not be re-claimable"
         );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The test above cannot catch a double claim, and for four months there
+    /// was one.**
+    ///
+    /// It holds both claiming transactions open across the claim, which is the
+    /// one arrangement where `SKIP LOCKED` is doing the work: the second poller
+    /// meets a lock that is still held and steps over it. That is a real
+    /// arrangement and worth asserting — and it is not the one the poller runs
+    /// in. [`claim`] commits *before* the handler, so in production the first
+    /// poller's lock is gone within milliseconds, and `SKIP LOCKED` has nothing
+    /// left to skip. From there the lease is the only thing holding the row,
+    /// and the lease is a column the second poller has to actually re-read.
+    ///
+    /// It did not. `seated` reads `outbox_events` unlocked under the
+    /// statement's snapshot; `due` is the only node that locks, and it joined on
+    /// `e.id = c.id` and nothing else. When PostgreSQL's `READ COMMITTED`
+    /// recheck walked to the version the first poller had just committed, the
+    /// only qual under `LockRows` was that join — which still held — so the row
+    /// was claimed a second time, `attempt_count` went straight to 2, and both
+    /// pollers ran the handler. Measured in `apps/server`'s two-poller test at
+    /// 24 of 60 events, the two claims 2.2 ms apart, inside a 120-second lease.
+    /// One of the rows in this table is `agent.turn.requested`.
+    ///
+    /// # Why this is not a race the test hopes to win
+    ///
+    /// The window is "after the second poller's snapshot, before its first row
+    /// lock", and in the statement that window is a whole phase: `seated` and
+    /// `shortlist` are both `MATERIALIZED` and both complete before `due` takes
+    /// a lock. So it is widened on purpose rather than raced for. Two claims
+    /// start together on the barrier; the big one shortlists
+    /// `SLOW * POLLER_HEADROOM` rows and spends about eight milliseconds
+    /// sorting them before it locks anything, and the small one takes its rows
+    /// and *commits* inside that — one or two milliseconds. The asymmetry of
+    /// the two limits is what orders the three events, so nothing here depends
+    /// on a sleep being long enough.
+    ///
+    /// It is still an interleaving and not a proof. Two orderings assert
+    /// nothing — the small claim committing *after* the big one has locked the
+    /// rows, and the big one finishing first and leaving the small one's
+    /// `FAST * POLLER_HEADROOM`-deep window with nothing due — and neither is a
+    /// failure. Measured against the unfixed query, one round bites a little
+    /// over half the time on this machine, which is why the interleaving is run
+    /// [`ROUNDS`] times: the run as a whole then bit 60 times in 60, against 4
+    /// in 60 for `apps/server`'s two-poller test, which is the same defect seen
+    /// from the far end of a poll loop. On the fixed query: 0 red in 120.
+    ///
+    /// [`ROUNDS`]: a_claim_that_lands_mid_statement_is_not_handed_out_twice
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_claim_that_lands_mid_statement_is_not_handed_out_twice() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let tenant = seed_tenant(&db, "midstatement").await;
+
+        // `SLOW * POLLER_HEADROOM` rows go through a sort before the first lock
+        // is taken; that sort is the window. Every round consumes what it
+        // claims — a claimed row is leased two minutes out — so the pool has to
+        // cover all of them with slack for the small claim to have something
+        // due after the big one has taken its thousand.
+        const SLOW: i64 = 1_000;
+        const FAST: i64 = 8;
+        const ROUNDS: i64 = 5;
+        const ROWS: i64 = (SLOW + FAST) * ROUNDS + 500;
+        seed_due(&db, tenant, ROWS, at(T0)).await;
+
+        for round in 0..ROUNDS {
+            // Both transactions are open before either claims, so the barrier
+            // releases two statements and not two connection handshakes.
+            let ready = Arc::new(Barrier::new(2));
+            let slow = tokio::spawn({
+                let db = db.clone();
+                let ready = ready.clone();
+                async move {
+                    let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+                    ready.wait().await;
+                    let got = claim(&mut tx, SLOW, at(T0)).await.expect("slow claim");
+                    tx.commit().await.expect("commit slow");
+                    got
+                }
+            });
+
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            ready.wait().await;
+            // Into the big claim's sort rather than alongside its snapshot:
+            // level, the small claim can reach `due` first, and then it is the
+            // big one that meets a held lock — which is the case the test above
+            // already covers.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let fast = claim(&mut tx, FAST, at(T0)).await.expect("fast claim");
+            tx.commit().await.expect("commit fast");
+
+            let slow = slow.await.expect("slow poller");
+
+            // The fingerprint, and it does not depend on which poller won: a
+            // row handed out twice comes back to the second claimer with the
+            // first claimer's increment already on it.
+            let twice: Vec<Uuid> = slow
+                .iter()
+                .chain(fast.iter())
+                .filter(|e| e.attempt_count != 1)
+                .map(|e| e.id)
+                .collect();
+            assert!(
+                twice.is_empty(),
+                "round {round}: {} rows came back already claimed — the lock \
+                 re-read a version somebody else had leased: {twice:?}",
+                twice.len()
+            );
+
+            let ids_slow: std::collections::HashSet<Uuid> = slow.iter().map(|e| e.id).collect();
+            let ids_fast: std::collections::HashSet<Uuid> = fast.iter().map(|e| e.id).collect();
+            assert!(
+                ids_slow.is_disjoint(&ids_fast),
+                "round {round}: the same event was claimed by both pollers: {:?}",
+                &ids_slow & &ids_fast
+            );
+            // Deliberately no assertion that either batch came back full. The
+            // small claim only looks `FAST * POLLER_HEADROOM` rows deep, so an
+            // ordering in which the big claim commits first leaves it nothing
+            // due and it correctly returns none — that is a round that asserted
+            // nothing, which is why there are several.
+            // `two_concurrent_pollers_never_claim_the_same_row` is where the
+            // batch bound is asserted, from an arrangement that controls it.
+        }
 
         drop_tenant(&db, tenant).await;
     }
