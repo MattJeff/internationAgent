@@ -362,7 +362,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use agentos_domain::action::E164;
+use agentos_domain::action::{E164, EmailAddress};
 use agentos_domain::employee::Step;
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, TenantId};
 use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
@@ -1032,6 +1032,160 @@ pub fn contact_of(from: &Untrusted<String>) -> String {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
+
+/// Phrases that mean "stop writing to me" and mean nothing else, wherever in a
+/// message they appear.
+///
+/// Matched against [`flatten`]ed text, so they are written as lower-case words
+/// separated by single spaces: punctuation and apostrophes have become spaces
+/// by the time these are compared, which is why `don t contact` is spelled that
+/// way and still matches `don't contact`. Accented spellings are listed twice
+/// rather than folded — two array entries are less code than a fold table, and
+/// there is exactly one word here that needs it.
+///
+/// **None of these appears in anything this system sends.** That is a property,
+/// not a coincidence: [`crate::vertical::OPT_OUT`] asks for the word STOP and
+/// says nothing about unsubscribing, so a reply that quotes our whole message
+/// back at us cannot trigger one of these. It is what lets them be matched
+/// across the quoted original as well as the typed reply — see
+/// [`refuses_contact`].
+const REFUSAL_PHRASES: [&str; 12] = [
+    "unsubscribe",
+    "desabonn",
+    "désabonn",
+    "remove me from",
+    "take me off",
+    "do not contact",
+    "don t contact",
+    "stop contacting",
+    "stop emailing",
+    "stop writing",
+    "ne me contactez plus",
+    "ne plus me contacter",
+];
+
+/// Longest typed reply, in words, in which a bare `stop` still means STOP.
+///
+/// `stop` is the word our own footer asks for and also an ordinary English and
+/// French verb — "we need to stop using our current provider" is a sales lead,
+/// not an opt-out. The bound is what separates the two: somebody obeying the
+/// footer types the word and little else, and eight words leaves room for
+/// "Stop please, we are not interested thank you".
+const BARE_REFUSAL_WORDS: usize = 8;
+
+/// Does this message ask us to stop writing to this person?
+///
+/// # Which way it is wrong on purpose
+///
+/// The two errors are not symmetric and they are not the ones they look like.
+///
+/// A **false negative** — we keep mailing somebody who told us to stop — costs
+/// a complaint, a spam report, and a sending domain that does not recover on a
+/// schedule. It is also a broken promise: every message we send carries
+/// [`crate::vertical::OPT_OUT`].
+///
+/// A **false positive** costs one prospect, permanently: `suppressions` is
+/// append-only and `contacts_reject_suppressed` refuses to re-import them.
+/// Bounded, but not reversible.
+///
+/// So this errs toward suppressing — with one exception that matters more than
+/// the rule. A polite refusal in prose ("merci, mais non", "not for us right
+/// now") is **not** matched here, and that is deliberate rather than a gap in
+/// the vocabulary list. Any inbound message already ends the follow-up sequence
+/// one line up in [`land`], via
+/// [`stop_follow_up`](agentos_store::revenue::stop_follow_up) — so the person
+/// who says "thanks but no" is not chased again either way. What a suppression
+/// adds on top is *permanent, cross-campaign, cannot-be-re-imported*, and
+/// reading that out of "not right now" claims more than they said. It is the
+/// same argument [`crate::queue::reconcile_opt_outs`] makes for recording a
+/// platform unsubscribe as [`Scope::Tenant`](agentos_store::revenue::Scope)
+/// rather than `Global`: record the claim they made, not the larger one we
+/// could infer.
+///
+/// # Untrusted, and read as such
+///
+/// The body is third-party text and hostile by default. It is classified, never
+/// rendered: nothing here formats it, logs it, or puts it in a prompt, and the
+/// only thing that leaves this function is a `bool`.
+pub fn refuses_contact(body: &Untrusted<String>) -> bool {
+    // Reading it to classify it, which is what this exit is for.
+    let raw = body.expose_for_parsing();
+
+    // Phrases are matched across the **whole** message, quoted original and
+    // all, because a bottom-posted "please unsubscribe me" under fifty lines of
+    // our own text is still a refusal. Safe precisely because none of them
+    // appears in anything we send.
+    let whole = flatten(raw);
+    if REFUSAL_PHRASES.iter().any(|phrase| whole.contains(phrase)) {
+        return true;
+    }
+
+    // The bare word is matched only in what they typed, and only when they
+    // typed almost nothing else. Both halves are load-bearing: our own footer
+    // contains STOP, most clients quote it back, and a rule that read the raw
+    // body would suppress every single person who replies.
+    let typed = flatten(reply_only(raw));
+    let words: Vec<&str> = typed.split(' ').filter(|word| !word.is_empty()).collect();
+    words.len() <= BARE_REFUSAL_WORDS && words.contains(&"stop")
+}
+
+/// Lower-case words separated by single spaces, and nothing else.
+///
+/// Everything that is not a letter or a digit becomes a separator, so `STOP.`,
+/// `Stop!`, `opt-out` and `don't` all normalise to something a plain
+/// [`str::contains`] can match without a regex or a word-boundary dance.
+fn flatten(raw: &str) -> String {
+    raw.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The part of a reply the person actually typed: everything above the quoted
+/// original.
+///
+/// **This is what makes a one-word STOP work at all.** Every message we send
+/// ends with [`crate::vertical::OPT_OUT`], which contains the word STOP, and
+/// every mail client quotes the whole thing under the four characters somebody
+/// typed. Without this cut, a length-bounded rule never fires on the one reply
+/// that matters and an unbounded one fires on every reply there is.
+///
+/// ponytail: a line scan, not a MIME-aware reply parser. It knows the shapes
+/// the clients we actually receive from write — a `>` quote, an attribution
+/// line, and Outlook's header block in English or French. A client that quotes
+/// in some fourth way costs a false negative on a bare STOP and nothing else;
+/// the phrase list above does not go through here.
+fn reply_only(body: &str) -> &str {
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        if quotes_the_original(line.trim()) {
+            return &body[..end];
+        }
+        end += line.len();
+    }
+    body
+}
+
+/// The first line of a quoted original.
+fn quotes_the_original(line: &str) -> bool {
+    if line.starts_with('>') || line.starts_with("-----") || line.starts_with("____") {
+        return true;
+    }
+    let lower = line.to_lowercase();
+    // Gmail and Apple Mail write one attribution line; Outlook writes a header
+    // block, in the language of the *reader's* client rather than the thread's.
+    (lower.starts_with("on ") && lower.ends_with("wrote:"))
+        || (lower.starts_with("le ") && lower.contains("a écrit"))
+        || lower.starts_with("from:")
+        || lower.starts_with("de :")
+        || lower.starts_with("sent:")
+        || lower.starts_with("envoyé :")
+}
+
 /// The thread this contact talks to this employee on, creating it if new.
 ///
 /// One conversation per `(employee, channel, contact)`. The schema has no
@@ -1259,6 +1413,118 @@ pub async fn land(
                 error = %err,
                 "a reply did not stop the follow-up sequence; this person may be chased again"
             ),
+        }
+
+        // **And where a refusal becomes final.** The line above ends one
+        // sequence; this ends the relationship, which is what every message we
+        // send already promises: `vertical::OPT_OUT` tells a stranger to *reply
+        // with STOP and I will not write to you*.
+        //
+        // Until this line nothing in production kept that promise. The only
+        // production writer of a `suppressions` row in the workspace was
+        // [`crate::queue::reconcile_opt_outs`], which reads the sending
+        // platform's own unsubscribe list — so somebody who clicked a link in
+        // Smartlead was recorded and somebody who did exactly what our footer
+        // asked told nobody. The promise was in every message and the mechanism
+        // was in none of them.
+        //
+        // Here, and not in the seller's cadence, for the reason every guard in
+        // this file is here: `land` is the only door inbound mail has, on every
+        // channel, so a refusal counts whether or not anybody ever takes the
+        // turn it enqueued and whichever loop was mid-flight when it arrived.
+        //
+        // **It can only close.** `suppress` is an INSERT into an append-only
+        // table; nothing on this path deletes, updates, or narrows the scope of
+        // an existing row. So the worst a forged `From` can do is silence one
+        // address — never re-open one — and that direction is the whole point:
+        // a body that could *lift* a suppression would let any stranger
+        // re-subscribe anybody. Idempotent for the same reason
+        // `reconcile_opt_outs` is: `suppress` says ON CONFLICT DO NOTHING, so a
+        // redelivered refusal is a no-op rather than a second error.
+        //
+        // **Open, and it needs the founder rather than a guess.** The footer
+        // promises more than this line delivers: `vertical::OPT_OUT` says "I
+        // will not write to you *or anyone else at your company*", and one row
+        // here silences one address. Closing that gap means either suppressing
+        // every `contacts` row on the same `accounts` id — a blast radius of
+        // dozens off one classified sentence, permanent and append-only — or
+        // narrowing the sentence we send. That is a commercial and legal
+        // decision about how much a stranger's one word is allowed to cost, not
+        // an implementation detail, so the address-level row is what is written
+        // and the wider claim is left visible here.
+        if refuses_contact(&message.body_text) {
+            match EmailAddress::parse(&from) {
+                Ok(address) => {
+                    revenue_store::suppress(
+                        tx,
+                        Uuid::now_v7(),
+                        &revenue_store::NewSuppression {
+                            // They told *us*. `Global` binds every tenant in
+                            // the deployment forever and is what "remove me
+                            // from everything" means — a strictly larger claim
+                            // than the one this reply made. Same reading
+                            // `reconcile_opt_outs` takes.
+                            scope: revenue_store::Scope::Tenant,
+                            channel: revenue_store::Channel::Email,
+                            // `parse` lower-cased both halves and rejects
+                            // whitespace and a second `@`, which is exactly
+                            // what `suppressions_address_normalised` CHECKs —
+                            // so this INSERT cannot fail that constraint, and
+                            // the `?` below cannot dead-letter a human's reply
+                            // forever on a malformed address.
+                            address: &address.to_string(),
+                            reason: "opt_out",
+                            // The address is what a reply carries; the trigger
+                            // matches on it and deactivates every `contacts`
+                            // row holding it, which drops that person off every
+                            // channel at once because the contact row is the
+                            // join all of them go through. Same shape as
+                            // `reconcile_opt_outs`, deliberately: one story
+                            // about what a suppression is, not two.
+                            contact_id: None,
+                            // The legal record, and a constant. **Never the
+                            // body** — it is personal data and hostile input at
+                            // once, and this note is read by a human in a
+                            // support ticket.
+                            note: Some("replied to an outbound message asking not to be contacted"),
+                            // When they asked, not when we got round to it.
+                            suppressed_at: message.received_at,
+                        },
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        revenue_store::RevenueError::Store(err) => InboundError::Store(err),
+                        // Unreachable for this INSERT — `suppressions` raises no
+                        // P0002 and holds no money — but mapped rather than
+                        // unwrapped, and mapped without the message: that string
+                        // is a database error built around somebody's address.
+                        _ => InboundError::Store(StoreError::conflict(
+                            "the opt-out could not be recorded",
+                        )),
+                    })?;
+                    // No address, no body, no subject: the fact is the whole
+                    // log line. Who it was is in `suppressions`, behind RLS.
+                    tracing::info!(
+                        channel = message.channel.as_str(),
+                        "somebody asked not to be contacted again; they are suppressed on every \
+                         channel"
+                    );
+                }
+                // ponytail: email only. `OPT_OUT` rides on email and nothing
+                // else sends cold, so this is the promise we actually made. A
+                // phone-channel refusal would need `Channel::Phone` and an
+                // `E164` whose digit count clears the table's own CHECK, which
+                // is a constraint re-derived in Rust for a case that cannot
+                // happen yet — add it the day an SMS cadence exists. Loud
+                // rather than silent, exactly as `reconcile_opt_outs` is about
+                // an address it cannot parse, because the person is refusing
+                // either way.
+                Err(_) => tracing::error!(
+                    channel = message.channel.as_str(),
+                    "a refusal arrived from an address that is not an email; it is NOT suppressed \
+                     here and must be recorded by hand"
+                ),
+            }
         }
     }
 
@@ -5251,5 +5517,111 @@ mod tests {
             }
             tx.rollback().await.expect("rollback");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals
+    // -----------------------------------------------------------------------
+
+    /// What a mail client puts between somebody's two typed characters and the
+    /// message they are answering — including our own opt-out footer, which is
+    /// the sentence that makes the naive rule suppress everybody who replies.
+    ///
+    /// Kept byte-for-byte in step with `vertical::OPT_OUT` by the test in that
+    /// module, which asserts the real constant is not itself a refusal.
+    const QUOTED_ORIGINAL: &str = "\n\nOn Tue, 3 Jun 2026 at 09:12, Lena <lena@sender.example> \
+         wrote:\n\
+         > Hello — I checked your booking flow for VN and it does not mention the\n\
+         > e-visa. Happy to show you what we found.\n\
+         >\n\
+         > If you would rather not hear from me again, reply with STOP and I will\n\
+         > not write to you or anyone else at your company.\n";
+
+    fn refuses(body: &str) -> bool {
+        refuses_contact(&Untrusted::new(body.to_owned()))
+    }
+
+    /// **The promise, read the way a real reply arrives.**
+    ///
+    /// Every case here is a body somebody would actually send. The quoted ones
+    /// are the point: our own footer contains the word STOP, so a rule that
+    /// read the raw body would either fire on every reply that quotes us or,
+    /// bounded by length to stop that, never fire on the one-word STOP the
+    /// footer asked for.
+    #[test]
+    fn a_refusal_is_recognised_through_the_quoted_original() {
+        for body in [
+            "STOP",
+            "stop",
+            "Stop please",
+            "  Stop.  ",
+            "Stop please, we are not interested — thank you",
+            "Unsubscribe",
+            "Please unsubscribe me from this list.",
+            "Merci de ne plus me contacter.",
+            "Ne me contactez plus s'il vous plaît.",
+            "Please take me off your mailing list, we get too many of these.",
+            "Do not contact me again.",
+            "Please stop emailing me — I have asked twice.",
+        ] {
+            assert!(refuses(body), "not read as a refusal: {body:?}");
+            // The same words, with our own message quoted underneath them.
+            let quoted = format!("{body}{QUOTED_ORIGINAL}");
+            assert!(
+                refuses(&quoted),
+                "a refusal stopped counting once our own footer was quoted below it: {body:?}"
+            );
+        }
+
+        // Bottom-posted, under the quote rather than above it. The phrase list
+        // is matched across the whole message for exactly this person.
+        assert!(
+            refuses(&format!(
+                "{QUOTED_ORIGINAL}\n\nPlease unsubscribe me, this is not relevant to us."
+            )),
+            "a refusal written below the quoted original was missed"
+        );
+    }
+
+    /// **What is deliberately not a refusal**, including the two cases that
+    /// cost the most if they were.
+    ///
+    /// The out-of-office and the ordinary reply both carry our own footer in
+    /// their quoted tail. Reading either as an opt-out would suppress a
+    /// prospect who never asked for anything — permanently, since
+    /// `suppressions` is append-only.
+    ///
+    /// `"Merci, mais non."` is the deliberate false negative, and it is
+    /// argued in the docs on `refuses_contact`: their sequence is already over
+    /// — `stop_follow_up` runs on *any* inbound message — and a permanent,
+    /// cannot-be-re-imported suppression claims more than "not right now" said.
+    #[test]
+    fn an_ordinary_reply_is_not_a_refusal_even_when_it_quotes_our_footer() {
+        for body in [
+            "",
+            "   \n\n  ",
+            "Who is this?",
+            "Merci, mais non.",
+            "Thanks, sounds interesting. Can we talk Thursday?",
+            // The word, used as the verb it is, in a message that is a lead.
+            "We need to stop using our current provider before Q4 — what does this cost?",
+            // An out-of-office, which is the auto-reply this path sees most.
+            "Bonjour, je suis absent du bureau jusqu'au 3 septembre. En cas d'urgence, \
+             contactez Marc.",
+        ] {
+            assert!(!refuses(body), "read as a refusal: {body:?}");
+            let quoted = format!("{body}{QUOTED_ORIGINAL}");
+            assert!(
+                !refuses(&quoted),
+                "our own quoted footer turned an ordinary reply into an opt-out: {body:?}"
+            );
+        }
+
+        // And the footer on its own — a bare bounce or auto-forward that echoes
+        // the message back with nothing typed above it.
+        assert!(
+            !refuses(QUOTED_ORIGINAL),
+            "our own message, echoed back, suppressed the person we sent it to"
+        );
     }
 }
