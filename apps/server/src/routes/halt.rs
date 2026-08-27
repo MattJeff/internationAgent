@@ -43,13 +43,75 @@
 //! So: **nothing new after the commit; sixty seconds of tail.** That is the
 //! number to say out loud, and it is a ceiling rather than a measurement.
 //!
-//! # What a halt deliberately does not stop
+//! # It stops receiving too, and this paragraph used to say otherwise
 //!
-//! **Receiving.** The inbound loop keeps fetching mail and landing it in
-//! `messages`, and the turns it queues wait in the outbox until the release.
-//! Stopping ingestion would mean a stopped company losing its customers' email,
-//! which is worse than the thing the halt is for, and reading is not acting —
+//! It said: *the inbound loop keeps fetching mail and landing it in `messages`,
+//! and the turns it queues wait in the outbox until the release.* **That has not
+//! been true since the halt moved onto the `tenants` driver.** A stopped tenant
+//! offers no seat, so `agentos_store::outbox::claim_of` returns none of its
+//! rows — and receiving is two claims off that one function, so the stop lands
+//! twice:
+//!
+//! 1. the **raw delivery** the edge stored (`routes::webhooks::RAW_AGGREGATE`),
+//!    which the general poller would turn into a notice;
+//! 2. the **notice** (`agentos_app::inbound::NOTICE_AGGREGATE`), which the
+//!    inbound loop would turn into a `messages` row.
+//!
+//! `loops::inbound`'s `a_stop_defers_receiving_at_both_gates_and_the_release_drains_it`
+//! asserts all of it against a database, including that fixing only the second
+//! gate would change nothing: no notice is ever written while the first is
+//! deferred.
+//!
+//! **The argument the old paragraph made is still right, and it is why this one
+//! exists rather than a deletion.** Losing a stopped company's customer email
+//! would be worse than the thing the halt is for, and reading is not acting —
 //! the same asymmetry `agentos_app::effects::Effects::opted_out` is argued from.
+//! What was wrong was the tense: that is what *should* happen, and it is not
+//! what the code does.
+//!
+//! ## What is actually at risk, which is less than it sounds and not nothing
+//!
+//! Nothing is lost on our side and no attempt is burned. `POST /v1/webhooks/…`
+//! is a route, not a claim, so the delivery is durable in `outbox_events` the
+//! moment the signature checks out, halt or no halt; both rows then wait at
+//! `attempt_count = 0` and the release makes them due at once. A halt cannot
+//! dead-letter mail.
+//!
+//! What waits **at the provider** is the part that was never ours. The webhook
+//! carries an envelope — message id, from, to — and
+//! `agentos_app::inbound::ingest_email` fetches the body and the attachment
+//! bytes afterwards, in phase two. So the exposure of a halt is exactly the
+//! provider's retention:
+//!
+//! * **Attachments: one hour, known.** `download_url` dies an hour after it is
+//!   minted, and `ingest_email` already lands the message without them and logs
+//!   a warning. Any halt longer than an hour loses a stopped company's
+//!   attachments, today, silently apart from that line.
+//! * **Bodies: unknown, and not knowable from this binary.**
+//!
+//! ## FOUNDER'S QUESTION, LEFT OPEN
+//!
+//! **How long does Resend keep an inbound message we have not fetched?** That
+//! number is the whole decision and nothing in this process can read it:
+//!
+//! * If it is comfortably longer than a halt ever lasts, this paragraph is the
+//!   end of it — the deferral is harmless and the halt is simpler for covering
+//!   everything.
+//! * If it is short, the code has to hold the old promise, and the shape of
+//!   that fix is known and is **not** a one-line one. Both claims come off
+//!   `claim_of`, whose halt clause is deliberately on the tenant driver rather
+//!   than on the rows ("same refusal, one join earlier"), and the general
+//!   poller's partition mixes rows that must keep waiting (`conversation`
+//!   turns, `employee.terminated`) with the `webhook` rows that must not. So it
+//!   means teaching the hottest statement in the system which aggregate types a
+//!   stop does not stop, *inside* the per-tenant `LIMIT` — outside it, a
+//!   tenant's backlog of deferred turns starves the exempt rows behind it — and
+//!   re-measuring the plan that `claim_of` documents.
+//!
+//! Do not half-do it. Exempting the notice claim alone is a change with no
+//! effect at all, and it would read like a fix.
+//!
+//! # What a halt deliberately does not stop
 //!
 //! **Provisioning.** `apps/server/src/loops/provisioning.rs` converges an
 //! employee somebody already asked for towards mailboxes and phone numbers, with

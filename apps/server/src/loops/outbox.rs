@@ -439,15 +439,39 @@ async fn fail(db: &Db, event: &OutboxEvent, failure: &Failure) {
 /// different question with a different answer, and
 /// [`outbox::dead_letters`](agentos_store::outbox::dead_letters) is what
 /// answers it. Alert on that; do not fail readiness on it.
+///
+/// And only tenants the poller is willing to serve, which is the same argument
+/// a second time and cost more to find. `outbox::claim_of` refuses a **stopped**
+/// company's rows at the `tenants` driver — an operator's halt, or an operating
+/// window whose `ends_at` has passed — so those rows are due, unclaimed and
+/// perfectly healthy for as long as the stop lasts. Counting them made
+/// `MAX_OUTBOX_LAG_SECS` a five-minute fuse on the *whole deployment*: one
+/// customer pressing stop, or one month running out on schedule, and every
+/// replica leaves the load balancer for every other customer. A stop is a
+/// customer asking us to wait; it is not this process falling behind.
+///
+/// **This is a third reader of the halt** — after `outbox::claim_of` and
+/// `initiative::claim_due`, both of which had to be corrected separately — and
+/// it is spelled out here rather than delegated to `halt::halted` for the same
+/// reason `claim_of` spells it: that function answers for one tenant on a
+/// `TenantTx`, and this is one aggregate over every tenant at once. The clause
+/// has to stay in step with `claim_of`'s, and
+/// `a_stopped_company_is_not_a_poller_that_is_behind` is what notices if it
+/// does not.
 pub async fn lag_secs(db: &Db) -> Result<i64, StoreError> {
     // Cross-tenant: the backlog is not any one tenant's.
     let mut tx = db.admin_tx_bypassing_rls().await?;
     let lag: Option<i64> = sqlx::query_scalar(
-        "SELECT max(extract(epoch FROM now() - available_at))::bigint \
-           FROM outbox_events \
-          WHERE published_at IS NULL \
-            AND available_at <= now() \
-            AND attempt_count < $1::int",
+        "SELECT max(extract(epoch FROM now() - e.available_at))::bigint \
+           FROM outbox_events e \
+          WHERE e.published_at IS NULL \
+            AND e.available_at <= now() \
+            AND e.attempt_count < $1::int \
+            AND NOT EXISTS (SELECT 1 FROM company_halts h \
+                             WHERE h.tenant_id = e.tenant_id) \
+            AND NOT EXISTS (SELECT 1 FROM company_windows w \
+                             WHERE w.tenant_id = e.tenant_id \
+                               AND w.ends_at <= now())",
     )
     .bind(MAX_ATTEMPTS)
     .fetch_one(&mut *tx)
@@ -1231,5 +1255,102 @@ mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **Nor is a company that asked us to stop, and this one is worse than a
+    /// poison message because it is not a fault at all.**
+    ///
+    /// The test above already argues the shape: a row that no poller will ever
+    /// claim is not lag, because `/readyz` fails on lag and a number that
+    /// climbs without bound takes **every replica** out of rotation with no way
+    /// back. It made that argument about dead letters and stopped there.
+    ///
+    /// `outbox::claim_of` refuses a stopped tenant's rows *at the driver*, so
+    /// they sit due and unclaimed for exactly as long as the halt lasts — and
+    /// `MAX_OUTBOX_LAG_SECS` is five minutes. So one customer pressing stop with
+    /// anything queued used to un-ready the whole deployment, for every other
+    /// customer, until they pressed start again.
+    ///
+    /// And the halt is the *mild* half. `company_windows` reaches the same
+    /// refusal by the same clause (`migrations/0054_operating_window.sql`), and
+    /// a window ending is not an emergency — it is a month running out on
+    /// schedule, on a company nobody is watching. There is no release verb for
+    /// it either.
+    ///
+    /// Both are asserted here because they are two rows and one predicate, and
+    /// `claim_of` is where that predicate lives: this is a third reader of it
+    /// and the only reason it is allowed to be one is that it must answer the
+    /// same question — *would the poller take this row?* — across every tenant
+    /// at once, which no per-tenant `halt::halted` can do.
+    #[tokio::test]
+    async fn a_stopped_company_is_not_a_poller_that_is_behind() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let now = Utc::now();
+
+        for (label, stop) in [("halt", false), ("window", true)] {
+            let tenant = seed_tenant(&db).await;
+            enqueue(&db, tenant, 1, now - TimeDelta::seconds(600)).await;
+            let lag = lag_secs(&db).await.expect("lag");
+            assert!(
+                lag > crate::MAX_OUTBOX_LAG_SECS,
+                "{label}: the row has to be un-ready *before* the stop, or this proves \
+                 nothing: {lag}s"
+            );
+
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            if stop {
+                agentos_store::halt::set_window(
+                    &mut tx,
+                    now - TimeDelta::days(1),
+                    "operator:ops",
+                    now,
+                )
+                .await
+                .expect("set_window");
+            } else {
+                agentos_store::halt::place(&mut tx, "the CFO called", "operator:ops", now)
+                    .await
+                    .expect("place")
+                    .expect("the tenant was running");
+            }
+            tx.commit().await.expect("commit the stop");
+
+            // The poller will not take this row, so it is not the poller being
+            // behind. It is a customer who asked us to wait.
+            assert_eq!(
+                lag_secs(&db).await.expect("lag"),
+                0,
+                "{label}: one stopped company took every replica out of the load balancer"
+            );
+
+            // And the deferral is genuinely a deferral: nothing published it,
+            // nothing burned an attempt, and lifting the stop makes it lag
+            // again — which is what says this hid a row rather than lost one.
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            if stop {
+                agentos_store::halt::set_window(
+                    &mut tx,
+                    now + TimeDelta::days(1),
+                    "operator:ops",
+                    now,
+                )
+                .await
+                .expect("extend");
+            } else {
+                agentos_store::halt::release(&mut tx)
+                    .await
+                    .expect("release")
+                    .expect("it was stopped");
+            }
+            tx.commit().await.expect("commit the release");
+            assert!(
+                lag_secs(&db).await.expect("lag") > crate::MAX_OUTBOX_LAG_SECS,
+                "{label}: the release has to give the backlog back"
+            );
+
+            drop_tenant(&db, tenant).await;
+        }
     }
 }

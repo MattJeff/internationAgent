@@ -713,6 +713,144 @@ mod tests {
         assert_eq!(still, first_turn);
     }
 
+    // -- the stop ------------------------------------------------------------
+
+    /// **A stop stops receiving too, at both gates, and this is what
+    /// `routes::halt` now says.**
+    ///
+    /// That module promised the opposite for four waves — "the inbound loop
+    /// keeps fetching mail and landing it in `messages`" — and the promise was
+    /// never true after `claim_of` moved the halt onto the `tenants` driver. A
+    /// stopped tenant offers no seat, so *none* of its rows are claimed, and
+    /// the notice partition is not exempt from that.
+    ///
+    /// Both gates, because receiving is two claims and stopping either one
+    /// stops the mail:
+    ///
+    /// * the **raw delivery** (`webhooks::RAW_AGGREGATE`) the edge stored, which
+    ///   the general poller claims and turns into a notice;
+    /// * the **notice** (`NOTICE_AGGREGATE`) this loop claims and turns into a
+    ///   `messages` row.
+    ///
+    /// Fixing only the second one would change nothing at all — no notice is
+    /// ever written while the first is deferred — which is the thing a reader
+    /// of that paragraph most needs to be told.
+    ///
+    /// **What this asserts is that nothing is lost, not that nothing waits.**
+    /// No attempt is burned, neither row is a dead letter, and the release
+    /// drains both. What the release cannot recover is the part that was never
+    /// ours: the body and the attachments are at the provider until phase two
+    /// fetches them, and `routes::halt` carries the founder's question about how
+    /// long they stay there.
+    #[tokio::test]
+    async fn a_stop_defers_receiving_at_both_gates_and_the_release_drains_it() {
+        use crate::routes::webhooks::{RAW_AGGREGATE, received_event};
+
+        let Some(db) = db().await else { return };
+        let _guard = INBOUND_LOCK.lock().await;
+        let (tenant, employee) = seed(&db).await;
+        let now = Utc::now();
+
+        // Gate one: what `POST /v1/webhooks/{provider}` stores. The edge writes
+        // this whatever the halt says — it is a route, not a claim — so the
+        // envelope is durable here and the deferral starts at the poller.
+        let raw = {
+            let event = NewEvent {
+                aggregate_type: RAW_AGGREGATE.to_owned(),
+                aggregate_id: Uuid::nil(),
+                event_type: received_event("resend"),
+                dedupe_key: Some(format!("resend:evt_{}", tenant.as_uuid().simple())),
+                payload: json!({ "provider": "resend", "body": "{}" }),
+                traceparent: None,
+            };
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let id = outbox::enqueue(&mut tx, &event, now)
+                .await
+                .expect("enqueue raw delivery");
+            tx.commit().await.expect("commit raw delivery");
+            id
+        };
+        // Gate two: the notice that gate one would have produced.
+        let notice = deliver_webhook(
+            &db,
+            tenant,
+            employee,
+            "email_halted",
+            notice_payload("email_halted", now),
+            now,
+        )
+        .await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::halt::place(&mut tx, "the CFO called", "operator:ops", now)
+            .await
+            .expect("place")
+            .expect("the tenant was running");
+        tx.commit().await.expect("commit halt");
+
+        // Neither poller sees the tenant at all.
+        let ingest = |job| land_job(&db, job, now);
+        assert_eq!(
+            tick(&db, &ingest, now).await.expect("tick"),
+            0,
+            "the notice claim is driven by `tenants` and a stopped tenant offers no seat"
+        );
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let general = outbox::claim_except(&mut tx, Some(NOTICE_AGGREGATE), 32, now)
+            .await
+            .expect("claim");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            general.iter().all(|event| event.tenant_id != tenant),
+            "the raw delivery is deferred by the same clause, one step earlier"
+        );
+        assert_eq!(messages(&db, tenant).await, 0, "so nothing lands");
+
+        // Deferred, which is the half that makes it survivable: no attempt was
+        // burned, so a halt of any length costs the queue nothing.
+        for (id, what) in [(raw, "the raw delivery"), (notice, "the notice")] {
+            let (attempts, error, published) = notice_row(&db, id).await;
+            assert_eq!(attempts, 0, "{what} burned an attempt while nobody ran it");
+            assert_eq!(error, None, "{what} recorded a failure that never happened");
+            assert!(
+                published.is_none(),
+                "{what} was published by a stopped company"
+            );
+        }
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let dead = outbox::dead_letters(&mut tx, 100).await.expect("dead");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            dead.iter().all(|event| event.tenant_id != tenant),
+            "a stop must never dead-letter a customer's mail"
+        );
+
+        // And the release makes them due at once, in our own database. Nothing
+        // here can say the same about the body still sitting at the provider.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::halt::release(&mut tx)
+            .await
+            .expect("release")
+            .expect("it was stopped");
+        tx.commit().await.expect("commit release");
+
+        assert_eq!(
+            tick(&db, &ingest, now).await.expect("tick"),
+            1,
+            "the release has to drain the mail the halt deferred"
+        );
+        assert_eq!(messages(&db, tenant).await, 1);
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let general = outbox::claim_except(&mut tx, Some(NOTICE_AGGREGATE), 32, now)
+            .await
+            .expect("claim");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            general.iter().any(|event| event.id == raw),
+            "and the raw delivery with it"
+        );
+    }
+
     // -- concurrency --------------------------------------------------------
 
     /// **Two pollers, and the bound is the thing under test.**
