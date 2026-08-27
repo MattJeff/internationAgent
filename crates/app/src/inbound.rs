@@ -461,12 +461,43 @@ impl InboundError {
     /// The poller needs this to tell "come back in a second" from "this will
     /// never work", and the difference is a dead letter either way — it is just
     /// eight retries earlier when we get it wrong.
+    ///
+    /// # Both seams now act on this, so `false` costs more than it used to
+    ///
+    /// It was written when the only reader was the inbound loop, and it fell
+    /// through to `false` for everything it had not thought about — which was
+    /// cheap while `main::on_webhook` ignored it entirely and retried the lot.
+    /// Now that both seams park what this calls unretryable, a variant landing
+    /// in the fall-through by accident is a customer's mail dead-lettered on
+    /// its first attempt. So the `Store` arms are enumerated rather than
+    /// defaulted, and the split is the one the rest of this change is built on:
+    /// **could the same input succeed later?**
+    ///
+    /// * `Serialization` — Postgres said so itself.
+    /// * `Database` — a pool timeout, a reset connection, a lock wait. The
+    ///   driver failing is not the message being wrong.
+    /// * `UnknownTenant` — the first-run row nobody inserted
+    ///   ([`StoreError::UnknownTenant`] has the whole story). An operator
+    ///   inserting it makes the next attempt work, so this is the definition of
+    ///   retryable even though eight attempts may well run out first — and when
+    ///   they do it is a dead letter with a reason, which is where it belongs.
+    ///
+    /// `Conflict` and `NotFound` stay unretryable and are the reason this is a
+    /// match and not a blanket `true`: the same INSERT violates the same unique
+    /// constraint, and a row that is not there is not there.
     pub fn is_retryable(&self) -> bool {
         match self {
             InboundError::NotReady => true,
             InboundError::Provider(err) => err.is_retryable(),
-            InboundError::Store(StoreError::Serialization) => true,
-            _ => false,
+            InboundError::Store(
+                StoreError::Serialization | StoreError::Database(_) | StoreError::UnknownTenant(_),
+            ) => true,
+            InboundError::Store(StoreError::Conflict(_) | StoreError::NotFound) => false,
+            InboundError::UnknownRecipient
+            | InboundError::Unallocated
+            | InboundError::BadNotice(_)
+            | InboundError::Normalize(_)
+            | InboundError::TelephonyNormalize(_) => false,
         }
     }
 
@@ -3264,6 +3295,11 @@ mod tests {
         ));
     }
 
+    /// Both seams that read this now *park* what it calls unretryable, so a
+    /// wrong `false` is a customer's mail dead-lettered on attempt one. The
+    /// database arms are asserted for that reason and not for completeness: a
+    /// pool timeout is the driver failing, not the message being wrong, and
+    /// nothing about the bytes changed.
     #[test]
     fn a_late_body_is_retryable_and_a_bad_address_is_not() {
         assert!(InboundError::NotReady.is_retryable());
@@ -3271,6 +3307,20 @@ mod tests {
         assert!(!InboundError::UnknownRecipient.is_retryable());
         assert!(!InboundError::Normalize(ParseError::Malformed).is_retryable());
         assert_eq!(InboundError::NotReady.code(), "not_ready");
+
+        // The database blinking is not the message being unreadable.
+        assert!(InboundError::Store(StoreError::Serialization).is_retryable());
+        assert!(
+            InboundError::Store(StoreError::Database(sqlx::Error::PoolTimedOut)).is_retryable(),
+            "a pool timeout parked on attempt one is mail lost to a busy minute"
+        );
+        assert!(
+            InboundError::Store(StoreError::UnknownTenant("employees".to_owned())).is_retryable(),
+            "the operator inserting the tenants row makes the next attempt work"
+        );
+        // And the two that genuinely cannot change.
+        assert!(!InboundError::Store(StoreError::NotFound).is_retryable());
+        assert!(!InboundError::Store(StoreError::Conflict("dedupe_key".to_owned())).is_retryable());
     }
 
     // -- the frontier: what a stored delivery turns out to be ----------------

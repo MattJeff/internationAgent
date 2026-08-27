@@ -91,7 +91,7 @@ use tracing_subscriber::EnvFilter;
 use crate::auth::{Keyring, Principal};
 use crate::config::{Config, ConfigError};
 use crate::error::ApiError;
-use crate::loops::outbox::{Handled, Handlers};
+use crate::loops::outbox::{Failure, Handled, Handlers};
 use crate::loops::provisioning::ProvisioningLoop;
 use crate::routes::a2a::A2aState;
 use crate::routes::mcp::{Fleets, McpState};
@@ -808,11 +808,13 @@ fn on_created<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
         .map_err(|err| format!("could not read the employee's resources: {err}"))?;
 
         if claimable == 0 {
-            return Err(
+            // Retry, not terminal: the rows are written by another transaction
+            // and a repair that inserts them makes the next attempt succeed.
+            return Err(Failure::Retry(
                 "this employee was accepted with no pending resource row, so the provisioning \
                  loop has nothing to claim and it will never be provisioned"
                     .to_owned(),
-            );
+            ));
         }
         tracing::info!(
             employee_id = %event.aggregate_id,
@@ -1063,10 +1065,10 @@ fn on_terminated<'a>(
         if !stuck.is_empty() {
             // Retried, then dead-lettered. Either way it is somebody's problem
             // rather than nobody's, and the bindings are still on the rows.
-            return Err(format!(
+            return Err(Failure::Retry(format!(
                 "terminated, but these resources are still bound and still billed: {}",
                 stuck.join(",")
-            ));
+            )));
         }
 
         tracing::info!(
@@ -1107,24 +1109,58 @@ fn on_terminated<'a>(
 ///
 /// # What is an error here, and what is merely not a message
 ///
-/// Only the first kind returns `Err`, because `Err` is eight attempts and then
-/// a dead letter. A refusal (`email.bounced`, `email.complained`) and a type
-/// this build has never read the docs for are both `Ok`: no number of retries
-/// turns either into something else, and treating them as failures is how a
-/// spam complaint got thrown away. See
+/// A refusal (`email.bounced`, `email.complained`) and a type this build has
+/// never read the docs for are both `Ok`: they were read, they were acted on or
+/// deliberately not, and treating them as failures is how a spam complaint got
+/// thrown away. See
 /// [`record_raw_email_delivery`](agentos_app::inbound::record_raw_email_delivery).
+///
+/// # And what is an error that no retry can fix
+///
+/// The half that fix left behind. `Err` used to mean one thing here — eight
+/// attempts, then a dead letter — so a body that is not JSON, a payload missing
+/// a field the provider always sends, and an envelope addressed to somebody
+/// this tenant does not employ were each read eight times and refused eight
+/// times, by the same parser, over the same bytes. Eight times zero chance.
+///
+/// [`agentos_app::inbound::InboundError::is_retryable`] already knew the
+/// difference and nothing here asked it. It is asked now, and the answer picks between
+/// [`Failure::Retry`] and [`Failure::Terminal`] — the dead letter either way,
+/// seven attempts earlier when it could never have worked.
+///
+/// **Not `Ok`, and this is the deliberate part.** An `UnknownRecipient` is not
+/// nothing: it is mail for a deleted employee, or a routing mistake, and the
+/// argument for keeping it an error — a dead letter is visible, a silent `Ok`
+/// is not — is correct and is preserved exactly. What changes is only the seven
+/// attempts in front of it, which bought no information and buried the failures
+/// that were real. `outbox::requeue_dead_letters` is the way back once the
+/// employee exists.
 fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
     Box::pin(async move {
+        // Terminal: this row's payload is written once, by the route, and a
+        // stored delivery that has no body will not grow one.
         let body = event
             .payload
             .get("body")
             .and_then(Value::as_str)
-            .ok_or_else(|| "this stored delivery has no body".to_owned())?;
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
 
         // Exactly the bytes the signature was checked over at the edge.
+        //
+        // The classification is `InboundError`'s own — asking it is the whole
+        // fix. Never the payload and never the provider's text in `why`:
+        // `code()` is a fixed label and every `InboundError` renders from an
+        // authored sentence, and this string is written to `last_error`.
         let recorded = record_raw_email_delivery(tx, body.as_bytes(), Utc::now())
             .await
-            .map_err(|err| format!("{}: {err}", err.code()))?;
+            .map_err(|err| {
+                let why = format!("{}: {err}", err.code());
+                if err.is_retryable() {
+                    Failure::Retry(why)
+                } else {
+                    Failure::Terminal(why)
+                }
+            })?;
 
         match recorded {
             Recorded::Notice {
@@ -1238,10 +1274,15 @@ impl Agent {
     fn on_turn<'a>(self, event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
         Box::pin(async move {
             let conversation_id = ConversationId::from_uuid(event.aggregate_id);
+            // Terminal, both: the payload of a claimed row is what the writer
+            // committed and no later attempt reads different bytes. This is the
+            // same structural case as a stored delivery with no body.
             let employee_id = EmployeeId::from_uuid(
-                uuid_field(event, "employee_id").ok_or("this turn names no employee")?,
+                uuid_field(event, "employee_id")
+                    .ok_or_else(|| Failure::Terminal("this turn names no employee".to_owned()))?,
             );
-            let message_id = uuid_field(event, "message_id").ok_or("this turn names no message")?;
+            let message_id = uuid_field(event, "message_id")
+                .ok_or_else(|| Failure::Terminal("this turn names no message".to_owned()))?;
 
             // The message that woke us, and the thread it is on. Every column
             // here except `channel`, `trust_label` and `internal_kind` is the
@@ -1408,13 +1449,19 @@ impl Agent {
                 // preference and the remedy, because "the model was
                 // unreachable" is what an operator would otherwise go looking
                 // for and there is nothing wrong with the provider.
-                return Err(format!(
+                // Terminal, and the sentence already said so — "retrying will
+                // not fix it" was written into an error the loop could only
+                // retry. Four layers intersecting to the empty set is a
+                // property of the policy rows, not of this attempt, and the
+                // next seven read the same rows. Grant a model and
+                // `outbox::requeue_dead_letters` brings the message back.
+                return Err(Failure::Terminal(format!(
                     "this employee's policy permits no model at all, so it cannot take a turn: \
                      role {role} asked for {preferred}, and platform ∧ tenant ∧ role ∧ employee \
                      intersected `allowed_models` to the empty set. Grant one in a policy layer \
                      — this is not a provider failure and retrying will not fix it",
                     role = charter.as_ref().map_or("(none)", Charter::role),
-                ));
+                )));
             };
             if model != preferred {
                 tracing::info!(
@@ -1647,13 +1694,18 @@ impl Agent {
                     error: TurnError::Unavailable(err),
                     ..
                 }) => {
-                    return Err(format!("the store was unreachable mid-turn: {err}"));
+                    return Err(Failure::Retry(format!(
+                        "the store was unreachable mid-turn: {err}"
+                    )));
                 }
                 Err(Failed {
                     error: TurnError::Llm(err),
                     ..
                 }) if err.is_retryable() => {
-                    return Err(format!("the model was unreachable: {}", err.code()));
+                    return Err(Failure::Retry(format!(
+                        "the model was unreachable: {}",
+                        err.code()
+                    )));
                 }
                 // Acknowledged. A budget that ran out, a refusal, a bad API
                 // key: eight more attempts cost eight more model calls and end
@@ -1761,6 +1813,9 @@ impl Agent {
                 Utc::now(),
             )
             .await
+            // A write, so a failure is the store's: retryable, and the turn's
+            // tokens are already banked in `tx` either way.
+            .map_err(Failure::Retry)
         })
     }
 }
@@ -3481,6 +3536,135 @@ mod tests {
             "these resources are still bound, so still billed: {still_bound:?}"
         );
         assert_eq!(stored.employee.lifecycle(), Lifecycle::Terminated);
+
+        drop_database(db, admin_url, database).await;
+    }
+
+    /// **`on_webhook` asks the classification that was already there.**
+    ///
+    /// `InboundError::is_retryable` has always known that a body which is not
+    /// JSON, a payload missing a field the provider always sends, and an
+    /// address nobody here employs are not going to change on the second read.
+    /// This handler never asked it, so all three cost eight attempts and eight
+    /// identical refusals from the same parser over the same bytes.
+    ///
+    /// Four cases, and the third and fourth are the point of the test rather
+    /// than decoration:
+    ///
+    /// * malformed and missing-field → `Terminal`, dead-lettered now;
+    /// * an address nobody owns → `Terminal` too, and **still an error**. This
+    ///   is where a lazier fix would have written `Ok`, and `Ok` here is a
+    ///   customer's mail deleted in silence. The row stays in the dead-letter
+    ///   queue exactly as it did, seven attempts earlier;
+    /// * a spam complaint → still `Ok`, still recorded. The frontier the last
+    ///   commit drew does not move.
+    ///
+    /// Nothing is asserted about attempt counts here; that is
+    /// `loops::outbox::a_terminal_failure_is_dead_lettered_on_the_first_attempt`.
+    /// This asserts only the classification, which is the half that was deaf.
+    #[tokio::test]
+    async fn on_webhook_parks_what_no_retry_can_fix_and_still_refuses_to_swallow_it() {
+        let Some((db, admin_url, database)) = own_database("webhook_class").await else {
+            return;
+        };
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("wh-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        // A claimed row, as the poller hands one over. No employee is inserted
+        // at all, which is what makes the `email.received` below unroutable.
+        let stored = |body: &str| OutboxEvent {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            aggregate_type: "webhook".to_owned(),
+            aggregate_id: Uuid::now_v7(),
+            event_type: "webhook.email.received".to_owned(),
+            payload: json!({ "body": body }),
+            attempt_count: 1,
+            available_at: now,
+            last_error: None,
+        };
+
+        // Read one delivery the way the loop does, and give the verdict back.
+        async fn read(db: &Db, tenant: TenantId, event: &OutboxEvent) -> Result<(), Failure> {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let handled = on_webhook(event, &mut tx).await;
+            match handled.is_ok() {
+                true => tx.commit().await.expect("commit"),
+                false => tx.rollback().await.expect("rollback"),
+            }
+            handled
+        }
+
+        for (label, body) in [
+            ("not JSON at all", "{"),
+            (
+                "a webhook with no type",
+                r#"{"created_at":"2026-08-24T10:00:00Z","data":{}}"#,
+            ),
+            (
+                "an inbound event missing every field",
+                r#"{"type":"email.received","created_at":"2026-08-24T10:00:00Z","data":{}}"#,
+            ),
+            (
+                "an address nobody here employs",
+                r#"{"type":"email.received","created_at":"2026-08-24T10:00:00Z",
+                    "data":{"email_id":"email_nobody_1","from":"ap@supplier.example",
+                            "to":["nobody@agents.example.com"]}}"#,
+            ),
+        ] {
+            let event = stored(body);
+            let verdict = read(&db, tenant, &event).await;
+            // Not `Ok`. Whatever else changes, this one must not: the row still
+            // goes to the queue a human reads.
+            let Err(failure) = verdict else {
+                panic!("{label} was swallowed as a success");
+            };
+            assert!(
+                matches!(failure, Failure::Terminal(_)),
+                "{label} is still being retried, and the retry cannot work: {failure:?}"
+            );
+        }
+
+        // A stored row whose payload has no `body` at all: same structural
+        // case, and the route writes that field once.
+        let mut headless = stored("");
+        headless.payload = json!({});
+        assert!(
+            matches!(
+                read(&db, tenant, &headless).await,
+                Err(Failure::Terminal(_))
+            ),
+            "a stored delivery with no body will not grow one on the second read"
+        );
+
+        // And the frontier the previous commit drew is where it was: a refusal
+        // is read, acted on, and completed. A `Terminal` here would dead-letter
+        // every spam complaint, which is the original bug wearing the fix's
+        // clothes.
+        let complaint = stored(
+            r#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z",
+                "data":{"email_id":"email_c_1","to":["ap@supplier.example"]}}"#,
+        );
+        read(&db, tenant, &complaint)
+            .await
+            .expect("a spam complaint is still not a handler failure");
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let refused: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action_kind = 'mail_refused'")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count the trail");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(refused, 1, "the complaint was accepted and not recorded");
 
         drop_database(db, admin_url, database).await;
     }

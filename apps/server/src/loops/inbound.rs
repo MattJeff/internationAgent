@@ -65,12 +65,11 @@ use agentos_app::inbound::{
     BlobStore, InboundError, InboundJob, Landed, NOTICE_AGGREGATE, ingest_email,
 };
 use agentos_store::db::{Db, StoreError};
-use agentos_store::outbox::{self, Aggregates, MAX_ATTEMPTS, OutboxEvent};
+use agentos_store::outbox::{self, Aggregates, OutboxEvent};
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-use uuid::Uuid;
 
 /// Notices taken per claim.
 ///
@@ -243,37 +242,14 @@ async fn record(db: &Db, event: &OutboxEvent, outcome: Outcome, now: DateTime<Ut
     let written = match outcome {
         Outcome::Done => outbox::mark_done(&mut tx, event.id, now).await,
         Outcome::Retry(why) => outbox::mark_failed(&mut tx, event.id, &why).await,
-        Outcome::Park(why) => park(&mut tx, event.id, &why).await,
+        // `outbox::park`, not a private copy: the outbox poller makes the same
+        // three-way decision now, and two spellings of one `UPDATE` is how the
+        // claim got fixed in one loop and not the other.
+        Outcome::Park(why) => outbox::park(&mut tx, event.id, &why).await,
     };
     if let Err(err) = written.and(tx.commit().await.map_err(StoreError::from)) {
         tracing::error!(error = %err, event_id = %event.id, "inbound outcome was not recorded");
     }
-}
-
-/// Stop retrying a notice without losing it.
-///
-/// ponytail: burning the attempt counter *is* the dead-letter state — see
-/// [`agentos_store::outbox`], which has no `dead_lettered_at` column and filters
-/// on `attempt_count` in both [`claim`](outbox::claim) and
-/// [`dead_letters`](outbox::dead_letters). So a park is one `UPDATE`: the row
-/// stays, unpublished, with the reason attached, and no poller will pick it up
-/// again. `greatest` because a park must never *lower* an attempt count.
-async fn park(conn: &mut PgConnection, id: Uuid, why: &str) -> Result<(), StoreError> {
-    let parked = sqlx::query(
-        "UPDATE outbox_events \
-            SET last_error = $2, attempt_count = greatest(attempt_count, $3::int) \
-          WHERE id = $1 AND published_at IS NULL",
-    )
-    .bind(id)
-    .bind(why)
-    .bind(MAX_ATTEMPTS)
-    .execute(&mut *conn)
-    .await?;
-
-    if parked.rows_affected() == 0 {
-        return Err(StoreError::NotFound);
-    }
-    Ok(())
 }
 
 /// Take up to `limit` due **inbound notices**, across every tenant.
@@ -311,10 +287,11 @@ mod tests {
     use agentos_domain::ids::{EmployeeId, TenantId};
     use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
     use agentos_domain::untrusted::Untrusted;
-    use agentos_store::outbox::NewEvent;
+    use agentos_store::outbox::{MAX_ATTEMPTS, NewEvent};
     use chrono::TimeDelta;
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     use super::*;
 

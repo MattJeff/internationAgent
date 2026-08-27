@@ -75,7 +75,65 @@ const IDLE: Duration = Duration::from_millis(250);
 
 /// What a handler returns. `Err` is the text that lands in `last_error`, so
 /// write it for the person reading a dead letter at 3am.
-pub type Handled<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type Handled<'a> = Pin<Box<dyn Future<Output = Result<(), Failure>> + Send + 'a>>;
+
+/// Why a handler did not finish, and whether trying again could change that.
+///
+/// # The question this type exists to let a handler answer
+///
+/// This loop used to take a bare `String`, so every failure meant one thing:
+/// eight attempts and a dead letter. That is right for a database that blinked
+/// and wrong — arithmetically, not arguably — for a failure that is a property
+/// of the *bytes*. A stored webhook body that is not JSON is not JSON on the
+/// eighth read either; a policy that intersects to no permitted model at all
+/// permits no model at all seven retries later. Those rows still had to be
+/// retried, because the only word a handler had for "stop" was `Ok`, and `Ok`
+/// throws the event away in silence.
+///
+/// So there are two words now, and neither of them is `Ok`. Both end in the
+/// same place an operator already looks — `outbox::dead_letters` — and the
+/// difference is only whether seven attempts happen first. [`Terminal`] is not
+/// a quieter failure than [`Retry`]; it is the same failure, arrived at
+/// honestly.
+///
+/// [`Terminal`]: Failure::Terminal
+/// [`Retry`]: Failure::Retry
+///
+/// # `From<String>` is `Retry`
+///
+/// Deliberately: `?` on a `map_err(|e| format!(…))` keeps meaning what it
+/// always meant, so nothing becomes terminal by being left alone. A handler has
+/// to *say* that retrying cannot work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// Trying again could work: the store blinked, the provider was overloaded,
+    /// a lease expired. The claim's backoff hands the row back.
+    Retry(String),
+
+    /// Trying again cannot work — the same input will fail the same way. The
+    /// row is parked: kept, unpublished, with this reason on it, and dead-lettered
+    /// on this attempt rather than the eighth.
+    ///
+    /// Reversible by hand: `outbox::requeue_dead_letters` gives a tenant's
+    /// parked rows their attempts back, which is what an operator runs after
+    /// fixing whatever made the event impossible.
+    Terminal(String),
+}
+
+impl Failure {
+    /// The reason, for `last_error`. Never third-party text.
+    fn why(&self) -> &str {
+        match self {
+            Failure::Retry(why) | Failure::Terminal(why) => why,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Self {
+        Failure::Retry(why)
+    }
+}
 
 /// One event type's side effect.
 ///
@@ -262,7 +320,15 @@ async fn tick(db: &Db, handlers: &Arc<Handlers>, now: DateTime<Utc>) -> Result<u
 /// Dispatch one claimed event and record what happened.
 async fn handle(db: &Db, handlers: &Handlers, event: &OutboxEvent) {
     let Some(handler) = handlers.0.get(&event.event_type) else {
-        fail(db, event, "no handler is registered for this event type").await;
+        // Retryable on purpose, and it is the one unregistered case that is:
+        // the row may have been written by a newer build than the one draining
+        // it, and a rolling deploy is exactly the window where retrying works.
+        fail(
+            db,
+            event,
+            &Failure::Retry("no handler is registered for this event type".to_owned()),
+        )
+        .await;
         return;
     };
 
@@ -270,7 +336,7 @@ async fn handle(db: &Db, handlers: &Handlers, event: &OutboxEvent) {
     let mut tx = match db.tenant_tx(event.tenant_id).await {
         Ok(tx) => tx,
         Err(err) => {
-            fail(db, event, &format!("no tenant transaction: {err}")).await;
+            fail(db, event, &format!("no tenant transaction: {err}").into()).await;
             return;
         }
     };
@@ -282,7 +348,7 @@ async fn handle(db: &Db, handlers: &Handlers, event: &OutboxEvent) {
         // is the tenant's own connection, still inside their transaction.
         if let Err(err) = outbox::mark_done(&mut tx, event.id, Utc::now()).await {
             let _ = tx.rollback().await;
-            fail(db, event, &format!("could not publish: {err}")).await;
+            fail(db, event, &format!("could not publish: {err}").into()).await;
             return;
         }
         if let Err(err) = tx.commit().await {
@@ -299,17 +365,28 @@ async fn handle(db: &Db, handlers: &Handlers, event: &OutboxEvent) {
 
 /// Record why an attempt failed, and shout if it was the last one.
 ///
-/// Nothing is rescheduled here — the claim already burned the attempt and
-/// already set the backoff, so an event is retried whether or not this
-/// succeeds. What this adds is the error text, which is the only thing that
-/// makes a dead letter diagnosable.
-async fn fail(db: &Db, event: &OutboxEvent, why: &str) {
-    if event.is_dead_lettered() {
+/// Nothing is rescheduled here for a [`Failure::Retry`] — the claim already
+/// burned the attempt and already set the backoff, so an event is retried
+/// whether or not this succeeds. What this adds is the error text, which is the
+/// only thing that makes a dead letter diagnosable.
+///
+/// A [`Failure::Terminal`] *is* rescheduled here, to never: the attempt counter
+/// is burned out in one `UPDATE` so the row becomes a dead letter now instead
+/// of after seven more attempts that cannot end differently. If that `UPDATE`
+/// fails the row keeps its ordinary backoff and is merely retried, which is the
+/// old behaviour and the safe direction to fall back in.
+async fn fail(db: &Db, event: &OutboxEvent, failure: &Failure) {
+    let why = failure.why();
+    let terminal = matches!(failure, Failure::Terminal(_));
+    if event.is_dead_lettered() || terminal {
         // The claim that produced this event was the last one it will ever
-        // get. Nothing moves the row; it just stops being selected.
+        // get — either because it burned the eighth attempt, or because the
+        // handler said no attempt can work and the `park` below burns the rest.
+        // Same line for both: an operator reading it has the same job.
         tracing::error!(
             error = why,
             attempts = event.attempt_count,
+            terminal,
             aggregate_type = %event.aggregate_type,
             aggregate_id = %event.aggregate_id,
             "outbox event dead-lettered; this side effect will not happen"
@@ -329,7 +406,12 @@ async fn fail(db: &Db, event: &OutboxEvent, why: &str) {
             return;
         }
     };
-    if let Err(err) = outbox::mark_failed(&mut tx, event.id, why).await {
+    let written = if terminal {
+        outbox::park(&mut tx, event.id, why).await
+    } else {
+        outbox::mark_failed(&mut tx, event.id, why).await
+    };
+    if let Err(err) = written {
         tracing::error!(error = %err, "could not record an outbox failure");
         return;
     }
@@ -722,7 +804,7 @@ mod tests {
                 let id = event.id;
                 Box::pin(async move {
                     counter.lock().expect("lock").push(id);
-                    Err("the provider said no".to_owned())
+                    Err(Failure::Retry("the provider said no".to_owned()))
                 })
             }),
         );
@@ -811,6 +893,88 @@ mod tests {
         assert!(
             last_error.unwrap_or_default().contains("no handler"),
             "the reason must say what is missing"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// A handler that says "no retry can change this" is believed **once**, and
+    /// the row is a dead letter on attempt one instead of attempt eight.
+    ///
+    /// The other half of this is
+    /// [`a_permanently_failing_handler_backs_off_then_dead_letters`], which
+    /// still runs a [`Failure::Retry`] handler the full [`MAX_ATTEMPTS`] times.
+    /// Both have to stay green: the pair is what says the loop distinguishes
+    /// the two rather than having collapsed one into the other.
+    #[tokio::test]
+    async fn a_terminal_failure_is_dead_lettered_on_the_first_attempt() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let tenant = seed_tenant(&db).await;
+
+        let attempts: Seen = Arc::default();
+        let counter = attempts.clone();
+        let handlers = Handlers::default().on(
+            EVENT,
+            Arc::new(move |event: &OutboxEvent, _tx: &mut TenantTx<'_>| {
+                let counter = counter.clone();
+                let id = event.id;
+                Box::pin(async move {
+                    counter.lock().expect("lock").push(id);
+                    Err(Failure::Terminal("these bytes will never parse".to_owned()))
+                })
+            }),
+        );
+
+        let now = Utc::now();
+        let id = enqueue(&db, tenant, 1, now).await;
+        assert_eq!(
+            tick(&db, &Arc::new(handlers.clone()), now)
+                .await
+                .expect("tick"),
+            1
+        );
+        assert_eq!(ids(&attempts).len(), 1, "the handler ran once");
+
+        // Not seven more times, at any point ever. This is the whole change:
+        // `mark_failed` here would leave the row claimable and the assertion
+        // below would find a handler that ran twice.
+        for skip in [TimeDelta::hours(2), TimeDelta::days(365)] {
+            assert_eq!(
+                tick(&db, &Arc::new(handlers.clone()), now + skip)
+                    .await
+                    .expect("tick"),
+                0,
+                "a parked event must not be claimed again"
+            );
+        }
+        assert_eq!(
+            ids(&attempts).len(),
+            1,
+            "the handler ran again after saying no attempt can work"
+        );
+
+        // **And it is not swallowed.** A `Failure::Terminal` that returned `Ok`
+        // would publish the row, empty `dead_letters`, and produce a system
+        // that looks perfectly healthy while dropping the event — which is the
+        // failure this whole change exists to avoid making. Every assertion
+        // below is against that, not against the retry count.
+        assert!(!published(&db, id).await, "a parked event must not publish");
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let dead = outbox::dead_letters(&mut tx, 10).await.expect("dead");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(dead.len(), 1, "a parked event has to be visible on call");
+        assert_eq!(dead[0].id, id);
+        assert_eq!(
+            dead[0].last_error.as_deref(),
+            Some("these bytes will never parse"),
+            "and it has to say why, or the dead letter is a mystery"
+        );
+        assert!(
+            dead[0].attempt_count >= MAX_ATTEMPTS,
+            "parking is spelled by burning the counter; {} attempts",
+            dead[0].attempt_count
         );
 
         drop_tenant(&db, tenant).await;

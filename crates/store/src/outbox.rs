@@ -665,6 +665,47 @@ pub async fn mark_failed(
     Ok(())
 }
 
+/// The handler failed in a way no retry can change. Stop, without losing it.
+///
+/// The third answer, between [`mark_done`] and [`mark_failed`]. `mark_failed`
+/// records the reason and lets [`claim`] hand the row back seven more times;
+/// this records the reason and burns the attempt counter, so the row is a dead
+/// letter on the *first* attempt instead of the eighth. Same visibility —
+/// [`dead_letters`] selects on exactly this predicate — minus seven attempts
+/// that were arithmetically certain to end here anyway.
+///
+/// ponytail: burning the attempt counter *is* the dead-letter state. This table
+/// has no `dead_lettered_at` column and both [`claim`] and [`dead_letters`]
+/// filter on `attempt_count`, so a park is one `UPDATE`: the row stays,
+/// unpublished, with the reason attached, and no poller picks it up again.
+/// `greatest` because a park must never *lower* an attempt count.
+///
+/// Not a one-way door: [`requeue_dead_letters`] is the operator's verb for
+/// giving a parked row its attempts back once whatever made it impossible —
+/// the employee that was never hired, the address nobody owns — has been fixed.
+///
+/// This used to be spelled privately in `apps/server/src/loops/inbound.rs`, and
+/// then the outbox poller needed the same three-way decision. One spelling,
+/// beside the `attempt_count` predicate it has to agree with — the same
+/// argument [`claim_of`] settled for the two claims.
+pub async fn park(conn: &mut PgConnection, id: Uuid, why: &str) -> Result<(), StoreError> {
+    let parked = sqlx::query(
+        "UPDATE outbox_events \
+            SET last_error = $2, attempt_count = greatest(attempt_count, $3::int) \
+          WHERE id = $1 AND published_at IS NULL",
+    )
+    .bind(id)
+    .bind(why)
+    .bind(MAX_ATTEMPTS)
+    .execute(&mut *conn)
+    .await?;
+
+    if parked.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 /// Events that exhausted [`MAX_ATTEMPTS`] and are no longer being retried.
 ///
 /// Not a separate table and not a separate flag — the same predicate [`claim`]

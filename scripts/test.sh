@@ -146,7 +146,7 @@ trap cleanup EXIT INT TERM
 # first time, and this guard proves nothing. It is vacant exactly once and
 # real from then on; there is no way to have it both ways, and saying so
 # beats a green run that looks like evidence.
-LEDGER=ci_migration_ledger
+LEDGER="ci_migration_ledger_$(printf '%s' "$PWD" | shasum | cut -c1-10)"
 echo "==> migrations against $LEDGER (kept between runs on purpose)"
 psql_admin -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '$LEDGER'" \
   | grep -q 1 || psql_admin -v ON_ERROR_STOP=1 -c "CREATE DATABASE $LEDGER"
