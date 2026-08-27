@@ -41,10 +41,12 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use agentos_app::mocks::{
     BrowserCredentials, Credentials, EmailCredentials, LlmBackend, TelephonyCredentials,
 };
+use agentos_app::oauth::OauthClients;
 use agentos_domain::ids::TenantId;
 
 use crate::auth::{ApiKeys, ApiKeysError, PlatformKeys, PlatformKeysError};
@@ -141,6 +143,18 @@ pub enum ConfigError {
         /// The path segment registered twice.
         provider: String,
     },
+    /// An OAuth client registration was not `connector:client_id:client_secret`.
+    ///
+    /// Its own variant rather than an [`ConfigError::Invalid`] with a rendered
+    /// message, so the position is a field a log can index on — and, like every
+    /// other error in this enum, it never names the value: entry three being
+    /// malformed is a fact about a `client_secret`, and half of one is still a
+    /// credential.
+    #[error("AGENTOS_OAUTH_CLIENTS entry {index} is not `connector:client_id:client_secret`")]
+    OauthClientEntry {
+        /// Zero-based position of the offending entry.
+        index: usize,
+    },
 
     /// Mock adapters were configured without an explicit blessing.
     ///
@@ -227,6 +241,21 @@ pub struct Config {
     /// 404, which is the right answer for a deployment that has integrated
     /// nobody.
     pub webhooks: Vec<WebhookRegistration>,
+    /// `AGENTOS_OAUTH_CLIENTS` — the OAuth applications *we* registered, one per
+    /// connector, as `connector:client_id:client_secret[,…]`.
+    ///
+    /// **Deployment scope, never tenant scope.** A `client_secret` identifies
+    /// this product to a provider; it is the same value for every customer and
+    /// no customer has any business reading or writing one. `agentos_app::oauth`
+    /// argues the whole split, and the visible consequence is in
+    /// `routes::mcp::catalog`: a connector with no registration here is not
+    /// advertised, so nobody clicks a button that cannot work.
+    ///
+    /// Empty is a deployment that offers no OAuth connectors, which is exactly
+    /// what this one is until somebody registers an application — see
+    /// `agentos_app::catalog::CATALOG` for why there is no entry to register for
+    /// yet.
+    pub oauth_clients: Arc<OauthClients>,
 }
 
 /// One provider callback endpoint.
@@ -278,6 +307,10 @@ impl fmt::Debug for Config {
                     .map(|hook| hook.provider.as_str())
                     .collect::<Vec<_>>(),
             )
+            // Its own Debug prints the connector keys and nothing else — not
+            // the client id, which is not a secret, and certainly not the one
+            // beside it.
+            .field("oauth_clients", &self.oauth_clients)
             .finish()
     }
 }
@@ -356,6 +389,14 @@ impl Config {
         // an operator has already pasted in here, rather than with a fourth
         // variable holding the same string.
         let webhooks = parse_webhooks(&get("AGENTOS_WEBHOOK_SECRETS").unwrap_or_default())?;
+
+        // Parsed here rather than in `routes::mcp`, because this file is the one
+        // place that reads the environment and a second `std::env::var` is how a
+        // deployment ends up with two answers about what it is registered for.
+        let oauth_clients = Arc::new(
+            OauthClients::parse(&get("AGENTOS_OAUTH_CLIENTS").unwrap_or_default())
+                .map_err(|err| ConfigError::OauthClientEntry { index: err.index })?,
+        );
 
         // The one read per adapter. What it produces decides *both* what gets
         // built and what the guard names, so the two cannot disagree about
@@ -443,6 +484,7 @@ impl Config {
             mock_adapters,
             credentials,
             webhooks,
+            oauth_clients,
         })
     }
 
