@@ -68,7 +68,7 @@ use serde::de::DeserializeOwned;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use crate::email::{
-    EmailProvider, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
+    EmailProvider, OptOuts, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
     WebhookHeaders, verify_signature,
 };
 use crate::{
@@ -95,6 +95,56 @@ pub struct ResendEmailProvider {
 impl ResendEmailProvider {
     /// Adapter identity, as recorded in a [`Provisioned`].
     pub const PROVIDER: &'static str = "resend";
+
+    /// Where a person who replies "stop" to mail this adapter sent is heard.
+    ///
+    /// `"email"` is the `provider` handle in `webhook_endpoints`, and it is the
+    /// only value `0053_webhook_endpoints.sql`'s
+    /// `webhook_endpoints_provider_is_wired` CHECK accepts — so this names a
+    /// door that exists, is registered per tenant, and verifies a signature
+    /// before it accepts a byte.
+    ///
+    /// # What this claim does NOT say, and nobody should read into it
+    ///
+    /// **Nothing on this deployment turns a Resend complaint into a
+    /// `suppressions` row.** The door is real and the reader is missing, in
+    /// three separate places, and none of them is fixed by this constant:
+    ///
+    /// * `apps/server/src/routes/webhooks.rs` files every verified delivery
+    ///   under `received_event(provider)` — literally
+    ///   `webhook.email.received`, whatever event Resend actually sent.
+    /// * [`crate::email::InboundNotice::parse`] refuses anything that is not
+    ///   `email.received` with [`crate::email::ParseError::WrongEvent`], and
+    ///   `main::on_webhook` turns that refusal into a handler error — so a
+    ///   `email.bounced` or `email.complained` delivery is retried eight times
+    ///   and dead-lettered. The bytes survive in the outbox; the suppression
+    ///   never happens.
+    /// * `agentos_app::queue::reconcile_opt_outs` — the one thing in this
+    ///   workspace that writes an opt-out home — reads
+    ///   `agentos_providers::leads::LeadSink`, which is the *campaign*
+    ///   platform. It has never had anything to say about direct mail.
+    ///
+    /// So the honest reading of this declaration is "the refusals arrive here
+    /// and are stored raw", not "the refusals are recorded". That is a gap this
+    /// unit deliberately did not close, because closing it is a handler and a
+    /// migration and not a trait obligation.
+    ///
+    /// # The two questions only the founder can answer
+    ///
+    /// 1. **Is that endpoint subscribed to `email.bounced` and
+    ///    `email.complained` at Resend at all?** Which events an endpoint
+    ///    receives is a setting in Resend's dashboard. Nothing in this binary
+    ///    can read it, and no code here should guess: if those events are not
+    ///    selected, this declaration names a door nothing is ever pushed
+    ///    through, and the gap above is not the first thing to fix.
+    /// 2. **Does Resend expose a read of its account-scoped suppression
+    ///    list?** If it does, the second declaration is
+    ///    [`OptOuts::Pulled`]`{ from: … }` and the reader is
+    ///    `reconcile_opt_outs`-shaped and cheap. Nobody here has called the
+    ///    live API — deliberately, see this module's header — so the endpoint
+    ///    is not named, because a named endpoint nobody has read is worse than
+    ///    an absent one.
+    pub const OPT_OUTS: OptOuts = OptOuts::Pushed { at: "email" }.vetted();
 
     /// Build an adapter for one sending `domain`.
     ///
@@ -330,6 +380,10 @@ impl EmailProvider for ResendEmailProvider {
             )
             .await?;
         Ok(ProviderMessageId::new(sent.id))
+    }
+
+    fn opt_outs(&self) -> OptOuts {
+        Self::OPT_OUTS
     }
 
     fn verify_webhook(&self, raw_body: &[u8], headers: &WebhookHeaders) -> Result<(), SigError> {
