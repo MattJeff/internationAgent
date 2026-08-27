@@ -42,6 +42,59 @@ use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::db::{StoreError, TenantTx};
 
+/// The two clauses a cross-tenant claim recites to skip a stopped company —
+/// **written once, here, and pasted by the compiler.**
+///
+/// [`halted`] is the reader every per-tenant caller uses, and it knows both
+/// stops. The claims cannot call it: they are cross-tenant SQL, driven by
+/// `tenants` or by a queue table, with a clock the caller injects rather than
+/// the `now()` that function reads. So they spell the predicate out — and a
+/// predicate spelled out is a predicate that can be spelled out incompletely.
+///
+/// **That is not hypothetical, it is the local history.** The halt clause
+/// landed in [`crate::outbox::claim_of`] while the window clause landed there
+/// only, and for a while [`crate::initiative::claim_due`] still claimed the
+/// employees of a company whose month had ended and spent their cadence on a
+/// refusal. Two sites, one repair, one of them found by accident. A third
+/// reciter — `apps/server`'s provisioning claim, which was buying mailboxes and
+/// phone numbers for stopped companies — would have been a third chance to get
+/// it wrong.
+///
+/// So the sites now agree by construction. `concat!` runs at compile time, the
+/// callers keep `&'static str` SQL and their measured query plans, and there is
+/// exactly one place to edit when a fourth way to stop a company is invented.
+///
+/// # Contract
+///
+/// * `$tenant` is the SQL expression naming the tenant column in scope —
+///   `"t.id"` where `tenants` drives the query, `"r.tenant_id"` where the queue
+///   table does. It is a literal because `concat!` takes literals.
+/// * **`$1` must be the caller's `now`, as `timestamptz`.** Every claim in this
+///   workspace binds it first; a query that renumbers its parameters has to
+///   renumber this too, and the compiler will not say so.
+/// * The fragment is a bare boolean with no outer parentheses, so it drops into
+///   a `WHERE` directly and needs wrapping inside an `OR`.
+///
+/// # It defers, it does not refuse
+///
+/// Every caller must *not select* the row rather than claim and reject it. The
+/// callers' own docs carry the argument — burnt attempts, dead letters, a spent
+/// cadence — and they all reduce to the same property: a row that was never
+/// selected was never written, so lifting the stop makes it due again with no
+/// intervention and no replay.
+#[macro_export]
+macro_rules! not_stopped {
+    ($tenant:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM company_halts h WHERE h.tenant_id = ",
+            $tenant,
+            ") AND NOT EXISTS (SELECT 1 FROM company_windows w WHERE w.tenant_id = ",
+            $tenant,
+            " AND w.ends_at <= $1::timestamptz)"
+        )
+    };
+}
+
 /// A company that has been stopped, as the row records it.
 ///
 /// No `tenant_id` field: the only way to hold one of these is to have read it

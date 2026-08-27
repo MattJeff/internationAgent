@@ -55,6 +55,12 @@
 //! | `pending_external` and `expected_by < now`     | **the wait is now a problem** |
 //! | `failed`, cold for `retry_after`, under the cap | a transient failure |
 //!
+//! ...and one exemption: **a stopped company's rows are not claimed, unless the
+//! row is the second one.** A halt, or an operating window that has run out,
+//! defers everything that has not started buying; the lapsed lease is the one
+//! row that has, and stranding it is the failure `routes::halt` warns about.
+//! [`CLAIM_SQL`] carries the whole argument and the table it turns on.
+//!
 //! The second row is the recovery case and the reason this query is not simply
 //! "state = 'pending'". A worker that was killed mid-step leaves the row in
 //! `provisioning` with its own lease on it; nothing else in the system ever
@@ -496,10 +502,65 @@ impl<C: Converge> ProvisioningLoop<C> {
 // Claiming
 // ---------------------------------------------------------------------------
 
-/// The four predicates, the trace to inherit, and the queue lock.
+/// The four predicates, the stop, the trace to inherit, and the queue lock.
 ///
 /// `$1` now, `$2` the retry cutoff, `$3` the attempt cap, `$4` the batch size.
-const CLAIM_SQL: &str = "\
+///
+/// # The stop, and exactly how far it reaches
+///
+/// The last clause is [`not_stopped!`](agentos_store::not_stopped), the same
+/// fragment `outbox::claim_of` and `initiative::claim_due` use, correlated on
+/// `r.tenant_id` because this query is driven by the queue table rather than by
+/// `tenants`. It **defers**: a row that is not selected is not written, so
+/// `attempt_count`, `updated_at` and `expected_by` are all exactly what they
+/// were, and the tick after the halt is lifted or the window extended finds
+/// them due again with nobody's help. That is the same property
+/// `initiative::claim_due` holds by leaving `next_at` in the past.
+///
+/// **The `OR` in front of it is the whole judgement, so it is written down.**
+/// `routes::halt` argues that stopping this loop half-way is worse than not
+/// stopping it, because interrupting a convergence leaves resources bought and
+/// unbound. That argument is right, and it is about *interrupting*. It does not
+/// cover *not starting*, and the two are different rows:
+///
+/// | state | is there a provider call to be uncertain about? |
+/// |-------|--------------------------------------------------|
+/// | `pending` | no — `claim_step` never ran, so there is no `provider_intents` row at all |
+/// | `failed` | no — `finish_step` closed the intent `failed`; a retry is a *fresh* purchase |
+/// | `pending_external` | not one we can affect — `ensure_step` returns from this state without touching anything, and the reaper below only files an approval |
+/// | `provisioning`, lease lapsed | **yes** — `claim_step` commits the intent *before* the call, so this row is a call whose outcome nobody knows |
+///
+/// So the fourth row is exempted from the stop and the other three are not.
+/// That exemption is not politeness: `ProvisioningEngine::claim` is the only
+/// thing in this workspace that closes an orphaned intent —
+/// `sweep_expired_leases` and `mark_intent_orphaned` have one call site each,
+/// both inside it, reachable only through `converge`, reachable only from this
+/// loop. Deferring that row would leave the intent `in_flight` for the length
+/// of the stop and leave the human who has to reconcile a possibly-bought phone
+/// number unasked. That is precisely the stranded stock `routes::halt`
+/// describes, and precisely what this clause refuses to create.
+///
+/// **What it does not buy back.** `converge` takes an employee, not a step, so
+/// an employee exempted for its one lapsed lease has *all eleven* of its steps
+/// run, pending ones included. The frontier is therefore per employee and not
+/// per row, and closing that last gap needs a `converge` that accepts a step
+/// list — the resumable state machine `routes::halt` says is not this unit, and
+/// it still is not. It is strictly less spend than before this clause existed,
+/// which is the bar every stop in this workspace is held to.
+///
+/// Measured, so the next reader does not have to: the planner turns both
+/// `NOT EXISTS` into **hashed subplans** — one scan of each of the two
+/// one-row-per-company tables per execution, not a probe per candidate row — so
+/// the clause costs the same whether the batch scans ten rows or ten thousand.
+///
+/// FOUNDER'S QUESTION, LEFT OPEN, and it is `outbox::claim_of`'s question word
+/// for word: a halt has `DELETE /v1/halt`, but a window that ended has no
+/// release verb, so a finished company's eleven pending resources now wait here
+/// forever. Deferred is the conservative half — nothing is lost, extending the
+/// window provisions them all — but "does a finished company ever get
+/// provisioned" is a product decision and this file will not invent one.
+const CLAIM_SQL: &str = concat!(
+    "\
 SELECT r.tenant_id,
        r.employee_id,
        (SELECT o.payload->>'traceparent'
@@ -515,9 +576,14 @@ SELECT r.tenant_id,
         OR (r.state = 'provisioning'     AND r.lease_until < $1)
         OR (r.state = 'pending_external' AND r.expected_by < $1)
         OR (r.state = 'failed' AND r.attempt_count < $3 AND r.updated_at < $2))
+   AND (   (r.state = 'provisioning' AND r.lease_until < $1)
+        OR (",
+    agentos_store::not_stopped!("r.tenant_id"),
+    "))
  ORDER BY r.updated_at
  LIMIT $4
- FOR UPDATE OF r SKIP LOCKED";
+ FOR UPDATE OF r SKIP LOCKED"
+);
 
 /// Take a batch of employees that want work, newest-stale first.
 ///
@@ -1373,6 +1439,233 @@ mod tests {
                 .expect("claim")
                 .is_empty(),
             "the attempt cap has to bind, or nothing ever stops"
+        );
+    }
+
+    // -- a stopped company buys nothing ------------------------------------
+
+    /// Stop this company the way an operator does.
+    async fn halt_company(db: &Db, employee: &Employee, reason: &str) {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        agentos_store::halt::place(&mut tx, reason, "operator:test", Utc::now())
+            .await
+            .expect("place")
+            .expect("not already halted");
+        tx.commit().await.expect("commit");
+    }
+
+    /// Say when this company's agents stop. An `ends_at` in the past is a stop.
+    async fn set_window(db: &Db, employee: &Employee, ends_at: DateTime<Utc>) {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        agentos_store::halt::set_window(&mut tx, ends_at, "operator:test", Utc::now())
+            .await
+            .expect("set window");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **Eleven resources, and every one of them is an invoice.** A company
+    /// somebody stopped — with the switch, or by letting the operating window it
+    /// bought run out — must not have mailboxes opened and phone numbers bought
+    /// for it while it is stopped.
+    ///
+    /// The third tenant is not decoration and neither is the first one's window:
+    /// every tenant here *has* a `company_windows` row, so a predicate that
+    /// skipped any tenant with a window, or that only ever read `company_halts`,
+    /// would pass this test exactly as the right one does.
+    #[tokio::test]
+    async fn a_stopped_company_is_not_provisioned_and_a_running_one_still_is() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let now = Utc::now();
+        // Bigger than the three tenants' thirty-three rows, so "not claimed"
+        // can only mean the predicate and never the batch size.
+        let cfg = LoopConfig {
+            batch: 64,
+            ..LoopConfig::default()
+        };
+
+        // Stopped by a human, and with a month still on the clock: the switch
+        // wins, and the window must not talk this one back into being work.
+        let switched = seed(&db, "switched").await;
+        set_window(&db, &switched, now + TimeDelta::days(30)).await;
+        halt_company(&db, &switched, "the CFO called").await;
+
+        // Stopped by the clock. Nobody threw anything; the time ran out.
+        let expired = seed(&db, "expired").await;
+        set_window(&db, &expired, now - TimeDelta::seconds(1)).await;
+
+        // The vacant guard: a window, open.
+        let running = seed(&db, "running").await;
+        set_window(&db, &running, now + TimeDelta::days(30)).await;
+
+        let claimed: Vec<_> = claim(&db, &cfg, now)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|work| work.employee_id)
+            .collect();
+        assert_eq!(
+            claimed,
+            vec![running.id()],
+            "a stopped company's pending resources are not work"
+        );
+
+        // ...and the loop spends nothing on them, which is the whole defect.
+        let engine = FakeEngine::ready(&db);
+        let cancel = CancellationToken::new();
+        ProvisioningLoop::new(db.clone(), engine.clone())
+            .with_config(cfg.clone())
+            .tick(now, &cancel)
+            .await
+            .expect("tick");
+        assert_eq!(
+            engine.calls(switched.id()),
+            0,
+            "an operator stopped this company and we bought it eleven resources"
+        );
+        assert_eq!(
+            engine.calls(expired.id()),
+            0,
+            "this company's month ran out and we bought it eleven resources"
+        );
+        assert_eq!(
+            engine.calls(running.id()),
+            1,
+            "a running company must still be provisioned"
+        );
+
+        // Nothing was spent while they were stopped: not a provider call, not
+        // an attempt, not a state.
+        for employee in [&switched, &expired] {
+            assert_eq!(
+                scalar::<i64>(
+                    &db,
+                    employee,
+                    "SELECT count(*) FROM employee_resources \
+                      WHERE employee_id = $1 AND state = 'pending' AND attempt_count = 0"
+                )
+                .await,
+                11,
+                "a deferred row must be untouched, or the reprise has nothing to give back"
+            );
+        }
+
+        // **The reprise, with no intervention.** The claim is a pure SELECT, so
+        // the rows it did not select were not rescheduled and not counted — the
+        // instant the stop lifts they are due again, exactly as they were.
+        let mut tx = db.tenant_tx(switched.tenant_id()).await.expect("tx");
+        agentos_store::halt::release(&mut tx)
+            .await
+            .expect("release")
+            .expect("was halted");
+        tx.commit().await.expect("commit");
+        set_window(&db, &expired, now + TimeDelta::days(30)).await;
+
+        let mut back: Vec<_> = claim(&db, &cfg, now)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|work| work.employee_id)
+            .collect();
+        back.sort_unstable();
+        let mut deferred = vec![switched.id(), expired.id()];
+        deferred.sort_unstable();
+        assert_eq!(
+            back, deferred,
+            "lifting the stop must make every deferred row due again by itself"
+        );
+    }
+
+    /// **Where the wedge stops.** A stop defers a convergence that has not
+    /// started; it never interrupts one that has.
+    ///
+    /// `claim_step` writes the `provider_intents` row and commits it *before*
+    /// the provider call, so a row a dead worker left in `provisioning` is a
+    /// call whose outcome nobody knows — and `ProvisioningEngine::claim` is the
+    /// only thing in the workspace that closes one (`sweep_expired_leases` and
+    /// `mark_intent_orphaned` have one call site each, both there, reachable
+    /// only through `converge`). Deferring *that* row is what strands bought
+    /// resources, which is the argument `routes::halt` makes and it is right.
+    ///
+    /// A `pending` row has no intent at all, a `failed` one had its intent
+    /// closed by `finish_step`, and `ensure_step` returns from a
+    /// `pending_external` one without touching anything. None of the three
+    /// leaves so much as a row behind by waiting.
+    #[tokio::test]
+    async fn a_stop_defers_a_convergence_that_has_not_started_and_never_one_in_flight() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let now = Utc::now();
+        let cfg = LoopConfig::default();
+
+        // Stopped by the switch. Nothing here has begun: eight never attempted,
+        // one failed and cold, one waiting on a provider past its deadline.
+        let deferred = seed(&db, "deferred").await;
+        set_window(&db, &deferred, now + TimeDelta::days(30)).await;
+        halt_company(&db, &deferred, "the CFO called").await;
+        exec(
+            &db,
+            &deferred,
+            "UPDATE employee_resources SET state = 'ready' WHERE employee_id = $1 \
+               AND step IN ('email', 'vault')",
+        )
+        .await;
+        exec(
+            &db,
+            &deferred,
+            "UPDATE employee_resources \
+                SET state = 'failed', attempt_count = 1, \
+                    updated_at = now() - interval '1 hour' \
+              WHERE employee_id = $1 AND step = 'browser'",
+        )
+        .await;
+        exec(
+            &db,
+            &deferred,
+            "UPDATE employee_resources \
+                SET state = 'pending_external', poll_ref = 'BU:FR:1234', \
+                    expected_by = now() - interval '1 hour' \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .await;
+
+        // Stopped by the clock, and a worker died holding one of its steps: the
+        // lease has lapsed and a provider may already have sold us something.
+        let midflight = seed(&db, "midflight").await;
+        set_window(&db, &midflight, now - TimeDelta::seconds(1)).await;
+        exec(
+            &db,
+            &midflight,
+            "UPDATE employee_resources SET state = 'ready' WHERE employee_id = $1",
+        )
+        .await;
+        exec(
+            &db,
+            &midflight,
+            "UPDATE employee_resources \
+                SET state = 'provisioning', lease_owner = gen_random_uuid(), \
+                    lease_until = now() - interval '1 second' \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .await;
+
+        let claimed: Vec<_> = claim(&db, &cfg, now)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|work| work.employee_id)
+            .collect();
+        assert_eq!(
+            claimed,
+            vec![midflight.id()],
+            "a stop must not strand the one step whose outcome nobody knows, \
+             and must not start any of the three that have not begun"
         );
     }
 

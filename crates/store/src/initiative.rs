@@ -250,20 +250,19 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 ///
 /// # A stopped company's employees are not claimed at all
 ///
-/// `NOT EXISTS (… company_halts …)` **and** `NOT EXISTS (… company_windows …
-/// ends_at <= $1)` on `tenants`, exactly as [`crate::outbox::claim_of`] spells
-/// them and in the same place — on the **driver**, so a stopped company never
-/// becomes a seat and its schedules are never read.
+/// [`not_stopped!`](crate::not_stopped) on `tenants`, exactly as
+/// [`crate::outbox::claim_of`] uses it and in the same place — on the
+/// **driver**, so a stopped company never becomes a seat and its schedules are
+/// never read.
 ///
-/// Two clauses rather than a call to [`crate::halt::halted`], which knows both
-/// stops and would keep them in one place: this is cross-tenant SQL driven by
-/// `tenants` with an injected clock, and it cannot ask a per-tenant reader.
-/// That is the whole cost of the shape, and it has already been paid once —
-/// the halt clause landed here while the window clause landed in the outbox
-/// only, and for a while a company whose month had ended still had its
+/// A macro rather than a call to [`crate::halt::halted`], which knows both
+/// stops: this is cross-tenant SQL driven by `tenants` with an injected clock,
+/// and it cannot ask a per-tenant reader. That workaround has already been paid
+/// for once — the halt clause landed here while the window clause landed in the
+/// outbox only, and for a while a company whose month had ended still had its
 /// employees claimed and their cadence spent. A predicate spelled out is a
-/// predicate that can be spelled out incompletely. Anything added to
-/// [`crate::halt::halted`] has to be added here and there by hand.
+/// predicate that can be spelled out incompletely, so it is now spelled out in
+/// exactly one place and pasted here by the compiler.
 ///
 /// **It is not the model bill, and the difference is worth writing down
 /// because the obvious reading is wrong.** This clause was added on a report
@@ -390,7 +389,7 @@ pub async fn claim_due(
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<Due>, StoreError> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(concat!(
         "WITH seated AS MATERIALIZED ( \
              SELECT q.employee_id, q.next_at, q.seat \
                FROM tenants t \
@@ -407,11 +406,9 @@ pub async fn claim_due(
                             ORDER BY i2.next_at, i2.employee_id \
                             LIMIT $2::bigint * $4::bigint) top \
                ) q \
-              WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
-                                 WHERE h.tenant_id = t.id) \
-                AND NOT EXISTS (SELECT 1 FROM company_windows w \
-                                 WHERE w.tenant_id = t.id \
-                                   AND w.ends_at <= $1::timestamptz) \
+              WHERE ",
+        crate::not_stopped!("t.id"),
+        " \
          ), shortlist AS MATERIALIZED ( \
              SELECT employee_id, seat, next_at FROM seated \
               ORDER BY seat, next_at, employee_id \
@@ -433,7 +430,7 @@ pub async fn claim_due(
            JOIN employees e ON e.id = d.employee_id \
           WHERE i.employee_id = d.employee_id \
         RETURNING i.employee_id, e.tenant_id, i.interval_secs, i.next_at, i.claims",
-    )
+    ))
     .bind(now)
     .bind(limit)
     // Bound rather than written as a literal, so the spelling stays tied to
