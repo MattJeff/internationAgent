@@ -30,3 +30,9 @@ uuid.workspace = true
 # Tests only: asserting that the key directory serves the public key and no
 # encoding of the sealed private one.
 base64.workspace = true
+# Tests only, and it is not a crack in the rule above: `agentos-providers` is
+# still absent, and this is the macro that spells `async fn` in a trait. One
+# test implements `agentos_app::mocks::Llm` — see that re-export for why a
+# scripted model cannot answer the question it asks — and `Llm` is declared with
+# `#[async_trait]`, so an implementation has to be too.
+async-trait.workspace = true

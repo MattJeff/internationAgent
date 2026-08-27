@@ -238,6 +238,33 @@ const ALLOWED_SCHEMES: [&str; 2] = ["http", "https"];
 /// numbers that can disagree is worse than one that is occasionally short.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long one binding may take to hand shake and list its tools.
+///
+/// **This is the only bound on it, and the thing it protects is other tenants.**
+/// [`CALL_TIMEOUT`] covers `tools/call` and nothing covered the two exchanges
+/// before it. `routes::mcp::run` walks the deployment's tenants one at a time
+/// and awaits each [`Fleet::bind`], and [`Fleet::bind`] walks a tenant's servers
+/// one at a time — so a single socket that accepts a connection and then says
+/// nothing wedges the binder for **every tenant in the process**, permanently.
+/// Their fleets are never bound and never refreshed, their employees take turns
+/// with no MCP tools, and the operator's binding page says `pending` with no
+/// reason on it. A connect timeout does not see this: the connect succeeded.
+///
+/// Thirty seconds, and the floor under that number is `ClientLifecycleMode::Auto`
+/// — it probes `server/discover` and falls back to the legacy `initialize`
+/// handshake after ten seconds of silence, so anything at or under ten would
+/// abandon exactly the older servers the fallback exists for. What is left is
+/// twenty seconds for the legacy handshake and `tools/list`, against an endpoint
+/// that is by construction not on a turn's critical path: binding happens in a
+/// background loop, and the two routes that bind inline are an operator's own
+/// admin request under the 30-second request timeout.
+///
+/// ponytail: one constant, like [`CALL_TIMEOUT`], with the same ceiling — a
+/// genuinely slow server is cut off at a number nobody chose for it, and the
+/// upgrade is the same per-server column. Two numbers that can disagree is
+/// worse than one that is occasionally short.
+const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Risk
 // ---------------------------------------------------------------------------
@@ -489,6 +516,21 @@ pub enum McpError {
         secs: u64,
     },
 
+    /// The server accepted the connection and did not finish the handshake or
+    /// list its tools inside [`BIND_TIMEOUT`].
+    ///
+    /// Distinct from [`Self::Connect`] for the reason [`Self::TimedOut`] gives —
+    /// the connect succeeded, so `connect_failed` would point an operator at
+    /// DNS and firewalls when the fault is the endpoint being mute — and
+    /// distinct from [`Self::TimedOut`] because there is no tool yet to name.
+    /// This is what an operator sees in `BindFailure::detail` when their
+    /// binding never comes up.
+    #[error("the mcp server accepted the connection and went quiet for {secs}s")]
+    BindTimedOut {
+        /// The ceiling it hit.
+        secs: u64,
+    },
+
     /// The stored credential could not be read.
     ///
     /// Its own variant rather than a [`Self::Connect`], because it is the one
@@ -526,6 +568,7 @@ impl McpError {
             McpError::MoreRoundsRequired(_) => "more_rounds_required",
             McpError::Connect(_) => "connect_failed",
             McpError::TimedOut { .. } => "timed_out",
+            McpError::BindTimedOut { .. } => "bind_timed_out",
             // The cipher's own code passes through: `envelope_malformed` and
             // `secret_decrypt_failed` are already stable, low-cardinality, and
             // they say which of the two things went wrong.
@@ -696,47 +739,64 @@ impl McpServer {
             ClientCapabilities::default(),
             Implementation::new(CLIENT_NAME, CLIENT_VERSION),
         );
-        let client = serve_client_with_lifecycle_and_ct(
-            info,
-            transport,
-            // `Auto`, not `Discover`. The note that used to sit here said to
-            // switch it "the day a server that predates the revision has to be
-            // supported — it is the same one literal", and that day arrived the
-            // first time this client was pointed at a server somebody else
-            // wrote. `Discover` is sessionless — no `initialize`, no session id,
-            // the protocol version on every request — and `rmcp` is explicit
-            // that it "does not fall back; a legacy server is an error". Every
-            // MCP server in the wild today is that error: the reference SDKs
-            // answer `server/discover` with `-32601 Method not found`, and the
-            // real Orizn server (2025-06-18) is one of them, so `Discover` made
-            // `bind` a function that could not bind anything a tenant owns.
-            //
-            // `Auto` probes with `server/discover` first and falls back to the
-            // legacy `initialize` handshake on a correlated JSON-RPC error or
-            // after ten seconds of silence. It costs one extra round trip at
-            // bind time — which happens once, in a background loop, never on a
-            // turn — and it buys the entire installed base.
-            //
-            // `legacy_version` is `V_2025_06_18` rather than `None` (which would
-            // leave `ClientInfo`'s own `LATEST`, currently 2025-11-25) because
-            // the fallback is for servers that are *behind*, and a fallback that
-            // opens by naming a revision older servers reject is a fallback that
-            // fails on the servers it exists for. 2025-06-18 is the oldest
-            // revision that still carries the tool-annotation fields
-            // `RiskClass::from_hints` reads.
-            ClientLifecycleMode::Auto {
-                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                legacy_version: Some(ProtocolVersion::V_2025_06_18),
-            },
-            ct,
-        )
-        .await
-        .map_err(|e| McpError::Connect(e.to_string()))?;
+        // Everything from here to the inventory is somebody else's server
+        // talking, and until this timeout existed none of it was bounded. See
+        // [`BIND_TIMEOUT`] for whose outage that became. It wraps both exchanges
+        // rather than each of them, because the ceiling that matters is how long
+        // *this binding* holds the loop — a server that spends the whole budget
+        // on the handshake and then lists instantly has still spent it.
+        //
+        // Dropping the future on timeout drops the transport with it, which
+        // closes the socket; there is nothing to unwind and nothing to leak.
+        let bound = tokio::time::timeout(BIND_TIMEOUT, async move {
+            let client = serve_client_with_lifecycle_and_ct(
+                info,
+                transport,
+                // `Auto`, not `Discover`. The note that used to sit here said to
+                // switch it "the day a server that predates the revision has to be
+                // supported — it is the same one literal", and that day arrived the
+                // first time this client was pointed at a server somebody else
+                // wrote. `Discover` is sessionless — no `initialize`, no session id,
+                // the protocol version on every request — and `rmcp` is explicit
+                // that it "does not fall back; a legacy server is an error". Every
+                // MCP server in the wild today is that error: the reference SDKs
+                // answer `server/discover` with `-32601 Method not found`, and the
+                // real Orizn server (2025-06-18) is one of them, so `Discover` made
+                // `bind` a function that could not bind anything a tenant owns.
+                //
+                // `Auto` probes with `server/discover` first and falls back to the
+                // legacy `initialize` handshake on a correlated JSON-RPC error or
+                // after ten seconds of silence. It costs one extra round trip at
+                // bind time — which happens once, in a background loop, never on a
+                // turn — and it buys the entire installed base.
+                //
+                // `legacy_version` is `V_2025_06_18` rather than `None` (which would
+                // leave `ClientInfo`'s own `LATEST`, currently 2025-11-25) because
+                // the fallback is for servers that are *behind*, and a fallback that
+                // opens by naming a revision older servers reject is a fallback that
+                // fails on the servers it exists for. 2025-06-18 is the oldest
+                // revision that still carries the tool-annotation fields
+                // `RiskClass::from_hints` reads.
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_06_18),
+                },
+                ct,
+            )
+            .await
+            .map_err(|e| McpError::Connect(e.to_string()))?;
 
-        // `list_all_tools` walks `next_cursor` for us; a partial inventory
-        // would silently classify the tools on page two as undeclared.
-        let discovered = client.list_all_tools().await?;
-        let tools = inventory(&discovered, declared)?;
+            // `list_all_tools` walks `next_cursor` for us; a partial inventory
+            // would silently classify the tools on page two as undeclared.
+            let discovered = client.list_all_tools().await?;
+            let tools = inventory(&discovered, declared)?;
+            Ok::<_, McpError>((client, tools))
+        })
+        .await
+        .map_err(|_| McpError::BindTimedOut {
+            secs: BIND_TIMEOUT.as_secs(),
+        })?;
+        let (client, tools) = bound?;
 
         Ok(Self {
             server,
@@ -2255,6 +2315,73 @@ mod tests {
         // "the network was unlucky" — a quiet server is not a reason to stop
         // asking, unlike a refusal.
         assert!(as_provider_error(&err).is_retryable(), "{err}");
+    }
+
+    /// **A server that accepts the connection and then says nothing must not
+    /// hold the binder open for every other tenant in the deployment.**
+    ///
+    /// [`CALL_TIMEOUT`] bounds `tools/call` and nothing bounded the handshake
+    /// or `tools/list`. That gap is not one tenant's problem, because
+    /// `routes::mcp::run` walks the deployment's tenants **one after another**
+    /// and awaits each [`Fleet::bind`]: a single customer pointing a binding at
+    /// a socket that accepts and stalls stops every *other* customer's fleet
+    /// from ever being bound or refreshed. Their employees keep answering their
+    /// mail with no MCP tools at all, the operator's binding page says
+    /// `pending` forever, and nothing in the logs names the tenant responsible.
+    ///
+    /// Same shape as `a_server_that_never_answers_is_abandoned_rather_than_
+    /// waited_for` and same clock discipline: the connection is made on a real
+    /// clock, so the socket genuinely opens, and the virtual clock is taken only
+    /// once the server has the connection in hand. The outer timeout is what
+    /// turns "this hangs" into "this fails", which is the difference between a
+    /// test that reports a bug and a suite that never finishes.
+    #[tokio::test]
+    async fn a_server_that_accepts_and_says_nothing_does_not_hold_the_binder_forever() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        let accepted = Arc::new(Mutex::new(0_usize));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            // Accept and hold. Never read, never answer, never close: the
+            // failure a *connect* timeout cannot see.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                *counted.lock().expect("not poisoned") += 1;
+                held.push(stream);
+            }
+        });
+
+        let bind = tokio::spawn(async move {
+            McpServer::bind(
+                erp(),
+                &format!("http://{addr}/mcp"),
+                &declared(),
+                Reach::Private,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while *accepted.lock().expect("not poisoned") == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "the binder never reached the server");
+
+        tokio::time::pause();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3600), bind)
+            .await
+            .expect("the bind never gave up at all; one tenant's dead endpoint stops the binder")
+            .expect("the bind panicked")
+            .expect_err("a server that never answers must not be waited on forever");
+
+        assert_eq!(err.code(), "bind_timed_out", "{err}");
+        // Reachable and mute, not unreachable — the accept count is what says
+        // so, and the code has to agree or an operator debugs the wrong end.
+        assert_eq!(*accepted.lock().expect("not poisoned"), 1);
     }
 
     #[tokio::test]

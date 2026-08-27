@@ -278,7 +278,7 @@ pub async fn claim(
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
-    claim_except(conn, None, limit, now).await
+    claim_of(conn, Aggregates::All, limit, now).await
 }
 
 /// [`claim`], minus one aggregate type.
@@ -327,6 +327,128 @@ pub async fn claim_except(
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
+    let filter = skip_aggregate.map_or(Aggregates::All, Aggregates::Except);
+    claim_of(conn, filter, limit, now).await
+}
+
+/// Which aggregate types a poller is willing to take.
+///
+/// Two pollers share `outbox_events` and neither may take the other's rows —
+/// see [`claim_except`] for what a stolen row costs. The enum rather than two
+/// `Option<&str>` arguments because `Only` and `Except` are the two halves of
+/// one partition and a caller that passes both has written a bug the type can
+/// refuse.
+#[derive(Debug, Clone, Copy)]
+pub enum Aggregates<'a> {
+    /// Everything. A deployment running one poller.
+    All,
+    /// Everything but this aggregate type — the general poller.
+    Except(&'a str),
+    /// Only this aggregate type — a specialised poller.
+    Only(&'a str),
+}
+
+/// How many batches' worth of one tenant's queue the claim looks at.
+///
+/// Fairness needs at most `limit` rows per tenant: one claim never returns more
+/// than that, so a deeper look could not change who gets a seat. What the extra
+/// depth buys is **concurrent pollers**. Two replicas claiming at the same
+/// instant against one busy tenant both want a full batch out of the same rows,
+/// and `SKIP LOCKED` can only step over the first poller's locks onto rows the
+/// candidate set actually contains. At 1 the second replica would come back
+/// empty — a throughput cliff that appears the day someone adds a pod.
+///
+/// ponytail: four, so four replicas can each fill a batch from a single tenant
+/// before the fifth comes back short. The ceiling is real and it is a *rate*
+/// limit, not a correctness one — nothing is lost, the next tick takes it. The
+/// upgrade, if a deployment ever runs more pollers than this, is to raise the
+/// number; it costs one index range scan of `limit` more rows per tenant per
+/// tick, against an index that exists for exactly this scan.
+const POLLER_HEADROOM: i64 = 4;
+
+/// [`claim`], restricted to one side of the aggregate partition.
+///
+/// # Round-robin, and why FIFO was the wrong queue discipline
+///
+/// `outbox_events` is one queue for every tenant, and the claim used to order it
+/// `available_at, id` across all of them. Nothing leaks that way and no lock is
+/// held — and a customer's employees still stop working because another customer
+/// is busy. There is no bound on what one tenant may enqueue, this drains 32 at
+/// a time, and `apps/server`'s handlers run one after another with a turn
+/// costing up to `TURN_DEADLINE`. One prospect import is measured in hours of
+/// other people's latency, and it shows up as nothing at all: no error, no
+/// denial, no row out of place. At this product's price that is the same size of
+/// failure as a leak, and it is the one no test in the workspace was making —
+/// every isolation test here proves a *table* hides.
+///
+/// So: **every tenant is offered a seat before any tenant is offered a second
+/// one.** `tenants` drives the selection, one `LATERAL` per tenant takes that
+/// tenant's oldest due rows, `row_number()` numbers the seats within a tenant,
+/// and the outer order is seat-first. A tenant with nothing due contributes
+/// nothing and costs one index probe. A tenant alone on the deployment still
+/// fills the whole batch — round-robin is not equal shares of a queue nobody
+/// else is using.
+///
+/// The lateral is capped, so the scan is `tenants × limit × POLLER_HEADROOM`
+/// index entries at worst and not the whole backlog. `0046_outbox_fair_claim`
+/// is the index it reads, and argues why it is a second one rather than a
+/// widened `outbox_events_due_idx`.
+///
+/// # `shortlist`, and why the lock is not taken in the lateral
+///
+/// Two spellings were measured against 100 000 due rows across 52 tenants,
+/// because both are correct and one of them is expensive in a way the plan does
+/// not advertise:
+///
+/// * `FOR UPDATE SKIP LOCKED` **inside the lateral** needs no shortlist at all
+///   and no headroom — the skip happens per tenant, so a second poller reads
+///   deeper into the index by itself. It also takes a row lock on every
+///   candidate: `tenants × limit` tuple writes to claim `limit` rows, which at
+///   fifty busy tenants is a fiftyfold write amplification on the hottest
+///   statement in the system.
+/// * Locking **once, over a shortlist**, takes exactly `limit` locks. Without
+///   the shortlist the planner joins 6 400 candidates to the table and picks a
+///   hash join over a **sequential scan of the whole queue** — the one plan
+///   this change must not produce. Cutting the candidates down to
+///   `limit × POLLER_HEADROOM` first turns that into a nested loop on the
+///   primary key.
+///
+/// The second, therefore. Measured: index scans throughout, 32 rows locked,
+/// ~7 ms against that backlog, and no plan node that grows with the queue.
+///
+/// # The rest of the statement, unchanged and still load-bearing
+///
+/// * `FOR UPDATE SKIP LOCKED` — concurrent pollers step over each other's
+///   in-flight rows instead of blocking on them. It sits on the `due` CTE
+///   rather than on `seated` because PostgreSQL will not lock a select that
+///   has a window function in it.
+/// * `AS MATERIALIZED` on **every** CTE, and it is not a hint. Written the
+///   obvious way — `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` —
+///   the subplan can be re-executed per outer row, and each re-execution steps
+///   over whichever rows a *concurrent* poller holds locked right then, so the
+///   UPDATE touches the union rather than `$n` rows. The rows stay disjoint
+///   between pollers, so nothing is handled twice; what breaks is the bound.
+///   A poller that claims 16 with a limit of 10 has silently stopped bounding
+///   its own batch, which is the only thing standing between one tick and the
+///   whole table. A single-session test returns exactly `$n` and proves
+///   nothing: the initiative loop's two-poller test caught the same query shape
+///   claiming 13, then 16, against a limit of 10.
+/// * `attempt_count + 1` — counted at claim time, so a worker that is *killed*
+///   mid-handler still burns an attempt.
+/// * `available_at` pushed out by an exponential backoff with jitter — the
+///   lease, which expires by itself.
+pub async fn claim_of(
+    conn: &mut PgConnection,
+    aggregates: Aggregates<'_>,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> Result<Vec<OutboxEvent>, StoreError> {
+    let (only, except) = match aggregates {
+        Aggregates::All => (None, None),
+        Aggregates::Except(kind) => (None, Some(kind)),
+        Aggregates::Only(kind) => (Some(kind), None),
+    };
+
     let rows = sqlx::query(
         // MATERIALIZED, and it is not a hint. Written the obvious way —
         // `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` — the
@@ -341,17 +463,48 @@ pub async fn claim_except(
         // A single-session test returns exactly `$n` and proves nothing. The
         // initiative loop's two-poller test caught the same query shape
         // claiming 13, then 16, against a limit of 10.
-        "WITH due AS MATERIALIZED ( \
-             SELECT id FROM outbox_events \
-             WHERE published_at IS NULL \
-               AND available_at <= $1::timestamptz \
-               AND attempt_count < $2::int \
-               AND ($4::text IS NULL OR aggregate_type <> $4::text) \
-               AND NOT EXISTS (SELECT 1 FROM company_halts h \
-                                WHERE h.tenant_id = outbox_events.tenant_id) \
-             ORDER BY available_at, id \
-             FOR UPDATE SKIP LOCKED \
-             LIMIT $3::bigint) \
+        // **The halt sits on the driver, not on the rows**, and that is a
+        // better place than the one it was written in. `claim_except` used to
+        // filter `NOT EXISTS (… company_halts h WHERE h.tenant_id =
+        // outbox_events.tenant_id)` per candidate row; here the query is driven
+        // by `tenants`, so a stopped company never becomes a seat at all and
+        // its rows are never read. Same refusal, one join earlier.
+        //
+        // It still DEFERS rather than refuses, which is the whole point:
+        // `attempt_count` is incremented at claim time (see `claim_of`'s docs
+        // below), so a halt that let the poller claim and reject would burn
+        // eight attempts and dead-letter every pending piece of the customer's
+        // work — an emergency stop destroying exactly what it exists to
+        // protect. Not selecting the row costs it nothing.
+        "WITH seated AS MATERIALIZED ( \
+             SELECT q.id, q.available_at, q.seat \
+               FROM tenants t \
+               CROSS JOIN LATERAL ( \
+                   SELECT top.id, top.available_at, \
+                          row_number() OVER (ORDER BY top.available_at, top.id) AS seat \
+                     FROM (SELECT e.id, e.available_at \
+                             FROM outbox_events e \
+                            WHERE e.tenant_id = t.id \
+                              AND e.published_at IS NULL \
+                              AND e.available_at <= $1::timestamptz \
+                              AND e.attempt_count < $2::int \
+                              AND ($4::text IS NULL OR e.aggregate_type = $4::text) \
+                              AND ($5::text IS NULL OR e.aggregate_type <> $5::text) \
+                            ORDER BY e.available_at, e.id \
+                            LIMIT $3::bigint * $6::bigint) top \
+               ) q \
+              WHERE NOT EXISTS (SELECT 1 FROM company_halts h \
+                                 WHERE h.tenant_id = t.id) \
+         ), shortlist AS MATERIALIZED ( \
+             SELECT id, seat, available_at FROM seated \
+              ORDER BY seat, available_at, id \
+              LIMIT $3::bigint * $6::bigint \
+         ), due AS MATERIALIZED ( \
+             SELECT e.id \
+               FROM shortlist c JOIN outbox_events e ON e.id = c.id \
+              ORDER BY c.seat, c.available_at, c.id \
+                FOR UPDATE OF e SKIP LOCKED \
+              LIMIT $3::bigint) \
          UPDATE outbox_events AS e \
          SET attempt_count = e.attempt_count + 1, \
              available_at = $1::timestamptz \
@@ -366,7 +519,9 @@ pub async fn claim_except(
     .bind(now)
     .bind(MAX_ATTEMPTS)
     .bind(limit)
-    .bind(skip_aggregate)
+    .bind(only)
+    .bind(except)
+    .bind(POLLER_HEADROOM)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -718,6 +873,64 @@ mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **One company's backlog must not decide when another company's work
+    /// starts.**
+    ///
+    /// This is not a leak and it is not a lock: two tenants that never see a
+    /// byte of each other's data still share one queue, and the claim used to
+    /// order it `available_at, id` across every tenant at once. So the position
+    /// of a customer's event in the queue is a function of *how busy the other
+    /// customers are*, and there is no ceiling on that — the backlog one tenant
+    /// can enqueue is unbounded, while the poller drains a batch of 32 with the
+    /// handlers running one after another, each of them up to `TURN_DEADLINE`.
+    /// A tenant paying three thousand dollars a month can watch its single
+    /// inbound email sit unclaimed for hours because somebody else imported a
+    /// prospect list.
+    ///
+    /// The numbers below are deliberately the smallest that make the point:
+    /// one tenant with more due events than a batch holds, another with one,
+    /// enqueued *after*. Under a FIFO claim the second tenant is not in the
+    /// batch at all. What the claim owes it is a seat, not a place in line.
+    #[tokio::test]
+    async fn one_tenants_backlog_does_not_push_another_tenant_out_of_the_batch() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let busy = seed_tenant(&db, "fair-busy").await;
+        let quiet = seed_tenant(&db, "fair-quiet").await;
+
+        const BATCH: i64 = 8;
+        const BACKLOG: usize = 40;
+
+        for n in 0..BACKLOG {
+            enqueue_committed(&db, busy, &event(n), at(T0)).await;
+        }
+        // One event, enqueued a second later, so FIFO puts it behind all forty.
+        let waiting = enqueue_committed(&db, quiet, &event(0), at(T0 + 1)).await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim(&mut tx, BATCH, at(T0 + 2)).await.expect("claim");
+        tx.commit().await.expect("commit");
+
+        let ids: Vec<Uuid> = claimed.iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), BATCH as usize, "the batch is still bounded");
+        assert!(
+            ids.contains(&waiting),
+            "the quiet tenant's only event was not claimed: one tenant's backlog \
+             decides when another tenant's company gets to act"
+        );
+        // And the busy tenant is not punished for being busy — it still fills
+        // everything the other tenants left. Fair is round-robin, not equal
+        // shares of a queue nobody else is using.
+        assert_eq!(
+            claimed.iter().filter(|e| e.tenant_id == busy).count(),
+            BATCH as usize - 1
+        );
+
+        drop_tenant(&db, busy).await;
+        drop_tenant(&db, quiet).await;
     }
 
     /// Two pollers, one table. The general one must leave the specialised

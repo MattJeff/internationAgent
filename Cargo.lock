@@ -194,6 +194,7 @@ dependencies = [
  "agentos-app",
  "agentos-domain",
  "agentos-store",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",

@@ -1,0 +1,46 @@
+-- 0046_outbox_fair_claim: the index a per-tenant claim needs.
+--
+-- One index, and the whole argument for it is in `crates/store/src/outbox.rs`'s
+-- `claim_of`. The short version:
+--
+-- `outbox_events` is one queue for every tenant in the deployment, and until
+-- this change the claim ordered it `available_at, id` across all of them. That
+-- is first-in-first-out over a shared resource with no ceiling on what one
+-- participant may put in it. A tenant importing a prospect list enqueues
+-- thousands of events; the poller drains 32 at a time and runs the handlers one
+-- after another, each of which may be a full model turn up to `TURN_DEADLINE`.
+-- Another tenant's single inbound email is then not late by a batch, it is late
+-- by *hours*, and nothing about that is visible as an error: no row leaked, no
+-- lock was held, no handler failed. The customer's company simply does not act.
+--
+-- At two to five thousand dollars a month, "your employees stopped working
+-- because another customer is busy" is the same size of failure as a leak, and
+-- it is the one this deployment had no measurement for — every isolation test
+-- in the workspace proves a *table* hides, and none of them had two companies
+-- taking turns at the same moment.
+--
+-- The claim is now round-robin: each tenant is offered a seat before any tenant
+-- is offered a second one. Expressed in SQL that is a `CROSS JOIN LATERAL` from
+-- `tenants` into each tenant's own due rows, and this index is what makes that
+-- lateral an index range scan of at most a batch's worth of rows rather than a
+-- filter over the whole queue.
+--
+-- WHY A SECOND INDEX AND NOT A WIDENED `outbox_events_due_idx`
+--
+-- `outbox_events_due_idx (available_at, id) where published_at is null` still
+-- has a reader with a different shape: `loops::outbox::lag_secs` asks for the
+-- oldest due row across every tenant, which is exactly a leading scan on
+-- `available_at`. Putting `tenant_id` in front of it would turn that question
+-- into a full scan of the partial index. Two indexes on a table whose rows are
+-- deleted as they are published is a cheap way to keep both answers fast.
+--
+-- WHY `attempt_count` IS NOT IN IT
+--
+-- Because it is not selective in the direction that matters. Almost every due
+-- row has `attempt_count < 8`; the ones that do not are dead letters, which are
+-- a bounded population an operator is already being alerted about. Adding the
+-- column would widen every entry to skip a handful of rows.
+
+create index if not exists outbox_events_tenant_due_idx
+  on outbox_events (tenant_id, available_at, id)
+  where published_at is null;

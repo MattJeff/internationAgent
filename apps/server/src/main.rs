@@ -2427,7 +2427,7 @@ mod tests {
     // between the two is a row.
 
     use agentos_app::inbound::land;
-    use agentos_app::mocks::{LlmResponse, ScriptedLlm, Usage};
+    use agentos_app::mocks::{LlmRequest, LlmResponse, ScriptedLlm, Usage};
     use agentos_domain::action::Domain;
     use agentos_domain::employee::Employee;
     use agentos_domain::ids::{ConversationId as ConvId, Slug};
@@ -3303,5 +3303,639 @@ mod tests {
             .expect("service");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Two companies, at the same instant
+    // -----------------------------------------------------------------------
+    //
+    // Every isolation test in this workspace proves that a *table* hides:
+    // `store::db::tenant_tx_hides_other_tenants_rows`,
+    // `knowledge::no_leg_ever_returns_another_tenants_chunk`,
+    // `outbox::a_tenant_cannot_see_another_tenants_pending_events`, and six
+    // more. All of them are true and none of them has ever had two companies
+    // running at once. This one does: two tenants, two org charts, two model
+    // connections, two MCP fleets, two knowledge stores, two inbound messages —
+    // through the real outbox poller, the real binder loop and the real
+    // `Agent::on_turn`, with the two turns held open **at the same instant** by
+    // a barrier inside the shared model client.
+    //
+    // The barrier is the load-bearing part and it is not decoration. Without it
+    // this is two turns one after another, which the workspace could already
+    // do, and every shared-state bug worth having — a cache keyed on the wrong
+    // thing, a cursor, a counter, a fleet resolved once — is invisible when the
+    // two never overlap. With it, a run that cannot overlap does not pass
+    // slowly: it times out and says so.
+    //
+    // # The adversarial choice in the fixture
+    //
+    // Both companies bind their MCP server under the **same handle and the same
+    // tool name**, `erp/ledger`. That is not a contrivance: `agentos_app::catalog`
+    // is a list of connectors every customer picks from, so two customers
+    // connecting GitHub have byte-identical tool handles by construction. And
+    // `allowed_mcp_tools` — the allowlist the gate rules against — is keyed by
+    // that string and nothing else. So the name cannot be what keeps them apart,
+    // and the question "did Alpha's `erp/ledger` reach Alpha's server with
+    // Alpha's token" has exactly one honest answer: the per-tenant `Fleet`, or
+    // nothing.
+
+    /// One process-wide model client, serving both companies, which is the
+    /// arrangement under test.
+    ///
+    /// It answers by *address*, which is the only thing in an `LlmRequest` that
+    /// says whose turn this is — `Agent::on_turn` puts the employee's own
+    /// address in the system prompt. A model that could not tell the two apart
+    /// could not prove anything about either.
+    struct Switchboard {
+        /// Every request, paired with the address it was recognised by. The
+        /// whole request, not a summary: the assertions below scan it for the
+        /// other company's markers and a projection is a place to hide.
+        seen: std::sync::Mutex<Vec<(String, LlmRequest)>>,
+        /// **Nobody answers until both companies have asked.** One `wait` per
+        /// company, taken on that company's first call.
+        both: tokio::sync::Barrier,
+        /// What each address is told to reply, and what it is billed.
+        script: HashMap<String, (String, Usage)>,
+    }
+
+    #[async_trait::async_trait]
+    impl Llm for Switchboard {
+        async fn complete(
+            &self,
+            req: LlmRequest,
+        ) -> Result<LlmResponse, agentos_app::mocks::ProviderError> {
+            let address = self
+                .script
+                .keys()
+                .find(|address| req.system.contains(address.as_str()))
+                .cloned()
+                .expect("a turn whose system prompt names no employee we set up");
+
+            // Scoped, because the guard must not be held across the barrier —
+            // and because holding it there would serialise exactly the overlap
+            // this exists to create.
+            let first = {
+                let mut seen = self.seen.lock().expect("not poisoned");
+                seen.push((address.clone(), req));
+                seen.iter().filter(|(who, _)| *who == address).count() == 1
+            };
+            if first {
+                self.both.wait().await;
+            }
+
+            let (text, usage) = &self.script[&address];
+            Ok(LlmResponse::text(text.clone(), *usage))
+        }
+    }
+
+    impl Switchboard {
+        /// Every request one company's employee made, in order.
+        fn asked_by(&self, address: &str) -> Vec<LlmRequest> {
+            self.seen
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .filter(|(who, _)| who == address)
+                .map(|(_, req)| req.clone())
+                .collect()
+        }
+    }
+
+    /// One customer's whole company, and every string that belongs to it alone.
+    struct Company {
+        tenant: TenantId,
+        employee: EmployeeId,
+        address: String,
+        model: ModelId,
+        /// The MCP endpoint this tenant bound, so the test can ask what
+        /// credential reached it.
+        mcp: agentos_app::mocks::FakeMcpServer,
+        token: String,
+        /// Strings that exist in this company and must exist nowhere in the
+        /// other's turn: its people, its work, its documents, its mail, its
+        /// credential and its identifiers.
+        markers: Vec<String>,
+        /// The one word this company's objective, document and mail all carry.
+        keyword: &'static str,
+    }
+
+    /// Everything that differs between the two companies, in one place, so the
+    /// fixture below reads as "the same company twice with different words".
+    struct Brief {
+        slug: &'static str,
+        domain: &'static str,
+        /// A nonsense word that appears in the objective, the document and the
+        /// message, so the full-text leg of the recall has something to match
+        /// and the cross-contamination scan has something to look for.
+        keyword: &'static str,
+        model: ModelId,
+        token: &'static str,
+        reply: &'static str,
+        usage: Usage,
+    }
+
+    /// Stand a whole customer up on a shared database: tenant, employee,
+    /// charter, policy layer, model connection, MCP binding and credential, one
+    /// document, and one inbound email that leaves a real turn event behind.
+    async fn stand_up(
+        db: &Db,
+        credentials: &agentos_app::mcp::Credentials,
+        brief: &Brief,
+    ) -> Company {
+        // First, because the row below has to name a port that exists. One tool,
+        // `ledger`, the same name the other company's server serves.
+        let mcp = agentos_app::mocks::FakeMcpServer::start(&["ledger"]).await;
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::new_v7(now);
+        let address = format!("{}@{}", brief.slug, brief.domain);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("co-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        // Whose credential pays. `ModelPath::Cli` on a `LlmBackend::Mock` host,
+        // which is the one path that spends nobody's money — see
+        // `agentos_app::model_access` for why the API-key path cannot be
+        // exercised from here without a real Anthropic account.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &agentos_domain::model_access::ModelAccess {
+                path: agentos_domain::model_access::ModelPath::Cli,
+                model: brief.model,
+                verified_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("connect the model");
+
+        let mut employee = Employee::new(
+            employee_id,
+            tenant,
+            Slug::parse(brief.slug).expect("slug"),
+            Domain::parse(brief.domain).expect("domain"),
+            now,
+        );
+        employee
+            .set_lifecycle(Lifecycle::Active, now)
+            .expect("draft to active");
+        employee_store::insert(&mut tx, &employee)
+            .await
+            .expect("insert employee");
+
+        Charter::Purchasing {
+            pack: agentos_app::rolepack::RolePack::international_buyer(),
+            objective: agentos_app::rolepack::Objective {
+                what: format!("{} hex bolts", brief.keyword),
+                quantity: 50_000,
+                max_unit_price: Some(
+                    agentos_domain::money::Money::from_major_str(
+                        "0.21",
+                        agentos_domain::money::Currency::Eur,
+                    )
+                    .expect("a price"),
+                ),
+                delivery_country: Some(
+                    agentos_app::rolepack::CountryCode::parse("de").expect("a country"),
+                ),
+                requirements: vec![format!("{} grade", brief.keyword)],
+            },
+        }
+        .save(&mut tx, employee_id, now)
+        .await
+        .expect("charter the employee");
+
+        // One document, whose only distinguishing word is this company's. The
+        // recall query is the inbound message, which carries the same word, so
+        // the full-text leg of `search_hybrid` has something real to match —
+        // a knowledge assertion over two stores that never retrieve anything
+        // proves nothing about either.
+        knowledge::ingest(
+            &mut tx,
+            Embedder::default(),
+            &knowledge::Document {
+                scope: knowledge::Scope::Company,
+                uri: Some("file://handbook.md"),
+                title: Some("handbook"),
+                format: agentos_app::knowledge::Format::Markdown,
+                trust: agentos_domain::untrusted::TrustLabel::Untrusted,
+                text: &format!(
+                    "{} lead time is four weeks, ex works, and the {} tolerance is h9.",
+                    brief.keyword, brief.keyword
+                ),
+            },
+        )
+        .await
+        .expect("ingest the handbook");
+
+        // The MCP binding: the same handle and the same tool name as the other
+        // company, a different URL, and a different credential. See the section
+        // header for why that is the interesting fixture and not a contrived
+        // one.
+        let sealed = credentials
+            .seal(
+                tenant,
+                &Slug::parse("erp").expect("slug"),
+                Some(brief.token.to_owned()),
+            )
+            .expect("seal the token")
+            .expect("a token was given");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, sealed_token) \
+             VALUES ($1, 'erp', $2, 'private', $3)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(mcp.url())
+        .bind(&sealed)
+        .execute(&mut **tx)
+        .await
+        .expect("insert the binding");
+        sqlx::query(
+            "INSERT INTO mcp_tool_declarations (tenant_id, server, tool, risk) \
+             VALUES ($1, 'erp', 'ledger', 'read')",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("insert the declaration");
+
+        let provider_message_id = ProviderRef::new(format!("email_{}", Uuid::now_v7().simple()));
+        let conversation = agentos_app::inbound::conversation_for(
+            &mut tx,
+            employee_id,
+            Channel::Email,
+            &format!("ap@{}-supplier.example", brief.keyword.to_lowercase()),
+            Some(&format!("RE: {}", brief.keyword)),
+            now,
+        )
+        .await
+        .expect("conversation");
+
+        let body = format!(
+            "What is the {} lead time, and is it still h9?",
+            brief.keyword
+        );
+        let landed = land(
+            &mut tx,
+            &CanonicalMessage {
+                tenant_id: tenant,
+                employee_id,
+                conversation_id: conversation,
+                idempotency_key: CanonicalMessage::dedupe_key(
+                    employee_id,
+                    Channel::Email,
+                    &provider_message_id,
+                ),
+                provider_message_id,
+                channel: Channel::Email,
+                direction: Direction::Inbound,
+                received_at: now,
+                from: Untrusted::new(format!(
+                    "Accounts <ap@{}-supplier.example>",
+                    brief.keyword.to_lowercase()
+                )),
+                subject: Some(Untrusted::new(format!("RE: {}", brief.keyword))),
+                body_text: Untrusted::new(body),
+                attachments: Vec::new(),
+            },
+            now,
+        )
+        .await
+        .expect("land the inbound message");
+        assert!(!landed.duplicate);
+        tx.commit().await.expect("commit the company");
+
+        // The tenant layer: one model, one channel, and the one MCP tool. It
+        // intersects with the ceiling installed above, so what this narrows to
+        // is what the employee actually gets.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                allowed_channels: std::collections::BTreeSet::from([Channel::Email]),
+                allowed_mcp_tools: std::collections::BTreeSet::from([erp_ledger()]),
+                max_new_contacts_per_day: 100,
+                allowed_models: std::collections::BTreeSet::from([brief.model]),
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the tenant policy");
+
+        Company {
+            tenant,
+            employee: employee_id,
+            address: address.clone(),
+            model: brief.model,
+            mcp,
+            keyword: brief.keyword,
+            token: brief.token.to_owned(),
+            markers: vec![
+                brief.slug.to_owned(),
+                brief.domain.to_owned(),
+                address,
+                brief.keyword.to_owned(),
+                brief.token.to_owned(),
+                brief.reply.to_owned(),
+                tenant.as_uuid().to_string(),
+                employee_id.as_uuid().to_string(),
+                conversation.as_uuid().to_string(),
+            ],
+        }
+    }
+
+    fn erp_ledger() -> agentos_domain::action::McpTool {
+        agentos_domain::action::McpTool::new(
+            Slug::parse("erp").expect("slug"),
+            Slug::parse("ledger").expect("slug"),
+        )
+    }
+
+    /// **Two companies take a turn at the same instant, and nothing crosses.**
+    ///
+    /// What it holds open at once: two `Agent::on_turn` calls, on two tenants,
+    /// through one process-wide `Arc<dyn Llm>`, one `Arc<Ports>`, one `Fleets`,
+    /// one vault, one gate, one connection pool and one outbox poller. Neither
+    /// model call returns until both have arrived, so every one of those shared
+    /// objects is being used by both companies at the same moment when the
+    /// assertions are decided.
+    ///
+    /// What it then asserts, in the order the money is at risk:
+    ///
+    /// 1. **The overlap really happened.** A run that serialises the two turns
+    ///    deadlocks on the barrier and fails on the deadline, loudly.
+    /// 2. **Nothing of Bravo's is in Alpha's turn**, and vice versa — scanned
+    ///    over the whole `LlmRequest`, system prompt, tools and messages, for
+    ///    every string that belongs to one company: its employee, its domain,
+    ///    its objective, its documents, its mail, its MCP credential and its
+    ///    three identifiers.
+    /// 3. **The model each turn ran on is its own tenant's**, decided by its own
+    ///    policy layer, not by whichever turn got there first.
+    /// 4. **The tool named `erp/ledger` in Alpha's prompt is Alpha's server**,
+    ///    reached with Alpha's credential and no other — the assertion the
+    ///    name-keyed allowlist cannot make, because both tenants' allowlists
+    ///    contain the identical string.
+    /// 5. **The rows**: messages, audit trail and token ledger, read back under
+    ///    row-level security, are each company's own and each company's whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_companies_take_a_turn_at_the_same_instant_and_nothing_crosses() {
+        let Some((db, admin_url, database)) = own_database("cotenant").await else {
+            return;
+        };
+
+        // No `install_ceiling` here, and the reason is worth writing down
+        // because it is a finding rather than a fixture detail. `policy::install`
+        // maintains the platform layer as the **union** of what every tenant
+        // layer names — `allowed_mcp_tools = platform || excluded`, and the same
+        // for models and channels — so a deployment's one ceiling accumulates
+        // every customer's tool handles by construction. That is correct as a
+        // ceiling (each tenant layer still narrows to its own) and it is the
+        // reason `erp/ledger` below is reachable for both companies at once
+        // without either being able to reach the other's server. In production
+        // the same union is an operator's obligation: `default_ceiling` ships
+        // `allowed_mcp_tools` empty, intersection is what composes the layers,
+        // and a tool no platform layer names is a tool no tenant can call
+        // however well it is bound.
+        let credentials = agentos_app::mcp::Credentials::from_master_key("co-tenancy-master-key");
+        let briefs = [
+            Brief {
+                slug: "lena",
+                domain: "alpha-corp.example",
+                keyword: "ALPHAKEEL",
+                model: ModelId::Haiku45,
+                token: "tok-alpha-9f2c",
+                reply: "Four weeks for ALPHAKEEL, tolerance confirmed.",
+                usage: Usage::new(31, 7, 0),
+            },
+            Brief {
+                slug: "otto",
+                domain: "bravo-corp.example",
+                keyword: "BRAVOKEEL",
+                model: ModelId::Sonnet5,
+                token: "tok-bravo-4d81",
+                reply: "Nine weeks for BRAVOKEEL, tolerance confirmed.",
+                usage: Usage::new(53, 11, 0),
+            },
+        ];
+
+        let mut companies = Vec::new();
+        for brief in &briefs {
+            companies.push(stand_up(&db, &credentials, brief).await);
+        }
+        // The real binder loop, cross-tenant, exactly as `main` spawns it.
+        let cancel = CancellationToken::new();
+        let (fleets, rebinds) = Fleets::new();
+        let binder = tokio::spawn(routes::mcp::run(
+            db.clone(),
+            fleets.clone(),
+            credentials.clone(),
+            rebinds,
+            cancel.clone(),
+        ));
+        let bound = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if companies
+                    .iter()
+                    .all(|c| !fleets.for_tenant(c.tenant).inventory().is_empty())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(bound.is_ok(), "the binder never bound both tenants' fleets");
+
+        let switchboard = Arc::new(Switchboard {
+            seen: std::sync::Mutex::new(Vec::new()),
+            both: tokio::sync::Barrier::new(2),
+            script: companies
+                .iter()
+                .zip(&briefs)
+                .map(|(c, b)| (c.address.clone(), (b.reply.to_owned(), b.usage)))
+                .collect(),
+        });
+
+        // One agent, one poller — the deployment `main` builds. Both companies'
+        // turns come out of this.
+        let agent = Agent {
+            db: db.clone(),
+            llm: switchboard.clone(),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            secrets: agentos_app::mocks::secret_store(),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: fleets.clone(),
+            cancel: cancel.clone(),
+        };
+        let handlers = Handlers::default().on(
+            agentos_app::inbound::TURN_EVENT,
+            Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
+        );
+        let poller = tokio::spawn(loops::outbox::run(db.clone(), handlers, cancel.clone()));
+
+        let answered = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut done = 0;
+                for company in &companies {
+                    let mut tx = db.tenant_tx(company.tenant).await.expect("tx");
+                    let n: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM messages WHERE direction = 'outbound'",
+                    )
+                    .fetch_one(&mut **tx)
+                    .await
+                    .expect("count");
+                    tx.commit().await.expect("commit read");
+                    done += n;
+                }
+                if done == companies.len() as i64 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        cancel.cancel();
+        let _ = poller.await;
+        let _ = binder.await;
+
+        assert!(
+            answered.is_ok(),
+            "the two companies never took a turn at the same time: each model call \
+             waits for the other company's, so a deployment that runs one tenant's \
+             turn to completion before starting another's deadlocks here. That is \
+             not a test artefact — it is what a customer's inbound email does \
+             while somebody else's employee is thinking."
+        );
+
+        // -- 2. nothing of one company's is in the other's turn --------------
+        for (mine, theirs) in [(0, 1), (1, 0)] {
+            let (mine, theirs) = (&companies[mine], &companies[theirs]);
+            let asked = switchboard.asked_by(&mine.address);
+            assert_eq!(asked.len(), 1, "{} took more than one turn", mine.address);
+            let request = &asked[0];
+            let whole = format!("{request:?}");
+
+            for marker in &theirs.markers {
+                assert!(
+                    !whole.contains(marker.as_str()),
+                    "{}'s turn carried {marker:?}, which belongs to {}",
+                    mine.address,
+                    theirs.address
+                );
+            }
+            // And it did get its own — otherwise the scan above passes on an
+            // empty prompt.
+            assert!(whole.contains(&mine.address), "{whole}");
+            assert!(
+                whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
+                "{}'s turn did not recall its own document, so the scan above \
+                 proves nothing about the other company's: {whole}",
+                mine.address
+            );
+
+            // -- 3. its own model, from its own policy layer -----------------
+            assert_eq!(
+                request.model,
+                mine.model.as_str(),
+                "{} ran on a model its own policy layer did not choose",
+                mine.address
+            );
+
+            // -- 4. the same tool name, a different server -------------------
+            assert!(
+                request.system.contains("erp/ledger"),
+                "{}'s prefix does not name the tool it bound: {}",
+                mine.address,
+                request.system
+            );
+        }
+
+        // The credential each endpoint actually received. Both bindings are
+        // `erp/ledger`; only the fleet keeps them apart.
+        for (mine, theirs) in [(0, 1), (1, 0)] {
+            let (mine, theirs) = (&companies[mine], &companies[theirs]);
+            let seen = mine.mcp.authorizations();
+            assert!(
+                !seen.is_empty(),
+                "{}'s mcp endpoint was never contacted",
+                mine.address
+            );
+            assert!(
+                seen.iter().all(|h| h.contains(&mine.token)),
+                "{}'s endpoint was sent a credential that is not its own: {seen:?}",
+                mine.address
+            );
+            assert!(
+                seen.iter().all(|h| !h.contains(&theirs.token)),
+                "{}'s endpoint was sent {}'s credential: {seen:?}",
+                mine.address,
+                theirs.address
+            );
+        }
+
+        // -- 5. the rows -----------------------------------------------------
+        for (mine, theirs) in [(0, 1), (1, 0)] {
+            let (mine, theirs) = (&companies[mine], &companies[theirs]);
+            let mut tx = db.tenant_tx(mine.tenant).await.expect("tx");
+
+            let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count");
+            assert_eq!(
+                messages, 2,
+                "{} sees a message that is not its own",
+                mine.address
+            );
+
+            // The whole audit trail as text, not a projection: the question is
+            // whether anything of the other company is in it anywhere.
+            let audit: Vec<String> =
+                sqlx::query_scalar("SELECT to_jsonb(a)::text FROM audit_log a")
+                    .fetch_all(&mut **tx)
+                    .await
+                    .expect("audit");
+            let audit = audit.join("\n");
+            for marker in &theirs.markers {
+                assert!(
+                    !audit.contains(marker.as_str()),
+                    "{}'s audit trail names {marker:?}, which belongs to {}",
+                    mine.address,
+                    theirs.address
+                );
+            }
+
+            let consumed = model_usage::on_day(&mut tx, mine.employee, Utc::now().date_naive())
+                .await
+                .expect("the ledger");
+            tx.commit().await.expect("commit read");
+
+            let usage = briefs
+                .iter()
+                .find(|b| mine.address.starts_with(b.slug))
+                .expect("a brief")
+                .usage;
+            assert_eq!(
+                (consumed.input_tokens, consumed.output_tokens),
+                (
+                    i64::try_from(usage.input_tokens).expect("small"),
+                    i64::try_from(usage.output_tokens).expect("small"),
+                ),
+                "{}'s bill is not exactly its own turn: a counter shared with the \
+                 other company would show here",
+                mine.address
+            );
+        }
+
+        drop_database(db, admin_url, database).await;
     }
 }

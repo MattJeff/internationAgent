@@ -54,6 +54,8 @@ use agentos_app::inbound::NOTICE_AGGREGATE;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, MAX_ATTEMPTS, OutboxEvent};
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -154,14 +156,43 @@ pub async fn run(db: Db, handlers: Handlers, cancel: CancellationToken) {
     tracing::info!("outbox poller stopped");
 }
 
+/// How many tenants' work this poller runs at once.
+///
+/// **One, until this constant existed, and that was a cross-tenant outage with
+/// no error in it.** The batch used to be handled with a plain `for` loop, on
+/// the argument that "a batch of 32 sequential handlers is a few seconds". That
+/// was true when every handler was a database write. It stopped being true when
+/// `agent.turn.requested` joined the table: a turn is a model call and
+/// `TURN_DEADLINE` is 120 seconds, so a full batch is up to an hour of one
+/// replica doing nothing else. Every tenant behind the first one in that batch
+/// waits — for work that has nothing to do with them, on a customer's own
+/// inbound email, with no denial, no failure and nothing in the trail that says
+/// why. At two to five thousand dollars a month that is the same size of failure
+/// as a leak. `agentos_store::outbox::claim_of` made the *queue order* fair;
+/// this is what stops one tenant's turn from holding the worker.
+///
+/// **Concurrent across tenants, sequential within one.** That keeps the reason
+/// the loop was sequential in the first place, and it was a good reason: the
+/// events in one batch frequently touch the same employee, and running those
+/// against each other buys latency and pays for it in write conflicts. Two
+/// different companies have no rows in common by construction.
+///
+/// ponytail: four, and the ceiling is the connection pool — `Db::connect` opens
+/// sixteen for the whole process, one turn holds its handler's transaction open
+/// for its whole length and takes a second for the knowledge recall, and the
+/// other three loops and every HTTP handler draw from the same sixteen. Four is
+/// what leaves room for them. Raise it and raise `max_connections` in the same
+/// commit, or the symptom is a pool acquire timeout that looks like a database
+/// problem and is not.
+const MAX_CONCURRENT_TENANTS: usize = 4;
+
 /// One pass: claim a batch and handle it. Returns how many events were claimed.
 ///
-/// Handlers run one after another. ponytail: a batch of 32 sequential handlers
-/// is a few seconds, and the events in one batch frequently touch the same
-/// employee, so concurrency here would buy latency and pay for it in write
-/// conflicts. The upgrade, when a single tenant's fan-out justifies it, is a
-/// `JoinSet` with a semaphore — not a second poller, which already works.
-async fn tick(db: &Db, handlers: &Handlers, now: DateTime<Utc>) -> Result<usize, StoreError> {
+/// One task per tenant in the batch, that tenant's events in order inside it,
+/// at most [`MAX_CONCURRENT_TENANTS`] running at once. The pass does not return
+/// until every one of them has finished, which is what keeps the next claim from
+/// overlapping the last — see [`run`].
+async fn tick(db: &Db, handlers: &Arc<Handlers>, now: DateTime<Utc>) -> Result<usize, StoreError> {
     let mut tx = db.admin_tx_bypassing_rls().await?;
     // Everything except the inbound loop's rows. The two pollers share one
     // table and only one of them has handlers for a webhook notice; claiming
@@ -171,23 +202,61 @@ async fn tick(db: &Db, handlers: &Handlers, now: DateTime<Utc>) -> Result<usize,
     let batch = outbox::claim_except(&mut tx, Some(NOTICE_AGGREGATE), BATCH, now).await?;
     // Commit the lease before the first handler runs. See the module docs.
     tx.commit().await?;
+    let claimed = batch.len();
 
-    for event in &batch {
-        // `instrument`, not `span.enter()`: a guard held across an await is on
-        // whatever task the executor resumes next.
-        let span = tracing::info_span!(
-            "outbox_event",
-            event_id = %event.id,
-            tenant_id = %event.tenant_id,
-            event_type = %event.event_type,
-            attempt = event.attempt_count,
-            // Carried in the payload rather than a column so it survives every
-            // hop; this is where async work rejoins the caller's trace.
-            traceparent = event.traceparent().unwrap_or_default(),
-        );
-        handle(db, handlers, event).instrument(span).await;
+    // Grouped rather than sorted: a `HashMap` keyed on the tenant keeps each
+    // tenant's events in the order the claim returned them, which is the order
+    // they were enqueued in, and that ordering is the whole of what "sequential
+    // within a tenant" has to preserve.
+    let mut by_tenant: HashMap<agentos_domain::ids::TenantId, Vec<OutboxEvent>> = HashMap::new();
+    for event in batch {
+        by_tenant.entry(event.tenant_id).or_default().push(event);
     }
-    Ok(batch.len())
+
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_TENANTS));
+    let mut running = JoinSet::new();
+    for events in by_tenant.into_values() {
+        let db = db.clone();
+        let handlers = Arc::clone(handlers);
+        let permits = Arc::clone(&permits);
+        running.spawn(async move {
+            // Taken inside the task rather than before the spawn, so the queue
+            // of waiting tenants is the semaphore's and not this function's.
+            // `expect`: the semaphore is never closed, it is dropped with this
+            // pass.
+            let _permit = permits.acquire_owned().await.expect("never closed");
+            for event in &events {
+                // `instrument`, not `span.enter()`: a guard held across an await
+                // is on whatever task the executor resumes next.
+                let span = tracing::info_span!(
+                    "outbox_event",
+                    event_id = %event.id,
+                    tenant_id = %event.tenant_id,
+                    event_type = %event.event_type,
+                    attempt = event.attempt_count,
+                    // Carried in the payload rather than a column so it survives
+                    // every hop; this is where async work rejoins the caller's
+                    // trace.
+                    traceparent = event.traceparent().unwrap_or_default(),
+                );
+                handle(&db, &handlers, event).instrument(span).await;
+            }
+        });
+    }
+
+    // Drained rather than abandoned. A pass that returned early would let the
+    // next claim run beside handlers that are still going, and the batch bound
+    // this loop is built around would stop bounding anything.
+    while let Some(finished) = running.join_next().await {
+        if let Err(err) = finished {
+            // A handler panicked. `handle` itself cannot — every failure path in
+            // it records and returns — so this is a bug in a registered handler,
+            // and the event is left to its lease rather than taking the poller
+            // down with it.
+            tracing::error!(error = %err, "an outbox handler task panicked; its events keep their lease");
+        }
+    }
+    Ok(claimed)
 }
 
 /// Dispatch one claimed event and record what happened.
@@ -522,14 +591,18 @@ mod tests {
 
         for attempt in 1..=MAX_ATTEMPTS {
             assert_eq!(
-                tick(&db, &handlers, now).await.expect("tick"),
+                tick(&db, &Arc::new(handlers.clone()), now)
+                    .await
+                    .expect("tick"),
                 1,
                 "attempt {attempt} should have claimed the event"
             );
             // Immediately again, at the same instant: if it is claimable now,
             // the backoff did not happen and this loop is a hot loop.
             assert_eq!(
-                tick(&db, &handlers, now).await.expect("tick"),
+                tick(&db, &Arc::new(handlers.clone()), now)
+                    .await
+                    .expect("tick"),
                 0,
                 "attempt {attempt} did not back off"
             );
@@ -541,7 +614,7 @@ mod tests {
 
         // Attempts spent. No poller will ever pick it up again, even a year on.
         assert_eq!(
-            tick(&db, &handlers, now + TimeDelta::days(365))
+            tick(&db, &Arc::new(handlers.clone()), now + TimeDelta::days(365))
                 .await
                 .expect("tick"),
             0,
@@ -577,7 +650,12 @@ mod tests {
 
         let now = Utc::now();
         let id = enqueue(&db, tenant, 1, now).await;
-        assert_eq!(tick(&db, &Handlers::default(), now).await.expect("tick"), 1);
+        assert_eq!(
+            tick(&db, &Arc::new(Handlers::default()), now)
+                .await
+                .expect("tick"),
+            1
+        );
 
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         let (last_error, published_at): (Option<String>, Option<DateTime<Utc>>) =
@@ -653,7 +731,7 @@ mod tests {
 
         let killed = tokio::spawn({
             let (db, handlers) = (db.clone(), handlers.clone());
-            async move { tick(&db, &handlers, now).await }
+            async move { tick(&db, &Arc::new(handlers.clone()), now).await }
         });
         entered.notified().await;
         killed.abort();
@@ -731,7 +809,7 @@ mod tests {
         let seen: Seen = Arc::default();
         let recovered = Handlers::default().on(EVENT, recorder(&seen));
         assert_eq!(
-            tick(&db, &recovered, now + TimeDelta::hours(2))
+            tick(&db, &Arc::new(recovered.clone()), now + TimeDelta::hours(2))
                 .await
                 .expect("tick"),
             1,
@@ -776,7 +854,7 @@ mod tests {
         let second: Seen = Arc::default();
         let handlers = Handlers::default().on(EVENT, recorder(&second));
         assert_eq!(
-            tick(&db, &handlers, now + TimeDelta::days(30))
+            tick(&db, &Arc::new(handlers.clone()), now + TimeDelta::days(30))
                 .await
                 .expect("tick"),
             0
@@ -813,7 +891,12 @@ mod tests {
         // Draining the queue clears it...
         let seen: Seen = Arc::default();
         let handlers = Handlers::default().on(EVENT, recorder(&seen));
-        assert_eq!(tick(&db, &handlers, Utc::now()).await.expect("tick"), 2);
+        assert_eq!(
+            tick(&db, &Arc::new(handlers.clone()), Utc::now())
+                .await
+                .expect("tick"),
+            2
+        );
         assert_eq!(lag_secs(&db).await.expect("lag"), 0);
         assert!(published(&db, stale).await);
 
