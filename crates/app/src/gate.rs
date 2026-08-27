@@ -19,6 +19,17 @@
 //!
 //! # The order of operations, and why it is that order
 //!
+//! 0. **The company before the seat.** If a human has stopped the whole
+//!    company ([`agentos_store::halt`]), nothing is authorised and no policy is
+//!    read. This is the same rule as (1) one level up, and it is read *here*
+//!    rather than at the start of a turn for the reason that makes it worth
+//!    anything: a turn is up to ten model calls and twenty effects long, so a
+//!    flag checked when the turn woke can still pay an invoice half a minute
+//!    after somebody said stop. Read at the door, it cannot — the mint of an
+//!    [`Authorized`] and the provider call that spends it are adjacent awaits
+//!    (`crate::turn`'s `gated!`), so a halt that commits before the ruling
+//!    refuses the ruling, and one that commits after has, at worst, one
+//!    already-dispatched HTTP request to outlive.
 //! 1. **Lifecycle before policy.** A suspended employee is refused before any
 //!    policy is read. A suspension implemented as "remove its permissions"
 //!    leaves behind exactly the permissions nobody remembered to remove.
@@ -88,6 +99,7 @@ use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::halt;
 use agentos_store::org::{self, TeamSpendRefused};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
 use agentos_store::spend::{CapExceeded, Reservation};
@@ -310,6 +322,18 @@ impl RedemptionFailure {
 /// dashboard that silently stops counting.
 #[derive(Debug, thiserror::Error)]
 pub enum Denied {
+    /// A human has stopped the whole company. Refused before the employee is
+    /// even looked up, let alone its policy read.
+    ///
+    /// Carries the reason the operator gave, because this refusal is the one
+    /// somebody will be reading out loud while a customer is on the phone, and
+    /// "denied" without "because your CFO called us at 14:02" is a support
+    /// ticket. It is an operator's own sentence, never a model's, and never a
+    /// counterparty's: `routes::halt` takes it from an authenticated request
+    /// body and nothing else writes the row.
+    #[error("the company is stopped: {0}")]
+    Halted(String),
+
     /// The employee is not [`Lifecycle::Active`]. Refused before any policy is
     /// consulted.
     #[error("employee is {0}, not active")]
@@ -351,6 +375,7 @@ impl Denied {
     /// Stable, low-cardinality metric label.
     pub const fn code(&self) -> &'static str {
         match self {
+            Denied::Halted(_) => audit::COMPANY_HALTED,
             Denied::NotActive(_) => "employee_not_active",
             Denied::UnknownEmployee => "unknown_employee",
             Denied::Policy(reason) => reason.code(),
@@ -397,9 +422,17 @@ pub struct PolicyGate {
 /// decays into "most outcomes are audited".
 #[derive(Debug)]
 enum Outcome {
-    Allow { reservation: Option<Reservation> },
+    Allow {
+        reservation: Option<Reservation>,
+    },
     Deny(DenyReason),
-    Approval { id: ApprovalId, decision: Decision },
+    /// The whole company is stopped. Carries the operator's reason so the audit
+    /// row and the refusal say the same sentence.
+    Halted(String),
+    Approval {
+        id: ApprovalId,
+        decision: Decision,
+    },
     NotActive(Lifecycle),
     UnknownEmployee,
     BrokenPolicy(PolicyLoadError),
@@ -474,13 +507,28 @@ impl PolicyGate {
             json!(approval_id.as_uuid().to_string()),
         );
 
-        let outcome = match self.lifecycle(&mut tx, principal).await? {
-            Some(Lifecycle::Active) => {
-                self.redeem(&mut tx, principal, approval_id, nonce, &subject, now)
-                    .await?
-            }
-            Some(other) => Outcome::NotActive(other),
-            None => Outcome::UnknownEmployee,
+        // The company, before the seat and before the human's click is spent.
+        //
+        // **This is the arm that makes a halt mean anything at all.** A pending
+        // approval is a permission a policy already granted, parked until a
+        // person presses a button — so an approval filed at 09:00 is a live
+        // effect somebody can still release at 14:03, one minute after the
+        // company was stopped, without any code in `decide` ever running. The
+        // approval survives: it is refused, not consumed, and the same nonce
+        // works the moment the halt is lifted. Refusing here rather than
+        // burning it is deliberate — a halt that quietly destroyed every
+        // pending approval would make the release the expensive half of the
+        // switch.
+        let outcome = match halt::halted(&mut tx).await.map_err(Denied::Unavailable)? {
+            Some(halt) => Outcome::Halted(halt.reason),
+            None => match self.lifecycle(&mut tx, principal).await? {
+                Some(Lifecycle::Active) => {
+                    self.redeem(&mut tx, principal, approval_id, nonce, &subject, now)
+                        .await?
+                }
+                Some(other) => Outcome::NotActive(other),
+                None => Outcome::UnknownEmployee,
+            },
         };
 
         self.finish(tx, principal, &subject, action, outcome, now, extra)
@@ -515,6 +563,7 @@ impl PolicyGate {
                 _seal: seal::Seal::new(),
             }),
             Outcome::Deny(reason) => Err(Denied::Policy(reason)),
+            Outcome::Halted(reason) => Err(Denied::Halted(reason)),
             Outcome::Approval { id, .. } => Err(Denied::PendingApproval(id)),
             Outcome::NotActive(lifecycle) => Err(Denied::NotActive(lifecycle)),
             Outcome::UnknownEmployee => Err(Denied::UnknownEmployee),
@@ -535,6 +584,22 @@ impl PolicyGate {
         trust: TrustLabel,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
+        // 0. The company, before anything at all. One row by primary key, in
+        //    this transaction, with no cache between the switch and the ruling
+        //    — so the promise a customer is given is "the next decision", and
+        //    "the next decision" is a number of seconds rather than a cache
+        //    lifetime.
+        //
+        //    Read through `tx`, which is pinned to this tenant, so row-level
+        //    security is what guarantees one company cannot stop another: the
+        //    only row this statement can see is its own tenant's, whatever the
+        //    query says. `crates/app/src/gate.rs`'s
+        //    `one_company_s_halt_does_not_touch_another_s` is that claim
+        //    against a real database.
+        if let Some(halt) = halt::halted(tx).await.map_err(Denied::Unavailable)? {
+            return Ok(Outcome::Halted(halt.reason));
+        }
+
         // 1. Lifecycle, before anything else is read. A suspended employee
         //    must not be able to act through a permission somebody forgot to
         //    revoke.
@@ -986,6 +1051,16 @@ fn audit_event(
         }
         Outcome::UnknownEmployee => {
             payload.insert(DENIED_KEY.to_owned(), json!("unknown_employee"));
+            None
+        }
+        // The row that answers "what did not happen while we were stopped".
+        // `agentos_store::halt::refused_since` counts exactly these, and the
+        // action kind, the counterparty and the employee are already on this
+        // same row — so the list a customer asks for after the incident is one
+        // query against a trail that was going to be written anyway.
+        Outcome::Halted(reason) => {
+            payload.insert(DENIED_KEY.to_owned(), json!(audit::COMPANY_HALTED));
+            payload.insert("halt_reason".to_owned(), json!(reason));
             None
         }
         Outcome::BrokenPolicy(err) => {
@@ -2142,5 +2217,250 @@ mod tests {
             )
             .is_allow()
         );
+    }
+
+    // -- the company-wide stop ---------------------------------------------
+
+    /// Stop the company, the way `routes::halt` does.
+    async fn stop(db: &Db, principal: &Principal, reason: &str) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        halt::place(&mut tx, reason, "operator:ops-console", Utc::now())
+            .await
+            .expect("place the halt")
+            .expect("it was not already halted");
+        tx.commit().await.expect("commit the halt");
+    }
+
+    /// Let it run again.
+    async fn resume(db: &Db, principal: &Principal) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        halt::release(&mut tx)
+            .await
+            .expect("release the halt")
+            .expect("it was halted");
+        tx.commit().await.expect("commit the release");
+    }
+
+    /// **The switch.** The same action, the same policy, the same employee: it
+    /// is allowed, then the company is stopped and it is refused, then the
+    /// company is released and it is allowed again.
+    ///
+    /// The policy is installed and never touched, which is the half that makes
+    /// this a *halt* rather than a permission edit — the ruling flips twice
+    /// while `policy_layers` holds still.
+    #[tokio::test]
+    async fn a_halt_refuses_what_the_policy_allows_and_the_release_gives_it_back() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = gate(&db, &principal).await;
+
+        gate.authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect("email is allowed while the company is running");
+
+        stop(&db, &principal, "the CFO called: stop everything").await;
+
+        let err = gate
+            .authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect_err("a stopped company authorises nothing");
+        assert!(
+            matches!(&err, Denied::Halted(reason) if reason == "the CFO called: stop everything"),
+            "the refusal carries the operator's own sentence: {err:?}"
+        );
+        assert_eq!(err.code(), audit::COMPANY_HALTED);
+
+        resume(&db, &principal).await;
+
+        gate.authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect("the release gives back exactly what the halt took");
+    }
+
+    /// A halt is refused *before* the policy is read, the same way a suspension
+    /// is — and the audit row proves which refusal it was.
+    ///
+    /// The employee here is `draft`, so a gate that consulted the lifecycle
+    /// first would answer `employee_not_active`. It answers `company_halted`,
+    /// which is only possible if the halt was read before anything about the
+    /// seat was.
+    #[tokio::test]
+    async fn the_halt_is_read_before_the_employee_and_before_the_policy() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "draft").await;
+        let gate = gate(&db, &principal).await;
+        stop(&db, &principal, "runaway agent").await;
+
+        let err = gate
+            .authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect_err("stopped");
+        assert_eq!(
+            err.code(),
+            audit::COMPANY_HALTED,
+            "the company is read before the seat, so a draft employee in a stopped \
+             company is refused for the company: {err:?}"
+        );
+
+        let rows = audit_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "exactly one audit row: {rows:?}");
+        assert_eq!(rows[0].2[DENIED_KEY], json!(audit::COMPANY_HALTED));
+        assert_eq!(rows[0].2["halt_reason"], json!("runaway agent"));
+        assert_eq!(
+            rows[0].2[COUNTERPARTY_KEY],
+            json!("supplier@example.com"),
+            "the counterparty is still recorded: `what did not happen, and to whom` \
+             is the question after the incident"
+        );
+    }
+
+    /// **The hard constraint: one tenant can never stop another.**
+    ///
+    /// Two companies, one halted. The other's identical action is still
+    /// allowed. This is not a `WHERE` clause being right — `company_halts` has
+    /// row-level security forced, and the gate reads it through a `tenant_tx`,
+    /// so the halted row is not merely filtered out of the other company's
+    /// query, it is invisible to it.
+    #[tokio::test]
+    async fn one_company_s_halt_does_not_touch_another_s() {
+        let Some(db) = db().await else { return };
+        let stopped = seed(&db, "active").await;
+        let running = seed(&db, "active").await;
+        let stopped_gate = gate(&db, &stopped).await;
+        let running_gate = gate(&db, &running).await;
+
+        stop(&db, &stopped, "not your company").await;
+
+        let err = stopped_gate
+            .authorize(&stopped, email("supplier@example.com"))
+            .await
+            .expect_err("its own company is stopped");
+        assert_eq!(err.code(), audit::COMPANY_HALTED);
+
+        running_gate
+            .authorize(&running, email("supplier@example.com"))
+            .await
+            .expect("a neighbour's emergency is not this company's emergency");
+
+        // And the neighbour cannot even see the row, let alone be stopped by
+        // it: RLS, not a filter.
+        let mut tx = db.tenant_tx(running.tenant_id).await.expect("tx");
+        assert_eq!(
+            halt::halted(&mut tx).await.expect("read"),
+            None,
+            "the other company's halt is invisible from here"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **The pending-approval hole, closed.** A human approval is a permission
+    /// the policy already granted, parked until somebody clicks — so it reaches
+    /// the world through `redeem_approval`, which never calls `decide` and would
+    /// therefore have walked straight past a halt installed only there.
+    ///
+    /// And the approval *survives*: refused, not consumed, so the same nonce
+    /// works the moment the company is released. A halt that destroyed every
+    /// pending approval would make coming back up the expensive half.
+    #[tokio::test]
+    async fn a_halt_refuses_an_approval_without_burning_it() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        // €250 per transaction, human above €200: a €210 payment escalates.
+        let gate = gate(&db, &principal).await;
+        give_caps(&db, &principal, 100_000, 100_000).await;
+
+        let Err(Denied::PendingApproval(id)) = gate.authorize(&principal, payment(21_000)).await
+        else {
+            panic!("a payment above the approval threshold should have been escalated");
+        };
+        let nonce = nonce_of(&db, &principal, id).await;
+
+        stop(&db, &principal, "stop everything").await;
+
+        let err = gate
+            .redeem_approval(&principal, id, &nonce, payment(21_000))
+            .await
+            .expect_err("a stopped company does not let a human spend an approval");
+        assert_eq!(
+            err.code(),
+            audit::COMPANY_HALTED,
+            "and it is refused for the halt, not for the approval: {err:?}"
+        );
+
+        resume(&db, &principal).await;
+
+        gate.redeem_approval(&principal, id, &nonce, payment(21_000))
+            .await
+            .expect("the approval was refused, not burned: the same nonce still works");
+    }
+
+    /// **Nothing widens, in either direction.** The effective policy is read
+    /// before the halt, during it, and after the release, and all three are the
+    /// same value.
+    ///
+    /// This is the property the whole design turns on and the reason a halt is
+    /// not an empty policy layer: halting writes no `policy_layers` row, so
+    /// releasing has no saved copy to restore wrong. A halt implemented as
+    /// "install an empty tenant layer" would make this test's third read depend
+    /// on code remembering what the company used to be allowed to do.
+    #[tokio::test]
+    async fn a_halt_and_its_release_do_not_move_one_number_in_the_policy() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let _gate = gate(&db, &principal).await;
+
+        async fn effective(db: &Db, principal: &Principal) -> agentos_domain::policy::PolicyLimits {
+            let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+            let policy = policy_store::load(&mut tx, principal.employee_id)
+                .await
+                .expect("load");
+            tx.rollback().await.expect("rollback");
+            policy.limits().clone()
+        }
+
+        let before = effective(&db, &principal).await;
+        stop(&db, &principal, "stop").await;
+        let during = effective(&db, &principal).await;
+        resume(&db, &principal).await;
+        let after = effective(&db, &principal).await;
+
+        assert_eq!(before, during, "a halt is not a policy edit");
+        assert_eq!(
+            before, after,
+            "and a release restores nothing, because it took nothing away"
+        );
+    }
+
+    /// Re-halting says so rather than overwriting the first operator's reason,
+    /// and releasing a running company says so rather than reporting success.
+    ///
+    /// Both matter for the same reason: two people reach for this switch in the
+    /// same minute, and the one whose sentence is on the record must be the one
+    /// the record names.
+    #[tokio::test]
+    async fn the_switch_is_honest_about_what_it_did_not_do() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        assert!(
+            halt::release(&mut tx).await.expect("release").is_none(),
+            "releasing a company that is running changed nothing"
+        );
+        halt::place(&mut tx, "first", "operator:alice", Utc::now())
+            .await
+            .expect("place")
+            .expect("it was running");
+        assert!(
+            halt::place(&mut tx, "second", "operator:bob", Utc::now())
+                .await
+                .expect("place")
+                .is_none(),
+            "the second caller is told it changed nothing"
+        );
+        let held = halt::halted(&mut tx).await.expect("read").expect("halted");
+        assert_eq!(held.reason, "first", "the first operator's reason stands");
+        assert_eq!(held.halted_by, "operator:alice");
+        tx.rollback().await.expect("rollback");
     }
 }

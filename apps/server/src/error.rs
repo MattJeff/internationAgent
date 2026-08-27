@@ -256,6 +256,25 @@ impl From<Denied> for ApiError {
                 )
             }
             Denied::UnknownEmployee => Self::not_found(),
+            // 409 and not 403, because the two mean different things to whoever
+            // is looking at the console at the time. A 403 says "this seat may
+            // not do this", and the remedy is a policy. This says "the company
+            // is stopped", and the remedy is one `DELETE /v1/halt` by whoever
+            // stopped it — a state of the tenant, which is what Conflict is
+            // for. It also keeps an emergency stop out of the same bucket as
+            // every ordinary budget refusal on the dashboard.
+            //
+            // The reason crosses, unlike the shape of a policy. It is an
+            // operator of *this* tenant telling their own console why their own
+            // company is stopped, so there is nothing here for it to leak to,
+            // and a refusal that cannot say "because you stopped us at 14:02"
+            // is a page somebody escalates.
+            Denied::Halted(reason) => Self::new(
+                StatusCode::CONFLICT,
+                code,
+                "the company has been stopped by an operator",
+            )
+            .with_extension("halt_reason", json!(reason)),
             Denied::PendingApproval(id) => Self::new(
                 StatusCode::FORBIDDEN,
                 code,

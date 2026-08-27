@@ -502,6 +502,7 @@ fn app(
         Router::new()
             .route("/v1/whoami", get(whoami))
             .merge(routes::employees::router(db.clone()))
+            .merge(routes::halt::router(db.clone()))
             .merge(routes::initiative::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could

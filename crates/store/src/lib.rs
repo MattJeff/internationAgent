@@ -7,6 +7,7 @@ pub mod approvals; // U13
 pub mod audit; // U11
 pub mod db; // U6
 pub mod employee; // U7
+pub mod halt; // wave J: the switch that stops a whole company
 pub mod idempotency; // U10
 pub mod initiative;
 pub mod knowledge; // U14

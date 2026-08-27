@@ -3,6 +3,7 @@ pub mod approvals;
 pub mod autonomy;
 pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
+pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod initiative;
 pub mod inventory;
 pub mod knowledge;

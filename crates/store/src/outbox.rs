@@ -295,6 +295,32 @@ pub async fn claim(
 ///
 /// `None` claims everything, which is what a deployment running a single poller
 /// wants.
+///
+/// # A stopped company's rows are not claimed at all
+///
+/// Both spellings skip any tenant with a row in `company_halts`, and the
+/// **not** in "not claimed" is the whole point: a deferred row burns no
+/// attempt, so a halt costs the customer nothing. Refusing the work inside the
+/// handler instead would look identical for four minutes and then destroy
+/// everything — `attempt_count` is incremented *at claim time*, the backoff is
+/// `2^n` seconds, and eight of those is about five minutes. Any halt longer
+/// than a coffee break would dead-letter every turn the company had pending,
+/// and the release would come back to an empty queue and a customer's
+/// unanswered mail in `dead_letters`. That is the exact failure this function's
+/// own doc-comment above already describes for the notice poller, arriving by a
+/// second road.
+///
+/// So the rows wait, in order, and the release makes them all due at once. This
+/// is also what stops the one un-gated real-world effect the drain performs —
+/// `employee.terminated`, whose handler cancels mailboxes and phone numbers at
+/// the providers with no [`crate::audit`] decision behind it — from running
+/// while a company is stopped. `PolicyGate` cannot refuse that one, because it
+/// never asks it.
+///
+/// The poller connects as the owning role and drains every tenant by
+/// definition, so this reads across tenants exactly as the surrounding query
+/// does. The correlated `tenant_id` is what keeps one company's halt to one
+/// company's rows.
 pub async fn claim_except(
     conn: &mut PgConnection,
     skip_aggregate: Option<&str>,
@@ -321,6 +347,8 @@ pub async fn claim_except(
                AND available_at <= $1::timestamptz \
                AND attempt_count < $2::int \
                AND ($4::text IS NULL OR aggregate_type <> $4::text) \
+               AND NOT EXISTS (SELECT 1 FROM company_halts h \
+                                WHERE h.tenant_id = outbox_events.tenant_id) \
              ORDER BY available_at, id \
              FOR UPDATE SKIP LOCKED \
              LIMIT $3::bigint) \
@@ -925,5 +953,100 @@ mod tests {
 
         drop_tenant(&db, a).await;
         drop_tenant(&db, b).await;
+    }
+
+    // -- the company-wide stop ---------------------------------------------
+
+    /// **A stopped company's work waits; it is not destroyed.**
+    ///
+    /// This is the test that stands between a halt and a support incident.
+    /// `attempt_count` is incremented *at claim time* and `MAX_ATTEMPTS` is 8,
+    /// so refusing this work inside the handler instead — which is what
+    /// `PolicyGate` alone would do — looks identical for about five minutes and
+    /// then dead-letters every turn the company had pending. Any halt longer
+    /// than a coffee break would come back to an empty queue and a customer's
+    /// unanswered mail in [`dead_letters`].
+    ///
+    /// So the assertion is not merely "it was not claimed": it is **the attempt
+    /// counter did not move**, which is the difference between deferred and
+    /// destroyed.
+    #[tokio::test]
+    async fn a_stopped_company_s_events_wait_and_burn_no_attempt() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let stopped = seed_tenant(&db, "halt-stopped").await;
+        let running = seed_tenant(&db, "halt-running").await;
+
+        let waiting = enqueue_committed(&db, stopped, &event(1), at(T0)).await;
+        enqueue_committed(&db, running, &event(2), at(T0)).await;
+
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        crate::halt::place(&mut tx, "stop everything", "operator:ops", at(T0))
+            .await
+            .expect("place")
+            .expect("it was running");
+        tx.commit().await.expect("commit halt");
+
+        // The poller drains every tenant. It sees one of these two.
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim(&mut conn, 10, at(T0 + 1)).await.expect("claim");
+        conn.commit().await.expect("commit claim");
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the running company's row: {claimed:?}"
+        );
+        assert_eq!(
+            claimed[0].tenant_id, running,
+            "and it is the one that was not stopped"
+        );
+
+        // The load-bearing half: the deferred row is untouched, so the halt
+        // costs the customer nothing and there is nothing to replay.
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let (attempts, available): (i32, DateTime<Utc>) =
+            sqlx::query_as("SELECT attempt_count, available_at FROM outbox_events WHERE id = $1")
+                .bind(waiting)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read the deferred row");
+        conn.commit().await.expect("commit read");
+        assert_eq!(attempts, 0, "a deferred row burns no attempt");
+        assert_eq!(
+            available,
+            at(T0),
+            "and its backoff was not pushed out either: it is due the instant the \
+             company is released"
+        );
+
+        // Released: the same row is claimed, in the state it was left in.
+        let mut tx = db.tenant_tx(stopped).await.expect("tenant tx");
+        crate::halt::release(&mut tx)
+            .await
+            .expect("release")
+            .expect("it was halted");
+        tx.commit().await.expect("commit release");
+
+        // Claimed at the same instant as the first claim, so the running
+        // company's row — pushed at least half a second out by its own backoff
+        // — is deterministically not due and this assertion is about the
+        // deferred row alone.
+        let mut conn = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let after = claim(&mut conn, 10, at(T0 + 1)).await.expect("claim");
+        conn.commit().await.expect("commit claim");
+        assert_eq!(
+            after.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![waiting],
+            "the release resumes exactly the work that was waiting"
+        );
+        assert_eq!(
+            after[0].attempt_count, 1,
+            "and it is on its FIRST attempt, not its second: the halt cost it nothing"
+        );
+
+        drop_tenant(&db, stopped).await;
+        drop_tenant(&db, running).await;
     }
 }

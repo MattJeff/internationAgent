@@ -50,6 +50,17 @@ const TRACE_ID_KEY: &str = "trace_id";
 /// [`Decision::RequireApproval`].
 const APPROVAL_SUMMARY_KEY: &str = "approval_summary";
 
+/// The refusal code the Policy Gate writes under `denied` when the whole
+/// company is stopped.
+///
+/// Public and here rather than private in `agentos_app::gate`, because it has
+/// two readers in two crates and they must agree on the spelling or the
+/// question "what did not happen while we were down" quietly answers zero:
+/// `gate` writes it into the payload, and [`crate::halt::refused_since`] counts
+/// the rows that carry it. A string constant is the cheapest way to make a
+/// rename break the build instead of a report.
+pub const COMPANY_HALTED: &str = "company_halted";
+
 // ---------------------------------------------------------------------------
 // Who
 // ---------------------------------------------------------------------------
@@ -153,6 +164,24 @@ pub enum AuditKind {
     /// model that was proven, and never the credential; see that module's
     /// `the_key_reaches_the_vault_and_appears_nowhere_else`.
     ModelConnected,
+    /// A human stopped the whole company, or let it run again. Written by
+    /// `routes::halt`, in the transaction that inserts or deletes the
+    /// `company_halts` row, so the trail cannot claim a halt the table does not
+    /// have.
+    ///
+    /// Its own kind rather than [`AuditKind::PolicyChanged`], and the
+    /// distinction is the same one `migrations/0045_company_halt.sql` argues:
+    /// a halt is not a permission that changed, it is a lifecycle fact about
+    /// the tenant — the twin of [`AuditKind::EmployeeLifecycleChanged`] one
+    /// level up. Sharing a kind with policy edits would bury the two rows
+    /// anybody actually goes looking for under every spend-cap tweak of the
+    /// quarter, and `/v1/autonomy` would count an emergency stop as a
+    /// configuration change.
+    ///
+    /// The payload carries `from` and `to` (`running` / `halted`), the reason,
+    /// and — on a release — the reason the original halt was placed for, so one
+    /// row answers "what did we come back up from".
+    CompanyHaltChanged,
 }
 
 impl AuditKind {
@@ -170,6 +199,7 @@ impl AuditKind {
             AuditKind::SecretAccessed => "secret_accessed",
             AuditKind::PolicyChanged => "policy_changed",
             AuditKind::ModelConnected => "model_connected",
+            AuditKind::CompanyHaltChanged => "company_halt_changed",
         }
     }
 }

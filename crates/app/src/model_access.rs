@@ -417,6 +417,27 @@ pub enum NoModel {
     )]
     KeyMissing,
 
+    /// A human has stopped the whole company.
+    ///
+    /// **In this enum because this enum is the answer to this function's
+    /// question**, which its own title states: *may this tenant's employees
+    /// take a turn at all*. A halt is one of the two ways the answer is no, and
+    /// the other four variants are already reasons that have nothing to do with
+    /// the model being broken — `NotConnected` is a company nobody set up, this
+    /// is a company somebody stopped.
+    ///
+    /// Putting it here rather than beside the caller is what buys the property
+    /// that matters: [`connected`] is asked *before* `turns::reserve`, so a
+    /// halted company loses no turns out of anybody's daily budget. A check
+    /// added one line later in the initiative loop would be a check the
+    /// message-driven path in `apps/server/src/main.rs` does not have.
+    #[error(
+        "this company has been stopped by an operator ({0}), so none of its employees will take \
+         a turn. Nothing about this is a provider failure and retrying will not fix it — release \
+         it with DELETE /v1/halt"
+    )]
+    CompanyHalted(String),
+
     /// The connection row could not be read.
     #[error(transparent)]
     Unavailable(#[from] StoreError),
@@ -430,7 +451,26 @@ pub enum NoModel {
 /// it reserves a turn out of the employee's daily budget, exactly as it already
 /// asks `model_for` before reserving one: a refusal that costs a turn from a
 /// budget of four is a refusal that costs a quarter of the employee's day.
+///
+/// # The company-wide stop is asked here, and first
+///
+/// `PolicyGate` already refuses every *effect* while a company is halted, so
+/// this read is not what keeps a stopped company off the world — it is what
+/// keeps a stopped company off the customer's bill. A turn that reaches the
+/// model and is then refused at every tool call still costs Anthropic tokens
+/// billed to the tenant's own credential, still sends their data to a third
+/// party, and still burns a slot out of `max_turns_per_day` that has no release
+/// verb. Asking one row here, before `turns::reserve` and before the credential
+/// is even read, is what makes "we stopped" also mean "you stopped paying for
+/// it", and what makes the release cost nothing: **no turn is consumed during a
+/// halt, so there is nothing to give back and nothing to replay.**
+///
+/// It is the same row the gate reads, with no cache on either side, so the two
+/// answers cannot disagree.
 pub async fn connected(tx: &mut TenantTx<'_>) -> Result<ModelAccess, NoModel> {
+    if let Some(halt) = agentos_store::halt::halted(tx).await? {
+        return Err(NoModel::CompanyHalted(halt.reason));
+    }
     agentos_store::model_access::load(tx)
         .await?
         .ok_or(NoModel::NotConnected)
@@ -944,5 +984,68 @@ mod tests {
             None,
             "a connected tenant whose policy permits nothing still takes no turn"
         );
+    }
+
+    /// **A stopped company thinks about nothing, and is billed for nothing.**
+    ///
+    /// The tenant is fully connected, so the only thing standing between it and
+    /// a model call is the halt. The refusal has to arrive *here*, before
+    /// `turns::reserve` — a check one line later would let a stopped company
+    /// spend a turn out of a budget that has no release verb, and every minute
+    /// of a long halt would cost a day of somebody's initiative.
+    #[tokio::test]
+    async fn a_stopped_company_takes_no_turn_and_is_billed_for_nothing() {
+        let Some((db, tenant_id)) = fixture().await else {
+            return;
+        };
+        let secrets = MemorySecretStore::new();
+        let host = host();
+        let now = Utc::now();
+
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &ModelAccess {
+                path: ModelPath::Cli,
+                model: ModelId::Opus5,
+                verified_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("save");
+        // Connected: it takes a turn.
+        for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None)
+            .await
+            .expect("a connected, running company thinks");
+
+        agentos_store::halt::place(&mut tx, "stop everything", "operator:ops", now)
+            .await
+            .expect("place")
+            .expect("it was running");
+
+        let Err(err) = for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None).await else {
+            panic!("a stopped company must not be handed a model client");
+        };
+        assert!(
+            matches!(&err, NoModel::CompanyHalted(reason) if reason == "stop everything"),
+            "{err}"
+        );
+        // Named, non-retryable, and it names the remedy — the same shape as
+        // every other refusal in this enum, because a poller that read this as
+        // an outage would retry a company somebody deliberately stopped.
+        let rendered = err.to_string();
+        assert!(rendered.contains("DELETE /v1/halt"), "{rendered}");
+        assert!(rendered.contains("retrying will not fix it"), "{rendered}");
+
+        // And the release gives it straight back, with nothing to replay.
+        agentos_store::halt::release(&mut tx)
+            .await
+            .expect("release")
+            .expect("it was halted");
+        for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None)
+            .await
+            .expect("released");
+        tx.commit().await.expect("commit");
     }
 }
