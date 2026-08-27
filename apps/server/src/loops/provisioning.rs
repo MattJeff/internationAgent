@@ -53,7 +53,14 @@
 //! | `pending`                                      | never attempted |
 //! | `provisioning` and `lease_until < now`         | **a worker died holding it** |
 //! | `pending_external` and `expected_by < now`     | **the wait is now a problem** |
-//! | `failed`, cold for `retry_after`, under the cap | a transient failure |
+//! | `failed`, cold for `retry_after`, under the cap, **and with a retryable code** | a transient failure |
+//!
+//! The last four words of that row are new, and they are the difference
+//! between "a step failed" and "a step failed at something a second call could
+//! fix". A terminal code — `bad_secret_ref`, `no_numbers_available`,
+//! `unauthorized` — used to buy five provider calls apiece on a backoff, which
+//! is the release side's `release_not_supported` bug in the other direction and
+//! it went unnoticed for exactly as long. See [`CLAIM_SQL`].
 //!
 //! The second row is the recovery case and the reason this query is not simply
 //! "state = 'pending'". A worker that was killed mid-step leaves the row in
@@ -96,7 +103,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use agentos_app::provisioning::{
-    EngineError, ProvisioningEngine, RELEASE_NOT_SUPPORTED, ReleaseReport, StepReport,
+    EngineError, ProvisioningEngine, RELEASE_NOT_SUPPORTED, RETRYABLE_CODES, ReleaseReport,
+    StepReport,
 };
 use agentos_domain::action::{Action, McpTool};
 use agentos_domain::employee::{Employee, Lifecycle, ResourceState, Step};
@@ -498,7 +506,39 @@ impl<C: Converge> ProvisioningLoop<C> {
 
 /// The four predicates, the trace to inherit, and the queue lock.
 ///
-/// `$1` now, `$2` the retry cutoff, `$3` the attempt cap, `$4` the batch size.
+/// `$1` now, `$2` the retry cutoff, `$3` the attempt cap, `$4` the batch size,
+/// `$5` the codes a retry could still fix.
+///
+/// # `failed` was never one thing, and the cap was pricing it as if it were
+///
+/// The fourth predicate used to read "failed, cold, under the cap" and stop
+/// there, so `bad_secret_ref`, `no_numbers_available`, `unauthorized` and every
+/// other terminal refusal bought [`LoopConfig::max_attempts`] provider calls
+/// each — the same answer, five times, on a backoff, for a step whose own
+/// `call_until` had already refused to retry it once inside the pass. The
+/// release side of this very file has had the corresponding guard since it
+/// existed (`SWEEP_SQL`, and `RELEASE_NOT_SUPPORTED` is bound into it); the
+/// converge side did not.
+///
+/// `$5` is [`agentos_providers::RETRYABLE_CODES`] — bound, never spelled here,
+/// for the reason that constant's own docs give. `last_error` on a failed row is
+/// `format!("{}: {err}", err.code())` (`ProvisioningEngine::ensure_step`), so
+/// `split_part(…, ':', 1)` is the code and nothing else; no provider code
+/// contains a colon.
+///
+/// **NULL `last_error` stays claimable, and that is the safe direction.** It is
+/// not "no code we recognise" — it is a row that never carried a provider
+/// verdict at all: the reaper's `pending_external -> failed`, whose whole point
+/// is that the wait ended and the step should be tried again, and every row
+/// written before this predicate existed. Reading NULL as terminal would park
+/// those silently, which is the failure mode this change must not become.
+///
+/// ponytail: an employee claimed for a *retryable* row still converges its
+/// terminal steps in the same pass, because `converge` walks all eleven. The
+/// ceiling is one extra call per terminal step per genuine retry, not five per
+/// tick; closing it means carrying `last_error` into `domain::ResourceStatus`
+/// so `ensure_step` can park on it, and that is a domain change to buy a
+/// rounding error.
 const CLAIM_SQL: &str = "\
 SELECT r.tenant_id,
        r.employee_id,
@@ -514,7 +554,9 @@ SELECT r.tenant_id,
    AND (   r.state = 'pending'
         OR (r.state = 'provisioning'     AND r.lease_until < $1)
         OR (r.state = 'pending_external' AND r.expected_by < $1)
-        OR (r.state = 'failed' AND r.attempt_count < $3 AND r.updated_at < $2))
+        OR (r.state = 'failed' AND r.attempt_count < $3 AND r.updated_at < $2
+            AND (   r.last_error IS NULL
+                 OR split_part(r.last_error, ':', 1) = ANY($5))))
  ORDER BY r.updated_at
  LIMIT $4
  FOR UPDATE OF r SKIP LOCKED";
@@ -531,6 +573,7 @@ async fn claim(db: &Db, cfg: &LoopConfig, now: DateTime<Utc>) -> Result<Vec<Work
         .bind(now - cfg.retry_after)
         .bind(cfg.max_attempts)
         .bind(cfg.batch)
+        .bind(RETRYABLE_CODES.as_slice())
         .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -1373,6 +1416,94 @@ mod tests {
                 .expect("claim")
                 .is_empty(),
             "the attempt cap has to bind, or nothing ever stops"
+        );
+    }
+
+    /// A terminal refusal is not a transient failure, and the cap was pricing
+    /// it as if it were.
+    ///
+    /// The expensive half is `bad_secret_ref`: five provider calls, on a
+    /// backoff, for an answer that was final the first time. The half that
+    /// matters more is everything else in this test — a `retryable` code, a
+    /// `rate_limited` code, and a NULL `last_error` all keep every attempt they
+    /// had. **A fix that made the whole `failed` state terminal would pass the
+    /// first assertion and fail the other three**, which is the only reason
+    /// they are here: it is much easier to stop the waste than to stop it
+    /// without also stopping the retries that work.
+    #[tokio::test]
+    async fn a_terminal_code_stops_costing_provider_calls_and_a_transient_one_keeps_its_attempts() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "noor").await;
+        let cfg = LoopConfig::default();
+
+        // Everything provisioned but one step, so the only thing that can make
+        // this employee claimable is the failed row itself — which is exactly
+        // the shape a half-provisioned employee sits in.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources SET state = 'ready' WHERE employee_id = $1",
+        )
+        .await;
+
+        // Cold, one attempt spent, four left under the cap. The only variable
+        // below is `last_error`.
+        let claimable = async |error: &'static str| {
+            let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+            sqlx::query(
+                "UPDATE employee_resources \
+                    SET state = 'failed', attempt_count = 1, \
+                        updated_at = now() - interval '1 hour', \
+                        last_error = nullif($2, '') \
+                  WHERE employee_id = $1 AND step = 'email'",
+            )
+            .bind(employee.id().as_uuid())
+            .bind(error)
+            .execute(&mut **tx)
+            .await
+            .expect("statement");
+            tx.commit().await.expect("commit");
+            !claim(&db, &cfg, Utc::now())
+                .await
+                .expect("claim")
+                .is_empty()
+        };
+
+        // The whole point. `ensure_step` writes `format!("{}: {err}", code)`, so
+        // this is the byte-for-byte shape of a real row.
+        assert!(
+            !claimable("bad_secret_ref: provider rejected the request: bad_secret_ref").await,
+            "a terminal refusal must not buy another provider call: the vault will not have \
+             grown the secret since the last one"
+        );
+        assert!(
+            !claimable("no_numbers_available: provider rejected the request: no_numbers_available")
+                .await,
+            "there are still no numbers"
+        );
+        assert!(
+            !claimable("unauthorized: provider rejected the request: unauthorized").await,
+            "the key is still wrong"
+        );
+
+        // ...and now the half that a blunt fix breaks.
+        assert!(
+            claimable("retryable: provider is unavailable, retry after 1s").await,
+            "a transient failure keeps every attempt it had; parking these is a worse bug than \
+             the one this predicate fixes"
+        );
+        assert!(
+            claimable("rate_limited: provider asked us to slow down, retry after 5s").await,
+            "a 429 is the provider telling us to come back, not to give up"
+        );
+        assert!(
+            claimable("").await,
+            "a NULL `last_error` never carried a provider verdict — it is the reaper's \
+             `pending_external -> failed`, whose whole purpose is that the step be tried again"
         );
     }
 

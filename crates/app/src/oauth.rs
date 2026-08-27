@@ -131,7 +131,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use agentos_domain::ids::{Slug, TenantId};
-use agentos_providers::Secret;
+use agentos_providers::{ProviderError, Secret};
 use agentos_store::db::{StoreError, TenantTx};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -195,6 +195,15 @@ const MAX_TOKEN_BYTES: usize = 64 * 1024;
 /// day it did not. An hour is the common default across providers that do
 /// answer, and being wrong in this direction costs one extra refresh.
 const ASSUMED_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// The [`OauthError::Endpoint`] code for "the authorization server answered, and
+/// the answer was no on a status a second attempt will not change".
+///
+/// One spelling, because it is written in [`post_token`] and matched in
+/// [`refresh_due`], and a rule in two literals is a rule that diverges the day
+/// somebody fixes a typo in one of them. It is the same discipline
+/// `RELEASE_NOT_SUPPORTED` gets on the provisioning side.
+const REJECTED: &str = "rejected";
 
 // ---------------------------------------------------------------------------
 // The deployment's client registrations
@@ -325,7 +334,7 @@ pub enum OauthError {
     /// something that is not a token response.
     #[error("the authorization server did not issue a token: {code}")]
     Endpoint {
-        /// `unreachable`, `rejected`, `too_large`, `unparseable`, or
+        /// `unreachable`, [`REJECTED`], `too_large`, `unparseable`, or
         /// `no_access_token`.
         code: &'static str,
     },
@@ -340,6 +349,23 @@ pub enum OauthError {
 }
 
 impl OauthError {
+    /// Is this the answer that means **stop asking**?
+    ///
+    /// True only for [`REJECTED`]: the authorization server answered, on a
+    /// status a second attempt will not change, and the refresh token behind it
+    /// is dead until a human consents again. [`refresh_due`] parks on this and
+    /// on nothing else — an `unreachable` (the connection failed, or a 429/5xx),
+    /// a `too_large`, an `unparseable` or a `no_access_token` all keep their
+    /// token and their retries.
+    ///
+    /// A named predicate rather than a `matches!` at the one call site, because
+    /// there is a second reader: the tests that prove a 400 parks and a 503 does
+    /// not. Spelling the arm twice is how the two drift, and this rule costs a
+    /// customer a consent screen when it drifts the wrong way.
+    fn needs_a_human(&self) -> bool {
+        matches!(self, OauthError::Endpoint { code } if *code == REJECTED)
+    }
+
     /// Stable, low-cardinality metric label.
     pub const fn code(&self) -> &'static str {
         match self {
@@ -580,12 +606,42 @@ const SELECT_DUE: &str = "\
 
 /// Refresh every token this tenant has that is about to expire.
 ///
-/// Returns how many were refreshed. **Never fails the caller**: the binder loop
-/// runs this for every tenant in turn, and one provider being down must not stop
-/// the other tenants — or the other bindings of the same tenant — from being
-/// rebound. Each failure is logged with its stable code and the old token is
-/// left in place, which keeps working until it expires and then shows up as an
-/// ordinary bind failure in `GET /v1/mcp/servers`.
+/// Returns **how many rows it wrote** — renewals plus the parks below — which is
+/// what the caller needs to decide between a commit and a rollback, and is why
+/// it is not "how many were refreshed". **Never fails the caller**: the binder
+/// loop runs this for every tenant in turn, and one provider being down must not
+/// stop the other tenants — or the other bindings of the same tenant — from
+/// being rebound. Each failure is logged with its stable code and the old token
+/// is left in place, which keeps working until it expires and then shows up as
+/// an ordinary bind failure in `GET /v1/mcp/servers`.
+///
+/// # A dead refresh token is not a transient failure, and this loop used to
+/// treat it as one
+///
+/// [`SELECT_DUE`] matches on `token_expires_at`, which a failed refresh does not
+/// move. So a binding whose refresh token the provider has *revoked* — the
+/// customer disconnected our app, an admin rotated it, the grant expired — was
+/// re-presented every five minutes, forever, against somebody else's
+/// authorization server, with a credential that will never work again. That is
+/// the argument `crates/app/src/mcp.rs` already makes against itself in
+/// [`reached_the_server`](crate::mcp): retrying hammers a third party with a
+/// dead credential and hides a broken binding behind a status that reads like
+/// progress. It is also the kind of traffic that gets an OAuth client
+/// suspended.
+///
+/// So a [`REJECTED`] refresh clears `sealed_refresh_token`, and that is the
+/// whole park: `SELECT_DUE` requires the column to be NOT NULL, and
+/// `0042_mcp_oauth` already gives NULL a meaning — "this binding cannot outlive
+/// its access token" — because some providers issue no refresh token at all. The
+/// binding keeps the access token it has, works until that expires, and then
+/// surfaces as an ordinary bind failure on the page an operator already reads.
+/// **No new notification, no new table, no new column**: re-consenting is a
+/// human's decision, which is the sentence [`due`] was written under.
+///
+/// Only [`REJECTED`] parks. `unreachable` (the connection failed, or the status
+/// was a 429/5xx), `too_large`, `unparseable` and `no_access_token` all keep
+/// their token and their retries — a provider having a bad minute must not cost
+/// a customer a trip back through a consent screen.
 ///
 /// The tenant is `tx`'s, because row-level security honours nothing else. The
 /// caller commits — this writes, which is why it cannot share the read-only
@@ -609,7 +665,7 @@ pub async fn refresh_due(
         }
     };
 
-    let mut refreshed = 0;
+    let mut written = 0;
     for row in rows {
         // Same fail-closed reading as `Fleet::bind`: a row this build cannot
         // name, or whose connector this build no longer has, is a binding that
@@ -638,7 +694,36 @@ pub async fn refresh_due(
         )
         .await
         {
-            Ok(()) => refreshed += 1,
+            Ok(()) => written += 1,
+            // The authorization server answered, and its answer will not change.
+            // Stop asking it. See this function's docs for why the park is a
+            // NULL in a column that already means this.
+            Err(err) if err.needs_a_human() => {
+                match park_refresh(tx, &server).await {
+                    Ok(()) => {
+                        written += 1;
+                        // No token, no sealed bytes, no provider body — the
+                        // handle and the reason, which is all an operator can
+                        // act on anyway.
+                        tracing::warn!(
+                            %tenant_id,
+                            server = server.as_str(),
+                            "this mcp oauth refresh token was refused and has been dropped; the \
+                             binding works until its access token expires and then needs a human \
+                             to connect it again"
+                        );
+                    }
+                    // Left selectable, which means it is retried — the old
+                    // behaviour, for one binding, rather than a park that
+                    // silently did not happen.
+                    Err(err) => tracing::error!(
+                        %tenant_id,
+                        server = server.as_str(),
+                        error = %err,
+                        "an mcp oauth refresh token was refused and could not be dropped"
+                    ),
+                }
+            }
             Err(err) => tracing::warn!(
                 %tenant_id,
                 server = server.as_str(),
@@ -647,7 +732,29 @@ pub async fn refresh_due(
             ),
         }
     }
-    refreshed
+    written
+}
+
+/// Drop a refresh token the authorization server has refused.
+///
+/// The access token is deliberately untouched: it may well still work, and
+/// throwing it away would break a binding that is currently serving tools in
+/// order to react to a renewal that is not due yet. What this ends is the
+/// asking — [`SELECT_DUE`] requires `sealed_refresh_token IS NOT NULL`.
+///
+/// Scoped by handle inside the caller's tenant transaction, so row-level
+/// security is what keeps it off another tenant's row; the same shape as the
+/// `UPDATE` in [`refresh_one`].
+async fn park_refresh(tx: &mut TenantTx<'_>, server: &Slug) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE mcp_servers SET sealed_refresh_token = NULL, updated_at = now() \
+          WHERE server = $1",
+    )
+    .bind(server.as_str())
+    .execute(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+    Ok(())
 }
 
 /// The selection, on its own.
@@ -796,7 +903,27 @@ async fn post_token(
         // Includes the 3xx a redirect-following client would have chased. The
         // provider's body is deliberately not read: it echoes the request, and
         // this error is rendered into an HTTP response.
-        return Err(OauthError::Endpoint { code: "rejected" });
+        //
+        // **The status is read, though, and only the status.** A 400
+        // `invalid_grant` and a 503 are both "no token" to the caller of a
+        // callback, and they are opposite instructions to [`refresh_due`]: one
+        // says the credential is dead and a human has to re-consent, the other
+        // says the authorization server is having a bad minute. Told apart by
+        // `ProviderError::from_status`, which is this workspace's one rule for
+        // whether a far side's status means try again — the same rule
+        // `crates/app/src/mcp.rs` reaches for when an MCP server refuses a
+        // token, and for the same stated reason: one vocabulary, not two.
+        //
+        // A retryable status folds into `unreachable` rather than earning a
+        // code of its own, because to everything upstream it *is* the connect
+        // failure above: the authorization server did not answer, ask later.
+        return Err(OauthError::Endpoint {
+            code: if ProviderError::from_status(response.status().as_u16(), None).is_retryable() {
+                "unreachable"
+            } else {
+                REJECTED
+            },
+        });
     }
 
     parse_issued(&bounded_body(response).await?)
@@ -1766,5 +1893,283 @@ mod tests {
              old one is a binding that renews exactly once"
         );
         assert!(expiry > expires_at, "the clock moved forward");
+    }
+
+    /// The status is what tells a dead credential from a bad minute, and both
+    /// directions are one bug away from each other.
+    ///
+    /// A pure unit over [`post_token`]'s classification, so that the two
+    /// database tests below can be about parking rather than about HTTP.
+    #[tokio::test]
+    async fn a_refused_grant_and_an_overloaded_server_are_not_the_same_answer() {
+        let clients = clients();
+        for (status, expected) in [
+            // RFC 6749 §5.2: `invalid_grant` — the refresh token is dead.
+            (400, REJECTED),
+            (401, REJECTED),
+            (403, REJECTED),
+            // ...and the ones that mean "later".
+            (429, "unreachable"),
+            (500, "unreachable"),
+            (503, "unreachable"),
+        ] {
+            let provider = FakeProvider::start(vec![(status, "{}".to_owned())]).await;
+            let connector = connector_for(&provider, ClientAuth::Post);
+            let (endpoints, client) =
+                registration(&clients, connector).expect("a registered connector");
+            let Err(err) = post_token(endpoints, client, &[("grant_type", "refresh_token")]).await
+            else {
+                panic!("a {status} is not a token");
+            };
+            assert_eq!(err.code(), expected, "{status}");
+            // The `code()` above is what an operator reads; this is what
+            // `refresh_due` actually branches on, and only one of them decides
+            // whether a customer is sent back through a consent screen.
+            assert_eq!(err.needs_a_human(), expected == REJECTED, "{status}");
+        }
+    }
+
+    /// The whole point of the park: **one** presentation of a refused refresh
+    /// token, not one every five minutes for the life of the deployment.
+    ///
+    /// Both halves are asserted against the same fake in the same test, because
+    /// they are the same claim: the second tick must select nothing, and the
+    /// provider must see nothing.
+    #[tokio::test]
+    async fn a_refused_refresh_token_is_presented_once_and_then_never_again() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the oauth refresh step needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // The exchange succeeds; every refresh after it is refused the way a
+        // provider refuses a revoked grant.
+        let provider = FakeProvider::start(vec![
+            (
+                200,
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#.to_owned(),
+            ),
+            (400, r#"{"error":"invalid_grant"}"#.to_owned()),
+        ])
+        .await;
+        let connector = connector_for(&provider, ClientAuth::Post);
+        let (creds, clients, tenant) = (credentials(), clients(), tenant());
+        let server = Slug::parse("fake-erp").expect("slug");
+        let now = seed_binding(&db, &provider, connector, &creds, &clients, tenant, &server).await;
+
+        // Tick one: due, presented, refused, parked.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert_eq!(
+            due(&mut tx, now).await.expect("select").len(),
+            1,
+            "the binding is inside the margin and has something to refresh with"
+        );
+        let selected = due(&mut tx, now).await.expect("select");
+        let Err(err) = refresh_one(
+            &mut tx,
+            &creds,
+            &clients,
+            tenant,
+            &server,
+            connector,
+            &selected[0],
+            now,
+        )
+        .await
+        else {
+            panic!("a 400 from the token endpoint is not a refreshed binding");
+        };
+        assert_eq!(err.code(), REJECTED);
+        assert!(
+            err.needs_a_human(),
+            "this is the verdict `refresh_due` parks on"
+        );
+        park_refresh(&mut tx, &server).await.expect("park");
+        tx.commit().await.expect("commit");
+
+        // Tick two, and every tick after it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert!(
+            due(&mut tx, now + chrono::TimeDelta::hours(6))
+                .await
+                .expect("select")
+                .is_empty(),
+            "a binding whose refresh token was refused must fall out of the selection; leaving \
+             it in is a dead credential presented to a third party every five minutes forever"
+        );
+
+        // The access token is untouched, which is what makes this a park and
+        // not a disconnection: the binding keeps working until it expires.
+        let (access, refresh): (Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT sealed_token, sealed_refresh_token FROM mcp_servers WHERE server = $1",
+        )
+        .bind(server.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("row");
+        tx.rollback().await.expect("rollback");
+        assert!(refresh.is_none(), "the refused refresh token is gone");
+        assert_eq!(
+            creds
+                .open_as(
+                    tenant,
+                    &crate::mcp::credential_context(tenant, &server),
+                    &access
+                )
+                .expect("open")
+                .expose_for_transport(),
+            "at-1",
+            "the access token is left alone: it may still work, and throwing it away would \
+             break a binding that is currently serving tools"
+        );
+
+        assert_eq!(
+            provider.seen().len(),
+            2,
+            "one exchange and exactly one refusal — the provider is asked once, not forever"
+        );
+    }
+
+    /// The mirror, and the one that stops the fix above from being "park
+    /// everything".
+    ///
+    /// A 503 is the provider having a bad minute. Parking on it would cost the
+    /// customer a trip back through a consent screen for an outage that ended
+    /// while they were reading the email.
+    #[tokio::test]
+    async fn an_overloaded_authorization_server_does_not_cost_a_binding_its_refresh_token() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the oauth refresh step needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let provider = FakeProvider::start(vec![
+            (
+                200,
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#.to_owned(),
+            ),
+            (503, "overloaded".to_owned()),
+        ])
+        .await;
+        let connector = connector_for(&provider, ClientAuth::Post);
+        let (creds, clients, tenant) = (credentials(), clients(), tenant());
+        let server = Slug::parse("fake-erp").expect("slug");
+        let now = seed_binding(&db, &provider, connector, &creds, &clients, tenant, &server).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let selected = due(&mut tx, now).await.expect("select");
+        let Err(err) = refresh_one(
+            &mut tx,
+            &creds,
+            &clients,
+            tenant,
+            &server,
+            connector,
+            &selected[0],
+            now,
+        )
+        .await
+        else {
+            panic!("a 503 is not a refreshed binding");
+        };
+        assert_eq!(err.code(), "unreachable", "{err}");
+        assert!(
+            !err.needs_a_human(),
+            "an outage is not a dead credential; parking on it costs the customer a trip \
+             back through a consent screen for something that fixed itself"
+        );
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert_eq!(
+            due(&mut tx, now).await.expect("select").len(),
+            1,
+            "an outage must leave the binding due: the refresh token is still good and the \
+             next tick is what renews it"
+        );
+        let refresh: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT sealed_refresh_token FROM mcp_servers WHERE server = $1")
+                .bind(server.as_str())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            creds
+                .open_as(
+                    tenant,
+                    &refresh_context(tenant, &server),
+                    &refresh.expect("still stored")
+                )
+                .expect("open")
+                .expose_for_transport(),
+            "rt-1",
+            "the refresh token survives an outage, or a bad minute at the provider becomes a \
+             consent screen for every customer"
+        );
+    }
+
+    /// A tenant, a binding seeded through the real callback path, and a
+    /// `token_expires_at` inside [`REFRESH_MARGIN`]. Returns `now`.
+    ///
+    /// Lifted out of `the_binder_loop_renews_what_is_about_to_expire` when the
+    /// two park tests needed the same forty lines. It seeds through `start` and
+    /// `complete` rather than by hand, so what is stored is what a real callback
+    /// would have stored — sealed under the real AAD, which is the half a
+    /// hand-written INSERT gets wrong.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_binding(
+        db: &Db,
+        provider: &FakeProvider,
+        connector: &'static Connector,
+        creds: &Credentials,
+        clients: &OauthClients,
+        tenant: TenantId,
+        server: &Slug,
+    ) -> DateTime<Utc> {
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("oauth-{}", tenant.as_uuid().simple()))
+            .execute(&mut *admin)
+            .await
+            .expect("tenant");
+        admin.commit().await.expect("commit");
+
+        let now = Utc::now();
+        let started = start(clients, creds, tenant, connector, REDIRECT, now).expect("start");
+        provider.expect_challenge(&param(&started.authorize_url, "code_challenge"));
+        let flow = Claimed {
+            tenant_id: tenant,
+            connector,
+            server: server.clone(),
+            state_hash: started.state_hash,
+            sealed_verifier: started.sealed_verifier,
+        };
+        let issued = complete(clients, creds, &flow, "code".to_owned(), REDIRECT, now)
+            .await
+            .expect("complete");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers \
+               (tenant_id, server, url, reach, connector, sealed_token, \
+                sealed_refresh_token, token_expires_at) \
+             VALUES ($1, $2, 'https://mcp.example.test/mcp', 'public', 'fake', $3, $4, $5)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(server.as_str())
+        .bind(issued.access.as_slice())
+        .bind(issued.refresh.as_deref())
+        .bind(now + chrono::TimeDelta::minutes(10))
+        .execute(&mut **tx)
+        .await
+        .expect("insert binding");
+        tx.commit().await.expect("commit");
+        now
     }
 }
