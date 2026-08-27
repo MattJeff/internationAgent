@@ -192,6 +192,15 @@ impl EnsureCtx {
 /// The variants are load-bearing: the provisioning engine branches on them, so
 /// mapping a transport timeout to `Terminal` would abandon a healthy provider
 /// mid-run.
+///
+/// **Adding a variant: add a specimen to `ProviderError::ALL` in the same
+/// edit.** The compiler will already stop you in [`ProviderError::is_retryable`]
+/// and [`ProviderError::code`]; it cannot stop you here, because stable Rust has
+/// no way to enumerate variants. `ALL` is what turns your answer in
+/// `is_retryable` into [`RETRYABLE_CODES`], which is what `CLAIM_SQL` binds to
+/// decide whether a failed row is ever tried again — so a retryable variant
+/// missing from `ALL` is a step that gets one attempt instead of five, with
+/// nothing red anywhere.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
     /// A timeout or a 5xx. The provider is fine, we were unlucky.
@@ -235,23 +244,84 @@ pub const RELEASE_NOT_SUPPORTED: &str = "release_not_supported";
 /// Every [`ProviderError::code`] whose error [`ProviderError::is_retryable`]
 /// calls retryable — the same rule, in the one form SQL can read.
 ///
+/// **Derived, not written.** It used to be a literal pair sitting next to
+/// `is_retryable`, which made the retry rule a thing stated in two places that
+/// cannot see each other: adding a retryable variant failed the build in
+/// `is_retryable` and `code` and then passed, silently, with its code missing
+/// from here — `CLAIM_SQL` parking the row after one attempt instead of five.
+/// The `const` block below reads the decision out of `is_retryable` itself, the
+/// same move [`agentos_domain::policy::DenyReason::GRANTABLE`] makes over
+/// `grantable`, so there is one rule and one list of its consequences.
+///
 /// Two entries and not forty, and that asymmetry is the whole reason this
 /// exists. The terminal codes are open — any adapter may invent one — so a
 /// `NOT IN (…)` list would be wrong the day somebody adds a `Terminal` arm,
 /// and wrong in the expensive direction: an unknown code would read as
 /// retryable and buy five provider calls. The retryable ones are closed by
-/// `is_retryable`'s own `matches!`, so listing *those* is wrong only in the
-/// direction of one attempt instead of five, and
-/// `the_retryable_code_list_is_the_same_rule_as_is_retryable` fails the build
-/// if the two ever disagree.
+/// `is_retryable`'s own exhaustive `match`, so listing *those* is wrong only in
+/// the direction of one attempt instead of five.
 ///
 /// The reader is `CLAIM_SQL` in `apps/server/src/loops/provisioning.rs`, which
 /// binds it rather than spelling it: a rule in two languages is a rule that
 /// diverges in silence, which is exactly what `RELEASE_NOT_SUPPORTED` above is
 /// bound for on the release side.
-pub const RETRYABLE_CODES: [&str; 2] = ["retryable", "rate_limited"];
+pub const RETRYABLE_CODES: [&str; 2] = {
+    // A `const` block, evaluated while this constant is — at compile time, in
+    // every crate that reads it. Flipping an arm of `is_retryable` without
+    // touching the length above does not produce a subtly short list bound into
+    // a `WHERE` clause; it fails the build, here, with the two messages below.
+    let all = ProviderError::ALL;
+    let mut out = [""; 2];
+    let (mut i, mut n) = (0, 0);
+    while i < all.len() {
+        if all[i].is_retryable() {
+            assert!(
+                n < 2,
+                "a ProviderError variant became retryable and RETRYABLE_CODES's length was not updated — grow it, or CLAIM_SQL parks that failure after one attempt"
+            );
+            out[n] = all[i].code();
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        n == 2,
+        "a ProviderError variant stopped being retryable and RETRYABLE_CODES's length was not updated"
+    );
+    out
+};
 
 impl ProviderError {
+    /// One specimen of every variant, so a rule can be proved total over the
+    /// enum without every reader writing the enum out again. The field values
+    /// are placeholders and nothing reads them: [`RETRYABLE_CODES`], the only
+    /// consumer, asks each specimen [`is_retryable`](Self::is_retryable) and
+    /// [`code`](Self::code), and neither looks inside.
+    ///
+    /// A slice and not `[Self; 4]` because a `PendingExternal` specimen holds a
+    /// `String`: a `const` block that binds the array by value has to drop it,
+    /// and a `String`'s destructor cannot run at compile time (E0493). Behind a
+    /// `&`, the specimens live in an anonymous static and are never dropped.
+    ///
+    /// ponytail: still a hand-written list, and a list does not force itself to
+    /// grow — the same residual `DenyReason::ALL` carries and
+    /// `reason_codes_are_stable_and_unique` names. Closing it needs
+    /// `mem::variant_count`, which is nightly. What it buys today is that the
+    /// *rule* is written once instead of twice.
+    const ALL: &'static [Self] = &[
+        Self::Retryable {
+            after: Duration::ZERO,
+        },
+        Self::RateLimited {
+            retry_after: Duration::ZERO,
+        },
+        Self::PendingExternal {
+            poll_ref: String::new(),
+            expected_by: DateTime::<Utc>::UNIX_EPOCH,
+        },
+        Self::Terminal { code: "" },
+    ];
+
     /// Default backoff when the provider gives no advice.
     const DEFAULT_BACKOFF: Duration = Duration::from_secs(1);
     /// Default cool-off when a 429 carries no `Retry-After`.
@@ -324,7 +394,12 @@ impl ProviderError {
     /// and does not ask the question this function asks. Being made to visit
     /// the impl block is not being made to decide. Spelled out, both sides are
     /// a decision somebody had to write down.
-    pub fn is_retryable(&self) -> bool {
+    ///
+    /// It is also the only place the retry rule is written: [`RETRYABLE_CODES`],
+    /// which `CLAIM_SQL` binds, is a `const` block over `Self::ALL` that calls
+    /// this function, so answering `true` here and forgetting the SQL side is a
+    /// build failure and not a row parked after one attempt.
+    pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Retryable { .. } | Self::RateLimited { .. } => true,
             Self::PendingExternal { .. } | Self::Terminal { .. } => false,
@@ -332,7 +407,7 @@ impl ProviderError {
     }
 
     /// Low-cardinality label for metrics. Never interpolate provider text here.
-    pub fn code(&self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::Retryable { .. } => "retryable",
             Self::RateLimited { .. } => "rate_limited",
@@ -479,17 +554,18 @@ mod tests {
         assert_eq!(ProviderError::from_status(404, None).code(), "not_found");
     }
 
-    /// [`RETRYABLE_CODES`] is a copy of [`ProviderError::is_retryable`] that a
-    /// `WHERE` clause can read, and a copy is a thing that drifts. This is the
-    /// test that makes drifting fail the build rather than quietly re-buying a
-    /// phone number four times.
+    /// What [`RETRYABLE_CODES`]'s `const` block cannot check, because it only
+    /// ever sees `ProviderError::ALL`.
     ///
-    /// Every variant, both directions: a code in the list whose error is not
-    /// retryable would spend the budget it was added to save, and a retryable
-    /// error whose code is missing would be parked after one attempt — which is
-    /// the failure this whole change is about not causing.
+    /// Drift between the list and [`ProviderError::is_retryable`] is now a
+    /// compile error and not this test's job. What is left is the half the
+    /// specimens miss: `Terminal` carries an **open** `&'static str`, so an
+    /// adapter can invent a code the list happens to contain and be read as
+    /// retryable by `CLAIM_SQL` — five provider calls for a refusal. The loop
+    /// below is that check, and the `from_status` rows are the mapping that
+    /// decides which variant a real response becomes in the first place.
     #[test]
-    fn the_retryable_code_list_is_the_same_rule_as_is_retryable() {
+    fn an_open_terminal_code_is_never_read_as_retryable() {
         let every_variant = [
             ProviderError::timeout(),
             ProviderError::from_status(429, None),
@@ -519,13 +595,13 @@ mod tests {
             );
         }
 
-        // Both spellings are reachable, so neither is a typo nobody would
-        // notice: a list that matched nothing would pass the loop above.
-        assert_eq!(ProviderError::timeout().code(), RETRYABLE_CODES[0]);
-        assert_eq!(
-            ProviderError::from_status(429, None).code(),
-            RETRYABLE_CODES[1]
-        );
+        // The exact wire spellings, pinned. `ensure_step` writes
+        // `format!("{}: {err}", err.code())` into `employee_resources.last_error`
+        // and `CLAIM_SQL` matches `split_part(…, ':', 1)` against this list, so
+        // renaming a code re-classifies every row already in the table. The
+        // `const` block above cannot see that: it would derive the new spelling
+        // and agree with itself.
+        assert_eq!(RETRYABLE_CODES, ["retryable", "rate_limited"]);
     }
 
     #[test]
