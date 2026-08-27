@@ -64,12 +64,10 @@ use agentos_app::effects::Ports;
 use agentos_app::inbound::{
     BlobStore, InboundError, InboundJob, Landed, NOTICE_AGGREGATE, ingest_email,
 };
-use agentos_domain::ids::TenantId;
 use agentos_store::db::{Db, StoreError};
-use agentos_store::outbox::{self, MAX_ATTEMPTS, OutboxEvent};
+use agentos_store::outbox::{self, Aggregates, MAX_ATTEMPTS, OutboxEvent};
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
+use sqlx::PgConnection;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -280,89 +278,27 @@ async fn park(conn: &mut PgConnection, id: Uuid, why: &str) -> Result<(), StoreE
 
 /// Take up to `limit` due **inbound notices**, across every tenant.
 ///
-/// The body is [`agentos_store::outbox::claim`] with one extra predicate, and it
-/// is here rather than there because `agentos_store` belongs to another unit.
-/// ponytail: the moment a third caller wants a filtered claim, this becomes
-/// `outbox::claim_of(conn, aggregate_type, limit, now)` and this function goes
-/// away. Until then, one query beats an edit to a file six agents are in.
+/// One line, and it used to be a copy of [`agentos_store::outbox::claim`] with
+/// one predicate changed. That copy's own note said it should become
+/// `outbox::claim_of` the moment a third caller wanted a filtered claim; what
+/// actually forced it was not a third caller but a **fix that had to land in
+/// both**. The shared claim is now round-robin over tenants rather than
+/// first-in-first-out over the whole queue — see [`agentos_store::outbox::claim_of`]
+/// for why a FIFO queue shared by paying customers is a customer whose company
+/// stops because another customer is busy — and a second spelling of it here
+/// would have been the inbound half of that bug, left in place, with a comment
+/// on it saying the two were the same query.
 ///
-/// Everything the predicate keeps is load-bearing: `FOR UPDATE SKIP LOCKED` so
-/// pollers take disjoint rows, `attempt_count + 1` at *claim* time so a worker
-/// killed mid-ingest still burns an attempt, and `available_at` pushed out by an
-/// exponential backoff with jitter — the lease, which expires on its own.
-///
-/// # `WITH … AS MATERIALIZED`, and why the obvious spelling is not enough
-///
-/// This selection used to be `WHERE e.id IN (SELECT … FOR UPDATE SKIP LOCKED
-/// LIMIT $n)`, which is the spelling every queue-in-Postgres article shows and
-/// the one [`agentos_store::initiative::claim_due`] documents at length **as a
-/// bug it hit in production**: a non-correlated `IN (SELECT …)` may be planned
-/// with the subquery on the inner side of a nested loop, re-executed per outer
-/// row, and each re-execution runs `ORDER BY … SKIP LOCKED LIMIT n` afresh over
-/// whichever rows the *other* poller holds locked at that moment. The claims
-/// stay disjoint — `SKIP LOCKED` is fine — but the `UPDATE` touches the union of
-/// those sets rather than `$n` rows, and the bound is gone. That loop's
-/// two-poller test caught it claiming 13 and then 16 against a limit of 10, and
-/// `EXPLAIN` on this statement's own text produces the same nested-loop plan on
-/// this schema. A poller that leases 24 notices when it asked for 8 has stopped
-/// bounding the batch it holds leases across, and this module's `BATCH` is 8
-/// precisely because one notice is a body fetch plus every attachment.
-///
-/// A CTE is evaluated exactly once whatever else is happening on the table.
-/// `MATERIALIZED` is stated rather than relied on: PostgreSQL 12 began inlining
-/// CTEs referenced once, and an inlined one is a subquery again. Both sibling
-/// claims — [`agentos_store::outbox::claim_except`] and `claim_due` — are
-/// spelled this way, and this one was the last that was not.
+/// Everything the old copy's docstring argued for is still argued, in the one
+/// place the SQL now lives: `FOR UPDATE SKIP LOCKED`, `attempt_count + 1` at
+/// claim time, the jittered backoff that is the lease, and `AS MATERIALIZED` on
+/// every CTE.
 async fn claim_notices(
     conn: &mut PgConnection,
     limit: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<OutboxEvent>, StoreError> {
-    let rows = sqlx::query(
-        "WITH due AS MATERIALIZED ( \
-             SELECT id FROM outbox_events \
-             WHERE aggregate_type = $4::text \
-               AND published_at IS NULL \
-               AND available_at <= $1::timestamptz \
-               AND attempt_count < $2::int \
-             ORDER BY available_at, id \
-             FOR UPDATE SKIP LOCKED \
-             LIMIT $3::bigint) \
-         UPDATE outbox_events AS e \
-         SET attempt_count = e.attempt_count + 1, \
-             available_at = $1::timestamptz \
-                 + least(interval '1 second' \
-                         * power(2::double precision, e.attempt_count::double precision), \
-                         interval '1 hour') \
-                   * (0.5 + random()) \
-         WHERE e.id IN (SELECT id FROM due) \
-         RETURNING e.id, e.tenant_id, e.aggregate_type, e.aggregate_id, e.event_type, \
-                   e.payload, e.attempt_count, e.available_at, e.last_error",
-    )
-    .bind(now)
-    .bind(MAX_ATTEMPTS)
-    .bind(limit)
-    .bind(NOTICE_AGGREGATE)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    Ok(rows.iter().map(event_from_row).collect())
-}
-
-/// `OutboxEvent` has public fields but no public row constructor, so the claim
-/// above rebuilds one. Column names match the `RETURNING` list.
-fn event_from_row(row: &PgRow) -> OutboxEvent {
-    OutboxEvent {
-        id: row.get("id"),
-        tenant_id: TenantId::from_uuid(row.get("tenant_id")),
-        aggregate_type: row.get("aggregate_type"),
-        aggregate_id: row.get("aggregate_id"),
-        event_type: row.get("event_type"),
-        payload: row.get("payload"),
-        attempt_count: row.get("attempt_count"),
-        available_at: row.get("available_at"),
-        last_error: row.get("last_error"),
-    }
+    outbox::claim_of(conn, Aggregates::Only(NOTICE_AGGREGATE), limit, now).await
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +308,7 @@ fn event_from_row(row: &PgRow) -> OutboxEvent {
 #[cfg(test)]
 mod tests {
     use agentos_app::inbound::{TURN_EVENT, contact_of, conversation_for, land};
-    use agentos_domain::ids::EmployeeId;
+    use agentos_domain::ids::{EmployeeId, TenantId};
     use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
     use agentos_domain::untrusted::Untrusted;
     use agentos_store::outbox::NewEvent;

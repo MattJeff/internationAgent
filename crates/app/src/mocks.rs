@@ -46,6 +46,7 @@ use agentos_domain::action::McpTool;
 use agentos_domain::ids::IdempotencyKey;
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::Untrusted;
+use agentos_providers::Secret;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
@@ -56,7 +57,6 @@ use agentos_providers::llm_cli::CliLlm;
 use agentos_providers::secrets::MemorySecretStore;
 use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
 use agentos_providers::telephony_twilio::TwilioTelephony;
-use agentos_providers::{ProviderError, Secret};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -70,7 +70,16 @@ use crate::provisioning::Adapters;
 // `inbound.rs` makes for `Secret`: one re-export beats widening the manifest.
 // `ScriptedLlm` and friends come along so a test in the binary can script a
 // model without one either.
-pub use agentos_providers::llm::{Llm, LlmResponse, ScriptedLlm, Usage};
+//
+// `LlmRequest` and `ProviderError` are the two the binary needs to *implement*
+// the trait rather than only hold one, and there is a test that has to: two
+// tenants taking a turn at the same instant are two turns through one process
+// wide `Arc<dyn Llm>`, and the only place that overlap can be observed — or
+// forced, with a barrier — is inside `complete`. `ScriptedLlm` cannot do it: its
+// cursor is shared, so which company gets which scripted turn depends on who
+// wins the race.
+pub use agentos_providers::ProviderError;
+pub use agentos_providers::llm::{Llm, LlmRequest, LlmResponse, ScriptedLlm, Usage};
 
 // And the browser, for exactly the same reason as `ScriptedLlm` next door: the
 // sales vertical drives a prospect's page, so a test of the loop that dispatches

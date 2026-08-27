@@ -116,6 +116,32 @@ pub enum ConfigError {
         index: usize,
     },
 
+    /// Two tenants were registered on one provider path.
+    ///
+    /// A boot failure rather than a warning, and the difference is where the
+    /// customer's mail ends up. `routes::webhooks` keys its registry on the
+    /// `{provider}` path segment alone and `main::webhooks` collects into a
+    /// `HashMap`, so the second registration silently replaces the first —
+    /// after which one tenant's deliveries are checked against the other
+    /// tenant's signing secret and refused as forgeries, or, when both tenants
+    /// sit behind one provider account and therefore one secret, accepted and
+    /// **filed against the wrong company**. `inbound::resolve_recipient` then
+    /// matches the address's local part inside that company, and two customers
+    /// who both hired a `sales` is the first two customers.
+    ///
+    /// Names the provider and never the value: the variable holds signing
+    /// secrets.
+    #[error(
+        "AGENTOS_WEBHOOK_SECRETS registers two tenants on the provider path {provider:?}, and \
+         the registry can only hold one — the second silently replaces the first and one of \
+         those customers' inbound deliveries is then refused as a forgery or filed against the \
+         other's company. Register one tenant per provider on this deployment"
+    )]
+    WebhookProviderTwice {
+        /// The path segment registered twice.
+        provider: String,
+    },
+
     /// Mock adapters were configured without an explicit blessing.
     ///
     /// The message names *which* adapters, which variables would fix them, and
@@ -502,7 +528,28 @@ fn split_pair(
 /// there is one format to learn rather than two.
 ///
 /// An empty string is a valid, empty registry.
+/// Parse `AGENTOS_WEBHOOK_SECRETS`, refusing a provider registered twice.
+///
+/// The duplicate check is here rather than in `main::webhooks` because that is
+/// where the value is *known* and this is where it is read — and because the
+/// collapse it prevents is invisible at every later point: `Webhooks` is a
+/// `HashMap` keyed on the provider path, so the second registration wins and
+/// nothing has a record that there was a first. See
+/// [`ConfigError::WebhookProviderTwice`] for what that costs a customer.
 fn parse_webhooks(raw: &str) -> Result<Vec<WebhookRegistration>, ConfigError> {
+    let parsed = parse_webhook_entries(raw)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for hook in &parsed {
+        if !seen.insert(hook.provider.as_str()) {
+            return Err(ConfigError::WebhookProviderTwice {
+                provider: hook.provider.clone(),
+            });
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_webhook_entries(raw: &str) -> Result<Vec<WebhookRegistration>, ConfigError> {
     raw.split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
@@ -969,6 +1016,58 @@ mod tests {
                 Err(ConfigError::WebhookEntry { index: 0 })
             ));
         }
+    }
+
+    /// **Two tenants cannot share one provider path, and the boot has to say so
+    /// rather than pick one.**
+    ///
+    /// `routes::webhooks` keys its registry on the `{provider}` path segment and
+    /// nothing else, and `main::webhooks` builds it by collecting into a
+    /// `HashMap` — so a second `email:` registration silently replaces the
+    /// first. Nothing anywhere reports it. What an operator gets is a
+    /// deployment where one customer's inbound mail is verified against the
+    /// other customer's signing secret and refused as a forgery, or — when the
+    /// two tenants are behind one provider account and therefore one secret —
+    /// **accepted and filed against the wrong tenant**, where
+    /// `inbound::resolve_recipient` matches the address's local part inside
+    /// that tenant. Two customers who both hired a `sales` is not a corner
+    /// case; it is the first two customers.
+    ///
+    /// The registry cannot hold two, so the honest thing at boot is to refuse.
+    /// The real fix is the `webhook_endpoints` table `routes::webhooks`'
+    /// ponytail note already sketches, with the tenant in the *path* so the two
+    /// deliveries never arrive at the same endpoint. Until that exists, a
+    /// deployment that would have silently mis-delivered does not start.
+    #[test]
+    fn two_registrations_for_one_provider_refuse_the_boot() {
+        const OTHER: &str = "00000000-0000-0000-0000-000000000002";
+        let mut env = complete();
+        env.insert(
+            "AGENTOS_WEBHOOK_SECRETS",
+            format!("email:{TENANT}:{SECRET},email:{OTHER}:{SECRET}"),
+        );
+
+        let err = parse(&env).expect_err(
+            "two tenants registered on one provider path: the registry keeps one of them and \
+             the other tenant's mail is either refused as a forgery or filed against the wrong \
+             company",
+        );
+        assert!(matches!(
+            err,
+            ConfigError::WebhookProviderTwice { ref provider } if provider == "email"
+        ));
+        // The message names the provider and the remedy, because the value it
+        // is about holds two signing secrets and cannot be printed.
+        let said = err.to_string();
+        assert!(said.contains("email"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+
+        // Two *different* providers are the ordinary deployment and still boot.
+        env.insert(
+            "AGENTOS_WEBHOOK_SECRETS",
+            format!("email:{TENANT}:{SECRET},telephony:{TENANT}:{SECRET}"),
+        );
+        assert_eq!(parse(&env).expect("valid").webhooks.len(), 2);
     }
 
     #[test]
