@@ -96,10 +96,15 @@ pub use agentos_providers::browser::MockBrowser;
 // platform — which is the only thing those tests are about.
 pub use agentos_providers::leads::MockLeadSink;
 
-// And the vault, for the fourth time and the same reason: `routes::model` puts
-// a customer's API key into it and `Agent::on_turn` takes it back out, both in
-// the binary, which may not name `agentos-providers`. Only the trait — the
-// concrete stores stay behind `secret_store`, so the binary cannot pick one.
+// And the vault, for the fourth time and the same reason: the provisioner's
+// identity canary is written and read from the binary, which may not name
+// `agentos-providers`. Only the trait — the concrete stores stay behind
+// `secret_store`, so the binary cannot pick one.
+//
+// It no longer carries a tenant's model credential. That moved to
+// `tenant_model_access.sealed_key` in `0050_tenant_model_key`, because every
+// implementation of this trait keeps its rows in a `HashMap` and a process-local
+// credential under a durable row is a row that lies after every restart.
 pub use agentos_providers::secrets::SecretStore;
 
 /// The signing secret the mock telephony adapter verifies callbacks against.
@@ -230,23 +235,28 @@ fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
 /// nothing; a mock cipher costs an identity.
 ///
 /// The vault (`secrets`) is still a plaintext map, and that is still fine: it
-/// holds a provisioning canary and nothing else in a mock deployment.
+/// holds a provisioning canary and nothing else — in a mock deployment or a real
+/// one, since 0050 took the tenant's model key out of it.
 pub fn adapters(master_key: &str) -> Adapters {
     adapters_for(master_key, &Credentials::default(), secret_store())
 }
 
-/// The vault this deployment stores credentials in.
+/// The vault this deployment stores its provisioning canary in.
 ///
-/// Its own constructor, and the binary calls it *once*, because the store is now
-/// shared by two readers that must see the same map: `Step::Identity`'s
-/// provisioning canary through [`Adapters::secrets`], and
-/// [`crate::model_access`]'s tenant model key through `POST /v1/model` and every
-/// turn after it. Two `MemorySecretStore::new()` calls would give a deployment
-/// two vaults, and the symptom would be a tenant that connects a key and then
-/// cannot take a turn with it — a bug with no error message anywhere.
+/// **In memory, and that is now the whole story.** It used to hold the tenant's
+/// model credential too — written by `POST /v1/model`, read by every turn — and
+/// the argument here used to be that the binary must call this *once* so both
+/// readers saw one map. That argument was true and insufficient: one map per
+/// process is still one map per process, so a restart, a crash or a second
+/// replica lost the key while the `tenant_model_access` row went on saying
+/// "connected", and every employee then spent its whole daily turn budget
+/// discovering it. `0050_tenant_model_key` moved that credential into the row
+/// that claims it, sealed. What is left here is a canary
+/// [`crate::provisioning`] writes and reads inside one step.
 ///
-/// Still in memory, still named a permanent mock by `Config::adapter_summary`.
-/// The day it is KMS this signature does not change.
+/// Still named a permanent mock by `Config::adapter_summary`, and now honestly:
+/// nothing durable depends on it. The day it is KMS this signature does not
+/// change.
 pub fn secret_store() -> Arc<dyn SecretStore> {
     Arc::new(MemorySecretStore::new())
 }
@@ -266,8 +276,8 @@ pub fn adapters_for(
         telephony: telephony_provider(credentials),
         browser: browser_provider(credentials),
         // Passed in rather than built here: see `secret_store`. One deployment,
-        // one vault, or a connected model key is invisible to the turn that
-        // needs it.
+        // one vault, so the provisioning canary a step writes is the one the
+        // next step reads.
         secrets,
         envelope: crate::identity::envelope(master_key),
     }

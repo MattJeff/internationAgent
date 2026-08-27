@@ -1,5 +1,5 @@
-//! **One key goes in. It comes out in exactly one place, and that place is the
-//! vault.**
+//! **One key goes in. It comes out in exactly one place, and that place is a
+//! `bytea` column nobody can read without the deployment's master key.**
 //!
 //! `agentos_app::model_access` takes a customer's Anthropic API key, proves it
 //! against the provider, and stores it. Between those three steps the key passes
@@ -7,7 +7,21 @@
 //! and two `tracing` events, and any one of them could keep a copy. This file is
 //! the search: after a successful connection, the key must not be findable in
 //! the outcome that becomes an HTTP body, the audit trail, the connection row,
-//! any `Debug` rendering, any log line, or the stored ciphertext.
+//! any `Debug` rendering, any log line, or the bytes a `pg_dump` would produce.
+//!
+//! # What `0050_tenant_model_key` moved, and what it did not
+//!
+//! The credential used to go to an `agentos_providers::secrets::SecretStore` —
+//! in every wired deployment, a `HashMap` in the server process — so a restart
+//! left a row claiming a connection nothing could honour. It is now
+//! `tenant_model_access.sealed_key`, sealed under AAD `model://<tenant>` and
+//! written by the same INSERT as the proof.
+//!
+//! That adds a surface rather than removing one, and this file searches it: the
+//! **actual bytes in the column**, read back out of Postgres, not a ciphertext
+//! this test produced for itself. A test that re-seals the key and searches its
+//! own output proves the cipher works; it says nothing about what the row
+//! contains.
 //!
 //! # Why this is a test binary of its own and not one more `#[test]` in the module
 //!
@@ -28,20 +42,21 @@
 //!
 //! Break any of these in `model_access.rs` and this file is what goes red:
 //! putting the key in the audit payload, hashing it into the payload, logging it
-//! beside the tenant id, adding a `key` field to `Outcome`, or storing it in the
-//! connection row instead of the vault. The assertion covers a rendered blob of
-//! every one of those surfaces at once, so a new surface added later is covered
-//! the moment it is added to the blob — and the blob is the thing to add to.
+//! beside the tenant id, adding a `key` field to `Outcome`, storing the
+//! credential in the row as plaintext, or sealing it under a context that is not
+//! the tenant's. The assertion covers a rendered blob of every one of those
+//! surfaces at once, so a new surface added later is covered the moment it is
+//! added to the blob — and the blob is the thing to add to.
 
 use std::sync::{Arc, Mutex};
 
+use agentos_app::mcp::Credentials;
 use agentos_app::mocks::{Llm, LlmBackend, LlmResponse, ScriptedLlm, Usage};
 use agentos_app::model_access::{connect, for_turn};
 use agentos_domain::ids::TenantId;
-use agentos_domain::model_access::{ModelAccess, ModelPath, Verdict};
+use agentos_domain::model_access::{ModelPath, Verdict};
 use agentos_domain::policy::ModelId;
 use agentos_providers::Secret;
-use agentos_providers::secrets::{LocalEnvelopeSecretStore, SecretStore};
 use agentos_store::audit::AuditActor;
 use agentos_store::db::{Db, TenantTx};
 use chrono::Utc;
@@ -54,6 +69,14 @@ use tracing_subscriber::fmt::MakeWriter;
 /// on purpose: three independent fragments, so a partial or truncated copy is
 /// caught as well as a whole one.
 const KEY: &str = "sk-ant-api03-DO-NOT-LEAK-ME-4a9f2c";
+
+/// This deployment's `AGENTOS_MASTER_KEY`.
+///
+/// Text, not 32 bytes, because that is what the environment variable is and what
+/// `Credentials::from_master_key` derives from. A test that fed the cipher raw
+/// bytes would prove the cipher works and skip the one step a deployment
+/// actually performs.
+const MASTER_KEY: &str = "leak-test-master-key";
 
 /// Everything `tracing` emitted, as bytes.
 ///
@@ -170,7 +193,7 @@ fn host() -> Arc<dyn Llm> {
 }
 
 #[tokio::test]
-async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
+async fn the_key_reaches_the_sealed_column_and_appears_nowhere_else() {
     let logs = Logs::default();
     tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
@@ -184,7 +207,7 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
         return;
     };
     let (origin, request) = anthropic("200 OK", OK_BODY).await;
-    let secrets = LocalEnvelopeSecretStore::new([3u8; 32]);
+    let credentials = Credentials::from_master_key(MASTER_KEY);
     let now = Utc::now();
 
     // The real `connect`, with its probe pointed at a listener instead of the
@@ -193,7 +216,7 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
     let mut tx: TenantTx<'_> = db.tenant_tx(tenant_id).await.expect("tx");
     let outcome = connect(
         &mut tx,
-        &secrets,
+        &credentials,
         &host(),
         LlmBackend::Mock,
         ModelPath::ApiKey,
@@ -216,29 +239,29 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
     assert!(raw.to_lowercase().contains("x-api-key"), "{raw}");
     assert!(raw.contains(KEY), "the probe must actually use the key");
 
-    // 2. The vault has it, under the ref derived from the tenant id.
-    let secret_ref = ModelAccess::secret_ref(tenant_id).unwrap();
-    assert_eq!(
-        secrets
-            .get(&secret_ref)
-            .await
-            .expect("stored")
-            .expose_for_transport(),
-        KEY
-    );
-
-    // 3. And the turn that spends it gets a client, not a copy anybody can
+    // 2. And the turn that spends it gets a client, not a copy anybody can
     //    read: `for_turn` hands back an `Arc<dyn Llm>` with no accessor on it.
+    //    Through a *second* `Credentials` over the same master key, because the
+    //    whole point of 0050 is that the process which stored the credential is
+    //    allowed to have gone away.
+    let after_restart = Credentials::from_master_key(MASTER_KEY);
     let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
-    let (llm, access) = for_turn(&mut tx, &secrets, &host(), LlmBackend::Mock, Some(&origin))
-        .await
-        .expect("connected");
+    let (llm, access) = for_turn(
+        &mut tx,
+        &after_restart,
+        &host(),
+        LlmBackend::Mock,
+        Some(&origin),
+    )
+    .await
+    .expect("connected");
     let spender = format!("{:?}", Arc::as_ptr(&llm));
 
-    // 4. Everything anybody can read. The outcome is the HTTP body, the audit
-    //    payloads are the trail, the row is the table, `Debug` on the store is
-    //    what a panic prints, and the ciphertext is what a database dump holds.
-    let row = agentos_store::model_access::load(&mut tx)
+    // 3. Everything anybody can read. The outcome is the HTTP body, the audit
+    //    payloads are the trail, the connection is what a turn holds, and
+    //    `stored_bytes` is literally the column — what a `pg_dump` would carry
+    //    off, read back rather than re-derived.
+    let connection = agentos_store::model_access::load(&mut tx)
         .await
         .expect("load")
         .expect("connected");
@@ -247,10 +270,10 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
             .fetch_all(&mut **tx)
             .await
             .expect("audit");
-    let ciphertext = secrets
-        .seal(&secret_ref, &Secret::new(KEY))
-        .expect("seal")
-        .to_bytes();
+    let stored_bytes: Vec<u8> = sqlx::query_scalar("SELECT sealed_key FROM tenant_model_access")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the sealed column");
     tx.commit().await.expect("commit");
 
     assert_eq!(audit_rows.len(), 1, "one connect, one row");
@@ -259,15 +282,20 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
         audit_rows[0].0, "operator:founder@example.com",
         "the trail names who, never what"
     );
-    assert_eq!(access, row);
+    assert_eq!(access, connection.access);
+    assert_eq!(
+        connection.sealed_key.as_deref(),
+        Some(stored_bytes.as_slice()),
+        "the credential a turn reads is the credential in the column"
+    );
 
     let everything = format!(
-        "{outcome:?} {json} {row:?} {access:?} {audit_rows:?} {secrets:?} {spender} {logs} \
-         {cipher:?} {cipher_utf8}",
+        "{outcome:?} {json} {connection:?} {access:?} {audit_rows:?} {credentials:?} \
+         {after_restart:?} {spender} {logs} {stored:?} {stored_utf8}",
         json = serde_json::to_string(&outcome).expect("serialize"),
         logs = logs.text(),
-        cipher = ciphertext,
-        cipher_utf8 = String::from_utf8_lossy(&ciphertext),
+        stored = stored_bytes,
+        stored_utf8 = String::from_utf8_lossy(&stored_bytes),
     );
     assert!(
         !everything.contains(KEY),
@@ -297,5 +325,5 @@ async fn the_key_reaches_the_vault_and_appears_nowhere_else() {
             .contains("connected"),
         "the response body must actually say something"
     );
-    assert!(ciphertext.len() > 32, "a sealed envelope is not empty");
+    assert!(stored_bytes.len() > 32, "a sealed envelope is not empty");
 }

@@ -289,7 +289,10 @@ async fn get(
 
     // Whose credential a turn would be billed to, and by what path. Before the
     // seats, because it decides whether any of them can take a turn at all.
-    let Some(access) = model_access::load(&mut tx).await? else {
+    // `.access`: the proof half. The sealed credential comes back in the same
+    // row and is dropped here — a forecast reads which path pays, never what
+    // pays.
+    let Some(access) = model_access::load(&mut tx).await?.map(|c| c.access) else {
         tx.rollback().await?;
         return Err(ApiError::not_found().with_detail(
             "no model is connected for this tenant, so none of its employees can take a turn and \
@@ -845,6 +848,10 @@ mod tests {
                     model: ModelId::Opus5,
                     verified_at: Utc::now(),
                 },
+                // A stand-in envelope for the `api_key` path: 0050's CHECK is a
+                // biconditional, so a row on that path has to carry one. Never
+                // opened — this route reads `path`, never a credential.
+                (path == ModelPath::ApiKey).then_some(&b"sealed-fixture"[..]),
                 Utc::now(),
             )
             .await

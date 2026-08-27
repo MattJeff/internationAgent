@@ -149,11 +149,11 @@ use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
 use agentos_domain::ids::Slug;
-use agentos_domain::model_access::ModelAccess;
 use agentos_domain::policy::{EffectivePolicy, ModelId, model_for};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::employee as employee_store;
 use agentos_store::initiative::{self, Due};
+use agentos_store::model_access::Connection;
 use agentos_store::model_usage::{self, Consumed};
 use agentos_store::policy as policy_store;
 use agentos_store::turns;
@@ -223,10 +223,23 @@ pub struct Assignment {
     /// takes no turn, so discovering it after the reservation would spend a
     /// quarter of an employee's day on finding out.
     ///
-    /// It does not name the model the turn runs: `model` above does, and
-    /// `agentos_domain::policy::model_for` is still the only thing that decides
-    /// it. See `agentos_domain::model_access::ModelAccess::model`.
-    pub access: ModelAccess,
+    /// It does not name the model the turn runs: [`Assignment::model`] above
+    /// does, and `agentos_domain::policy::model_for` is still the only thing
+    /// that decides it. See `agentos_domain::model_access::ModelAccess::model`.
+    ///
+    /// **The sealed credential rides along inside it**, which is why this is a
+    /// `Connection` and not a `ModelAccess`. `assignment_for` rolls its read
+    /// transaction back before the turn starts, so a `take_turn` that had only
+    /// the proof would have to go looking for the key somewhere else — and
+    /// "somewhere else" was a process-local `HashMap` that a restart emptied,
+    /// which is the whole of `migrations/0050_tenant_model_key.sql`. Carrying
+    /// both out of one `SELECT` is what makes the reservation below safe: by the
+    /// time `reserve_a_turn` commits, the thing that pays for the turn is
+    /// already in hand.
+    ///
+    /// It is ciphertext in memory for the length of a turn, and its `Debug`
+    /// prints a length rather than bytes.
+    pub connection: Connection,
     /// The one piece of work a sales charter does this turn, resolved here for
     /// exactly the reason [`Assignment::model`] is: **an empty answer is a
     /// reason not to start a turn.**
@@ -645,15 +658,15 @@ async fn assignment_for(
         };
         // And whose credential a turn would be billed to. One row by primary
         // key, in the same read as everything else, and it is here rather than
-        // in `take_turn` for the reason `Assignment::access` states: an
+        // in `take_turn` for the reason `Assignment::connection` states: an
         // unconnected tenant must not spend a reserved turn discovering that it
         // has no model. `model_access::connected` is the *row*; turning it into
         // a client needs the host backend and the vault, which only the agent
         // has, so that half happens in `take_turn`.
-        let access = agentos_app::model_access::connected(&mut tx)
+        let connection = agentos_app::model_access::connected(&mut tx)
             .await
             .map_err(|err| Outcome::NoModel(err.to_string()))?;
-        Ok((employee.employee, charter, colleagues, policy, access))
+        Ok((employee.employee, charter, colleagues, policy, connection))
     }
     .await;
 
@@ -661,7 +674,7 @@ async fn assignment_for(
     // is awaited rather than dropped so a pooled connection is handed back
     // deliberately.
     let _ = tx.rollback().await;
-    let (employee, charter, colleagues, policy, access) = read?;
+    let (employee, charter, colleagues, policy, connection) = read?;
 
     let Some(charter) = charter else {
         return Ok(None);
@@ -738,7 +751,7 @@ async fn assignment_for(
         colleagues,
         policy,
         model,
-        access,
+        connection,
         sales,
     }))
 }
@@ -839,18 +852,21 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         colleagues,
         policy,
         model,
-        access,
+        connection,
         sales,
     } = assignment;
     let role = charter.role();
 
     // The tenant's own model, as a client. `assignment_for` already refused a
-    // tenant that has connected none — this is the other half, which needs the
-    // vault and the host backend and therefore needs the agent.
+    // tenant that has connected none, and handed back the sealed credential in
+    // the same read — this is the other half, which needs the master key and the
+    // host backend and therefore needs the agent.
     //
     // The two failures left are misconfigurations of a connection that exists: a
-    // credential the vault no longer has, and a host whose `AGENTOS_LLM` became
-    // an API key of ours after the tenant connected to it. Both record as
+    // credential this deployment can no longer decrypt because its master key
+    // changed, and a host whose `AGENTOS_LLM` became an API key of ours after
+    // the tenant connected to it. Neither is "the key is gone" any more — 0050
+    // put it in the row — and both record as
     // `error` rather than `no_model`, and that is a known rough edge rather than
     // a judgement — `handle` maps every `Err` from here to `Outcome::Failed`,
     // and giving it a second code would mean threading `LlmBackend` through
@@ -860,8 +876,8 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // the remedy.
     let llm = agentos_app::model_access::llm_for(
         due.tenant_id,
-        access,
-        agent.secrets.as_ref(),
+        &connection,
+        &agent.credentials,
         &agent.llm,
         agent.backend,
         // `None` is the real API. See `agentos_app::model_access::ApiBase`.
@@ -1456,11 +1472,13 @@ pub(crate) mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         agentos_store::model_access::save(
             &mut tx,
-            &ModelAccess {
+            &agentos_domain::model_access::ModelAccess {
                 path: agentos_domain::model_access::ModelPath::Cli,
                 model: ModelId::Opus5,
                 verified_at: now,
             },
+            // `cli`: no credential, and 0050's CHECK insists there is none.
+            None,
             now,
         )
         .await
@@ -1920,7 +1938,7 @@ pub(crate) mod tests {
             db: db.clone(),
             llm: Arc::new(ScriptedLlm::responses(script)),
             backend: agentos_app::mocks::LlmBackend::Mock,
-            secrets: agentos_app::mocks::secret_store(),
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
@@ -2155,7 +2173,7 @@ pub(crate) mod tests {
             db: db.clone(),
             llm: Arc::new(agentos_app::mocks::scripted_mock()),
             backend: agentos_app::mocks::LlmBackend::Mock,
-            secrets: agentos_app::mocks::secret_store(),
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             // No binder loop here, so every tenant's fleet is empty and every
@@ -2263,7 +2281,7 @@ pub(crate) mod tests {
             db: db.clone(),
             llm: Arc::new(ScriptedLlm::new(Vec::new())),
             backend: agentos_app::mocks::LlmBackend::Mock,
-            secrets: agentos_app::mocks::secret_store(),
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
@@ -2520,7 +2538,7 @@ pub(crate) mod tests {
                 db: db.clone(),
                 llm: Arc::new(agentos_app::mocks::scripted_mock()),
                 backend: agentos_app::mocks::LlmBackend::Mock,
-                secrets: agentos_app::mocks::secret_store(),
+                credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 gate: PolicyGate::new(db.clone()),
                 ports: Arc::new(ports),
                 // No binder loop, so the fleet is empty and the Orizn lookup is

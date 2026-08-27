@@ -133,7 +133,8 @@ use std::sync::Arc;
 
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
-use agentos_app::mocks::{Llm, LlmBackend, SecretStore};
+use agentos_app::mcp::Credentials;
+use agentos_app::mocks::{Llm, LlmBackend};
 use agentos_app::turn::{Budgets, Context, Turn};
 use agentos_app::vertical::{Charter, CharterError, Question};
 use agentos_domain::action::ActionKind;
@@ -213,8 +214,10 @@ pub struct InterviewState {
     /// decide whether this tenant's connection is allowed to use it.
     host: Arc<dyn Llm>,
     backend: LlmBackend,
-    /// The vault the tenant's proven key was sealed into.
-    secrets: Arc<dyn SecretStore>,
+    /// The cipher the tenant's proven key was sealed with. Since
+    /// `0050_tenant_model_key` the credential itself is a column on
+    /// `tenant_model_access`, so this is a master key and not a place to look.
+    credentials: Credentials,
 }
 
 /// This unit's routes. Merged into the API router, so auth, the rate limit and
@@ -225,7 +228,7 @@ pub fn router(
     ports: Arc<Ports>,
     host: Arc<dyn Llm>,
     backend: LlmBackend,
-    secrets: Arc<dyn SecretStore>,
+    credentials: Credentials,
 ) -> Router {
     Router::new()
         .route("/v1/interview", get_route(questionnaire))
@@ -236,7 +239,7 @@ pub fn router(
             ports,
             host,
             backend,
-            secrets,
+            credentials,
         })
 }
 
@@ -601,9 +604,13 @@ async fn answer(
     let policy = policy_store::load(&mut tx, employee_id)
         .await
         .map_err(unreadable_policy)?;
+    // The proof half only: this read decides whether a turn may happen at all,
+    // and `for_turn` below reads the row again — in the transaction that
+    // reserves the turn — for the credential that pays for it.
     let access = agentos_app::model_access::connected(&mut tx)
         .await
-        .map_err(no_model)?;
+        .map_err(no_model)?
+        .access;
     tx.rollback().await?;
 
     let role = charter.role();
@@ -656,7 +663,7 @@ async fn answer(
         .map_err(over_budget)?;
     let (llm, _access) = agentos_app::model_access::for_turn(
         &mut tx,
-        state.secrets.as_ref(),
+        &state.credentials,
         &state.host,
         state.backend,
         // `None` is the real API. See `agentos_app::model_access::ApiBase`.
@@ -1570,6 +1577,8 @@ mod tests {
                     model: agentos_domain::policy::ModelId::Opus5,
                     verified_at: now,
                 },
+                // `cli`: no credential, and 0050's CHECK insists there is none.
+                None,
                 now,
             )
             .await
@@ -1598,7 +1607,7 @@ mod tests {
                     Arc::new(agentos_app::mocks::ports()),
                     llm,
                     LlmBackend::Mock,
-                    agentos_app::mocks::secret_store(),
+                    agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 ),
                 db.clone(),
                 crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),

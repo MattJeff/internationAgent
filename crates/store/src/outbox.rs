@@ -603,6 +603,68 @@ pub async fn dead_letters(
     Ok(rows.iter().map(OutboxEvent::from_row).collect())
 }
 
+/// Give this tenant's dead letters their attempts back.
+///
+/// # Why this verb has to exist at all
+///
+/// Because until it did, [`dead_letters`] was a one-way door. Nothing in the
+/// workspace ever wrote `attempt_count = 0`, so a row that burned its eight
+/// attempts was never claimed again by anything, ever — and the only handler
+/// that reads it is a human with `psql`.
+///
+/// That is the right shape for a poisoned payload. It is the wrong shape for the
+/// failure that actually produces dead letters in this product: a tenant who
+/// receives mail *before* connecting a model. `apps/server/src/main.rs` turns
+/// `NoModel` into a `String` and hands it to the retry channel, so eight
+/// attempts — about two minutes, per [`claim`]'s schedule — pass before anybody
+/// has finished pasting an API key. Every one of those messages is then a mail
+/// the customer's employees will never answer, on a system whose entire premise
+/// is that they do.
+///
+/// # It is untargeted, and that is deliberate
+///
+/// This requeues *every* exhausted event the tenant has, not the ones that died
+/// of `NoModel`. The alternative is matching on `last_error`, which means
+/// pattern-matching a human sentence that any refactor is free to reword — a
+/// filter that silently stops matching is worse than no filter, because the
+/// symptom is the same permanent silence this function exists to end.
+///
+/// The cost of being untargeted is bounded and small: a genuinely poisoned event
+/// fails eight more times over the same two hours and returns to exactly where
+/// it was, with a fresh `last_error` saying so. The trigger is not automatic —
+/// it is a person deliberately connecting a model — so there is no loop here,
+/// only a retry a human asked for.
+///
+/// # What it does not touch
+///
+/// `published_at`, because an event that was published is done and replaying it
+/// would be the side effect happening twice. And `last_error`, which stays until
+/// something succeeds: erasing it here would hide, from the operator reading
+/// [`dead_letters`] tomorrow, why the row was ever stuck. [`mark_done`] is what
+/// clears it, and only after the handler actually worked.
+///
+/// Returns how many rows were revived, so a caller can say nothing at all when
+/// the answer is zero.
+pub async fn requeue_dead_letters(
+    tx: &mut TenantTx<'_>,
+    now: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    // No `WHERE tenant_id`: RLS is forced on `outbox_events` and this is a
+    // `TenantTx`, so the tenant filter is the database's. That also means this
+    // cannot revive another tenant's stuck mail, which a `Db`-level verb taking
+    // a tenant id could have been talked into.
+    let revived = sqlx::query(
+        "UPDATE outbox_events SET attempt_count = 0, available_at = $1 \
+         WHERE published_at IS NULL AND attempt_count >= $2::int",
+    )
+    .bind(now)
+    .bind(MAX_ATTEMPTS)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(revived.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1058,6 +1120,102 @@ mod tests {
         assert_eq!(dead[0].last_error.as_deref(), Some("boom 8"));
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **A dead letter can be claimed again, and only by its own tenant.**
+    ///
+    /// The half of the fix that is not about credentials: before
+    /// [`requeue_dead_letters`], a message that arrived while a tenant had no
+    /// model connected was gone for good, because the eight attempts run out in
+    /// about two minutes and nobody pastes an API key that fast.
+    ///
+    /// Three properties, and the third is the one a `WHERE tenant_id` somebody
+    /// forgot would break: a published event is not resurrected, a live event is
+    /// not disturbed, and another tenant's dead letter stays dead.
+    #[tokio::test]
+    async fn a_requeued_dead_letter_is_claimed_again_and_only_the_tenants_own() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let mine = seed_tenant(&db, "requeue-mine").await;
+        let theirs = seed_tenant(&db, "requeue-theirs").await;
+
+        // One of mine dies, one of mine is published, one of mine is healthy,
+        // and one of theirs dies.
+        let stuck = enqueue_committed(&db, mine, &event(1), at(T0)).await;
+        let published = enqueue_committed(&db, mine, &event(2), at(T0)).await;
+        let healthy = enqueue_committed(&db, mine, &event(3), at(T0)).await;
+        let not_mine = enqueue_committed(&db, theirs, &event(4), at(T0)).await;
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        for id in [stuck, not_mine] {
+            sqlx::query("UPDATE outbox_events SET attempt_count = $2 WHERE id = $1")
+                .bind(id)
+                .bind(MAX_ATTEMPTS)
+                .execute(&mut *admin)
+                .await
+                .expect("exhaust");
+        }
+        mark_done(&mut admin, published, at(T0 + 1))
+            .await
+            .expect("publish");
+        sqlx::query("UPDATE outbox_events SET attempt_count = $2 WHERE id = $1")
+            .bind(published)
+            .bind(MAX_ATTEMPTS)
+            .execute(&mut *admin)
+            .await
+            .expect("exhaust the published one too");
+        mark_failed(&mut admin, stuck, "no model is connected")
+            .await
+            .expect("mark failed");
+        admin.commit().await.expect("commit");
+
+        // The customer connects a model.
+        let mut tx = db.tenant_tx(mine).await.expect("tx");
+        let revived = requeue_dead_letters(&mut tx, at(T0 + 2))
+            .await
+            .expect("requeue");
+        tx.commit().await.expect("commit");
+        assert_eq!(revived, 1, "one dead letter, not the published one");
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed: Vec<Uuid> = claim(&mut admin, 10, at(T0 + 3))
+            .await
+            .expect("claim")
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(claimed.contains(&stuck), "the mail is deliverable again");
+        assert!(claimed.contains(&healthy), "and so is everything else");
+        assert!(
+            !claimed.contains(&published),
+            "a published event stays done"
+        );
+        assert!(!claimed.contains(&not_mine), "another tenant's stays dead");
+
+        // The reason it was stuck survives the requeue, for whoever is reading
+        // `dead_letters` output from yesterday.
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM outbox_events WHERE id = $1")
+                .bind(stuck)
+                .fetch_one(&mut *admin)
+                .await
+                .expect("last_error");
+        assert_eq!(reason.as_deref(), Some("no model is connected"));
+        admin.rollback().await.expect("rollback");
+
+        // And it is idempotent: nothing is exhausted any more.
+        let mut tx = db.tenant_tx(mine).await.expect("tx");
+        assert_eq!(
+            requeue_dead_letters(&mut tx, at(T0 + 4))
+                .await
+                .expect("again"),
+            0
+        );
+        tx.commit().await.expect("commit");
+
+        drop_tenant(&db, mine).await;
+        drop_tenant(&db, theirs).await;
     }
 
     /// The ordinary path: claim, succeed, and it is gone for good.

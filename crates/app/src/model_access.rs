@@ -2,15 +2,41 @@
 //!
 //! `crates/domain/src/model_access.rs` argues why the connection is a tenant
 //! resource and not a policy field; `migrations/0041_tenant_model_access.sql`
-//! argues the table. This module is the only place the two meet a network, and
-//! it makes four decisions.
+//! argues the table and `migrations/0050_tenant_model_key.sql` the credential
+//! column. This module is the only place any of them meets a network, and it
+//! makes five decisions.
+//!
+//! # 0. The credential is a column on the row it proves
+//!
+//! `migrations/0050_tenant_model_key.sql` is the argument in full; the part that
+//! belongs here is what it changed about this module. Until 0050 the key went to
+//! an `agentos_providers::secrets::SecretStore` and the row went to Postgres,
+//! and the only `SecretStore` this deployment ever wires is
+//! `MemorySecretStore` — a `HashMap` in the server process. So the two halves of
+//! a connection had different lifetimes, and every restart produced the state
+//! the sentence below promises is unreachable: a row saying "connected" and a
+//! credential that was not there. Worse, it produced it *expensively*, because
+//! [`connected`] reads the row and `reserve_a_turn` commits before anything
+//! looks for the key.
+//!
+//! Now the sealed credential is `tenant_model_access.sealed_key`, written by the
+//! same INSERT as the proof and read by the same SELECT, under AAD
+//! `model://<tenant>` — the shape `0040_mcp_credentials` established for MCP
+//! bearer tokens and `crates/app/src/mcp.rs`'s [`Credentials`] already
+//! implements. This module builds no cipher of its own and stores nothing
+//! anywhere else.
 //!
 //! # 1. Prove first, store second. Never the other way round.
 //!
-//! [`connect`] runs the verification call **before** the credential reaches the
-//! vault, and writes nothing at all unless the call returned a completion. So a
-//! stored key is always a key that answered, and there is no state where the row
-//! says "connected" and the credential does not work.
+//! [`connect`] runs the verification call **before** the credential is sealed
+//! into the row, and writes nothing at all unless the call returned a
+//! completion. So a stored key is always a key that answered, and there is no
+//! state where the row says "connected" and the credential does not work.
+//!
+//! Since 0050 that is a property of the schema rather than of this function's
+//! ordering: the CHECK constraint makes `path = 'api_key'` and a present
+//! `sealed_key` a biconditional, so the half-written state cannot be spelled in
+//! SQL at all, by this function or by anything else.
 //!
 //! The alternative — store, then verify, then mark — buys one thing (the user
 //! does not re-paste a key that failed for a transient reason) and costs the
@@ -73,17 +99,43 @@ use std::sync::Arc;
 use agentos_domain::ids::TenantId;
 use agentos_domain::model_access::{ModelAccess, ModelPath, Verdict};
 use agentos_domain::policy::ModelId;
+use agentos_providers::Secret;
 use agentos_providers::llm::{Llm, LlmRequest, Message};
 use agentos_providers::llm_anthropic::AnthropicLlm;
-use agentos_providers::secrets::SecretStore;
-use agentos_providers::{ProviderError, Secret};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{StoreError, TenantTx};
+use agentos_store::model_access::Connection;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 
+use crate::mcp::{Credentials, McpError};
 use crate::mocks::LlmBackend;
+
+/// The encryption context this module's credential is sealed under.
+///
+/// One tenant, one credential, so the tenant id is the whole of it — the MCP
+/// spelling needs a server slug because a tenant has many bindings and
+/// `tenant_model_access` has a single-column primary key precisely so it cannot.
+///
+/// The `model://` scheme is the convention
+/// [`LocalEnvelopeSecretStore::seal_in`](agentos_providers::secrets::LocalEnvelopeSecretStore::seal_in)
+/// asks every caller to follow — "`context` must be unambiguous across callers
+/// or two key spaces collide" — and this is the fourth key space in the
+/// workspace, beside `secret://`, `mcp://` and `crate::oauth`'s.
+///
+/// What the disjointness buys, concretely: the four columns holding these blobs
+/// are one `UPDATE … SELECT` apart for anybody who can write the tables, and a
+/// tenant's own MCP bearer token landing in `tenant_model_access.sealed_key`
+/// would be sent to Anthropic as an API key, on a request they are billed for.
+/// The tenant AAD does not stop that one — both blobs belong to the same tenant
+/// — so the payload context is the only thing that does.
+///
+/// `an_mcp_token_moved_into_the_model_column_opens_nothing` is the test, and it
+/// fails when this function returns a string any other caller can also produce.
+fn model_context(tenant_id: TenantId) -> String {
+    format!("model://{tenant_id}")
+}
 
 /// The prompt every verification call sends.
 ///
@@ -230,10 +282,17 @@ pub enum ConnectError {
     )]
     HostModelIsNotYours,
 
-    /// The credential could not be stored. Nothing was written; the row is not
-    /// there either, because it is written after this.
-    #[error("the credential store refused the key: {0}")]
-    Vault(ProviderError),
+    /// The credential could not be sealed, so nothing was written at all —
+    /// the row carries the ciphertext, so there is no half of this to fail
+    /// separately any more.
+    ///
+    /// Reachable only through the cipher itself (`secret_encrypt_failed`), which
+    /// in practice means the deployment's master key is wrong. Named `Seal`
+    /// rather than the `Vault` it was before 0050, because there is no vault on
+    /// this path to blame and an operator sent to look for one finds a
+    /// `HashMap`.
+    #[error("the credential could not be sealed: {0}")]
+    Seal(McpError),
 
     /// The row or the audit line could not be written.
     #[error(transparent)]
@@ -246,26 +305,49 @@ pub enum ConnectError {
 /// [`ModelPath::Cli`]. `host` is the deployment's own backend, used as the
 /// thing to probe on the CLI path and never touched on the key path.
 ///
-/// The order of the three writes is the contract, and it is the same order
-/// `provisioning.rs` uses for a phone number: the expensive irreversible thing
-/// first, then the record of it.
+/// The order is the contract, and it is the same order `provisioning.rs` uses
+/// for a phone number: the expensive irreversible thing first, then the record
+/// of it.
 ///
 /// 1. **Probe.** Anything but [`Verdict::Connected`] returns here with the key
 ///    still on the caller's stack, where it is dropped and zeroized.
-/// 2. **Vault.** The credential is written under a ref derived from the tenant
-///    id. If the caller's transaction later rolls back, the worst that survives
-///    is an orphan credential nothing points at — which the next attempt
-///    overwrites and tenant deletion removes.
-/// 3. **Row and audit line, in the caller's transaction.** They commit together
-///    or not at all, so the trail cannot claim a connection the table lacks.
+/// 2. **Seal.** In memory, into an envelope bound to `model://<tenant>`.
+///    Nothing is stored by this step, so nothing survives a rollback.
+/// 3. **Row, credential and audit line, in the caller's transaction.** One
+///    INSERT carries the proof *and* the ciphertext, so they commit together or
+///    not at all — this is the sentence `0041` wrote about the vault and could
+///    not keep, and the reason 0050 exists.
+/// 4. **Requeue.** See below.
 ///
 /// The caller commits. Nothing here does, because the route that calls it has
 /// other work in the same transaction and two commits would be two chances to
 /// half-succeed.
+///
+/// # Why connecting a model unsticks the mailbox
+///
+/// A customer's first inbound mail routinely arrives *before* they finish
+/// setting up. `apps/server/src/main.rs` renders [`NoModel`] into a `String` and
+/// returns it as a handler failure, which puts a named, human-remediable refusal
+/// into the outbox's retry channel: eight attempts, roughly two minutes end to
+/// end, and then the row is a dead letter that nothing in this workspace ever
+/// claimed again. So the customer who pastes their key ten minutes later has a
+/// working deployment and a silently abandoned inbox.
+///
+/// [`agentos_store::outbox::requeue_dead_letters`] is called here, in the same
+/// transaction, so it is atomic with the connection that justifies it — a commit
+/// that stores the key and a commit that revives the mail cannot come apart.
+/// It runs only on [`Verdict::Connected`]; a refused key has changed nothing and
+/// has no business touching a queue.
+///
+/// **The `?` at `apps/server/src/main.rs`'s `for_turn` call is deliberately left
+/// alone.** Turning it into `Ok(())` would reach `mark_done`, which sets
+/// `published_at` and clears `last_error` — converting a recoverable, alerting
+/// dead letter into an irrecoverable silent success. The failure is correctly
+/// recorded; what was missing was any way back.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect(
     tx: &mut TenantTx<'_>,
-    secrets: &dyn SecretStore,
+    credentials: &Credentials,
     host: &Arc<dyn Llm>,
     backend: LlmBackend,
     path: ModelPath,
@@ -280,13 +362,13 @@ pub async fn connect(
     // Which client does the proving. On the key path it is a client built
     // around the customer's credential *here* and thrown away at the end of this
     // function — the caller never holds one, so the key is in exactly one
-    // long-lived place and it is the vault.
+    // long-lived place and it is the sealed column.
     //
     // **The key is narrowed to the path here, and that is not tidiness.** It is
     // the invariant this module exists for: what gets stored has to be the thing
     // that was proven. A `cli` request that also carried an `api_key` would
     // otherwise be proved against the *host's* model and then have that
-    // untouched credential written to the vault — a stored key nobody tried,
+    // untouched credential sealed into the row — a stored key nobody tried,
     // which is exactly the state "prove first, store second" is supposed to make
     // unreachable. One `match`, both jobs, and no path where they can disagree.
     let (verdict, key) = match path {
@@ -321,27 +403,22 @@ pub async fn connect(
         });
     }
 
-    if let Some(key) = key {
-        let secret_ref = ModelAccess::secret_ref(tenant_id).map_err(|_| {
-            // Unreachable: `MODEL_SECRET_NAME` is a const that satisfies
-            // `SecretRef::new`, and an unreachable arm that unwraps is an
-            // unreachable arm that panics one refactor later.
-            ConnectError::Vault(ProviderError::Terminal {
-                code: "secret_ref_invalid",
-            })
-        })?;
-        secrets
-            .put(&secret_ref, &key)
-            .await
-            .map_err(ConnectError::Vault)?;
-    }
+    // Sealed here and dropped at the end of this function. The plaintext exists
+    // on this stack and in the client that just proved it, and reaches no other
+    // owner: `seal_as` borrows the `Secret` and hands back ciphertext, which is
+    // what makes "the key never crosses into `apps/server`" a property of the
+    // signature rather than four handlers being careful.
+    let sealed = key
+        .map(|key| credentials.seal_as(tenant_id, &model_context(tenant_id), &key))
+        .transpose()
+        .map_err(ConnectError::Seal)?;
 
     let access = ModelAccess {
         path,
         model,
         verified_at: now,
     };
-    agentos_store::model_access::save(tx, &access, now).await?;
+    agentos_store::model_access::save(tx, &access, sealed.as_deref(), now).await?;
     audit::append(
         tx,
         &AuditEvent {
@@ -362,6 +439,20 @@ pub async fn connect(
         },
     )
     .await?;
+
+    // The mail that arrived before the model did. See this function's docs: the
+    // count is logged rather than returned, because it is an operational fact
+    // about a queue and `Outcome` is an answer about a credential — putting it
+    // in the response body would be a number the setup UI has to explain.
+    let revived = agentos_store::outbox::requeue_dead_letters(tx, now).await?;
+    if revived > 0 {
+        tracing::info!(
+            tenant_id = %tenant_id.as_uuid(),
+            revived,
+            "events that had exhausted their attempts before this tenant had a model are \
+             deliverable again"
+        );
+    }
 
     tracing::info!(
         tenant_id = %tenant_id.as_uuid(),
@@ -407,13 +498,20 @@ pub enum NoModel {
     )]
     HostModelIsNotTheirs,
 
-    /// The row says [`ModelPath::ApiKey`] and the vault has nothing at the
-    /// derived ref. A database restored without its secrets, or a master key
-    /// that changed.
+    /// The row says [`ModelPath::ApiKey`] and its sealed credential will not
+    /// open.
+    ///
+    /// **Since 0050 this no longer means "a restart lost it".** The ciphertext
+    /// is a column on the row, so it is present whenever the row is — the CHECK
+    /// constraint makes the pair inseparable. What is left is the genuinely
+    /// unrecoverable case the sentence has always described: a deployment whose
+    /// `AGENTOS_MASTER_KEY` changed, or a database restored under a different
+    /// one. Both are real, both need the same remedy, and neither is fixable by
+    /// waiting.
     #[error(
-        "this tenant's connection names an API key the credential store does not have. \
-         Reconnect: the key has to be pasted again, because we never kept a copy we could show \
-         you and cannot recover one"
+        "this tenant's connection names an API key this deployment can no longer decrypt — its \
+         master key has changed since the key was stored. Reconnect: the key has to be pasted \
+         again, because we never kept a copy we could show you and cannot recover one"
     )]
     KeyMissing,
 
@@ -467,7 +565,21 @@ pub enum NoModel {
 ///
 /// It is the same row the gate reads, with no cache on either side, so the two
 /// answers cannot disagree.
-pub async fn connected(tx: &mut TenantTx<'_>) -> Result<ModelAccess, NoModel> {
+///
+/// # It returns the credential too, sealed, and that is the point
+///
+/// The [`Connection`] this hands back carries the ciphertext alongside the
+/// proof. Before 0050 this function returned the proof alone and the caller went
+/// looking for the credential later, in a different place, at a different time —
+/// which is exactly how a reservation got committed for a key that was not
+/// there. Now the two travel together from one `SELECT`, so the only thing
+/// between [`connected`] saying yes and [`llm_for`] producing a client is a
+/// decryption that cannot fail for want of storage.
+///
+/// It is still "no credential read": the blob is opaque here. Nothing is
+/// decrypted until [`llm_for`], which is what keeps this cheap enough to ask
+/// before `turns::reserve`.
+pub async fn connected(tx: &mut TenantTx<'_>) -> Result<Connection, NoModel> {
     if let Some(halt) = agentos_store::halt::halted(tx).await? {
         return Err(NoModel::CompanyHalted(halt.reason));
     }
@@ -486,18 +598,24 @@ pub async fn connected(tx: &mut TenantTx<'_>) -> Result<ModelAccess, NoModel> {
 /// the same commit.
 ///
 /// Two failures are left after [`connected`] has run, and neither falls back to
-/// anything: a credential the vault no longer has, and a host whose own model
-/// became a key of ours. A missing or forbidden credential must never quietly
-/// become somebody else's bill, which is what any fallback here would be.
+/// anything: a credential this deployment can no longer decrypt, and a host
+/// whose own model became a key of ours. A missing or forbidden credential must
+/// never quietly become somebody else's bill, which is what any fallback here
+/// would be.
+///
+/// **It takes no database handle and no store.** Everything it needs came out of
+/// the one row [`connected`] already read, which is what lets the initiative
+/// loop roll its read transaction back before the turn starts and still spend
+/// the right credential.
 pub async fn llm_for(
     tenant_id: TenantId,
-    access: ModelAccess,
-    secrets: &dyn SecretStore,
+    connection: &Connection,
+    credentials: &Credentials,
     host: &Arc<dyn Llm>,
     backend: LlmBackend,
     api_base: ApiBase<'_>,
 ) -> Result<Arc<dyn Llm>, NoModel> {
-    match access.path {
+    match connection.access.path {
         ModelPath::Cli => {
             // The founder's rule at the spending end. `connect` refuses this
             // path on a host whose model is a key of ours; `AGENTOS_LLM` can
@@ -510,22 +628,27 @@ pub async fn llm_for(
             Ok(Arc::clone(host))
         }
         ModelPath::ApiKey => {
-            let secret_ref = ModelAccess::secret_ref(tenant_id).map_err(|_| NoModel::KeyMissing)?;
-            // Straight to the store rather than through
-            // `crate::secrets::SecretResolver`, and the reason is that
-            // resolver's own rule: it compares the ref against the acting
-            // principal, and this ref's employee segment is the nil uuid, so
-            // **no employee can ever resolve it**. That is the property we want
-            // — a seat cannot read the company's model key — and it is why this
-            // read happens here, above the turn, rather than inside one.
-            //
+            // `None` here is a row 0050's CHECK constraint forbids, so reaching
+            // this arm means somebody dropped the constraint or restored a
+            // database from before it. `KeyMissing` is the right answer to that
+            // for the reason it is the right answer to a rotated master key: we
+            // cannot produce the credential, and the only remedy is a person
+            // pasting it again.
+            let sealed = connection
+                .sealed_key
+                .as_deref()
+                .ok_or(NoModel::KeyMissing)?;
             // No audit row per read. The connect is audited once, the turn it
             // pays for is recorded in `model_usage_daily` and `turn_buckets`,
-            // and a row per turn saying "we read the key to do the thing the
+            // and a row per turn saying "we opened the key to do the thing the
             // next row describes" is volume without a question behind it.
-            let key = secrets
-                .get(&secret_ref)
-                .await
+            //
+            // The cipher's own code is dropped rather than carried: it is
+            // `envelope_malformed` or `secret_decrypt_failed`, both of which are
+            // facts about a credential, and this error is read by an operator
+            // through `last_outcome_detail`. What they need is the remedy.
+            let key = credentials
+                .open_as(tenant_id, &model_context(tenant_id), sealed)
                 .map_err(|_| NoModel::KeyMissing)?;
             Ok(Arc::new(client(&key, api_base)))
         }
@@ -542,22 +665,24 @@ pub async fn llm_for(
 /// halves at the two moments that are right for it.
 pub async fn for_turn(
     tx: &mut TenantTx<'_>,
-    secrets: &dyn SecretStore,
+    credentials: &Credentials,
     host: &Arc<dyn Llm>,
     backend: LlmBackend,
     api_base: ApiBase<'_>,
 ) -> Result<(Arc<dyn Llm>, ModelAccess), NoModel> {
     let tenant_id = tx.tenant_id();
-    let access = connected(tx).await?;
-    let llm = llm_for(tenant_id, access, secrets, host, backend, api_base).await?;
-    Ok((llm, access))
+    let connection = connected(tx).await?;
+    let llm = llm_for(tenant_id, &connection, credentials, host, backend, api_base).await?;
+    // The proof half only. The ciphertext stays inside this function: a caller
+    // that wanted it would be a caller building a second client, and there is
+    // exactly one place that builds clients.
+    Ok((llm, connection.access))
 }
 
 #[cfg(test)]
 mod tests {
     use agentos_domain::policy::{EffectivePolicy, PolicyLimits, model_for};
     use agentos_providers::llm::{LlmResponse, ScriptedLlm, Usage};
-    use agentos_providers::secrets::{LocalEnvelopeSecretStore, MemorySecretStore};
     use agentos_store::db::Db;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -567,6 +692,10 @@ mod tests {
 
     /// The string this whole module exists to keep out of everything.
     const KEY: &str = "sk-ant-api03-DO-NOT-LEAK-ME-4a9f2c";
+
+    /// What `api.anthropic.com` answers a successful probe with.
+    const OK_BODY: &str = r#"{"content":[{"type":"text","text":"h"}],
+        "stop_reason":"max_tokens","usage":{"input_tokens":9,"output_tokens":1}}"#;
 
     // -----------------------------------------------------------------------
     // Harness
@@ -644,6 +773,17 @@ mod tests {
         ))]))
     }
 
+    /// The deployment's cipher, from a master key spelled out here.
+    ///
+    /// A *text* master key rather than 32 raw bytes, because that is what
+    /// `Credentials::from_master_key` takes and what `AGENTOS_MASTER_KEY` is —
+    /// and the derivation from one to the other is the thing a second spelling
+    /// would get wrong. Tests that want to prove a restart build a second one
+    /// from the same string.
+    fn cipher() -> Credentials {
+        Credentials::from_master_key("test-master-key-for-model-access")
+    }
+
     // -----------------------------------------------------------------------
     // The probe
     // -----------------------------------------------------------------------
@@ -687,20 +827,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A key that is refused leaves nothing behind — no row, no audit line, and
-    /// nothing in the vault to be found later by whoever inherits the box.
+    /// no ciphertext to be found later by whoever inherits the box.
     #[tokio::test]
     async fn a_refused_key_is_not_stored_anywhere() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
         let (origin, _h) = server("401 Unauthorized", "{}").await;
-        let secrets = LocalEnvelopeSecretStore::new([5u8; 32]);
         let now = Utc::now();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         let outcome = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host(),
             LlmBackend::Mock,
             ModelPath::ApiKey,
@@ -715,22 +854,29 @@ mod tests {
 
         assert_eq!(outcome.verdict, Verdict::KeyRefused);
         assert!(outcome.access.is_none());
-        assert_eq!(
-            agentos_store::model_access::load(&mut tx).await.unwrap(),
-            None
+        assert!(
+            agentos_store::model_access::load(&mut tx)
+                .await
+                .unwrap()
+                .is_none()
         );
         let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log")
             .fetch_one(&mut **tx)
             .await
             .expect("count");
         assert_eq!(audits, 0, "a refusal writes no trail about a credential");
-        tx.commit().await.expect("commit");
 
-        let secret_ref = ModelAccess::secret_ref(tenant_id).unwrap();
-        assert_eq!(
-            secrets.get(&secret_ref).await.unwrap_err().code(),
-            "secret_not_found"
-        );
+        // And no ciphertext either. Since 0050 the credential has exactly one
+        // home, so "nothing was stored" is one COUNT rather than a search of two
+        // places that could disagree.
+        let blobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM tenant_model_access WHERE sealed_key IS NOT NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        assert_eq!(blobs, 0);
+        tx.commit().await.expect("commit");
     }
 
     /// The founder's rule, at both ends: a host whose model is our key may
@@ -740,14 +886,13 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
         let now = Utc::now();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         let err = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host,
             LlmBackend::Anthropic,
             ModelPath::Cli,
@@ -764,7 +909,7 @@ mod tests {
         // The same tenant on a host that is not billing us connects fine…
         let outcome = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host,
             LlmBackend::Cli,
             ModelPath::Cli,
@@ -780,12 +925,13 @@ mod tests {
 
         // …and stops being able to take a turn the moment the host's own model
         // becomes a key somebody else pays for.
-        let Err(err) = for_turn(&mut tx, &secrets, &host, LlmBackend::Anthropic, None).await else {
+        let Err(err) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Anthropic, None).await
+        else {
             panic!("must refuse");
         };
         assert!(matches!(err, NoModel::HostModelIsNotTheirs), "{err}");
         assert!(
-            for_turn(&mut tx, &secrets, &host, LlmBackend::Cli, None)
+            for_turn(&mut tx, &cipher(), &host, LlmBackend::Cli, None)
                 .await
                 .is_ok()
         );
@@ -795,21 +941,20 @@ mod tests {
     /// **What is stored is what was proven, and nothing else.**
     ///
     /// A `cli` connection that also carries a key proves the *host's* model. The
-    /// key was never tried, so it must not reach the vault — otherwise "a stored
-    /// credential is always one that answered" is a sentence in a doc comment
-    /// rather than a property.
+    /// key was never tried, so it must not be sealed into the row — otherwise "a
+    /// stored credential is always one that answered" is a sentence in a doc
+    /// comment rather than a property.
     #[tokio::test]
     async fn a_cli_connection_does_not_store_a_key_it_never_tried() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         let outcome = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host,
             LlmBackend::Cli,
             ModelPath::Cli,
@@ -826,15 +971,18 @@ mod tests {
         assert_eq!(outcome.access.expect("stored").path, ModelPath::Cli);
         tx.commit().await.expect("commit");
 
-        let secret_ref = ModelAccess::secret_ref(tenant_id).unwrap();
         // Two steps, so the failure names the fact rather than printing
         // `unwrap_err() on an Ok value` at whoever broke it.
-        let found = secrets.get(&secret_ref).await;
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let stored = agentos_store::model_access::load(&mut tx)
+            .await
+            .expect("load")
+            .expect("connected");
         assert!(
-            found.is_err(),
-            "the vault holds a key that was never proven against anything"
+            stored.sealed_key.is_none(),
+            "the row holds a key that was never proven against anything"
         );
-        assert_eq!(found.unwrap_err().code(), "secret_not_found");
+        tx.commit().await.expect("commit");
     }
 
     /// The api_key path with no key never reaches a provider.
@@ -843,12 +991,11 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         let err = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host,
             LlmBackend::Mock,
             ModelPath::ApiKey,
@@ -874,11 +1021,10 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
-        let Err(err) = for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None).await else {
+        let Err(err) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, None).await else {
             panic!("must refuse");
         };
         assert!(matches!(err, NoModel::NotConnected), "{err}");
@@ -889,17 +1035,187 @@ mod tests {
         tx.commit().await.expect("commit");
     }
 
-    /// A row that names a key the vault does not have refuses, and says the one
-    /// thing that is true: we cannot show you the key, so paste it again.
+    /// **A key survives a restart, and a rotated master key is the only way it
+    /// does not.**
+    ///
+    /// The regression test for the whole of 0050, and it is two halves of one
+    /// story because the second is what proves the first was not vacuous.
+    ///
+    /// The restart is simulated the only way it honestly can be in-process: a
+    /// *second* `Credentials`, built from the same `AGENTOS_MASTER_KEY` text and
+    /// sharing nothing with the first — no `Arc`, no map, no cipher. Before this
+    /// migration the credential lived in a `HashMap` owned by the connecting
+    /// process, so this is precisely the boundary a pod replan crosses, and the
+    /// old code failed here with `KeyMissing`.
+    ///
+    /// Then the same row, read by a deployment whose master key has changed:
+    /// still `KeyMissing`, and still not a silent fallback to the host's model,
+    /// because a credential we cannot produce must never quietly become somebody
+    /// else's bill.
     #[tokio::test]
-    async fn a_connection_whose_key_is_gone_refuses_rather_than_falling_back() {
+    async fn a_key_survives_a_restart_and_only_a_rotated_master_key_loses_it() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
+        let host = host();
+        let now = Utc::now();
+        let (origin, _h) = server("200 OK", OK_BODY).await;
+
+        // The process that served POST /v1/model.
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let outcome = connect(
+            &mut tx,
+            &cipher(),
+            &host,
+            LlmBackend::Mock,
+            ModelPath::ApiKey,
+            ModelId::Opus5,
+            Some(Secret::new(KEY)),
+            Some(&origin),
+            AuditActor::Operator("founder@example.com".to_owned()),
+            now,
+        )
+        .await
+        .expect("connect");
+        assert_eq!(outcome.verdict, Verdict::Connected);
+        tx.commit().await.expect("commit");
+
+        // The pod is replanned. Nothing of the process above survives except
+        // the database and the master key in the environment.
+        let after_restart = Credentials::from_master_key("test-master-key-for-model-access");
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let (_llm, access) = for_turn(
+            &mut tx,
+            &after_restart,
+            &host,
+            LlmBackend::Mock,
+            Some(&origin),
+        )
+        .await
+        .expect("the key outlived the process that stored it");
+        assert_eq!(access.path, ModelPath::ApiKey);
+        assert_eq!(access.model, ModelId::Opus5);
+
+        // And a deployment whose master key changed cannot open it, which is the
+        // one case `KeyMissing` is left describing.
+        let rotated = Credentials::from_master_key("a-different-master-key-entirely");
+        let Err(err) = for_turn(&mut tx, &rotated, &host, LlmBackend::Mock, Some(&origin)).await
+        else {
+            panic!("a rotated master key must not open the row");
+        };
+        assert!(matches!(err, NoModel::KeyMissing), "{err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("master key has changed"), "{rendered}");
+        assert!(rendered.contains("pasted again"), "{rendered}");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **A sealed key copied into another tenant's row opens nothing.**
+    ///
+    /// `0050_tenant_model_key` claims this in prose — "a row lifted into another
+    /// tenant's context fails to authenticate rather than decrypting to somebody
+    /// else's key" — and a claim about a cipher with no test is a claim about
+    /// nothing. The attack is one `UPDATE` by anyone who can already write the
+    /// table, and the cheapest wrong design (sealing under a constant context,
+    /// or under none) would make it work.
+    ///
+    /// Written through `admin_tx_bypassing_rls` because RLS is the *other*
+    /// defence and this test is about what is left when it is gone. Both AADs
+    /// carry the tenant — the data key's wrap and the payload's
+    /// `model://<tenant>` — so the theft fails at the first of them.
+    #[tokio::test]
+    async fn a_sealed_key_does_not_open_in_another_tenants_row() {
+        let Some((db, mine)) = fixture().await else {
+            return;
+        };
+        let Some((_, theirs)) = fixture().await else {
+            return;
+        };
+        let host = host();
+        let now = Utc::now();
+        let (origin, _h) = server("200 OK", OK_BODY).await;
+
+        let mut tx = db.tenant_tx(mine).await.expect("tx");
+        connect(
+            &mut tx,
+            &cipher(),
+            &host,
+            LlmBackend::Mock,
+            ModelPath::ApiKey,
+            ModelId::Opus5,
+            Some(Secret::new(KEY)),
+            Some(&origin),
+            AuditActor::Operator("founder@example.com".to_owned()),
+            now,
+        )
+        .await
+        .expect("connect");
+        tx.commit().await.expect("commit");
+
+        // The theft: my ciphertext, filed under their tenant id.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query(
+            "INSERT INTO tenant_model_access \
+               (tenant_id, path, verified_model, verified_at, sealed_key, updated_at) \
+             SELECT $1, path, verified_model, verified_at, sealed_key, updated_at \
+               FROM tenant_model_access WHERE tenant_id = $2",
+        )
+        .bind(theirs.as_uuid())
+        .bind(mine.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("the row really was copied, or this test proves nothing");
+        admin.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(theirs).await.expect("tx");
+        let Err(err) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, Some(&origin)).await
+        else {
+            panic!("a stolen credential opened for the tenant that stole it");
+        };
+        assert!(matches!(err, NoModel::KeyMissing), "{err}");
+        tx.commit().await.expect("commit");
+
+        // …and the rightful owner is unaffected.
+        let mut tx = db.tenant_tx(mine).await.expect("tx");
+        for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, Some(&origin))
+            .await
+            .expect("the owner still opens their own");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **One tenant's own MCP bearer token is not their model key either.**
+    ///
+    /// The half the cross-tenant test cannot reach. Both ciphertexts belong to
+    /// the same tenant, so the data key's `tenant=<id>` wrap authenticates for
+    /// both and only the *payload* context separates them — which is exactly
+    /// what [`model_context`] is for and the only thing this test can fail on.
+    ///
+    /// It matters because the two columns are one `UPDATE … SELECT` apart, and
+    /// the consequence of a collision is specific and bad: a customer's MCP
+    /// bearer token would be sent to Anthropic as an API key, on a request they
+    /// are billed for, in a header they never chose.
+    ///
+    /// The blob is produced by `Credentials::seal_as` under the same
+    /// `mcp://<tenant>/<server>` string `crate::mcp::credential_context` builds,
+    /// so the thing being confused is the real encoding and not a stand-in.
+    #[tokio::test]
+    async fn an_mcp_token_moved_into_the_model_column_opens_nothing() {
+        let Some((db, tenant_id)) = fixture().await else {
+            return;
+        };
         let host = host();
         let now = Utc::now();
 
+        let credentials = cipher();
+        let mcp_blob = credentials
+            .seal_as(
+                tenant_id,
+                &crate::mcp::credential_context(tenant_id, &"github".parse().expect("a slug")),
+                &Secret::new("ghp_a_bearer_token_for_an_mcp_server"),
+            )
+            .expect("seal");
+
+        // Same tenant, right cipher, right master key, wrong context.
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         agentos_store::model_access::save(
             &mut tx,
@@ -908,18 +1224,123 @@ mod tests {
                 model: ModelId::Opus5,
                 verified_at: now,
             },
+            Some(&mcp_blob),
             now,
         )
         .await
-        .expect("save");
+        .expect("the row really was written, or this test proves nothing");
 
-        let Err(err) = for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None).await else {
-            panic!("must refuse");
+        let Err(err) = for_turn(&mut tx, &credentials, &host, LlmBackend::Mock, None).await else {
+            panic!("an MCP bearer token was about to be sent to Anthropic as an API key");
         };
         assert!(matches!(err, NoModel::KeyMissing), "{err}");
-        // Not the host's model. A missing credential must never quietly become
-        // somebody else's bill.
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **Connecting a model gives the tenant's abandoned mail its attempts
+    /// back.**
+    ///
+    /// The downstream half. `apps/server/src/main.rs` renders `NoModel` into a
+    /// handler failure, so mail that arrives before setup burns eight attempts
+    /// in about two minutes and is then claimed by nothing, ever — there was no
+    /// verb in the workspace that wrote `attempt_count = 0`.
+    ///
+    /// It runs only on a success: a refused key has changed nothing about why
+    /// those events failed, and reviving them would be eight more attempts spent
+    /// on the same wall.
+    ///
+    /// **Asserted on the row, not through `claim`.** `outbox::claim` is
+    /// cross-tenant by design and libtest runs this binary's tests in parallel,
+    /// so a sibling test's poller can lease this event out from under the
+    /// assertion — a flake that looks like a bug in the requeue. What `claim`
+    /// does with a revived row is proved once, under a lock, in
+    /// `agentos_store::outbox`'s own
+    /// `a_requeued_dead_letter_is_claimed_again_and_only_the_tenants_own`. What
+    /// belongs here is whether `connect` calls it, and on which verdict.
+    #[tokio::test]
+    async fn connecting_a_model_revives_the_mail_that_arrived_before_it() {
+        let Some((db, tenant_id)) = fixture().await else {
+            return;
+        };
+        let host = host();
+        let now = Utc::now();
+
+        // One event, dead exactly the way `NoModel` kills them.
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let id = agentos_store::outbox::enqueue(
+            &mut tx,
+            &agentos_store::outbox::NewEvent::new("inbound", tenant_id.as_uuid(), "email.received"),
+            now,
+        )
+        .await
+        .expect("enqueue");
+        sqlx::query("UPDATE outbox_events SET attempt_count = $2 WHERE id = $1")
+            .bind(id)
+            .bind(agentos_store::outbox::MAX_ATTEMPTS)
+            .execute(&mut **tx)
+            .await
+            .expect("exhaust");
         tx.commit().await.expect("commit");
+
+        async fn attempts(db: &Db, tenant_id: TenantId, id: uuid::Uuid) -> i32 {
+            let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+            let n = sqlx::query_scalar("SELECT attempt_count FROM outbox_events WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("attempt_count");
+            tx.commit().await.expect("commit");
+            n
+        }
+
+        // A refused key changes nothing.
+        let (refused, _h) = server("401 Unauthorized", "{}").await;
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let outcome = connect(
+            &mut tx,
+            &cipher(),
+            &host,
+            LlmBackend::Mock,
+            ModelPath::ApiKey,
+            ModelId::Opus5,
+            Some(Secret::new(KEY)),
+            Some(&refused),
+            AuditActor::Operator("founder@example.com".to_owned()),
+            now,
+        )
+        .await
+        .expect("connect");
+        assert_eq!(outcome.verdict, Verdict::KeyRefused);
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            attempts(&db, tenant_id, id).await,
+            agentos_store::outbox::MAX_ATTEMPTS,
+            "a refused key must not revive anything"
+        );
+
+        // Connecting one does.
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let outcome = connect(
+            &mut tx,
+            &cipher(),
+            &host,
+            LlmBackend::Cli,
+            ModelPath::Cli,
+            ModelId::Opus5,
+            None,
+            None,
+            AuditActor::Operator("founder@example.com".to_owned()),
+            now,
+        )
+        .await
+        .expect("connect");
+        assert_eq!(outcome.verdict, Verdict::Connected);
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            attempts(&db, tenant_id, id).await,
+            0,
+            "the mail that arrived before the model is deliverable again"
+        );
     }
 
     /// **Connecting a key does not widen anything.**
@@ -932,14 +1353,13 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
         let now = Utc::now();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
         let outcome = connect(
             &mut tx,
-            &secrets,
+            &cipher(),
             &host,
             LlmBackend::Cli,
             ModelPath::Cli,
@@ -953,7 +1373,7 @@ mod tests {
         .expect("connect");
         assert_eq!(outcome.verdict, Verdict::Connected);
 
-        let (_llm, access) = for_turn(&mut tx, &secrets, &host, LlmBackend::Cli, None)
+        let (_llm, access) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Cli, None)
             .await
             .expect("connected");
         assert_eq!(access.model, ModelId::Fable5);
@@ -998,7 +1418,6 @@ mod tests {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
-        let secrets = MemorySecretStore::new();
         let host = host();
         let now = Utc::now();
 
@@ -1010,12 +1429,13 @@ mod tests {
                 model: ModelId::Opus5,
                 verified_at: now,
             },
+            None,
             now,
         )
         .await
         .expect("save");
         // Connected: it takes a turn.
-        for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None)
+        for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, None)
             .await
             .expect("a connected, running company thinks");
 
@@ -1024,7 +1444,7 @@ mod tests {
             .expect("place")
             .expect("it was running");
 
-        let Err(err) = for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None).await else {
+        let Err(err) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, None).await else {
             panic!("a stopped company must not be handed a model client");
         };
         assert!(
@@ -1043,7 +1463,7 @@ mod tests {
             .await
             .expect("release")
             .expect("it was halted");
-        for_turn(&mut tx, &secrets, &host, LlmBackend::Mock, None)
+        for_turn(&mut tx, &cipher(), &host, LlmBackend::Mock, None)
             .await
             .expect("released");
         tx.commit().await.expect("commit");
