@@ -676,6 +676,35 @@ mod tests {
     /// disjoint work — the failure this rules out is the expensive one: the
     /// same email sent twice because two replicas grabbed the same row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// **KNOWN FLAKY — measured at ~6.7%, and the measurement is the point.**
+    ///
+    /// On 2026-08-28 this failed a full-suite run with `left: 60, right: 67`:
+    /// sixty events, sixty unique ids, and seven handled a second time. Isolated
+    /// on an idle machine it fails about one run in fifteen, so it is not
+    /// contention — and it is **not new**: 4 red in 60 at `cc73243`, before that
+    /// day's waves touched this loop, against 1 in 17 after. Same rate.
+    ///
+    /// Two things worth keeping from working that out. The first attempt read
+    /// 20/20 green and concluded the regression was absent; at a true rate of
+    /// 6.7% a clean run of twenty happens 29% of the time, so that proved
+    /// nothing. And a run of this test that finishes in under a tenth of a
+    /// second has almost certainly *skipped* — `db()` returns early and reports
+    /// `ok` when the database is unreachable, and the database it wants is
+    /// derived (`private_db("outbox")`), not the one in `DATABASE_URL`. Count
+    /// the tables in the derived database before believing a green run.
+    ///
+    /// What makes seven duplicates surprising rather than merely racy:
+    /// [`claim`](agentos_store::outbox::claim) commits *before* the handler
+    /// runs, so `SKIP LOCKED` protects nothing once that transaction closes.
+    /// What keeps a row to one worker is the same `UPDATE` pushing
+    /// `available_at` a `LEASE_SECS` into the future — a lease of two minutes,
+    /// against handlers that return instantly in a test lasting about a second.
+    /// A second claim inside that window should be impossible. It happens
+    /// anyway, and until somebody explains why, the honest reading is that
+    /// either this test manufactures duplicates the queue does not have, or an
+    /// `agent.turn.requested` can be handled twice — which is the customer
+    /// billed twice for one event, the outage `main.rs` asserts against at
+    /// compile time.
     async fn two_pollers_never_handle_the_same_event() {
         let Some((db, _guard)) = db().await else {
             return;
