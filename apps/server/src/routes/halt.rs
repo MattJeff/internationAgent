@@ -332,6 +332,33 @@ struct WindowRequest {
     ends_at: DateTime<Utc>,
 }
 
+/// A window has to end in the future, wherever it is being written.
+///
+/// **Shared by the two doors on purpose**, and it is one function rather than
+/// two copies of the sentence because they must not drift: `PUT /v1/window`
+/// moves an existing company's window and `POST /v1/companies` writes a new
+/// company's first one, and "in the past" has to mean the same thing to both.
+/// The second was written months after the first, which is exactly how a rule
+/// that lives in two places ends up meaning two things.
+///
+/// A window in the past is an instant stop with nobody's sentence attached to
+/// it, and the product has a verb for stopping now that insists on the
+/// sentence. Refused in the routes rather than in the store, where there is no
+/// operator left to tell — see `halt::set_window`.
+pub(crate) fn must_end_in_the_future(
+    ends_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if ends_at <= now {
+        return Err(ApiError::bad_request(
+            "an operating window has to end in the future; a date in the past would stop the \
+             company immediately with no reason recorded. To stop it now, POST /v1/halt with the \
+             reason",
+        ));
+    }
+    Ok(())
+}
+
 /// `PUT /v1/window` — say when this company's agents stop.
 ///
 /// Idempotent by shape: the same body twice leaves the same row, and a
@@ -369,17 +396,7 @@ async fn set_window(
     Json(body): Json<WindowRequest>,
 ) -> Result<Response, ApiError> {
     let now = Utc::now();
-    // A window in the past is an instant stop with nobody's sentence attached
-    // to it, and the product has a verb for stopping now that insists on the
-    // sentence. Refused here rather than in the store, where there is no
-    // operator left to tell — see `halt::set_window`.
-    if body.ends_at <= now {
-        return Err(ApiError::bad_request(
-            "an operating window has to end in the future; a date in the past would stop the \
-             company immediately with no reason recorded. To stop it now, POST /v1/halt with the \
-             reason",
-        ));
-    }
+    must_end_in_the_future(body.ends_at, now)?;
 
     let who = principal.actor.label();
     let mut tx = db.tenant_tx(principal.tenant_id).await?;

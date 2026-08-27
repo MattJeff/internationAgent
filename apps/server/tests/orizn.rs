@@ -49,9 +49,10 @@
 //!
 //! The route's own test owns what the runbook has no equivalent of: that no
 //! ceiling is a refusal rather than a permissive default, that a chart naming a
-//! team with no role layer is refused by name, that a call cut in the middle
-//! leaves limits without employees and never the reverse, and that replaying it
-//! repairs rather than duplicates.
+//! team with no role layer is refused by name, that a company with no operating
+//! window is refused rather than given an invented one, that a call cut in the
+//! middle leaves limits without employees and never the reverse, and that
+//! replaying it repairs rather than duplicates.
 //!
 //! # What this test does not run
 //!
@@ -76,7 +77,7 @@ use agentos_domain::ids::{EmployeeId, TenantId};
 use agentos_domain::money::Currency;
 use agentos_domain::policy::{EffectivePolicy, PolicyLimits, evaluate};
 use agentos_store::db::Db;
-use agentos_store::policy;
+use agentos_store::{halt, policy};
 use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
@@ -1046,7 +1047,18 @@ async fn the_runbook_stands_orizn_up_and_the_company_is_the_one_it_describes() {
 /// sends the files they already have, so a test that typed the numbers again
 /// would be testing a company nobody deployed. The ceiling is deliberately
 /// absent: it belongs to no tenant and stays `agentos-server policy install`.
+///
+/// `window_ends_at` is **not** in any of those files and could not be: it is the
+/// founder's answer to step 8 of the entry journey — "2 days, one week, one
+/// month" — worked out against the moment they answered, so it belongs to a
+/// company rather than to a document. A month, here, because that is the answer
+/// `docs/ORIZN.md`'s cost table is priced for. Truncated to the microsecond
+/// Postgres stores, so the instant that goes out in the body compares equal to
+/// the one that comes back out of `GET /v1/halt`.
 fn orizn_company_body() -> Value {
+    use chrono::SubsecRound;
+    let window_ends_at = (Utc::now() + chrono::Duration::days(30)).trunc_subsecs(6);
+
     let read = |path: PathBuf| -> Value {
         serde_json::from_str(
             &std::fs::read_to_string(&path)
@@ -1070,7 +1082,39 @@ fn orizn_company_body() -> Value {
         "name": "Orizn",
         "org": read(docs("orizn-org.json")),
         "roles": roles,
+        "window_ends_at": window_ends_at,
     })
+}
+
+/// This tenant's operating window, if anybody has said when its agents stop.
+///
+/// Read through `halt::window`, the same call `GET /v1/halt` makes, rather than
+/// a `SELECT` of its own — a second query here could disagree with the one the
+/// product uses and the test would be asserting about its own SQL.
+async fn window_of(db: &Db, tenant: TenantId) -> Option<chrono::DateTime<Utc>> {
+    let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+    let found = halt::window(&mut tx).await.expect("read the window");
+    tx.rollback().await.expect("rollback");
+    found
+}
+
+/// Every `company_halt_changed` row for this tenant, oldest first.
+///
+/// `company_windows` holds one row that is overwritten in place, so this trail
+/// is the only thing that can say who chose when the company stops — and it is
+/// the only way to see that a replay wrote nothing rather than writing the same
+/// thing twice.
+async fn window_trail(db: &Db, tenant: TenantId) -> Vec<(String, Value)> {
+    let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+    let rows = sqlx::query_as(
+        "select actor, payload from audit_log \
+          where action_kind = 'company_halt_changed' order by occurred_at, id",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .expect("read the trail");
+    tx.rollback().await.expect("rollback");
+    rows
 }
 
 /// **`docs/ORIZN.md` steps 3, 4 and 5 in one request — and the same company on
@@ -1081,7 +1125,7 @@ fn orizn_company_body() -> Value {
 /// the project, connect your server, describe it* cannot ship one whose third
 /// step is a shell on the database box.
 ///
-/// This asserts five things, in the order they can go wrong:
+/// This asserts six things, in the order they can go wrong:
 ///
 /// 1. **No ceiling is a refusal, not a default.** The most dangerous document in
 ///    the system is not in this body and no permissive stand-in is invented for
@@ -1091,17 +1135,25 @@ fn orizn_company_body() -> Value {
 ///    root of the org chart would become the most permissive employee.
 /// 3. **A layer that omits a field is refused by name**, from the same rule
 ///    `agentos-server policy install` applies to a file.
-/// 4. **A call cut in the middle is repaired by replaying it**, and the state it
-///    leaves has limits and no employees rather than employees and no limits.
-/// 5. **The company is the runbook's**, asserted by
+/// 4. **No operating window is a refusal too**, and so is one that has already
+///    run out. The same answer as the ceiling, about time instead of authority:
+///    a company with no window runs until somebody notices, on the customer's
+///    own model credential, and no duration is invented to fill the gap.
+/// 5. **A call cut in the middle is repaired by replaying it**, and the state it
+///    leaves has limits and no employees rather than employees and no limits —
+///    and no window, because the window is written in the chart's own
+///    transaction.
+/// 6. **The company is the runbook's**, asserted by
 ///    [`assert_the_company_is_orizn`] — the same function, not a copy of it,
 ///    which is what makes "the route cannot build a wider company" a fact rather
 ///    than a claim about two lists that could drift.
 ///
-/// And one more, which is the line this route is drawn on: it may *create*
-/// limits and may never *replace* them. Creating can only narrow (an absent
-/// layer inherits, and intersection is monotone); replacing has no such
-/// property, so it stays the operator's command on the operator's credential.
+/// And one more, which is the line this route is drawn on: it may *create* and
+/// may never *replace*. Creating a limit can only narrow (an absent layer
+/// inherits, and intersection is monotone) and creating a window can only close
+/// (no window means runs forever); replacing either has no such property, so
+/// both stay deliberate acts elsewhere — `agentos-server policy install` on the
+/// operator's own credential, and `PUT /v1/window`.
 #[tokio::test]
 async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
     let Some(mut server) = Orizn::boot().await else {
@@ -1199,7 +1251,58 @@ async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
         "the refusal must name the field and say the omission is a denial: {refused:#}"
     );
 
-    // Nothing above wrote a row: all three are decided from the body, or from
+    // --- 3b. no operating window is a refusal, not "runs forever" ------------
+    //
+    // Step 8 of the entry journey, and the same answer as the ceiling one level
+    // down. The omission that costs the *customer* money rather than widening
+    // their policy: with no `company_windows` row `halt::halted` answers `None`
+    // for ever, so the initiative loop keeps taking turns on the customer's own
+    // model credential until a human notices. A route that filled that in would
+    // be choosing a price — too short and a paying company stops in the night,
+    // too long and the runaway is only slower — so it refuses instead, and says
+    // that it is refusing on purpose.
+    let mut timeless = body.clone();
+    timeless
+        .as_object_mut()
+        .expect("body")
+        .remove("window_ends_at")
+        .expect("window_ends_at was there");
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&timeless.to_string()));
+    assert_eq!(
+        status, 400,
+        "a company with no operating window must not be built: {refused:#}"
+    );
+    let detail = refused["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("window_ends_at"),
+        "name the field: {refused:#}"
+    );
+    assert!(
+        detail.contains("no default"),
+        "and say that the absence is deliberate rather than an oversight, or the next \
+         reader adds one: {refused:#}"
+    );
+
+    // ...and a window that has already run out is refused too, rather than
+    // creating a company that is stopped before it ever ran — with nobody's
+    // sentence on the record for why. `POST /v1/halt` is the verb that stops a
+    // company now, and it insists on a reason.
+    let mut expired = body.clone();
+    expired["window_ends_at"] = serde_json::json!(Utc::now() - chrono::Duration::hours(1));
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&expired.to_string()));
+    assert_eq!(
+        status, 400,
+        "a company must not be created already out of time: {refused:#}"
+    );
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("POST /v1/halt"),
+        "and it must name the verb that stops one now, which insists on a reason: {refused:#}"
+    );
+
+    // Nothing above wrote a row: all five are decided from the body, or from
     // the deployment, before the tenant exists.
     let (status, teams) = server.get("/v1/teams");
     assert_eq!(status, 200, "{teams:#}");
@@ -1268,6 +1371,23 @@ async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
         0,
         "the chart is one transaction, so a bad line in row 2 must undo the team in row 1"
     );
+    // **And the window is in that transaction too.** This is the half of the
+    // atomicity claim a passing call cannot show: the window is written just
+    // before `apply_org_chart` in the same `TenantTx`, so a chart that rolled
+    // back took the window with it. If this ever finds one, the window is
+    // committing on its own — and the state it would eventually reach is a
+    // company with seats and no clock, which is the defect the whole feature is
+    // for.
+    assert_eq!(
+        window_of(&db, server.tenant).await,
+        None,
+        "a call that died inside the chart left an operating window behind: the window and \
+         the chart are not in one transaction"
+    );
+    assert!(
+        window_trail(&db, server.tenant).await.is_empty(),
+        "and no audit row may claim somebody chose a window that was rolled back"
+    );
 
     // --- 5. the replay repairs it ------------------------------------------
     //
@@ -1288,6 +1408,24 @@ async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
         role_layer_names(&db, server.tenant).await.len(),
         EXPECTED.len(),
         "the replay duplicated a layer"
+    );
+
+    // The company that now has employees also has a clock, from the same commit,
+    // and reads it back on the surface an operator looks at.
+    assert_eq!(
+        applied["window_ends_at"], body["window_ends_at"],
+        "the call answers with the window it wrote: {applied:#}"
+    );
+    let (status, stopped) = server.get("/v1/halt");
+    assert_eq!(status, 200, "{stopped:#}");
+    assert_eq!(
+        stopped["halted"], false,
+        "a month in hand is not a stop: {stopped:#}"
+    );
+    assert_eq!(
+        stopped["window_ends_at"], body["window_ends_at"],
+        "GET /v1/halt is where a founder reads how long is left, and it must be the instant \
+         the company was created with: {stopped:#}"
     );
 
     let (seats, _teams) = assert_chart_matches_document(&server, &body["org"], &applied);
@@ -1325,6 +1463,37 @@ async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
         "the refusal wrote the wider number anyway"
     );
 
+    // --- 6b. …and it writes a window without ever extending one -------------
+    //
+    // The same line, drawn about time instead of authority, and it rests on the
+    // same arithmetic. No window at all means *runs forever*, so writing the
+    // first one can only close; moving it later extends what a company is
+    // allowed to spend, which is a widening — and a widening that would arrive
+    // by re-running a provisioning script with a fresh date in it. Extending is
+    // `PUT /v1/window`, deliberately, and it leaves a row saying who did it.
+    let mut longer = body.clone();
+    longer["window_ends_at"] = serde_json::json!(Utc::now() + chrono::Duration::days(365));
+    let (status, refused) = server.curl("POST", "/v1/companies", true, Some(&longer.to_string()));
+    assert_eq!(
+        status, 409,
+        "a route must not extend an operating window: {refused:#}"
+    );
+    assert_eq!(refused["code"], "window_exists", "{refused:#}");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PUT /v1/window"),
+        "and it must name the verb that does move one: {refused:#}"
+    );
+    assert_eq!(
+        window_of(&db, server.tenant)
+            .await
+            .map(|w| serde_json::json!(w)),
+        Some(body["window_ends_at"].clone()),
+        "the refusal gave the company another year anyway"
+    );
+
     // --- 7. and it will not build one company inside another ----------------
     //
     // The tenant is the API key's and never the body's, so a body naming a
@@ -1350,6 +1519,33 @@ async fn one_call_stands_the_same_company_up_and_replaying_it_repairs_a_cut() {
     // and the reason a provisioning script can run this on every deploy.
     let (status, again) = server.curl("POST", "/v1/companies", true, Some(&body.to_string()));
     assert_eq!(status, 200, "nothing was outstanding: {again:#}");
+    assert_eq!(
+        again["window_ends_at"], body["window_ends_at"],
+        "a no-op still answers with the window that is binding: {again:#}"
+    );
+
+    // **The window was chosen once**, by whichever run got there first, and the
+    // two replays after it wrote nothing at all — not the row, whose `set_at`
+    // would move, and not a second audit line claiming somebody chose a window
+    // again. That is what makes this safe to run on every deploy: the trail of
+    // "who decided when this company stops" stays the list of the decisions
+    // somebody actually made.
+    let trail = window_trail(&db, server.tenant).await;
+    assert_eq!(
+        trail.len(),
+        1,
+        "one window, chosen once, however many times the script runs: {trail:?}"
+    );
+    assert_eq!(
+        trail[0].0, "operator:ops",
+        "and it names the key that chose it, never `system` and never the secret: {trail:?}"
+    );
+    assert_eq!(trail[0].1["window_ends_at"], body["window_ends_at"]);
+    assert_eq!(
+        trail[0].1["previous_window_ends_at"],
+        Value::Null,
+        "this route only ever writes a first window: {trail:?}"
+    );
 
     server.stop();
     server.drop_database();
