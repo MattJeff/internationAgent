@@ -398,6 +398,18 @@ mod tests {
     /// before it dies. Its own event type, so counting it is a scoped read.
     const KILLED_EVENT: &str = "employee.killed-mid-handler";
 
+    /// What every tenant this module seeds is called, and the only thing
+    /// [`db`]'s cleanup is allowed to remove.
+    ///
+    /// **One constant, read by both**, because the two used to be two literals
+    /// and they had drifted: [`seed_tenant`] wrote `loop-<uuid>` and the cleanup
+    /// deleted `outbox-loop-%`, which matches nothing a run of this module has
+    /// ever written. The cleanup therefore deleted no rows, silently, while
+    /// reading as a protection — see
+    /// [`the_startup_cleanup_removes_what_this_module_seeded`] for the failure
+    /// it is there to stop.
+    const TENANT_SLUG: &str = "outbox-loop-";
+
     /// An empty outbox, held exclusively until the returned guard is dropped.
     ///
     /// The guard comes back with the handle rather than being taken separately,
@@ -416,7 +428,8 @@ mod tests {
         // happens to be empty, and `crates/app/tests/scoped_deletes.rs` is what
         // keeps that true. Events cascade from the tenant that owns them.
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("DELETE FROM tenants WHERE slug LIKE 'outbox-loop-%'")
+        sqlx::query("DELETE FROM tenants WHERE slug LIKE $1")
+            .bind(format!("{TENANT_SLUG}%"))
             .execute(&mut *tx)
             .await
             .expect("clear outbox");
@@ -429,7 +442,7 @@ mod tests {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
             .bind(tenant.as_uuid())
-            .bind(format!("loop-{}", tenant.as_uuid()))
+            .bind(format!("{TENANT_SLUG}{}", tenant.as_uuid()))
             .bind("outbox loop")
             .execute(&mut *tx)
             .await
@@ -500,6 +513,55 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    // -- the fixture itself ------------------------------------------------
+
+    /// **The cleanup in [`db`] has to match the seeder in [`seed_tenant`], and
+    /// for a while it did not.**
+    ///
+    /// It looked for `outbox-loop-%` and nothing had ever written that prefix,
+    /// so it deleted nothing. What it exists to delete is a *crashed* run's
+    /// rows: this module's poller is cross-tenant — [`run`] claims by
+    /// `published_at IS NULL`, never by tenant — so an `employee.provisioned`
+    /// row left behind by a run that was killed mid-test is claimed by the very
+    /// next test's poller and counted as its own. That is
+    /// [`two_pollers_never_handle_the_same_event`] failing with sixty-one
+    /// events, or [`a_poller_killed_mid_handler_loses_the_row_and_not_the_work`]
+    /// seeing a stranger's id, in a run where nothing is wrong — and the failure
+    /// names neither the crash nor the cleanup.
+    ///
+    /// So the assertion is on the fixture: seed the way every test seeds, take
+    /// the fixture again the way a fresh `cargo test` does, and the row is gone.
+    #[tokio::test]
+    async fn the_startup_cleanup_removes_what_this_module_seeded() {
+        let Some((first, guard)) = db().await else {
+            return;
+        };
+        let tenant = seed_tenant(&first).await;
+        // The lock, not the database: `db` takes it again below and it is not
+        // reentrant. Dropping it here is what makes the second call the
+        // "previous run crashed and left this behind" case.
+        drop(first);
+        drop(guard);
+
+        let Some((again, _guard)) = db().await else {
+            return;
+        };
+        let mut tx = again.admin_tx_bypassing_rls().await.expect("admin tx");
+        let survived: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .expect("read the tenant back");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            survived, None,
+            "the startup cleanup left a tenant this module seeded behind, so it \
+             deletes nothing a crashed run wrote and every event under that \
+             tenant is still claimable by the next test's poller"
+        );
     }
 
     // -- concurrency -------------------------------------------------------

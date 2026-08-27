@@ -1140,12 +1140,49 @@ impl ProvisioningEngine {
             // worth pooling the adapter answers `PendingExternal` with a bundle
             // in human review, which is the wait; where it answers with a
             // number, the employee has one of its own and releases it as such.
-            Step::Phone => Ok(bind(
-                self.adapters
-                    .telephony
-                    .ensure_number(ctx, &self.cfg.region)
-                    .await?,
-            )),
+            //
+            // # This number bills monthly and nothing in this build can use it
+            //
+            // Not a suspicion — every leg of it is checked in
+            // [`a_bought_number_is_a_monthly_bill_for_a_channel_nobody_can_use`]
+            // and in `turn::catalogue_covers_every_proposable_kind`. Outbound:
+            // `Effects::send_sms` and `Effects::send_whatsapp` are written and
+            // have no caller, there is no `SmsSend` in `turn::catalogue`, and
+            // `turn::UNSERVED` says so on purpose. Inbound: the purchase sets
+            // no `SmsUrl` or `VoiceUrl` on the Twilio resource, the one webhook
+            // route speaks Standard-Webhooks rather than Twilio's signature
+            // scheme, and the outbox handler behind it parses email. And above
+            // all of it `store::policy::default_ceiling` grants neither `sms`
+            // nor `whatsapp` nor `voice`, so no tenant policy can widen into
+            // one — layers intersect.
+            //
+            // It is warned rather than skipped because skipping it honestly
+            // needs a state the step can *land* in: not `Failed` (`Step::Phone`
+            // is optional, so a failure makes every employee in every
+            // deployment `Health::Degraded` forever) and not absent (`Pending`
+            // degrades too). The one state `Employee::resource_health` reads as
+            // "off on purpose" is `ResourceState::Disabled`, and no
+            // `StepOutcome` writes it — `store::provisioning::finish_step` has
+            // `Ready`, `PendingExternal` and `Failed`. So the honest fix is a
+            // fourth outcome plus the `StepReport` that reports it, which is a
+            // change to the store's step state machine and not to this line.
+            // Until somebody makes it, the operator is told what the invoice is
+            // for.
+            Step::Phone => {
+                tracing::warn!(
+                    tenant = %employee.tenant_id().as_uuid(),
+                    employee = %employee.id().as_uuid(),
+                    region = self.cfg.region.as_str(),
+                    "provisioning a phone number, which bills monthly until it is released: \
+                     no channel in this build can send or receive on it"
+                );
+                Ok(bind(
+                    self.adapters
+                        .telephony
+                        .ensure_number(ctx, &self.cfg.region)
+                        .await?,
+                ))
+            }
             Step::Browser => Ok(bind(self.adapters.browser.ensure_context(ctx).await?)),
 
             // One verified company sender, employees routed to it. The routing
@@ -1970,6 +2007,70 @@ mod tests {
             // ... and the ones that do are exactly the ones that get a
             // write-ahead log entry, because they are the only ones whose
             // outcome can ever be unknown.
+        }
+    }
+
+    /// **`Step::Phone` buys a number that bills every month and that no part of
+    /// this build can send or receive on**, and the warning in
+    /// [`ProvisioningEngine::call`] is the only thing telling the operator so.
+    ///
+    /// This is the tripwire under that warning: both legs of the claim are
+    /// asserted here, so the sentence cannot quietly become false. It fails the
+    /// day somebody makes a phone channel real — which is the right day to go
+    /// back to that arm, delete the warning, and provision the number for
+    /// something.
+    ///
+    /// The two legs, and why either alone is enough to make the number useless:
+    ///
+    /// * **No policy can permit a phone channel.** `default_ceiling` is the
+    ///   platform layer and layers *intersect* — `policy::evaluate` narrows,
+    ///   never widens — so a channel missing from the ceiling is a channel no
+    ///   tenant, role or employee layer can grant. Whatever the number is for,
+    ///   the gate refuses it.
+    /// * **No tool proposes one.** A model cannot ask for what is not in
+    ///   `turn::catalogue`, so even a ceiling that allowed `sms` tomorrow would
+    ///   reach nothing: the three phone kinds are in `turn::UNSERVED`, each with
+    ///   the missing thing named.
+    ///
+    /// Inbound is broken twice over as well — the purchase sets no `SmsUrl` and
+    /// the one webhook route speaks a different signature scheme — but those are
+    /// absences, and an absence has nothing to assert on. `docs/OPERATIONS.md`
+    /// carries them.
+    #[test]
+    fn a_bought_number_is_a_monthly_bill_for_a_channel_nobody_can_use() {
+        use agentos_domain::action::ActionKind;
+        use agentos_domain::message::Channel;
+
+        use crate::turn;
+
+        let ceiling = agentos_store::policy::default_ceiling();
+        for channel in [Channel::Sms, Channel::Whatsapp, Channel::Voice] {
+            assert!(
+                !ceiling.allowed_channels.contains(&channel),
+                "the shipped ceiling now grants {channel}, so a phone number can \
+                 finally be authorised for something — go and read \
+                 `ProvisioningEngine::call`'s `Step::Phone` arm, which still \
+                 warns every operator that the number it is buying is dead \
+                 weight"
+            );
+        }
+
+        let offered: Vec<ActionKind> = turn::catalogue().iter().map(|row| row.1).collect();
+        for kind in [
+            ActionKind::SmsSend,
+            ActionKind::WhatsappSend,
+            ActionKind::CallPlace,
+        ] {
+            assert!(
+                !offered.contains(&kind),
+                "{kind:?} is a tool now, so something can finally use the number \
+                 `Step::Phone` buys — same instruction as above"
+            );
+            assert!(
+                turn::UNSERVED.iter().any(|(unserved, _)| *unserved == kind),
+                "{kind:?} is neither offered nor listed as withheld, so nothing \
+                 in this workspace says why it is missing"
+            );
         }
     }
 
