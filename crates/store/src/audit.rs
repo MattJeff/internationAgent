@@ -209,6 +209,13 @@ pub enum AuditKind {
     /// The payload carries `from` and `to` (`running` / `halted`), the reason,
     /// and — on a release — the reason the original halt was placed for, so one
     /// row answers "what did we come back up from".
+    ///
+    /// **`PUT /v1/window` writes this kind too**, with `window_ends_at` and
+    /// `previous_window_ends_at` instead of `from`/`to`: choosing when a
+    /// company stops is the same *kind* of fact as stopping it, and
+    /// `company_windows` is one row that gets overwritten, so this trail is the
+    /// only thing that can answer "who gave this company another month, and
+    /// when". A separate kind would split one question across two greps.
     CompanyHaltChanged,
     /// An API key was minted for this tenant. Written by
     /// `agentos_store::api_keys::issue`, in the same admin transaction as the
