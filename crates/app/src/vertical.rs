@@ -377,6 +377,57 @@ impl Charter {
         )
     }
 
+    /// The questions this charter still owes an answer to, in the order
+    /// `gaps()` gives them.
+    ///
+    /// This is [`Charter::brief`]'s clarification, taken apart. `brief` renders
+    /// the same gaps as one sentence for a model to read; a person being
+    /// interviewed needs them one at a time, with a stable code beside each so a
+    /// front end can show progress and a metric can count what is still open.
+    /// Both come from the same `gaps()` call, so the interview and the plan
+    /// cannot disagree about what is missing — which they would the moment
+    /// somebody wrote a second list.
+    ///
+    /// # Why the sales channel is in here and is not answerable
+    ///
+    /// [`rolepack_sales::RolePack::plan`] adds [`rolepack_sales::Gap::Channel`]
+    /// to the objective's own gaps when no channel this segment is reachable on
+    /// is permitted, and its own doc comment says it is "not a missing field".
+    /// Leaving it out would make an interview that runs to completion and leaves
+    /// the seat in `Stage::Clarify` anyway, with nothing saying why. Marking it
+    /// [`Question::answerable`]`== false` is the other half: **no prose the
+    /// founder writes can close it**, because the remedy is a policy layer and
+    /// widening a policy is not something an answer is allowed to do. It is
+    /// reported so a person can go and do it, and refused as an interview
+    /// question so nothing tries to do it for them.
+    pub fn open_questions(&self) -> Vec<Question> {
+        match self {
+            Charter::Purchasing { objective, .. } => objective
+                .gaps()
+                .into_iter()
+                .map(|gap| Question::asked(gap.code(), gap.question()))
+                .collect(),
+            Charter::Sales { pack, objective } => {
+                let mut questions: Vec<Question> = objective
+                    .gaps()
+                    .into_iter()
+                    .map(|gap| Question::asked(gap.code(), gap.question()))
+                    .collect();
+                // The same condition `RolePack::plan` tests, through the same
+                // public method, so the two cannot drift.
+                if pack.approach_channel(objective.segment).is_none() {
+                    let gap = rolepack_sales::Gap::Channel;
+                    questions.push(Question::blocked(gap.code(), gap.question()));
+                }
+                questions
+            }
+            Charter::Support { objective } => service_questions(objective.gaps()),
+            Charter::Growth { objective } => service_questions(objective.gaps()),
+            Charter::Finance { objective } => service_questions(objective.gaps()),
+            Charter::EntryRequirements { objective } => service_questions(objective.gaps()),
+        }
+    }
+
     /// Write it down, replacing whatever this employee was chartered for
     /// before.
     ///
@@ -472,7 +523,14 @@ impl Charter {
 
     /// The objective as it is stored. Our own words about our own business —
     /// not one byte here is a counterparty's.
-    fn objective_json(&self) -> Value {
+    ///
+    /// Public because it is also the **wire** shape: every key here is a field
+    /// of the body `PUT /v1/employees/{id}/initiative` accepts, which is what
+    /// `apps/server`'s interview relies on to fill a hole without inventing a
+    /// third spelling of the same objective. Read that route's `ObjectiveBody`
+    /// beside this `match`; a key that appears in one and not the other is a
+    /// bug in whichever was edited alone.
+    pub fn objective_json(&self) -> Value {
         match self {
             Charter::Purchasing { objective, .. } => json!({
                 "what": objective.what,
@@ -513,6 +571,61 @@ impl Charter {
             }),
         }
     }
+}
+
+/// One thing nobody has said yet, put as a question.
+///
+/// The `ask` is the role pack's own `Gap::question()` and the `code` its own
+/// `Gap::code()` — neither is written here, because a second copy of a question
+/// is a question that drifts from the one the plan puts to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Question {
+    /// The gap's stable label. A metric counts these; a front end keys on them.
+    ///
+    /// **Not a field name.** `rolepack_service::Gap::FirstResponse` codes as
+    /// `first_response` and the column it is about is `first_response_hours`.
+    /// Anything that needs the field reads [`Charter::objective_json`], which is
+    /// the only place the spelling lives.
+    pub code: &'static str,
+    /// The sentence to put to the person who set the objective.
+    pub ask: &'static str,
+    /// Whether stating an objective can close this.
+    ///
+    /// `false` for a gap whose remedy is an operator document rather than a
+    /// value — today that is exactly [`rolepack_sales::Gap::Channel`]. See
+    /// [`Charter::open_questions`].
+    pub answerable: bool,
+}
+
+impl Question {
+    /// A gap an answer can fill.
+    const fn asked(code: &'static str, ask: &'static str) -> Self {
+        Self {
+            code,
+            ask,
+            answerable: true,
+        }
+    }
+
+    /// A gap an answer must not fill.
+    const fn blocked(code: &'static str, ask: &'static str) -> Self {
+        Self {
+            code,
+            ask,
+            answerable: false,
+        }
+    }
+}
+
+/// [`Charter::open_questions`] for the four packs that share one `Gap`.
+///
+/// Written once for the same reason `loops::initiative::service_plan` is: those
+/// four have a common `Gap` type and the two older packs have none in common
+/// with it or with each other.
+fn service_questions(gaps: Vec<rolepack_service::Gap>) -> Vec<Question> {
+    gaps.into_iter()
+        .map(|gap| Question::asked(gap.code(), gap.question()))
+        .collect()
 }
 
 /// A buying objective, re-parsed rather than deserialised.

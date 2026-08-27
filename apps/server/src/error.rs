@@ -62,6 +62,19 @@ impl ApiError {
         self
     }
 
+    /// The caller-facing explanation, if this error has one.
+    ///
+    /// For a handler that built an [`ApiError`] and then decided the failure is
+    /// not the caller's after all — `routes::interview` catches the one
+    /// `ObjectiveBody::into_charter` returns, because there the bad value came
+    /// from a *model* and belongs in a 200 body describing what was refused,
+    /// not in a 4xx blaming the founder for it. Rule 1 is unaffected: this
+    /// reads back what a handler put in, and nothing ever puts a server-side
+    /// error in.
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
     /// Add one RFC 9457 extension member.
     #[must_use]
     pub fn with_extension(mut self, key: &str, value: Value) -> Self {

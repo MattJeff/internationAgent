@@ -9,6 +9,7 @@ pub mod employees; // U31
 pub mod forecast;
 pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod initiative;
+pub mod interview; // the guided conversation that finishes a company
 pub mod inventory;
 pub mod knowledge;
 pub mod mcp;

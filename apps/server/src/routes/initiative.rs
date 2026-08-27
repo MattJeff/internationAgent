@@ -114,7 +114,7 @@ struct SetInitiative {
 /// 400 that names itself.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "role", deny_unknown_fields)]
-enum ObjectiveBody {
+pub(crate) enum ObjectiveBody {
     #[serde(rename = "international-buyer")]
     Purchasing {
         /// Everything defaults, because an operator really can say "a few
@@ -195,13 +195,21 @@ enum ObjectiveBody {
 /// comes back out of `GET` is what goes into `PUT`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PriceBody {
+pub(crate) struct PriceBody {
     minor: u64,
     currency: String,
 }
 
 impl ObjectiveBody {
-    fn into_charter(self) -> Result<Charter, ApiError> {
+    /// Every value, through the constructor it belongs to.
+    ///
+    /// `pub(crate)` for `routes::interview`, which reads a *model's* proposal
+    /// through this exact function rather than growing a second one. That reuse
+    /// is the whole security property there: a value the interview writes is a
+    /// value an operator could have typed into `PUT` by hand, because it came in
+    /// through the same deserialiser and the same `CountryCode::parse`,
+    /// `Money::new`, `Currency` and `Segment`.
+    pub(crate) fn into_charter(self) -> Result<Charter, ApiError> {
         match self {
             ObjectiveBody::Purchasing {
                 what,
