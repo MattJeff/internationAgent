@@ -78,11 +78,43 @@ done
 
 They are written `IF NOT EXISTS` / `DROP`-then-`CREATE` and are replayable.
 
-### 1.4 The tenant you have to create yourself
+### 1.4 The tenant, and the key that speaks for it
 
-**There is no endpoint that creates a tenant, and there cannot be one.** Every
-route derives its tenant from the API key, so the key for a tenant that does not
-exist yet cannot authorise creating it. `AGENTOS_API_KEYS` names a tenant UUID;
+There are two ways to get a tenant and a credential, and which one you want
+depends on whether this box is a single deployment or a control plane.
+
+**a. Over HTTP, with a platform key — the customer-facing way.** Export
+
+```bash
+export AGENTOS_PLATFORM_KEYS=signup:$(openssl rand -hex 32)
+```
+
+and then one call creates the tenant, its active policy version and its first
+API key, and returns the secret **once**:
+
+```bash
+curl -sS -X POST http://localhost:8090/v1/platform/tenants \
+  -H "Authorization: Bearer $PLATFORM_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"slug":"acme","name":"Acme Corp"}'
+```
+
+That secret is stored only as an HMAC digest and cannot be recovered. Losing it
+means issuing another (`POST /v1/platform/keys`) and revoking this one
+(`DELETE /v1/platform/keys/{id}`) — and a revocation takes effect on the **next
+request**, with no restart and with every other customer's key untouched.
+
+A platform key names no tenant and can read no tenant's data: presented to
+`/v1/whoami` it is a 401. A tenant's key presented to `/v1/platform/*` is also a
+401 — a stolen key that could mint another would make revoking it pointless.
+`apps/server/src/routes/platform.rs` is the argument in full.
+
+**b. With `DATABASE_URL`, from a shell — the single-deployment way.** Still
+supported, still what the rest of this runbook assumes, and the only way when
+this box has no platform key. **There is no *tenant-authenticated* endpoint that
+creates a tenant, and there cannot be one.** Every route derives its tenant from
+the API key, so the key for a tenant that does not exist yet cannot authorise
+creating it. `AGENTOS_API_KEYS` names a tenant UUID;
 `employees.tenant_id` has a foreign key to `tenants(id)` — one of fifty that do.
 If the row is missing, the first write answers `400 unknown_tenant` and names
 this section; it used to fail on the FK as `500 internal` with the cause only in
@@ -432,7 +464,8 @@ That is deliberate.
 | `AGENTOS_LLM` | `mock` | The scripted mock answers every message with `MOCK_REPLY`, which says out loud that it is a mock. An unknown value is a boot failure that lists the valid ones — it never silently falls back. |
 | `ANTHROPIC_API_KEY` | — | Required **at boot** when `AGENTOS_LLM=anthropic`; missing it is a named boot failure, so the first inbound email is never where you find out. |
 | `AGENTOS_ALLOW_MOCKS` | unset (false) | `1` / `true` / `yes` permits mock adapters. Anything else, plus any mock, is `refusing to start`. |
-| `AGENTOS_API_KEYS` | empty | **Every request is answered 401.** The server warns about this at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
+| `AGENTOS_API_KEYS` | empty | The operators' keyring, consulted **before** the `api_keys` table so a row cannot shadow it. Empty is fine when `AGENTOS_PLATFORM_KEYS` is set; empty *and* no platform key means every request is 401 and nothing can issue one, which the server warns about at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
+| `AGENTOS_PLATFORM_KEYS` | empty | **`/v1/platform/*` is 401 to everybody**, so nobody can sign up and no key can be issued or revoked without a redeploy. Format: `label:secret[,…]` — no tenant uuid, deliberately. Secret ≥ 32 chars. |
 | `AGENTOS_WEBHOOK_SECRETS` | empty | **Every `/v1/webhooks/{provider}` is a 404 and no inbound message can ever arrive.** The server warns about this too. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). |
 | `EMAIL_API_KEY` | — | Unset runs `MockEmailProvider`. Set to the `re_…` key, it **builds the real Resend client**. |
 | `TELEPHONY_API_KEY` | — | Unset runs `MockTelephony`. Set to `ACxxxx:auth_token` — Twilio authenticates with both halves together — it **builds the real Twilio client**. Half of it is a boot failure. |

@@ -47,7 +47,7 @@ use agentos_app::mocks::{
 };
 use agentos_domain::ids::TenantId;
 
-use crate::auth::{ApiKeys, ApiKeysError};
+use crate::auth::{ApiKeys, ApiKeysError, PlatformKeys, PlatformKeysError};
 
 /// Where the listener binds when `APP_BIND` is unset.
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
@@ -178,6 +178,16 @@ pub struct Config {
     pub rust_log: String,
     /// `AGENTOS_API_KEYS` — the keyring. See [`crate::auth`].
     pub api_keys: ApiKeys,
+    /// `AGENTOS_PLATFORM_KEYS` — the credential that may create a tenant and
+    /// issue or revoke that tenant's keys, as `label:secret`. It names no
+    /// tenant, because it speaks for none.
+    ///
+    /// Empty is the default and means `/v1/platform/*` answers 401 to
+    /// everybody: a deployment that has not been handed this key has no signup
+    /// surface at all, which is the right state for one that is not a control
+    /// plane. See [`crate::auth`] for why this one credential stays in the
+    /// environment while every customer's moved into the database.
+    pub platform_keys: PlatformKeys,
     /// Adapters that will run as mocks in this process, derived from
     /// [`PROVIDER_CREDENTIALS`].
     pub mock_adapters: Vec<&'static str>,
@@ -225,6 +235,10 @@ impl fmt::Debug for Config {
             .field(
                 "api_keys",
                 &format_args!("{} configured", self.api_keys.len()),
+            )
+            .field(
+                "platform_keys",
+                &format_args!("{} configured", self.platform_keys.len()),
             )
             .field("mock_adapters", &self.mock_adapters)
             // Its own Debug prints which adapters are configured, never with
@@ -281,6 +295,12 @@ impl Config {
                 detail: err.to_string(),
             },
         )?;
+
+        let platform_keys = PlatformKeys::parse(&get("AGENTOS_PLATFORM_KEYS").unwrap_or_default())
+            .map_err(|err: PlatformKeysError| ConfigError::Invalid {
+                var: "AGENTOS_PLATFORM_KEYS",
+                detail: err.to_string(),
+            })?;
 
         // The model, before the mock guard: a typo'd backend name is a more
         // useful message than "the llm would run as a mock".
@@ -393,6 +413,7 @@ impl Config {
             anthropic_api_key,
             rust_log: get("RUST_LOG").unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned()),
             api_keys,
+            platform_keys,
             mock_adapters,
             credentials,
             webhooks,
@@ -429,10 +450,18 @@ impl Config {
                  AGENTOS_ALLOW_MOCKS is set; unset it in any environment that matters."
             );
         }
-        if self.api_keys.is_empty() {
+        if self.api_keys.is_empty() && self.platform_keys.is_empty() {
+            // Both, together, because either one on its own is now a legitimate
+            // deployment: a control plane holds only a platform key and issues
+            // the rest, and the runbook's single-tenant box holds only the
+            // environment keyring. Warning about an empty `AGENTOS_API_KEYS` on
+            // a box that is issuing keys over HTTP would be an alarm that is
+            // always on, and an alarm that is always on is off.
             tracing::warn!(
-                "AGENTOS_API_KEYS is empty: every request will be answered 401. \
-                 Set it to `label:tenant-uuid:secret[,…]`."
+                "AGENTOS_API_KEYS and AGENTOS_PLATFORM_KEYS are both empty: every request will \
+                 be answered 401 and no key can be issued to change that. Set \
+                 AGENTOS_API_KEYS to `label:tenant-uuid:secret[,…]`, or AGENTOS_PLATFORM_KEYS \
+                 to `label:secret` and sign a tenant up through POST /v1/platform/tenants."
             );
         }
         if self.webhooks.is_empty() {

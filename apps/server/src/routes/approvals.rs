@@ -481,7 +481,10 @@ mod tests {
     }
 
     fn mount(db: &Db, gate: &PolicyGate, keys: ApiKeys) -> Router {
-        router(db.clone(), gate.clone()).layer(from_fn_with_state(keys, require_api_key))
+        router(db.clone(), gate.clone()).layer(from_fn_with_state(
+            crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+            require_api_key,
+        ))
     }
 
     /// One authenticated request. `body` `None` means GET.

@@ -39,6 +39,33 @@
 //! "prove you are the operator", and the proof this deployment already has is
 //! the database credential.
 //!
+//! **That second class of credential now exists, and the ceiling is still not a
+//! route.** `AGENTOS_PLATFORM_KEYS` and `crate::routes::platform` were built for
+//! the one platform write that could not stay in a shell — issuing a customer's
+//! first API key, because a customer filling in a form cannot ssh anywhere. Every
+//! cost this paragraph listed was paid: a second keyring, a second 401 path, a
+//! second way to be misconfigured. What did not change is which side of the line
+//! the *ceiling* falls on, and the reason is not that no principal could be
+//! authenticated for it:
+//!
+//! * **Issuing a key cannot widen anything.** The row it writes is a credential
+//!   for one tenant, bounded by exactly the policy that tenant already had. The
+//!   ceiling is the only row in this schema that makes *every* tenant able to do
+//!   more, and rolling one back is the one operation in this file that genuinely
+//!   widens.
+//! * **A ceiling is a document, not a call.** `install` reads a JSON file and
+//!   refuses one that omits a field, because an omitted field is DENY and not
+//!   "leave it alone" — see [`parse_limits_document`]. That check exists where an
+//!   operator's *file* is read, and a route would be a second place for the
+//!   belief it refuses.
+//!
+//! So the widest thing this deployment can do stays behind the credential that
+//! is hardest to hold and impossible to hold by accident. If a hosted control
+//! plane ever needs to widen a customer's ceiling without shell access, the
+//! principal to build it on is `auth::PlatformPrincipal` and the function is
+//! [`policy::install_ceiling`] — but read the two bullets above before deciding
+//! that is what is wanted.
+//!
 //! **A subcommand runs on exactly that credential.** `DATABASE_URL`, an admin
 //! transaction, no new authorisation concept, and nothing added to the HTTP
 //! surface for an attacker to find. It is the same shape as `doctor`, for the
@@ -85,12 +112,22 @@
 //! operator reads next.
 //!
 //! **The premise the route would rest on is one variable wide.** "The key is the
-//! operator" holds because `AGENTOS_API_KEYS` is a static, operator-written
-//! keyring: there is no route that mints a key, so no employee holds one. The
+//! operator" held because `AGENTOS_API_KEYS` was a static, operator-written
+//! keyring: there was no route that minted a key, so no employee held one. The
 //! day one does — a self-service console, a per-seat token — a route here
 //! becomes an employee that can rewrite its own employee layer up to its
 //! tenant's, which is every grant its colleagues have. A subcommand keeps
 //! working through that change without anybody noticing it had to.
+//!
+//! *That day half-arrived with `0044_api_keys`, and the premise survives on a
+//! narrower reason.* There is now a route that mints a key — but it is
+//! `POST /v1/platform/keys`, it is authorised by a principal that is not a
+//! tenant, and what it mints is a **tenant** credential with exactly the
+//! authority `AGENTOS_API_KEYS` always granted. No employee holds one, because
+//! nothing an employee can reach can issue one: a tenant's own key presented to
+//! that route is a 401, which is the property `routes::platform` exists to keep.
+//! The premise fails the day a key is minted *per seat*, and the sentence above
+//! is still the reason not to.
 //!
 //! What the route would buy, concretely, is a tenant who is *not* the operator:
 //! somebody who holds an API key and no shell. This deployment has no such
@@ -133,8 +170,10 @@
 //!   *employee* scope has no door at all.
 //!
 //! What is still only here: the platform ceiling (whose row belongs to no tenant
-//! and binds every other one — no route, ever, until there is a platform
-//! principal), and every *edit* to a layer that exists. [`rollback_layer`] too:
+//! and binds every other one — there is a platform principal now, and the two
+//! bullets at the top of this module are why the ceiling did not follow the
+//! keyring onto it), and every *edit* to a layer that exists. [`rollback_layer`]
+//! too:
 //! a rollback removes a layer, and removing one is the one operation in this
 //! file that genuinely widens.
 

@@ -25,6 +25,11 @@ rand.workspace = true
 # being skipped. Same reasoning, same place, as `mcp.rs`, which already dials
 # out from this crate. Already in the lock via `agentos-providers`.
 reqwest.workspace = true
+# `api_keys` hashes every presented bearer token with HMAC-SHA256. Already in
+# the lock; `sha2` beside it is the only other half it needs. Not hand-rolled
+# like `providers::telephony`'s HMAC-SHA1 — that one exists because the
+# workspace pins no SHA-1, and this one has a vetted crate one line away.
+hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

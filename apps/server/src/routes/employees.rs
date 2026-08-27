@@ -525,7 +525,11 @@ mod tests {
             .expect("keyring");
 
             Some(Self {
-                app: crate::with_api_stack(router(db.clone()), db.clone(), keys),
+                app: crate::with_api_stack(
+                    router(db.clone()),
+                    db.clone(),
+                    crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+                ),
                 db,
                 a,
                 b,

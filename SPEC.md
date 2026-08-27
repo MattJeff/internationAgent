@@ -1251,6 +1251,15 @@ merges.
 | `GET` | `/.well-known/agent-card.json` |
 | `GET` | `/.well-known/http-message-signatures-directory` |
 
+**Behind `Authorization: Bearer <platform secret>` — `AGENTOS_PLATFORM_KEYS`,
+not a tenant's key, and a tenant's key is refused here:**
+
+| Method | Path |
+|---|---|
+| `POST` | `/v1/platform/tenants` |
+| `POST`, `GET` | `/v1/platform/keys` |
+| `DELETE` | `/v1/platform/keys/{id}` |
+
 **Behind `Authorization: Bearer <secret>`:**
 
 | Method | Path |
@@ -1310,11 +1319,13 @@ per-tenant, not per-employee), a tenant endpoint, a knowledge *search* endpoint,
 a dead-letter endpoint. `/metrics` **is** mounted — see §27, which has said so
 for some time while this list went on calling it absent.
 
-**There is no endpoint that creates a tenant**, and there is a command:
-`agentos-server policy new-tenant`, on the operator's own database credentials.
-`tenants` is not tenant-scoped and there is no path to it from a `tenant_tx`,
-which is the reason there is no route. A write against a tenant whose row is
-missing answers `400 unknown_tenant` and names what to run.
+**No endpoint authorised by a tenant's key creates a tenant.** `tenants` is not
+tenant-scoped and there is no path to it from a `tenant_tx`, which is why there
+is no route on the tenant surface. Two things that are not tenants do create
+one: `agentos-server policy new-tenant`, on the operator's own database
+credentials, and `POST /v1/platform/tenants`, behind `AGENTOS_PLATFORM_KEYS` —
+which also issues the tenant's first API key. A write against a tenant whose row
+is missing answers `400 unknown_tenant` and names both.
 
 ### Idempotency
 
@@ -1366,11 +1377,21 @@ token bucket.
 
 ### Auth
 
-`Authorization: Bearer <secret>`, matched against `AGENTOS_API_KEYS`
-(`label:tenant-uuid:secret`, comma separated, secret at least 32 characters and
-allowed to contain colons). The label becomes the audit actor and — see §14 —
-the caller's approval *role*. There is no roles table; the key's label is the
-role.
+`Authorization: Bearer <secret>`, matched against **two** keyrings in order:
+`AGENTOS_API_KEYS` (`label:tenant-uuid:secret`, comma separated, secret at least
+32 characters and allowed to contain colons), then the `api_keys` table
+(`0044_api_keys.sql`), whose rows are issued over HTTP and hold an HMAC-SHA256
+digest of the secret rather than the secret. The environment wins a collision,
+because a row must not be able to shadow the credential the deployment itself
+declared. The label becomes the audit actor either way and — see §14 — the
+caller's approval *role*. There is no roles table; the key's label is the role.
+
+The table is read on every request with **no cache**, so `DELETE
+/v1/platform/keys/{id}` takes effect on the next call rather than the next
+deploy. Issuing and revoking are authorised by a *platform* principal
+(`AGENTOS_PLATFORM_KEYS`, `label:secret`, no tenant uuid) and never by a
+tenant's own key: a stolen key that could mint another would make revoking it
+pointless.
 
 `Principal` is constructed in exactly one place, from that header, and is
 deliberately **not `Deserialize`**, so no path segment, body field or header can

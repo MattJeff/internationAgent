@@ -1063,7 +1063,7 @@ mod tests {
         let keys = ApiKeys::parse(&format!("{peer}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
         let state = A2aState::new(db.clone(), gate(db), HOST);
         card_router(state.clone()).merge(router(state).layer(axum::middleware::from_fn_with_state(
-            keys,
+            crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
             crate::auth::require_api_key,
         )))
     }
@@ -1572,7 +1572,7 @@ mod tests {
             PeerKeys::pinned([(Domain::parse(peer).expect("domain"), keys)]),
         );
         router(state).layer(axum::middleware::from_fn_with_state(
-            api_keys,
+            crate::auth::Keyring::new(api_keys, db.clone(), crate::auth::TEST_MASTER_KEY),
             crate::auth::require_api_key,
         ))
     }
@@ -1831,7 +1831,10 @@ mod tests {
         let keys =
             ApiKeys::parse(&format!("{unreachable}:{}:{SECRET}", tenant.as_uuid())).expect("keys");
         let app = router(A2aState::new(db.clone(), allowing, HOST)).layer(
-            axum::middleware::from_fn_with_state(keys, crate::auth::require_api_key),
+            axum::middleware::from_fn_with_state(
+                crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
+                crate::auth::require_api_key,
+            ),
         );
         let answer = rpc_signed(app, body.as_bytes(), Some(&signed)).await;
         assert!(

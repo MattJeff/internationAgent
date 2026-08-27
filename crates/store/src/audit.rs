@@ -153,6 +153,20 @@ pub enum AuditKind {
     /// model that was proven, and never the credential; see that module's
     /// `the_key_reaches_the_vault_and_appears_nowhere_else`.
     ModelConnected,
+    /// An API key was minted for this tenant. Written by
+    /// `agentos_store::api_keys::issue`, in the same admin transaction as the
+    /// `api_keys` row.
+    ///
+    /// **This is the row that makes revocation mean something.** `api_keys`
+    /// holds only live keys — revoking is a DELETE, see `0044_api_keys.sql` —
+    /// so the question "which keys has this tenant ever had, and who asked for
+    /// them" has no other answer. The payload names the key id and the label,
+    /// never the secret.
+    ApiKeyIssued,
+    /// An API key was destroyed. Written by `agentos_store::api_keys::revoke`,
+    /// in the same transaction as the DELETE, so the trail cannot claim a
+    /// revocation that did not take.
+    ApiKeyRevoked,
 }
 
 impl AuditKind {
@@ -170,6 +184,8 @@ impl AuditKind {
             AuditKind::SecretAccessed => "secret_accessed",
             AuditKind::PolicyChanged => "policy_changed",
             AuditKind::ModelConnected => "model_connected",
+            AuditKind::ApiKeyIssued => "api_key_issued",
+            AuditKind::ApiKeyRevoked => "api_key_revoked",
         }
     }
 }
@@ -343,6 +359,38 @@ impl AuditRecord {
 /// no caller can file an event under the wrong tenant, and RLS's `WITH CHECK`
 /// would reject it anyway.
 pub async fn append(tx: &mut TenantTx<'_>, event: &AuditEvent) -> Result<Uuid, StoreError> {
+    let tenant_id = tx.tenant_id();
+    append_admin(&mut *tx, tenant_id, event).await
+}
+
+/// [`append`] for a transaction that has no tenant of its own.
+///
+/// # Why this exists, and why it is not a hole
+///
+/// One caller: `crate::api_keys`. Issuing and revoking an API key both write
+/// `api_keys`, a table `app_role` holds **no** privilege on (`0044_api_keys.sql`
+/// argues why), so those two statements can only run in
+/// [`Db::admin_tx_bypassing_rls`](crate::db::Db::admin_tx_bypassing_rls) — and
+/// the audit row has to commit with them or the trail claims a key that was
+/// never minted, which is the one thing [`append`]'s signature exists to
+/// prevent.
+///
+/// The choice was between this and a second `INSERT INTO audit_log` written by
+/// hand in another module. A second INSERT is a second place for the payload
+/// shape, the `decision_columns` split and the column list to drift, and the
+/// drift would be invisible until somebody read the trail. So: one INSERT, two
+/// ways to reach a connection, and the tenant passed explicitly because there is
+/// nothing to read it off.
+///
+/// What it costs, stated plainly: a caller of *this* function can file an event
+/// under any tenant, because RLS is not there to say no. `append` cannot, and
+/// `append` is what every other module in this crate calls. Keep it that way —
+/// `grep -rn append_admin` is the list.
+pub async fn append_admin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: TenantId,
+    event: &AuditEvent,
+) -> Result<Uuid, StoreError> {
     let id = Uuid::now_v7();
     let (decision, deny_reason_code) = match &event.decision {
         Some(decision) => {
@@ -359,7 +407,7 @@ pub async fn append(tx: &mut TenantTx<'_>, event: &AuditEvent) -> Result<Uuid, S
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
-    .bind(tx.tenant_id().as_uuid())
+    .bind(tenant_id.as_uuid())
     .bind(event.employee_id.map(|e| e.as_uuid()))
     .bind(event.conversation_id.map(|c| c.as_uuid()))
     .bind(event.decision_id.map(|d| d.as_uuid()))
@@ -369,7 +417,7 @@ pub async fn append(tx: &mut TenantTx<'_>, event: &AuditEvent) -> Result<Uuid, S
     .bind(deny_reason_code)
     .bind(Value::Object(event.payload_object()))
     .bind(event.occurred_at)
-    .execute(&mut ***tx)
+    .execute(&mut **tx)
     .await?;
 
     Ok(id)
