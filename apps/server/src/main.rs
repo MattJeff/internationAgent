@@ -166,6 +166,25 @@ const MAX_OUTBOX_LAG_SECS: i64 = 300;
 /// `Client::builder().timeout(..)` each closes it.
 const TURN_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The turn has to fit inside the outbox lease that protects it, and this is the
+/// only place the two numbers can be compared.
+///
+/// `agentos_store::outbox::claim` commits before the handler runs, so what keeps
+/// a claimed `agent.turn.requested` to one replica is `available_at` and nothing
+/// else. When the lease was shorter than [`TURN_DEADLINE`] a second poller took
+/// the row mid-turn and ran the turn again on the customer's own model key —
+/// silently, because nothing failed. The two constants live in two crates that
+/// cannot import each other's opinions, so raising this one without raising the
+/// other would reopen that quietly. A `const` assertion is a build error rather
+/// than a test, which is the right size of alarm for a number that has no
+/// runtime.
+const _: () = assert!(
+    TURN_DEADLINE.as_secs() <= agentos_store::outbox::LEASE_SECS as u64,
+    "TURN_DEADLINE is longer than agentos_store::outbox::LEASE_SECS: a second \
+     poller will reclaim a turn the first replica is still taking, and the \
+     customer is billed twice for one event"
+);
+
 /// Why the process could not start or could not keep running.
 #[derive(Debug, thiserror::Error)]
 enum BootError {
