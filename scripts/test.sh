@@ -27,9 +27,28 @@
 # and refuse to finish if any test skipped itself anyway. `--nocapture` is what
 # makes the second guard possible at all; libtest throws away the output of
 # passing tests, and a skipped test passes.
+#
+# Why the lints are in here too, and this is the same argument a third time.
+# This script is what everybody — every contributor, every agent — runs before
+# saying "green". Until now green meant "the tests pass", while `cargo clippy`
+# and `cargo fmt --check` were something somebody remembered to run separately.
+# That is another failure mode nobody notices, and it is not hypothetical: a
+# `pub fn` in `apps/server/src/metrics.rs` sat behind an `#[allow(dead_code)]`
+# with a note reading "delete it in the commit that adds the call", the call
+# never came, and every green run agreed. Model-usage metrics were not wired at
+# all in a product whose closing screen is a forecast of model spend.
+#
+# `fmt` first because it costs a second and a diff is cheaper to fix before a
+# build than after one. Clippy last because it needs a compiled tree and the
+# tests have just warmed one — and `-D warnings` because a lint nobody is
+# forced to read is a lint that does not exist.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# --- formatting, before anything is compiled ---------------------------------
+echo "==> cargo fmt --check"
+cargo fmt --all --check || die "the tree is not formatted; run \`cargo fmt --all\`"
 
 HOST=${PGHOST:-localhost}
 PORT=${PGPORT:-5442}
@@ -150,3 +169,12 @@ done
 # minutes is a suite nobody runs.
 echo "==> agentos-eval  (no database; deterministic suites only)"
 cargo test -p agentos-eval
+
+
+# --- the lints ---------------------------------------------------------------
+# Last, and with `-D warnings`. See the header: a warning nobody is forced to
+# read is a warning that does not exist, and this workspace has already paid for
+# that once.
+echo "==> cargo clippy --workspace --all-targets"
+cargo clippy --workspace --all-targets -- -D warnings \
+  || die "clippy is not silent"

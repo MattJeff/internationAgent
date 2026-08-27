@@ -1414,6 +1414,17 @@ impl Agent {
                 )
                 .await
                 .map_err(|err| format!("could not record what the failed turn spent: {err}"))?;
+                // The metric, beside the ledger. `metrics::record_llm_usage`
+                // carried `#[allow(dead_code)]` and its own instruction —
+                // "delete it in the commit that adds the call" — and that
+                // commit never came, so token counts were persisted and never
+                // observable. A product whose closing screen is a forecast of
+                // model spend had no live figure for model spend.
+                //
+                // Here rather than inside `model_usage::record`: that lives in
+                // `agentos-store`, which may not reach the server's registry,
+                // and a metric is not a row.
+                metrics::record_llm_usage(event.tenant_id, failed.usage);
                 bill.commit()
                     .await
                     .map_err(|err| format!("could not commit the failed turn's tokens: {err}"))?;
@@ -1505,6 +1516,11 @@ impl Agent {
             )
             .await
             .map_err(|err| format!("the turn's token usage could not be recorded: {err}"))?;
+            // Beside the ledger, for the reason the failed-turn arm above
+            // gives at length. Both arms, because a forecast that counted only
+            // the turns that worked would under-report exactly the deployments
+            // in trouble.
+            metrics::record_llm_usage(event.tenant_id, finished.usage);
 
             let from = employee.address().to_string();
             let reply = finished.reply.trim();

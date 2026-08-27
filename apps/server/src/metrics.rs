@@ -139,12 +139,12 @@ pub fn record_provisioning(step: Step, report: &StepReport) {
 /// which is behind the same wall as the rest of the logs, while the metric
 /// stays aggregate. See the module docs.
 ///
-/// ponytail: the last `allow(dead_code)` in this module, and the reason it is
-/// on this function rather than on the module. Its call site is being wired by
-/// the change that persists token counts; a module-wide allow would have gone
-/// on hiding the other two the same way it hid all three. Delete it in the
-/// commit that adds the call.
-#[allow(dead_code)]
+/// **Its call site exists now**, in `Agent::on_turn`, beside both
+/// `model_usage::record` calls — the successful turn and the failed one that
+/// still paid for what it spent. The `allow(dead_code)` that sat here said
+/// "delete it in the commit that adds the call"; that commit was a long time
+/// coming, and until it did, token counts were persisted to `model_usage_daily`
+/// and never observable anywhere a human watches.
 pub fn record_llm_usage(tenant_id: TenantId, usage: Usage) {
     tracing::debug!(tenant_id = %tenant_id, tokens = usage.total(), "llm usage");
     counters().llm.add(usage);
