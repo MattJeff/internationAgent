@@ -6978,6 +6978,185 @@ mod tests {
         );
     }
 
+    /// **Our own footer is not a refusal.**
+    ///
+    /// The load-bearing property behind [`crate::inbound::refuses_contact`],
+    /// asserted against the real constant rather than a copy of it. [`OPT_OUT`]
+    /// contains the word STOP; every mail client quotes it back under whatever
+    /// the person typed. If this ever fails, the recognition rule suppresses
+    /// **everybody who replies at all** — which is a worse outage than the hole
+    /// it was written to close, and a silent, append-only one.
+    #[test]
+    fn our_own_opt_out_footer_is_never_read_as_a_refusal() {
+        assert!(
+            !crate::inbound::refuses_contact(&Untrusted::new(OPT_OUT.to_owned())),
+            "the sentence we put at the bottom of every message reads as an opt-out"
+        );
+
+        // And quoted back, line by line, under an ordinary interested reply.
+        let quoted: String = OPT_OUT.lines().map(|line| format!("> {line}\n")).collect();
+        assert!(
+            !crate::inbound::refuses_contact(&Untrusted::new(format!(
+                "Sounds interesting — can we talk Thursday?\n\n\
+                 On Tue, 3 Jun 2026 at 09:12, Lena <lena@sender.example> wrote:\n{quoted}"
+            ))),
+            "a prospect who said yes was read as having opted out"
+        );
+    }
+
+    /// **A reply that says STOP is final, in the schema.**
+    ///
+    /// The promise [`OPT_OUT`] makes to a stranger, kept. Before this the only
+    /// production writer of a `suppressions` row was
+    /// [`crate::queue::reconcile_opt_outs`], which asks the *sending platform*
+    /// what it knows — so an unsubscribe click was recorded and the one word
+    /// our own footer asks for was not. The sequence stopped, because any reply
+    /// stops it, and then in three weeks the next campaign wrote to them again.
+    ///
+    /// Asserted through the real door on both ends: `inbound::land` writes it
+    /// and the schema's own `SECURITY DEFINER` lookup reads it back.
+    #[tokio::test]
+    async fn replying_stop_suppresses_the_prospect_for_good() {
+        use agentos_domain::message::{
+            CanonicalMessage, Channel as MessageChannel, Direction, ProviderRef,
+        };
+
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact, _) = approached(&db, &desk, now).await;
+        assert!(
+            next_chase(&db, &desk.principal, now + crate::revenue::FOLLOW_UP_AFTER)
+                .await
+                .is_some(),
+            "the chase was never due, so this test proves nothing"
+        );
+
+        // One word, with our own message quoted underneath it — which is what
+        // obeying the footer actually looks like on the wire.
+        let body = {
+            let quoted: String = OPT_OUT.lines().map(|line| format!("> {line}\n")).collect();
+            format!(
+                "STOP\n\nOn Tue, 3 Jun 2026 at 09:12, Lena <lena@sender.example> wrote:\n{quoted}"
+            )
+        };
+
+        let employee = desk.principal.employee_id;
+        let replied_at = now + TimeDelta::hours(1);
+        // Twice, with two provider ids: a duplicate delivery from the provider
+        // is the ordinary case, and two refusals must not be two errors or two
+        // rows.
+        for provider_id in ["msg-stop", "msg-stop-again"] {
+            let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+            let conversation = crate::inbound::conversation_for(
+                &mut tx,
+                employee,
+                MessageChannel::Email,
+                PROSPECT_EMAIL,
+                None,
+                replied_at,
+            )
+            .await
+            .expect("conversation");
+            let provider_message_id = ProviderRef::new(provider_id);
+            crate::inbound::land(
+                &mut tx,
+                &CanonicalMessage {
+                    tenant_id: desk.principal.tenant_id,
+                    employee_id: employee,
+                    conversation_id: conversation,
+                    idempotency_key: CanonicalMessage::dedupe_key(
+                        employee,
+                        MessageChannel::Email,
+                        &provider_message_id,
+                    ),
+                    provider_message_id,
+                    channel: MessageChannel::Email,
+                    direction: Direction::Inbound,
+                    received_at: replied_at,
+                    // Display name and mixed case: `suppressions.address` has a
+                    // CHECK that it is lower case, and the reply is where the
+                    // spelling has to be fixed.
+                    from: Untrusted::new(
+                        "Head Of Digital <Head.Of.Digital@Airline.Example>".to_owned(),
+                    ),
+                    subject: None,
+                    body_text: Untrusted::new(body.clone()),
+                    attachments: Vec::new(),
+                },
+                replied_at,
+            )
+            .await
+            .expect("land the refusal");
+            tx.commit().await.expect("commit the refusal");
+        }
+
+        // 1. The send path's own check now refuses this address — read through
+        //    `revenue_suppression_of`, the lookup production uses.
+        assert!(
+            suppression_for(&db, &desk.principal, &address(PROSPECT_EMAIL))
+                .await
+                .contains(&address(PROSPECT_EMAIL)),
+            "somebody who replied STOP is still sendable"
+        );
+
+        // 2. Neither queue will hand them out again — not the chase, and not
+        //    the first-touch selection a later campaign would run.
+        assert!(
+            next_chase(&db, &desk.principal, now + crate::revenue::FOLLOW_UP_AFTER)
+                .await
+                .is_none(),
+            "somebody who replied STOP is still on the chase list"
+        );
+        assert!(
+            next_prospect(&db, &desk.principal, now + TimeDelta::days(90))
+                .await
+                .is_none(),
+            "somebody who replied STOP came back as a fresh prospect"
+        );
+
+        // 3. Every channel, because the trigger deactivates the contact row and
+        //    that row is the join every channel goes through — their phone
+        //    number is on it.
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        let active: bool = sqlx::query_scalar("SELECT active FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the contact");
+        let (rows, reason, scope, note): (i64, String, String, Option<String>) = sqlx::query_as(
+            "SELECT count(*) OVER (), reason, scope, note FROM suppressions \
+              WHERE address = $1 LIMIT 1",
+        )
+        .bind(PROSPECT_EMAIL)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read the suppression");
+        tx.rollback().await.expect("rollback");
+
+        assert!(!active, "the contact is still active after they said STOP");
+        assert_eq!(
+            rows, 1,
+            "a second delivery of the same refusal wrote a second row"
+        );
+        assert_eq!(reason, "opt_out");
+        // Their claim, not a larger one invented for them.
+        assert_eq!(scope, "tenant");
+        // The legal record is a constant. Their words are personal data and
+        // hostile input at once, and this column is read by humans.
+        let note = note.expect("a suppression with no note is not a legal record");
+        assert!(
+            !note.contains("STOP\n") && !note.contains("Lena"),
+            "the reply body leaked into the suppression note: {note}"
+        );
+    }
+
     /// **Where each of the two boundaries actually bites on the chase**, which
     /// is not the same place for both.
     ///
