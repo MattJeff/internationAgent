@@ -450,29 +450,39 @@ async fn fail(db: &Db, event: &OutboxEvent, failure: &Failure) {
 /// replica leaves the load balancer for every other customer. A stop is a
 /// customer asking us to wait; it is not this process falling behind.
 ///
-/// **This is a third reader of the halt** — after `outbox::claim_of` and
-/// `initiative::claim_due`, both of which had to be corrected separately — and
-/// it is spelled out here rather than delegated to `halt::halted` for the same
-/// reason `claim_of` spells it: that function answers for one tenant on a
-/// `TenantTx`, and this is one aggregate over every tenant at once. The clause
-/// has to stay in step with `claim_of`'s, and
-/// `a_stopped_company_is_not_a_poller_that_is_behind` is what notices if it
-/// does not.
+/// **This is a fourth reader of the halt** — after `outbox::claim_of`,
+/// `initiative::claim_due` and the provisioning loop's `CLAIM_SQL` — and it
+/// cannot delegate to `halt::halted` for the same reason none of them can: that
+/// function answers for one tenant on a `TenantTx`, and this is one aggregate
+/// over every tenant at once.
+///
+/// So it uses [`not_stopped!`](agentos_store::not_stopped), which is what those
+/// three already share, and it landed here late: this clause was written on a
+/// branch beside the one that made the macro, and for one merge the workspace
+/// had the macro *and* a hand-written fourth copy of what the macro says. The
+/// two agreed on the day, which is exactly how the same drift went unnoticed
+/// between `claim_of` and `claim_due` until the window arrived in one and not
+/// the other.
+///
+/// **The second argument is the point of the second arm.** This function takes
+/// no `now` — its `$1` is `MAX_ATTEMPTS` — and reads the transaction's own
+/// clock, twice, in the subtraction above and in `available_at <= now()`. The
+/// window has to be asked about the same instant those two are, so the clock is
+/// passed rather than assumed; the one-argument form assumes `$1`, and here
+/// that is an integer. `a_stopped_company_is_not_a_poller_that_is_behind` is
+/// what notices if any of it stops being true.
 pub async fn lag_secs(db: &Db) -> Result<i64, StoreError> {
     // Cross-tenant: the backlog is not any one tenant's.
     let mut tx = db.admin_tx_bypassing_rls().await?;
-    let lag: Option<i64> = sqlx::query_scalar(
+    let lag: Option<i64> = sqlx::query_scalar(concat!(
         "SELECT max(extract(epoch FROM now() - e.available_at))::bigint \
            FROM outbox_events e \
           WHERE e.published_at IS NULL \
             AND e.available_at <= now() \
             AND e.attempt_count < $1::int \
-            AND NOT EXISTS (SELECT 1 FROM company_halts h \
-                             WHERE h.tenant_id = e.tenant_id) \
-            AND NOT EXISTS (SELECT 1 FROM company_windows w \
-                             WHERE w.tenant_id = e.tenant_id \
-                               AND w.ends_at <= now())",
-    )
+            AND ",
+        agentos_store::not_stopped!("e.tenant_id", "now()"),
+    ))
     .bind(MAX_ATTEMPTS)
     .fetch_one(&mut *tx)
     .await?;

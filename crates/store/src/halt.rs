@@ -60,6 +60,14 @@ use crate::db::{StoreError, TenantTx};
 /// phone numbers for stopped companies — would have been a third chance to get
 /// it wrong.
 ///
+/// **And a fourth arrived the same week, from a branch that could not see this
+/// one.** `apps/server`'s `loops::outbox::lag_secs` learned to ignore a stopped
+/// tenant — a customer pressing stop was taking every replica out of the load
+/// balancer — and spelled the two clauses out by hand, because on that branch
+/// this macro did not exist yet. The merge kept both. That is four recitations
+/// with a definition sitting between them, so it now calls this too, through
+/// the second arm below.
+///
 /// So the sites now agree by construction. `concat!` runs at compile time, the
 /// callers keep `&'static str` SQL and their measured query plans, and there is
 /// exactly one place to edit when a fourth way to stop a company is invented.
@@ -69,11 +77,33 @@ use crate::db::{StoreError, TenantTx};
 /// * `$tenant` is the SQL expression naming the tenant column in scope —
 ///   `"t.id"` where `tenants` drives the query, `"r.tenant_id"` where the queue
 ///   table does. It is a literal because `concat!` takes literals.
-/// * **`$1` must be the caller's `now`, as `timestamptz`.** Every claim in this
-///   workspace binds it first; a query that renumbers its parameters has to
-///   renumber this too, and the compiler will not say so.
+/// * **In the one-argument form, `$1` must be the caller's `now`, as
+///   `timestamptz`.** Every claim in this workspace binds it first; a query
+///   that renumbers its parameters has to renumber this too, and the compiler
+///   will not say so. A caller whose `$1` is something else passes its clock
+///   explicitly — see below.
 /// * The fragment is a bare boolean with no outer parentheses, so it drops into
 ///   a `WHERE` directly and needs wrapping inside an `OR`.
+///
+/// # The second arm, for a query with no clock to bind
+///
+/// `not_stopped!($tenant, $now)` takes the clock expression instead of assuming
+/// `$1`, and the two arms are **the same predicate over a different clock** —
+/// not two predicates. That distinction is the whole reason the second arm
+/// exists rather than a fourth hand-written copy: [`crate::outbox::claim_of`]
+/// and [`crate::initiative::claim_due`] are given a `now` by the poller so it
+/// can be moved in a test, while `apps/server`'s `loops::outbox::lag_secs` has
+/// no `now` argument at all and reads the transaction's own `now()` — its `$1`
+/// is `MAX_ATTEMPTS`.
+///
+/// So the arms must not be mixed inside one statement, and the rule is simply
+/// that a caller passes the clock it already uses everywhere else in the same
+/// query. `lag_secs` subtracts `now()` from `available_at` and compares
+/// `available_at <= now()`; a window clause reading `$1` there would answer
+/// about a different instant than the number it returns — and in fact does not
+/// even typecheck, which is how this arm was found. `now()` is
+/// `transaction_timestamp()`, so a statement that uses it twice cannot see the
+/// window close halfway through itself, exactly as [`halted`] argues.
 ///
 /// # It defers, it does not refuse
 ///
@@ -85,12 +115,17 @@ use crate::db::{StoreError, TenantTx};
 #[macro_export]
 macro_rules! not_stopped {
     ($tenant:literal) => {
+        $crate::not_stopped!($tenant, "$1::timestamptz")
+    };
+    ($tenant:literal, $now:literal) => {
         concat!(
             "NOT EXISTS (SELECT 1 FROM company_halts h WHERE h.tenant_id = ",
             $tenant,
             ") AND NOT EXISTS (SELECT 1 FROM company_windows w WHERE w.tenant_id = ",
             $tenant,
-            " AND w.ends_at <= $1::timestamptz)"
+            " AND w.ends_at <= ",
+            $now,
+            ")"
         )
     };
 }

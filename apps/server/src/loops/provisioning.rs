@@ -53,7 +53,14 @@
 //! | `pending`                                      | never attempted |
 //! | `provisioning` and `lease_until < now`         | **a worker died holding it** |
 //! | `pending_external` and `expected_by < now`     | **the wait is now a problem** |
-//! | `failed`, cold for `retry_after`, under the cap | a transient failure |
+//! | `failed`, cold for `retry_after`, under the cap, **and with a retryable code** | a transient failure |
+//!
+//! The last four words of that row are new, and they are the difference between
+//! "a step failed" and "a step failed at something a second call could fix". A
+//! terminal code — `bad_secret_ref`, `no_numbers_available`, `unauthorized` —
+//! used to buy five provider calls apiece on a backoff, which is the release
+//! side's `release_not_supported` bug in the other direction and it went
+//! unnoticed for exactly as long. See [`CLAIM_SQL`].
 //!
 //! ...and one exemption: **a stopped company's rows are not claimed, unless the
 //! row is the second one.** A halt, or an operating window that has run out,
