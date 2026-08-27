@@ -549,7 +549,7 @@ byte precisely so a future rewrap can read the old one.
 a secret with full entropy, not a password, so a work factor would buy nothing
 and cost boot time.
 
-Every secret read **and every refusal** appends one `secret_accessed` audit row
+**NOT WIRED.** Every secret read **and every refusal** appends one `secret_accessed` audit row
 naming who asked, the ref and the verdict — never the value — and that row is
 **committed before the `Secret` is returned** (`crates/app/src/secrets.rs`). The
 ownership prefix check runs before any I/O, so a cross-tenant or cross-employee

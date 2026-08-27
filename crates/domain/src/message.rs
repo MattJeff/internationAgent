@@ -36,7 +36,17 @@ pub enum Channel {
     Voice,
     /// Agent-to-agent, i.e. another AI employee (ours or someone else's).
     A2a,
-    /// The human operator console.
+    /// The human operator console — **and the channel that permits browsing.**
+    ///
+    /// It was only the console once, and a table cell in `docs/ORIZN.md` still
+    /// said so long after it stopped being true. Since reading the web became a
+    /// channel rather than a host list, `policy::always_denies` answers
+    /// `ActionKind::BrowserRead` with `closed(Channel::Web)`: an employee whose
+    /// intersected layers carry this reads any public host not on
+    /// `denied_domains`, and one whose layers do not reads nothing at all.
+    ///
+    /// So dropping it from a layer is how an operator says "this seat does not
+    /// browse" — and dropping it from the *ceiling* says that of everybody.
     Web,
     /// One of *our* employees to another, inside one tenant.
     ///
