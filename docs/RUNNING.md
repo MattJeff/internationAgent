@@ -1,6 +1,6 @@
 # The company, running
 
-*Last walked: 2026-08-28.*
+*Last walked: 2026-08-28 (second pass, after wave O).*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -73,11 +73,14 @@ expensive defect available in this product.
 | Connect tools (MCP) | built | `/v1/mcp/*`, `catalog.rs`, `mcp.rs` |
 | Budget and caps | built | `/v1/employees/{id}/spend-caps`, `/v1/billing`, `/v1/usage` |
 | Duration → forecast | built | `/v1/forecast`, `forecast.rs` |
-| **Duration → enforced stop** | **absent** | — |
+| Duration → enforced stop | built | `company_windows` (0054), `halt.rs`, `PUT /v1/window` |
+| A new company gets one | built, **required** | `POST /v1/companies` refuses without `window_ends_at` |
+| **Hiring into a company with no window** | **still open** | `POST /v1/org` does not ask; every company built before today came through it |
 | Initiatives | built | `initiative.rs`, `loops/initiative.rs` |
 | Employees talk to each other | built | `a2a.rs` |
 | Browser | built | `browser.rs`, `effects.rs` |
-| Email | built, one hole | `providers/src/email.rs` — see below |
+| Email | built | `providers/src/email.rs`, `email_resend.rs` |
+| **Inbound STOP → suppression** | **absent** | nothing reads the reply we ask for |
 | Work queues | built | `outbox.rs`, `queue.rs` |
 | Chases (follow-ups) | built | `vertical.rs`, `due_chase` |
 | New turns | built | `turn.rs` |
@@ -86,24 +89,48 @@ expensive defect available in this product.
 
 ## The gaps, stated plainly
 
-**The run window does not exist.** Step 8 of the onboarding lets the founder
-choose 2 days, 1 week or 1 month. `/v1/forecast` will *price* that window — it
-even bounds itself to a quarter because its four inputs have a shorter shelf
-life than that — but nothing enforces it. A company started today runs forever.
+**The run window is closed at the front door and open at the side one.** Step 8
+of the onboarding lets the founder choose 2 days, 1 week or 1 month.
+`/v1/forecast` prices that window, `company_windows` enforces it, `PUT
+/v1/window` sets it, and `POST /v1/companies` now **refuses to build a company
+without one** — optional would have handed the hurried caller the pre-0054
+behaviour as the silent consequence of a missing field, and a default duration
+would be a price nobody here may invent.
 
-The intended shape, when it is built, is that **an expired window IS a halt**:
-it surfaces through `halt::active()` with its own reason, so every place that
-already respects the emergency stop respects the window for free and no second
-list of callers has to be kept in sync. A manual halt beats a window that is
-still open; a window can only close, never re-open.
+What is still open is `POST /v1/org`, the *editing* door: it hires into a
+company that has no window and does not ask for one. Every company standing
+today came through it. Closing it means deciding that hiring is forbidden where
+there is no clock, which is a wider blast radius than one route — and there is
+still no backfill, because a backfill needs a default duration, which is the one
+thing that is the founder's to choose.
 
-**`EmailProvider` has no mandatory opt-out.** `LeadSink::opted_out` is a required
-trait method, so a sending connector cannot be written without saying where
-complaints arrive. The MCP catalogue got the same lock on 2026-08-27 — `OptOuts`
-is a required field on `Connector` and a `const` block makes the lazy answer a
-compile error. `EmailProvider` is `send` / `verify_webhook` / `fetch_inbound`
-with no such method: an adapter written today would send mail with nobody forced
-to name where the unsubscribes land.
+The shape it shipped in: **an expired window IS a halt.** It surfaces through
+`halt::halted()` with its own sentence, so every place that already respects the
+emergency stop respects the window with no change, and no second list of callers
+has to be kept in sync. A manual halt beats a window that is still open; a
+window can only close, never re-open.
+
+**The exception is the price of that shape, and it has already been paid.** Two
+statements are cross-tenant SQL driven by `tenants` with an injected clock —
+`outbox::claim_of` and `initiative::claim_due` — so they cannot ask a per-tenant
+reader and spell the predicate out instead. The halt clause landed in one and
+the window clause in the other, and for a while a company whose month had ended
+still had its employees claimed and their cadence spent. Anything added to
+`halt::halted()` has to be copied into both by hand.
+
+**Three doors now demand an opt-out declaration, and nobody reads the answers.**
+`LeadSink::opted_out` has always been a required trait method. The MCP catalogue
+got the same lock on 2026-08-27 (`OptOuts` is a required field on `Connector`;
+a `const` block makes the lazy answer a compile error), and `EmailProvider` on
+2026-08-28 (`opt_outs()` is required with no default, and its enum has no lazy
+variant — an email adapter's whole job is putting mail in front of people, so
+there is nothing left to be lazy about).
+
+What none of that fixes: **the only production writer of a `suppressions` row is
+`queue::reconcile_opt_outs`, which reads the campaign platform.** Every outbound
+message carries `vertical::OPT_OUT` inviting the recipient to reply STOP, and no
+production path turns that reply into a suppression. The declarations are now
+mandatory; the readers behind them are not built.
 
 **There is no ready-made org chart.** `POST /v1/companies` stands a whole
 company from one call, but the founder describes every team in it. Nothing
@@ -137,9 +164,19 @@ rather than deleted.
 These block work and cannot be guessed. They are listed here because a map that
 hides its blanks is a map that lies.
 
-- The Smartlead opt-out endpoint. Most urgent — outbound moves to the API on
+- **The Smartlead opt-out endpoint.** Most urgent — outbound moves to the API on
   2026-09-01, and the catalogue entry is now a compile error without it.
+- **Is the Resend endpoint subscribed to `email.bounced` and `email.complained`?**
+  A checkbox in a dashboard; no process here can read it. If it is unticked, the
+  complaint path is correct and simply never runs, and the dashboard is what to
+  fix rather than any code.
+- **A default run duration**, and what happens to work in flight when a window
+  ends. Needed twice over: `POST /v1/org` still hires where there is no window,
+  and there is no backfill for companies that predate `0054` — both blocked on
+  the same number, and a duration is a price, so nobody here may invent it.
+- **Should extending an expired window restart the company in one call?** It
+  does today. The safer alternative is to require the two deliberate gestures a
+  halt requires.
 - Whether we host a Google Ads MCP server, and carry the developer key.
 - Whether we host the Smartlead stdio bridge.
-- A default run duration, and what happens to work in flight when a window ends.
 - The pricing tariff itself.

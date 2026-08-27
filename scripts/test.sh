@@ -127,6 +127,45 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# --- guard: an applied migration is immutable, and only a long-lived database
+# can say so -------------------------------------------------------------------
+# Every database above is created fresh, so every migration is applied for the
+# first time and no checksum is ever compared. That is precisely the blind spot:
+# sqlx stores a hash of each migration file in `_sqlx_migrations`, and editing a
+# file that has already been applied makes every existing database refuse to
+# start with `VersionMismatch` — while a fresh run stays green. It has happened
+# here: a comment changed in an applied `0041` took down every database that had
+# it, and the suite said nothing.
+#
+# So one database is deliberately NOT dropped between runs, and NOT named after
+# RUN_ID. It carries the migration history of every previous run, which makes it
+# the only thing in this repo that can notice an edit. It is never used by a
+# test — only migrated — so nothing in it needs to be clean.
+#
+# On the very first run it is created empty, every migration applies for the
+# first time, and this guard proves nothing. It is vacant exactly once and
+# real from then on; there is no way to have it both ways, and saying so
+# beats a green run that looks like evidence.
+LEDGER=ci_migration_ledger
+echo "==> migrations against $LEDGER (kept between runs on purpose)"
+psql_admin -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '$LEDGER'" \
+  | grep -q 1 || psql_admin -v ON_ERROR_STOP=1 -c "CREATE DATABASE $LEDGER"
+if command -v sqlx >/dev/null 2>&1; then
+  sqlx migrate run --source migrations \
+    --database-url "postgres://$USER:$PASS@$HOST:$PORT/$LEDGER" 2>&1 | tail -3 ||
+    die "migrations failed against a database that already had earlier ones applied.
+  If this says VersionMismatch, a migration file that was already applied has
+  been edited. Restore it byte-for-byte from the commit that added it and put
+  the correction in a NEW migration -- editing it breaks every database that
+  ever ran it, and every fresh database will keep passing while they do."
+else
+  # Not fatal: the ledger is the only thing here that needs the CLI, and a run
+  # without it is still a real run — it just cannot see this one class of edit.
+  # Said out loud rather than skipped quietly, because a guard nobody knows is
+  # off is worse than no guard.
+  echo "==> sqlx CLI absent: the applied-migration check did NOT run" >&2
+fi
+
 for pkg in "${PACKAGES[@]}"; do
   db="ci_${pkg//-/}_$RUN_ID"
   echo "==> $pkg  (database $db)"

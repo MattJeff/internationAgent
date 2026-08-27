@@ -715,49 +715,18 @@ pub async fn record_raw_email_delivery(
 /// That is the same standard `migrations/0011_revenue.sql` holds `suppressions`
 /// to, which is not a coincidence: it is the next thing this row has to become.
 ///
-/// # SEAM — this stops one call short of a `suppressions` row, deliberately
+/// # The second door into `suppressions`, and why it was joined by hand
 ///
-/// A complaint *should* produce a suppression. It does not yet, and the missing
-/// step is one statement, not a design:
+/// This wrote only the trail row for one commit, on purpose: the
+/// `reply STOP -> suppressions` writer was being built at the same time, and
+/// two writers arriving on one append-only table from two sides is precisely
+/// the seam that manufactures a bug. They were joined at the merge, once there
+/// was one story about what a suppression is rather than two.
 ///
-/// ```ignore
-/// for address in &refusal.addresses {
-///     agentos_store::revenue::suppress(
-///         tx,
-///         Uuid::now_v7(),
-///         &revenue_store::NewSuppression {
-///             channel: revenue_store::Channel::Email,
-///             address,                       // already trimmed and lower-cased
-///             reason: refusal.reason,        // "complaint" | "bounce"
-///             scope: revenue_store::Scope::Tenant,
-///             contact_id: None,
-///             note: Some("resend webhook"),
-///             suppressed_at: refusal.at.unwrap_or(now),
-///         },
-///     )
-///     .await?;
-/// }
-/// ```
-///
-/// Everything it needs is already in place: `suppressions_reason`'s CHECK
-/// already accepts `'complaint'` and `'bounce'`, `suppress` is idempotent by
-/// `ON CONFLICT DO NOTHING`, and [`Refusal::addresses`] is normalised into the
-/// exact shape `suppressions_address_normalised` demands. **No migration is
-/// required** — `0056` was considered and is not needed.
-///
-/// It is left undone here because another wave is building the
-/// `reply STOP -> suppressions` writer at the same time, and two writers landing
-/// on one append-only table from two sides is precisely the seam that
-/// manufactures a bug. One writer, joined at the merge.
-///
-/// Two conditions the joining commit owes, neither of which is guesswork:
-///
-/// * **Gate the bounce branch on [`Refusal::permanent`].** A complaint is
-///   always final; a bounce is only final when the provider called it
-///   `Permanent`. `suppressions` takes no DELETE, so suppressing on a full
-///   mailbox removes a live customer with no way back.
-/// * **`refusal.addresses` may be empty**, and a suppression of nothing is not
-///   a failure — the trail row below is still the record.
+/// Both doors write the same row — `Scope::Tenant`, `Channel::Email`,
+/// `contact_id: None`, a constant note, the counterparty's own instant. What
+/// differs is the evidence: a reply is a person typing a word, and a refusal is
+/// a provider reporting one. The `reason` column says which.
 ///
 /// # For the founder, and not answerable from this binary
 ///
@@ -797,6 +766,68 @@ async fn record_refusal(
         },
     )
     .await?;
+
+    // The seam, joined. `record_refusal` used to stop here and name this call
+    // in a doc comment, because the `reply STOP -> suppressions` writer was
+    // being built at the same time and two writers landing on one append-only
+    // table from two sides is how a bug gets manufactured. There is now one
+    // writer's worth of agreement about what a suppression is, and this is the
+    // second door into it.
+    //
+    // **Gated on `permanent`, and that gate is the whole care here.** A
+    // complaint is always final — `Delivery::parse` sets `permanent` for one
+    // unconditionally — but a bounce is final only when the provider itself
+    // called it permanent. `suppressions` accepts no DELETE, so treating a full
+    // mailbox or a weekend outage as a refusal removes a live customer with no
+    // way back, and nobody would find out from this side: the mail simply stops
+    // and the trail says it was asked for.
+    //
+    // An empty `addresses` is not a failure. The audit row above is the record
+    // either way, and a provider that named nobody has told us nothing to act
+    // on rather than something to fail on.
+    if refusal.permanent {
+        for address in &refusal.addresses {
+            revenue_store::suppress(
+                tx,
+                Uuid::now_v7(),
+                &revenue_store::NewSuppression {
+                    // They complained to *their* provider about *our* tenant's
+                    // mail. `Global` would bind every tenant in the deployment,
+                    // which is a larger claim than the one that was made — the
+                    // same reading `reconcile_opt_outs` and the STOP reply both
+                    // take.
+                    scope: revenue_store::Scope::Tenant,
+                    channel: revenue_store::Channel::Email,
+                    // Already trimmed and lower-cased by `Delivery::parse`,
+                    // which is the exact shape
+                    // `suppressions_address_normalised` CHECKs.
+                    address,
+                    // `"complaint"` or `"bounce"`, spelled by the parser the way
+                    // `suppressions_reason`'s CHECK spells it, so this is a
+                    // field rather than a translation table to keep in step.
+                    reason: refusal.reason,
+                    contact_id: None,
+                    // A constant, never the payload: that document is somebody
+                    // else's system's description of a person, and this note is
+                    // read by a human in a support ticket.
+                    note: Some("the provider reported a permanent refusal for this address"),
+                    // When they refused, not when the poller drained the row.
+                    suppressed_at: refusal.at.unwrap_or(now),
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                revenue_store::RevenueError::Store(err) => InboundError::Store(err),
+                _ => InboundError::Store(StoreError::conflict("the refusal could not be recorded")),
+            })?;
+        }
+        // No address and no reason text: who it was is in `suppressions`, behind
+        // RLS, and the count is what an operator watching deliverability needs.
+        tracing::info!(
+            suppressed = refusal.addresses.len(),
+            "a provider reported a permanent refusal; those addresses are suppressed"
+        );
+    }
     Ok(())
 }
 
@@ -3262,6 +3293,18 @@ mod tests {
     }
 
     /// Every `mail_refused` row this tenant holds, newest last.
+    /// The suppressed addresses for a tenant, with the reason each carries.
+    async fn suppressed(db: &Db, tenant: TenantId) -> Vec<(String, String)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT address, reason FROM suppressions ORDER BY address")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("read suppressions");
+        tx.commit().await.expect("commit read");
+        rows
+    }
+
     async fn refusals(db: &Db, tenant: TenantId) -> Vec<Value> {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         let rows: Vec<Value> = sqlx::query_scalar(
@@ -3287,6 +3330,59 @@ mod tests {
     /// Note who complained: `data.to` is the counterparty and `data.from` is
     /// *our own* employee address. A reader that took `from` would put the
     /// tenant's own sender on the suppression list and end their outbound mail.
+    /// **The join between the two doors into `suppressions`, and its gate.**
+    ///
+    /// This is the assertion the merge owed. Two waves built the two halves in
+    /// separate trees: one taught the bridge that a complaint is not a parse
+    /// error, the other wrote the `reply STOP -> suppressions` writer. Each was
+    /// green alone, and neither could see that the trail row was where the
+    /// evidence stopped.
+    ///
+    /// The gate is the load-bearing half, and it is asserted from both sides in
+    /// one test on purpose. `suppressions` accepts no DELETE: a transient bounce
+    /// — a full mailbox, a weekend outage — recorded as a refusal removes a live
+    /// customer with no way back, and nobody finds out from here, because the
+    /// mail simply stops and the trail says it was asked for.
+    #[tokio::test]
+    async fn a_permanent_refusal_suppresses_and_a_transient_one_does_not() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+
+        let (final_tenant, _) = seed(&db).await;
+        let complaint = r#"{"type":"email.complained","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_21","from":"lena@agents.example.com",
+                     "to":["Angry@Prospect.Example"]}}"#;
+        read_delivery(&db, final_tenant, complaint, now)
+            .await
+            .expect("a complaint is not a handler error");
+
+        assert_eq!(
+            suppressed(&db, final_tenant).await,
+            vec![("angry@prospect.example".to_owned(), "complaint".to_owned())],
+            "a spam complaint must reach `suppressions`, not stop at the trail — \
+             the trail is what an operator reads afterwards, and the table is \
+             what the sender checks before writing again"
+        );
+
+        // The same path, one field different, and the answer must invert.
+        let (transient_tenant, _) = seed(&db).await;
+        let soft = r#"{"type":"email.bounced","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_22","from":"lena@agents.example.com",
+                     "to":["away@prospect.example"],
+                     "bounce":{"type":"Transient"}}}"#;
+        read_delivery(&db, transient_tenant, soft, now)
+            .await
+            .expect("a soft bounce is not a handler error either");
+
+        assert!(
+            suppressed(&db, transient_tenant).await.is_empty(),
+            "a bounce the provider itself called Transient must not silence \
+             anybody: the row cannot be taken back"
+        );
+        // It is still on the trail — recorded, just not acted on.
+        assert_eq!(refusals(&db, transient_tenant).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn a_spam_complaint_is_recorded_once_and_is_never_a_handler_error() {
         let Some(db) = db().await else { return };
