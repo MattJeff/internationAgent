@@ -143,6 +143,10 @@ trap cleanup EXIT INT TERM
 #   inside `mod tests`, replace `Utc::now()` with
 #   `(Utc::now() + chrono::TimeDelta::nanoseconds(1))`, run, and revert.
 #
+# Skip `crates/app/tests/ui/` when you do — those are trybuild fixtures whose
+# whole job is to produce one exact compiler error, and editing them fails
+# the comparison for a reason that has nothing to do with clocks.
+#
 # Anything that compares an instant against its own round trip goes red. That
 # sweep found exactly two in `agentos-store`; it has not been run on the other
 # crates, because CI stops at the first failing package and has never reached

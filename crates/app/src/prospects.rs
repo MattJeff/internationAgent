@@ -815,6 +815,7 @@ mod tests {
     use agentos_store::db::Db;
 
     use super::*;
+    use chrono::SubsecRound;
 
     /// The real thing, copied out of `~/Desktop/VOYAGEURS`: the header, a plain
     /// row, a row whose `company_name` contains a comma, and a row that is not
@@ -1014,7 +1015,13 @@ mod tests {
     async fn the_founders_own_rows_become_the_rows_we_expect() {
         let Some(db) = db().await else { return };
         let tenant = seed_tenant(&db).await;
-        let now = Utc::now();
+        // `timestamptz` holds microseconds, and the assertions below compare a
+        // `consent_recorded_at` this test made against the one it reads back.
+        // macOS hands out a microsecond clock so nothing is lost and this was
+        // green on every laptop; Linux hands out nanoseconds and the round trip
+        // drops the last three digits. It was red in CI for as long as it
+        // existed, about the clock and nothing else.
+        let now = Utc::now().trunc_subsecs(6);
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
         let report = import(&mut tx, &insurers(), REAL, now)
@@ -1518,7 +1525,13 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
     async fn a_directory_page_becomes_ordinary_rows_and_a_second_read_writes_nothing() {
         let Some(db) = db().await else { return };
         let tenant = seed_tenant(&db).await;
-        let now = Utc::now();
+        // `timestamptz` holds microseconds, and the assertions below compare a
+        // `consent_recorded_at` this test made against the one it reads back.
+        // macOS hands out a microsecond clock so nothing is lost and this was
+        // green on every laptop; Linux hands out nanoseconds and the round trip
+        // drops the last three digits. It was red in CI for as long as it
+        // existed, about the clock and nothing else.
+        let now = Utc::now().trunc_subsecs(6);
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
         let report = discover(&mut tx, &associations(), &directory(), now, 50)
