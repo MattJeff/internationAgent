@@ -306,9 +306,12 @@ pub trait TelephonyProvider: Send + Sync {
     /// answer, an answering machine, and a human who declined are all states
     /// the call reaches **after** this future resolves, and not one of them is
     /// expressible in this return type. They arrive on the provider's status
-    /// callback, and this workspace has no route that accepts one — see
-    /// `agentos_app::inbound::land_inbound_text`, which is the telephony ingest
-    /// and is documented as not wired.
+    /// callback, and this workspace has no reader for one. The telephony ingest
+    /// itself *is* wired — `agentos_app::inbound::land_inbound_text`, behind
+    /// `main::on_telephony_webhook` — but it lands **messages**: it reads a
+    /// counterparty, a body and a channel off the form, and a call status
+    /// carries none of those. A status callback would need a reader of its own
+    /// and there is none.
     ///
     /// So a caller that reports "I called them" on `Ok` is reporting something
     /// this signature never said. What it did say is "the carrier took the

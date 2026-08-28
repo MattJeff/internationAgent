@@ -1312,7 +1312,11 @@ The tenant comes from the registration or the row, never off the wire. The
 `event_type` comes from the endpoint's `provider`, never from the path — a
 minted path in an event type is an event type nothing registered a handler for.
 
-**One signature scheme is reachable: Standard Webhooks / Svix.** Headers
+**Two signature schemes are reachable, and the endpoint's `provider` picks
+between them** — `twilio` gets the block at the end of this section, everything
+else gets the default below.
+
+**The default: Standard Webhooks / Svix.** Headers
 `webhook-id` / `svix-id`, `webhook-timestamp`, `webhook-signature`
 (`v1,<base64>`, possibly several space-separated for rotation); HMAC-SHA256 over
 `id.timestamp.body`; constant-time comparison with no early return inside the
@@ -2118,11 +2122,17 @@ An employee can, today:
   `TELEPHONY_API_KEY` selects the real Twilio client, acquisition and the
   pending-compliance state and the pool and the routing rules all work, and
   `EngineConfig::provision_phone` ships `false` so none of it runs: nothing in
-  this build can send or receive on a number (no `sms_send` or `call_place` in
+  this build can **send** on a number (no `sms_send` or `call_place` in
   `turn::catalogue`, and the ceiling grants neither `sms` nor `voice`), so
   `Step::Phone` settles as `NotWired` in `disabled` rather than starting a
   monthly bill per employee. Turning it on is a code change, and a test pins the
   switch to the catalogue in both directions
+- ⏸️ **receive** on a number — the ingest is built (§19: `/v1/webhooks/{path}`
+  verifies Twilio's scheme, `main::on_telephony_webhook` →
+  `inbound::land_inbound_text` lands the text and wakes the employee) and the
+  purchase never binds it: `TwilioTelephony::ensure_number` posts `PhoneNumber`
+  and `FriendlyName` and **no `SmsUrl`**, so Twilio has nowhere to deliver. One
+  form field, deliberately unset — it points a live carrier at this deployment
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
 - ❌ place or receive voice calls — **NOT BUILT**
 - ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
