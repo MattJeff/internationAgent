@@ -1,0 +1,100 @@
+-- 0057_outbox_claimable: the claim's index stops carrying rows the claim can
+-- never take.
+--
+-- WHAT WENT WRONG, AND IT WAS ARGUED IN 0046 ITSELF
+--
+-- `0046` gave the round-robin claim its index and said, under "WHY
+-- `attempt_count` IS NOT IN IT":
+--
+--   Because it is not selective in the direction that matters. Almost every due
+--   row has `attempt_count < 8`; the ones that do not are dead letters, which
+--   are a bounded population an operator is already being alerted about.
+--
+-- That was true of the deployment it was written for, where reaching the dead
+-- letter state cost eight failed attempts spread over twenty minutes. It is not
+-- true any more. `outbox::park` burns the attempt counter in **one** UPDATE, and
+-- `apps/server/src/main.rs` now parks a turn whose model call cannot finish —
+-- deliberately, so the customer's message is visible and recoverable instead of
+-- being recorded as answered. That was the right change and this is its bill:
+-- one parked row per unanswerable message, on the first attempt.
+--
+-- Nothing in this repository has ever deleted a row from `outbox_events`. So a
+-- dead letter is permanent, and it is permanent **inside the index the hottest
+-- statement in the system scans**: `park` does not move `available_at`, so a
+-- parked row keeps a timestamp in the past and sorts at the *head* of its
+-- tenant's range. `attempt_count` was only a filter, so every claim walked past
+-- every one of them, four times a second, forever.
+--
+-- MEASURED, PostgreSQL 17, 20 tenants, 5 due rows each, `claim_of` with
+-- `limit = 32`, median of three. The parked rows all belong to ONE tenant —
+-- which is the shape this actually takes, one customer who has not connected a
+-- model — and the cost lands on everybody:
+--
+--     parked rows      claim         lag_secs
+--     (one tenant)                   (/readyz)
+--     ----------------------------------------
+--              0        1.0 ms        0.2 ms
+--          1 000        1.6 ms        0.3 ms
+--         10 000        3.8 ms        1.2 ms
+--         30 000        5.8 ms        5.0 ms
+--        100 000       26.1 ms       14.1 ms
+--
+-- With the index below, that last row claims in ~1.0 ms — flat, back to where
+-- the empty table was — and the index the claim reads holds the 100 live rows in
+-- **16 kB**, against **5 776 kB** for the one it replaces, which held all
+-- 100 100. This is the same failure `0046` exists to prevent — one tenant's rows
+-- becoming every tenant's latency — arriving by a road `0046` had ruled out, and
+-- the ruling is what expired, not the reasoning.
+--
+-- THE `8` IS `outbox::MAX_ATTEMPTS`, AND THE QUERY STILL BINDS IT AS `$2`
+--
+-- A partial index is only usable when the planner can *prove* the query implies
+-- its predicate. About `$2` it can prove that only from the parameter's value,
+-- which means only from a **custom** plan — so this was measured rather than
+-- assumed. Eight consecutive executions of the prepared statement at
+-- `plan_cache_mode = auto`, against the 100 000-parked table above: eight custom
+-- plans, eight index scans, ~1 ms each. PostgreSQL never reaches for the generic
+-- plan because the generic plan is enormously worse, and it is worth writing
+-- down how much worse, because nothing would report it: forced generic, the same
+-- statement takes **783 ms** and removes 100 095 rows by filter *per tenant* —
+-- it is back to reading the whole queue, twenty times over.
+--
+-- So the claim keeps `$2` — one source for the cap — and this predicate carries
+-- the second copy of the number. An applied migration is immutable, so raising
+-- `MAX_ATTEMPTS` needs a new migration as well. Forgetting is not a correctness
+-- bug: rows between the old and new cap simply stop being provable, the planner
+-- drops this index, and the claim goes back to walking dead letters at the speed
+-- of the table. `a_tenants_dead_letters_are_not_scanned_by_every_claim` in
+-- `crates/store/src/outbox.rs` EXPLAINs the shipped statement and fails when the
+-- index stops being used, which is the only way anybody would find out.
+--
+-- WHY `outbox_events_due_idx` IS LEFT ALONE
+--
+-- Because its readers want the opposite half. `outbox::dead_letters` — the
+-- operator's queue and the metrics gauge — selects `attempt_count >= 8`, and
+-- narrowing that index the same way would leave it a sequential scan of the
+-- whole table. `0046` kept two indexes because two readers have two shapes;
+-- this keeps the split and only sharpens the one whose shape changed.
+--
+-- `loops::outbox::lag_secs` still reads the wide one and still walks past dead
+-- letters (14 ms at 100 000 above). Named rather than fixed: it runs on
+-- `/readyz`, not four times a second, and it is a `max()` over the whole queue
+-- that no per-tenant index answers anyway.
+--
+-- WHAT THIS DOES NOT DO
+--
+-- It does not prune anything, and nothing here needs to. See the module comment
+-- in `crates/store/src/outbox.rs` for the two populations that grow, which of
+-- them was measured to cost a reader anything (one of two), and the founder's
+-- question that a retention sweep would have to answer first.
+
+create index if not exists outbox_events_claimable_idx
+  on outbox_events (tenant_id, available_at, id)
+  where published_at is null and attempt_count < 8;
+
+-- Superseded by the line above: same columns, same partial predicate minus the
+-- half that now matters. Dropped rather than kept, because keeping it would put
+-- a third index on the hottest table in the system — a write on every enqueue,
+-- every claim and every publish, 5 776 kB of it above — and nothing reads this
+-- shape any more. `outbox_events_due_idx` stays; see above for its two readers.
+drop index if exists outbox_events_tenant_due_idx;

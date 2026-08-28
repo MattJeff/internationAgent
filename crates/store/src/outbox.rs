@@ -45,6 +45,62 @@
 //!   dead-letter state. Nothing has to move the row anywhere. [`dead_letters`]
 //!   is the same predicate read back for whoever is on call.
 //!
+//! # Nothing deletes a row, and only one of the two piles costs anything
+//!
+//! There is no prune, no sweep, no `pg_cron`, and no `DELETE FROM
+//! outbox_events` outside test fixtures. A row lives as long as its tenant does.
+//! Two populations grow without a ceiling, and they are not the same problem:
+//!
+//! * **Published rows.** Both partial indexes are predicated on
+//!   `published_at IS NULL`, so a published row leaves them the moment
+//!   [`mark_done`] commits — the heap keeps it, no reader looks. Measured
+//!   on PostgreSQL 17: **500 000 published rows, 94 MB, and neither [`claim_of`]
+//!   nor `loops::outbox::lag_secs` moves at all** — 0.7 ms and 0.2 ms, the same
+//!   as an empty table. This pile is disk and nothing else, and disk is the
+//!   cheapest thing in this system. **It is not a defect and it is not urgent.**
+//!
+//! * **Parked rows** — [`park`], or eight failed attempts. `published_at` stays
+//!   NULL, so they stay *in* the index, and nothing moves `available_at`, so
+//!   they sort at the head of their tenant's range and every claim walked past
+//!   every one of them. That one was real, it was the same shape `0046` exists
+//!   to prevent — one customer's rows becoming every customer's latency — and
+//!   `migrations/0057_outbox_claimable.sql` has the numbers and the fix.
+//!
+//! ## FOUNDER'S QUESTION, LEFT OPEN: how long may a published row be deleted?
+//!
+//! Not asked here because nothing needs the answer yet — the measurement above
+//! is why this file has no retention constant to be wrong about. If disk ever
+//! becomes the reason, the number is **not** an engineering choice, and the
+//! constraint that decides it is [`enqueue`]'s:
+//!
+//! > the id of a deduped event is `md5(tenant : aggregate : type : dedupe_key)`,
+//! > so the row *is* the dedupe record. Delete it and a re-delivery of the same
+//! > event inserts a fresh row and the side effect happens a second time.
+//!
+//! So the retention floor is **how long a provider may re-deliver**, and every
+//! provider that reaches this table has its own answer:
+//! `routes::webhooks` keys on `<provider>:<delivery id>`, and
+//! `apps/server/src/routes/halt.rs` is already holding an unanswered question
+//! about Resend's retention for the same reason. One number, two decisions.
+//! Until somebody has it, deleting a published row is trading a duplicate side
+//! effect — a second email to a customer, a second model call on their key —
+//! for disk. `audit_log` keeps the history either way; it is append-only, has no
+//! foreign key to `tenants`, and is not what this table is for.
+//!
+//! Whoever eventually runs it is *not* a loop in `apps/server/src/loops/`. A
+//! sweep by age reads no policy and takes nothing from anybody, so putting it
+//! behind the emergency stop and the operating window would only raise the
+//! question of whether a stopped company's disk keeps growing — a question
+//! nobody has to answer if the sweep never asks. A migration cannot do it
+//! either; it runs once. That leaves `pg_cron` or a cron'd `psql`, which is
+//! where a `DELETE ... WHERE published_at < now() - <the number>` belongs the
+//! day the number exists.
+//!
+//! Parked rows are a different question and the answer is already no: a dead
+//! letter is an effect that was supposed to happen and did not, and
+//! [`requeue_dead_letters`] is the way back. Deleting one destroys the only
+//! record that anything is owed. It leaves the *index* now, not the table.
+//!
 //! # Clocks
 //!
 //! Every function takes `now`. Nothing here calls `now()` in SQL or
@@ -65,6 +121,13 @@ use crate::db::{StoreError, TenantTx};
 /// With the schedule in [`claim`] the eighth attempt lands roughly two hours
 /// after the first, which is long enough to ride out a provider outage and
 /// short enough that a genuinely poisoned event reaches a human the same day.
+/// `migrations/0057_outbox_claimable.sql` spells this number a second time, in
+/// the predicate of the index [`claim_of`] reads, and an applied migration is
+/// immutable — so raising it needs a new migration too. Nothing goes *wrong* if
+/// somebody forgets: the claim keeps returning the right rows, it just stops
+/// being able to use the index and walks every dead letter in the deployment
+/// again. `a_tenants_dead_letters_are_not_scanned_by_every_claim` is what turns
+/// that back into a failure somebody sees.
 pub const MAX_ATTEMPTS: i32 = 8;
 
 /// The floor under a claim's `available_at`, in seconds: how long a claimed
@@ -530,61 +593,102 @@ pub async fn claim_of(
         Aggregates::Only(kind) => (Some(kind), None),
     };
 
-    let rows = sqlx::query(
-        // MATERIALIZED, and it is not a hint. Written the obvious way —
-        // `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` — the
-        // subplan can be re-executed per outer row, and each re-execution
-        // steps over whichever rows a *concurrent* poller holds locked right
-        // then, so the UPDATE touches the union rather than `$n` rows. The
-        // rows stay disjoint between pollers, so nothing is handled twice;
-        // what breaks is the bound. A poller that claims 16 with a limit of
-        // 10 has silently stopped bounding its own batch, which is the only
-        // thing standing between one tick and the whole table.
-        //
-        // A single-session test returns exactly `$n` and proves nothing. The
-        // initiative loop's two-poller test caught the same query shape
-        // claiming 13, then 16, against a limit of 10.
-        // **The halt sits on the driver, not on the rows**, and that is a
-        // better place than the one it was written in. `claim_except` used to
-        // filter `NOT EXISTS (… company_halts h WHERE h.tenant_id =
-        // outbox_events.tenant_id)` per candidate row; here the query is driven
-        // by `tenants`, so a stopped company never becomes a seat at all and
-        // its rows are never read. Same refusal, one join earlier.
-        //
-        // It still DEFERS rather than refuses, which is the whole point:
-        // `attempt_count` is incremented at claim time (see `claim_of`'s docs
-        // below), so a halt that let the poller claim and reject would burn
-        // eight attempts and dead-letter every pending piece of the customer's
-        // work — an emergency stop destroying exactly what it exists to
-        // protect. Not selecting the row costs it nothing.
-        //
-        // **The second predicate is the same refusal, and it is the one place
-        // in the workspace where a window had to be spelled out.** Every other
-        // reader of a stop calls `halt::halted`, which reports an exhausted
-        // operating window as a halt and needed no edit
-        // (`migrations/0054_operating_window.sql` argues why). This query
-        // cannot: it is cross-tenant SQL driven by `tenants`, with a clock the
-        // caller injects, so it reads the row itself against `$1` rather than
-        // the `now()` that function uses. The two must agree, and the cost of
-        // them disagreeing is stated exactly by the paragraph above — a company
-        // whose month ran out would have every queued piece of its work claimed,
-        // refused by the gate, and dead-lettered inside five minutes. A window
-        // ending is not a reason to destroy the mail.
-        //
-        // FOUNDER'S QUESTION, LEFT OPEN: these rows then wait forever, because
-        // a window that ended has no release verb the way a halt does. Deferred
-        // is the conservative half — nothing is lost and extending the window
-        // drains them all — but "what happens to a finished company's queue"
-        // is a product decision (drain once? export? expire?) and this file
-        // will not invent one.
-        //
-        // The two clauses are now `crate::not_stopped!`, pasted here at compile
-        // time from `crate::halt` — same tokens, same plan, one definition. The
-        // paragraph above explains why this query cannot simply call
-        // `halt::halted`; the macro is what stops the workaround being copied a
-        // fourth time by hand.
-        concat!(
-            "WITH seated AS MATERIALIZED ( \
+    let rows = sqlx::query(CLAIM_SQL)
+        .bind(now)
+        .bind(MAX_ATTEMPTS)
+        .bind(limit)
+        .bind(only)
+        .bind(except)
+        .bind(POLLER_HEADROOM)
+        .bind(LEASE_SECS)
+        .fetch_all(&mut *conn)
+        .await?;
+
+    Ok(rows.iter().map(OutboxEvent::from_row).collect())
+}
+
+/// The statement [`claim_of`] runs, lifted out of it so a test can `EXPLAIN` the
+/// bytes that actually ship rather than a second copy of them that is free to
+/// drift. `claim_of`'s doc comment is the argument for every clause in it.
+///
+/// The bytes are unchanged by `0057`; what changed is the index underneath the
+/// `seated` lateral, which is now `outbox_events_claimable_idx` and no longer
+/// contains a dead letter. `a_tenants_dead_letters_are_not_scanned_by_every_claim`
+/// is the test this constant exists for.
+pub(crate) const CLAIM_SQL: &str = {
+    // MATERIALIZED, and it is not a hint. Written the obvious way —
+    // `WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT $n)` — the
+    // subplan can be re-executed per outer row, and each re-execution
+    // steps over whichever rows a *concurrent* poller holds locked right
+    // then, so the UPDATE touches the union rather than `$n` rows. The
+    // rows stay disjoint between pollers, so nothing is handled twice;
+    // what breaks is the bound. A poller that claims 16 with a limit of
+    // 10 has silently stopped bounding its own batch, which is the only
+    // thing standing between one tick and the whole table.
+    //
+    // A single-session test returns exactly `$n` and proves nothing. The
+    // initiative loop's two-poller test caught the same query shape
+    // claiming 13, then 16, against a limit of 10.
+    // **The halt sits on the driver, not on the rows**, and that is a
+    // better place than the one it was written in. `claim_except` used to
+    // filter `NOT EXISTS (… company_halts h WHERE h.tenant_id =
+    // outbox_events.tenant_id)` per candidate row; here the query is driven
+    // by `tenants`, so a stopped company never becomes a seat at all and
+    // its rows are never read. Same refusal, one join earlier.
+    //
+    // It still DEFERS rather than refuses, which is the whole point:
+    // `attempt_count` is incremented at claim time (see `claim_of`'s docs
+    // below), so a halt that let the poller claim and reject would burn
+    // eight attempts and dead-letter every pending piece of the customer's
+    // work — an emergency stop destroying exactly what it exists to
+    // protect. Not selecting the row costs it nothing.
+    //
+    // **The second predicate is the same refusal, and it is the one place
+    // in the workspace where a window had to be spelled out.** Every other
+    // reader of a stop calls `halt::halted`, which reports an exhausted
+    // operating window as a halt and needed no edit
+    // (`migrations/0054_operating_window.sql` argues why). This query
+    // cannot: it is cross-tenant SQL driven by `tenants`, with a clock the
+    // caller injects, so it reads the row itself against `$1` rather than
+    // the `now()` that function uses. The two must agree, and the cost of
+    // them disagreeing is stated exactly by the paragraph above — a company
+    // whose month ran out would have every queued piece of its work claimed,
+    // refused by the gate, and dead-lettered inside five minutes. A window
+    // ending is not a reason to destroy the mail.
+    //
+    // FOUNDER'S QUESTION, LEFT OPEN: these rows then wait forever, because
+    // a window that ended has no release verb the way a halt does. Deferred
+    // is the conservative half — nothing is lost and extending the window
+    // drains them all — but "what happens to a finished company's queue"
+    // is a product decision (drain once? export? expire?) and this file
+    // will not invent one.
+    //
+    // The two clauses are now `crate::not_stopped!`, pasted here at compile
+    // time from `crate::halt` — same tokens, same plan, one definition. The
+    // paragraph above explains why this query cannot simply call
+    // `halt::halted`; the macro is what stops the workaround being copied a
+    // fourth time by hand.
+    //
+    // **`e.attempt_count < $2::int` in the lateral stopped being a filter and
+    // became an index predicate**, and that is the whole of
+    // `migrations/0057_outbox_claimable.sql`: dead letters are not in
+    // `outbox_events_claimable_idx` at all, so the claim no longer walks past
+    // every one a tenant ever produced. The clause reads the same; what
+    // changed is underneath it.
+    //
+    // A partial index is only usable when the planner can *prove* the query
+    // implies its predicate, and about a parameter it can prove that only from
+    // the parameter's value — that is, from a **custom** plan. Measured on
+    // PostgreSQL 17 against 200 000 parked rows: eight consecutive executions
+    // of the prepared statement at `plan_cache_mode = auto`, all eight custom,
+    // all eight on the index, ~1 ms. PostgreSQL never reaches for the generic
+    // plan here because it costs so much more — but what "more" means is worth
+    // writing down, since nothing in this process would report it: forced
+    // generic, the same statement takes **3 141 ms** and removes 200 095 rows
+    // by filter *per tenant*. `plan_cache_mode` on this connection is not a
+    // tuning knob, it is a cliff.
+    concat!(
+        "WITH seated AS MATERIALIZED ( \
              SELECT q.id, q.available_at, q.seat \
                FROM tenants t \
                CROSS JOIN LATERAL ( \
@@ -602,8 +706,8 @@ pub async fn claim_of(
                             LIMIT $3::bigint * $6::bigint) top \
                ) q \
               WHERE ",
-            crate::not_stopped!("t.id"),
-            " \
+        crate::not_stopped!("t.id"),
+        " \
          ), shortlist AS MATERIALIZED ( \
              SELECT id, seat, available_at FROM seated \
               ORDER BY seat, available_at, id \
@@ -628,20 +732,8 @@ pub async fn claim_of(
          WHERE e.id IN (SELECT id FROM due) \
          RETURNING e.id, e.tenant_id, e.aggregate_type, e.aggregate_id, e.event_type, \
                    e.payload, e.attempt_count, e.available_at, e.last_error",
-        ),
     )
-    .bind(now)
-    .bind(MAX_ATTEMPTS)
-    .bind(limit)
-    .bind(only)
-    .bind(except)
-    .bind(POLLER_HEADROOM)
-    .bind(LEASE_SECS)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    Ok(rows.iter().map(OutboxEvent::from_row).collect())
-}
+};
 
 /// The handler succeeded. The event is published and never claimed again.
 ///
@@ -849,6 +941,15 @@ pub async fn dead_letters(
 ///
 /// Returns how many rows were revived, so a caller can say nothing at all when
 /// the answer is zero.
+///
+// ponytail: this is a sequential scan and always was — measured at 2.2 s to
+// revive one tenant's 100 000 dead letters out of 100 100 rows, on both sides of
+// `0057`, because no index helps a statement that updates almost every row it
+// looks at and the planner knows it. Left alone: it is a verb a human triggers
+// by connecting a model or activating a policy, not a poller, and two seconds
+// once is not worth an index that every enqueue would then maintain. The upgrade,
+// if a tenant ever holds a backlog this size *and* somebody is waiting on the
+// HTTP response, is to bound it — revive the oldest `n` and say so — not to index it.
 pub async fn requeue_dead_letters(
     tx: &mut TenantTx<'_>,
     now: DateTime<Utc>,
@@ -1018,6 +1119,174 @@ mod tests {
         .await
         .expect("seed");
         tx.commit().await.expect("commit seed");
+    }
+
+    /// `rows` dead letters for one tenant, exactly as [`park`] leaves them:
+    /// unpublished, `attempt_count` burnt out, and `available_at` *not moved* —
+    /// which is why they sort ahead of everything claimable in the same tenant.
+    ///
+    /// One statement for the same reason [`seed_due`] is one: the point of the
+    /// test below is a few thousand of these.
+    async fn seed_parked(db: &Db, tenant: TenantId, rows: i64, now: DateTime<Utc>) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outbox_events \
+                 (id, tenant_id, aggregate_type, aggregate_id, event_type, payload, \
+                  created_at, available_at, attempt_count, last_error) \
+             SELECT gen_random_uuid(), $1, 'employee', gen_random_uuid(), \
+                    'employee.provisioned', '{}'::jsonb, $2, $2 - g * interval '1 second', \
+                    $4::int, 'this employee''s policy permits no model at all' \
+               FROM generate_series(1, $3::bigint) g",
+        )
+        .bind(tenant.as_uuid())
+        .bind(now)
+        .bind(rows)
+        .bind(MAX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await
+        .expect("seed parked");
+        tx.commit().await.expect("commit parked seed");
+    }
+
+    /// **A tenant's dead letters must cost the claim nothing, and until
+    /// `0057_outbox_claimable` they cost it everything.**
+    ///
+    /// `park` burns the attempt counter and leaves `published_at` NULL and
+    /// `available_at` where it was, so a parked row stays inside the partial
+    /// index the claim scans, at the *head* of its tenant's range — and nothing
+    /// in this repository has ever deleted a row from `outbox_events`. With
+    /// `attempt_count` a mere filter, every claim walked past every dead letter
+    /// the deployment had ever produced, four times a second, forever. Measured
+    /// at 26 ms per claim against one tenant holding 100 000 of them, which is
+    /// `0046`'s own failure — one customer's rows becoming every customer's
+    /// latency — reached by the road `0046` explicitly ruled out on the grounds
+    /// that dead letters were "a bounded population". `outbox::park` and
+    /// `main.rs`'s `Failure::Terminal` are what unbounded them.
+    ///
+    /// This asserts the plan rather than a duration, because a duration is a
+    /// flaky test on a laptop and the plan is the thing that regressed. Three
+    /// assertions, each of which was watched go red against a deliberate break,
+    /// and no two of them catch the same one:
+    ///
+    /// * **the plan names `outbox_events_claimable_idx` somewhere.** Red when
+    ///   the index's predicate and [`MAX_ATTEMPTS`] part company — the planner
+    ///   can no longer prove the index applies and silently drops it, and this
+    ///   is the only thing in the workspace that would notice, because an
+    ///   applied migration cannot follow a Rust constant. Deliberately weak
+    ///   about *which* node: both the `seated` lateral and the `due` recheck can
+    ///   read that index, and pinning the assertion to one of them means pinning
+    ///   it to a plan shape the planner is free to change.
+    /// * **`Rows Removed by Filter` stays near zero rather than near
+    ///   [`PARKED`].** This is the one that measures the actual complaint — work
+    ///   done per claim, not index names — and it is red when the index is
+    ///   widened back to `published_at IS NULL` alone, which the first assertion
+    ///   happily passes.
+    /// * **exactly the rows under the cap come back.** Red when the cap in the
+    ///   lateral moves, which the first two both pass: a `<=` accepts the dead
+    ///   letters instead of filtering them, so nothing is *removed by filter*
+    ///   and the `due` recheck still reads the index.
+    ///
+    /// It runs [`CLAIM_SQL`] itself, not a copy: a test that measures a second
+    /// spelling of the query measures nothing about the first.
+    #[tokio::test]
+    async fn a_tenants_dead_letters_are_not_scanned_by_every_claim() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let tenant = seed_tenant(&db, "parked-scan").await;
+
+        /// Enough that walking them is unmistakable in the plan, few enough
+        /// that one INSERT is instant.
+        const PARKED: i64 = 5_000;
+
+        seed_parked(&db, tenant, PARKED, at(T0 - 1)).await;
+        // One claimable row, behind all of them in `available_at` order.
+        seed_due(&db, tenant, 1, at(T0)).await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        // ANALYZE runs the UPDATE for real, so this transaction is rolled back
+        // rather than committed. Same seven binds as [`claim_of`]: the statement
+        // under test is the constant the poller ships, not a copy of it.
+        //
+        // `AssertSqlSafe`, and the audit is that both halves are compile-time
+        // constants of this module — a literal `EXPLAIN` prefix and
+        // [`CLAIM_SQL`]. No value reaches the string.
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {CLAIM_SQL}"
+        )))
+        .bind(at(T0))
+        .bind(MAX_ATTEMPTS)
+        .bind(32_i64)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(POLLER_HEADROOM)
+        .bind(LEASE_SECS)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain the claim");
+        tx.rollback().await.expect("rollback the explained claim");
+
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("outbox_events_claimable_idx"),
+            "the claim no longer reads the index that excludes dead letters. A \
+             partial index is dropped by the planner the moment it can no longer \
+             prove the query implies the predicate — which is what happens when \
+             MAX_ATTEMPTS and 0057's `attempt_count < 8` stop agreeing — and the \
+             fallback is silent and correct and slow. Plan:\n{plan}"
+        );
+
+        // Every `Rows Removed by Filter` in the plan, summed. Zero nodes is
+        // fine; what must not happen is a node that threw away the parked rows,
+        // because throwing them away means it read them first.
+        let discarded: i64 = plan
+            .split("Rows Removed by Filter: ")
+            .skip(1)
+            .map(|tail| {
+                tail.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("0")
+                    .parse::<i64>()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            discarded < PARKED / 10,
+            "the claim discarded {discarded} rows to find one; {PARKED} dead \
+             letters are being read on every claim. Plan:\n{plan}"
+        );
+
+        // And the cap still sits where it is supposed to. The two assertions
+        // above are both about the *plan*, and a plan can be perfect about rows
+        // the claim should not have been offered in the first place — a `<=` in
+        // the lateral reads the index, filters nothing, and hands back five
+        // thousand dead letters. A row one attempt short of the cap is what
+        // pins the boundary from the other side.
+        seed_due(&db, tenant, 1, at(T0 + 1)).await;
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "UPDATE outbox_events SET attempt_count = $2 \
+              WHERE tenant_id = $1 AND available_at = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(MAX_ATTEMPTS - 1)
+        .bind(at(T0 + 1))
+        .execute(&mut *tx)
+        .await
+        .expect("age the last row");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed = claim(&mut tx, 32, at(T0 + 2)).await.expect("claim");
+        tx.commit().await.expect("commit claim");
+        assert_eq!(
+            claimed.len(),
+            2,
+            "exactly the two rows under the cap are claimable; {PARKED} at the \
+             cap are not, and a row at MAX_ATTEMPTS - 1 still is"
+        );
+
+        drop_tenant(&db, tenant).await;
     }
 
     // -- enqueue ----------------------------------------------------------
