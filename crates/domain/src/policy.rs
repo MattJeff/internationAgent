@@ -509,10 +509,10 @@ pub const fn turns_remaining(policy: &EffectivePolicy, turns_today: u32) -> u32 
 /// because the thing on the other side of a wrong answer is a stranger's inbox.
 ///
 /// `false` is the shipped answer everywhere: [`PolicyLimits::default`] grants
-/// nothing, the platform ceiling and every role pack in `docs/` leave it unset,
-/// and `#[serde(default)]` makes an operator's document that never mentions it
-/// mean the same thing. Turning it on is a policy layer somebody writes on
-/// purpose.
+/// nothing, `docs/orizn-ceiling.json` never mentions it and `#[serde(default)]`
+/// makes that mean the same thing, and all five `docs/orizn-roles/*.json` write
+/// `"allow_lead_upload": false` out by hand. Turning it on is a policy layer
+/// somebody writes on purpose.
 pub const fn may_upload_leads(policy: &EffectivePolicy) -> bool {
     policy.limits().allow_lead_upload
 }
@@ -993,10 +993,16 @@ pub fn evaluate_browser_read(policy: &EffectivePolicy, domain: &Domain) -> Decis
 /// called — but the A2A arm asks `allowed_a2a_peers` and nothing else, so the
 /// ceiling has never had an opinion about a peer. A ledger charging on "has a
 /// counterparty" therefore refuses A2A on any policy whose outreach budget is
-/// spent, and on the shipped default of `0` it refuses every one: every role
-/// pack in `docs/` ships `max_new_contacts_per_day: 0`, and
-/// `app::a2a::GateInterceptor` authorises every **inbound** call as an
-/// `Action::A2aSend`.
+/// spent, and `app::a2a::GateInterceptor` authorises every **inbound** call as
+/// an `Action::A2aSend` — so the whole endpoint went down with the day's email.
+///
+/// The sentence that used to stand here said "every role pack in `docs/` ships
+/// `max_new_contacts_per_day: 0`", and no version of this tree has been true of:
+/// `direction` and `growth` ship `0`, `sales-development` and `finance` ship
+/// `5`, `customer-success` ships `20`, and `docs/orizn-ceiling.json` ships `20`.
+/// Counted rather than asserted, and the corrected fact is the worse one — on
+/// the two zero packs A2A was refused outright and obviously, while on the other
+/// three it worked in the morning and stopped when the day's outreach ran out.
 ///
 /// [`Action::InternalSend`] is the same pairing read the other way. It has no
 /// counterparty and does not come through `channel_rules`, for the reason that

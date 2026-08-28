@@ -863,11 +863,18 @@ impl PolicyGate {
     /// But `evaluate`'s A2A arm asks `allowed_a2a_peers` and never
     /// `channel_rules`, so the ceiling has never ruled on a peer. Reserving on
     /// "has a counterparty" therefore *invented* a refusal the policy does not
-    /// express, and on the shipped default — every role pack in `docs/` ships
-    /// `max_new_contacts_per_day: 0` — it refused every A2A call there is,
-    /// inbound ones included: `crate::a2a::GateInterceptor::before` authorises
-    /// each incoming call as an `Action::A2aSend`. The ledger behind a ceiling
-    /// may refuse where the ceiling refuses and nowhere else.
+    /// express, and it refused A2A calls the endpoint has to answer, inbound
+    /// ones included: `crate::a2a::GateInterceptor::before` authorises each
+    /// incoming call as an `Action::A2aSend`. The ledger behind a ceiling may
+    /// refuse where the ceiling refuses and nowhere else.
+    ///
+    /// **Counted, because the sentence here used to assert it.** It read "every
+    /// role pack in `docs/` ships `max_new_contacts_per_day: 0`", which no
+    /// version of this tree has been true of: `direction` and `growth` ship `0`,
+    /// `sales-development` and `finance` ship `5`, `customer-success` ships
+    /// `20`, `docs/orizn-ceiling.json` ships `20`. Two packs closed the endpoint
+    /// outright; on the other three it closed the moment the day's email had
+    /// spent the budget, which is the harder failure to attribute.
     ///
     /// A payment is not an approach and never charges, and neither does a browse
     /// or a message to a colleague: [`Self::contacts`] reports `New` for an
@@ -2072,9 +2079,10 @@ mod tests {
     ///
     /// It is not a hypothetical path. `a2a::GateInterceptor::before` authorises
     /// every **inbound** call as `Action::A2aSend { peer }`, so on a policy that
-    /// grants peers and no cold outreach — which is every role pack in `docs/`,
-    /// all of which ship `max_new_contacts_per_day: 0` — the whole A2A endpoint
-    /// answers `unsupported_operation` to everybody.
+    /// grants peers and no cold outreach — `docs/orizn-roles/direction.json` and
+    /// `growth.json` — the whole A2A endpoint answers `unsupported_operation` to
+    /// everybody, and on the three packs that ship a non-zero budget it starts
+    /// doing so partway through the day. Both halves are covered below.
     #[tokio::test]
     async fn a_peer_call_is_not_a_cold_approach_and_does_not_need_the_budget() {
         let Some(db) = db().await else { return };

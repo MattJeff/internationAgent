@@ -149,10 +149,18 @@ Delivery is **at-least-once**, knowingly. Handlers must be idempotent.
 - **S3-compatible object storage — NOT BUILT.** Attachment bytes go to
   `InMemoryBlobs` (`crates/app/src/inbound.rs`) and do not survive a restart.
   The whole durable state of this system is Postgres.
-- **OpenTelemetry — NOT BUILT.** No `opentelemetry` dependency anywhere. A W3C
-  `traceparent` *is* carried, in the outbox payload under
-  `outbox::TRACEPARENT_KEY`, so it survives every hop without the schema
-  knowing about tracing.
+- **OpenTelemetry — NOT BUILT.** No `opentelemetry` dependency anywhere, and no
+  request handler extracts a `traceparent` header. The outbox has a *slot* for
+  one — `NewEvent::traceparent`, written into the payload under
+  `outbox::TRACEPARENT_KEY` — so a trace would survive every hop without the
+  schema knowing about tracing. Nothing fills it: `traceparent` is `Some` at two
+  call sites in the workspace, both inside `agentos_store::outbox`'s own test
+  module. This line used to say a traceparent "*is* carried", and the
+  provisioning loop read it back out of `outbox_events` on the strength of that
+  sentence — one sequential scan of the whole table per claimed row, five times
+  a second, for a column that is `NULL` on every deployment. See the
+  `# traceparent, and why there is none` section of
+  `apps/server/src/loops/provisioning.rs`.
 
 ### Workers
 
