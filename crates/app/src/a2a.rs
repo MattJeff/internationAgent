@@ -668,12 +668,22 @@ impl A2aExecutor {
         self.store.list(req).await
     }
 
-    // ponytail: no `cancel_task`. `send_message` runs the turn synchronously,
-    // so by the time a peer could call `CancelTask` there is nothing left to
-    // interrupt, and a method that flips a row to `TASK_STATE_CANCELED` while
-    // the work happens anyway is a lie with a return type. It becomes real the
-    // day the runtime moves to a background worker: a state write plus a
-    // `CancellationToken`, which `turn::Turn::run` already takes.
+    // ponytail: no `cancel_task`. *This* `send_message` runs the turn
+    // synchronously — `self.runtime.respond` is awaited inline between the two
+    // `store.update` calls above — so by the time a peer could call
+    // `CancelTask` there is nothing left to interrupt, and a method that flips
+    // a row to `TASK_STATE_CANCELED` while the work happens anyway is a lie
+    // with a return type.
+    //
+    // **The day the note names has arrived, on the other implementation.** This
+    // executor has no production caller: `apps/server/src/routes/a2a.rs` speaks
+    // the JSON-RPC methods directly, and its `send_message` writes
+    // `TASK_STATE_SUBMITTED` and stops — the model has not run. So the served
+    // endpoint's absent `CancelTask` is *not* covered by the paragraph above,
+    // and that route's own comment copies this sentence onto a world where the
+    // work is deferred. What a real cancel needs there is what this note
+    // predicted: a state write plus a `CancellationToken`, which
+    // `turn::Turn::run` already takes.
 }
 
 /// Every text part of a message, joined. Non-text parts (files, structured

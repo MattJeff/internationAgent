@@ -762,6 +762,26 @@ pub async fn push(
 /// here also means the export and the reconcile cannot get out of order,
 /// because there is only one order.
 ///
+/// # …except that on the shipped configuration it runs nowhere
+///
+/// The dilemma above has two branches, route or cadence, and the deployment is
+/// on a third: `routes::queue`'s call site is guarded by
+/// `policy::may_upload_leads`, which its own comment says is "false on every
+/// shipped document". So the CSV a founder uploads by hand today is built
+/// against a `suppressions` table that has never been reconciled with the
+/// platform — which is the harm the paragraph above was written to prevent,
+/// arriving through the branch it did not consider.
+///
+/// The guard is defensible and the conflation is not: the question the argument
+/// needs is "is a real lead platform configured", because with none there is
+/// nobody to ask and asking the mock invents an answer. The question the code
+/// asks is "may this employee upload leads", which is a *policy* answer about a
+/// different thing. Nothing can currently tell the two apart —
+/// `crate::mocks::ports_for` hands out a `MockLeadSink` unconditionally and has
+/// no credential field to select on — so the fix is a real
+/// [`LeadSink`](agentos_providers::leads::LeadSink) and its configuration
+/// check, not a wider `if` here.
+///
 /// The read happens **outside** any transaction and the writes inside one: a
 /// database transaction must not be held open across a call to a third party.
 /// A platform that will not answer fails the whole pull rather than exporting

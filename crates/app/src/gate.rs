@@ -484,9 +484,14 @@ impl PolicyGate {
     /// call.
     ///
     /// The policy is deliberately not re-evaluated: it already said "ask a
-    /// human", and asking it again would only ask again. The two things that
-    /// *are* re-checked are the ones a human decision cannot substitute for —
-    /// the employee is still active, and the ledger still has the headroom.
+    /// human", and asking it again would only ask again. The things that *are*
+    /// re-checked are the ones a human decision cannot substitute for, and
+    /// there are **three**: the company has not been stopped, the employee is
+    /// still active, and the ledger still has the headroom. The halt is the one
+    /// this sentence used to miss — it was written before `waveJ-j2` put the
+    /// arm below in, and the item it left out is the one with the widest blast
+    /// radius. A list in a doc comment is a list that has to be re-counted
+    /// every time the code below it grows an arm.
     pub async fn redeem_approval<A: Authorizable>(
         &self,
         principal: &Principal,
@@ -643,8 +648,20 @@ impl PolicyGate {
             }
         };
 
-        // 3. Context, from state, inside this transaction.
-        let (new_contacts_today, contact) = self.contacts(tx, principal, action, now).await?;
+        // 3. Context, from state, inside this transaction. Each read is asked
+        //    only for the actions whose arm of `evaluate` can use the answer —
+        //    the ledger for a payment, the roster for a charter, and now the
+        //    trail for the four channel sends, which is the same predicate
+        //    `take_contact` charges on.
+        let (new_contacts_today, contact) = if spends_contact_budget(action) {
+            self.contacts(tx, principal, action, now).await?
+        } else {
+            // The *refusing* value, not the free one. `channel_rules` denies on
+            // `New && new_contacts_today >= max`, so if `spends_contact_budget`
+            // ever drifts from `evaluate` this fails closed and loudly instead
+            // of handing an unmeasured arm a budget it never spent.
+            (u32::MAX, ContactStanding::New)
+        };
         let spent_today = match action {
             Action::PaymentCreate { amount } => {
                 self.spent_today(tx, principal, amount.currency(), now)
@@ -744,11 +761,42 @@ impl PolicyGate {
     /// carries its counterparty in the payload, so "first seen today" is a
     /// `min(occurred_at)` away.
     ///
-    /// ponytail: aggregates the whole trail for this employee on every
-    /// decision. Correct, and O(rows since the employee was hired). The
-    /// upgrade is a `contacts (tenant_id, employee_id, counterparty,
-    /// first_seen_at)` table maintained by this same function — do it when the
-    /// trail outgrows the index, not before.
+    /// ponytail: aggregates the whole trail for this employee, and there is no
+    /// index it can ride. `audit_log` carries `audit_log_tenant_time_idx`
+    /// (`tenant_id, occurred_at`) and `audit_log_denials_idx`, which is partial
+    /// on `decision = 'deny'` — the wrong half of the only predicate this
+    /// statement has. Re-measured on PostgreSQL 17, median of three, one
+    /// employee's allowed rows, `EXPLAIN` confirming a Seq Scan at every size:
+    ///
+    /// ```text
+    /// trail rows   this statement
+    /// -----------------------------
+    ///      1 000      3.4 ms
+    ///     10 000     11.6 ms
+    ///     50 000     48.9 ms
+    ///    100 000     58.8 ms
+    ///    500 000    310.3 ms
+    /// ```
+    ///
+    /// **The upgrade this note used to name was the wrong one.** It said "a
+    /// `contacts (tenant_id, employee_id, counterparty, first_seen_at)` table,
+    /// when the trail outgrows the index" — a dilemma with two branches, keep
+    /// the aggregate or materialise it, written when every decision needed the
+    /// number. `spends_contact_budget` is the third branch and it arrived on
+    /// 2026-08-28 with waveV-v3: eleven of the fifteen action kinds — every
+    /// `A2aSend`, every `McpCall`, every browse, every payment, every message
+    /// to a colleague — have an arm of `evaluate` that provably cannot read
+    /// `new_contacts_today`, and `policy`'s own
+    /// `the_contact_budget_charges_exactly_the_arms_the_ceiling_rules_on` is
+    /// what proves it, by running the real evaluator twice rather than by
+    /// re-reading the list.
+    /// v3 used the predicate to narrow the *write* and left the *read* wide, so
+    /// the table above was being paid on the eleven arms that throw the answer
+    /// away. `decide` now asks the predicate first; the aggregate runs on the
+    /// four channel sends and nowhere else.
+    ///
+    /// Materialising it is still the upgrade for those four, the day the trail
+    /// of an employee that really does send mail outgrows the numbers above.
     async fn contacts(
         &self,
         tx: &mut TenantTx<'_>,
@@ -863,8 +911,16 @@ impl PolicyGate {
     /// [`Self::redeem`] re-takes the spend headroom and not this, because there
     /// is nothing to take: `evaluate` answers `RequireApproval` only for
     /// payments, contract signatures, credential changes, bulk erasure and
-    /// charters, and [`counterparty`] is `None` for every one of them. A
-    /// redeemed approval cannot write a row this budget counts.
+    /// charters, and [`spends_contact_budget`] is `false` for every one of
+    /// them. A redeemed approval cannot write a row this budget counts.
+    ///
+    /// **The predicate named here used to be [`counterparty`], and that is now
+    /// the wrong one to check.** The two deliberately disagree —
+    /// [`Action::A2aSend`] has a counterparty and does not spend this budget —
+    /// and the guard below asks `spends_contact_budget`, which is the question
+    /// `evaluate` actually answers. The conclusion is unchanged; a reader who
+    /// adds an approval-gated channel send has to re-check the live predicate,
+    /// not the retired one.
     async fn take_contact(
         &self,
         tx: &mut TenantTx<'_>,

@@ -57,16 +57,23 @@
 //!
 //! # What is deliberately not here: the CDP socket
 //!
-//! Driving the DOM means speaking CDP over a websocket, and this crate has no
-//! websocket client. The seam is [`CdpDriver`]: the adapter owns the
+//! Driving the DOM means speaking CDP over a websocket, and none of that is in
+//! *this file*. The seam is [`CdpDriver`]: the adapter owns the
 //! Browserbase-shaped work (contexts, session lifecycle, secret hygiene) and
 //! hands the verbatim connect URL to whoever owns the socket. Building
 //! `Page.navigate` frames is Chrome knowledge, not Browserbase knowledge, and
 //! belongs next to the socket that ships them.
 //!
-//! ponytail: one trait, one method, no in-tree implementation — a websocket
-//! dependency is not on the table for this crate today. Delete [`CdpDriver`]
-//! and inline a client the day one is.
+//! ponytail: one trait, one method — and the implementation is
+//! [`crate::cdp::CdpWebsocket`], in this crate, over `tokio_tungstenite`.
+//!
+//! This note used to read "no in-tree implementation — a websocket dependency
+//! is not on the table for this crate today. Delete [`CdpDriver`] and inline a
+//! client the day one is." All three claims were overtaken the same afternoon
+//! they were written, by the commit that added `cdp.rs`, and the instruction
+//! is the wrong way round: the seam earned its keep rather than expiring.
+//! `crate::mocks`' real adapter is handed a `CdpWebsocket` unconditionally, so
+//! the trait's job now is the file split, not the missing client.
 
 use std::sync::Arc;
 use std::time::Duration;

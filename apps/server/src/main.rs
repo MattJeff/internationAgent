@@ -482,16 +482,26 @@ async fn drain_loops(loops: Vec<(&'static str, JoinHandle<()>)>, deadline: Durat
 /// * **inside `with_api_stack`** — everything a *customer* calls. Auth, then
 ///   the per-tenant rate limit, then idempotency.
 /// * **outside it, inside `with_outer_stack`** — everything a *stranger*
-///   calls: provider webhooks, which carry a signature instead of an API key,
-///   and the A2A agent card, which is the document a peer fetches before it
-///   has anything at all. They still get a request id, a trace, the body limit
+///   calls: provider webhooks, which carry a signature instead of an API key;
+///   the A2A agent card, which is the document a peer fetches before it has
+///   anything at all; the OAuth callback, which a *browser* is redirected to
+///   holding no key; and the key directory a verifier fetches to check a
+///   signature of ours. They still get a request id, a trace, the body limit
 ///   and the timeout.
 ///
 /// ponytail: the rate limiter is *not* on that second tier, and cannot be —
 /// it is keyed on the tenant from the credential, and there is no credential
-/// there. Both routes are one INSERT or one SELECT behind a hard body cap; a
-/// per-source limit belongs at the ingress proxy, which is also the only thing
-/// that can see the real client address.
+/// there. Every route on it is one INSERT or one indexed lookup behind a hard
+/// body cap; a per-source limit belongs at the ingress proxy, which is also the
+/// only thing that can see the real client address.
+///
+/// This used to say "both routes", and the tier grew to four while the sentence
+/// stayed at two. The bound is what the sentence is really claiming, so it is
+/// now stated as a bound rather than as a count — `routes::webhooks` costs one
+/// primary-key lookup on an unregistered path, `routes::mcp::public_router`
+/// costs one lookup on the `state` parameter and 404s on everything else, and
+/// the two documents are selects. A route that cannot say that about itself
+/// does not belong here.
 /// Everything the model-connection route needs, and nothing any other route
 /// does.
 ///

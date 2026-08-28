@@ -1693,10 +1693,22 @@ fn rfq_letter(objective: &rolepack::Objective, reference: Uuid) -> sourcing::Out
 /// the alternative is comparing the same fortnight-old quotes forever. It does
 /// mean a supplier mid-conversation on day 14 is dropped mid-conversation.
 ///
-// ponytail: nothing drives `negotiations` in production yet, so there is no
-// conversation to be mid. When something does, the close wants a "extend rather
+// ponytail: no production caller advances a thread past round zero, so there is
+// no conversation to be mid. When one does, the close wants a "extend rather
 // than end a round with a live thread on it" clause, keyed on that table — not
 // a longer constant.
+//
+// **This used to read "nothing drives `negotiations` in production yet", and
+// that has been false since the loop was wired.** `loops::initiative` calls
+// `purchasing_turn`, which calls `sourcing_store::record_rfq_recipients`, which
+// opens one `negotiations` row per recipient — and `close_expired_rounds`, the
+// statement two lines below this comment, is a production *reader* of the same
+// table. What is still true is the narrower thing: `record_round` and
+// `negotiations_awaiting_reply` have callers only in `store::sourcing`'s own
+// tests, so every live row sits at `awaiting_supplier`, round zero, with
+// nothing in flight. The conclusion survived its premise, which is the whole
+// reason to state the premise this precisely: the trigger is a caller of
+// `record_round`, not the first row in the table.
 async fn close_due_rounds(
     db: &Db,
     principal: &Principal,
