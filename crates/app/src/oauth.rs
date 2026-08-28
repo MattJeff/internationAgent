@@ -647,6 +647,24 @@ const SELECT_DUE: &str = "\
 /// caller commits — this writes, which is why it cannot share the read-only
 /// transaction `Fleet::bind` runs in.
 ///
+/// # `catalog` is a parameter, and it is what makes this loop testable at all
+///
+/// The lookup below used to be [`catalog::find`], which reads the `const`
+/// [`CATALOG`](catalog::CATALOG). Every OAuth entry in it points at somebody
+/// else's authorization server through a `&'static str` https literal, so the
+/// only way to run this function end to end was to reach one — and a test that
+/// reaches a real provider is a test nobody runs. Everything on the far side of
+/// the lookup was therefore proved one link at a time, by tests that call
+/// [`refresh_one`] and then [`park_refresh`] **by hand, in that order**: the
+/// loop body written a second time, next to a loop nothing ran.
+///
+/// [`catalog::find_in`] already existed for exactly this, with the argument
+/// written on it: `apps/server`'s routes thread the array through for the same
+/// reason and at four call sites. This is the fifth. **There is no branch here
+/// that behaves differently for one catalogue than for another** — the shipped
+/// wiring passes `catalog::CATALOG` in one place, and a test passes a one-entry
+/// slice whose token endpoint is a loopback port.
+///
 /// ponytail: the SQL is here rather than in `agentos-store`, the same call
 /// `mcp::Fleet::bind` makes two hundred lines away and for the same reason —
 /// there is one caller. Move both the day there is a second.
@@ -654,6 +672,7 @@ pub async fn refresh_due(
     tx: &mut TenantTx<'_>,
     credentials: &Credentials,
     clients: &OauthClients,
+    catalog: &'static [Connector],
     now: DateTime<Utc>,
 ) -> usize {
     let tenant_id = tx.tenant_id();
@@ -673,7 +692,7 @@ pub async fn refresh_due(
         let Ok(server) = Slug::parse(&row.server) else {
             continue;
         };
-        let Some(connector) = catalog::find(&row.connector) else {
+        let Some(connector) = catalog::find_in(catalog, &row.connector) else {
             tracing::warn!(
                 %tenant_id,
                 server = server.as_str(),
@@ -2113,6 +2132,127 @@ mod tests {
         );
     }
 
+    /// The `for` inside [`refresh_due`], which nothing had ever run.
+    ///
+    /// Every link it chains is proved on its own above — the classification by
+    /// `a_refused_grant_and_an_overloaded_server_are_not_the_same_answer`, the
+    /// park and the disappearance by the two tests before this one, the
+    /// predicate by [`OauthError::needs_a_human`]'s own asserts. And each of
+    /// those tests calls [`refresh_one`] and then [`park_refresh`] **by hand, in
+    /// that order**, which is this loop's body written a second time. What no
+    /// test ran is the loop's own judgement: *which* of the two failures gets
+    /// the park, and what the count it returns means afterwards.
+    ///
+    /// **Two bindings, opposite answers, one tick.** A test with only the
+    /// refused one passes against a loop that parks unconditionally, and a test
+    /// with only the outage passes against a loop that never parks. Neither
+    /// half is a test of a branch; both together are.
+    ///
+    /// Three claims, and each is a different production failure:
+    ///
+    /// * the refused binding falls out of the selection — otherwise a dead
+    ///   credential is presented to somebody else's authorization server every
+    ///   five minutes forever;
+    /// * the outage binding stays in it, with the token it could not use —
+    ///   otherwise a provider's bad minute costs every customer on it a trip
+    ///   back through a consent screen;
+    /// * the count is 1 and not 0 or 2. `routes::mcp::refresh_tokens` commits on
+    ///   the strength of what that number means: a park is a write, an outage is
+    ///   not, and a count that missed the park had the loop rolling it back on
+    ///   every tick.
+    #[tokio::test]
+    async fn one_tick_parks_the_dead_credential_and_leaves_the_outage_alone() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the oauth refresh step needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // Two exchanges at seed time, then one refusal and one outage. The
+        // refreshes arrive in `SELECT_DUE`'s `ORDER BY server`, which is why the
+        // handles are named to sort that way.
+        let provider = FakeProvider::start(vec![
+            (
+                200,
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"access_token":"at-2","refresh_token":"rt-2","expires_in":3600}"#.to_owned(),
+            ),
+            (400, r#"{"error":"invalid_grant"}"#.to_owned()),
+            (503, "overloaded".to_owned()),
+        ])
+        .await;
+        let connector = connector_for(&provider, ClientAuth::Post);
+        // The catalogue the loop resolves against. A token endpoint on a
+        // loopback port will never be in `CATALOG`, which is the whole reason
+        // `refresh_due` takes this rather than reading the `const`.
+        let catalog: &'static [Connector] = std::slice::from_ref(connector);
+        let (creds, clients, tenant) = (credentials(), clients(), tenant());
+        let dead = Slug::parse("fake-dead").expect("slug");
+        let outage = Slug::parse("fake-outage").expect("slug");
+        let now = seed_binding(&db, &provider, connector, &creds, &clients, tenant, &dead).await;
+        seed_binding(&db, &provider, connector, &creds, &clients, tenant, &outage).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert_eq!(
+            due(&mut tx, now).await.expect("select").len(),
+            2,
+            "both bindings are inside the margin, or this tick proves nothing"
+        );
+        let written = refresh_due(&mut tx, &creds, &clients, catalog, now).await;
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            written, 1,
+            "the park is a write and the failed refresh is not — this is the number \
+             `refresh_tokens` decided to stop branching on, and it has to mean what it says"
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let still_due: Vec<String> = due(&mut tx, now)
+            .await
+            .expect("select")
+            .into_iter()
+            .map(|row| row.server)
+            .collect();
+        assert_eq!(
+            still_due,
+            vec![outage.as_str().to_owned()],
+            "the loop parks the refused binding and only the refused one: a 400 is a credential \
+             that will never work again, a 503 is a provider having a bad minute, and the two \
+             cost opposite things when they are confused"
+        );
+
+        let refresh: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT sealed_refresh_token FROM mcp_servers WHERE server = $1")
+                .bind(outage.as_str())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            creds
+                .open_as(
+                    tenant,
+                    &refresh_context(tenant, &outage),
+                    &refresh.expect("still stored")
+                )
+                .expect("open")
+                .expose_for_transport(),
+            "rt-2",
+            "an outage leaves the very token it could not spend"
+        );
+
+        assert_eq!(
+            provider.seen().len(),
+            4,
+            "two exchanges and exactly one presentation each — a tick does not retry inside itself"
+        );
+    }
+
     /// A tenant, a binding seeded through the real callback path, and a
     /// `token_expires_at` inside [`REFRESH_MARGIN`]. Returns `now`.
     ///
@@ -2131,13 +2271,18 @@ mod tests {
         tenant: TenantId,
         server: &Slug,
     ) -> DateTime<Utc> {
+        // `DO NOTHING`, so this can be called twice for the same tenant and
+        // seed a **second** binding. The slug is derived from the id, so the
+        // only conflict it can swallow is this same row.
         let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
-        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
-            .bind(tenant.as_uuid())
-            .bind(format!("oauth-{}", tenant.as_uuid().simple()))
-            .execute(&mut *admin)
-            .await
-            .expect("tenant");
+        sqlx::query(
+            "INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant.as_uuid())
+        .bind(format!("oauth-{}", tenant.as_uuid().simple()))
+        .execute(&mut *admin)
+        .await
+        .expect("tenant");
         admin.commit().await.expect("commit");
 
         let now = Utc::now();

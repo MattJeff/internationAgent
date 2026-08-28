@@ -415,6 +415,36 @@ async fn stand_up(db: Db, passes: usize) -> Company {
     // The provisioning loop's work, in this process: converge every resource,
     // then draft → active. An employee the gate refuses every action for is a
     // row, not a seat.
+    //
+    // # The stop is not on this path, and that is not a hole
+    //
+    // `converge` is called directly, so `loops::provisioning`'s `CLAIM_SQL` —
+    // and with it `not_stopped!`, the company halt and the operating window —
+    // never runs here. Somebody will notice that and ask whether a dry run
+    // provisions a company an operator stopped. Three independent answers, and
+    // the first is the one that settles it:
+    //
+    // * **There is no stopped company to skip.** This function does not take a
+    //   company, it *builds* the one it measures: the tenant id is minted at
+    //   the top of this function and the row created at step 3, in a database
+    //   this module refuses to share (`EMPTY_DATABASE`), and nothing writes
+    //   `company_halts` or `company_windows`. A dry run cannot be pointed at a
+    //   halted tenant the way the loop can.
+    // * **Nothing is bought.** These eleven steps call `mocks::adapters`, so a
+    //   converge that ran for a stopped company would spend nothing, reach
+    //   nobody, and hold no resource anyone is billed for.
+    // * **The stop still bites where it decides anything.** `PolicyGate` reads
+    //   `halt::halted` before any policy and `model_access::connected` reads it
+    //   before a turn is reserved — every turn `take_turn` takes goes through
+    //   both. A halt thrown while a dry run is in flight stops the actions and
+    //   the model calls, which is the half of a dry run that costs money.
+    //
+    // And it could not simply be moved into `converge` either: `CLAIM_SQL`
+    // exempts the lapsed-lease row from the stop on purpose, because `converge`
+    // is the only thing in this workspace that closes an orphaned provider
+    // intent. A halt check inside the engine would strand exactly the row that
+    // exemption exists to rescue. The stop belongs to the claim, and the claim
+    // is what a dry run deliberately stands in for.
     let engine = ProvisioningEngine::new(
         db.clone(),
         mocks::adapters(MASTER_KEY),

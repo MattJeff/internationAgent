@@ -39,7 +39,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use agentos_app::catalog::{ClientAuth, Connector, Credential, OAuth};
+use agentos_app::catalog::{self, ClientAuth, Connector, Credential, OAuth};
 use agentos_app::mcp::{Credentials, Reach, RiskClass};
 use agentos_app::oauth::{Claimed, OauthClients, complete, refresh_due, start, state_hash};
 use agentos_domain::ids::{Slug, TenantId};
@@ -361,8 +361,12 @@ async fn no_part_of_a_flow_is_findable_after_it_completes() {
     // that takes a pasted bearer — so `refresh_due` selects the row and then
     // refuses it. That is the branch worth searching: an error path is where a
     // token gets logged "just this once, for debugging".
+    //
+    // The shipped catalogue, deliberately: this test is about what a *real*
+    // entry does on the failure path, so handing it a fixture would be handing
+    // it a different question.
     let mut tx = db.tenant_tx(tenant_id).await.expect("tenant tx");
-    let refreshed = refresh_due(&mut tx, &credentials, &clients, now).await;
+    let refreshed = refresh_due(&mut tx, &credentials, &clients, catalog::CATALOG, now).await;
     tx.rollback().await.expect("rollback");
     assert_eq!(
         refreshed, 0,

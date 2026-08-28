@@ -614,6 +614,19 @@ pub enum DenyReason {
 
 impl DenyReason {
     /// Stable, low-cardinality metric label.
+    ///
+    /// # If the compiler sent you here, [`ALL`](Self::ALL) is owed an entry too
+    ///
+    /// This match and [`grantable`](Self::grantable) are the only two places a
+    /// new variant fails the build — measured over `--workspace --all-targets`,
+    /// and nothing outside this file matches this enum exhaustively at all —
+    /// and neither of them touches `ALL`. A variant that
+    /// answers both and is left out of `ALL` compiles clean, and every rule
+    /// proved "total over the enum" by iterating `ALL` — [`Self::GRANTABLE`],
+    /// `reason_codes_are_stable_and_unique` — is then total over a list with a
+    /// hole in it, silently. `agentos_providers::ProviderError::ALL` carries the
+    /// identical residual and its docs carry the argument for why stable Rust
+    /// has nothing better; this is the same note at the same door.
     pub const fn code(self) -> &'static str {
         match self {
             DenyReason::NoRule => "no_rule",
