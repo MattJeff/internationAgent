@@ -1425,10 +1425,15 @@ mod tests {
                 .await
                 .expect("backend pid");
             ready.wait().await;
-            // Into the other replica's scan rather than alongside its snapshot:
+            // Into the other replica's scan rather than alongside its snapshot.
+            // The barrier releases both sides at once, and coming off it dead
             // level, this one can reach `due` first, and then it is the *other*
             // one that meets a lock still held — which is the case the test
-            // above already covers.
+            // above already covers. The 3ms buys the interleaving only this
+            // test reaches: the first replica is already inside its `DISTINCT
+            // ON` over `COMPANIES × PADDING` rows, so this claim's snapshot is
+            // taken mid-statement and has to survive the other one committing
+            // underneath it.
             tokio::time::sleep(Duration::from_millis(3)).await;
             let second = claim_due(&mut tx, BATCH, at(NOW)).await.expect("claim");
             tx.commit().await.expect("commit second");

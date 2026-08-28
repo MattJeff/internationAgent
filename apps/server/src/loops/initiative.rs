@@ -1764,7 +1764,10 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Show
     let mut cut = Vec::new();
     let lines = |heading: &str, kind: &str, items: Vec<Held>, cut: &mut Vec<String>| {
         let heading = heading.to_owned();
-        if let Some(note) = cut_note(kind, items.len()) {
+        // Both board lists come back in `store::backlog`'s `ORDER`, which is
+        // the founder's own ranking; see this function's docs for why the
+        // diary next door says something else.
+        if let Some(note) = cut_note(kind, "in the order somebody ranked them", items.len()) {
             cut.push(note);
         }
         items
@@ -1882,12 +1885,24 @@ struct Shown {
 /// between this and a `LIMIT`: an employee shown twenty of twenty-two and one
 /// shown twenty of two hundred are in different situations, and only the second
 /// one should stop trusting the list to be the work.
-fn cut_note(kind: &str, total: usize) -> Option<String> {
+///
+/// **`order` is a parameter because the three lists are not sorted alike, and
+/// this sentence is said to a model.** It used to read "in the order somebody
+/// ranked them" for all three, which is true of the two board lists —
+/// `store::backlog`'s `ORDER` is the founder's own ranking — and false of the
+/// diary, which `store::calendar::upcoming` returns `ORDER BY at ASC, id ASC`.
+/// Nobody ranks an hour; it simply comes round. Telling a turn that a
+/// chronological list was ranked invites it to read the top of the list as
+/// somebody's priority and the tail as the part that was judged to matter
+/// least, and the tail of a diary is only the far future. A claim we make in
+/// our own voice has to be one we can defend, and the fix is to say which
+/// order it actually is.
+fn cut_note(kind: &str, order: &str, total: usize) -> Option<String> {
     (total > MAX_LINES).then(|| {
         format!(
-            "You are being shown the first {MAX_LINES} of {total} {kind}, in the order somebody \
-             ranked them; the other {} are real and you are not seeing them. Do not treat this \
-             list as everything there is, and do not conclude from it that anything is finished.",
+            "You are being shown the first {MAX_LINES} of {total} {kind}, {order}; the other {} \
+             are real and you are not seeing them. Do not treat this list as everything there \
+             is, and do not conclude from it that anything is finished.",
             total - MAX_LINES,
         )
     })
@@ -1930,7 +1945,7 @@ async fn diary(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Shown>
             return None;
         }
     };
-    let cut = cut_note("hours you have promised", promised.len());
+    let cut = cut_note("hours you have promised", "soonest first", promised.len());
     let lines = promised
         .into_iter()
         .take(MAX_LINES)

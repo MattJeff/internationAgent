@@ -59,6 +59,29 @@
 //! trigger, which refuses the same write even from a psql prompt, and neither is
 //! redundant: the trigger raises where this returns `false`, and a caller that
 //! wants to say "somebody already recorded that" needs the `false`.
+//!
+//! # The hole this module leaves open: a credit note has no author
+//!
+//! [`issue`] records the seat that raised the demand in `issued_by`.
+//! [`credit`] records nobody: the column is NULL on a credit note by
+//! construction — 0071's `invoices_issuer_or_correction` makes the two answers
+//! exclusive — and there is no second column naming the operator instead. So
+//! the register can say a demand was withdrawn, for how much and why, and
+//! cannot say **who** withdrew it.
+//!
+//! It is a gap in the audit trail and not in the arithmetic: the amount, the
+//! reason, the moment and the document corrected are all on the row, and
+//! `POST /v1/invoices/{id}/credit` still requires an operator key to reach
+//! [`credit`] at all — so *some* operator authorised it, and the separation of
+//! duties that route argues for is intact. What is missing is only **which**.
+//!
+//! And the identity is not unavailable, which is what makes this a hole rather
+//! than a constraint: the route has a `Principal` in hand and passes only its
+//! `tenant_id` down. Closing it is a column and a parameter, not a redesign.
+//! It is named here rather than half-answered with whichever seat happened to
+//! be nearby — writing a *seat* into `issued_by` on a credit note would make
+//! the row indistinguishable from an invoice, which is exactly what 0071's
+//! `invoices_issuer_or_correction` refuses.
 
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -1227,14 +1250,21 @@ mod tests {
     /// still be deleted.**
     ///
     /// `DELETE FROM tenants` now walks a self-referencing foreign key, a
-    /// counter row and a line table whose constraint trigger is *deferred* — so
-    /// that trigger fires at COMMIT, after the invoice it was going to check
-    /// has already gone. It answers correctly because both of its reads come
-    /// back NULL together, which the comparison in
-    /// `invoice_lines_total_the_document` calls an agreement. Nothing else in
-    /// this workspace covers it:
-    /// the fixtures that drop a tenant hold no invoices, and the tests that
-    /// hold invoices drop no tenant.
+    /// counter row and a line table. What this proves is the **cascade**: all
+    /// three go, and nothing blocks the statement.
+    ///
+    /// It proves nothing about `invoice_lines_total_the_document`, and an
+    /// earlier version of this comment claimed it did — that the deferred
+    /// trigger fired at COMMIT after the invoice had gone and answered
+    /// correctly because both its reads came back NULL together. `pg_trigger`
+    /// refutes that: `tgtype = 5` is ROW + AFTER + INSERT and nothing else, so
+    /// a DELETE fires this trigger **zero times**. There is no arm to
+    /// exercise, and that absence is *why* the cascade is free — not a
+    /// comparison that happens to agree.
+    ///
+    /// Nothing else in this workspace covers the cascade: the fixtures that
+    /// drop a tenant hold no invoices, and the tests that hold invoices drop
+    /// no tenant.
     #[tokio::test]
     async fn a_company_with_documents_can_still_be_deleted() {
         let Some(db) = db().await else { return };

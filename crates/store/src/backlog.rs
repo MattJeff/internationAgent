@@ -224,7 +224,14 @@ pub async fn open_for(
 /// bound is a fact about what a *prompt* may cost, not about what a board holds:
 /// at `agentos_eval::scoping::tokens` a line of this list is 16–39 tokens, of
 /// which 15 are the bullet and the uuid before the founder has typed a word.
-/// `GET /v1/work` reads the same rows onto a screen and must not be cut.
+///
+/// This function has exactly one reader — `agentos_app::backlog`, on the way to
+/// a brief — and no HTTP route calls it. A previous version of this sentence
+/// said `GET /v1/work` "reads the same rows onto a screen and must not be cut",
+/// and that was an argument for keeping the read whole which the route does not
+/// support: `GET /v1/work` calls [`board`], which is `SELECT … FROM work_items`
+/// with no `WHERE` at all. Different rows, different function. The reason to
+/// keep *this* read whole is the one above it and nothing else.
 ///
 /// Keeping the read whole is also what pays for the notice. A `LIMIT` returns
 /// twenty rows and no way to say there are two hundred, and a list that is

@@ -1,7 +1,7 @@
 //! Le calendrier: the port an employee's diary is reached through, and the one
 //! adapter behind it today.
 //!
-//! # Why this is a port and not three functions on `agentos_store::calendar`
+//! # Why this is a port and not free functions on `agentos_store::calendar`
 //!
 //! [`crate::backlog`]'s argument, and it is *stronger* here rather than merely
 //! repeated. A customer whose team already lives in Google Calendar must be able

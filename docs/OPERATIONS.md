@@ -1138,9 +1138,11 @@ is `tenant_tx`.
 The escape hatch is `Db::admin_tx_bypassing_rls`, named so it cannot appear in a
 diff unnoticed. This paragraph used to read "three legitimate callers:
 migrations, the outbox poller and the provisioning loop's claims", and it was
-wrong twice. There are **twenty-six outside tests**, counted — and *migrations
-was never one of them*: `Db::migrate` runs sqlx's migrator against the pool and
-opens no transaction at all.
+wrong twice. There are **many more outside tests** — and *migrations was never
+one of them*: `Db::migrate` runs sqlx's migrator against the pool and opens no
+transaction at all. The count that replaced the list is gone too, for the reason
+the end of this section gives: three readers counting on three different days
+got three different numbers, which is what a number in a document does.
 
 What is legitimate is a **shape**, not a list, which is why the list kept going
 stale while the shape never did:
