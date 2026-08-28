@@ -139,9 +139,12 @@ pub async fn fetch(tx: &mut TenantTx<'_>, name: &str) -> Result<Content, StoreEr
 /// have we just been sent", and a name is what you use when you already know it.
 ///
 /// ponytail: no `LIMIT` and no pagination, the same open question
-/// [`crate::calendar::diary`] leaves. A classeur a founder fills by hand is a
-/// human-scale set; the place for the answer is the `LIMIT` this read does not
-/// have.
+/// [`crate::calendar::diary`] leaves — **and its premise has since changed.**
+/// This note said a classeur a founder fills by hand is a human-scale set, and
+/// that was true while an operator key was the only writer. `ingest_email` now
+/// files every inbound attachment here, so the size of this set is chosen by
+/// whoever writes to us. The `LIMIT` this read does not have stopped being a
+/// tidiness question and became a real one.
 pub async fn index(tx: &mut TenantTx<'_>) -> Result<Vec<Filed>, StoreError> {
     let rows = sqlx::query(
         "SELECT name, content_type, octet_length(content)::bigint AS size, digest, created_at \

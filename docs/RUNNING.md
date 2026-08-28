@@ -245,18 +245,37 @@ before the deploy. Mail that arrives after it lands in a table.
 * A database failure during the deposit that heals within milliseconds loses
   that one attachment permanently. One that does not heal costs nothing, because
   the landing transaction fails too and the whole job retries.
+* **Four CHECKs are reachable by a stranger, not one.** `files_content_size` is
+  `between 1 and 1048576`, so a **zero-byte attachment is refused and lost** —
+  and an empty part is a thing mail clients really send. `files_name_shape` and
+  `files_content_type_shape` each cap at 200 characters and reject control
+  characters, while the provider-supplied id and content type they are built
+  from are unbounded `String`s. Each of the four ends the same way: a
+  `tracing::warn!` and no state column. That is also why pre-validating in Rust
+  was refused — it would be four SQL constraints copied into another language,
+  with guaranteed drift.
 * An **employee** still cannot read an attachment. There is no `ActionKind` for
   it, deliberately — see `crates/app/src/files.rs`. Only an operator key can.
 
-**And the rewiring has a trap that has to be handled in the same change**, named
+**The rewiring had a trap, and it was handled in the same change.** Named
 by the agent that built `files` and repeated here because it is the kind of fix
 that quietly makes things worse: an attachment larger than the column's ceiling
 fails the CHECK, arrives as `StoreError::Database`, and
 `InboundError::is_retryable` calls that **retryable** — a message that can never
 land and a job that retries for ever. Today's path warns and continues, on
 purpose, because *losing an invoice is bad and losing the email that carried it
-is worse*. Preserving that means **classifying** the store failure, not
-propagating it.
+is worse*. Preserving that meant **classifying** the store failure rather than
+propagating it, and the mutation that proves it restores the propagation and
+watches a message vanish on `violates check constraint "files_content_size"`.
+
+**And one premise changed underneath 0067 when this landed.** That migration
+argued its refusal of `DELETE` — and of `UPDATE` — about a cabinet an operator
+fills by hand, where erasure is lawful, rare, identified, and decided by a
+person at a psql prompt. `files` now takes bytes from unauthenticated third
+parties, so the set is sized and named by whoever writes to us. The refusal is
+still right, and for the same reason — an UPDATE on `content` would swap a
+contract while leaving a row that looks untouched — but the erasure question is
+no longer hypothetical, and neither is the missing `LIMIT` on `GET /v1/files`.
 
 ## The five internal tools, and where each one stands
 

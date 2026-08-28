@@ -68,7 +68,12 @@
 //! row", and there are now two kinds of writer — this route, and the inbound
 //! loop. The conclusion survives because **the name already answers it**.
 //! Anything under `inbound/` was deposited by `ingest_email` and nothing else
-//! can write that prefix; anything else came through here. A column would be a
+//! writes that prefix **by convention and not by enforcement** — nothing in
+//! `deposit` refuses a caller-supplied name beginning `inbound/`, and the
+//! argument for having no `deposited_by` column leans on that convention
+//! rather than on a guard. The guard is one line in `deposit` the day the
+//! convention is worth enforcing. Anything outside the prefix came through
+//! here. A column would be a
 //! second answer to a question the primary key already answers, which is the
 //! shape `0067` refuses for a uuid beside the name. The inbound half is
 //! attributable further than a column would reach anyway:
