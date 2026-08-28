@@ -48,10 +48,14 @@
 //! **widens** — an adapter author under deadline writes the convenient value,
 //! and a customer's Jira service desk, which anybody with a portal login can
 //! file into, becomes a channel that writes instructions straight into an
-//! employee's brief. The one adapter here is our own table, whose only writer is
-//! an operator holding an API key, and even *that* one wraps: the moment a
-//! second writer exists the wrapper is already where it needs to be, rather than
-//! being a change somebody has to remember.
+//! employee's brief. The one adapter here is our own table, and it wrapped from
+//! the first day — when its only writer was an operator holding an API key and
+//! the wrapper looked like ceremony. **That second writer now exists**
+//! ([`Effects::post_work`](crate::effects::Effects::post_work)), so an
+//! employee's own words reach a colleague's brief through here, and the wrapper
+//! was already where it needed to be rather than being a change somebody had to
+//! remember. That is the whole of what writing it early bought, and it is worth
+//! saying now that the bill has arrived.
 //!
 //! The price is real and is named where it is paid, in
 //! `apps/server/src/loops/initiative.rs`: a turn shown its board is an untrusted
@@ -100,17 +104,43 @@ pub enum BacklogError {
 
 /// A board an employee puts work on and takes work off.
 ///
-/// Two methods, which is what the three failures `migrations/0061_work_items.sql`
-/// names need and no more.
+/// **Five methods, and they are one loop rather than five conveniences**: write
+/// it down, see what is yours, see what is nobody's, take one, say it is done.
+/// This started at two — the three failures `migrations/0061_work_items.sql`
+/// names needed no more while the founder was the only writer and the employee
+/// only read. The other three are what "an agent decides, another agent picks it
+/// up and finishes it" costs, and no fewer: drop `unclaimed` and there is
+/// nothing to pick up, drop `claim` and two employees do it twice, drop `close`
+/// and the loop never ends.
+///
+/// Every one of them is a verb a connected board already has an answer for —
+/// create an issue, my issues, unassigned issues, assign to me, transition to
+/// done — which is the bar the module docs set for a method being on the port at
+/// all. Ranking is still not here, for the same reason it never was.
 #[async_trait]
 pub trait Backlog: Send + Sync {
     /// Write one item down.
     ///
     /// `assignee` is `None` for an item nobody has been given yet.
+    ///
+    /// `author` is `None` for an operator writing through `POST /v1/work`, and
+    /// `Some` for an employee filing through
+    /// [`Effects::post_work`](crate::effects::Effects::post_work). It is a
+    /// parameter rather than a constructor field because the two writers share
+    /// one board and differ per call, and it is on the trait rather than on
+    /// [`PgBacklog`] alone because a board with two classes of writer has the
+    /// question whatever system it runs on — an adapter that cannot record it
+    /// drops it, and that lost fidelity is a fact about the customer's Jira and
+    /// not a hole in ours.
+    ///
+    /// **Not an authority.** Nothing anywhere reads this to decide anything;
+    /// who may file for whom is settled before this is called, against the org
+    /// chart as it is at that instant. See `migrations/0064`.
     async fn post(
         &self,
         title: &str,
         assignee: Option<EmployeeId>,
+        author: Option<EmployeeId>,
     ) -> Result<WorkItemId, BacklogError>;
 
     /// What this seat still has to do, in the order the board holds them.
@@ -119,11 +149,98 @@ pub trait Backlog: Send + Sync {
     /// list and keep the titles — see the module docs for why that obligation is
     /// a type rather than a declaration.
     ///
-    /// No item id in the answer, and that is a decision rather than an
-    /// oversight: nothing can yet *close* an item from inside a turn, so an id
-    /// here would be a field with no reader. It grows one in the same change
-    /// that gives an employee a way to say "done".
-    async fn open_for(&self, assignee: EmployeeId) -> Result<Vec<Untrusted<String>>, BacklogError>;
+    /// **The id is here now**, and it arrived on the change this method's own
+    /// doc predicted: it said an id would be a field with no reader until an
+    /// employee could say "done", and [`Backlog::close`] is that. It is outside
+    /// the [`Untrusted`] wrapper because it is ours — a uuid this workspace
+    /// minted — while the title is the board's.
+    async fn open_for(&self, assignee: EmployeeId) -> Result<Vec<Held>, BacklogError>;
+
+    /// Open work nobody is holding, in the same order.
+    ///
+    /// Not scoped, and `agentos_store::backlog::unclaimed` carries the argument:
+    /// the only writer that can leave an item unheld is the founder's
+    /// `POST /v1/work`, so this is his undecided work and nobody else's, and a
+    /// team boundary here would be answering a question he declined to answer.
+    async fn unclaimed(&self) -> Result<Vec<Held>, BacklogError>;
+
+    /// Take one unheld item for this seat. `false` is somebody was faster.
+    ///
+    /// **No lease, no deadline.** See `agentos_store::backlog::claim`: nobody is
+    /// owed a work item the way somebody is owed a queued email, and a lease
+    /// whose duration nobody can name would hand a half-done job to a second
+    /// employee — the double-work claiming exists to prevent.
+    ///
+    /// A `bool` rather than an error, because losing a race is an *answer*: two
+    /// employees reached for one item, one has it, and the other should look at
+    /// the rest of the pool rather than retry.
+    async fn claim(&self, item: WorkItemId, who: EmployeeId) -> Result<bool, BacklogError>;
+
+    /// Say one item is done. `false` is "not yours", which is also what an item
+    /// that does not exist answers.
+    ///
+    /// The assignee only — a manager that filed the work may not sign it off,
+    /// and the founder who needs to has `PUT /v1/work/{id}`. One way only:
+    /// nothing here reopens.
+    async fn close(&self, item: WorkItemId, who: EmployeeId) -> Result<bool, BacklogError>;
+}
+
+/// What an employee does to an item that already exists.
+///
+/// Two variants and one type, rather than two methods on
+/// [`Effects`](crate::effects::Effects) and two rows in
+/// `turn::catalogue`, for [`Errand`](crate::inbound::Errand)'s reason: both take
+/// exactly one argument — which item — and differ only in the verb, so one
+/// schema with a closed enum costs a model one name to learn instead of two and
+/// costs every prompt one description instead of two. A wrong choice between
+/// them is not dangerous either: `claim` refuses anything already held and
+/// `close` refuses anything not this employee's, so the two cannot be confused
+/// into an effect nobody wanted.
+///
+/// There is deliberately no `Unclaim` and no `Reopen`. Giving work back would
+/// let an employee push its own load into every colleague's brief, which is the
+/// flooding the org-chart guard on filing exists to bound; reopening would let a
+/// model argue with the founder about whether something was finished. Both are
+/// `PUT /v1/work/{id}` and both are his.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkAction {
+    /// Take an item nobody is holding.
+    Claim,
+    /// Say an item of this employee's own is done.
+    Close,
+}
+
+impl WorkAction {
+    /// The word the model writes, and the only two it may.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Close => "close",
+        }
+    }
+
+    /// The model's word, parsed. `None` is anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "claim" => Some(Self::Claim),
+            "close" => Some(Self::Close),
+            _ => None,
+        }
+    }
+}
+
+/// One line of a board as a turn is allowed to see it: our id, their words.
+///
+/// A pair rather than two parallel `Vec`s, and a named type rather than a
+/// tuple, because the whole point is that the two halves have different
+/// provenance and must not be zipped back together by index somewhere down the
+/// line.
+#[derive(Debug, Clone)]
+pub struct Held {
+    /// Ours. What [`Backlog::claim`] and [`Backlog::close`] name.
+    pub id: WorkItemId,
+    /// The board's. Never a `String` on this side of the port.
+    pub title: Untrusted<String>,
 }
 
 /// Our own board: `work_items`, one company's.
@@ -159,23 +276,53 @@ impl Backlog for PgBacklog {
         &self,
         title: &str,
         assignee: Option<EmployeeId>,
+        author: Option<EmployeeId>,
     ) -> Result<WorkItemId, BacklogError> {
         let id = WorkItemId::new_v7(chrono::Utc::now());
         let mut tx = self.db.tenant_tx(self.tenant).await?;
-        let item = backlog::post(&mut tx, id, title, assignee).await?;
+        let item = backlog::post(&mut tx, id, title, assignee, author).await?;
         tx.commit().await?;
         Ok(item.id)
     }
 
-    async fn open_for(&self, assignee: EmployeeId) -> Result<Vec<Untrusted<String>>, BacklogError> {
+    async fn open_for(&self, assignee: EmployeeId) -> Result<Vec<Held>, BacklogError> {
         let mut tx = self.db.tenant_tx(self.tenant).await?;
         let items = backlog::open_for(&mut tx, assignee).await?;
         // Rolled back, not committed: a read that took no lock and wrote
         // nothing, exactly as `routes::halt::status` does it.
         tx.rollback().await?;
-        Ok(items
-            .into_iter()
-            .map(|item| Untrusted::new(item.title))
-            .collect())
+        Ok(items.into_iter().map(held).collect())
+    }
+
+    async fn unclaimed(&self) -> Result<Vec<Held>, BacklogError> {
+        let mut tx = self.db.tenant_tx(self.tenant).await?;
+        let items = backlog::unclaimed(&mut tx).await?;
+        tx.rollback().await?;
+        Ok(items.into_iter().map(held).collect())
+    }
+
+    async fn claim(&self, item: WorkItemId, who: EmployeeId) -> Result<bool, BacklogError> {
+        let mut tx = self.db.tenant_tx(self.tenant).await?;
+        let taken = backlog::claim(&mut tx, item, who).await?;
+        // Committed either way: `false` is not a failure, it is the other
+        // employee's claim having won, and there is nothing of ours to undo.
+        tx.commit().await?;
+        Ok(taken)
+    }
+
+    async fn close(&self, item: WorkItemId, who: EmployeeId) -> Result<bool, BacklogError> {
+        let mut tx = self.db.tenant_tx(self.tenant).await?;
+        let closed = backlog::close(&mut tx, item, who, chrono::Utc::now()).await?;
+        tx.commit().await?;
+        Ok(closed)
+    }
+}
+
+/// One row as the port hands it over: the id kept out of the wrapper because it
+/// is ours, the title kept inside because it is not.
+fn held(item: backlog::Item) -> Held {
+    Held {
+        id: item.id,
+        title: Untrusted::new(item.title),
     }
 }

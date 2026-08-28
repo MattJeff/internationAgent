@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::{DecisionId, IdempotencyKey, Slug};
+use agentos_domain::ids::{DecisionId, IdempotencyKey, Slug, WorkItemId};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
@@ -64,6 +64,7 @@ use chrono::Utc;
 use serde_json::{Map, Value, json};
 use url::Url;
 
+use crate::backlog::{Backlog, BacklogError, PgBacklog, WorkAction};
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 use crate::turn::WHOLE_PAGE;
@@ -1706,6 +1707,163 @@ impl Effects {
         }
     }
 
+    /// Write one item onto this company's board — for this employee, or for a
+    /// seat it directly manages.
+    ///
+    /// `assignee` is `None` for a note to self. There is deliberately no way to
+    /// spell *the shared board*: `store::backlog::open_for` hands an employee
+    /// its assigned items only, so an unassigned item posted from a turn would
+    /// be a write with no reader, and the founder's `POST /v1/work` is where
+    /// unassigned work comes from.
+    ///
+    /// # Why there is no token, and why the founder's argument needed redoing
+    ///
+    /// `POST /v1/work` established that posting is not an [`Action`]: every
+    /// [`ActionKind`](agentos_domain::action::ActionKind) names something that
+    /// leaves the building or spends, and the one internal verb that is an
+    /// action — [`InternalSend`] — is one because it consumes a turn of the
+    /// recipient's daily budget. A work item wakes nobody.
+    ///
+    /// That was argued about an **operator holding an API key**, and it does not
+    /// transfer for free. A founder answers for what he types; an employee is a
+    /// model, and a model is steerable by any text it has read. So the question
+    /// is not "does this leave the building" but "what can a hostile page buy by
+    /// steering this call", and there are three answers:
+    ///
+    /// 1. **Instructions into a colleague's context — no.**
+    ///    [`Backlog::open_for`] returns [`Untrusted`] per item, unconditionally,
+    ///    with nowhere in the trait for an adapter to claim otherwise, and
+    ///    `loops::initiative::waiting` never unwraps one. A turn shown its board
+    ///    is an untrusted turn and is offered no high-risk schema. So a
+    ///    supplier's sentence relayed through the board arrives as quoted
+    ///    material — the same landing a tainted `message_colleague` gets, minus
+    ///    the wake. One hop launders nothing.
+    /// 2. **A woken colleague or a spent budget — no**, and this half of the
+    ///    founder's argument is a claim about the mechanism rather than about
+    ///    the writer, so it survives the change intact. `open_for` is read at
+    ///    the top of a turn the cadence had already scheduled.
+    /// 3. **Flooding — yes, and it is the only thing that changes.** There is no
+    ///    ceiling on `work_items` anywhere, and an employee that could file for
+    ///    anyone could bury anyone. That is what
+    ///    [`inbound::may_assign`] bounds, and it bounds it with the org chart
+    ///    rather than with a number nobody has: the set of people whose day this
+    ///    employee may fill is the set it may already order about — and an order
+    ///    spends their turns, which is strictly worse than a line on a board.
+    ///    **The new verb is weaker than one the employee already had, against
+    ///    exactly the same people.** Nothing widens.
+    ///
+    /// So: still not an action. Inventing `ActionKind::WorkItemPost` would put a
+    /// discriminant in [`ActionKind::ALL`](agentos_domain::action::ActionKind),
+    /// a row in every role pack's partition and an arm in
+    /// `domain::policy::evaluate` — and that arm would have nothing to say,
+    /// because `PolicyLimits` has no field a board could be measured against and
+    /// the founder's brief is explicit that the bound must not be an invented
+    /// number. It is the same variant-that-adds-no-rule [`Effects::brief`]
+    /// refuses for a briefing.
+    ///
+    /// And the ruling that *is* made lives here for the reason
+    /// [`EffectError::Refused`] already gives: an [`Action`] carries a parsed
+    /// subject and no org chart, so the gate cannot see a reporting line. It is
+    /// the same seam `send_internal` refuses an unreachable colleague at.
+    ///
+    /// # Two transactions, and why they cannot be one
+    ///
+    /// The org chart is read here and the item is written by the board, which is
+    /// a port: a customer's Jira has no transaction of ours to join. So a guard
+    /// that insisted on one transaction with the write would be a guard no
+    /// second adapter could ever satisfy. The window is the same one
+    /// [`Effects::brief`] has between `line()` and `brief()`, and what fits in
+    /// it is one item filed against a seat that stopped reporting to this
+    /// employee a moment ago.
+    ///
+    /// `title` is not length-checked here. `work_items_title_shape` is a `CHECK`
+    /// and a violation classifies as [`StoreError::Database`], which
+    /// `Turn::performed` turns into an aborted run — so the bound is enforced
+    /// against [`agentos_store::backlog::MAX_TITLE`] in `Turn::propose`, where a
+    /// too-long line costs a tool result the model can act on instead of the
+    /// rest of its turn.
+    pub async fn post_work(&self, assignee: Option<&Slug>, title: &str) -> Result<(), EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let target = inbound::may_assign(&mut tx, self.principal.employee_id, assignee).await;
+        // Rolled back, not committed: nothing here took a lock or wrote a row.
+        let _ = tx.rollback().await;
+
+        let target = target.map_err(|err| match err {
+            InternalError::Store(err) => EffectError::Unavailable(err),
+            refused => EffectError::Refused(refused.code()),
+        })?;
+
+        // ponytail: the third `PgBacklog::new` in the workspace, beside
+        // `routes::work` and `loops::initiative`. All three say the same thing
+        // — this tenant's own table — and the day a `backlog_bindings` row can
+        // say otherwise, one constructor replaces all three at once. Choosing
+        // the adapter here would be inventing that selection point in the least
+        // visible of the three places.
+        PgBacklog::new(self.db.clone(), self.principal.tenant_id)
+            .post(title, Some(target), Some(self.principal.employee_id))
+            .await
+            .map(|_| ())
+            .map_err(|err| match err {
+                BacklogError::Unavailable(err) => EffectError::Unavailable(err),
+                BacklogError::Provider(err) => EffectError::Provider(err),
+            })
+    }
+
+    /// Take one item off the pool, or say one of yours is done.
+    ///
+    /// `Ok(false)` is the ordinary answer and not a failure: somebody claimed it
+    /// first, or the item is not this employee's to close. The two are one
+    /// answer on purpose — a distinguishable one lets a turn walk the board by
+    /// asking, which is the silence [`inbound::may_assign`] keeps one function
+    /// over.
+    ///
+    /// # Why neither of these is an [`Action`] either
+    ///
+    /// [`Effects::post_work`] argues the case for filing, and both verbs here
+    /// are *narrower* than filing was:
+    ///
+    /// **Claiming** moves work into this employee's own day and nobody else's.
+    /// It takes a row that was nobody's; the seat it costs is the claimant's own
+    /// turn budget, which is already metered by the thing that woke it. There is
+    /// no org-chart guard because there is nobody to guard: the pool is the
+    /// founder's undecided work — an employee cannot put anything in it — and an
+    /// employee taking a job the founder wrote down is the whole point of a
+    /// board being shared. The only rule is the one the `UPDATE` enforces: it is
+    /// still there, and it is still open.
+    ///
+    /// **Closing** asserts something about this employee's own board. It wakes
+    /// nobody, spends nothing and reaches nothing outside; and it is safe to
+    /// give a model at all only because `0061` refused `DELETE`, so the worst a
+    /// hijacked turn can do is mark its own items done — visibly, reversibly,
+    /// and one `PUT /v1/work/{id}` from being undone. A verb whose damage is
+    /// fully reversible by the person who can see it is not a verb the gate has
+    /// anything to rule on.
+    ///
+    /// What is *not* recorded is who closed it. `assignee_id` answers it for
+    /// every turn-close, because a turn can only close what is its own; it
+    /// cannot tell a founder's close from the assignee's, and a `closed_by`
+    /// column is the fix the day that difference is worth a migration.
+    pub async fn work_item(
+        &self,
+        item: WorkItemId,
+        action: WorkAction,
+    ) -> Result<bool, EffectError> {
+        let board = PgBacklog::new(self.db.clone(), self.principal.tenant_id);
+        let who = self.principal.employee_id;
+        match action {
+            WorkAction::Claim => board.claim(item, who).await,
+            WorkAction::Close => board.close(item, who).await,
+        }
+        .map_err(|err| match err {
+            BacklogError::Unavailable(err) => EffectError::Unavailable(err),
+            BacklogError::Provider(err) => EffectError::Provider(err),
+        })
+    }
+
     /// The de-duplication token for one authorised effect.
     ///
     /// Derived from the decision, so a crash between the provider's `202` and
@@ -2031,6 +2189,95 @@ mod tests {
 
     fn gate(db: &Db) -> PolicyGate {
         PolicyGate::new(db.clone())
+    }
+
+    /// A second active employee in the same company.
+    async fn hire(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+        let employee = EmployeeId::new_v7(Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, $3, 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit hire");
+        employee
+    }
+
+    /// The org chart `post_work` is bounded by, with one seat of every shape
+    /// around the acting employee.
+    ///
+    /// **All five share one team on purpose.** The rule is the reporting line
+    /// and not the team, so a fixture that put the peer somewhere else would
+    /// make every refusal below pass for the wrong reason — the same trap
+    /// `inbound`'s `department` fixture names.
+    ///
+    /// ```text
+    ///     carla ─(no manager, same team: a peer)
+    ///     lena  ─── bruno ─── eve
+    ///        the actor    one link   two links
+    /// ```
+    async fn org_around(db: &Db, principal: &Principal) -> (EmployeeId, EmployeeId, EmployeeId) {
+        let tenant = principal.tenant_id;
+        let bruno = hire(db, tenant, "bruno").await;
+        let carla = hire(db, tenant, "carla").await;
+        let eve = hire(db, tenant, "eve").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let team = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("desk").expect("slug"),
+            "The desk",
+        )
+        .await
+        .expect("create team");
+        for who in [principal.employee_id, bruno, carla, eve] {
+            agentos_store::org::set_member(&mut tx, who, team, None)
+                .await
+                .expect("join team");
+        }
+        agentos_store::org::set_position(&mut tx, principal.employee_id, Some("Head"), None)
+            .await
+            .expect("seat lena");
+        agentos_store::org::set_position(
+            &mut tx,
+            bruno,
+            Some("Buyer"),
+            Some(principal.employee_id),
+        )
+        .await
+        .expect("seat bruno under lena");
+        agentos_store::org::set_position(&mut tx, carla, Some("Head of the other desk"), None)
+            .await
+            .expect("seat carla beside lena");
+        agentos_store::org::set_position(&mut tx, eve, Some("Junior"), Some(bruno))
+            .await
+            .expect("seat eve under bruno");
+        tx.commit().await.expect("commit the org chart");
+
+        (bruno, carla, eve)
+    }
+
+    /// The titles waiting on one seat's board, in the board's own order.
+    async fn board_of(db: &Db, tenant: TenantId, who: EmployeeId) -> Vec<(String, Option<Uuid>)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let items = agentos_store::backlog::open_for(&mut tx, who)
+            .await
+            .expect("read the board");
+        tx.rollback().await.expect("rollback");
+        items
+            .into_iter()
+            .map(|item| (item.title, item.posted_by.map(|e| e.as_uuid())))
+            .collect()
+    }
+
+    fn slug(raw: &str) -> Slug {
+        Slug::parse(raw).expect("slug")
     }
 
     fn ports(email: MockEmailProvider, payments: Arc<MockPayments>) -> Arc<Ports> {
@@ -2861,5 +3108,259 @@ mod tests {
         assert_eq!(denied.code(), "untrusted_input");
         assert!(reservation_states(&db, &principal).await.is_empty());
         assert_eq!(effect_rows(&db, &principal).await.len(), 1);
+    }
+
+    /// **The frontier the founder drew**: an employee files work for itself and
+    /// for the seats it directly manages, and for nobody else on the board.
+    ///
+    /// One run against one org chart, because the rule is a single relation and
+    /// splitting it into six tests would be six fixtures of one company. Every
+    /// refusal is checked twice — the coded answer *and* the board, because a
+    /// guard that returns the right error after writing the row has refused
+    /// nothing.
+    ///
+    /// The negative half is the half worth having, and each case is a different
+    /// way the rule could have been written wrong:
+    ///
+    /// * **carla** is on the same team and answers to nobody. A guard written
+    ///   against the team — which is what a question and a handover ride on —
+    ///   would file for her, and an employee that can fill a peer's board can
+    ///   bury a peer.
+    /// * **eve** answers to bruno who answers to lena. A guard that walked the
+    ///   chart instead of taking one link would file for her, and a head would
+    ///   thereby own the day of every seat beneath it.
+    /// * **carla filing for lena** is the line read upward. Escalation is a
+    ///   `question`, which spends the asker's own turn; an item on a manager's
+    ///   board is work a report put there.
+    /// * **a terminated report** is still `reports_to` in the chart. The
+    ///   lifecycle join is `directs`', inherited rather than restated, and this
+    ///   is what proves it was inherited.
+    #[tokio::test]
+    async fn an_employee_files_work_for_itself_and_its_line_and_for_nobody_else() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let (bruno, carla, eve) = org_around(&db, &principal).await;
+        let (tenant, lena) = (principal.tenant_id, principal.employee_id);
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        // A note to self, which is the case that needs no org chart at all: it
+        // survives the turn and risks nothing, and `may_message` would have
+        // refused it out of hand because a message to yourself is a wake-up
+        // loop and this is not.
+        effects
+            .post_work(None, "check the tariff code tomorrow")
+            .await
+            .expect("an employee may always write itself a note");
+        // Naming your own slug is the same act spelled the long way.
+        effects
+            .post_work(Some(&slug("lena")), "and the customs email")
+            .await
+            .expect("naming yourself is the same as saying nothing");
+        // One link down: the whole of what the founder widened.
+        effects
+            .post_work(Some(&slug("bruno")), "confirm the HS code with the broker")
+            .await
+            .expect("a manager may put work in a direct report's day");
+
+        assert_eq!(
+            board_of(&db, tenant, lena).await,
+            vec![
+                (
+                    "check the tariff code tomorrow".to_owned(),
+                    Some(lena.as_uuid())
+                ),
+                ("and the customs email".to_owned(), Some(lena.as_uuid())),
+            ],
+            "both landed on lena's own board, and `0064` says who wrote them — \
+             which is the only record anywhere that an employee did"
+        );
+        assert_eq!(
+            board_of(&db, tenant, bruno).await,
+            vec![(
+                "confirm the HS code with the broker".to_owned(),
+                Some(lena.as_uuid())
+            )],
+            "the report reads it at the top of its next turn, and the board says \
+             its manager put it there"
+        );
+
+        // -- and now everything that must not work --------------------------
+        for (who, why) in [
+            (
+                "carla",
+                "a peer shares the team and not the line: a question rides the team, work does not",
+            ),
+            (
+                "eve",
+                "one link and never a walk — a report's report is not this employee's to fill",
+            ),
+            (
+                "mallory",
+                "nobody by that name, and it must read exactly like the two above",
+            ),
+        ] {
+            let err = effects
+                .post_work(Some(&slug(who)), "do this for me")
+                .await
+                .expect_err(why);
+            assert!(
+                matches!(err, EffectError::Refused("unreachable_colleague")),
+                "{why}: got {err:?}"
+            );
+        }
+        assert!(
+            board_of(&db, tenant, carla).await.is_empty()
+                && board_of(&db, tenant, eve).await.is_empty(),
+            "a refusal that wrote the row anyway has refused nothing"
+        );
+
+        // Upward. Carla is a head of her own, so this is not "an employee with
+        // no authority": it is authority pointed the wrong way.
+        let upward = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            Principal::employee(tenant, carla),
+        );
+        assert!(
+            matches!(
+                upward.post_work(Some(&slug("lena")), "handle this").await,
+                Err(EffectError::Refused("unreachable_colleague"))
+            ),
+            "the line runs one way: a report escalates with a question, not by \
+             filing work on its manager"
+        );
+
+        // A terminated report is still `reports_to` in the chart, and `directs`
+        // joins `employees` on `lifecycle = 'active'` at both ends.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("UPDATE employees SET lifecycle = 'terminated' WHERE id = $1")
+            .bind(bruno.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("terminate bruno");
+        tx.commit().await.expect("commit");
+        assert!(
+            matches!(
+                effects
+                    .post_work(Some(&slug("bruno")), "one more thing")
+                    .await,
+                Err(EffectError::Refused("unreachable_colleague"))
+            ),
+            "a seat nobody works cannot be given work"
+        );
+        assert_eq!(
+            board_of(&db, tenant, bruno).await.len(),
+            1,
+            "…and what was filed while it was working is still there: closing is \
+             a column and terminating is not a delete"
+        );
+    }
+
+    /// **The loop, end to end, through the port**: the founder writes work down
+    /// without deciding who does it, one employee takes it, a second is told it
+    /// is gone, the holder finishes it, and the founder still has the record.
+    ///
+    /// Before this there was no loop — the founder assigned and the employee
+    /// read, and the three verbs in between did not exist. Everything here goes
+    /// through `Effects`, so it is the path a turn takes and not the store
+    /// underneath it.
+    #[tokio::test]
+    async fn one_employee_takes_the_work_the_other_is_told_it_is_gone_and_the_holder_closes_it() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let (bruno, _, _) = org_around(&db, &principal).await;
+        let (tenant, lena) = (principal.tenant_id, principal.employee_id);
+        let effects = |who| {
+            Effects::new(
+                db.clone(),
+                ports(MockEmailProvider::new(), MockPayments::healthy()),
+                Principal::employee(tenant, who),
+            )
+        };
+        let (lena_acts, bruno_acts) = (effects(lena), effects(bruno));
+
+        // The founder's half, and the only writer that can leave an item
+        // unheld: `post_work` has no spelling for "nobody", on purpose.
+        let board = PgBacklog::new(db.clone(), tenant);
+        let item = board
+            .post("chase the tariff code", None, None)
+            .await
+            .expect("the founder writes it down without deciding who does it");
+
+        // Both employees see it, and it is on neither board. That is what the
+        // pool is, and it is not scoped to a team or a line.
+        for who in [lena, bruno] {
+            assert_eq!(
+                board.unclaimed().await.expect("pool").len(),
+                1,
+                "the pool is the whole company's"
+            );
+            assert!(
+                board_of(&db, tenant, who).await.is_empty(),
+                "and an unheld item is on nobody's board"
+            );
+        }
+
+        assert!(
+            lena_acts
+                .work_item(item, WorkAction::Claim)
+                .await
+                .expect("the board answers"),
+            "the first one to reach for it gets it"
+        );
+        assert!(
+            !bruno_acts
+                .work_item(item, WorkAction::Claim)
+                .await
+                .expect("the board answers"),
+            "and the second is told so — `Ok(false)`, not an error: losing a race \
+             is an answer, and a model told 'failed' would retry"
+        );
+        assert!(
+            board.unclaimed().await.expect("pool").is_empty(),
+            "it is out of the pool the moment it is taken"
+        );
+
+        // Closing is the holder's word. Bruno is Lena's report and could not
+        // even file this for her; he certainly cannot sign it off.
+        assert!(
+            !bruno_acts
+                .work_item(item, WorkAction::Close)
+                .await
+                .expect("the board answers"),
+            "you close what is on your own board and nothing else"
+        );
+        assert_eq!(
+            board_of(&db, tenant, lena).await.len(),
+            1,
+            "…and the refusal closed nothing"
+        );
+
+        assert!(
+            lena_acts
+                .work_item(item, WorkAction::Close)
+                .await
+                .expect("the board answers"),
+            "the holder can"
+        );
+        assert!(
+            board_of(&db, tenant, lena).await.is_empty()
+                && board.unclaimed().await.expect("pool").is_empty(),
+            "a closed item is nobody's work and does not fall back into the pool"
+        );
+
+        // And the founder still has it, which is the whole reason a model is
+        // allowed to close anything at all: `0061` refused `DELETE`.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let all = agentos_store::backlog::board(&mut tx)
+            .await
+            .expect("the founder's board");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(all.len(), 1, "closing is a column, not a delete");
+        assert!(all[0].closed_at.is_some() && all[0].assignee_id == Some(lena));
     }
 }
