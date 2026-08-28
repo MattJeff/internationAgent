@@ -702,11 +702,24 @@ async fn adopt_or_create_tenant(
             tx.rollback().await?;
             match ours {
                 Some(found) if found == slug => Ok(()),
-                _ => Err(ApiError::conflict(
-                    "tenant_slug_taken",
-                    "another company in this deployment already uses that slug",
-                )
-                .with_detail(format!("{what}. Pick another `slug`; nothing was written."))),
+                // `what` is a **constraint name** — `StoreError::from` fills a
+                // `Conflict` with `e.constraint()` and nothing else, and
+                // `create_tenant`'s only conflict is a unique violation. It goes
+                // to the log and not into the body: this handler builds its own
+                // `ApiError` instead of going through `From<StoreError>`, so it
+                // has to keep that module's split itself — the caller gets the
+                // status and the code, the operator gets the cause. Interpolated
+                // into `detail` it read as `tenants_slug_key. Pick another
+                // slug…`, which told the caller a table's internals and told
+                // them nothing they could act on.
+                _ => {
+                    tracing::warn!(conflict = %what, %slug, "a company was stood up under a slug another tenant holds");
+                    Err(ApiError::conflict(
+                        "tenant_slug_taken",
+                        "another company in this deployment already uses that slug",
+                    )
+                    .with_detail("Pick another `slug`; nothing was written."))
+                }
             }
         }
         Err(err) => Err(err.into()),

@@ -433,9 +433,15 @@ struct RegisterWebhookRequest {
     /// Whose deliveries these are. Named by the platform, never by the request
     /// that later arrives on the endpoint.
     tenant_id: Uuid,
-    /// Which ingest reads them. `email` is the only one wired — the table's
-    /// `webhook_endpoints_provider_is_wired` CHECK is what says so, and it is
-    /// paired with the one `on_webhook` registration in `main::handlers`.
+    /// Which ingest reads them. `email` and `twilio` are wired — the table's
+    /// `webhook_endpoints_provider_is_wired` CHECK is what says so, and each is
+    /// paired with an ingest in `routes::webhooks`.
+    ///
+    /// This said "`email` is the only one wired" until somebody read it beside
+    /// the constraint: `0069_a_number_is_an_endpoint_too.sql` widened it to two
+    /// and this line was not moved with it. The CHECK is the answer; a comment
+    /// that restates a constraint is a comment that goes stale the next time the
+    /// constraint moves.
     #[serde(default = "default_provider")]
     provider: String,
     /// The `whsec_…` signing secret from the provider's dashboard.
@@ -474,34 +480,7 @@ async fn register_webhook(
         Utc::now(),
     )
     .await
-    .map_err(|err| match err {
-        // The tenant uuid was made up. A 404, not the `400 unknown_tenant`
-        // `ApiError::from` produces — that message is addressed to the holder of
-        // a *tenant* key and tells them their own key names a tenant that was
-        // never created, which this caller cannot act on.
-        agentos_app::webhooks::EndpointError::Store(StoreError::UnknownTenant(_)) => {
-            ApiError::new(StatusCode::NOT_FOUND, "unknown_tenant", "no such tenant").with_detail(
-                format!(
-                    "There is no tenant {}. Create one with `POST /v1/platform/tenants`.",
-                    request.tenant_id
-                ),
-            )
-        }
-        // A provider with no ingest is refused by the table, not by a list in
-        // this file: one place to widen, and it is the same place as the CHECK.
-        agentos_app::webhooks::EndpointError::Store(StoreError::Database(_)) => {
-            ApiError::bad_request(
-                "provider: no ingest reads this provider's deliveries on this build",
-            )
-        }
-        agentos_app::webhooks::EndpointError::Store(err) => err.into(),
-        // Ours, not theirs: the master key. The cipher's code goes to the log
-        // and never into the body.
-        agentos_app::webhooks::EndpointError::Cipher { code } => {
-            tracing::error!(code, "a webhook signing secret could not be sealed");
-            ApiError::internal()
-        }
-    })?;
+    .map_err(|err| registration_refused(err, request.tenant_id))?;
 
     // The path and the tenant. **Never the secret**, and nothing derived from
     // it — this line is what an operator greps, and a grep-able log is a log
@@ -538,6 +517,74 @@ async fn register_webhook(
         })),
     )
         .into_response())
+}
+
+/// Postgres SQLSTATE for `check_violation`.
+///
+/// Named here rather than reached for from `agentos_store::db`, which keeps its
+/// own list private: this is the one route that has a reason to tell one
+/// constraint failure apart from a database that is simply down.
+const SQLSTATE_CHECK_VIOLATION: &str = "23514";
+
+/// Why a webhook endpoint was not registered.
+///
+/// A named function rather than the closure this was, so the arm below can be
+/// tested without a database — which is the whole point, because **the arm that
+/// was wrong is the one no end-to-end test can reach on purpose**: it fires when
+/// the database is down.
+///
+/// The `Database` arm used to match every driver error and answer `400
+/// provider: no ingest reads this provider's deliveries`. A pool timeout, a
+/// dropped connection, a table missing after a half-applied migration — each of
+/// them told an operator that a `provider` value which was correct is wrong, and
+/// sent them to change it while the thing that is down is ours. It is the same
+/// wrong-culprit failure `StoreError::UnknownTenant` was split out of, pointing
+/// the other way: there a 500 blamed us for the caller's mistake, here a 400
+/// blames the caller for ours.
+///
+/// So the arm now names the SQLSTATE it means. Everything else falls through to
+/// `StoreError`'s own mapping, which is a 500 — or a 503 for a retryable abort,
+/// which this route is one `webhook_endpoints_pkey` race away from producing.
+fn registration_refused(err: agentos_app::webhooks::EndpointError, tenant_id: Uuid) -> ApiError {
+    use agentos_app::webhooks::EndpointError;
+
+    match err {
+        // The tenant uuid was made up. A 404, not the `400 unknown_tenant`
+        // `ApiError::from` produces — that message is addressed to the holder of
+        // a *tenant* key and tells them their own key names a tenant that was
+        // never created, which this caller cannot act on.
+        EndpointError::Store(StoreError::UnknownTenant(_)) => {
+            ApiError::new(StatusCode::NOT_FOUND, "unknown_tenant", "no such tenant").with_detail(
+                format!(
+                    "There is no tenant {tenant_id}. Create one with `POST /v1/platform/tenants`."
+                ),
+            )
+        }
+        // A provider with no ingest is refused by the table, not by a list in
+        // this file: one place to widen, and it is the same place as the CHECK.
+        // `webhook_endpoints_provider_is_wired` is the only CHECK this insert
+        // can break, so the SQLSTATE is enough to say so without reading the
+        // constraint name back out — which `error.rs` would not let into the
+        // body anyway.
+        EndpointError::Store(StoreError::Database(ref err))
+            if err
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some(SQLSTATE_CHECK_VIOLATION) =>
+        {
+            ApiError::bad_request(
+                "provider: no ingest reads this provider's deliveries on this build",
+            )
+        }
+        EndpointError::Store(err) => err.into(),
+        // Ours, not theirs: the master key. The cipher's code goes to the log
+        // and never into the body.
+        EndpointError::Cipher { code } => {
+            tracing::error!(code, "a webhook signing secret could not be sealed");
+            ApiError::internal()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +676,57 @@ mod tests {
         assert_eq!(key_label(Some("  ")).expect("blank is absent"), "owner");
         assert_eq!(key_label(Some("Ops Console")).ok(), None, "not a slug");
         assert_eq!(key_label(Some("ops-console")).expect("slug"), "ops-console");
+    }
+
+    /// **A database that is down is not a caller who typed the wrong provider.**
+    ///
+    /// The arm this pins fires only when the database fails, so no end-to-end
+    /// test can reach it on purpose — which is exactly why it was wrong for as
+    /// long as it was. `PoolTimedOut` is the cheapest real driver failure to
+    /// hold in a test: it is a unit variant, it carries no connection, and it is
+    /// what a saturated pool actually produces.
+    ///
+    /// A 400 here reads `provider: no ingest reads this provider's deliveries`,
+    /// which sends an operator to change a field that was right while ours is
+    /// the thing that is down.
+    #[test]
+    fn a_database_failure_is_not_the_caller_s_provider_being_wrong() {
+        let refused = registration_refused(
+            agentos_app::webhooks::EndpointError::Store(StoreError::Database(
+                sqlx::Error::PoolTimedOut,
+            )),
+            Uuid::nil(),
+        );
+        assert_eq!(
+            refused.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a driver failure is ours to own; only a CHECK violation is the provider's"
+        );
+
+        // The two arms that were already right, kept beside it: a tenant that
+        // does not exist, and a master key that cannot seal.
+        assert_eq!(
+            registration_refused(
+                agentos_app::webhooks::EndpointError::Store(StoreError::UnknownTenant(
+                    "webhook_endpoints_tenant_id_fkey".to_owned()
+                )),
+                Uuid::nil(),
+            )
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let cipher = registration_refused(
+            agentos_app::webhooks::EndpointError::Cipher {
+                code: "secret_decrypt_failed",
+            },
+            Uuid::nil(),
+        );
+        assert_eq!(cipher.detail(), None, "the cipher's code is a log line");
+        assert_eq!(
+            cipher.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     /// The secret is in the body once, and the body says so.
