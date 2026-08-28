@@ -53,7 +53,7 @@
 //!
 //! | The bridge must not reach | Refused by |
 //! |---|---|
-//! | This server's environment — `DATABASE_URL`, `AGENTOS_MASTER_KEY`, every provider token | **The process is not ours.** Nothing on this path calls `Command::spawn`, so there is no tree to inherit; and [`BridgeSpec`] enumerates the environment it asks for, so inheritance is not expressible rather than merely not done — the type has no field a `std::env::vars()` could go in. |
+//! | This server's environment — `DATABASE_URL`, `AGENTOS_MASTER_KEY`, every provider token | **The process is not ours.** Nothing on this path calls `Command::spawn`, so there is no tree to inherit; and [`BridgeSpec`] enumerates the environment it asks for, so inheritance is not expressible rather than merely not done — the type has no field a `std::env::vars()` could go in. That is a claim about *names*; the one value a tenant chooses is the credential, and [`Bridges::endpoint`] refuses one that could become a second variable — see `transportable`. |
 //! | This server's filesystem | Same mechanism: nothing shares a mount namespace with a process we never create. The runtime is additionally required to give the bridge a read-only root and no bind mounts — a **deployment requirement**, listed below, not something this crate can check. |
 //! | The database | Nothing in a [`BridgeSpec`] names it. The bridge network must not route to Postgres — a **deployment requirement**, and the reason [`BridgeNetwork`] is an operator's value rather than a default. |
 //! | Another tenant's credential | **One bridge per (tenant, server)**, never shared — see [`BridgeSpec`]. The single secret in a bridge's environment is opened from that tenant's own `mcp_servers` row under the AAD `mcp://<tenant>/<server>` ([`crate::mcp::credential_context`]), so there is no second tenant's value in scope to leak. |
@@ -184,21 +184,32 @@
 //!   about an address still cannot point us at one.
 //! * **What one bridge consumes.** CPU, memory and process limits are the
 //!   runtime's; nothing here can bound them.
-//! * **How many bridges a tenant gets, which is NOT the runtime's** and is the
-//!   correction to the sentence that used to stand here. The runtime is
-//!   *required* to start a second container for a second `(tenant, server)` —
-//!   that is the isolation unit and refusing would break a legitimate second
-//!   binding — so it has no basis on which to say no. The count is decided
-//!   upstream, by how many rows a tenant has in `mcp_servers` on a hosted
-//!   connector, and `server` is a slug the tenant chooses: **`0013_mcp.sql`
-//!   caps nothing and no route counts.** For a dialled binding that is
-//!   harmless, because a row is an address we connect to on demand. For a
-//!   hosted one, every row is a container that the binder loop's refresh tick
+//! * **How many bridges a tenant gets, which is NOT the runtime's.** The
+//!   runtime is *required* to start a second container for a second
+//!   `(tenant, server)` — that is the isolation unit and refusing would break a
+//!   legitimate second binding — so it has no basis on which to say no. The
+//!   count is decided upstream, by how many rows a tenant has in `mcp_servers`
+//!   on a hosted connector, and `server` is a slug the tenant chooses:
+//!   **`0013_mcp.sql` caps nothing and no route counts.** For a dialled binding
+//!   that is harmless, because a row is an address we connect to on demand. For
+//!   a hosted one, every row is a container that the binder loop's refresh tick
 //!   keeps alive indefinitely — the lease is renewed exactly as fast as it
-//!   expires. Nothing today can create such a row (see the deployment section),
-//!   which is the only reason this is a note and not a hole; a per-tenant cap
-//!   on hosted bindings has to ship in the same change as the route that
-//!   creates them, and is listed there.
+//!   expires.
+//!
+//!   So the cap is here, on the value that reaches the runtime:
+//!   [`BRIDGES_PER_TENANT`] is the number, [`Bridges`] carries it, and
+//!   [`crate::mcp::Fleet::bind`] refuses a tenant's hosted bindings past it
+//!   **before** calling [`BridgeRuntime::start`]. It bounds starts *asked for*
+//!   and not starts that succeeded, because a hosted row whose container fails
+//!   to come up is still a container attempt on every refresh tick, and "how
+//!   many processes can one customer make us try to run" is the question worth
+//!   answering.
+//!
+//!   What it does not bound is the number of *rows*: all but the first
+//!   [`Bridges::per_tenant`] of a tenant's hosted bindings are recorded
+//!   failures that bind nothing, which is inert but is a customer told
+//!   "connected" about a binding that is not. Refusing the (cap+1)th **write**
+//!   is the other half and is deployment requirement 4 below.
 //! * **The child this deployment already has.** "This process spawns nothing"
 //!   is true of the MCP path and is *not* true of the binary:
 //!   `crates/providers/src/llm_cli.rs` runs `claude` as a child when
@@ -218,9 +229,11 @@
 //! could hand one in**, and that is worth saying separately because the two
 //! read alike and are not: `Fleet::bind`'s `bridges` argument is the literal
 //! `None` at `apps/server/src/routes/mcp.rs`, which is its one production call
-//! site; [`Bridges`] is constructed nowhere outside tests; and no environment
-//! variable in this workspace feeds [`BridgeNetwork::parse`]. So [`accept`],
-//! [`BridgeNetwork`] and [`Bridges`] are today reached only from tests —
+//! site; [`Bridges`] is constructed nowhere outside tests; no environment
+//! variable in this workspace feeds [`BridgeNetwork::parse`]; and
+//! [`BRIDGES_PER_TENANT`] has no caller, because the wiring that would pass it
+//! is the wiring that does not exist. So [`accept`], [`BridgeNetwork`] and
+//! [`Bridges`] are today reached only from tests —
 //! everything they refuse, they refuse in a test. Until a runtime *and* its
 //! wiring land, a hosted binding fails to bind with `hosting_unavailable` and
 //! its tenant simply has no tools on it — the same fail-closed path as a server
@@ -231,7 +244,12 @@
 //!    package's stdio in Streamable HTTP (`supergateway` is the off-the-shelf
 //!    one, and is what `tests/orizn.rs` already runs), and answers with the
 //!    address it assigned. Its container contract: read-only root, no bind
-//!    mounts, an environment containing only [`BridgeSpec`]'s variables, a
+//!    mounts, an environment containing only [`BridgeSpec`]'s variables and
+//!    **built as a list of pairs rather than interpolated into text** — an
+//!    `execve` array or a container API's JSON, never an `--env-file`, a
+//!    generated manifest or a shell `NAME=value`, because the value in it is
+//!    the one thing here a tenant typed and `transportable` only refuses the
+//!    separators we know a line-oriented encoding splits on — a
 //!    network with no route to Postgres or to this server's admin surface, an
 //!    idle TTL satisfying the inequality above — and **a log stream that is
 //!    dropped rather than shipped**. That last row is the one a container
@@ -255,16 +273,33 @@
 //! 3. **A transport to it that is not the public internet** — a unix socket or
 //!    mTLS on the same private network — because the request carrying
 //!    [`BridgeSpec`] carries a tenant's credential.
-//! 4. **A per-tenant cap on hosted bindings, in the same change as the route
-//!    that creates them.** `POST /v1/mcp/connect` answers `503
-//!    hosting_unavailable` for a [`crate::catalog::Provision::Host`] connector
-//!    today, so no tenant can create a hosted row at all — which is what makes
-//!    the uncapped count above a note rather than a hole. Opening that branch
-//!    without a cap turns a tenant-chosen slug into a container: `mcp_servers`
-//!    is keyed `(tenant_id, server)`, nothing counts the rows, and the refresh
-//!    tick renews every lease as fast as it expires. The cap belongs on the
-//!    write, not on the bind — a refusal at bind time is a container already
-//!    started.
+//! 4. **A refusal at the write, in the same change as the route that creates a
+//!    hosted row** — and note what this requirement no longer says. The
+//!    *process* cap is not deployment work and did not wait for the route: it
+//!    is [`BRIDGES_PER_TENANT`], it is carried by [`Bridges`], and
+//!    [`crate::mcp::Fleet::bind`] applies it before anything is started, so a
+//!    tenant-chosen slug cannot become an unbounded number of containers
+//!    whatever door writes the row. That door had to be second, because a cap
+//!    that ships after the branch it bounds leaves a window in which a customer
+//!    can start as many processes on our machine as they can think of names.
+//!
+//!    What is still owed is the customer-facing half. `POST /v1/mcp/connect`
+//!    answers `503 hosting_unavailable` for a
+//!    [`crate::catalog::Provision::Host`] connector today, so no tenant can
+//!    create a hosted row at all. Opening that branch without also refusing the
+//!    (cap+1)th write leaves a tenant able to fill `mcp_servers` with rows that
+//!    are answered "verified" and bind nothing — a lie to a customer rather
+//!    than a load on the machine, which is exactly why it is second and not
+//!    first. A refusal there is also the only one that can explain itself: at
+//!    bind time the cap is a `hosted_cap_reached` in a listing, and the person
+//!    who needs to hear it is the one holding the API key at the moment they
+//!    ask.
+//!
+//! And one number in that list is not the operator's to leave alone:
+//! [`BRIDGES_PER_TENANT`] is **zero**, so a deployment that satisfies every
+//! requirement above still starts nothing until somebody answers the question
+//! written on that constant. That is the intended order — the machine that runs
+//! bridges is the one that knows how many it can hold.
 
 use std::net::IpAddr;
 
@@ -522,40 +557,121 @@ fn host_bits_set(ip: IpAddr, bits: u8) -> bool {
         .any(|&byte| byte != 0)
 }
 
-/// A runtime, and the network its answers must land in.
+/// How many bridges one tenant may have running at once.
 ///
-/// # Why the two are one value
+/// # The number is not this crate's to choose, and the placeholder is zero
 ///
-/// So that the check cannot be skipped. [`Bridges::endpoint`] is the only way
-/// to reach the runtime from outside this module — the field is private and
-/// there is no accessor — so "start a bridge" and "vet what it answered" are
-/// one operation with no arrangement of the caller in which the second half is
+/// A process ceiling per customer is an operations decision about a particular
+/// machine: how much resident memory a runner image costs with a typical stdio
+/// package inside it, how much the smallest box a deployment runs on has, and
+/// how many tenants share that box. **None of those three facts is in this
+/// repository**, so the number here is a placeholder for the founder's, and the
+/// placeholder is the value that fails closed.
+///
+/// **Zero, not `usize::MAX`, and not "no check until we know".** The two
+/// mistakes are not symmetric. An unset [`BridgeNetwork`] refuses every address
+/// and hosts nothing, which is a deployment that does not work. An unset cap
+/// *admits*: one tenant, one `POST` per slug they can invent, one container
+/// each, on our machine, and the binder loop renews every lease exactly as fast
+/// as it expires. So the wrong default is not a smaller version of the right
+/// one, it is the failure this module exists to prevent, and a constant that
+/// has not been decided yet must sit on the side that starts nothing.
+///
+/// # The question, left open on purpose
+///
+/// > **How many hosted MCP containers may one tenant hold at once on this
+/// > deployment?**
+///
+/// It is answered with an operator's arithmetic and not a programmer's:
+/// `(box memory ÷ resident size of one runner) ÷ tenants per box`, with margin,
+/// and then sanity-checked against what a customer plausibly connects — the
+/// catalogue has one hosted entry, so "more than a handful" is a number nobody
+/// has a use for yet. Raising it is a one-line deploy, which is the same price
+/// this module already charges for adding a [`Package`], and for the same
+/// reason: it is a decision somebody should have to make on purpose.
+pub const BRIDGES_PER_TENANT: usize = 0;
+
+/// A runtime, the network its answers must land in, and how many of its bridges
+/// one tenant may hold.
+///
+/// # Why the three are one value
+///
+/// So that no check can be skipped. [`Bridges::endpoint`] is the only way to
+/// reach the runtime from outside this module — the field is private and there
+/// is no accessor — so "start a bridge" and "vet what it answered" are one
+/// operation with no arrangement of the caller in which the second half is
 /// forgotten. It is the same construction `crate::mcp::McpServer::bind` uses to
 /// keep the address check attached to the connect.
+///
+/// The cap rides along for the sharper version of that reason: it is the only
+/// value in this type that bounds *how much of somebody else's machine a
+/// customer can take*, and the day a deployment hands in a runtime it will do
+/// it by constructing one of these. A constructor that takes the cap is a
+/// wiring change that cannot be written without stating a number.
 pub struct Bridges {
     runtime: std::sync::Arc<dyn BridgeRuntime>,
     network: BridgeNetwork,
+    per_tenant: usize,
 }
 
 impl std::fmt::Debug for Bridges {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bridges")
             .field("network", &self.network)
+            .field("per_tenant", &self.per_tenant)
             .finish_non_exhaustive()
     }
 }
 
 impl Bridges {
-    /// Wire a runtime to the subnet it allocates from.
-    pub const fn new(runtime: std::sync::Arc<dyn BridgeRuntime>, network: BridgeNetwork) -> Self {
-        Self { runtime, network }
+    /// Wire a runtime to the subnet it allocates from and the per-tenant cap it
+    /// runs under.
+    ///
+    /// `per_tenant` is a parameter and not a read of [`BRIDGES_PER_TENANT`],
+    /// because a constant that is zero is a constant whose arithmetic no test
+    /// can reach: the first comparison refuses and the counting below it never
+    /// runs. **The constant has no caller yet** — there is no wiring in this
+    /// workspace that constructs a `Bridges` outside tests, which is the same
+    /// sentence the module docs make about [`BridgeRuntime`] — so today the
+    /// numbers that reach this parameter are the ones tests pass to prove the
+    /// count is a count, and [`BRIDGES_PER_TENANT`] is what the wiring is
+    /// required to pass on the day it exists.
+    pub const fn new(
+        runtime: std::sync::Arc<dyn BridgeRuntime>,
+        network: BridgeNetwork,
+        per_tenant: usize,
+    ) -> Self {
+        Self {
+            runtime,
+            network,
+            per_tenant,
+        }
+    }
+
+    /// How many bridges this deployment will start for one tenant.
+    ///
+    /// Read by [`crate::mcp::Fleet::bind`], which is the only thing that calls
+    /// [`Self::endpoint`] and therefore the only place the count can be kept.
+    pub(crate) const fn per_tenant(&self) -> usize {
+        self.per_tenant
     }
 
     /// Start the bridge and vet the address it answered with.
     ///
     /// The only path from a [`BridgeSpec`] to a URL, and therefore the only
     /// place a runtime's answer becomes something this process will dial.
+    ///
+    /// The secret is checked **before** the runtime is asked, for the reason
+    /// [`transportable`] gives: a value that cannot be one environment variable
+    /// must not be handed to something that is going to try.
     pub(crate) async fn endpoint(&self, spec: BridgeSpec<'_>) -> Result<Url, McpError> {
+        if let Some(secret) = spec.secret
+            && !transportable(secret)
+        {
+            return Err(McpError::Hosting {
+                code: "bridge_secret_not_transportable",
+            });
+        }
         let endpoint = self
             .runtime
             .start(spec)
@@ -563,6 +679,59 @@ impl Bridges {
             .map_err(|BridgeError(code)| McpError::Hosting { code })?;
         accept(&endpoint, &self.network)
     }
+}
+
+/// Whether this secret can be *one* environment variable's value, whatever the
+/// runtime encodes it into.
+///
+/// # The gap this closes, which is the one gap the module's own table has
+///
+/// The isolation table says the bridge's environment is "**enumerated** by
+/// [`BridgeSpec`] rather than inherited: there is no code path in this crate
+/// that copies `std::env` into a spec, because the type has no field that could
+/// hold one". That is true, and it is a claim about *names*. It is not a claim
+/// about *bytes*, and the bytes are the one thing in a [`BridgeSpec`] the
+/// tenant chose: the variable's name is a `&'static str` in [`Package::env`],
+/// and its value is whatever they pasted into `POST /v1/mcp/connect`.
+///
+/// So the interesting question is not "can a tenant name a variable" — they
+/// cannot — but "can one variable become two". It can, in every line-oriented
+/// encoding a runtime plausibly reaches for: `docker run --env-file`, a
+/// generated compose or Kubernetes manifest, `printenv`-shaped IPC, a shell
+/// `NAME=value` that somebody wrote because it was one line. A credential
+/// holding `\nDATABASE_URL=…` in any of those is a second variable this system
+/// never enumerated, in a process we started, and the module would still be
+/// truthfully saying the type has no field for it.
+///
+/// **A deployment requirement would be the wrong shape here**, and the module
+/// already knows why: [`accept`] exists because "a runtime that is wrong about
+/// an address still cannot point us at one". Same sentence, other value — a
+/// runtime that is careless with an environment string still cannot be handed
+/// one that splits. It costs six lines and it is checkable from here, which is
+/// the test this file applies to every row of its own table.
+///
+/// # What is refused, and what it costs a legitimate customer
+///
+/// NUL, LF and CR. NUL cannot be in a POSIX environment value at all — the
+/// strings are NUL-terminated, and `std::process::Command::env` rejects it — so
+/// refusing it early turns a runtime's opaque failure into a stable code. LF
+/// and CR are the separators every encoding above is line-oriented *about*.
+///
+/// Nothing else: not length, not the rest of the control range, not a charset.
+/// A bearer credential is `token68` in practice and none of this is near it,
+/// and a check that guesses at a third party's key format is a check that
+/// refuses a real customer's real key. The two characters here are refused
+/// because of what *our* side does with them, which is the only thing this
+/// crate is entitled to have an opinion about.
+///
+/// The value is inspected and never copied, never logged, never measured into
+/// an error: the answer is a `bool`, and the code the caller returns says which
+/// rule, not which byte.
+fn transportable(secret: &Secret) -> bool {
+    !secret
+        .expose_for_transport()
+        .bytes()
+        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
 }
 
 /// Vet an endpoint a runtime just handed us.
@@ -837,6 +1006,7 @@ pub(crate) mod tests {
         let bridges = Bridges::new(
             std::sync::Arc::new(FakeRuntime::answering("http://169.254.169.254/mcp")),
             net("0.0.0.0/0"),
+            1,
         );
         let server = Slug::parse("example").expect("a slug");
         let refused = bridges
@@ -857,6 +1027,7 @@ pub(crate) mod tests {
         let bridges = Bridges::new(
             std::sync::Arc::new(FakeRuntime::failing("bridge_image_missing")),
             net("10.0.0.0/8"),
+            1,
         );
         let server = Slug::parse("example").expect("a slug");
         let refused = bridges
@@ -869,6 +1040,88 @@ pub(crate) mod tests {
             .await
             .expect_err("the runtime said no");
         assert_eq!(code(&refused), "bridge_image_missing");
+    }
+
+    /// **A credential that could become two environment variables never reaches
+    /// the runtime**, and the assertion is on what the runtime *saw*, not on
+    /// what `endpoint` returned.
+    ///
+    /// That distinction is the whole test. An error code proves the call
+    /// failed; only an empty `seen` proves the failure happened on this side of
+    /// the wire, which is the only kind of failure that helps — a runtime that
+    /// has already been handed a splitting value has already built whatever it
+    /// was going to build out of it, and our returning an error afterwards
+    /// changes nothing about the container it started.
+    ///
+    /// The clean secret at the end is what stops this passing for the wrong
+    /// reason: it goes through the same `Bridges`, is seen, and comes back
+    /// `Ok` — so the three refusals above are about the three bytes and not
+    /// about there being a secret at all.
+    #[tokio::test]
+    async fn a_secret_that_could_split_an_environment_never_reaches_a_runtime() {
+        let server = Slug::parse("example").expect("a slug");
+        let tenant = TenantId::new_v7(chrono::Utc::now());
+
+        for raw in [
+            // The realistic one: a token pasted with the newline the terminal
+            // put after it, or an env-file line appended on purpose.
+            "sk-live-fine\nDATABASE_URL=postgres://elsewhere",
+            // The same trick where the encoding splits on CR.
+            "sk-live-fine\rORIZN_API_KEY=somebody-elses",
+            // Not expressible in a POSIX environment at all.
+            "sk-live-fine\0trailing",
+            // Leading, not only embedded: a value that *starts* a new line is
+            // the same hazard with the halves swapped.
+            "\nAGENTOS_MASTER_KEY=0000",
+        ] {
+            let runtime = std::sync::Arc::new(FakeRuntime::answering("http://10.0.0.1:8931/mcp"));
+            let bridges = Bridges::new(
+                std::sync::Arc::clone(&runtime) as std::sync::Arc<dyn BridgeRuntime>,
+                net("10.0.0.0/8"),
+                1,
+            );
+            let secret = Secret::new(raw);
+            let refused = bridges
+                .endpoint(BridgeSpec {
+                    tenant,
+                    server: &server,
+                    package: &PACKAGE,
+                    secret: Some(&secret),
+                })
+                .await
+                .expect_err("a value that cannot be one variable is not a credential we pass on");
+            assert_eq!(code(&refused), "bridge_secret_not_transportable", "{raw:?}");
+            assert!(
+                runtime.seen.lock().expect("not poisoned").is_empty(),
+                "the runtime was handed {raw:?} and only told afterwards"
+            );
+        }
+
+        let runtime = std::sync::Arc::new(FakeRuntime::answering("http://10.0.0.1:8931/mcp"));
+        let bridges = Bridges::new(
+            std::sync::Arc::clone(&runtime) as std::sync::Arc<dyn BridgeRuntime>,
+            net("10.0.0.0/8"),
+            1,
+        );
+        // Every other control byte stays legal, deliberately: a tab is not a
+        // separator in any encoding this rule is about, and guessing at a third
+        // party's key format is how a real customer's real key gets refused.
+        let secret = Secret::new("sk-live\tstill-one-value");
+        bridges
+            .endpoint(BridgeSpec {
+                tenant,
+                server: &server,
+                package: &PACKAGE,
+                secret: Some(&secret),
+            })
+            .await
+            .expect("a credential with no separator in it is passed on");
+        assert_eq!(
+            runtime.seen.lock().expect("not poisoned").len(),
+            1,
+            "the clean secret did not reach the runtime either, so the refusals \
+             above prove nothing about the bytes"
+        );
     }
 
     /// **A spec does not print the secret**, whoever holds it.

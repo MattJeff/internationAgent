@@ -1039,6 +1039,27 @@ async fn connect(
         // `agentos_app::hosted` for what that deployment is. The row shape
         // itself works and is exercised by
         // `mcp::tests::a_hosted_binding_starts_a_bridge_and_never_names_its_address`.
+        //
+        // **What is left to write here, when the branch opens, and in what
+        // order.** The process cap is done and did not wait for this route:
+        // `hosted::BRIDGES_PER_TENANT` is the number and `app::mcp::Fleet::bind`
+        // applies it before any runtime is asked, so opening this branch cannot
+        // hand a tenant an unbounded number of containers whatever it writes.
+        // What is still owed *here* is the refusal a customer can read: count
+        // this tenant's rows on hosted connectors and answer 409 past the cap,
+        // in the same change that first lets one be written. Without it a
+        // customer is told "verified" about a row that will bind as
+        // `hosted_cap_reached` forever — a lie rather than a load, which is the
+        // whole reason this half is second and not first.
+        //
+        // The count belongs in the same transaction as the INSERT below, and it
+        // needs `pg_advisory_xact_lock(hashtextextended($tenant::text, 0))` in
+        // front of it — the pattern `0027_positions.sql` already uses for a
+        // per-tenant invariant — or two concurrent requests each count N and
+        // each write. The catalogue cannot be a SQL predicate (`0043`'s
+        // decision 2 says why), so the hosted connector keys go down as a
+        // parameter read out of `catalog::CATALOG` at the call, never as a
+        // stored copy.
         catalog::Provision::Host(_) => {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2095,6 +2116,14 @@ async fn rebind(
     // gets tools from a container nobody started. The day a runtime is
     // deployed, this is the line that hands it in, and nothing else here
     // changes.
+    //
+    // It cannot be handed in without a number: `Bridges::new` takes the
+    // per-tenant cap, and the value it is required to be passed here is
+    // `hosted::BRIDGES_PER_TENANT`, which is zero until somebody answers the
+    // question written on it. So the wiring change is a `Some(...)` that still
+    // starts nothing, and turning hosting on is a second, deliberate edit to a
+    // constant — which is the order that stops "wire it up" from also meaning
+    // "and let a customer run as many processes as they like on our box".
     let fleet = Fleet::bind(&mut tx, credentials, None, ct).await;
     // A read-only transaction either way; rolling back is the cheaper unwind.
     let _ = tx.rollback().await;
