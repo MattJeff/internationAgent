@@ -543,8 +543,11 @@ const SQLSTATE_CHECK_VIOLATION: &str = "23514";
 /// blames the caller for ours.
 ///
 /// So the arm now names the SQLSTATE it means. Everything else falls through to
-/// `StoreError`'s own mapping, which is a 500 — or a 503 for a retryable abort,
-/// which this route is one `webhook_endpoints_pkey` race away from producing.
+/// `StoreError`'s own mapping, which is a 500 — or a 503 for a retryable abort
+/// (`40001`), which is *not* what a `webhook_endpoints_pkey` race produces: a
+/// duplicate key is `23505`, so that race arrives as a 409. Said because an
+/// earlier version of this sentence named the wrong one, and a doc that
+/// mispredicts a status is how an alert gets built on a code that never fires.
 fn registration_refused(err: agentos_app::webhooks::EndpointError, tenant_id: Uuid) -> ApiError {
     use agentos_app::webhooks::EndpointError;
 

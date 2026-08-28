@@ -1245,9 +1245,13 @@ mod tests {
         //
         // **This depends on `N` fitting in the pool** — `Db` opens sixteen
         // connections and twelve tasks hold one each while they wait. Raise `N`
-        // past that and every task blocks on a connection nobody will release —
-        // which used to be a hang; the bounded wait below turns it into a red
-        // run that names the barrier nobody arrived at.
+        // past that and every task blocks on a connection nobody will release.
+        // That was never a hang, whatever an earlier version of this comment
+        // said: `db.rs` sets no `acquire_timeout`, so sqlx's thirty-second
+        // default already ends it. The bounded wait below fires first and names
+        // the barrier — which is the wrong culprit for that particular failure,
+        // so if this test ever reports a missing peer, check `N` against the
+        // pool size before believing the message.
         let gate = Arc::new(tokio::sync::Barrier::new(N));
         let tasks: Vec<_> = employees
             .into_iter()

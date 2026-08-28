@@ -712,6 +712,14 @@ async fn adopt_or_create_tenant(
                 // into `detail` it read as `tenants_slug_key. Pick another
                 // slug…`, which told the caller a table's internals and told
                 // them nothing they could act on.
+                // NOT COVERED: no test in this workspace reaches this arm, so
+                // nothing pins the property the arm exists for — that
+                // `tenants_slug_key` stays out of the body. `error.rs` tests
+                // exactly that rule for every other path; this one is the
+                // exception, and it is the path that was leaking. A test wants
+                // two `POST /v1/companies` on one slug and an assertion on the
+                // absence of the constraint name, not on the presence of the
+                // message.
                 _ => {
                     tracing::warn!(conflict = %what, %slug, "a company was stood up under a slug another tenant holds");
                     Err(ApiError::conflict(
