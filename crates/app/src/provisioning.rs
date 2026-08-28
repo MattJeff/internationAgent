@@ -2704,7 +2704,20 @@ mod tests {
         let (tenant_id, employee_id) = (employee.tenant_id(), employee.id());
         let run = tokio::spawn(async move { dying.converge(tenant_id, employee_id).await });
         // ---- the number now exists at the provider, and the process dies ----
-        telephony.entered.notified().await;
+        // Bounded on purpose: this notify only fires if `converge` actually
+        // schedules `Step::Phone` and calls the telephony port. If it stops
+        // doing either — a step ordering change, a precondition that is never
+        // met, a lease that is never taken — the kill this test is about never
+        // happens, and an unbounded wait would hang the suite instead of
+        // failing it.
+        tokio::time::timeout(Duration::from_secs(20), telephony.entered.notified())
+            .await
+            .expect(
+                "`converge` never entered `ensure_number`, so there was no in-flight \
+                 provider call to kill and everything below is asserting about a run \
+                 that never started. Does `Step::Phone` still get scheduled first, and \
+                 does the engine still reach the telephony port for it?",
+            );
         run.abort();
         let _ = run.await;
 

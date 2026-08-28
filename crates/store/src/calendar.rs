@@ -1424,7 +1424,7 @@ mod tests {
                 .fetch_one(&mut *tx)
                 .await
                 .expect("backend pid");
-            ready.wait().await;
+            crate::db::wait_at_barrier(&ready, "the first replica").await;
             // Into the other replica's scan rather than alongside its snapshot.
             // The barrier releases both sides at once, and coming off it dead
             // level, this one can reach `due` first, and then it is the *other*

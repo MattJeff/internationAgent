@@ -1050,7 +1050,7 @@ mod tests {
                 .fetch_one(&mut **tx)
                 .await
                 .expect("backend pid");
-            ready.wait().await;
+            crate::db::wait_at_barrier(&ready, "the first claimer").await;
             tokio::time::sleep(DELTA).await;
             let second = allocate_atomic(&mut tx, CONTENDERS[1], FR, Utc::now())
                 .await
