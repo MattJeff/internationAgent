@@ -21,7 +21,10 @@
 //!   [`OpenWindow`], and an `OpenWindow` can only be obtained from
 //!   [`OpenWindow::since_last_inbound`] while the window is genuinely open. A
 //!   free-text send outside the window is not a runtime error, it is
-//!   unspellable.
+//!   unspellable. **And the window names the person it is with** — the proof is
+//!   a window with somebody, never a window in the abstract — so
+//!   [`OutboundWhatsapp::FreeForm`] has no recipient field of its own and
+//!   free text addressed to anyone but that person is unspellable too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -114,14 +117,36 @@ pub struct OutboundCall {
     pub to: E164,
 }
 
-/// Proof that the WhatsApp 24-hour customer-service window is open.
+/// Proof that the WhatsApp 24-hour customer-service window **with `peer`** is
+/// open.
 ///
-/// The field is private and the only constructor is
+/// The fields are private and the only constructor is
 /// [`OpenWindow::since_last_inbound`], so holding one of these *is* evidence
-/// that a real inbound message arrived less than 24 hours before the instant
-/// the caller was reasoning about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// that a real inbound message from `peer` arrived less than 24 hours before
+/// the instant the caller was reasoning about.
+///
+/// # Why the number is in here, and not merely beside it
+///
+/// This carried the expiry alone until it was noticed that the expiry alone
+/// proves the wrong sentence: *a window is open somewhere*, rather than *the
+/// window with this person is open*. Nobody could forge one —
+/// [`Self::since_last_inbound`] is still the only way to get one — but a real
+/// window derived for a customer who wrote to us could be handed to a message
+/// addressed to a stranger who never did, and both halves would be honest on
+/// their own. That is not a window at all; it is one person's consent spent on
+/// another.
+///
+/// Meta's rule is about a *conversation*, so the proof is about a conversation
+/// too. [`OutboundWhatsapp::FreeForm`] therefore has no `to` of its own and
+/// reads the recipient off this value: the mismatch is not refused, it is
+/// unspellable, which is the move `agentos_app::effects::PaymentInstruction`
+/// makes for a payee.
+///
+/// Not `Copy` any more, because [`E164`] is not. That is a smaller loss than it
+/// looks — a window is minted once per send and moved into the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWindow {
+    peer: E164,
     expires_at: DateTime<Utc>,
 }
 
@@ -156,17 +181,33 @@ impl OpenWindow {
     /// because this crate is below that one and must stay there.
     pub const DURATION: TimeDelta = TimeDelta::hours(24);
 
-    /// The window state: `Some` while free-form text is allowed, `None` when
-    /// only an approved template may be sent.
+    /// The window state with `peer`: `Some` while free-form text to **them** is
+    /// allowed, `None` when only an approved template may be sent.
     ///
-    /// `last_inbound_at` is `None` for a conversation the customer never
-    /// started — which is closed, not open.
+    /// `last_inbound_at` is when `peer` last wrote to us on this channel, and
+    /// the caller is the one that knows — it is a query about a conversation and
+    /// this crate has no database. Passing one person's number with another
+    /// person's clock is the one mistake this signature cannot catch; what it
+    /// does catch is everything downstream of it, because the number travels
+    /// with the proof from here on.
+    ///
+    /// `None` for a conversation the customer never started — which is closed,
+    /// not open.
     pub fn since_last_inbound(
+        peer: &E164,
         last_inbound_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Option<Self> {
         let expires_at = last_inbound_at? + Self::DURATION;
-        (expires_at > now).then_some(Self { expires_at })
+        (expires_at > now).then(|| Self {
+            peer: peer.clone(),
+            expires_at,
+        })
+    }
+
+    /// Whose window this is: the number that wrote to us.
+    pub fn peer(&self) -> &E164 {
+        &self.peer
     }
 
     /// When free-form sending stops being allowed.
@@ -182,14 +223,16 @@ impl OpenWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundWhatsapp {
     /// Free text. Requires an open window — see [`OpenWindow`].
+    ///
+    /// **No `to`, and the absence is the point.** The recipient is
+    /// [`OpenWindow::peer`], so a window derived for one number cannot address
+    /// free text to another: there is nowhere to write the second number down.
     FreeForm {
         /// The employee's own WhatsApp sender.
         from: E164,
-        /// The counterparty.
-        to: E164,
         /// Body text, already rendered.
         body: String,
-        /// The proof the window was open.
+        /// The proof the window was open — and with whom.
         window: OpenWindow,
     },
     /// A pre-approved template. Always allowed, in or out of the window.
@@ -206,10 +249,13 @@ pub enum OutboundWhatsapp {
 }
 
 impl OutboundWhatsapp {
-    /// The counterparty, whichever variant this is.
+    /// The counterparty, whichever variant this is — off the window for free
+    /// text, off the message for a template, because a template needs no window
+    /// and may open a conversation.
     pub fn to(&self) -> &E164 {
         match self {
-            Self::FreeForm { to, .. } | Self::Template { to, .. } => to,
+            Self::FreeForm { window, .. } => window.peer(),
+            Self::Template { to, .. } => to,
         }
     }
 }
@@ -334,6 +380,21 @@ pub trait TelephonyProvider: Send + Sync {
     /// immediately before the send. A third copy would be a third place for the
     /// rule to drift; what belongs one layer up is deriving the window, which
     /// is `Effects::whatsapp_window`.
+    ///
+    /// # And an implementor MUST NOT re-check who it is for, because it cannot
+    ///
+    /// The other half of the same rule — *the window has to be the window with
+    /// this person* — is deliberately **not** an instruction to adapters, and
+    /// the difference is what makes one rule belong here and the other one in
+    /// the type. Expiry is a claim about *now*: its truth changes between the
+    /// layer that mints the proof and the wire, so only the last hop can settle
+    /// it. Identity does not change: `window.peer()` is either the recipient or
+    /// it is not, and it was decided the moment the value was built. A check
+    /// whose answer cannot move belongs at the earliest point that can make it,
+    /// and the earliest point is the type — [`OutboundWhatsapp::FreeForm`] has
+    /// no recipient beside the window's, so there is no pair left to compare
+    /// and no adapter, including the Meta one that does not exist yet, can
+    /// forget to.
     async fn send_whatsapp(
         &self,
         key: &IdempotencyKey,
@@ -1211,20 +1272,19 @@ mod tests {
     // -- the 24-hour window ------------------------------------------------
 
     #[test]
-    fn the_window_closes_24h_after_the_last_inbound() {
+    fn the_window_closes_24h_after_the_last_inbound_and_names_whose_it_is() {
         let last = at(T0);
-        assert!(OpenWindow::since_last_inbound(Some(last), at(T0 + 60)).is_some());
-        assert_eq!(
-            OpenWindow::since_last_inbound(Some(last), at(T0 + 60))
-                .unwrap()
-                .expires_at(),
-            at(T0) + TimeDelta::hours(24)
-        );
+        let them = E164::parse("+14158675309").unwrap();
+        assert!(OpenWindow::since_last_inbound(&them, Some(last), at(T0 + 60)).is_some());
+        let open = OpenWindow::since_last_inbound(&them, Some(last), at(T0 + 60)).unwrap();
+        assert_eq!(open.expires_at(), at(T0) + TimeDelta::hours(24));
+        // Whose window it is, which is the half an expiry alone cannot say.
+        assert_eq!(open.peer(), &them);
         // Exactly 24h later it is shut.
-        assert!(OpenWindow::since_last_inbound(Some(last), at(T0 + 86_400)).is_none());
-        assert!(OpenWindow::since_last_inbound(Some(last), at(T0 + 90_000)).is_none());
+        assert!(OpenWindow::since_last_inbound(&them, Some(last), at(T0 + 86_400)).is_none());
+        assert!(OpenWindow::since_last_inbound(&them, Some(last), at(T0 + 90_000)).is_none());
         // A conversation the customer never started is closed, not open.
-        assert!(OpenWindow::since_last_inbound(None, at(T0)).is_none());
+        assert!(OpenWindow::since_last_inbound(&them, None, at(T0)).is_none());
     }
 
     /// Outside the window, free text is not merely rejected — it cannot be
@@ -1237,7 +1297,7 @@ mod tests {
         let to = E164::parse("+14158675309").unwrap();
 
         // Closed: no token, so no free-form message exists to send.
-        assert!(OpenWindow::since_last_inbound(Some(at(T0 - 90_000)), at(T0)).is_none());
+        assert!(OpenWindow::since_last_inbound(&to, Some(at(T0 - 90_000)), at(T0)).is_none());
 
         // Only a template goes out.
         let template = OutboundWhatsapp::Template {
@@ -1254,25 +1314,27 @@ mod tests {
         );
 
         // Open: the token exists and free text is allowed.
-        let window = OpenWindow::since_last_inbound(Some(at(T0 - 60)), at(T0)).unwrap();
+        let window = OpenWindow::since_last_inbound(&to, Some(at(T0 - 60)), at(T0)).unwrap();
         let free = OutboundWhatsapp::FreeForm {
             from: from.clone(),
-            to: to.clone(),
             body: "on its way".to_owned(),
             window,
         };
         assert!(provider.send_whatsapp(&key("wa:2"), &free).await.is_ok());
+        // The recipient is the window's person and there is no other place it
+        // could come from — a window derived for `to` cannot address anybody
+        // else, which is why this variant has no `to` field to disagree with.
         assert_eq!(free.to(), &to);
 
         // A token that expired while the message sat in a queue is refused at
         // the wire, not silently sent as free text.
         // Open when the message was built at T0-60, shut by the time the mock
         // clock reaches T0.
-        let stale = OpenWindow::since_last_inbound(Some(at(T0 - 86_410)), at(T0 - 60)).unwrap();
+        let stale =
+            OpenWindow::since_last_inbound(&to, Some(at(T0 - 86_410)), at(T0 - 60)).unwrap();
         assert!(stale.expires_at() <= at(T0));
         let late = OutboundWhatsapp::FreeForm {
             from,
-            to,
             body: "on its way".to_owned(),
             window: stale,
         };

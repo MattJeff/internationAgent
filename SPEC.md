@@ -466,8 +466,11 @@ the deadline exists.
 The send side has one piece of real machinery: the **24-hour customer-service
 window is a type, not a check.** `OutboundWhatsapp::FreeForm` carries an
 `OpenWindow`, and an `OpenWindow` can only be obtained while the window is
-genuinely open. A free-text send outside the window is not a runtime error — it
-is unspellable. **Template management and opt-out tracking are NOT BUILT.**
+genuinely open **and it names the counterparty it was opened with** — the
+variant has no recipient of its own, so one person's window carrying free text
+to another is unspellable too. A free-text send outside the window is not a
+runtime error — it is unspellable. **Template management and opt-out tracking
+are NOT BUILT.**
 
 ---
 

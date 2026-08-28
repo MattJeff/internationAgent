@@ -5919,7 +5919,7 @@ mod tests {
                     .await
                     .expect("read the clock");
                 tx.commit().await.expect("commit read");
-                (last, OpenWindow::since_last_inbound(last, at))
+                (last, OpenWindow::since_last_inbound(&who, last, at))
             }
         };
 
@@ -5977,6 +5977,9 @@ mod tests {
         );
         let open = window.expect("23h59 is inside the window");
         assert_eq!(open.expires_at(), wrote_at + OpenWindow::DURATION);
+        // Whose window it is, and it is not the SMS sender or our own number:
+        // the proof carries the counterparty so it cannot be spent on another.
+        assert_eq!(open.peer(), &them);
         // The fixture really does straddle the threshold — a constant that
         // never crossed it would make the two assertions below agree for the
         // wrong reason.
@@ -5986,11 +5989,12 @@ mod tests {
         // Exactly 24 hours is shut. `since_last_inbound` tests `>` and not
         // `>=`, and the difference is one legal message.
         assert!(
-            OpenWindow::since_last_inbound(last, wrote_at + Duration::hours(24)).is_none(),
+            OpenWindow::since_last_inbound(&them, last, wrote_at + Duration::hours(24)).is_none(),
             "the boundary instant itself was treated as open"
         );
         assert!(
             OpenWindow::since_last_inbound(
+                &them,
                 last,
                 wrote_at + Duration::hours(24) + Duration::minutes(1)
             )

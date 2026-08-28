@@ -231,8 +231,19 @@ pub const UNSERVED: [(ActionKind, &str); 11] = [
          `0069` wired the telephony ingest, an inbound WhatsApp message is a dated `messages` row \
          on a thread, and `Effects::whatsapp_window` reads it and mints the `OpenWindow` that \
          `RenderedWhatsapp::FreeForm` needs — which until then could be obtained nowhere outside \
-         a test. So the ordinary case, answering somebody who wrote to us in the last 24 hours, \
-         is built end to end and this entry is the only thing between an employee and it. What is \
+         a test, and which now names the counterparty it was minted for, so a real window with \
+         one number cannot carry free text to another. So the ordinary case, answering somebody \
+         who wrote to us in the last 24 hours, is built end to end. **This entry is NOT the only \
+         thing between an employee and it**, and the sentence that said so was wrong in both \
+         directions at once: it undersold the protection and oversold what switching the verb on \
+         would cost. `store::policy::default_ceiling` grants `{Email, Internal, Web}` and no \
+         calling code at all, so on the shipped ceiling `always_denies(WhatsappSend)` is true \
+         twice over — the schema is not even offered to a turn — and layers only narrow, so no \
+         tenant can widen it back. Deleting this entry and applying the row below would therefore \
+         *not* open the verb; an operator's ceiling has to grant `Channel::Whatsapp` and a \
+         calling code as well, which is a separate decision nobody has taken. What this entry \
+         withholds is the tool. What the ceiling withholds is the act, and the `CallPlace` entry \
+         below has always said so about voice. What is \
          left is the *closed*-window case: outside 24 hours the only legal message is a \
          pre-approved template, and this workspace has no template registry to name one from — \
          nor could it invent one, since a template is an object in a console nobody here has \

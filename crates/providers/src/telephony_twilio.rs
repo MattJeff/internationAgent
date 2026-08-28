@@ -531,12 +531,7 @@ impl TelephonyProvider for TwilioTelephony {
         message: &OutboundWhatsapp,
     ) -> Result<ProviderMessageId, ProviderError> {
         let form = match message {
-            OutboundWhatsapp::FreeForm {
-                from,
-                to,
-                body,
-                window,
-            } => {
+            OutboundWhatsapp::FreeForm { from, body, window } => {
                 // The token proved the window was open when the message was
                 // built. It can still have expired while the send sat in a
                 // queue, and free text after that is a policy violation, not a
@@ -546,9 +541,13 @@ impl TelephonyProvider for TwilioTelephony {
                         code: "window_closed",
                     });
                 }
+                // The recipient is the window's own person. There is no second
+                // number on this variant to prefer, which is what stops a
+                // genuine window with one customer from carrying free text to
+                // another — see `OpenWindow`.
                 vec![
                     ("From", format!("whatsapp:{from}")),
-                    ("To", format!("whatsapp:{to}")),
+                    ("To", format!("whatsapp:{}", window.peer())),
                     ("Body", body.clone()),
                 ]
             }
@@ -655,6 +654,12 @@ mod tests {
         purchases: usize,
         /// Message POSTs that reached the wire.
         messages: usize,
+        /// The whole form of the last message POST. A count says a message went
+        /// out; only the form says **to whom**, and for free-form WhatsApp the
+        /// recipient is now read off the window rather than off a field of its
+        /// own — a swap there would send a real reply to the wrong person and
+        /// leave every count in this file unchanged.
+        last_message_form: Option<BTreeMap<String, String>>,
         /// The `Twiml` of every call POST that reached the wire, in order.
         /// What a call *says* is the whole question this build answers with
         /// silence, so the assertion is on the body and not on a count.
@@ -830,6 +835,7 @@ mod tests {
             }
             ("POST", p) if p.ends_with("/Messages.json") => {
                 state.messages += 1;
+                state.last_message_form = Some(request.form.clone());
                 (201, json!({"sid": format!("SM{:016}", state.messages)}))
             }
             ("POST", p) if p.ends_with("/Calls.json") => {
@@ -1465,7 +1471,6 @@ mod tests {
         let to = E164::parse("+14158675309").expect("e164");
         let free = |window| OutboundWhatsapp::FreeForm {
             from: from.clone(),
-            to: to.clone(),
             body: "on its way".to_owned(),
             window,
         };
@@ -1473,19 +1478,37 @@ mod tests {
         // Minted a minute ago against a message from a minute before that: open
         // now, and it goes.
         let now = Utc::now();
-        let open = OpenWindow::since_last_inbound(Some(now - TimeDelta::minutes(2)), now)
+        let open = OpenWindow::since_last_inbound(&to, Some(now - TimeDelta::minutes(2)), now)
             .expect("two minutes is inside the window");
         client
             .send_whatsapp(&key("wa:open"), &free(open))
             .await
             .expect("an open window sends");
         assert_eq!(twilio.state().messages, 1);
+        // **Whose number is on the wire**, which the count above cannot say.
+        // The recipient of free text is the window's person and there is no
+        // other field it could come from; an adapter that put the employee's
+        // own sender here would still POST exactly one message.
+        let form = twilio
+            .state()
+            .last_message_form
+            .clone()
+            .expect("the fake saw the POST");
+        assert_eq!(
+            form.get("To").map(String::as_str),
+            Some(format!("whatsapp:{to}").as_str())
+        );
+        assert_eq!(
+            form.get("From").map(String::as_str),
+            Some(format!("whatsapp:{from}").as_str())
+        );
 
         // Minted while it was genuinely open — `since_last_inbound` would hand
         // back `None` otherwise and there would be nothing to test — and
         // expired by the time we send. This is the queue, expressed.
         let then = now - TimeDelta::hours(23);
         let stale = OpenWindow::since_last_inbound(
+            &to,
             Some(then - TimeDelta::hours(23) - TimeDelta::minutes(59)),
             then,
         )
