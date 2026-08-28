@@ -970,6 +970,15 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
         //      that is not a special case to work around, it is the taint stop
         //      restated in the type system. See that method's docs.
         //
+        //      `InvoiceDraft` grew two fields in 0071 and the schema above
+        //      deliberately does not offer either. `due_at` is a payment term
+        //      somebody agreed with the customer and a model does not know it,
+        //      so the arm passes `None`; `lines` are the document's itemisation
+        //      and the schema has one `memo` because a model that can invent
+        //      line amounts can invent a total that is not the one on the
+        //      token. Both are the founder's to open, and opening them is a
+        //      schema change with the pins that implies.
+        //
         // WHAT IS TRUE UNTIL THEN, SAID PLAINLY
         //
         // Nothing. Unlike the two rows below, `Turn::propose` matches no such

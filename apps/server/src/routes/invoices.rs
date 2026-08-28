@@ -17,8 +17,13 @@
 //! An operator route here would be that second path — a demand for money with no
 //! decision behind it, indistinguishable in the table from one an employee was
 //! authorised to make. `work_items` accepted exactly that ambiguity and paid for
-//! it with `0064`'s `posted_by` column; this table declines it up front, which
-//! is why `invoices.issued_by` is NOT NULL.
+//! it with `0064`'s `posted_by` column; this table declines it up front.
+//!
+//! `invoices.issued_by` stopped being NOT NULL in
+//! `migrations/0071_an_invoice_needs_a_number.sql` and this paragraph did not
+//! weaken: the null is not "an operator issued this", it is "this row is a
+//! credit note", which `invoices_issuer_or_correction` makes the *same* fact
+//! rather than a second one. Issuing is still an employee's only.
 //!
 //! The cost is real and is the founder's to switch on: until the `issue_invoice`
 //! tool row lands in `agentos_app::turn::catalogue` — written out there
@@ -69,6 +74,7 @@ pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/invoices", get(register))
         .route("/v1/invoices/{id}/paid", post(paid))
+        .route("/v1/invoices/{id}/credit", post(credit))
         .with_state(db)
 }
 
@@ -80,29 +86,65 @@ pub fn router(db: Db) -> Router {
 #[derive(Serialize)]
 struct InvoiceView {
     id: Uuid,
+    /// The number a customer quotes, gap-free inside this company.
+    number: i64,
     /// The won deal it bills.
     opportunity_id: Uuid,
-    /// The seat that issued it.
-    issued_by: Uuid,
+    /// The seat that issued it, and null on a credit note — those are written
+    /// by an operator, not by a seat.
+    issued_by: Option<Uuid>,
+    /// Set on a credit note, and it *is* what makes this row one: the invoice
+    /// this document withdraws part or all of.
+    corrects_invoice_id: Option<Uuid>,
+    /// Positive on a credit note too. The direction is `corrects_invoice_id`.
     amount_minor: u64,
     currency: &'static str,
     memo: String,
     issued_at: DateTime<Utc>,
+    /// When payment is due. Null when no term was agreed; this product invents
+    /// none.
+    due_at: Option<DateTime<Utc>>,
     /// When somebody declared the money had arrived. Null is outstanding.
     paid_at: Option<DateTime<Utc>>,
+    lines: Vec<LineView>,
+}
+
+/// One line of a document.
+///
+/// `tax_rate_bp` is reported and never used: nothing in this product multiplies
+/// a rate by an amount, because whether tax rounds per line or per band is a
+/// jurisdiction's rule and a total computed by the wrong one is worse than no
+/// total. See `migrations/0071_an_invoice_needs_a_number.sql`.
+#[derive(Serialize)]
+struct LineView {
+    description: String,
+    amount_minor: i64,
+    tax_rate_bp: Option<i32>,
 }
 
 impl From<invoices::Invoice> for InvoiceView {
     fn from(invoice: invoices::Invoice) -> Self {
         Self {
             id: invoice.id.as_uuid(),
+            number: invoice.number,
             opportunity_id: invoice.opportunity_id,
-            issued_by: invoice.issued_by.as_uuid(),
+            issued_by: invoice.issued_by.map(|seat| seat.as_uuid()),
+            corrects_invoice_id: invoice.corrects_invoice_id.map(|id| id.as_uuid()),
             amount_minor: invoice.amount.minor(),
             currency: invoice.amount.currency().code(),
             memo: invoice.memo,
             issued_at: invoice.issued_at,
+            due_at: invoice.due_at,
             paid_at: invoice.paid_at,
+            lines: invoice
+                .lines
+                .into_iter()
+                .map(|line| LineView {
+                    description: line.description,
+                    amount_minor: line.amount_minor,
+                    tax_rate_bp: line.tax_rate_bp,
+                })
+                .collect(),
         }
     }
 }
@@ -122,19 +164,45 @@ async fn register(State(db): State<Db>, principal: Principal) -> Result<Response
     let all = invoices::register(&mut tx).await?;
     tx.rollback().await?;
 
+    // What each invoice has been credited, so the total below is net. A credit
+    // note is a positive figure pointing at the invoice it withdraws — see
+    // `migrations/0071_an_invoice_needs_a_number.sql` — and this is the one
+    // place in the product that applies the sign.
+    let mut credited: std::collections::HashMap<Uuid, u64> = std::collections::HashMap::new();
+    for note in &all {
+        if let Some(corrected) = note.corrects_invoice_id {
+            let entry = credited.entry(corrected.as_uuid()).or_default();
+            *entry = entry.saturating_add(note.amount.minor());
+        }
+    }
+
     let mut outstanding: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     for invoice in &all {
-        if invoice.paid_at.is_none() {
-            // Saturating, and it is not laziness: the alternative is a 500 on a
-            // read, and a register that refuses to display itself because the
-            // total overflowed a u64 is worse than a total that is visibly
-            // wrong. Nothing branches on this number.
-            let entry = outstanding
-                .entry(invoice.amount.currency().code())
-                .or_default();
-            *entry = entry.saturating_add(invoice.amount.minor());
+        // Credit notes are not owed to anybody and settled invoices are not
+        // owed any more. A credit note against an invoice that was *already
+        // paid* is a refund the company owes its customer, which this register
+        // does not track and does not pretend to: it is left out of both sides.
+        if invoice.corrects_invoice_id.is_some() || invoice.paid_at.is_some() {
+            continue;
         }
+        let owed = invoice.amount.minor().saturating_sub(
+            credited
+                .get(&invoice.id.as_uuid())
+                .copied()
+                .unwrap_or_default(),
+        );
+        if owed == 0 {
+            continue;
+        }
+        // Saturating, and it is not laziness: the alternative is a 500 on a
+        // read, and a register that refuses to display itself because the
+        // total overflowed a u64 is worse than a total that is visibly
+        // wrong. Nothing branches on this number.
+        let entry = outstanding
+            .entry(invoice.amount.currency().code())
+            .or_default();
+        *entry = entry.saturating_add(owed);
     }
 
     Ok(Json(json!({
@@ -175,6 +243,77 @@ async fn paid(
     tx.commit().await?;
 
     Ok(Json(json!({ "id": id, "state": "paid" })).into_response())
+}
+
+/// What a credit note says. The currency is not in it: a credit note is
+/// denominated by the invoice it corrects, so a second answer here could only
+/// disagree with the first.
+#[derive(serde::Deserialize)]
+struct CreditBody {
+    /// In the corrected invoice's currency, and no larger than it.
+    amount_minor: u64,
+    /// Why. One line, 1..=200 characters, `invoices_memo_shape`'s bound.
+    memo: String,
+}
+
+/// `POST /v1/invoices/{id}/credit` — withdraw part or all of an issued invoice.
+///
+/// # Why this one *is* an operator's route when `POST /v1/invoices` is not
+///
+/// The module docs above refuse an operator route that **issues**, because a
+/// demand for money with no ruling behind it is indistinguishable in the table
+/// from one an employee was authorised to make. A credit note is the other
+/// direction and the argument does not transfer: it creates no obligation on
+/// anybody, it only withdraws one this company already made.
+///
+/// What *does* transfer is `paid_at`'s separation of duties, and it is the
+/// reason this is not an `ActionKind`: **the seat that issues an invoice must
+/// not be the thing that can erase it.** An employee able to credit its own
+/// receivables has a clean ledger and no revenue, and nobody reading the
+/// register would see the difference. So the authority here is the same one
+/// that records a settlement — an API key, not a principal the gate rules on —
+/// and `invoices.issued_by` is null on the row that results, which 0071's
+/// `invoices_issuer_or_correction` makes exactly equivalent to "this is a
+/// credit note".
+///
+/// 404 when the invoice is not this company's, does not exist, is itself a
+/// credit note, or is smaller than the amount being withdrawn. 409 when it has
+/// already been credited: 0071 allows one credit note per invoice, and that is
+/// a unique index rather than a check somebody reads too early — two callers
+/// crediting at the same instant cannot both win.
+async fn credit(
+    State(db): State<Db>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreditBody>,
+) -> Result<Response, ApiError> {
+    let note = InvoiceId::new_v7(Utc::now());
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let written = invoices::credit(
+        &mut tx,
+        note,
+        InvoiceId::from_uuid(id),
+        body.amount_minor,
+        &body.memo,
+    )
+    .await;
+    match written {
+        Ok(issued) => {
+            tx.commit().await?;
+            Ok(Json(InvoiceView::from(issued)).into_response())
+        }
+        Err(err) => {
+            // Rolled back rather than dropped: a refused credit note must take
+            // the number it would have claimed with it, which is the whole
+            // point of claiming it in the same statement.
+            tx.rollback().await?;
+            Err(match err {
+                agentos_store::db::StoreError::NotFound => ApiError::not_found()
+                    .with_detail("no invoice by that id in this company that can be credited"),
+                other => ApiError::from(other),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -226,12 +365,35 @@ mod tests {
         }
 
         async fn send(&self, method: &str, uri: &str, secret: &str) -> (StatusCode, Value) {
+            self.send_body(method, uri, secret, Body::empty()).await
+        }
+
+        /// The same request with a JSON body, for the one route that takes one.
+        async fn send_json(
+            &self,
+            method: &str,
+            uri: &str,
+            secret: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            self.send_body(method, uri, secret, Body::from(body.to_string()))
+                .await
+        }
+
+        async fn send_body(
+            &self,
+            method: &str,
+            uri: &str,
+            secret: &str,
+            body: Body,
+        ) -> (StatusCode, Value) {
             let req = HttpRequest::builder()
                 .method(method)
                 .uri(uri)
                 .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .header(header::CONTENT_TYPE, "application/json")
                 .header("idempotency-key", Uuid::now_v7().to_string())
-                .body(Body::empty())
+                .body(body)
                 .expect("request");
             let response = self.app.clone().oneshot(req).await.expect("service");
             let status = response.status();
@@ -272,10 +434,10 @@ mod tests {
         )
         .bind(employee.as_uuid())
         .bind(tenant.as_uuid())
-        .bind(format!(
-            "lena-{}",
-            &employee.as_uuid().simple().to_string()[..8]
-        ))
+        // The whole uuid and not a prefix of it: a v7's leading hex digits are
+        // the clock, so two seats minted in the same second inside one test
+        // collided on `employees_tenant_slug_key`.
+        .bind(format!("lena-{}", employee.as_uuid().simple()))
         .execute(&mut *tx)
         .await
         .expect("employee");
@@ -307,11 +469,20 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         invoices::issue(
             &mut tx,
-            id,
-            opportunity,
-            employee,
-            Money::new(120_000, Currency::Eur).expect("nonzero"),
-            "March",
+            invoices::Draft {
+                id,
+                opportunity_id: opportunity,
+                issued_by: employee,
+                amount: Money::new(120_000, Currency::Eur).expect("nonzero"),
+                memo: "March",
+                due_at: None,
+                lines: &[invoices::Line {
+                    description: "One month of the service".to_owned(),
+                    amount_minor: 120_000,
+                    // The founder's, and null until they say: see 0071.
+                    tax_rate_bp: None,
+                }],
+            },
         )
         .await
         .expect("issue");
@@ -367,5 +538,110 @@ mod tests {
         // The register still shows it: what came in is half of what a founder
         // reads at the end of a month.
         assert_eq!(body["invoices"].as_array().expect("array").len(), 1);
+    }
+
+    /// **The correction, end to end**: what the founder can do about an invoice
+    /// that went out wrong, now that editing it is still impossible.
+    ///
+    /// Four refusals and one acceptance, and the interesting one is the last:
+    /// crediting twice is a 409 rather than a second document, because 0071
+    /// makes it a unique index instead of a sum somebody read too early.
+    #[tokio::test]
+    async fn a_credit_note_withdraws_part_of_a_demand_and_nets_the_register() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the register needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let invoice = issued(&db, h.a).await;
+        let uri = format!("/v1/invoices/{}/credit", invoice.as_uuid());
+
+        // The invoice as issued: number one of this company's run, with the one
+        // line it is made of and no tax rate on it.
+        let (_, body) = h.send("GET", "/v1/invoices", SECRET_A).await;
+        assert_eq!(body["invoices"][0]["number"], json!(1));
+        assert_eq!(
+            body["invoices"][0]["lines"][0]["amount_minor"],
+            json!(120_000)
+        );
+        assert_eq!(body["invoices"][0]["lines"][0]["tax_rate_bp"], Value::Null);
+        assert_eq!(body["invoices"][0]["due_at"], Value::Null);
+
+        // Another company cannot credit what it was never owed.
+        let (status, _) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_B,
+                json!({"amount_minor": 1, "memo": "theirs"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Nor can this one credit more than it asked for.
+        let (status, _) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 120_001, "memo": "too much"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, note) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 20_000, "memo": "Two seats were never provisioned"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{note}");
+        assert_eq!(note["number"], json!(2), "one run, both documents");
+        assert_eq!(note["corrects_invoice_id"], json!(invoice.as_uuid()));
+        assert_eq!(
+            note["issued_by"],
+            Value::Null,
+            "a credit note is an operator's act, not a seat's"
+        );
+
+        let (_, body) = h.send("GET", "/v1/invoices", SECRET_A).await;
+        assert_eq!(
+            body["invoices"].as_array().expect("array").len(),
+            2,
+            "a corrected invoice is not removed; the correction sits beside it"
+        );
+        assert_eq!(
+            body["outstanding_minor"]["EUR"],
+            json!(100_000),
+            "what is owed is what was demanded less what was withdrawn"
+        );
+
+        // Twice is a conflict and not a second document.
+        let (status, _) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 1, "memo": "again"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // And the run has no hole where the three refusals were: the next
+        // document this company issues is number three.
+        let next = issued(&db, h.a).await;
+        let (_, body) = h.send("GET", "/v1/invoices", SECRET_A).await;
+        let numbers: Vec<_> = body["invoices"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|invoice| invoice["number"].clone())
+            .collect();
+        assert_eq!(numbers, vec![json!(1), json!(2), json!(3)]);
+        let _ = next;
     }
 }
