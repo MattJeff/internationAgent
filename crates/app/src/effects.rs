@@ -58,9 +58,10 @@ use agentos_providers::telephony::{
 };
 use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
-use agentos_store::db::{Db, StoreError};
+use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::invoices;
 use agentos_store::org;
+use agentos_store::provisioning;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
@@ -191,6 +192,29 @@ pub const UNKNOWN_ZONE: &str = "unknown_zone";
 /// than about this deployment — see [`crate::calendar::CalendarError::SubjectShape`],
 /// which argues why the check lives in the adapter and not here.
 pub const BAD_SUBJECT: &str = "bad_subject";
+
+/// The last error a rate-limited send is filed under.
+///
+/// `429` is an answer: the provider read the request and declined to act on it,
+/// so the intent is `failed` and not left ambiguous. It sits beside
+/// [`ProviderError::code`]'s own spelling on purpose — the same word for the
+/// same fact, in the column an operator reads.
+const RATE_LIMITED: &str = "rate_limited";
+
+/// What a send's write-ahead row names as its provider: the **port**, not the
+/// vendor bound behind it.
+///
+/// The same two spellings `crate::provisioning::adapter_of` already uses for the
+/// same two ports, so an operator reading `provider_intents` sees one vocabulary
+/// whether the row came from a provisioning step or from a send. Deliberately
+/// not `telephony::PROVIDER` (`"twilio"`) or `ResendEmailProvider::PROVIDER`:
+/// which adapter is installed is deployment configuration, this row outlives the
+/// deployment, and a row that says `twilio` when a mock was bound is a row that
+/// lies to whoever goes looking in the Twilio console.
+const TELEPHONY_PORT: &str = "telephony";
+
+/// The email port, for [`TELEPHONY_PORT`]'s reasons.
+const EMAIL_PORT: &str = "email";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -835,6 +859,10 @@ impl Effects {
     }
 
     /// Send the rendered email to the address on the token.
+    ///
+    /// Fenced by [`Self::begin_send`] and [`Self::record_sent`] — a row committed
+    /// before the request leaves and closed after it is answered. Read
+    /// [`SEND_UNSETTLED`] for exactly how much that is worth.
     pub async fn send_email<A: Subject<Of = EmailSend>>(
         &self,
         ok: Authorized<A>,
@@ -850,13 +878,12 @@ impl Effects {
             in_reply_to: body.in_reply_to,
         };
 
-        let sent = self
-            .ports
-            .email
-            .send(&self.key_for(&ok), &email)
-            .await
-            .map_err(EffectError::Provider);
-        self.record(&ok, message_detail(&sent), sent).await
+        // `?`, and no audit row on this arm: the only way this fails is the
+        // database being unreachable, at which point `record` cannot write one
+        // either. Nothing has been sent, which is the state the failure leaves.
+        self.begin_send(&ok, EMAIL_PORT).await?;
+        let sent = self.ports.email.send(&self.key_for(&ok), &email).await;
+        self.record_sent(&ok, sent).await
     }
 
     /// Put the prospect on the token onto the sending platform's list.
@@ -943,6 +970,24 @@ impl Effects {
     }
 
     /// Send the rendered SMS to the number on the token.
+    ///
+    /// # The double-text, and which half of it this fence actually catches
+    ///
+    /// Twilio's `POST /Messages` takes no idempotency header. When the request
+    /// leaves and the answer never comes back, `TwilioTelephony` returns a
+    /// retryable error whose own documentation says *"the request may even have
+    /// landed"*. Whoever retries then texts the customer a second time, and
+    /// **this fence does not stop them** — the retry comes with a new ruling and
+    /// a new key, and there is no query on this planet that would tell us
+    /// whether the first one arrived.
+    ///
+    /// What it does is make the ambiguity *exist somewhere*. A row is committed
+    /// before the POST and closed after the answer; a send that got no answer is
+    /// left `in_flight` on purpose, and `GET /v1/employees/{id}` renders it as
+    /// `unsettled_calls` for a person to settle against Twilio's own console.
+    /// Before this, a text that may or may not have gone out left nothing behind
+    /// but a retryable error nobody was reading. That is the whole of the
+    /// improvement, and it is not "cannot double-text".
     pub async fn send_sms<A: Subject<Of = SmsSend>>(
         &self,
         ok: Authorized<A>,
@@ -954,13 +999,13 @@ impl Effects {
             body: body.body,
         };
 
+        self.begin_send(&ok, TELEPHONY_PORT).await?;
         let sent = self
             .ports
             .telephony
             .send_sms(&self.key_for(&ok), &sms)
-            .await
-            .map_err(EffectError::Provider);
-        self.record(&ok, message_detail(&sent), sent).await
+            .await;
+        self.record_sent(&ok, sent).await
     }
 
     /// Whether this employee may write free text to this number on WhatsApp
@@ -1048,6 +1093,8 @@ impl Effects {
     }
 
     /// Send the rendered WhatsApp message to the number on the token.
+    ///
+    /// Same fence and the same bounded promise as [`Self::send_sms`].
     pub async fn send_whatsapp<A: Subject<Of = WhatsappSend>>(
         &self,
         ok: Authorized<A>,
@@ -1055,13 +1102,13 @@ impl Effects {
     ) -> Result<ProviderMessageId, EffectError> {
         let message = body.addressed_to(ok.action().subject().to.clone());
 
+        self.begin_send(&ok, TELEPHONY_PORT).await?;
         let sent = self
             .ports
             .telephony
             .send_whatsapp(&self.key_for(&ok), &message)
-            .await
-            .map_err(EffectError::Provider);
-        self.record(&ok, message_detail(&sent), sent).await
+            .await;
+        self.record_sent(&ok, sent).await
     }
 
     /// Ring the number on the token, from this employee's own number.
@@ -1112,17 +1159,17 @@ impl Effects {
             to: ok.action().subject().to.clone(),
         };
 
+        self.begin_send(&ok, TELEPHONY_PORT).await?;
         let placed = self
             .ports
             .telephony
             .place_call(&self.key_for(&ok), &call)
-            .await
-            .map_err(EffectError::Provider);
+            .await;
         // `message_detail`'s `provider_message_id`, reused rather than spelled
         // a second way: it is the id the provider handed back, which is what
         // the key means, and the row's own `effect` field already says a call
         // is what it was handed back for.
-        self.record(&ok, message_detail(&placed), placed).await
+        self.record_sent(&ok, placed).await
     }
 
     /// Run one browser step in an existing session.
@@ -2418,6 +2465,67 @@ impl Effects {
         )
     }
 
+    /// Write, **and commit**, "a request under this ruling is about to leave for
+    /// `provider`" — before it does.
+    ///
+    /// # This is the frontier, and the commit is the whole of it
+    ///
+    /// [`Self::record`] opens its transaction *after* the provider has answered,
+    /// which is correct and is not enough: the interesting failure is the one
+    /// where no answer arrives, and in that failure `record` is never reached.
+    /// Everything this system knew about the request dies with the process. So
+    /// there are two writes around every send now — this one, committed before
+    /// the request leaves, and [`Self::record_sent`]'s, committed after — and a
+    /// crash between them leaves an `in_flight` row instead of silence.
+    ///
+    /// # What it does **not** do: refuse a second send
+    ///
+    /// There is no "this ruling already sent something" branch here, and adding
+    /// one would be a guard on a door nobody can open. [`Self::key_for`] derives
+    /// the key from the ruling's `decision_id`; every mint of an
+    /// [`Authorized`] takes a fresh `DecisionId::new_v7`, the token is not
+    /// `Clone`, and each send method consumes it **by value** — so two requests
+    /// can never present the same key, and a branch keyed on finding a prior row
+    /// could never run. A refusal code that cannot fire is worse than no code at
+    /// all: it reads, to the next person, as a promise that duplicates are
+    /// impossible.
+    ///
+    /// They are not. The realistic double-send is a crashed turn retried under a
+    /// *new* ruling, which arrives here with a new key and gets a second row. It
+    /// is not stopped, it is **recorded** — see [`Self::record_sent`] for what is
+    /// left behind, and `GET /v1/employees/{id}`'s `unsettled_calls` for who
+    /// reads it. If a caller ever does reuse a key, the insert hits
+    /// `provider_intents_tenant_key_idx`, this returns
+    /// [`EffectError::Unavailable`], and nothing leaves — which is the outcome
+    /// the branch would have wanted, obtained from a constraint that cannot rot.
+    ///
+    /// `provider` is the port — `telephony`, `email` — spelled the way
+    /// `crate::provisioning::adapter_of` spells it, because which vendor is
+    /// bound behind that port is deployment configuration and the row outlives
+    /// it.
+    async fn begin_send<A: Subject>(
+        &self,
+        ok: &Authorized<A>,
+        provider: &str,
+    ) -> Result<(), EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        provisioning::begin_send_intent(
+            &mut tx,
+            self.principal.employee_id,
+            provider,
+            ok.action().to_action().kind().as_str(),
+            &self.key_for(ok),
+            Utc::now(),
+        )
+        .await
+        .map_err(EffectError::Unavailable)?;
+        tx.commit().await.map_err(EffectError::Unavailable)
+    }
+
     /// One audit row per attempt, plus the reservation bookkeeping, in one
     /// transaction.
     ///
@@ -2439,7 +2547,85 @@ impl Effects {
             .tenant_tx(self.principal.tenant_id)
             .await
             .map_err(EffectError::Unavailable)?;
+        self.book_effect(&mut tx, ok, detail, &outcome, now).await?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        outcome
+    }
 
+    /// [`Self::record`], plus closing the row [`Self::begin_send`] committed —
+    /// in the same transaction, so the audit trail and the intent log cannot
+    /// disagree about what happened.
+    ///
+    /// # The classification is the honest part
+    ///
+    /// Only the caller of a provider knows the difference between "it said no"
+    /// and "it never said anything", and that difference is the entire value of
+    /// the row. So the match below is total over [`ProviderError`] and there is
+    /// no `_` arm: a fifth variant has to be classified by whoever adds it.
+    ///
+    /// * [`ProviderError::Terminal`] and [`ProviderError::RateLimited`] are
+    ///   **answers**. The provider read the request and declined; nothing was
+    ///   sent, and the row is settled `failed` so it stops asking for attention.
+    /// * [`ProviderError::Retryable`] is a timeout or a 5xx, which is exactly
+    ///   the case `telephony_twilio` documents as *"the request may even have
+    ///   landed"*. Nothing is written. The row stays `in_flight`, which is the
+    ///   only true statement about it.
+    /// * [`ProviderError::PendingExternal`] is filed with the timeout and not
+    ///   with the refusals, deliberately: it means somebody outside must act
+    ///   before the resource is usable, it carries no message id, and a send
+    ///   cannot produce one at all — so if one ever arrives here, an adapter is
+    ///   doing something this method has no honest answer for, and leaving the
+    ///   row for a person is the answer that does not invent one.
+    ///
+    /// It takes the port's own `Result` rather than an [`EffectError`] because
+    /// that is what makes the match total: by the time an error has been widened
+    /// to `EffectError` the refusals this method must not settle — including
+    /// [`Self::begin_send`]'s own — are indistinguishable from the provider's.
+    async fn record_sent<A: Subject>(
+        &self,
+        ok: &Authorized<A>,
+        sent: Result<ProviderMessageId, ProviderError>,
+    ) -> Result<ProviderMessageId, EffectError> {
+        let now = Utc::now();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+
+        // `None` is the case this whole fence exists for, and it writes nothing.
+        if let Some(answer) = match &sent {
+            Ok(id) => Some(Ok(id.as_str())),
+            Err(ProviderError::Terminal { code }) => Some(Err(*code)),
+            Err(ProviderError::RateLimited { .. }) => Some(Err(RATE_LIMITED)),
+            Err(ProviderError::Retryable { .. } | ProviderError::PendingExternal { .. }) => None,
+        } {
+            provisioning::settle_send_intent(&mut tx, &self.key_for(ok), answer, now)
+                .await
+                .map_err(EffectError::Unavailable)?;
+        }
+
+        let sent = sent.map_err(EffectError::Provider);
+        self.book_effect(&mut tx, ok, message_detail(&sent), &sent, now)
+            .await?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        sent
+    }
+
+    /// The reservation bookkeeping and the audit row, in a transaction the
+    /// caller opens and commits.
+    ///
+    /// Extracted so [`Self::record_sent`] can put the intent's closing write in
+    /// the *same* transaction as the audit row rather than in a third one; the
+    /// body is byte-for-byte what [`Self::record`] used to do inline.
+    async fn book_effect<A: Subject, T>(
+        &self,
+        tx: &mut TenantTx<'_>,
+        ok: &Authorized<A>,
+        detail: Option<Value>,
+        outcome: &Result<T, EffectError>,
+        now: DateTime<Utc>,
+    ) -> Result<(), EffectError> {
         // Only a payment carries one, and it is the whole reason the gate's
         // docs call this module the executor: money that did not move must not
         // keep holding the day's headroom.
@@ -2450,7 +2636,7 @@ impl Effects {
                 // buckets charged — money that moved stays spent against the
                 // employee's day and against the team's. `spend::settle` flips
                 // the reservation row and touches no bucket at all.
-                spend::settle(&mut tx, reservation).await
+                spend::settle(tx, reservation).await
             } else {
                 // `org::release` and not `spend::release`, because the gate
                 // reserved through `org::reserve` and that charged **two**
@@ -2471,7 +2657,7 @@ impl Effects {
                 // `org::release` calls `spend::release` first, so the employee
                 // half is byte-for-byte what it was; an employee on no team is
                 // exactly the old behaviour.
-                org::release(&mut tx, reservation).await
+                org::release(tx, reservation).await
             };
             settled.map_err(EffectError::Unavailable)?;
         }
@@ -2481,7 +2667,7 @@ impl Effects {
             "effect".to_owned(),
             json!(ok.action().to_action().kind().as_str()),
         );
-        match &outcome {
+        match outcome {
             Ok(_) => {
                 payload.insert("outcome".to_owned(), json!("ok"));
             }
@@ -2507,12 +2693,10 @@ impl Effects {
                 now,
             )
         };
-        audit::append(&mut tx, &event)
+        audit::append(tx, &event)
             .await
-            .map_err(EffectError::Unavailable)?;
-        tx.commit().await.map_err(EffectError::Unavailable)?;
-
-        outcome
+            .map(drop)
+            .map_err(EffectError::Unavailable)
     }
 }
 
@@ -2580,6 +2764,7 @@ mod tests {
     use agentos_providers::{FaultMode, ProviderBinding};
     use agentos_store::org;
     use agentos_store::spend::SpendCaps;
+    use chrono::TimeDelta;
     use url::Url;
     use uuid::Uuid;
 
@@ -2759,7 +2944,21 @@ mod tests {
                 // `store::policy::default_ceiling` grants neither, layers only
                 // narrow, and this database has no platform layer at all. See
                 // `turn::UNSERVED`'s `CallPlace` entry.
-                allowed_channels: BTreeSet::from([Channel::Email, Channel::Web, Channel::Voice]),
+                // `Channel::Sms` joins them for the write-ahead tests below, and
+                // it is the same argument `Voice` makes one paragraph up, checked
+                // the same way rather than assumed: `SmsSend` appears in exactly
+                // two places in this crate — the `subject!` macro and
+                // `Effects::send_sms` — and no other test in this module
+                // authorises an SMS-shaped action, so this entry is read by the
+                // two that do and can make nothing else pass. `evaluate`'s
+                // `SmsSend` arm asks the channel *and* the calling code, so the
+                // `+1` below is load-bearing for it too.
+                allowed_channels: BTreeSet::from([
+                    Channel::Email,
+                    Channel::Web,
+                    Channel::Voice,
+                    Channel::Sms,
+                ]),
                 allowed_calling_codes: BTreeSet::from([
                     CallingCode::new(1).expect("+1 is a calling code")
                 ]),
@@ -3043,6 +3242,53 @@ mod tests {
 
     async fn open_deal(db: &Db, principal: &Principal) -> Uuid {
         deal(db, principal, "negotiation").await
+    }
+
+    /// One `provider_intents` row as the write-ahead tests read it:
+    /// `(intent_kind, provider, step, state, external_id, last_error)`.
+    ///
+    /// `step` is in here and is asserted NULL rather than ignored: it is the
+    /// column `store::provisioning::unsettled_calls` filters on to tell a send
+    /// apart from a provisioning step, so a send that quietly acquired one would
+    /// vanish from the reader while every other assertion stayed green.
+    type IntentRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// Every write-ahead row this seat has, oldest first.
+    async fn intent_rows(db: &Db, principal: &Principal) -> Vec<IntentRow> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let rows = sqlx::query_as(
+            "SELECT intent_kind, provider, step, state, external_id, last_error \
+               FROM provider_intents WHERE employee_id = $1 ORDER BY created_at, id",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read provider_intents");
+        tx.commit().await.expect("commit read");
+        rows
+    }
+
+    /// The reader an operator gets through `GET /v1/employees/{id}`, called
+    /// directly. `before` is the caller's grace: a request younger than it is
+    /// still in progress, not an ambiguity.
+    async fn unsettled(
+        db: &Db,
+        principal: &Principal,
+        before: DateTime<Utc>,
+    ) -> Vec<agentos_store::provisioning::UnsettledCall> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let calls = provisioning::unsettled_calls(&mut tx, principal.employee_id, before)
+            .await
+            .expect("read unsettled calls");
+        tx.commit().await.expect("commit read");
+        calls
     }
 
     /// Every `provider_call_attempted` row: `(decision_id, payload)`.
@@ -3366,6 +3612,202 @@ mod tests {
                 .expect("the read succeeds")
                 .is_none(),
             "a message from 25 hours ago left the window open"
+
+    /// A number the fixture policy grants, for the two write-ahead tests.
+    fn a_number() -> E164 {
+        E164::parse("+14158675309").expect("e164")
+    }
+
+    fn a_text(body: &str) -> RenderedSms {
+        RenderedSms {
+            from: E164::parse("+15005550006").expect("e164"),
+            body: body.to_owned(),
+        }
+    }
+
+    /// **The crash window, fabricated.** The request reaches the provider and
+    /// the answer never comes back.
+    ///
+    /// `FaultMode::FailAfterExternalSuccess` is this workspace's own word for
+    /// exactly that shape — the double records the send and *then* fails — and
+    /// `ProviderError::Retryable` is the variant `TwilioTelephony` produces for a
+    /// read timeout, whose own documentation says *"the request may even have
+    /// landed"*. So the error under test is the production one and not a
+    /// test-only stand-in.
+    ///
+    /// # What is asserted, and the sentence that is deliberately not asserted
+    ///
+    /// Not "the customer was not texted twice". Nothing in this system can say
+    /// that: Twilio's Messages API takes no idempotency key, the retry after a
+    /// crashed turn arrives under a fresh Policy Gate ruling and therefore a
+    /// fresh key, and there is no query that would settle it.
+    ///
+    /// What is asserted is that the send **left something behind**: a row whose
+    /// state is the honest one, still `in_flight` after the call returned,
+    /// carrying no external id it never received — and a reader that hands it to
+    /// a person once the grace has run out. Before this, a text that may or may
+    /// not have gone out left one retryable error nobody was reading.
+    #[tokio::test]
+    async fn a_send_whose_answer_never_came_back_is_left_on_the_record() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let phone = Arc::new(MockTelephony::new(Utc::now(), "token").with_fault(
+            FaultMode::FailAfterExternalSuccess(ProviderError::Retryable {
+                after: std::time::Duration::from_secs(1),
+            }),
+        ));
+        let effects = Effects::new(db.clone(), ports_dialling(phone.clone()), principal.clone());
+
+        let ok = gate(&db)
+            .authorize(&principal, SmsSend { to: a_number() })
+            .await
+            .expect("sms and +1 are both granted by the fixture policy");
+        let err = effects
+            .send_sms(ok, a_text("your delivery is late"))
+            .await
+            .expect_err("the answer never came back");
+        // The exact classification and not `is_err()`: an `Unavailable` from the
+        // write-ahead commit is also an error, and it would mean the request
+        // never left — the opposite of the case being fabricated.
+        assert_eq!(err.code(), "retryable");
+
+        let rows = intent_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "one request, one row: {rows:?}");
+        let (kind, provider, step, state, external_id, last_error) = &rows[0];
+        assert_eq!(kind, "sms_send");
+        assert_eq!(provider, "telephony");
+        assert_eq!(step.as_deref(), None, "a send is not a provisioning step");
+        assert_eq!(
+            state, "in_flight",
+            "a timeout is not a failure; the row must keep saying we do not know"
+        );
+        assert_eq!(external_id.as_deref(), None);
+        assert_eq!(
+            last_error.as_deref(),
+            None,
+            "there is no error to quote: the provider never said anything"
+        );
+
+        // The grace, crossed in both directions off the same row. A request that
+        // is merely in progress must not page anybody, and the same request must
+        // once its answer is overdue — a reader that always answered the same
+        // way would satisfy exactly one of these.
+        let now = Utc::now();
+        assert!(
+            unsettled(&db, &principal, now - TimeDelta::hours(1))
+                .await
+                .is_empty(),
+            "a send younger than the grace is in progress, not an ambiguity"
+        );
+        let waiting = unsettled(&db, &principal, now + TimeDelta::hours(1)).await;
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert_eq!(waiting[0].intent_kind, "sms_send");
+        assert_eq!(waiting[0].provider, "telephony");
+        // The key spells out the ruling, which is the join to the audit row that
+        // names the recipient. Nobody can settle a text without knowing who it
+        // was to.
+        let decision = effect_rows(&db, &principal).await[0]
+            .0
+            .expect("the effect row carries its ruling");
+        assert!(
+            waiting[0].idempotency_key.ends_with(&decision.to_string()),
+            "the key must lead back to the ruling: {}",
+            waiting[0].idempotency_key
+        );
+    }
+
+    /// The other half, and the one that keeps the reader worth reading: a
+    /// provider that **answered** settles its row and asks for nobody.
+    ///
+    /// Both answers are here because they are one decision seen from two sides.
+    /// A build that left every send `in_flight` would pass the test above and
+    /// turn `unsettled_calls` into a log of every message ever sent, which is
+    /// the state in which a person stops opening it — and then the one row that
+    /// mattered is in there too, unread.
+    ///
+    /// All three answers a provider can give are here, because they are one
+    /// decision seen from three sides:
+    ///
+    /// * `Ok` — the id is recorded, which is what a person reconciles against.
+    /// * `Terminal` (`empty_body`) — a request that reached the provider and
+    ///   produced nothing. Settled `failed`, with the provider's own code
+    ///   quoted, because that much is knowable.
+    /// * `RateLimited` — a `429`, which is **also an answer** and the arm most
+    ///   worth pinning: it is retryable, so the lazy reading files it with the
+    ///   timeout and leaves the row open. It is not the same thing. The provider
+    ///   read the request and declined to act on it; nothing was sent, nobody
+    ///   needs to look, and a throttled hour would otherwise fill this reader
+    ///   with rows that are not ambiguous at all.
+    #[tokio::test]
+    async fn a_provider_that_answered_settles_its_row_and_asks_for_nobody() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let phone = Arc::new(MockTelephony::new(Utc::now(), "token"));
+        let effects = Effects::new(db.clone(), ports_dialling(phone.clone()), principal.clone());
+        let gate = gate(&db);
+
+        let ok = gate
+            .authorize(&principal, SmsSend { to: a_number() })
+            .await
+            .expect("sms is allowed");
+        let sent = effects
+            .send_sms(ok, a_text("we are on our way"))
+            .await
+            .expect("the provider took it");
+
+        let ok = gate
+            .authorize(&principal, SmsSend { to: a_number() })
+            .await
+            .expect("sms is allowed");
+        let err = effects
+            .send_sms(ok, a_text(""))
+            .await
+            .expect_err("the provider refuses an empty body");
+        assert_eq!(err.code(), "empty_body");
+
+        // The same seat, a throttled provider. `FailBefore` is a refusal that
+        // arrives before the double touches anything, which is the shape of a
+        // `429`.
+        let throttled = Arc::new(MockTelephony::new(Utc::now(), "token").with_fault(
+            FaultMode::FailBefore(ProviderError::RateLimited {
+                retry_after: std::time::Duration::from_secs(30),
+            }),
+        ));
+        let effects = Effects::new(db.clone(), ports_dialling(throttled), principal.clone());
+        let ok = gate
+            .authorize(&principal, SmsSend { to: a_number() })
+            .await
+            .expect("sms is allowed");
+        let err = effects
+            .send_sms(ok, a_text("still on our way"))
+            .await
+            .expect_err("the provider is throttling us");
+        assert_eq!(err.code(), "rate_limited");
+        assert!(
+            err.is_retryable(),
+            "a 429 stays retryable to the caller; that is not the same question \
+             as whether the row is ambiguous"
+        );
+
+        let rows = intent_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 3, "three rulings, three rows: {rows:?}");
+        assert_eq!(rows[0].3, "succeeded");
+        assert_eq!(
+            rows[0].4.as_deref(),
+            Some(sent.as_str()),
+            "the id the provider handed back is what a person reconciles against"
+        );
+        assert_eq!(rows[1].3, "failed");
+        assert_eq!(rows[1].5.as_deref(), Some("empty_body"));
+        assert_eq!(rows[2].3, "failed");
+        assert_eq!(rows[2].5.as_deref(), Some("rate_limited"));
+
+        // With the grace opened as wide as it goes, neither is an ambiguity.
+        assert!(
+            unsettled(&db, &principal, Utc::now() + TimeDelta::hours(1))
+                .await
+                .is_empty(),
+            "an answered request is not somebody's morning, whichever answer it was"
         );
     }
 

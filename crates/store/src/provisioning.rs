@@ -35,6 +35,15 @@
 //! worker whose lease expired and was stolen while it was talking to the
 //! provider cannot land a stale result on top of the new owner's work.
 //!
+//! # The same window, for a call that is not a step
+//!
+//! A send holds no lease and converges no resource, but it has the same gap
+//! between the request leaving and the answer arriving. [`begin_send_intent`],
+//! [`settle_send_intent`] and [`unsettled_calls`] are that gap's before, after,
+//! and — the one that makes the other two worth writing — the reader for the
+//! requests that never got an after. They promise less than the step machinery
+//! above does, and say so in their own docs.
+//!
 //! Nothing here reads the clock; every entry point takes `now`.
 
 use chrono::{DateTime, Duration, Utc};
@@ -320,6 +329,205 @@ pub async fn mark_intent_orphaned(
     .await?;
 
     Ok(done.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
+// The intent log for a one-shot provider call
+// ---------------------------------------------------------------------------
+//
+// A send is not a provisioning step. It holds no lease, it converges no
+// `employee_resources` row, and it happens once. What it shares with a step is
+// the only thing this section is about: there is a window between the request
+// leaving and the answer arriving, and a process that dies inside it has done
+// something to somebody that no row in this database mentions.
+//
+// The three functions below are that window's before, after, and — the one that
+// makes the other two worth writing — the reader for the calls that never got
+// an after.
+
+/// Record, durably, that we are about to ask `provider` to do one thing under
+/// `key`.
+///
+/// The sibling of [`begin_intent`], and it exists because that one cannot be
+/// reused: it takes a [`Claim`] — a leased `employee_resources` row plus a
+/// [`Step`] — and hard-codes `intent_kind = 'provisioning_step'`. A send has no
+/// lease, no step and no row. It leaves `step` NULL, which is what
+/// [`unsettled_calls`] reads to tell the two kinds apart.
+///
+/// Call it and **commit before the request leaves**. That commit is the whole
+/// mechanism; everything else here is bookkeeping around it.
+///
+/// # There is no `ON CONFLICT` clause, and that is the guard rather than the
+/// missing half of one
+///
+/// [`begin_intent`] has one because a provisioning key is *deliberately* stable
+/// across attempts — same employee, same step, same key forever — so a retry has
+/// to be able to find its own row. A send key is the opposite: it is derived
+/// from one Policy Gate ruling, and a ruling is minted fresh per token and
+/// consumed by value, so no two requests can ever present the same key. If one
+/// somehow did, the right answer is that the request **must not leave**, and
+/// `provider_intents_tenant_key_idx` refusing the insert is exactly that answer
+/// with no branch here to get wrong. The caller sees a store error and sends
+/// nothing.
+///
+/// # What this does not do, said plainly because the name invites the opposite
+///
+/// It does **not** make a duplicate impossible, and it does not try to. Nothing
+/// here reaches the provider. The send APIs it is written for take no
+/// idempotency key and answer no "did key K land" question, so a row left
+/// `in_flight` can never be resolved by asking, and the retry that follows a
+/// crashed send arrives under a *new* ruling and a new key — this function will
+/// happily write it a second row. What it buys, and the whole of what it buys,
+/// is that an ambiguous send is **recorded** as ambiguous instead of being
+/// invisible, and that a person is shown it: see [`unsettled_calls`]. That is a
+/// far smaller claim than the one a reader of the word "idempotency" will
+/// assume, and the smaller one is the true one.
+pub async fn begin_send_intent(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    provider: &str,
+    intent_kind: &str,
+    key: &IdempotencyKey,
+    now: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO provider_intents \
+           (id, tenant_id, employee_id, provider, intent_kind, \
+            idempotency_key, state, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'in_flight', $7, $7)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tx.tenant_id().as_uuid())
+    .bind(employee.as_uuid())
+    .bind(provider)
+    .bind(intent_kind)
+    .bind(key.as_str())
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Close the row [`begin_send_intent`] opened, in whatever transaction also
+/// records the effect.
+///
+/// `answer` is `Ok(external_id)` when the provider named what it did, and
+/// `Err(reason)` when the provider **answered and refused** — a request that
+/// reached the other end and produced nothing.
+///
+/// # A call whose answer never came back is not passed here at all
+///
+/// There is deliberately no third variant meaning "unknown", because the
+/// correct write for that case is *no write*: the row stays `in_flight`, which
+/// is the only true statement about a request that may have landed. A timeout
+/// settled as `failed` would be this whole section lying in its own vocabulary,
+/// and the caller that has the classification — `EffectError`'s provider arm —
+/// is the one that decides. [`unsettled_calls`] is where those rows surface.
+///
+/// Only an `in_flight` row moves, so a late second answer cannot overwrite a
+/// settled outcome, and a caller that never opened a row of its own cannot
+/// clobber somebody else's: the update matches nothing and returns `false`.
+pub async fn settle_send_intent(
+    tx: &mut TenantTx<'_>,
+    key: &IdempotencyKey,
+    answer: Result<&str, &str>,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let (state, external_id, error) = match answer {
+        Ok(id) => (IntentState::Succeeded, Some(id), None),
+        Err(reason) => (IntentState::Failed, None, Some(reason)),
+    };
+
+    let done = sqlx::query(
+        "UPDATE provider_intents \
+         SET state = $3, external_id = $4, last_error = $5, updated_at = $6 \
+         WHERE tenant_id = $1 AND idempotency_key = $2 AND state = 'in_flight'",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(key.as_str())
+    .bind(state.as_str())
+    .bind(external_id)
+    .bind(error)
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(done.rows_affected() == 1)
+}
+
+/// One request this system sent to a provider and never learned the outcome of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledCall {
+    /// What was being attempted — the effect's `ActionKind`, e.g. `sms_send`.
+    pub intent_kind: String,
+    /// The port it went out through: `telephony`, `email`. The port and not the
+    /// vendor, because which adapter is installed behind it is deployment
+    /// configuration and this row outlives it.
+    pub provider: String,
+    /// The key the request carried, verbatim. It spells out the Policy Gate
+    /// ruling — `employee:{id}:step:effect:{decision_id}` — which is how a
+    /// person joins this row to the `audit_log` row that names the recipient.
+    /// The recipient is deliberately not copied here: it already lives in one
+    /// place under that tenant's own RLS, and two copies is one to forget.
+    pub idempotency_key: String,
+    /// When the request left.
+    pub started_at: DateTime<Utc>,
+}
+
+/// Requests for `employee` that left before `before` and never came back with an
+/// answer — oldest first.
+///
+/// **This is the reader that makes the write-ahead row worth writing.** An
+/// `in_flight` row nobody selects is a column that grows forever and tells
+/// nobody anything; the point of writing one is that a person can be shown it
+/// and settle what the provider will not answer — by looking in the provider's
+/// own console for the message, or by asking the recipient.
+///
+/// `before` is the caller's grace period, and it is what keeps a send that is
+/// merely *in progress* out of the answer. Every row here is older than any
+/// adapter's request timeout, so "no answer yet" has already stopped being a
+/// plausible reading.
+///
+/// `step IS NULL` is the whole of what separates these from provisioning:
+/// [`begin_intent`] and `record_release` both write the step they are for, and a
+/// row without one is a one-shot provider call. A payment intent would land in
+/// this list too if anything wrote one, and that is correct — an unsettled
+/// payment is exactly as much somebody's morning as an unsettled text.
+pub async fn unsettled_calls(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    before: DateTime<Utc>,
+) -> Result<Vec<UnsettledCall>, StoreError> {
+    // ponytail: bounded, with no cursor. A hundred unsettled calls on one seat
+    // is an incident and not a page to walk through; if this ever truncates, the
+    // number to act on is the first row's age, which is at the top either way.
+    let rows = sqlx::query_as::<_, (String, String, String, DateTime<Utc>)>(
+        "SELECT intent_kind, provider, idempotency_key, created_at \
+           FROM provider_intents \
+          WHERE employee_id = $1 \
+            AND state = 'in_flight' \
+            AND step IS NULL \
+            AND created_at < $2 \
+          ORDER BY created_at \
+          LIMIT 100",
+    )
+    .bind(employee.as_uuid())
+    .bind(before)
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(intent_kind, provider, idempotency_key, started_at)| UnsettledCall {
+                intent_kind,
+                provider,
+                idempotency_key,
+                started_at,
+            },
+        )
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,6 +1721,127 @@ mod tests {
                 tx.rollback().await.expect("rollback");
             }
         }
+
+        teardown(&db, tenant).await;
+    }
+
+    /// The predicate that separates the two kinds of intent, checked against
+    /// both of them at once.
+    ///
+    /// `unsettled_calls` filters on `step IS NULL`, and that one word is the
+    /// whole of the separation. A stuck provisioning step already has its own
+    /// machinery — a lease that expires, [`sweep_expired_leases`], a recovery
+    /// pass that files an approval — so reporting it here as well would put a
+    /// second alarm on a fire somebody is already fighting, and the reader that
+    /// cries about a phone number every morning is the reader nobody opens on
+    /// the morning a text is in it.
+    ///
+    /// The inverse is asserted in the same breath: the send *is* returned. A
+    /// predicate that excluded both would satisfy the sentence above and be
+    /// useless.
+    #[tokio::test]
+    async fn a_stuck_provisioning_step_is_not_reported_as_an_unsettled_send() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "unsettled").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        // One of each, for the same employee, both `in_flight`.
+        let claim = claim_step(
+            &mut tx,
+            employee,
+            Step::Phone,
+            Uuid::now_v7(),
+            lease(),
+            at(T0),
+        )
+        .await
+        .expect("claim")
+        .expect("claim");
+        begin_intent(&mut tx, &claim, "telephony", &json!({}), at(T0))
+            .await
+            .expect("the provisioning intent");
+        let key = IdempotencyKey::for_step(employee, "effect:a-ruling");
+        begin_send_intent(&mut tx, employee, "telephony", "sms_send", &key, at(T0 + 1))
+            .await
+            .expect("the send intent");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let unsettled = unsettled_calls(&mut tx, employee, at(T0 + 1_000))
+            .await
+            .expect("read");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(unsettled.len(), 1, "{unsettled:?}");
+        assert_eq!(unsettled[0].intent_kind, "sms_send");
+        assert_eq!(unsettled[0].idempotency_key, key.as_str());
+        assert_eq!(unsettled[0].started_at, at(T0 + 1));
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM provider_intents").await,
+            2,
+            "both rows exist; only one of them is this reader's business"
+        );
+
+        teardown(&db, tenant).await;
+    }
+
+    /// A settled row leaves the reader, and a timeout that was never settled
+    /// stays in it.
+    ///
+    /// [`settle_send_intent`] is the only way out, and it takes no "unknown"
+    /// answer on purpose — the caller with a timeout in hand simply does not
+    /// call it. This pins both halves of that: the answered row goes quiet, the
+    /// unanswered one does not.
+    #[tokio::test]
+    async fn only_an_answered_send_leaves_the_reader() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "settled").await;
+        let answered = IdempotencyKey::for_step(employee, "effect:answered");
+        let silent = IdempotencyKey::for_step(employee, "effect:silent");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        for key in [&answered, &silent] {
+            begin_send_intent(&mut tx, employee, "telephony", "sms_send", key, at(T0))
+                .await
+                .expect("begin");
+        }
+        assert!(
+            settle_send_intent(&mut tx, &answered, Ok("SM0001"), at(T0 + 1))
+                .await
+                .expect("settle"),
+            "an in-flight row is settleable"
+        );
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let unsettled = unsettled_calls(&mut tx, employee, at(T0 + 1_000))
+            .await
+            .expect("read");
+        assert_eq!(unsettled.len(), 1, "{unsettled:?}");
+        assert_eq!(unsettled[0].idempotency_key, silent.as_str());
+
+        // And a second answer cannot rewrite the first: only `in_flight` moves,
+        // so a late arrival is refused rather than overwriting the `sid` a
+        // person may already be reconciling against.
+        assert!(
+            !settle_send_intent(&mut tx, &answered, Err("too_late"), at(T0 + 2))
+                .await
+                .expect("settle"),
+            "a settled row must not move again"
+        );
+        let (state, external_id, last_error): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT state, external_id, last_error FROM provider_intents \
+                  WHERE idempotency_key = $1",
+            )
+            .bind(answered.as_str())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the settled row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, "succeeded");
+        assert_eq!(external_id.as_deref(), Some("SM0001"));
+        assert_eq!(last_error, None);
 
         teardown(&db, tenant).await;
     }
