@@ -1,9 +1,9 @@
 # The company, running
 
-*Last walked: 2026-08-28 (fifth pass, after waves C and D. The first two of the
-founder's five internal tools are in — a shared work queue an employee can post
-to, claim from and sign off, and a calendar that can promise an hour and be
-woken by it.)*
+*Last walked: 2026-08-28 (sixth pass, after wave E. **All five of the founder's
+internal tools are in** — work board, calendar, a desk to talk to a human,
+invoicing, a file store — and the catalogue rows for the first two have been
+measured live rather than guessed.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -213,28 +213,47 @@ customer brings their own, the adapter has to have somewhere to plug in.
 | 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. |
 | 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. |
 | 3 | **A thread with a human** | **Built, and it needed no table.** Half the mechanism was already here: a zero-turn seat is delivered to without being woken, which is the founder's own seat, so escalations already landed on a real desk. What was missing was a window and a pen — nothing read `messages.body`, and `/v1/reports` gave a *count* of questions owed rather than a sentence. `/v1/desk/{id}` reads it and writes back; 0065 is one partial index. |
-| 4 | **Invoicing** | Not built. The company buys end to end and the selling path stops at the opportunity. |
-| 5 | **A file store** | Not built. `knowledge` stores to retrieve; nothing keeps *the signed contract, as it is*. |
+| 4 | **Invoicing** | **Built.** `invoices` (0066), a seventeenth `ActionKind::InvoiceIssue`, `/v1/invoices`. No invoice can exist against a deal nobody won, and 0011 already refused `closed_won` without an approval — so the ceiling needed no invented number. |
+| 5 | **A file store** | **Built.** `files` (0067), `bytea` under the same RLS policy as the name beside it, `digest = sha256(content)` as a CHECK. No DELETE and no UPDATE grant — an UPDATE on `content` would swap a contract while leaving a row that looks untouched. |
 
-**The one thing tools 1 and 2 still wait on is the same thing**, and it is
-not code: the catalogue line in `turn.rs::catalogue()` that lets a model reach
-the verb. (Tool 3 needed none — the verb an employee uses to answer the founder
-is `InternalSend`, already in the vocabulary and already in every role pack.)
-Both are written out in full, in place, as comments — because
-applying them moves `toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}`, and the
-only thing entitled to re-pin those is a live measurement. The measurement
-harness is proven (`cargo run -p agentos-eval -- --live`, five prompts through
-the host's `claude` CLI, no key and no spend); running it is a deliberate act,
-not a wave's.
+**The catalogue rows for tools 1 and 2 have landed and been measured.**
+`turn.rs::catalogue()` went from eight rows to eleven, both toolchoice pins
+moved, and so did a third nobody had planned for — `cost::digest` hashes the
+tool schemas too. Tool 3 needed no row at all: the verb an employee uses to
+answer the founder is `InternalSend`, already in the vocabulary. Tool 4's row is
+written out in place and deliberately unapplied, and tool 5 has no turn surface
+by design.
 
-**Two holes are named and open.** `0061` promises in writing that a terminated
-employee's items *go back on the board unassigned*, and the referential action
-that would do it never fires — termination is a column (`lifecycle =
-'terminated'`), never a `DELETE`. The item stays assigned to somebody who will
-never be briefed again, while `GET /v1/work` still shows it assigned: work
-stops silently. The calendar has the mirror of it — its claim filters
-`lifecycle = 'active'`, so a departed employee's promise never rings and sits
-`rang_at IS NULL` for good.
+**What the measurement said, and it is the reason to be slow about a twelfth
+row.** Tool choice did not move: 4/5 before and after, the same failing case,
+zero safety violations. The bill did: $70–$84 a month became $87–$105, because
+input tokens per call went from ~4.6k to ~6.0k. **A catalogue row is billed on
+every model call whether or not anybody ever uses it.**
+
+**Two holes were named and are now closed.** `0061` promised in writing that a
+terminated employee's items *go back on the board unassigned*, and the
+referential action never fired: termination is a column (`lifecycle =
+'terminated'`), never a `DELETE`. The item stayed assigned to somebody who
+would never be briefed again while `GET /v1/work` still showed it assigned, and
+work stopped silently. Termination now unassigns in the transaction that writes
+the lifecycle, and a suspension deliberately does not — suspension is documented
+as pausing an employee *without* releasing what it owns, which is the only thing
+separating the two verbs.
+
+`employees` is referenced `on delete set null` from **ten** columns and all ten
+of those actions are equally dead. Only this one was a defect: `assignee_id IS
+NULL` is the single place in the schema where "nobody holds this" is a state
+something reads. Everywhere else the column is provenance, and nulling it would
+destroy a record without giving the work to anyone.
+
+The calendar's mirror is settled rather than reassigned. A departed seat's
+promise never rang and sat `rang_at IS NULL` forever, which `diary` shows the
+founder as *still ahead*; 0063 already says an appointment has no unassigned
+state and nothing else can keep it, and the founder never said a manager
+inherits an hour. So it is cancelled in the only vocabulary 0063 gave —
+`rang_at` written *before* `at` — and only for hours still ahead, because
+stamping `now` on an hour already past would manufacture a record saying
+somebody kept it.
 
 ## Not on the map, deliberately
 
