@@ -1406,9 +1406,10 @@ restart loses in-flight mock mail.
 The whole durable state of this system is the Postgres database. There is no
 store beside it: no queue, no cache, and the file store (`files`, `0067`) is a
 `bytea` column in that same database rather than a bucket somewhere else.
-Inbound attachments are the exception and are not durable at all: the
-`BlobStore` behind them is `InMemoryBlobs` and does not survive a restart. Back
-up Postgres and you have backed up AgentOS.
+Inbound attachments used to be the exception — they went to an in-process
+`HashMap` that no restart survived and no reader could reach — and they are not
+any more: `ingest_email` deposits them into `files`, so they are in the dump
+like everything else. Back up Postgres and you have backed up AgentOS.
 
 ### The important thing to understand first
 

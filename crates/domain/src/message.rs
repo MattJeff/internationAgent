@@ -134,8 +134,9 @@ impl std::fmt::Display for ProviderRef {
 
 /// A file that rode in with a message.
 ///
-/// The bytes are not here — they stay at the provider or in blob storage
-/// behind `provider_ref`, so a 30 MB invoice never sits in a domain struct.
+/// The bytes are not here — they stay at the provider, or are filed in the
+/// company's classeur under the name `agentos_app::inbound::blob_key` derives,
+/// so a 30 MB invoice never sits in a domain struct.
 /// The `filename` is [`Untrusted`] because it is attacker-chosen text that
 /// looks harmless enough to be pasted into a prompt or a shell command, which
 /// is exactly why it must not be.

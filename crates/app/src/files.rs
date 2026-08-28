@@ -14,26 +14,27 @@
 //! needs to be **those bytes, unchanged, retrievable by the name they were filed
 //! under, and impossible to make disappear.**
 //!
-//! [`crate::inbound::BlobStore`] is the nearest thing that already existed and
-//! it does not close the gap — it is worth being exact about why, because from a
-//! distance it looks like this module.
+//! `crate::inbound::BlobStore` **was** the nearest thing that already existed,
+//! and it is worth keeping the reason it lost, because from a distance it looked
+//! like this module. It has since been deleted and the inbound path deposits
+//! here; see the last section.
 //!
-//! * **It has one method and the method is `put`.** Its own doc says a reader
-//!   can be added "against a real object store" when somebody needs one. Nobody
-//!   did. So nothing in this workspace can hand an attachment back to anybody:
-//!   the bytes go in and there is no `get` anywhere.
-//! * **Its only implementation is `InMemoryBlobs`**, a `HashMap` behind a
-//!   `Mutex`, and `apps/server/src/main.rs` builds *that one* for the running
-//!   server. A customer's attachments live as long as the process and are gone
-//!   on the next deploy. That is a defect and it predates this module.
-//! * **It cannot be given a tenant.** `put(&self, key, content_type, bytes)`
-//!   carries the company only inside a formatted string —
+//! * **It had one method and the method was `put`.** Its own doc said a reader
+//!   could be added "against a real object store" when somebody needed one.
+//!   Nobody did. So nothing in the workspace could hand an attachment back to
+//!   anybody: the bytes went in and there was no `get` anywhere.
+//! * **Its only implementation was `InMemoryBlobs`**, a `HashMap` behind a
+//!   `Mutex`, and `apps/server/src/main.rs` built *that one* for the running
+//!   server. A customer's attachments lived as long as the process and were
+//!   gone on the next deploy.
+//! * **It could not be given a tenant.** `put(&self, key, content_type, bytes)`
+//!   carried the company only inside a formatted string —
 //!   `inbound/<tenant>/<message>/<attachment>` — so a Postgres adapter for it
-//!   would have to *parse a tenant out of a key* to know which company's row to
-//!   write. That is why the derived-key design cannot be given row-level
-//!   security, and it is the reason this module is a new port rather than a
-//!   second implementation of that one. See the last section for the exact
-//!   change that would join them, and for why it is not this change.
+//!   would have had to *parse a tenant out of a key* to know which company's row
+//!   to write. That is why the derived-key design could not be given row-level
+//!   security, and it is why the merge went in this direction: `BlobStore`
+//!   deleted, this port kept. Adding `get` to it would have produced a second,
+//!   weaker spelling of this one, with no tenant and therefore no RLS.
 //!
 //! # Why this is a port and not three functions on `agentos_store::files`
 //!
@@ -201,29 +202,44 @@
 //! administration surface, and it keeps working under a connected adapter
 //! precisely because the row stays ours when the bytes leave.
 //!
-//! # The defect next door, named and not fixed here
+//! # The defect next door, now closed
 //!
-//! `ingest_email` still writes attachments into `InMemoryBlobs`, so they still
-//! die with the process. This change does not touch it, and the reason is that
-//! joining the two is a second change with its own failure mode rather than a
-//! line of tidying:
+//! `ingest_email` deposits attachments **here**, and `BlobStore` is deleted. The
+//! prediction the previous version of this section made was right in outline and
+//! wrong in one place, which is worth recording:
 //!
-//! 1. `BlobStore::put` would take a `TenantId` — one signature, one call site
-//!    (`inbound::ingest_email`, which already holds `job.tenant_id`), one
-//!    implementation. Without it there is no company to write the row against.
-//! 2. `blob_key`'s output becomes the `name`, unchanged, so a retried ingest
-//!    still addresses the same file — and the conflict a retry now raises has to
-//!    be swallowed as success, because a retry finding its own bytes already
-//!    there is the mechanism working.
-//! 3. **The failure mode, which is the reason this is separate.** An attachment
-//!    larger than the ceiling would fail the `files_content_size` CHECK. That
-//!    arrives as `StoreError::Database`, which `InboundError::is_retryable`
-//!    reports as retryable, so a single oversized attachment becomes a message
-//!    that can never land and a job that retries forever. Today's path warns and
-//!    continues, which is deliberate — *"a lost invoice is bad; losing the email
-//!    that carried it is worse"* — and preserving that means the deposit's
-//!    failure must be classified, not propagated. Getting that wrong loses
-//!    customer mail, which is worth its own change and its own test.
+//! 1. It said `BlobStore::put` would take a `TenantId`. It does not — the trait
+//!    is gone entirely. A tenant argument would have been the third address for
+//!    a company in one call (the argument, the key, and the transaction's
+//!    `SET LOCAL`), and the loop that calls it drains *every* tenant, so no
+//!    port bound at startup could have been bound to the right one.
+//!    `ingest_email` builds a [`PgFiles`] from `job.tenant_id` instead.
+//! 2. It said `blob_key`'s output becomes the `name`, unchanged, and that the
+//!    conflict a retry raises must be swallowed as success. **Both correct**,
+//!    and both are what the code does. The reason the key stays derived changed,
+//!    though: it was "this string becomes a path", and under `bytea` nothing
+//!    becomes a path. What replaced it is stronger — a sender-chosen name would
+//!    let a counterparty **squat** a company's flat first-write-wins namespace.
+//! 3. **The failure mode, which was the real content of the warning.** An
+//!    attachment larger than the ceiling fails the `files_content_size` CHECK;
+//!    a CHECK violation has no SQLSTATE arm in `StoreError::from`, so it arrives
+//!    as `StoreError::Database`, which `InboundError::is_retryable` reports as
+//!    retryable. Propagating it would make a single oversized attachment into a
+//!    message that can never land and a job that retries until it dead-letters.
+//!    So the deposit's failure is **classified at the call site and never
+//!    propagated**: a conflict is success, and everything else is a
+//!    `tracing::warn!` and a message that lands anyway — *"a lost invoice is
+//!    bad; losing the email that carried it is worse"*. `is_retryable` is
+//!    deliberately **not** touched: the bucket is not made finer, the failure is
+//!    simply never turned into an `InboundError`.
+//!
+//! What that costs, recorded rather than implied: a database failure during a
+//! deposit that heals within milliseconds loses that attachment permanently,
+//! because the message lands and the next delivery takes the `resume` branch.
+//! One that does not heal costs nothing — the landing transaction fails too and
+//! the job retries. The race closes by depositing inside the landing transaction
+//! behind a SAVEPOINT per attachment, which is nested-transaction machinery
+//! `TenantTx` does not expose today.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
