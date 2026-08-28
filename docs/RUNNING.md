@@ -199,6 +199,40 @@ gap at all: the decided target is people who *already have a SaaS*, and they
 arrive with a stack, a server and a problem rather than a blank page. Left
 unbuilt on purpose until somebody who is not the founder asks for it.
 
+## The gap nobody has closed: attachments are write-only
+
+**Verified by hand on 2026-08-28, not reported second-hand.** A customer's email
+attachment goes into a `HashMap` in process memory that nothing can read back,
+and that empties on every restart.
+
+Three facts, each checkable in one grep:
+
+* `apps/server/src/main.rs:327` builds `InMemoryBlobs` for the running server.
+* `impl BlobStore for` appears **once** in the whole workspace, and that is it.
+  There is no durable adapter to switch to.
+* The trait has exactly one method, `put`. **There is no `get`.** `InMemoryBlobs`
+  has a `bytes()` accessor, but it is on the concrete type, and production holds
+  an `Arc<dyn BlobStore>` — so through the trait the store is write-only. The
+  doc on `put` says whoever reads them later can add `get`; nobody did.
+
+So the restart is the second-worst part. The worst is that nothing could read an
+attachment back even without one.
+
+**The destination now exists.** `files` (0067) is durable, tenant-isolated, RLS
+forced, and carries `digest = sha256(content)` as a CHECK — which is exactly
+what a stored attachment wants, because a counterparty's bytes are the one thing
+in this system you most want to prove unchanged.
+
+**And the rewiring has a trap that has to be handled in the same change**, named
+by the agent that built `files` and repeated here because it is the kind of fix
+that quietly makes things worse: an attachment larger than the column's ceiling
+fails the CHECK, arrives as `StoreError::Database`, and
+`InboundError::is_retryable` calls that **retryable** — a message that can never
+land and a job that retries for ever. Today's path warns and continues, on
+purpose, because *losing an invoice is bad and losing the email that carried it
+is worse*. Preserving that means **classifying** the store failure, not
+propagating it.
+
 ## The five internal tools, and where each one stands
 
 The founder named five things a company cannot run without, and asked for them
