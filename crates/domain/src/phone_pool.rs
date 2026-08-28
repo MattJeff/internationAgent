@@ -33,9 +33,13 @@
 //!   `ORDER BY` over `employee_resources` joined to `conversations`. The
 //!   affinity it reads is the `conversations` row the landing transaction has
 //!   already written, so there is no second table to keep in step — which is
-//!   the other half of why the pure version never shipped. (That lander is
-//!   itself waiting on a telephony ingest; see its own NOT WIRED note. It is
-//!   still the one the pool's routing goes through.)
+//!   the other half of why the pure version never shipped. Since
+//!   `0069_a_number_is_an_endpoint_too` that lander runs on a real webhook, so
+//!   an over-allocated pooled number would no longer be a row too many in a
+//!   table — it would be a supplier's message landing on the colleague who was
+//!   allocated first. (Would, not does: `EngineConfig::default()` is
+//!   [`NumberStrategy::Dedicated`] with `provision_phone: false`, so nothing in
+//!   the shipped server allocates a pooled slot yet.)
 //!
 //! The pure functions were deleted along with a `counterparty_affinity` table
 //! nothing writes. Their arguments live on where the shipped code makes the

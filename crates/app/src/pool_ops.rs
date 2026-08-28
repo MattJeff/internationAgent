@@ -72,8 +72,9 @@
 //! them. Routing the supplier elsewhere silently throws the relationship away.
 //!
 //! That rule lives in [`crate::inbound::resolve_phone_recipient`], which is what
-//! [`crate::inbound::land_inbound_text`] calls — read that function's own
-//! NOT WIRED note before assuming a message reaches either of them today. This
+//! [`crate::inbound::land_inbound_text`] calls — and since
+//! `0069_a_number_is_an_endpoint_too` a real customer's SMS reaches it, so the
+//! NOT WIRED note this paragraph used to send you to is gone. This
 //! module had a `route_inbound` of its own that said the same thing and that
 //! nothing outside `#[cfg(test)]` ever called, not even the lander. It was not
 //! merely redundant — it was **narrower**: two queries instead of one,

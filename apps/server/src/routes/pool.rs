@@ -829,9 +829,19 @@ mod tests {
         owner.ok()
     }
 
-    /// Hand a pooled slot back, the way `ProvisioningEngine::release_step`
-    /// does: clear the binding and disable the row. No provider is called —
-    /// the number is the tenant's and stays.
+    /// Hand a pooled slot back: clear the binding and disable the row. No
+    /// provider is called — the number is the tenant's and stays.
+    ///
+    /// **Half of what `ProvisioningEngine::release_step` does.** The real one
+    /// also calls `phone_pool::release`, in the same commit, and this does not.
+    /// That is honest here and only here: nothing in this file writes
+    /// `number_allocations` at all — `allocate` above builds the employee and
+    /// its `employee_resources` row through the domain — and the two endpoints
+    /// under test read `employee_resources` and `conversations`. Seat
+    /// *accounting* is `agentos_store::phone_pool`'s subject and is tested
+    /// there. Do not copy this into a test that asks whether a released slot
+    /// gave its capacity back: against this helper the answer would be no, and
+    /// the reason would be the helper.
     async fn give_up_slot(db: &Db, tenant: TenantId, employee_id: EmployeeId) {
         let now = Utc::now();
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
