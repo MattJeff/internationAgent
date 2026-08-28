@@ -643,6 +643,24 @@ pub enum Action {
     A2aSend {
         peer: Domain,
     },
+    /// Money out. The subject is the **amount**, and the payee lives on
+    /// `app::effects::PaymentInstruction` for the module rule above.
+    ///
+    /// **An HTTP `402 Payment Required` is one of these**, and that is a
+    /// decision rather than an omission. A 402 arrives *inside* an effect the
+    /// gate has already authorised — an `Action::McpCall`, say — and paying it
+    /// on the strength of that token would be spending under a ruling that
+    /// carried no amount for [`crate::policy::SpendLimits`] to read and took no
+    /// reservation against the day's bucket, so `ActionCtx::spent_today` would
+    /// stop being true for every later payment. It is therefore a
+    /// `PaymentCreate` like any other, and specifically **not** a new
+    /// [`ActionKind`]: a verb outside this enum is a verb no policy layer can
+    /// withhold from a seat and no role pack can decline, which is the same
+    /// argument [`Action::InvoiceIssue`] makes below and
+    /// `PolicyLimits::allow_lead_upload` makes for staying a field.
+    ///
+    /// `agentos_app::x402` carries the whole argument, both sides of it, and
+    /// the two decisions about money that are still open.
     PaymentCreate {
         amount: Money,
     },
@@ -823,14 +841,19 @@ impl Action {
             | Action::PaymentCreate { .. }
             // High, and the reason is the direction of the money rather than
             // its size. A stranger's text saying "please invoice us €50,000"
-            // must not produce a demand for money in this company's name — and
-            // unlike `ContractSign`, which escalates and therefore slips past
-            // the taint wire (`evaluate` applies it only to an `Allow`), this
-            // arm's ruling *is* an `Allow`, so an untrusted turn is refused
-            // outright with `DenyReason::UntrustedInput` and no approval is
-            // filed for a human to look at. See `app::revenue`'s module docs
-            // for why an approval queue a stranger can write into is the thing
-            // being avoided.
+            // must not produce a demand for money in this company's name, so an
+            // untrusted turn is refused outright with
+            // `DenyReason::UntrustedInput` and no approval is filed for a human
+            // to look at. See `app::revenue`'s module docs for why an approval
+            // queue a stranger can write into is the thing being avoided.
+            //
+            // That last sentence used to be true of this arm *only*, because
+            // its ruling is an `Allow` while `ContractSign` escalates — and the
+            // taint wire tested `decision.is_allow()`, so the escalating arms
+            // slipped past it into the approval queue. `policy::evaluate` now
+            // refuses any high-risk action from untrusted input whatever the
+            // rules answered, so `High` here means the same thing it means
+            // everywhere else on this list.
             | Action::InvoiceIssue { .. }
             | Action::ContractSign { .. }
             | Action::CredentialChange { .. }

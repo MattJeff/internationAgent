@@ -382,6 +382,26 @@ impl ProviderError {
                 code: "unauthorized",
             },
             403 => Self::Terminal { code: "forbidden" },
+            // The far side wants money. Terminal like the rest of the 4xx —
+            // asking again without paying gets the same answer — but it is
+            // named rather than swept into `client_error`, because it is the
+            // one status whose meaning this product has a whole vocabulary for.
+            // Unnamed, a supplier that starts charging per call is an audit row
+            // that reads exactly like a malformed request, and nobody ever
+            // learns why the tool stopped working.
+            //
+            // `Verdict::from_provider_code` still lands this on
+            // `Verdict::Unusable` through its catch-all, unchanged and argued
+            // there: a customer whose model key hit a 402 has an exhausted
+            // balance, not a broken credential, and retrying it forever is the
+            // worse answer. The label changes; no decision does.
+            //
+            // Reading the demand is `agentos_app::x402`, which explains why
+            // paying it is an `Action::PaymentCreate` and not a side effect of
+            // whatever call collected this.
+            402 => Self::Terminal {
+                code: "payment_required",
+            },
             404 => Self::Terminal { code: "not_found" },
             409 => Self::Terminal { code: "conflict" },
             422 => Self::Terminal {
@@ -599,6 +619,16 @@ mod tests {
             }
         );
         assert_eq!(ProviderError::from_status(404, None).code(), "not_found");
+
+        // 402 is the far side asking to be paid, and it is *not* the
+        // `client_error` catch-all: an operator has to be able to tell "this
+        // supplier now charges per call" apart from "we sent it nonsense".
+        // Terminal, because asking again without paying gets the same answer.
+        let wants_money = ProviderError::from_status(402, None);
+        assert_eq!(wants_money.code(), "payment_required");
+        assert!(!wants_money.is_retryable());
+        // The catch-all still exists and 402 is no longer in it.
+        assert_eq!(ProviderError::from_status(418, None).code(), "client_error");
     }
 
     /// What [`RETRYABLE_CODES`]'s `const` block cannot check, because it only

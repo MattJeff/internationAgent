@@ -1856,6 +1856,39 @@ fn reached_the_server(err: &ServiceError) -> ProviderError {
 /// The codes are [`ProviderError::from_status`]'s own, so a refused MCP
 /// credential reads in an audit row exactly like a refused HTTP one — one
 /// vocabulary for "the far side would not take this token", not two.
+///
+/// # The hole beside it: a server that answers `402 Payment Required`
+///
+/// This walk recognises two causes and everything else falls to
+/// [`ProviderError::timeout`] in the caller, i.e. **retryable**. That is right
+/// for a socket that died mid-send, which is the other thing
+/// [`ServiceError::TransportSend`] means, and it is wrong for every status
+/// `rmcp` does not lift into a named error — including `402`, which reaches
+/// `response.error_for_status()?` and arrives here as an opaque client error.
+/// So an MCP server that starts charging per call is asked again, inside the
+/// turn, until `Budgets::max_tool_calls` runs out, and the audit row says
+/// `retryable: true` about a refusal that is not going to change. It is the
+/// exact failure this function's own docs describe for a revoked credential,
+/// one status along.
+///
+/// **It is not fixed here, and the reason is a version.** The fix is to read
+/// the status off the error and hand it to [`ProviderError::from_status`] —
+/// this workspace's one rule for classifying an HTTP response, which already
+/// names `402` as `payment_required`. Reading it means downcasting to
+/// `reqwest::Error`, and `rmcp` 3.1.4 is built against **reqwest 0.13** while
+/// this workspace is on **0.12**: two distinct crates to the compiler, so the
+/// downcast cannot match and `Any` cannot be made to lie about it. Naming both
+/// versions in this crate to close it would leave `mcp.rs` and `peer_keys.rs`
+/// each using a different `reqwest::Client`, which is a worse bug than the one
+/// being fixed. The day the two agree, this function becomes
+/// `err.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)`
+/// followed by `from_status`, the two arms below fold into it unchanged, and
+/// this paragraph goes away.
+///
+/// Nothing downstream is waiting on that. `agentos_app::x402` argues that
+/// paying a 402 is an `Action::PaymentCreate` the Policy Gate rules on, which
+/// means the payment starts from a demand a human has looked at — not from a
+/// retry loop inside a tool call.
 fn refused_the_credential(sent: &DynamicTransportError) -> Option<ProviderError> {
     let mut cause = Some(sent.error.as_ref() as &(dyn std::error::Error + 'static));
     while let Some(err) = cause {

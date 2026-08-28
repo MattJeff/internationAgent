@@ -807,7 +807,7 @@ policy.
 **NOT BUILT.** `PaymentProvider` (`crates/app/src/effects.rs`) has one method,
 `pay`, and exactly one implementation: `NotConfigured`, which returns
 `Terminal { code: "not_configured" }` and logs it at `error` with the amount.
-There is no x402, no MPP, no card integration and no wallet.
+There is no MPP, no card integration and no wallet.
 
 That refusal is deliberate and worth preserving. A fake that returns a plausible
 payment id is a fake that will one day be believed; `not_configured` is the
@@ -829,6 +829,58 @@ What **is** built is everything around the payment:
 Steps 5 through 8 of the intended flow — *payment worker creates intent, signer
 signs only the exact approved transaction, rail submits, receipt persisted* —
 are **NOT BUILT**.
+
+### x402 — the reading half, and the two decisions that block the rest
+
+`crates/app/src/x402.rs` reads a `402 Payment Required` body into the amount and
+payee the Policy Gate would rule on, and stops there. **We are the client**: an
+employee that buys a lookup at the moment it needs one. We are not the server —
+the JSON-RPC binding sits behind the API-key layer, so every caller that could
+be charged already has a credential from a human and is already billed
+elsewhere; money in that direction is `Action::InvoiceIssue`.
+
+**Paying a 402 is an `Action::PaymentCreate` the gate rules on**, not a side
+effect of the call that collected it. The token for that call — an
+`Action::McpCall` — carries a tool handle and no amount, so `SpendLimits` has
+nothing to read and no reservation is taken; fifty side-effect 402s would walk
+past the daily wall §14 builds. It is deliberately **not** a new `ActionKind`:
+a verb outside that enum is one no policy layer can withhold and no role pack
+can decline, and it would cost a `turn.rs` catalogue row (~1.4k input tokens on
+every model call) for a proposal no model ever makes.
+
+The path is held shut in three independent places, none of them a flag: a 402
+body is untrusted by construction, so `policy::evaluate`'s taint wire denies the
+`PaymentCreate` outright with no approval filed; `x402::PRICED_ASSETS` ships
+empty; and `PaymentProvider` is still `NotConfigured`.
+
+The first of those is only true because the wire refuses a `RequireApproval` as
+well as an `Allow`. It did not, until this change: a demand at or above
+`approval_above` took the escalating branch and was filed in the founder's queue
+with the payee and amount chosen by the server that sent the 402. A server names
+its own price, so an amount-dependent lock is one the attacker holds the key to
+— which is the general form of the bug, not an x402 detail. See the note under
+`policy::evaluate`.
+
+Two open decisions, both about money and both the founder's:
+
+1. **An x402 challenge quotes an ERC-20 contract; `Money` is ISO-4217.**
+   Nothing in `asset: "0x…"` / `network: "base"` / `maxAmountRequired: "10000"`
+   names a currency or the token's decimals, and reading that amount as $0.01 or
+   $100.00 differs by 10⁴. `PRICED_ASSETS` is the table that answers it, it is a
+   `const` in source rather than a row a tenant API key could write, and it is
+   empty.
+2. **`Money` cannot hold a sub-cent price and x402 exists to charge sub-cent
+   prices.** A demand of $0.001 is refused rather than rounded — `Money::
+   from_major_str`'s own rule. Widening that touches `SpendLimits`, the
+   `reserved_minor` column, every audit row and every invoice, so *does `Money`
+   grow a sub-minor representation, or is x402 used only at ≥ one minor unit?*
+   is left open.
+
+Also true and not yet fixed: an MCP server that answers 402 is classified
+**retryable** and asked again until the turn's tool budget runs out.
+`ProviderError::from_status` now names 402 `payment_required`, but `rmcp` is
+built against reqwest 0.13 and this workspace against 0.12, so `mcp.rs` cannot
+downcast far enough to read the status. See `mcp::refused_the_credential`.
 
 The wallet design this is aimed at, kept as a decision: customer-controlled
 funding source, employee wallet or delegated/session signer, small balance and
@@ -2105,7 +2157,10 @@ An employee can, today:
 9. ⏸️ Phone *(Twilio + pool built and switched off: `EngineConfig::provision_phone`
    ships `false`, because no tool can use a number)* / ❌ voice
 10. ❌ WhatsApp
-11. ❌ Wallet + x402
+11. ❌ Wallet / ⚠️ x402 *(the reading half: `crates/app/src/x402.rs` turns a 402
+    into the `PaymentCreate` the gate rules on, and refuses everything, because
+    `PRICED_ASSETS` is empty and the taint wire denies a stranger's demand. No
+    wallet, no key, no rail — §13)*
 12. ❌ MPP
 13. ✅ Purchasing workflows, ✅ sales workflows
 14. ⚠️ Hardening — the type-level half is done (§21, §22); abuse and compliance

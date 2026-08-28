@@ -880,7 +880,8 @@ impl DenyReason {
     ///
     /// The one that matters most is [`DenyReason::UntrustedInput`]. It is the
     /// prompt-injection stop, it fires on an action the rules had already
-    /// allowed, and it is the only refusal a hostile page can *cause on purpose*:
+    /// allowed *or escalated to a human*, and it is the only refusal a hostile
+    /// page can *cause on purpose*:
     /// a document that says "wire $10,000" produces exactly this code, three
     /// times, on demand. If it were grantable, a page the employee read would be
     /// able to put "this employee needs the taint check relaxed" in front of a
@@ -1069,7 +1070,34 @@ pub fn evaluate(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) -> D
     // strength of a rule alone. Applied *after* the rules, so it cannot be
     // forgotten in one branch: there is exactly one place it can be bypassed,
     // and it is this expression.
-    if ctx.trust.is_untrusted() && action.risk().is_high() && decision.is_allow() {
+    //
+    // **`RequireApproval` is caught too, and that is the half that was once
+    // missing.** The wire used to read `decision.is_allow()`, which let every
+    // escalating high-risk arm through: `PaymentCreate` above
+    // `approval_above`, `ContractSign` (unconditional), `CredentialChange`,
+    // `DataDelete { AllForEmployee }`. An escalation is not a refusal — it is a
+    // row in the founder's approval queue whose payee and amount were chosen by
+    // the hostile source, presented as their own employee's proposal. Orizn
+    // sets `approval_above` to one dollar, so on the shipped configuration that
+    // bypass was not an edge case: it was every injected payment.
+    //
+    // The cost is deliberate and small: a tainted turn can no longer escalate a
+    // high-risk action to a human at all, not even to ask. That is what the
+    // rest of the design already wants — `app::turn::visible` withholds these
+    // schemas from an untrusted turn, so the escalation path was an
+    // inconsistency, not a feature. The honest way for a tainted employee to
+    // reach a human about what it just read is a *message* (`InternalSend`,
+    // deliberately `Risk::Low`), not a pre-filled approval with a stranger's
+    // number in it.
+    //
+    // A rule that already denied keeps its own, more specific reason:
+    // `CrossTenantSecret` and `PerTransactionLimit` say more than
+    // `UntrustedInput` does, and relabelling them would lose that. Deny is deny
+    // either way, so nothing widens.
+    if ctx.trust.is_untrusted()
+        && action.risk().is_high()
+        && !matches!(decision, Decision::Deny { .. })
+    {
         return Decision::deny(DenyReason::UntrustedInput);
     }
     decision
@@ -2391,17 +2419,123 @@ mod tests {
             }
         );
 
-        // And the property, over every high-risk action.
-        for action in one_of_every_action() {
+        // And the property, over every high-risk action — including the four
+        // arms whose ruling is `RequireApproval` rather than `Allow`, which the
+        // sample set does not reach on its own: a payment at or above
+        // `approval_above` (and still under the per-transaction cap, so that
+        // the escalating arm is the one being tested), and a bulk erase.
+        //
+        // `!is_allow()` is *not* the assertion. That is what this test used to
+        // say, and `RequireApproval` satisfies it, which is precisely how a
+        // tainted high-risk action kept its path into the founder's approval
+        // queue. The property is that the answer is a refusal.
+        let escalating = [
+            Action::PaymentCreate {
+                amount: usd(50_000),
+            },
+            Action::DataDelete {
+                scope: DataScope::AllForEmployee {
+                    id: EmployeeId::from_uuid(uuid::Uuid::from_u128(4)),
+                },
+            },
+        ];
+        for action in one_of_every_action().into_iter().chain(escalating) {
             let decision = evaluate(&policy, &action, &tainted);
             if action.risk().is_high() {
                 assert!(
-                    !decision.is_allow(),
-                    "high-risk {} was allowed from untrusted input: {decision:?}",
+                    matches!(decision, Decision::Deny { .. }),
+                    "high-risk {} was not refused from untrusted input: {decision:?}",
                     action.kind()
                 );
             }
         }
+    }
+
+    /// The other direction, and the reason this test exists beside the one
+    /// above: the taint wire narrows an *untrusted* turn, and must leave the
+    /// approval path intact for everybody else. Deleting the escalation for all
+    /// callers would also make the test above pass.
+    #[test]
+    fn a_trusted_turn_still_escalates_every_high_risk_action_to_a_human() {
+        let policy = effective(&permissive());
+        let trusted = ctx();
+        assert_eq!(trusted.trust, TrustLabel::Trusted);
+
+        for (action, reason) in [
+            (
+                Action::PaymentCreate {
+                    amount: usd(50_000),
+                },
+                ApprovalReason::PaymentAboveThreshold,
+            ),
+            (
+                Action::ContractSign {
+                    title: "supply agreement".into(),
+                },
+                ApprovalReason::ContractSignature,
+            ),
+            (
+                Action::CredentialChange { secret: secret() },
+                ApprovalReason::CredentialChange,
+            ),
+            (
+                Action::DataDelete {
+                    scope: DataScope::AllForEmployee {
+                        id: EmployeeId::from_uuid(uuid::Uuid::from_u128(4)),
+                    },
+                },
+                ApprovalReason::BulkDataDelete,
+            ),
+        ] {
+            assert!(action.risk().is_high());
+            let decision = evaluate(&policy, &action, &trusted);
+            assert!(
+                matches!(decision, Decision::RequireApproval { reason: got, .. } if got == reason),
+                "trusted {} lost its approval path: {decision:?}",
+                action.kind()
+            );
+        }
+    }
+
+    /// A rule that already refused keeps its own reason rather than being
+    /// relabelled `UntrustedInput` — the wire adds a refusal, it does not
+    /// overwrite the more specific one the rules found.
+    #[test]
+    fn the_taint_wire_does_not_relabel_a_refusal_the_rules_already_made() {
+        let policy = effective(&permissive());
+        let tainted = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            ..ctx()
+        };
+
+        let other = SecretRef::new(
+            TenantId::from_uuid(uuid::Uuid::from_u128(99)),
+            EmployeeId::from_uuid(uuid::Uuid::from_u128(2)),
+            "smtp_password",
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &policy,
+                &Action::CredentialChange { secret: other },
+                &tainted
+            ),
+            Decision::Deny {
+                reason: DenyReason::CrossTenantSecret
+            }
+        );
+        assert_eq!(
+            evaluate(
+                &policy,
+                &Action::PaymentCreate {
+                    amount: usd(50_001)
+                },
+                &tainted
+            ),
+            Decision::Deny {
+                reason: DenyReason::PerTransactionLimit
+            }
+        );
     }
 
     #[test]

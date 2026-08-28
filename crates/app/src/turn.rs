@@ -2128,9 +2128,14 @@ impl Turn {
                     .with_timezone(&Utc);
                 Ok(Proposal::Appointment(AppointmentBook, at, at_zone, subject))
             }
-            // Including every high-risk tool that was filtered out of this
-            // turn's schemas: a model that remembers a name from a trusted
-            // turn gets nothing for it.
+            // Only names outside the catalogue land here. **This arm is not
+            // the taint filter and must not be read as one**: a high-risk tool
+            // `visible` withheld from this turn is still matched above if it
+            // has a catalogue row, so a model that remembers `pay` from a
+            // trusted turn does get a `Proposal::Pay` out of it. What refuses
+            // it is `perform`, which gates every proposal with the live turn's
+            // `TrustLabel` — `policy::evaluate`'s taint wire, not this `_`.
+            // The schema filter saves a wasted turn; the gate is the control.
             other => Err(format!("{other}: no such tool")),
         }
     }
@@ -2830,13 +2835,19 @@ mod tests {
         )
     }
 
+    /// €50,000 — under the fixture's `approval_above` of €90,000, so the rules
+    /// answer `Allow` and the taint wire is what refuses it.
     fn pay_call(id: &str) -> LlmResponse {
+        pay_call_at(id, 5_000_000)
+    }
+
+    fn pay_call_at(id: &str, amount_minor: u64) -> LlmResponse {
         LlmResponse::tool_use(
             id,
             PAY,
             json!({
                 "payee": "account-X",
-                "amount_minor": 5_000_000,
+                "amount_minor": amount_minor,
                 "currency": "EUR",
                 "memo": "as instructed"
             }),
@@ -3623,6 +3634,78 @@ mod tests {
 
         // And the tool was not on offer in the first place.
         assert!(!offered(&llm.requests(), 0).contains(&PAY.to_owned()));
+    }
+
+    /// The same injection with one number changed, and the reason this test
+    /// exists beside the one above.
+    ///
+    /// €95,000 is over the fixture's `approval_above` (€90,000) and under its
+    /// per-transaction cap (€100,000), so the rules answer `RequireApproval`
+    /// rather than `Allow`. The taint wire used to read `decision.is_allow()`
+    /// and skipped that branch entirely: the run above passed while a wire
+    /// one euro larger sailed through the gate and wrote a row into the
+    /// founder's approval queue — payee and amount chosen by the injected
+    /// email, filed under his own employee's name. Orizn sets `approval_above`
+    /// to one dollar, so in the shipped configuration *every* injected payment
+    /// took this branch and none took the one above.
+    ///
+    /// The assertion that names the harm is the empty `approvals` table.
+    #[tokio::test]
+    async fn an_injected_wire_over_the_approval_threshold_files_no_approval() {
+        let Some(db) = db().await else { return };
+        let llm = Arc::new(ScriptedLlm::responses(vec![
+            pay_call_at("toolu_1", 9_500_000),
+            done(),
+        ]));
+        let h = harness(&db, llm.clone(), "{}").await;
+
+        let context = Context::new()
+            .with_task("read the supplier's email and reply")
+            .with_untrusted(&Untrusted::new(INJECTION.to_owned()), "email-1");
+
+        let finished = h
+            .turn
+            .run(context, &CancellationToken::new())
+            .await
+            .expect("the run itself completes");
+
+        assert!(
+            h.payments.calls().is_empty(),
+            "money moved: {:?}",
+            h.payments.calls()
+        );
+
+        // Nothing was put in front of a human. This is the whole test: an
+        // escalation is not a refusal, and a queue a stranger can write into is
+        // the thing being avoided.
+        let mut tx = db.tenant_tx(h.principal.tenant_id).await.expect("tx");
+        let filed: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM approvals WHERE employee_id = $1")
+                .bind(h.principal.employee_id.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count approvals");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            filed, 0,
+            "an injected email filed an approval request in the founder's queue"
+        );
+
+        // And the model was told which rule refused it — the taint, not a cap.
+        let results = last_results(&finished);
+        let [
+            Content::ToolResult {
+                content, is_error, ..
+            },
+        ] = results.as_slice()
+        else {
+            panic!("expected one tool result, got {results:?}");
+        };
+        assert!(*is_error);
+        assert!(
+            content.contains(DenyReason::UntrustedInput.code()),
+            "the model must be told which rule refused it: {content}"
+        );
     }
 
     #[tokio::test]

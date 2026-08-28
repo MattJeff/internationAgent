@@ -436,8 +436,19 @@ impl BrowserProvider for BrowserbaseBrowser {
             // 405/501: this account's API has no context delete. The context is
             // still there and still billed, so say so instead of returning
             // `Ok(())` — the binding has to stay put for someone to find.
+            //
+            // 402 lands here for the same reason and by the same test: the
+            // account owes money, the delete did not happen, and the context is
+            // still there and still billed. It used to arrive as `client_error`
+            // and be caught by the arm above; naming 402 in `from_status` moved
+            // it out, and without this line it would fall to `Err(other)` and be
+            // reported as merely *stuck*. That is the wrong bucket — `main.rs`
+            // retries a stuck release and dead-letters the termination, and no
+            // number of retries settles an invoice. `RELEASE_NOT_SUPPORTED` is
+            // the bucket that alerts an operator and keeps the binding, which is
+            // the only record of what a human still has to cancel.
             Err(ProviderError::Terminal {
-                code: "client_error",
+                code: "client_error" | "payment_required",
             }) => Err(ProviderError::Terminal {
                 code: RELEASE_NOT_SUPPORTED,
             }),
@@ -1041,20 +1052,32 @@ mod tests {
 
     /// If the account cannot delete contexts, the resource is still there and
     /// still billed. `Ok(())` would clear the binding and lose it forever.
+    ///
+    /// **405 and 402 are the same outcome and that is the point of testing
+    /// both.** 402 used to reach the arm as `client_error`; naming it in
+    /// `ProviderError::from_status` moved it out, and nothing failed — this
+    /// test is what makes that silence impossible next time. An unpaid account
+    /// and an account without the endpoint leave a human the same job.
     #[tokio::test]
     async fn a_refused_delete_is_reported_not_swallowed() {
-        let fake = FakeBrowserbase::start().await;
-        fake.state().next_status = Some(405);
+        for status in [405, 402] {
+            let fake = FakeBrowserbase::start().await;
+            fake.state().next_status = Some(status);
 
-        let error = fake
-            .client()
-            .release(&ProviderBinding {
-                provider: PROVIDER.to_owned(),
-                external_id: "ctx_1".to_owned(),
-            })
-            .await
-            .expect_err("the context still exists");
-        assert_eq!(error.code(), RELEASE_NOT_SUPPORTED);
+            let error = fake
+                .client()
+                .release(&ProviderBinding {
+                    provider: PROVIDER.to_owned(),
+                    external_id: "ctx_1".to_owned(),
+                })
+                .await
+                .expect_err("the context still exists");
+            assert_eq!(
+                error.code(),
+                RELEASE_NOT_SUPPORTED,
+                "a {status} on delete leaves a billed context behind"
+            );
+        }
     }
 
     // -- secret hygiene --------------------------------------------------------

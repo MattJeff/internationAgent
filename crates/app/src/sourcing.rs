@@ -1417,9 +1417,12 @@ impl Buyer {
     /// With `trust` untrusted, what goes to the gate is the money leg —
     /// `Untrusted<Action::PaymentCreate>` for the order total — and the domain
     /// refuses it: a high-risk action derived from third-party input is denied
-    /// outright, audited, and reserves nothing. A tainted order large enough to
-    /// have needed a human anyway ends up in front of one instead. Either way
-    /// no effect happens and no order is placed.
+    /// outright, audited, and reserves nothing. **The order total does not
+    /// change that** — a tainted order over `approval_above` is refused like
+    /// any other, not escalated into a human's queue, because an approval
+    /// request whose payee and amount came from the stranger's text is the
+    /// thing being avoided rather than the safe fallback. No effect happens and
+    /// no order is placed.
     pub async fn place_order(
         &self,
         order: &Order,

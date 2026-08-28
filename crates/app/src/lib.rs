@@ -42,3 +42,4 @@ pub mod sourcing;
 pub mod turn; // U25
 pub mod vertical; // le fil du pack de rôle vers une verticale
 pub mod webhooks; // wave M: whose provider callback this is, when there is more than one customer
+pub mod x402; // reading a 402: the client half of the payment path, built and held shut

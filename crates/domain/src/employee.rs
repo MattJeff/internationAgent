@@ -139,7 +139,22 @@ pub enum Step {
     Phone,
     /// WhatsApp sender or routed company sender.
     Whatsapp,
-    /// Spending wallet.
+    /// Spending wallet — **a local binding, not an account anywhere**.
+    ///
+    /// `app::provisioning` answers this step with `local(employee, "wallet")`
+    /// and `adapter_of` gives it no adapter, so nothing is created, nothing is
+    /// funded and nothing is billed; the row *is* the resource, which is why
+    /// releasing it is a no-op. What the row does is switch a capability on and
+    /// off: `Ready` puts the "Purchasing" skill on the employee's A2A card and
+    /// `Disabled` takes it off again.
+    ///
+    /// The word "wallet" is the intent and the direction — this employee
+    /// **pays**, it is never paid at this step — and `agentos_app::x402`
+    /// argues why that makes this deployment the client of a paid API and not
+    /// the seller of one. Nothing here holds a key: `SPEC.md` §13's standing
+    /// rule is that a model never holds a private key, and the honest
+    /// consequence is that this step provisions a promise the payment port has
+    /// not been configured to keep.
     Wallet,
     /// Isolated browser context.
     Browser,
