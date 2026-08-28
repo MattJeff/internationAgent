@@ -1,6 +1,8 @@
 # The company, running
 
-*Last walked: 2026-08-28 (third pass, after waves O, P and Q).*
+*Last walked: 2026-08-28 (fourth pass, after waves R through V. CI is green
+end to end for the first time — including the three jobs that had been skipped
+behind a failing suite since before this map existed.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -76,7 +78,8 @@ expensive defect available in this product.
 | Duration → enforced stop | built | `company_windows` (0054), `halt.rs`, `PUT /v1/window` |
 | A new company gets one | built, **required** | `POST /v1/companies` refuses without `window_ends_at` |
 | Hiring into a company with no window | allowed, on purpose | hiring is not acting: the seat is inert until a window exists |
-| **Provisioning during a stop** | **open, and it spends money** | `loops/provisioning.rs` filters neither halts nor windows |
+| Provisioning during a stop | closed | the claim defers, except the one row whose provider call already went out |
+| Cold-outreach ceiling | has a ledger | `outreach_buckets` (0055) — it was the only limit reserving nothing |
 | Initiatives | built | `initiative.rs`, `loops/initiative.rs` |
 | Employees talk to each other | built | `a2a.rs` |
 | Browser | built | `browser.rs`, `effects.rs` |
@@ -211,6 +214,18 @@ hides its blanks is a map that lies.
   ends. Needed twice over: `POST /v1/org` still hires where there is no window,
   and there is no backfill for companies that predate `0054` — both blocked on
   the same number, and a duration is a price, so nobody here may invent it.
+- **`max_new_contacts_per_day: 0` ships in one of `docs/orizn-roles/*.json`.**
+  It is a real value with a real effect, and worth a look: a role that must
+  never approach a stranger, or a ceiling nobody filled in?
+- **How long can Resend re-deliver a webhook we have not acknowledged?** One
+  number, two decisions: it is the floor under any retention on
+  `outbox_events` — the row *is* the deduplication record, so deleting one and
+  letting a provider re-deliver sends a second email and buys a second model
+  call — and it bounds how long a stopped company's inbound mail can wait.
+- **A ceiling on model round-trips inside one turn.** `Budgets` is a hard-coded
+  default of ten with no lever, so a turn that needs eleven is stuck for good.
+  Raising it must intersect like every other policy, which means a platform
+  number that does not exist yet.
 - **Should extending an expired window restart the company in one call?** It
   does today. The safer alternative is to require the two deliberate gestures a
   halt requires.
