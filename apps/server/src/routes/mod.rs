@@ -27,3 +27,6 @@ pub mod turns; // the daily turn budget, read-side
 pub mod usage;
 pub mod webhooks; // U33
 pub mod well_known;
+// le carnet: the founder writes work down, ranks it, and gives it to a seat.
+// The employee's half is `agentos_app::backlog` and `loops::initiative`.
+pub mod work;

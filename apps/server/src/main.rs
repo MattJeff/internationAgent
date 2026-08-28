@@ -565,6 +565,11 @@ fn app(
             .merge(routes::employees::router(db.clone()))
             .merge(routes::halt::router(db.clone()))
             .merge(routes::initiative::router(db.clone()))
+            // Beside `initiative`, deliberately: that one says *how often* a
+            // seat acts on its own, this one says *what is waiting for it*.
+            // Before it there was nowhere in this product for an operator to
+            // put one piece of work before another.
+            .merge(routes::work::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
