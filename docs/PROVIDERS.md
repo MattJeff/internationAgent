@@ -329,12 +329,23 @@ its webhook. Also SMS and WhatsApp sends.
    no colon in it, by name.
 
 Twilio's inbound webhook signature is a **different scheme** — HMAC-SHA1 over the
-callback URL plus sorted form parameters. It is implemented
-(`telephony::verify_twilio_signature`) but **not reachable from
-`/v1/webhooks/{provider}`**, which does the Svix scheme only. There is no
-telephony ingest at the other end of the queue to read the row, so wiring it
-would be a route that fills a table nobody drains. When it lands, `Endpoint`
-grows a `scheme` field and the `verify` call grows a `match`.
+callback URL plus sorted form parameters — and it is **wired**, since
+`migrations/0069`. `/v1/webhooks/{path}` picks the verifier from the endpoint's
+`provider`: `twilio` gets this scheme, anything else gets the Svix one. The
+reader at the other end of the queue is `main::on_telephony_webhook`, which
+calls `agentos_app::inbound::land_inbound_text` — one phase, because the
+callback carries the body and there is nothing to fetch.
+
+`Endpoint` did **not** grow the `scheme` field this note predicted, and that is
+deliberate: the scheme and the ingest are one choice, `provider` already has to
+name the ingest (`webhook_endpoints_provider_is_wired`), and a second field is a
+second place for them to disagree.
+
+What this scheme needs and the other does not is the **callback URL**, which it
+MACs. It is built from `PUBLIC_HOST` plus the request path, so the URL pasted
+into the Twilio console must be exactly `${PUBLIC_HOST}/v1/webhooks/{path}` —
+including the scheme. A mismatch answers every genuine delivery 401 and logs the
+URL it signed over, which is the one line that makes that diagnosable.
 
 ### The human gate: the regulatory bundle
 

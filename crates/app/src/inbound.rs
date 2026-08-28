@@ -395,6 +395,10 @@ use crate::turn::Context;
 // duplicated or reached for directly.
 pub use agentos_providers::Secret;
 pub use agentos_providers::email::{SigError, WebhookHeaders, sign_webhook, verify_signature};
+pub use agentos_providers::telephony::{
+    PROVIDER as TELEPHONY_PROVIDER, SigError as TelephonySigError,
+    TWILIO_SIGNATURE_HEADER as TELEPHONY_SIGNATURE_HEADER,
+};
 
 /// `aggregate_type` of a stored raw webhook notice.
 pub const NOTICE_AGGREGATE: &str = "inbound";
@@ -937,6 +941,98 @@ async fn resolve_recipient(
 // Telephony: many employees, one number
 // ---------------------------------------------------------------------------
 
+/// Authenticate one raw telephony callback, and name the id a redelivery of it
+/// collapses onto.
+///
+/// The twin of [`verify_signature`] for the other scheme, re-exported into the
+/// HTTP layer for the reason stated at the top of this file: `apps/server` may
+/// not depend on `agentos-providers`, and signature verification is the one
+/// thing the edge has to do before any gated machinery exists.
+///
+/// # Why one function does both jobs
+///
+/// Because the second answer is provider knowledge and the edge must not have
+/// any. Standard Webhooks puts an event id in a header that the MAC covers, so
+/// `routes::webhooks` can dedupe on `headers.id` without reading a byte of the
+/// body. **Twilio sends no such header.** An edge that reached for `headers.id`
+/// anyway would compute the same empty key for every callback a deployment ever
+/// receives, and `outbox::enqueue` would collapse the lot onto the first one —
+/// so the second text message and every one after it would be answered 202 and
+/// silently dropped. Handing the id back from here is what makes that
+/// unspellable at the call site.
+///
+/// # And why the id is a digest of the body rather than `MessageSid`
+///
+/// `MessageSid` would read better in an operator's terminal, and getting it
+/// means parsing the payload — which is exactly what `routes::webhooks` refuses
+/// to do, and refuses for a reason it states at length. Doing it here instead
+/// would put a form parser and a "which field is the id on this provider"
+/// question into the crate the edge calls, one commit before somebody adds the
+/// second provider and the second field.
+///
+/// A digest needs neither. It is deterministic, it carries no key material — a
+/// MAC would also be stable per delivery and is not something to file in a
+/// column — and `MessageSid` is *inside* the bytes it covers, so two distinct
+/// messages cannot produce one id.
+///
+/// What it gives up is that a redelivery whose bytes differ (a re-ordered form,
+/// which Twilio does not do) would be a second outbox row. That costs nothing:
+/// `land` arbitrates on `messages.idempotency_key`, which **is** keyed on
+/// `MessageSid`, so the second row lands as a duplicate and enqueues no second
+/// turn. This key is an optimisation in front of that one, never the guarantee.
+///
+/// `callback_url` must be the URL as the provider was configured to post to,
+/// including its query string: the scheme MACs the URL, so a deployment whose
+/// idea of its own address differs by one character from what was pasted into
+/// the provider's console refuses every genuine delivery. It is not a secret —
+/// log it when this fails.
+pub fn verify_telephony_webhook(
+    auth_token: &Secret,
+    callback_url: &str,
+    signature: &str,
+    raw_form: &[u8],
+) -> Result<String, TelephonySigError> {
+    use sha2::Digest as _;
+
+    telephony::verify_twilio_signature(
+        auth_token,
+        callback_url,
+        telephony::WebhookBody::Form(raw_form),
+        &[(TELEPHONY_SIGNATURE_HEADER.to_owned(), signature.to_owned())],
+    )?;
+
+    // Only after the MAC. Hashing before it would be work an unauthenticated
+    // caller can ask for, which is the same argument the body cap makes.
+    Ok(sha2::Sha256::digest(raw_form)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        }))
+}
+
+/// Produce the header [`verify_telephony_webhook`] accepts.
+///
+/// The twin of [`sign_webhook`], and it exists for the same reason and with the
+/// same warning on it: **fixtures and tests only**. Real signatures are made by
+/// the provider. What this buys is that the edge's refusal of a forgery can be
+/// shown to be a refusal of the *signature* and not of the payload shape, which
+/// needs a control that is signed correctly.
+///
+/// Infallible for a form body — the fallible half of the underlying signer is
+/// the JSON `bodySHA256` branch, which this never takes. The unreachable arm
+/// yields an empty string rather than a panic, and an empty signature verifies
+/// against nothing, so even that failure is closed.
+pub fn sign_telephony_webhook(auth_token: &Secret, callback_url: &str, raw_form: &[u8]) -> String {
+    telephony::sign_twilio_signature(
+        auth_token,
+        callback_url,
+        telephony::WebhookBody::Form(raw_form),
+    )
+    .unwrap_or_default()
+}
+
 /// The two numbers a telephony delivery is routed by.
 ///
 /// Read off the **verified** form body by our own edge, so these are routing
@@ -1104,19 +1200,34 @@ const fn telephony_scope(channel: Channel) -> Option<(Step, &'static [&'static s
 /// second transaction would lose the relationship exactly when the first
 /// message from a new supplier is the one that established it.
 ///
-/// # NOT WIRED — there is no telephony ingest yet
+/// # Wired, and by one caller only
 ///
-/// Nothing outside `#[cfg(test)]` calls this, and by consequence nothing calls
-/// [`resolve_phone_recipient`] either: `apps/server/src/loops/inbound.rs`
-/// drains `webhook.*.received` for email only, and
-/// `apps/server/src/routes/webhooks.rs` says the other half of it — Twilio's
-/// HMAC-SHA1-over-the-callback-URL signature scheme is not wired into the
-/// ingest endpoint "because there is no telephony ingest on the other end of
-/// the queue to read the row".
+/// `apps/server/src/main.rs::on_telephony_webhook`, the outbox handler
+/// registered under `webhook.twilio.received`. That is the whole ingest: the
+/// route verified the bytes and stored them, the outbox poller claims the row,
+/// and this lands the message and wakes the employee inside the same
+/// transaction that marks the row done.
 ///
-/// So this is the reader that half is waiting for, not a path a message takes
-/// today. The paragraph above describes what happens when it is called, not
-/// what happens now. Outbound SMS and WhatsApp are wired; the reply is not.
+/// **There is no second queue, unlike email, and there must not be one.** The
+/// `inbound` notice aggregate that `loops/inbound.rs` drains exists because a
+/// Resend webhook carries an id and the body has to be fetched afterwards. A
+/// Twilio callback carries the body, so a notice here would be a row whose only
+/// content is a pointer to the row above it.
+///
+/// # It wakes, for the same reason email does
+///
+/// [`land`] enqueues [`TURN_EVENT`], and nothing on this path opts out of it. A
+/// text arriving on a number is a person waiting for an answer exactly as much
+/// as mail arriving at an address, and an employee who is woken by one and not
+/// the other has a channel it cannot hold a conversation on.
+///
+/// The reachable surface is *narrower* than email's, not wider, which is worth
+/// saying because the instinct runs the other way. [`resolve_recipient`] will
+/// route mail to any local part that matches a slug, so a stranger who guesses
+/// `sales@` reaches an employee. [`resolve_phone_recipient`] routes only to a
+/// number this tenant bought and an employee is `ready` on; a stranger cannot
+/// invent one, and a number nobody is allocated to is
+/// [`InboundError::Unallocated`] rather than a guess.
 pub async fn land_inbound_text(
     tx: &mut TenantTx<'_>,
     telephony: &dyn TelephonyProvider,
@@ -1477,6 +1588,65 @@ fn quotes_the_original(line: &str) -> bool {
         || lower.starts_with("envoyé :")
 }
 
+/// How `suppressions` spells this counterparty, or `None` when it cannot hold
+/// them at all.
+///
+/// # The question [`land`] used to ask, and why it was the wrong one
+///
+/// It asked *"does this contact parse as an email address?"* — which was the
+/// same question as *"which channel did they refuse us on?"* for exactly as long
+/// as email was the only channel that reached [`land`]. It stopped being the
+/// same question the day `land_inbound_text` acquired a caller, and the failure
+/// was not silent: the `else` arm logged an **error** and recorded nothing, so
+/// a person texting STOP to one of our numbers produced a log line saying a
+/// human must go and do it by hand, on every message, forever.
+///
+/// Nothing here widens what a refusal *means* — it is still `Scope::Tenant`,
+/// still one address, still append-only and still incapable of lifting a
+/// suppression. What changes is that the claim is now recorded on the channel it
+/// was made on rather than discarded.
+///
+/// # The phone half was already built and had no writer
+///
+/// `0011_revenue.sql` has held `check (channel in ('email', 'phone'))` and an
+/// E.164 branch of `suppressions_address_normalised` since it was written;
+/// `revenue_suppression_of(p_email, p_phone)` matches a phone row against
+/// `contacts.phone`, `suppressions_deactivate_contacts` deactivates on it and
+/// `contacts_reject_suppressed` refuses to re-import it. Every half of the
+/// enforcement existed. The only missing piece was a caller that spelled the
+/// number, which is these six lines.
+///
+/// # The digit floor is the constraint, re-derived exactly once
+///
+/// [`E164::parse`] takes 1..=15 digits; the CHECK takes `^\+[1-9][0-9]{6,14}$`,
+/// i.e. 7..=15. A short code — `+12345`, which is what a carrier gateway texts
+/// from — parses and would then violate the CHECK, and the `?` on the INSERT
+/// would roll back the message that carried the refusal and dead-letter it. So
+/// the floor is asserted here and an address below it is `None`: loud, and the
+/// message still lands.
+fn suppressible(channel: Channel, contact: &str) -> Option<(revenue_store::Channel, String)> {
+    match channel {
+        // `parse` lower-cases both halves and rejects whitespace and a second
+        // `@`, which is what the `email` branch of the CHECK asks for.
+        Channel::Email => Some((
+            revenue_store::Channel::Email,
+            EmailAddress::parse(contact).ok()?.to_string(),
+        )),
+        // One number, whichever of the two rides on it — and voice, which is
+        // the same person on the same number. A refusal is about the number,
+        // never about the transport it arrived over.
+        Channel::Sms | Channel::Whatsapp | Channel::Voice => {
+            let number = E164::parse(contact).ok()?;
+            (number.digits().len() >= 7)
+                .then(|| (revenue_store::Channel::Phone, number.as_str().to_owned()))
+        }
+        // Nothing lands on these through `land`, and if something ever does, a
+        // slug and an A2A peer id are not addresses a person can be reached at.
+        // `None` is the honest answer and it is loud.
+        Channel::A2a | Channel::Web | Channel::Internal => None,
+    }
+}
+
 /// The thread this contact talks to this employee on, creating it if new.
 ///
 /// One conversation per `(employee, channel, contact)`. The schema has no
@@ -1744,8 +1914,8 @@ pub async fn land(
         // an implementation detail, so the address-level row is what is written
         // and the wider claim is left visible here.
         if refuses_contact(&message.body_text) {
-            match EmailAddress::parse(&from) {
-                Ok(address) => {
+            match suppressible(message.channel, &from) {
+                Some((channel, address)) => {
                     revenue_store::suppress(
                         tx,
                         Uuid::now_v7(),
@@ -1756,14 +1926,23 @@ pub async fn land(
                             // than the one this reply made. Same reading
                             // `reconcile_opt_outs` takes.
                             scope: revenue_store::Scope::Tenant,
-                            channel: revenue_store::Channel::Email,
-                            // `parse` lower-cased both halves and rejects
-                            // whitespace and a second `@`, which is exactly
-                            // what `suppressions_address_normalised` CHECKs —
-                            // so this INSERT cannot fail that constraint, and
-                            // the `?` below cannot dead-letter a human's reply
-                            // forever on a malformed address.
-                            address: &address.to_string(),
+                            // Whichever channel they refused us on. `Phone` and
+                            // `Email` are both first-class in
+                            // `suppressions_channel` and in
+                            // `revenue_suppression_of`, which matches a phone
+                            // row against `contacts.phone` exactly as it
+                            // matches an email row against `contacts.email` —
+                            // so a number recorded here deactivates the contact
+                            // and blocks the next `outreach_sent` by trigger,
+                            // with nothing else to build.
+                            channel,
+                            // Normalised by `suppressible` into the exact shape
+                            // `suppressions_address_normalised` CHECKs for this
+                            // channel — so this INSERT cannot fail that
+                            // constraint, and the `?` below cannot dead-letter a
+                            // human's refusal forever on an address the table
+                            // will not take.
+                            address: &address,
                             reason: "opt_out",
                             // The address is what a reply carries; the trigger
                             // matches on it and deactivates every `contacts`
@@ -1801,19 +1980,16 @@ pub async fn land(
                          channel"
                     );
                 }
-                // ponytail: email only. `OPT_OUT` rides on email and nothing
-                // else sends cold, so this is the promise we actually made. A
-                // phone-channel refusal would need `Channel::Phone` and an
-                // `E164` whose digit count clears the table's own CHECK, which
-                // is a constraint re-derived in Rust for a case that cannot
-                // happen yet — add it the day an SMS cadence exists. Loud
-                // rather than silent, exactly as `reconcile_opt_outs` is about
-                // an address it cannot parse, because the person is refusing
-                // either way.
-                Err(_) => tracing::error!(
+                // The address is not one this table can hold — a short code, an
+                // A2A peer, a `From` that is neither an address nor a number.
+                // Loud rather than silent, exactly as `reconcile_opt_outs` is
+                // about an address it cannot parse, because the person is
+                // refusing either way. No address in the line: it would be the
+                // one piece of the refusal that is personal data.
+                None => tracing::error!(
                     channel = message.channel.as_str(),
-                    "a refusal arrived from an address that is not an email; it is NOT suppressed \
-                     here and must be recorded by hand"
+                    "a refusal arrived from a contact `suppressions` cannot store; it is NOT \
+                     suppressed here and must be recorded by hand"
                 ),
             }
         }
@@ -4630,6 +4806,233 @@ mod tests {
         tx.commit().await.expect("commit read");
         assert_eq!(body, INJECTION);
         assert_eq!(label, "untrusted");
+    }
+
+    /// Every suppression this tenant holds, with the channel it was recorded
+    /// on. `suppressed` above drops the channel, and the channel is the whole
+    /// claim here.
+    async fn suppressions_of(db: &Db, tenant: TenantId) -> Vec<(String, String, String)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows =
+            sqlx::query_as("SELECT channel, address, reason FROM suppressions ORDER BY address")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("read suppressions");
+        tx.commit().await.expect("commit read");
+        rows
+    }
+
+    /// **A STOP by SMS is recorded, and until this landed it was a log line
+    /// asking a human to do it by hand.**
+    ///
+    /// `land` used to ask "does this contact parse as an email address?", which
+    /// was the same question as "which channel did they refuse us on?" for
+    /// exactly as long as email was the only channel that reached it. Wiring the
+    /// telephony ingest made that arm reachable by ordinary human input: a
+    /// person texting STOP produced an `error!` and no row.
+    ///
+    /// The three claims, and the third is the one that keeps this honest:
+    ///
+    /// 1. the row exists, on `channel = 'phone'`, spelling the number the way
+    ///    `suppressions_address_normalised` CHECKs it — so a constraint
+    ///    violation cannot dead-letter the message that carried the refusal;
+    /// 2. the message **still lands and still wakes**, because a refusal is not
+    ///    a reason to lose what they wrote;
+    /// 3. an ordinary text from the same number writes nothing. Without this the
+    ///    test would pass against a `land` that suppressed every inbound text,
+    ///    and `suppressions` takes no DELETE — that mistake is not reversible.
+    #[tokio::test]
+    async fn a_stop_by_sms_suppresses_the_number_and_an_ordinary_text_does_not() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let pool = number(9);
+        allocate(&db, tenant, lena, &pool, true, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        // A supplier answers an RFQ. Nothing about it is a refusal.
+        let chatty = number(10);
+        text(
+            &db,
+            tenant,
+            &telephony,
+            &form(
+                "SM_chat",
+                chatty.as_str(),
+                &pool,
+                "yes, we can ship on the 4th",
+            ),
+            now,
+        )
+        .await
+        .expect("the ordinary text lands");
+        assert!(
+            suppressions_of(&db, tenant).await.is_empty(),
+            "an ordinary text suppressed the person who sent it, permanently"
+        );
+
+        // Somebody else types the word the footer asks for.
+        let refuser = number(11);
+        let landed = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM_stop", refuser.as_str(), &pool, "STOP"),
+            now,
+        )
+        .await
+        .expect("the refusal still lands");
+
+        // It is a message like any other: stored, and the employee is woken. A
+        // refusal we swallowed would be a refusal nobody could answer.
+        assert!(!landed.duplicate);
+        assert_eq!(messages(&db, tenant).await, 2);
+        assert_eq!(turns(&db, tenant).await, 2);
+
+        let rows = suppressions_of(&db, tenant).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (channel, address, reason) = &rows[0];
+        assert_eq!(channel, "phone", "recorded on the wrong channel: {rows:?}");
+        // The E.164 spelling `contacts.phone` carries, which is what
+        // `revenue_suppression_of` compares against — a suppression stored in a
+        // different shape from the contact it should match never fires.
+        assert_eq!(address, refuser.as_str());
+        assert_eq!(reason, "opt_out");
+    }
+
+    /// A number `suppressions` cannot hold is loud and loses nothing.
+    ///
+    /// A short code is six digits; `E164::parse` takes it and
+    /// `suppressions_address_normalised` does not. Without the floor in
+    /// `suppressible` the INSERT violates the CHECK, the `?` rolls back the
+    /// whole transaction, and the message carrying the refusal is retried and
+    /// dead-lettered — which is the one message in the system that must not be
+    /// lost.
+    #[tokio::test]
+    async fn a_refusal_from_a_short_code_still_lands_the_message() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let pool = number(12);
+        allocate(&db, tenant, lena, &pool, true, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        let short = E164::parse("+12345").expect("a short code parses as E.164");
+        assert!(
+            short.digits().len() < 7,
+            "the fixture stopped being a short code"
+        );
+
+        let landed = text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM_short", short.as_str(), &pool, "stop"),
+            now,
+        )
+        .await
+        .expect("a refusal from an unstorable number must not lose the message");
+
+        assert!(!landed.duplicate);
+        assert_eq!(messages(&db, tenant).await, 1);
+        assert!(
+            suppressions_of(&db, tenant).await.is_empty(),
+            "a number the table CHECKs against was written anyway"
+        );
+    }
+
+    /// The two halves of `suppressible`, without a database: which channel maps
+    /// to which list, and which contacts the list cannot hold at all.
+    #[test]
+    fn a_refusal_is_recorded_on_the_channel_it_arrived_on() {
+        assert_eq!(
+            suppressible(Channel::Email, "ap@supplier.example"),
+            Some((
+                revenue_store::Channel::Email,
+                "ap@supplier.example".to_owned()
+            ))
+        );
+        for channel in [Channel::Sms, Channel::Whatsapp, Channel::Voice] {
+            assert_eq!(
+                suppressible(channel, "+33612345678"),
+                Some((revenue_store::Channel::Phone, "+33612345678".to_owned())),
+                "{channel}"
+            );
+        }
+
+        // A number where an address belongs and an address where a number does:
+        // neither is storable, and neither may be quietly filed on the other
+        // list. Recording an email address as a phone row would be a row that
+        // never fires; recording a number as an email row violates the CHECK and
+        // dead-letters the message.
+        assert_eq!(suppressible(Channel::Email, "+33612345678"), None);
+        assert_eq!(suppressible(Channel::Sms, "ap@supplier.example"), None);
+        // The digit floor the table asks for, which `E164::parse` does not.
+        assert_eq!(suppressible(Channel::Sms, "+12345"), None);
+        // Nothing lands on these, and a slug is not an address anybody can be
+        // reached at.
+        for channel in [Channel::Internal, Channel::A2a, Channel::Web] {
+            assert_eq!(suppressible(channel, "lena"), None, "{channel}");
+        }
+    }
+
+    /// The edge's half: a callback verifies against its own token and its own
+    /// URL, and the id it hands back is stable per delivery and distinct per
+    /// message.
+    ///
+    /// The last two claims are what stands between a deployment and losing every
+    /// text after the first — see `verify_telephony_webhook` for why the id
+    /// cannot come from a header on this scheme.
+    #[test]
+    fn a_telephony_callback_verifies_and_names_a_stable_id() {
+        const URL: &str = "https://agents.test/v1/webhooks/whe_abcdefghijklmnop";
+        let token = Secret::new("an-auth-token");
+        let first = form(
+            "SM_a",
+            "+33612345678",
+            &E164::parse("+33755500001").expect("e164"),
+            "hi",
+        );
+        let second = form(
+            "SM_b",
+            "+33612345678",
+            &E164::parse("+33755500001").expect("e164"),
+            "hi",
+        );
+
+        let signature = sign_telephony_webhook(&token, URL, &first);
+        let id = verify_telephony_webhook(&token, URL, &signature, &first).expect("verifies");
+        // Stable: a redelivery of the same bytes collapses onto the same row.
+        assert_eq!(
+            verify_telephony_webhook(&token, URL, &signature, &first).expect("verifies"),
+            id
+        );
+
+        // Distinct: two messages are two rows. Same sender, same number, same
+        // text — only `MessageSid` differs, and it is inside the bytes.
+        let other = sign_telephony_webhook(&token, URL, &second);
+        assert_ne!(
+            verify_telephony_webhook(&token, URL, &other, &second).expect("verifies"),
+            id,
+            "two messages produced one id; every text after the first is dropped"
+        );
+
+        // Wrong token, wrong URL, tampered body, no signature: all refused, and
+        // none of them yields an id.
+        assert!(
+            verify_telephony_webhook(&Secret::new("another"), URL, &signature, &first).is_err()
+        );
+        assert!(
+            verify_telephony_webhook(
+                &token,
+                "https://elsewhere.test/v1/webhooks/x",
+                &signature,
+                &first
+            )
+            .is_err()
+        );
+        assert!(verify_telephony_webhook(&token, URL, &signature, &second).is_err());
+        assert!(verify_telephony_webhook(&token, URL, "", &first).is_err());
     }
 
     /// The audit row, through `ingest_email` — the path the outbox poller runs,

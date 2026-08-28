@@ -1272,13 +1272,21 @@ verbatim), 202. All processing is asynchronous.
 
 Dead-lettering is the outbox's — 8 attempts, then the row stops being selected.
 
-> **Twilio's scheme is implemented and NOT WIRED.**
-> `telephony::verify_twilio_signature` does HMAC-SHA1 over the callback URL plus
-> sorted form parameters, for both form and JSON bodies. It is not reachable
-> from `/v1/webhooks/{provider}`, because there is no telephony ingest at the
-> other end of the queue — wiring it would be a route that fills a table nobody
-> drains. When it lands, the endpoint registration grows a `scheme` field and
-> the verify call grows a `match`.
+> **Twilio's scheme is wired.** `telephony::verify_twilio_signature` does
+> HMAC-SHA1 over the callback URL plus sorted form parameters, and
+> `/v1/webhooks/{path}` picks it when the endpoint's `provider` is `twilio`
+> (`migrations/0069` widened the CHECK that had refused that value while no
+> reader existed). The reader is `main::on_telephony_webhook` →
+> `inbound::land_inbound_text`: **one phase**, since the callback carries the
+> body, so the message and its `agent.turn.requested` commit in the same
+> transaction that retires the delivery.
+>
+> Two details that are not obvious from the outside. The endpoint registration
+> did **not** grow a `scheme` field — the scheme is a function of `provider`,
+> and a second column is a second place for them to disagree. And the dedupe key
+> is a digest of the body rather than an event id: Twilio sends no `webhook-id`,
+> so an edge that reached for one would compute the same key for every callback
+> and collapse every text after the first onto one row.
 
 > **This block used to read "one webhook endpoint per provider per deployment
 > … needs a `webhook_endpoints` table. NOT BUILT", and it was still saying so
