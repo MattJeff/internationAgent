@@ -5652,9 +5652,16 @@ mod tests {
         })
         .await;
         cancel.cancel();
-        let _ = poller.await;
-        let _ = binder.await;
 
+        // **Asserted before the joins, and that ordering is the whole point.**
+        // The failure this bounds is one company's turn never starting, which
+        // leaves the other one parked inside `Switchboard::both` — inside a
+        // handler, inside `tick`, which `loops::outbox::run` awaits to
+        // completion and only checks cancellation between. So the poller task
+        // is wedged for good, and joining it below would hang a test that has
+        // already worked out its own answer: thirty seconds of knowing,
+        // followed by a CI executor held until the job-level timeout blames
+        // the suite. Panic first, and the runtime takes the poller with it.
         assert!(
             answered.is_ok(),
             "the two companies never took a turn at the same time: each model call \
@@ -5663,6 +5670,9 @@ mod tests {
              not a test artefact — it is what a customer's inbound email does \
              while somebody else's employee is thinking."
         );
+
+        let _ = poller.await;
+        let _ = binder.await;
 
         // -- 2. nothing of one company's is in the other's turn --------------
         for (mine, theirs) in [(0, 1), (1, 0)] {

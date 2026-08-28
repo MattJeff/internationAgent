@@ -474,6 +474,39 @@ pub(crate) async fn wait_until_blocked(db: &Db, pid: i32) {
     }
 }
 
+/// Meet a spawned contender at `gate`, or fail because it is not coming.
+///
+/// [`tokio::sync::Barrier::wait`] has no deadline, and every contention test in
+/// this crate arranges its race by having the test's own task meet a spawned
+/// one there. The spawned one opens a transaction and reads its backend pid
+/// first — so anything that makes *that* panic (the pool exhausted, the server
+/// gone, `tenant_tx` refusing) leaves one party at a barrier that will never
+/// release. The panic is printed, and then the run hangs anyway: the test that
+/// already knows it has failed is the one that never says so, and it holds a CI
+/// executor until the job-level timeout blames the whole suite for it.
+///
+/// `peer` names the task that did not arrive, because "timed out" sends the
+/// reader to the barrier and the barrier is never the culprit.
+///
+/// Twenty seconds, matching the joins in `calendar` and `outbox`: what it
+/// bounds is one `BEGIN` and one `SELECT pg_backend_pid()` against a local
+/// server, which is under a millisecond, so this is three orders of magnitude
+/// of headroom and cannot go red on a loaded machine. It costs a timer and
+/// nothing else on the path that passes.
+#[cfg(test)]
+pub(crate) async fn wait_at_barrier(gate: &tokio::sync::Barrier, peer: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), gate.wait())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{peer} never reached the barrier, so the two-connection arrangement \
+                 this test is about was never built and nothing it asserts next is \
+                 about contention. It died on the way — look above for its own panic, \
+                 which is usually a transaction it could not open."
+            )
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

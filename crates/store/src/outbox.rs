@@ -1609,7 +1609,20 @@ mod tests {
 
         let a = tokio::spawn(poller(db.clone(), ready.clone(), claimed.clone()));
         let b = tokio::spawn(poller(db.clone(), ready, claimed));
-        let (a, b) = (a.await.expect("poller a"), b.await.expect("poller b"));
+        // Bounded, because the failure this test exists to catch is a *block*
+        // and not a wrong answer: drop `SKIP LOCKED` and the second poller
+        // waits on the first one's row locks, while the first one waits at
+        // `claimed` for the second — a deadlock the join would sit in forever.
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+            (a.await.expect("poller a"), b.await.expect("poller b"))
+        })
+        .await
+        .expect(
+            "a poller never came back: the second one is waiting on row locks the first \
+             one holds until it has claimed, and it never will. That is `FOR UPDATE` \
+             without `SKIP LOCKED` — two pollers on one queue stop being a supported \
+             deployment and become a deadlock",
+        );
 
         let ids_a: std::collections::HashSet<Uuid> = a.iter().map(|e| e.id).collect();
         let ids_b: std::collections::HashSet<Uuid> = b.iter().map(|e| e.id).collect();
@@ -1721,7 +1734,7 @@ mod tests {
             });
 
             let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-            ready.wait().await;
+            crate::db::wait_at_barrier(&ready, "the slow poller").await;
             // Into the big claim's sort rather than alongside its snapshot:
             // level, the small claim can reach `due` first, and then it is the
             // big one that meets a held lock — which is the case the test above

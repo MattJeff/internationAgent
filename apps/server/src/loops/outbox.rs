@@ -1149,7 +1149,18 @@ mod tests {
             let (db, handlers) = (db.clone(), handlers.clone());
             async move { tick(&db, &Arc::new(handlers.clone()), now).await }
         });
-        entered.notified().await;
+        // Bounded, because the handler is only entered if the tick claims the
+        // row *and* routes it: a claim that stops seeing the row, or a dispatch
+        // that stops matching `EVENT`, leaves this notify unsignalled forever
+        // and the whole suite parked on a test whose premise is gone.
+        tokio::time::timeout(Duration::from_secs(20), entered.notified())
+            .await
+            .expect(
+                "the handler was never entered, so there was no in-flight handler to \
+                 kill and nothing below is about a killed worker. Did `tick` claim the \
+                 row at all, and does it still dispatch it to the handler registered \
+                 for this event name?",
+            );
         killed.abort();
         let _ = killed.await;
         // **An aborted task is a weaker kill than a dead pod, and the gap has to

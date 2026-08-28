@@ -1245,8 +1245,9 @@ mod tests {
         //
         // **This depends on `N` fitting in the pool** — `Db` opens sixteen
         // connections and twelve tasks hold one each while they wait. Raise `N`
-        // past that and every task blocks on a connection nobody will release,
-        // which is a hang and not a failure.
+        // past that and every task blocks on a connection nobody will release —
+        // which used to be a hang; the bounded wait below turns it into a red
+        // run that names the barrier nobody arrived at.
         let gate = Arc::new(tokio::sync::Barrier::new(N));
         let tasks: Vec<_> = employees
             .into_iter()
@@ -1256,7 +1257,13 @@ mod tests {
                 tokio::spawn(async move {
                     // A transaction per task, exactly as a real caller has.
                     let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-                    gate.wait().await;
+                    // Bounded *inside* the task and not around the join: one
+                    // task that dies before the gate — the pool exhausted, the
+                    // server gone — parks the other eleven on a barrier that
+                    // will never release, and the join of a parked task is a
+                    // hang and not a failure. Timing out here makes each
+                    // survivor panic, which the join reports as a red test.
+                    crate::db::wait_at_barrier(&gate, "one of the twelve employees").await;
                     let start = Instant::now();
                     let outcome = reserve(&mut tx, employee, DAY, usd(AMOUNT)).await;
                     let granted = match outcome {
