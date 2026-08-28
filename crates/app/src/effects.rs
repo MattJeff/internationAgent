@@ -4865,6 +4865,22 @@ mod tests {
              and a click are one row read twice"
         );
 
+        // **And the other half of that belt, which the field's own doc names and
+        // nothing held.** `step` is the step's *name* and never its argument,
+        // because `format!("{step:?}")` would print `Type { text }` — a
+        // customer's keystrokes — straight into a table with no `DELETE`. The
+        // assertion above pins one field's value and so catches a `Debug` swap
+        // there; this one covers the whole row, so a *new* field carrying the
+        // text is caught too. That is the failure worth guarding: nobody
+        // rewrites `step`, somebody adds `detail["typed"]`.
+        for (_, payload) in &rows {
+            let serialised = payload.to_string();
+            assert!(
+                !serialised.contains("FRA"),
+                "a customer's typed text reached the audit row: {serialised}"
+            );
+        }
+
         // The domain the token named is still there beside it: `step` is an
         // addition to `browse_detail`, not a replacement for what it said.
         assert_eq!(rows[0].1["detail"]["domain"], json!("portal.example.com"));
