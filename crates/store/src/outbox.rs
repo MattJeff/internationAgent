@@ -128,6 +128,12 @@ use crate::db::{StoreError, TenantTx};
 /// being able to use the index and walks every dead letter in the deployment
 /// again. `a_tenants_dead_letters_are_not_scanned_by_every_claim` is what turns
 /// that back into a failure somebody sees.
+///
+/// **Two statements read that index, not one.** `apps/server`'s
+/// `loops::outbox::lag_secs` binds this same constant against the same
+/// predicate, so forgetting the migration costs `/readyz` a sequential scan on
+/// every probe of every replica as well — measured, and guarded by
+/// `dead_letters_do_not_cost_the_readiness_probe` beside it.
 pub const MAX_ATTEMPTS: i32 = 8;
 
 /// The floor under a claim's `available_at`, in seconds: how long a claimed
@@ -942,14 +948,50 @@ pub async fn dead_letters(
 /// Returns how many rows were revived, so a caller can say nothing at all when
 /// the answer is zero.
 ///
-// ponytail: this is a sequential scan and always was — measured at 2.2 s to
-// revive one tenant's 100 000 dead letters out of 100 100 rows, on both sides of
-// `0057`, because no index helps a statement that updates almost every row it
-// looks at and the planner knows it. Left alone: it is a verb a human triggers
-// by connecting a model or activating a policy, not a poller, and two seconds
-// once is not worth an index that every enqueue would then maintain. The upgrade,
-// if a tenant ever holds a backlog this size *and* somebody is waiting on the
-// HTTP response, is to bound it — revive the oldest `n` and say so — not to index it.
+// ponytail: this is a sequential scan **once the pile is large, and an index
+// scan until then** — which is the half the note above this one was missing, and
+// it is the half that decides. Re-measured on PostgreSQL 17, median of three,
+// one tenant's dead letters, each run rolled back:
+//
+//     dead letters   table            requeue
+//     -------------------------------------------
+//                5   500 105 rows       0.1 ms   <- Index Scan, outbox_events_due_idx
+//          100 000   100 100 rows     2 867 ms   <- Seq Scan
+//          200 000   200 100 rows     4 753 ms
+//          500 000   500 100 rows    13 191 ms
+//        1 000 000  1 000 100 rows    41 675 ms
+//
+// The first row is the case that actually happens on every `install_layer`,
+// every `rollback_layer` and every `POST /v1/model`: a handful of dead letters
+// in a table of any size at all. It costs nothing, and half a million *published*
+// rows beside them cost nothing either — `outbox_events_due_idx` is partial on
+// `published_at IS NULL`, so the statement never sees them. So indexing is not
+// the upgrade for the same reason twice: the reachable case is already indexed,
+// and the expensive case is expensive because it updates 100 000 of 100 100 rows,
+// which no index makes cheaper.
+//
+// **The ceiling is not slowness, it is `REQUEST_TIMEOUT`.** Both callers run
+// inside an HTTP request that `apps/server/src/main.rs` gives 30 seconds, and the
+// table above crosses it somewhere around three quarters of a million. What
+// happens then is not a slow success: the layer answers 408, the handler future
+// is dropped, the transaction rolls back — and the transaction is the one holding
+// the *credential*. `POST /v1/model` would fail to connect a model because of the
+// mail that is waiting for the model, every retry would redo the same work and
+// fail the same way, and the verb that exists to unstick a tenant would be the
+// thing keeping it stuck. That is a real cliff and it is worth knowing it is at
+// ~750 000 rather than "eventually".
+//
+// FOUNDER'S QUESTION, LEFT OPEN, AND DELIBERATELY NOT ANSWERED HERE: bounding
+// this to the oldest `n` is the way out, and `n` is not an engineering choice.
+// Today the contract is "everything comes back"; bounded, it becomes "some of it
+// came back and you have to run the verb again", and neither caller can say so —
+// `connect` and `activate` both *log* the count and hand back an answer about a
+// credential or a policy version, so a partial revival would be invisible to the
+// person who has to repeat it. So the number and its telling are one decision:
+// how many, and where does the operator read "500 of 100 000"? Nothing is near
+// the cliff (the largest pile this deployment could hold is one parked row per
+// unanswerable message), so this ships unbounded and measured rather than bounded
+// and guessed.
 pub async fn requeue_dead_letters(
     tx: &mut TenantTx<'_>,
     now: DateTime<Utc>,
