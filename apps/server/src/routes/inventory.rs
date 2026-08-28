@@ -34,6 +34,18 @@
 //! this handler becomes a `map` over it. That is a `crates/store` change this
 //! unit does not own. Until then, `WHERE` clause parity with the store is the
 //! thing to keep: terminated employee, provider and external id both present.
+//!
+//! **One thing this duplication is doing that the note above did not claim, and
+//! that the merge must not drop.** `step` is a `String` here and a typed `Step`
+//! in `Stranded`, behind a `filter_map` that silently skips a name the build
+//! cannot parse. `employee_resources.step` is bare `text` with no CHECK, so a
+//! rolling deploy really can leave a row this binary has no `Step` for — and
+//! that row is a provider resource somebody is still being billed for.
+//! `loops::provisioning::sweep` now escalates it to a human precisely because
+//! nothing can release it, and the reason it files sends the operator **here**.
+//! So whoever collapses these two queries has to widen `Stranded::step` to text
+//! in the same commit, or this screen stops showing the one row the alert is
+//! about.
 
 use agentos_store::db::{Db, StoreError};
 use axum::Json;

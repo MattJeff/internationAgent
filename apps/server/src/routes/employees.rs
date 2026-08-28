@@ -49,6 +49,7 @@ use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, NewEvent};
+use agentos_store::{backlog, calendar};
 use agentos_store::{employee as employee_store, employee::StoredEmployee};
 use axum::Json;
 use axum::Router;
@@ -410,6 +411,40 @@ async fn load(db: &Db, principal: &Principal, id: EmployeeId) -> Result<StoredEm
 /// The version read by `load` is quoted by `update`, so two operators racing a
 /// suspend and a terminate produce one winner and one 409 rather than a lost
 /// write.
+///
+/// # What a termination hands back, and why it is here rather than in a trigger
+///
+/// **This is the only production writer of `employees.lifecycle` in the
+/// workspace.** Every other `UPDATE employees SET lifecycle` is inside a
+/// `#[cfg(test)]` module, and every typed `set_lifecycle(Terminated)` outside
+/// this function is a test helper — so one branch here covers every path there
+/// is, and there is no sibling caller left un-guarded.
+///
+/// It matters because two tables carried an assignment that a lifecycle column
+/// cannot cancel on its own:
+///
+/// * `work_items.assignee_id` is `on delete set null`, and `0061` reads that
+///   action as "the item goes back on the board unassigned". Nothing ever
+///   deletes an employee, so the action never fires and the work stopped in
+///   silence — see [`backlog::unassign_all`].
+/// * `appointments` is `on delete cascade` for the opposite and correct reason,
+///   and has the same problem in the other direction: the row survives, its
+///   claim filters `lifecycle = 'active'`, and a promise nobody can keep reads
+///   as still ahead forever — see [`calendar::cancel_outstanding`].
+///
+/// Both run in **this** transaction, beside the row they are about, so there is
+/// no committed instant in which a terminated seat still holds work. A
+/// background handler would have been the other option and is the wrong one: the
+/// `employee.terminated` event it would hang off dead-letters after eight
+/// attempts, which is precisely the failure `loops::provisioning::sweep` exists
+/// to clean up after.
+///
+/// **Terminated only.** A suspension pauses a seat "without releasing anything
+/// it owns", which is what `POST /v1/employees/{id}/suspend` says it is for and
+/// the only thing that distinguishes the two verbs; and `Suspended` moves back
+/// to `Active`, so a board handed out and an hour cancelled could not be undone
+/// when it did. Re-terminating cannot double-run either: `Terminated` is
+/// absorbing, so `set_lifecycle` on the domain object refuses before this point.
 async fn set_lifecycle(
     db: &Db,
     principal: &Principal,
@@ -433,6 +468,18 @@ async fn set_lifecycle(
     })?;
 
     let next_version = employee_store::update(&mut tx, &employee, version).await?;
+    if to == Lifecycle::Terminated {
+        let unassigned = backlog::unassign_all(&mut tx, id).await?;
+        let cancelled = calendar::cancel_outstanding(&mut tx, id, now).await?;
+        if unassigned > 0 || cancelled > 0 {
+            tracing::info!(
+                %id,
+                unassigned,
+                cancelled,
+                "a terminated seat handed its board back and its promises were settled"
+            );
+        }
+    }
     // Re-asserting a lifecycle is legal and writes nothing interesting, but it
     // still bumps the version — so the dedupe key names the version and the
     // event fans out exactly once per write.
@@ -1116,6 +1163,201 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(problem["code"], "illegal_lifecycle");
 
+        h.teardown().await;
+    }
+
+    /// The two things a departure has to hand back, and the two it must not
+    /// touch — all four through the real endpoint, because the defect was that
+    /// the endpoint did nothing and a foreign key was believed to.
+    ///
+    /// `0061` says `on delete set null` puts a terminated employee's work back
+    /// on the board. Nothing deletes an employee, so before this test's fix the
+    /// open item kept an assignee that would never take another turn: absent
+    /// from `open_for` (only ever asked about a *due* employee), absent from
+    /// `unclaimed` (which wants a null assignee), and showing as assigned on
+    /// `GET /v1/work`. `0063`'s side of it is the mirror: `claim_due` filters
+    /// `lifecycle = 'active'`, so an outstanding promise of a departed seat
+    /// stayed `rang_at IS NULL` forever and read as still ahead in the diary.
+    ///
+    /// The two negatives are the doors next to the one being closed. **Suspend
+    /// changes nothing**, or it stops being the reversible verb it is documented
+    /// as. **A closed item keeps its assignee**, because `close` can only be
+    /// reached by the assignee, so that column is the only record of who did it.
+    /// And a promise that has already gone by keeps its NULL rather than being
+    /// stamped `now`: `rang_at` after `at` means *kept late*, and forging that
+    /// would credit a departed seat with something it never did.
+    #[tokio::test]
+    async fn terminating_a_seat_hands_back_its_board_and_settles_its_promises() {
+        use agentos_domain::ids::{AppointmentId, WorkItemId};
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (_, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key("handback")),
+                Some(body("ada")),
+            )
+            .await;
+        let id = created["id"].as_str().expect("id").to_owned();
+        let employee_id = EmployeeId::from_uuid(id.parse().expect("uuid"));
+
+        let now = Utc::now();
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let StoredEmployee {
+            mut employee,
+            version,
+        } = employee_store::load(&mut tx, employee_id)
+            .await
+            .expect("load");
+        employee
+            .set_lifecycle(Lifecycle::Active, now)
+            .expect("activate");
+        employee_store::update(&mut tx, &employee, version)
+            .await
+            .expect("update");
+
+        let open = WorkItemId::new_v7(now);
+        backlog::post(
+            &mut tx,
+            open,
+            "chase the tariff code",
+            Some(employee_id),
+            None,
+        )
+        .await
+        .expect("post the open item");
+        let signed_off = WorkItemId::new_v7(now);
+        backlog::post(
+            &mut tx,
+            signed_off,
+            "file the return",
+            Some(employee_id),
+            None,
+        )
+        .await
+        .expect("post the closed item");
+        assert!(
+            backlog::close(&mut tx, signed_off, employee_id, now)
+                .await
+                .expect("close"),
+            "the assignee closes its own item"
+        );
+
+        let ahead = AppointmentId::new_v7(now);
+        let promised_for = now + chrono::TimeDelta::days(3);
+        calendar::book(
+            &mut tx,
+            ahead,
+            employee_id,
+            promised_for,
+            "Europe/Paris",
+            "call the broker back",
+        )
+        .await
+        .expect("book the promise still ahead");
+        let missed = AppointmentId::new_v7(now);
+        calendar::book(
+            &mut tx,
+            missed,
+            employee_id,
+            now - chrono::TimeDelta::days(1),
+            "Europe/Paris",
+            "the hour that went by while the company was halted",
+        )
+        .await
+        .expect("book the promise already past");
+        tx.commit().await.expect("commit");
+
+        // The door next to the one being closed: a suspension releases nothing.
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/suspend"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        assert_eq!(
+            backlog::open_for(&mut tx, employee_id)
+                .await
+                .expect("open_for")
+                .len(),
+            1,
+            "a suspension took the seat's board away"
+        );
+        assert_eq!(
+            calendar::upcoming(&mut tx, employee_id)
+                .await
+                .expect("upcoming")
+                .len(),
+            2,
+            "a suspension settled a promise the seat can still keep"
+        );
+        tx.rollback().await.expect("rollback");
+
+        let (status, view) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/terminate"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["lifecycle"], "terminated");
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let board = backlog::board(&mut tx).await.expect("board");
+        let item = |id: WorkItemId| {
+            board
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("{id} left the board"))
+                .clone()
+        };
+        assert_eq!(
+            item(open).assignee_id,
+            None,
+            "the open item did not go back on the board: {board:?}"
+        );
+        assert_eq!(
+            item(signed_off).assignee_id,
+            Some(employee_id),
+            "a closed item lost the record of who did it: {board:?}"
+        );
+
+        let diary = calendar::diary(&mut tx).await.expect("diary");
+        let promise = |id: AppointmentId| {
+            diary
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap_or_else(|| panic!("{id} left the diary"))
+                .clone()
+        };
+        let cancelled = promise(ahead)
+            .rang_at
+            .expect("the promise ahead is settled");
+        assert!(
+            cancelled < promised_for,
+            "settled at or after the hour it was promised for reads as kept, not cancelled: \
+             {cancelled} vs {promised_for}"
+        );
+        assert_eq!(
+            promise(missed).rang_at,
+            None,
+            "an hour that had already gone by was stamped as kept: {diary:?}"
+        );
+
+        tx.rollback().await.expect("rollback");
         h.teardown().await;
     }
 

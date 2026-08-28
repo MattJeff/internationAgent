@@ -253,9 +253,10 @@ pub async fn unclaimed(tx: &mut TenantTx<'_>) -> Result<Vec<Item>, StoreError> {
 /// claiming exists to prevent, reintroduced by the mechanism meant to prevent
 /// it. There is no duration that is right for "chase the tariff code".
 ///
-/// The one automatic return that *is* wanted already exists and is not this
-/// function's: `on delete set null` on `assignee_id`, which puts a terminated
-/// employee's work back on the board — `0061` argues it.
+/// The one automatic return that *is* wanted is [`unassign_all`], and it is a
+/// statement rather than a foreign key. `0061` says `on delete set null` puts a
+/// terminated employee's work back on the board; it does not, because nothing
+/// deletes an employee — see that function and `migrations/0068`.
 ///
 /// # Why one statement is the whole of the mutual exclusion
 ///
@@ -395,6 +396,64 @@ pub async fn amend(
     .await?
     .ok_or(StoreError::NotFound)?;
     Ok(row_of(&row))
+}
+
+/// Put back on the board everything one seat was holding. Returns how many rows
+/// moved.
+///
+/// # This is the statement `0061` said was a foreign key
+///
+/// `0061` argues, in as many words, that `on delete set null` on `assignee_id`
+/// is what "puts the item back on the board unassigned" when somebody leaves.
+/// **The action never fires**, because nothing in this workspace deletes an
+/// employee: termination is a column, `UPDATE employees SET lifecycle =
+/// 'terminated'`, and `employees` has no DELETE path at all. So the item kept an
+/// assignee that would never take another turn — invisible to
+/// [`open_for`], which is only ever asked about an employee that is *due*, and
+/// invisible to [`unclaimed`], which wants `assignee_id IS NULL`. It read
+/// "assigned" on `GET /v1/work` and appeared in no brief ever again. The
+/// migration's prose cannot be corrected — it has been applied and sqlx
+/// checksums it — so `migrations/0068` is where it is contradicted.
+///
+/// `closed_at IS NULL`, and it is the whole of the clause that matters.
+/// [`close`] can only be reached by the assignee, so a closed item's
+/// `assignee_id` is the only record of **who did it**; blanking it would erase
+/// that to no purpose, because a finished item is not work waiting for somebody.
+///
+/// `posted_by` is deliberately not touched. It is a register of who wrote the
+/// row down, not a claim on it — `0064` says so and [`amend`] refuses to move it
+/// for the same reason. Whoever filed the work still filed it after they left.
+///
+/// Called by `routes::employees::set_lifecycle` **in the transaction that writes
+/// the lifecycle**, so an employee is never terminated in a committed state
+/// where it still holds work. Termination only: a suspension is reversible and
+/// `POST /v1/employees/{id}/suspend` is documented as pausing a seat "without
+/// releasing anything it owns" — taking its board away and handing it out would
+/// make the two verbs the same one.
+///
+/// # Why only this table, when nine columns have the same dead action
+///
+/// `employees` is referenced with `on delete set null` from `a2a_tasks`, `rfqs`,
+/// `negotiations`, `purchase_orders`, `accounts`, `opportunities`,
+/// `opportunity_events`, `proof_of_need_attempts` and both of `work_items`' own
+/// columns. Every one of those actions is as dead as this one was, and only this
+/// one was a defect — because `assignee_id IS NULL` is the sole place in the
+/// schema where *nobody holds this* is a state something **reads**, in
+/// [`unclaimed`]. Everywhere else the column is provenance or ownership, NULL
+/// means "nobody, and nobody will", and blanking it would destroy a record
+/// without handing the work to anyone. Redistributing those needs a rule the
+/// founder has not written; this needed no rule at all, because 0061 had already
+/// written it.
+pub async fn unassign_all(tx: &mut TenantTx<'_>, who: EmployeeId) -> Result<u64, StoreError> {
+    let moved = sqlx::query(
+        "UPDATE work_items SET assignee_id = NULL \
+          WHERE assignee_id = $1 AND closed_at IS NULL",
+    )
+    .bind(who.as_uuid())
+    .execute(&mut ***tx)
+    .await?
+    .rows_affected();
+    Ok(moved)
 }
 
 #[cfg(test)]

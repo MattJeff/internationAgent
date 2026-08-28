@@ -2531,6 +2531,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// **One [`BATCH`] shared between two claims, which nothing tested.**
+    ///
+    /// `tick` runs `calendar::claim_due(BATCH)` and then
+    /// `initiative::claim_due(BATCH - rung.len())`, and every sentence
+    /// [`MAX_CONCURRENT_TENANTS`] writes about how long one pass may take rests
+    /// on that subtraction. Two claims of `BATCH` each would be a pass of eight
+    /// turns — eight minutes of [`TURN_DEADLINE`] instead of four — and nothing
+    /// anywhere would say so, because both halves would still be individually
+    /// correct. That is the shape of defect a seam produces.
+    ///
+    /// Five companies, each owing an hour *and* each with a cadence that came
+    /// round, is the arrangement where the two claims collide hardest:
+    ///
+    /// * the calendar hands out **one appointment per company**, so its own
+    ///   `LIMIT` binds at four and the fifth company waits — the fairness
+    ///   `0052`'s defect cost, asserted rather than assumed;
+    /// * that leaves `BATCH - 4 = 0` for the cadences, and **no cadence runs at
+    ///   all** — promises first, which is the ordering decision `tick` argues
+    ///   for: a rhythm that misses a pass comes round again and a promise that
+    ///   misses its hour is broken.
+    ///
+    /// No charter on any of them, so `assignment_for` stops at `NoCharter` and
+    /// no model is called. What is under test is the arithmetic of the claim,
+    /// and a turn would only make it slower.
+    #[tokio::test]
+    async fn the_two_claims_share_one_batch_and_the_promises_take_it_first() {
+        use agentos_domain::ids::AppointmentId;
+        use agentos_store::calendar as diary_store;
+
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(db) = db().await else {
+            return;
+        };
+        clear_schedules(&db).await;
+        clear_diaries(&db).await;
+
+        let now = Utc::now();
+        let due_at = now - chrono::TimeDelta::minutes(5);
+        let mut tenants = Vec::new();
+        for n in 0..5 {
+            let tenant = seed_tenant(&db).await;
+            let seat = seed_due(&db, tenant, &format!("batch-{n}"), None).await;
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            diary_store::book(
+                &mut tx,
+                AppointmentId::new_v7(now),
+                seat,
+                due_at,
+                "Europe/Paris",
+                "the hour this company was owed",
+            )
+            .await
+            .expect("book");
+            tx.commit().await.expect("commit");
+            tenants.push(tenant);
+        }
+
+        let cancel = CancellationToken::new();
+        let take = |_assignment: Assignment| async { Ok(()) };
+        assert_eq!(
+            tick(&db, &take, &cancel, now).await.expect("tick"),
+            BATCH as usize,
+            "one pass took more than one BATCH: the two claims are not sharing it"
+        );
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let rung: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointments WHERE rang_at IS NOT NULL AND tenant_id IN \
+             (SELECT id FROM tenants WHERE slug LIKE 'loop-initiative-%')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count the rung");
+        let advanced: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM employee_initiative WHERE claims > 0 AND tenant_id IN \
+             (SELECT id FROM tenants WHERE slug LIKE 'loop-initiative-%')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count the advanced");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            rung, 4,
+            "one appointment per company, four of the five: the calendar's own \
+             LIMIT is what keeps a flood from starving everybody"
+        );
+        assert_eq!(
+            advanced, 0,
+            "the promises filled the batch, so no cadence may have been claimed \
+             beside them"
+        );
+
+        for tenant in tenants {
+            drop_tenant(&db, tenant).await;
+        }
+    }
+
     async fn outcome_of(
         db: &Db,
         tenant: TenantId,
