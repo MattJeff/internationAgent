@@ -690,15 +690,21 @@ fn app(
     // the agent card here for the same reason: a verifier who has never heard
     // of us has nothing to authenticate with, and a key nobody can fetch
     // verifies nothing.
-    let public = routes::webhooks::router(db.clone(), credentials.clone(), webhooks(config))
-        .merge(routes::a2a::card_router(a2a))
-        // The OAuth callback belongs on this tier and could not be on the other:
-        // a provider redirects a *browser* back to us, and a browser holds no
-        // API key, so behind `with_api_stack` every real callback is a 401. What
-        // stands in for the credential is the `state` parameter, and
-        // `routes::mcp::public_router` is where that argument lives.
-        .merge(routes::mcp::public_router(mcp_state))
-        .merge(routes::well_known::router(db.clone()));
+    let public = routes::webhooks::router(
+        db.clone(),
+        credentials.clone(),
+        webhooks(config),
+        // Half of what Twilio's scheme MACs. See `routes::webhooks`.
+        &config.public_host,
+    )
+    .merge(routes::a2a::card_router(a2a))
+    // The OAuth callback belongs on this tier and could not be on the other:
+    // a provider redirects a *browser* back to us, and a browser holds no
+    // API key, so behind `with_api_stack` every real callback is a 401. What
+    // stands in for the credential is the `state` parameter, and
+    // `routes::mcp::public_router` is where that argument lives.
+    .merge(routes::mcp::public_router(mcp_state))
+    .merge(routes::well_known::router(db.clone()));
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
     // and that is a deliberate reading of the two tiers above rather than the
@@ -777,6 +783,11 @@ fn webhooks(config: &Config) -> Webhooks {
 /// happens, *and* a permanently unpublished row, which `/readyz` eventually
 /// reports as lag. If you add an `enqueue` anywhere, add a line here.
 fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handlers {
+    // Cloned before `agent` is moved into the turn handler below. The telephony
+    // ingest needs exactly one of the ports — the adapter that normalises a
+    // verified form body — and `Ports` is process-wide, so this is one `Arc`
+    // bump and not a second set of adapters.
+    let ports = agent.ports.clone();
     let mut handlers = Handlers::default()
         .on(routes::employees::CREATED_EVENT, Arc::new(on_created))
         .on(
@@ -802,28 +813,43 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
             Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
         );
 
-    // `email` unconditionally, because a `webhook_endpoints` row does not exist
-    // at boot and the loop below cannot see one. There is exactly one wired
-    // ingest — `on_webhook` parses the body as Resend JSON whatever the provider
-    // is called — and `0053`'s `webhook_endpoints_provider_is_wired` CHECK is
-    // the pair of this line: a stored endpoint cannot name a provider whose
-    // event type nothing here registers, which would be eight retries and a dead
-    // letter per delivered message.
-    handlers = handlers.on(
-        routes::webhooks::received_event("email"),
-        Arc::new(on_webhook),
-    );
-
-    // Then one per environment registration, whose path segment is its provider
-    // name and need not be `email` — `resend:<tenant>:<secret>` is a legitimate
-    // entry and files under `webhook.resend.received`. `Handlers::on` overwrites
-    // by key, so the `email` line above is idempotent under this loop.
+    // One per environment registration, whose path segment is its provider name
+    // and need not be `email` — `resend:<tenant>:<secret>` is a legitimate entry
+    // and files under `webhook.resend.received`. `on_webhook` is the right
+    // reader for an unrecognised name because Resend is the only provider a
+    // deployment configures this way today.
     for hook in &config.webhooks {
         handlers = handlers.on(
             routes::webhooks::received_event(&hook.provider),
             Arc::new(on_webhook),
         );
     }
+
+    // Then the two wired ingests, unconditionally and **after** that loop.
+    //
+    // Unconditionally, because a `webhook_endpoints` row does not exist at boot
+    // and the loop above cannot see one; `0053`'s
+    // `webhook_endpoints_provider_is_wired` CHECK, widened by `0069`, is the
+    // pair of these two lines — a stored endpoint cannot name a provider whose
+    // event type nothing here registers, which would be eight retries and a dead
+    // letter per delivered message.
+    //
+    // **After, and that ordering is load-bearing.** `Handlers::on` overwrites by
+    // key. These lines used to sit above the loop, which was harmless while
+    // every reader was `on_webhook` and stops being harmless the moment two
+    // readers exist: `AGENTOS_WEBHOOK_SECRETS=twilio:<tenant>:<token>` is a
+    // legal entry, and with the old order the loop would have replaced the
+    // telephony reader with the email one — a Twilio form body parsed as Resend
+    // JSON, which is a terminal park on every text message a customer sends.
+    handlers = handlers
+        .on(
+            routes::webhooks::received_event("email"),
+            Arc::new(on_webhook),
+        )
+        .on(
+            routes::webhooks::received_event(routes::webhooks::TELEPHONY_PROVIDER),
+            Arc::new(move |event, tx| on_telephony_webhook(ports.clone(), event, tx)),
+        );
     handlers
 }
 
@@ -1233,6 +1259,90 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
                 );
             }
         }
+        Ok(())
+    })
+}
+
+/// `webhook.twilio.received`: a text message becomes a conversation and a turn.
+///
+/// The other missing joint, and the shorter one.
+/// [`agentos_app::inbound::land_inbound_text`] had exactly one caller in this
+/// workspace and it was a test; `resolve_phone_recipient` — the one of four
+/// inbound routing implementations that survived a clean-up, and the one whose
+/// comment said it was waiting for an ingest — therefore had none at all. This
+/// is the ingest.
+///
+/// # One phase, and no second queue
+///
+/// Email needs two: the Resend webhook carries an id and the body has to be
+/// fetched afterwards, so `on_webhook` writes an `inbound` notice and
+/// `loops::inbound` drains it. **A Twilio callback carries the body.** There is
+/// nothing to fetch, nothing to race the provider for, and a notice here would
+/// be a row whose only content is a pointer to the row above it. So the routing,
+/// the thread, the message and the turn all commit in this transaction, together
+/// with the `mark_done` that retires the delivery — which is exactly what makes
+/// a crash anywhere in here re-run the whole thing rather than half of it.
+///
+/// That is also why the thread is written here and not later: the thread **is**
+/// the affinity `resolve_phone_recipient` reads next time, so a second
+/// transaction would lose the relationship precisely when the first message from
+/// a new supplier is the one that established it.
+///
+/// # What is retryable, and what is a park
+///
+/// [`agentos_app::inbound::InboundError::is_retryable`] decides, exactly as it
+/// does for mail. The variant worth naming is
+/// [`Unallocated`](agentos_app::inbound::InboundError::Unallocated): a number
+/// this tenant holds that no `ready` employee is on. It is **not** retryable and
+/// it is deliberately not `Ok` either — it is a misconfiguration an operator has
+/// to see, and a dead letter is visible where a silent success is not.
+/// `outbox::requeue_dead_letters` is the way back once somebody is allocated.
+fn on_telephony_webhook<'a>(
+    ports: Arc<Ports>,
+    event: &'a OutboxEvent,
+    tx: &'a mut TenantTx<'_>,
+) -> Handled<'a> {
+    Box::pin(async move {
+        // Terminal, for `on_webhook`'s reason: this row's payload is written
+        // once, by the route, and a stored delivery with no body will not grow
+        // one.
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
+
+        // Exactly the bytes the signature was checked over at the edge. The
+        // provider is reached through `agentos_app`, never named here — this
+        // crate does not depend on `agentos-providers`, which is why the
+        // adapter arrives as a port rather than as a type.
+        let landed = agentos_app::inbound::land_inbound_text(
+            tx,
+            &*ports.telephony,
+            body.as_bytes(),
+            Utc::now(),
+        )
+        .await
+        .map_err(|err| {
+            // Never the payload and never a counterparty's text: `code()` is a
+            // fixed label, every `InboundError` renders from an authored
+            // sentence, and this string is written to `last_error`.
+            let why = format!("{}: {err}", err.code());
+            if err.is_retryable() {
+                Failure::Retry(why)
+            } else {
+                Failure::Terminal(why)
+            }
+        })?;
+
+        // No number and no body. Who wrote is in `messages`, behind RLS.
+        tracing::info!(
+            message_id = %landed.message_id,
+            conversation_id = %landed.conversation_id,
+            turn_event_id = %landed.turn_event_id,
+            duplicate = landed.duplicate,
+            "inbound text landed"
+        );
         Ok(())
     })
 }
@@ -4345,6 +4455,307 @@ mod tests {
                 .expect("count the trail");
         tx.rollback().await.expect("rollback");
         assert_eq!(refused, 1, "the complaint was accepted and not recorded");
+
+        drop_database(db, admin_url, database).await;
+    }
+
+    /// **`on_telephony_webhook` asks the same classification `on_webhook`
+    /// asks**, and the answer matters more on this side.
+    ///
+    /// `Failure::Retry` is eight attempts before the dead letter;
+    /// `Failure::Terminal` is one. Every failure this handler can have is one
+    /// no retry can fix — the bytes are already durable on the row that got us
+    /// here and they will parse exactly the same way next time — so a blanket
+    /// `Retry` is seven attempts that buy nothing and bury the outages that are
+    /// real. That is the bug `on_webhook` was already fixed for, arriving
+    /// through a second door.
+    ///
+    /// `Unallocated` is the one worth naming: a number this tenant holds that
+    /// no `ready` employee is on. Terminal, and deliberately **not** `Ok` — a
+    /// dead letter is visible and a silent success is a customer's text
+    /// deleted. `outbox::requeue_dead_letters` is the way back once somebody is
+    /// allocated.
+    #[tokio::test]
+    async fn on_telephony_webhook_parks_what_no_retry_can_fix_and_still_refuses_to_swallow_it() {
+        let Some((db, admin_url, database)) = own_database("tel_class").await else {
+            return;
+        };
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("tc-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        let ports = Arc::new(agentos_app::mocks::ports());
+        let stored = |body: &str| OutboxEvent {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            aggregate_type: routes::webhooks::RAW_AGGREGATE.to_owned(),
+            aggregate_id: Uuid::nil(),
+            event_type: routes::webhooks::received_event(routes::webhooks::TELEPHONY_PROVIDER),
+            payload: json!({ "body": body }),
+            attempt_count: 1,
+            available_at: now,
+            last_error: None,
+        };
+
+        for (label, body) in [
+            ("not a form at all", "}{"),
+            (
+                "a callback with no To",
+                "MessageSid=SM1&From=%2B33612345678",
+            ),
+            (
+                "a To that is not E.164",
+                "MessageSid=SM1&From=%2B33612345678&To=nonsense",
+            ),
+            // No employee is allocated to anything in this database, so this is
+            // a well-formed callback on a number nobody answers.
+            (
+                "a number nobody is allocated to",
+                "MessageSid=SM1&From=%2B33612345678&To=%2B33755500001&Body=hello",
+            ),
+        ] {
+            let event = stored(body);
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let handled = on_telephony_webhook(ports.clone(), &event, &mut tx).await;
+            tx.rollback().await.expect("rollback");
+
+            // Not `Ok`. Whatever else changes, this one must not: the row still
+            // goes to the queue a human reads.
+            let Err(failure) = handled else {
+                panic!("{label} was swallowed as a success");
+            };
+            assert!(
+                matches!(failure, Failure::Terminal(_)),
+                "{label} is still being retried, and the retry cannot work: {failure:?}"
+            );
+        }
+
+        // A stored row whose payload has no `body`: same structural case, and
+        // the route writes that field once.
+        let mut headless = stored("");
+        headless.payload = json!({});
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let handled = on_telephony_webhook(ports, &headless, &mut tx).await;
+        tx.rollback().await.expect("rollback");
+        assert!(
+            matches!(handled, Err(Failure::Terminal(_))),
+            "a stored delivery with no body will not grow one on the second read"
+        );
+
+        drop_database(db, admin_url, database).await;
+    }
+
+    /// **The wire, end to end: a stored Twilio callback becomes a message and a
+    /// turn — through the real dispatch table.**
+    ///
+    /// `agentos_app::inbound::land_inbound_text` had exactly one caller in this
+    /// workspace and it was a test, so `resolve_phone_recipient` — the surviving
+    /// inbound routing rule, whose own comment said it was waiting for an
+    /// ingest — had none at all. Everything under it was built and unreachable.
+    ///
+    /// Through [`handlers`] and the real poller, not a hand-called handler,
+    /// because **the registration is the thing under test**. `loops::outbox`
+    /// does not skip an event type with no entry in that table: it retries it
+    /// eight times and dead-letters it. So a missing line there is not a
+    /// compile error and not an obvious failure — it is every customer text
+    /// message disappearing with `no handler is registered` in a column nobody
+    /// reads, which is exactly what this asserts on directly.
+    ///
+    /// The turn is asserted as an enqueued event and not as a taken turn: what
+    /// this is about is that inbound telephony wakes the employee at all. What
+    /// the employee then does with it is `Agent::on_turn`, which has its own
+    /// tests and no budget in this fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_text_message_becomes_a_message_and_a_turn_through_the_real_dispatch_table() {
+        use agentos_store::outbox::{self, NewEvent};
+
+        let Some((db, admin_url, database)) = own_database("telephony").await else {
+            return;
+        };
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::from_uuid(Uuid::now_v7());
+        // The pooled binding shape `Step::Phone` writes: `{number}/{employee}`,
+        // so two employees can share one number without colliding on
+        // `(provider, external_id)`. `resolve_phone_recipient` reads the number
+        // back out with `split_part(external_id, '/', 1)`.
+        let dialled = "+33755500001";
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("tel-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'Lena', 'active')",
+        )
+        .bind(employee_id.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+                 (employee_id, step, tenant_id, state, provider, external_id, created_at) \
+             VALUES ($1, 'phone', $2, 'ready', 'twilio', $3, $4)",
+        )
+        .bind(employee_id.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(format!("{dialled}/{}", employee_id.as_uuid()))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .expect("allocate the number");
+        tx.commit().await.expect("commit the seed");
+
+        // Exactly the row `routes::webhooks::ingest` writes once it has verified
+        // the signature: the raw form body, verbatim, under the event type the
+        // endpoint's provider names. Percent-encoded by hand — `url` is not a
+        // dependency of this crate and must not become one for one fixture.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        outbox::enqueue(
+            &mut tx,
+            &NewEvent {
+                payload: json!({
+                    "provider": routes::webhooks::TELEPHONY_PROVIDER,
+                    "event_id": "digest-of-the-body",
+                    "body": "MessageSid=SM_wire&From=%2B33612345678&To=%2B33755500001\
+                &Body=the+pallet+is+late",
+                }),
+                ..NewEvent::new(
+                    routes::webhooks::RAW_AGGREGATE,
+                    Uuid::nil(),
+                    routes::webhooks::received_event(routes::webhooks::TELEPHONY_PROVIDER),
+                )
+            },
+            now,
+        )
+        .await
+        .expect("enqueue the stored delivery");
+        tx.commit().await.expect("commit the delivery");
+
+        let cancel = CancellationToken::new();
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            agentos_app::mocks::adapters("telephony-test-master-key"),
+            EngineConfig::default(),
+        );
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![])),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: Fleets::new().0,
+            cancel: cancel.clone(),
+        };
+        // **An environment registration naming the same provider**, which is a
+        // legal `AGENTOS_WEBHOOK_SECRETS` entry and is the shape that catches
+        // the ordering seam in `handlers`: that function registers one
+        // `on_webhook` per configured hook and then the two wired ingests, and
+        // with those two blocks the other way round this entry silently
+        // replaces the telephony reader with the email one. The body below is a
+        // form, not JSON, so that mistake is a terminal park on the first text
+        // and this test times out with the reason in `last_error`.
+        let mut config = test_config(tenant);
+        config.webhooks = vec![crate::config::WebhookRegistration {
+            provider: routes::webhooks::TELEPHONY_PROVIDER.to_owned(),
+            tenant_id: tenant,
+            secret: "an-auth-token".to_owned(),
+        }];
+
+        let poller = tokio::spawn(loops::outbox::run(
+            db.clone(),
+            handlers(&config, agent, engine),
+            cancel.clone(),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let (published, last_error): (bool, Option<String>) = sqlx::query_as(
+                "SELECT published_at IS NOT NULL, last_error FROM outbox_events \
+                  WHERE event_type = $1",
+            )
+            .bind(routes::webhooks::received_event(
+                routes::webhooks::TELEPHONY_PROVIDER,
+            ))
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the delivery row");
+            tx.rollback().await.expect("rollback");
+
+            assert!(
+                !last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no handler"),
+                "`webhook.twilio.received` is not in the dispatch table, so every inbound text \
+                 retries eight times and dead-letters: {last_error:?}"
+            );
+            if published {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stored text was never read: {last_error:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        poller.await.expect("the poller task");
+
+        // The thread, the message and the wake-up, all written by the one
+        // transaction that retired the delivery.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (owner, channel, direction, sender, body): (Uuid, String, String, String, String) =
+            sqlx::query_as(
+                "SELECT employee_id, channel, direction, sender, body FROM messages \
+                  WHERE provider_message_id = $1",
+            )
+            .bind("SM_wire")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the text never landed as a message");
+        let threads: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM conversations WHERE channel = 'sms' AND external_ref = $1",
+        )
+        .bind("+33612345678")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count the threads");
+        let turns: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM outbox_events WHERE event_type = $1")
+                .bind(agentos_app::inbound::TURN_EVENT)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count the turns");
+        tx.rollback().await.expect("rollback");
+
+        // Routed by the number that was dialled, to the employee allocated to
+        // it — not by anything in the payload.
+        assert_eq!(owner, employee_id.as_uuid());
+        assert_eq!(channel, "sms");
+        assert_eq!(direction, "inbound");
+        assert_eq!(sender, "+33612345678");
+        assert_eq!(body, "the pallet is late");
+        assert_eq!(
+            threads, 1,
+            "the thread the next message routes by is missing"
+        );
+        assert_eq!(turns, 1, "the employee was never woken");
 
         drop_database(db, admin_url, database).await;
     }

@@ -60,20 +60,52 @@
 //! operator who registers a row on a legacy path finds that mail keeps arriving
 //! where it always did, rather than finding out that it silently moved.
 //!
-//! ponytail: one signature scheme — the Standard Webhooks / Svix one, which is
-//! what `agentos_providers::email` signs and what Resend sends. Twilio's
-//! HMAC-SHA1-over-the-callback-URL scheme lives in
-//! `agentos_providers::telephony::verify_twilio_signature` and is not wired
-//! here, because there is no telephony ingest on the other end of the queue to
-//! read the row. When there is: [`Endpoint`] grows a `scheme` field, the
-//! `verify` call below grows a `match`, `0053`'s
-//! `webhook_endpoints_provider_is_wired` grows a value, and nothing else
-//! changes.
+//! # Two signature schemes, and the endpoint's `provider` is what picks
+//!
+//! This file used to carry a note saying there was one — the Standard Webhooks
+//! / Svix scheme, which is what `agentos_providers::email` signs and what Resend
+//! sends — and that Twilio's HMAC-SHA1-over-the-callback-URL scheme was "not
+//! wired here, because there is no telephony ingest on the other end of the
+//! queue to read the row". There is one now:
+//! `main::on_telephony_webhook`. The note's own recipe is what was followed,
+//! minus one line of it.
+//!
+//! **No `scheme` field on [`Endpoint`], and that is the deliberate deviation.**
+//! It would be a column whose value is a pure function of a column next to it:
+//! `provider` already has to name the ingest that reads the row — that is what
+//! `0053`'s `webhook_endpoints_provider_is_wired` CHECK is *for* — and the
+//! ingest and the scheme are the same choice. A second field is a second place
+//! for them to disagree, and the shape of that disagreement is an endpoint
+//! whose deliveries verify under one scheme and are read by the other.
+//!
+//! Both directions of a mismatch fail **closed and loudly**: an endpoint
+//! registered under the wrong provider has its genuine deliveries answered 401,
+//! which is a support ticket. Neither direction skips a check.
+//!
+//! # What the telephony arm needs that the other does not: the URL
+//!
+//! Twilio MACs the callback URL itself, so verifying requires knowing the
+//! address the provider was configured to post to. It is taken from
+//! `PUBLIC_HOST` — whose own documentation is "the origin this deployment is
+//! reachable at, **for webhook URLs** and A2A agent cards" — plus the request's
+//! own path and query, and never from the `Host` header, which the caller
+//! controls.
+//!
+//! ponytail: derived, not stored. The ceiling is that the operator must paste
+//! exactly `${PUBLIC_HOST}/v1/webhooks/{path}` into the provider's console, and
+//! a deployment whose idea of its own address differs by one character refuses
+//! every genuine delivery. That is why a telephony verification failure logs the
+//! URL it signed over — it is our own configured string, not a secret, and it
+//! turns "everything 401s" from a mystery into one line. Give
+//! `webhook_endpoints` a `callback_url` column the day a deployment needs two
+//! origins, and not before.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agentos_app::inbound::{WebhookHeaders, verify_signature};
+use agentos_app::inbound::{
+    TELEPHONY_SIGNATURE_HEADER, WebhookHeaders, verify_signature, verify_telephony_webhook,
+};
 use agentos_app::mcp::Credentials;
 use agentos_app::webhooks::{self, Endpoint};
 use agentos_domain::untrusted::Untrusted;
@@ -97,6 +129,15 @@ pub const MAX_WEBHOOK_BYTES: usize = 256 * 1024;
 
 /// `aggregate_type` of a stored raw delivery.
 pub const RAW_AGGREGATE: &str = "webhook";
+
+/// The endpoint `provider` whose deliveries are verified with Twilio's scheme
+/// and read by `main::on_telephony_webhook`.
+///
+/// Re-exported from `agentos_app` rather than spelled again, because three
+/// places have to agree on it — this file's `match`, `main::handlers`'
+/// registration, and `0069`'s widened
+/// `webhook_endpoints_provider_is_wired` — and two of them are compiled.
+pub use agentos_app::inbound::TELEPHONY_PROVIDER;
 
 /// The `event_type` a stored delivery from `provider` is filed under.
 ///
@@ -148,24 +189,56 @@ impl Resolved<'_> {
     }
 }
 
-/// What the handler needs: somewhere to write, the deployment's cipher, and the
-/// endpoints the environment registered.
+/// What the handler needs: somewhere to write, the deployment's cipher, the
+/// endpoints the environment registered, and this deployment's own address.
 #[derive(Clone)]
 struct Ingress {
     db: Db,
     credentials: Credentials,
     webhooks: Webhooks,
+    /// `PUBLIC_HOST`, normalised to a scheme-bearing origin with no trailing
+    /// slash. Half of the string Twilio's scheme MACs; unread by the other one.
+    callback_origin: Arc<str>,
 }
 
 /// The webhook surface. Merge this **outside** `with_api_stack`.
-pub fn router(db: Db, credentials: Credentials, webhooks: Webhooks) -> Router {
+///
+/// `public_host` is `PUBLIC_HOST`. It is a parameter and not a lazy read of the
+/// environment for the reason every other route takes its configuration this
+/// way — a test has to be able to point it somewhere else — and it is required
+/// rather than optional because a deployment with no idea of its own address
+/// cannot verify a scheme that signs one, and the honest failure for that is at
+/// boot rather than on the first text message.
+pub fn router(db: Db, credentials: Credentials, webhooks: Webhooks, public_host: &str) -> Router {
     Router::new()
         .route("/v1/webhooks/{path}", post(ingest))
         .with_state(Ingress {
             db,
             credentials,
             webhooks,
+            callback_origin: Arc::from(callback_origin(public_host)),
         })
+}
+
+/// `PUBLIC_HOST` as an absolute origin: scheme, host, no trailing slash.
+///
+/// The trailing slash is trimmed the way `routes::a2a` and `routes::mcp` trim
+/// it, and for the same reason — the path is appended and `//v1` is a different
+/// URL.
+///
+/// **The scheme is defaulted, and that default is `https`.** `.env.example`
+/// shipped `PUBLIC_HOST=agents.example.com` for as long as nothing MACed a URL,
+/// so a deployment that copied it has no scheme at all — and a MAC computed over
+/// `agents.example.com/v1/webhooks/…` matches nothing a provider ever signed.
+/// `https` because it is the only scheme a provider will post a callback to. A
+/// host that names its own scheme keeps it, so a development box on
+/// `http://localhost` is untouched.
+fn callback_origin(public_host: &str) -> String {
+    let host = public_host.trim().trim_end_matches('/');
+    match host.contains("://") {
+        true => host.to_owned(),
+        false => format!("https://{host}"),
+    }
 }
 
 /// Verify, store, 202.
@@ -237,22 +310,83 @@ async fn ingest(
         )
     })?;
 
-    // The signature covers `id . timestamp . raw`, so the id and timestamp are
-    // authenticated too — which is what makes the id below safe to dedupe on.
-    // The replay window lives inside `verify_signature`.
-    let headers = signature_headers(&parts.headers);
     let now = Utc::now();
-    verify_signature(&endpoint.secret, &headers, &raw, now).map_err(|err| {
-        // The variant is low-cardinality and carries no third-party text; it
-        // is the difference between "we are being probed" and "the secret
-        // rotation is half applied". The caller gets none of it.
-        tracing::warn!(%provider, error = %err, "webhook signature rejected");
+    // The variant is low-cardinality and carries no third-party text; it is the
+    // difference between "we are being probed" and "the secret rotation is half
+    // applied". The caller gets none of it, on either scheme.
+    let unverified = || {
         ApiError::new(
             StatusCode::UNAUTHORIZED,
             "webhook_unverified",
             "webhook signature could not be verified",
         )
-    })?;
+    };
+
+    // **The authentication and the dedupe id are decided together**, because on
+    // one of these two schemes the id is not in a header and there is no safe
+    // way for this file to go and find it. See
+    // `agentos_app::inbound::verify_telephony_webhook`: reaching for
+    // `headers.id` on a Twilio callback yields the empty string on every
+    // delivery a deployment ever receives, `outbox::enqueue` collapses them all
+    // onto the first, and every text after the first is answered 202 and
+    // dropped. Producing the id here, out of the same expression that verified,
+    // is what stops that from being spellable.
+    let delivery_id = if provider == TELEPHONY_PROVIDER {
+        // **This scheme has no replay window, and it cannot have one.** The
+        // Standard Webhooks arm below MACs a timestamp and `verify_signature`
+        // refuses one that is too old; Twilio signs the URL and the form fields
+        // and nothing else, so a captured callback stays valid for as long as
+        // the auth token does. That is the provider's design, not a gap here.
+        //
+        // What makes it survivable is that a replay lands nothing rather than
+        // being refused: identical bytes give an identical dedupe id, so
+        // `outbox::enqueue` hands back the original row — and even a second row
+        // would land as a duplicate, because `inbound::land` arbitrates on
+        // `messages.idempotency_key`, which is keyed on `MessageSid`. A replay
+        // is a no-op, and it is not an error. Rotating the auth token is the
+        // only thing that invalidates one.
+        //
+        // Reconstructed from **our own** configuration, never from the `Host`
+        // header. Not because the header would break the MAC's guarantee — a
+        // caller who picks the URL still cannot forge a signature over it — but
+        // because `PUBLIC_HOST` is the address an operator pasted into the
+        // provider's console, and a header is not.
+        let url = format!(
+            "{}{}",
+            ingress.callback_origin,
+            parts
+                .uri
+                .path_and_query()
+                .map_or("", axum::http::uri::PathAndQuery::as_str)
+        );
+        let signature = parts
+            .headers
+            .get(TELEPHONY_SIGNATURE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        verify_telephony_webhook(&endpoint.secret, &url, signature, &raw).map_err(|err| {
+            // `%url` on purpose, and it is the only place in this file a
+            // rejection says anything but its own variant. The URL is a string
+            // this deployment configured for itself, it is in every provider
+            // dashboard already, and it is the single most likely cause of a
+            // scheme that MACs a URL refusing everything: `PUBLIC_HOST` and the
+            // pasted callback disagreeing. Without it the fix somebody reaches
+            // for at 3am is to stop verifying.
+            tracing::warn!(%provider, %url, error = %err, "telephony signature rejected");
+            unverified()
+        })?
+    } else {
+        // The signature covers `id . timestamp . raw`, so the id and timestamp
+        // are authenticated too — which is what makes the id safe to dedupe on.
+        // The replay window lives inside `verify_signature`.
+        let headers = signature_headers(&parts.headers);
+        verify_signature(&endpoint.secret, &headers, &raw, now).map_err(|err| {
+            tracing::warn!(%provider, error = %err, "webhook signature rejected");
+            unverified()
+        })?;
+        headers.id
+    };
 
     // Verified, and still not trusted: everything below is storage, not
     // interpretation. A body that is not UTF-8 is not a webhook.
@@ -272,15 +406,18 @@ async fn ingest(
         // handler in `main::handlers` is not skipped — it is retried eight times
         // and dead-lettered, which is a quiet way to stop receiving email.
         event_type: received_event(provider),
-        // The provider's own event id, from the header the signature covers.
-        // A redelivery reuses it, so the second copy collapses onto the first.
-        // Two tenants behind one provider account see the same id: the derived
-        // outbox id mixes the tenant in, so those are two rows and not a
-        // collision — `outbox::dedupe_keys_do_not_collide_across_tenants`.
-        dedupe_key: Some(format!("{provider}:{}", headers.id)),
+        // What identifies this delivery under whichever scheme authenticated
+        // it: the provider's own event id from the header the signature covers,
+        // or — where the scheme has no such header — a digest of the bytes it
+        // covered. A redelivery reuses it either way, so the second copy
+        // collapses onto the first. Two tenants behind one provider account see
+        // the same id: the derived outbox id mixes the tenant in, so those are
+        // two rows and not a collision —
+        // `outbox::dedupe_keys_do_not_collide_across_tenants`.
+        dedupe_key: Some(format!("{provider}:{delivery_id}")),
         payload: json!({
             "provider": provider,
-            "event_id": headers.id,
+            "event_id": delivery_id,
             // Third-party text, stored verbatim into jsonb — never rendered,
             // and never re-serialised, so the loop parses exactly the bytes
             // that were signed.
@@ -326,7 +463,7 @@ fn signature_headers(headers: &HeaderMap) -> WebhookHeaders {
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::inbound::{Secret, sign_webhook};
+    use agentos_app::inbound::{Secret, sign_telephony_webhook, sign_webhook};
     use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
@@ -337,6 +474,16 @@ mod tests {
     const PROVIDER: &str = "email";
     const SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
     const MASTER: &str = "webhook-route-tests-master-key";
+
+    /// What this deployment believes its own address is. Half of the string
+    /// Twilio's scheme MACs, so a test that signs must build the URL the same
+    /// way the route does — see [`callback_url`].
+    const ORIGIN: &str = "https://agents.test";
+
+    /// Twilio's auth token, which is the signing secret on that scheme. Not a
+    /// `whsec_…`: the two schemes take different secrets from different
+    /// dashboards, and one endpoint holds one of them.
+    const AUTH_TOKEN: &str = "a-twilio-auth-token-that-is-not-the-other-one";
 
     async fn connect() -> Option<Db> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -384,6 +531,7 @@ mod tests {
             db.clone(),
             Credentials::from_master_key(MASTER),
             Webhooks::new(endpoints),
+            ORIGIN,
         );
         Some((db, tenant, router))
     }
@@ -403,6 +551,82 @@ mod tests {
 
     fn signed(id: &str, body: &[u8]) -> HttpRequest<Body> {
         signed_to(PROVIDER, SECRET, id, body)
+    }
+
+    // -- the telephony scheme -----------------------------------------------
+
+    /// The callback URL as the route reconstructs it, which is the URL the
+    /// operator pasted into the provider's console. Built here the same way and
+    /// deliberately by hand: a helper shared with the route would make both
+    /// sides wrong together, which is the one thing this test cannot afford.
+    fn callback_url(path: &str) -> String {
+        format!("{ORIGIN}/v1/webhooks/{path}")
+    }
+
+    /// A Twilio messaging webhook body — an inbound text, as the provider
+    /// posts it.
+    fn twilio_form(sid: &str, from: &str, body: &str) -> Vec<u8> {
+        url_encoded(&[
+            ("MessageSid", sid),
+            ("From", from),
+            ("To", "+33755500001"),
+            ("Body", body),
+        ])
+    }
+
+    /// `application/x-www-form-urlencoded`, spelled out rather than pulled in:
+    /// `url` is not a dependency of this crate and must not become one for a
+    /// four-field fixture.
+    fn url_encoded(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let escape = |raw: &str| {
+            raw.bytes().fold(String::new(), |mut out, byte| {
+                match byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    true => out.push(byte as char),
+                    false => out.push_str(&format!("%{byte:02X}")),
+                }
+                out
+            })
+        };
+        pairs
+            .iter()
+            .map(|(key, value)| format!("{}={}", escape(key), escape(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes()
+    }
+
+    /// A telephony delivery signed the way the provider signs it: HMAC-SHA1
+    /// over the callback URL and the sorted form fields, in one header.
+    fn signed_twilio(path: &str, token: &str, url: &str, form: &[u8]) -> HttpRequest<Body> {
+        HttpRequest::post(format!("/v1/webhooks/{path}"))
+            .header(
+                TELEPHONY_SIGNATURE_HEADER,
+                sign_telephony_webhook(&Secret::new(token), url, form),
+            )
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form.to_vec()))
+            .expect("request")
+    }
+
+    /// A tenant whose endpoint is a Twilio one, and the router in front of it.
+    async fn telephony_harness() -> Option<(Db, TenantId, Router)> {
+        let db = connect().await?;
+        let tenant = seed_tenant(&db).await;
+        let endpoints = HashMap::from([(
+            TELEPHONY_PROVIDER.to_owned(),
+            Endpoint {
+                tenant_id: tenant,
+                provider: TELEPHONY_PROVIDER.to_owned(),
+                secret: Secret::new(AUTH_TOKEN),
+            },
+        )]);
+        let router = router(
+            db.clone(),
+            Credentials::from_master_key(MASTER),
+            Webhooks::new(endpoints),
+            ORIGIN,
+        );
+        Some((db, tenant, router))
     }
 
     fn payload(email_id: &str) -> Vec<u8> {
@@ -793,7 +1017,7 @@ mod tests {
 
         // No environment registry at all: this is the deployment the table is
         // for, where every endpoint is a row.
-        let router = router(db.clone(), credentials, Webhooks::default());
+        let router = router(db.clone(), credentials, Webhooks::default(), ORIGIN);
 
         let for_a = payload("email_for_a");
         let for_b = payload("email_for_b");
@@ -844,7 +1068,7 @@ mod tests {
         )
         .await
         .expect("register");
-        let router = router(db.clone(), credentials, Webhooks::default());
+        let router = router(db.clone(), credentials, Webhooks::default(), ORIGIN);
 
         let body = payload("email_stored_forgery");
         let (status, _) = call(
@@ -917,7 +1141,7 @@ mod tests {
                 secret: Secret::new(SECRET),
             },
         )]);
-        let router = router(db.clone(), credentials, Webhooks::new(endpoints));
+        let router = router(db.clone(), credentials, Webhooks::new(endpoints), ORIGIN);
 
         let (status, _) = call(
             &router,
@@ -934,5 +1158,359 @@ mod tests {
             stored(&db, intruder).await.is_empty(),
             "a row shadowed the deployment's own registration"
         );
+    }
+
+    // -- telephony -----------------------------------------------------------
+
+    /// `PUBLIC_HOST` is the origin the MAC is computed over, and every
+    /// deployment configured before this scheme existed set it without one.
+    /// Left alone, that is a deployment where every genuine text message is
+    /// answered 401.
+    #[test]
+    fn a_public_host_with_no_scheme_becomes_an_https_origin() {
+        assert_eq!(
+            callback_origin("agents.example.com"),
+            "https://agents.example.com"
+        );
+        assert_eq!(
+            callback_origin("agents.example.com/"),
+            "https://agents.example.com"
+        );
+        // A host that names its own scheme keeps it — a development box on
+        // plain http must not be rewritten into one that cannot be reached.
+        assert_eq!(
+            callback_origin("http://localhost:8080"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            callback_origin(" https://agents.test/ "),
+            "https://agents.test"
+        );
+    }
+
+    /// **The claim the telephony arm exists for.** The other scheme's verifier
+    /// would reject this delivery outright — it carries none of the three
+    /// Standard Webhooks headers — so an endpoint that accepts it is an
+    /// endpoint that ran Twilio's verifier, and a forgery under the same scheme
+    /// is still refused.
+    #[tokio::test]
+    async fn a_telephony_delivery_is_verified_with_twilios_own_scheme() {
+        let Some((db, tenant, router)) = telephony_harness().await else {
+            return;
+        };
+        let url = callback_url(TELEPHONY_PROVIDER);
+        let form = twilio_form("SM_verify", "+33612345678", "bonjour");
+
+        // Unsigned: no header at all.
+        let naked = HttpRequest::post(format!("/v1/webhooks/{TELEPHONY_PROVIDER}"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form.clone()))
+            .expect("request");
+        let (status, _) = call(&router, naked).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Signed with a token we do not hold.
+        let (status, _) = call(
+            &router,
+            signed_twilio(TELEPHONY_PROVIDER, "not-our-auth-token", &url, &form),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Signed correctly, then a byte of the body flipped: the MAC covers the
+        // form fields, so the same header must stop working.
+        let mut tampered = signed_twilio(TELEPHONY_PROVIDER, AUTH_TOKEN, &url, &form);
+        *tampered.body_mut() = Body::from(twilio_form("SM_verify", "+33612345678", "bonjouR"));
+        let (status, _) = call(&router, tampered).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        assert!(
+            stored(&db, tenant).await.is_empty(),
+            "an unverified text was queued; it is one outbox drain away from a turn"
+        );
+
+        // The control: the same bytes, the right token, the right URL.
+        let (status, _) = call(
+            &router,
+            signed_twilio(TELEPHONY_PROVIDER, AUTH_TOKEN, &url, &form),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let rows = stored(&db, tenant).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, format!("webhook.{TELEPHONY_PROVIDER}.received"));
+        // Verbatim, so `land_inbound_text` reads exactly the bytes that were
+        // signed rather than a round trip through serde_json.
+        assert_eq!(
+            rows[0].1["body"].as_str().expect("body").as_bytes(),
+            form.as_slice()
+        );
+    }
+
+    /// **The one this scheme can get wrong silently, and the reason the dedupe
+    /// id is not `headers.id`.**
+    ///
+    /// Twilio sends no `webhook-id`, so `signature_headers` reads an empty
+    /// string for it. An edge that deduped on that would compute the key
+    /// `twilio:` for every callback a deployment ever receives, `outbox::enqueue`
+    /// would collapse them all onto the first row, and every text after the
+    /// first would be answered 202 and dropped — with no error anywhere and a
+    /// customer whose second message was never read.
+    ///
+    /// Two distinct texts must be two rows; three deliveries of one text must be
+    /// one. Both halves, because a key that is unique per delivery would pass
+    /// the first assertion and break redelivery instead.
+    #[tokio::test]
+    async fn two_texts_are_two_rows_and_three_deliveries_of_one_are_one() {
+        let Some((db, tenant, router)) = telephony_harness().await else {
+            return;
+        };
+        let url = callback_url(TELEPHONY_PROVIDER);
+
+        let first = twilio_form("SM_one", "+33612345678", "the invoice is wrong");
+        let mut ids = Vec::new();
+        for attempt in 1..=3 {
+            let (status, answer) = call(
+                &router,
+                signed_twilio(TELEPHONY_PROVIDER, AUTH_TOKEN, &url, &first),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "delivery {attempt}");
+            ids.push(answer["event_id"].clone());
+        }
+        assert_eq!(ids[0], ids[1], "a redelivery must name the original row");
+        assert_eq!(ids[1], ids[2]);
+        assert_eq!(stored(&db, tenant).await.len(), 1);
+
+        // A second message from the same person on the same number.
+        let second = twilio_form("SM_two", "+33612345678", "and so is the delivery date");
+        let (status, _) = call(
+            &router,
+            signed_twilio(TELEPHONY_PROVIDER, AUTH_TOKEN, &url, &second),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let rows = stored(&db, tenant).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "a second text collapsed onto the first: every message after the first is lost"
+        );
+        let bodies: Vec<&str> = rows
+            .iter()
+            .map(|(_, payload)| payload["body"].as_str().expect("body"))
+            .collect();
+        assert!(
+            bodies.iter().any(|body| body.contains("SM_one")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("SM_two")),
+            "{bodies:?}"
+        );
+    }
+
+    /// The callback URL is inside the MAC, which is what `PUBLIC_HOST` has to
+    /// get exactly right. A signature minted for a neighbouring origin is not
+    /// accepted here — stated as a test so that the cost of getting that
+    /// variable wrong is a documented refusal rather than a mystery.
+    #[tokio::test]
+    async fn a_signature_minted_for_another_origin_is_refused() {
+        let Some((db, tenant, router)) = telephony_harness().await else {
+            return;
+        };
+        let form = twilio_form("SM_origin", "+33612345678", "hello");
+
+        for elsewhere in [
+            "https://agents.test.evil.example/v1/webhooks/twilio",
+            "http://agents.test/v1/webhooks/twilio",
+            "https://agents.test/v1/webhooks/twilio/",
+        ] {
+            let (status, _) = call(
+                &router,
+                signed_twilio(TELEPHONY_PROVIDER, AUTH_TOKEN, elsewhere, &form),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{elsewhere}");
+        }
+        assert!(stored(&db, tenant).await.is_empty());
+
+        // The control, so the three refusals above were the URL and not the
+        // fixture.
+        let (status, _) = call(
+            &router,
+            signed_twilio(
+                TELEPHONY_PROVIDER,
+                AUTH_TOKEN,
+                &callback_url(TELEPHONY_PROVIDER),
+                &form,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    /// **The scheme follows the endpoint's `provider`, and a mismatch fails
+    /// closed in both directions.**
+    ///
+    /// This is the property that lets `Endpoint` carry no `scheme` field. An
+    /// endpoint registered under the wrong provider does not fall back to the
+    /// other verifier, does not skip verification, and writes nothing.
+    #[tokio::test]
+    async fn an_endpoint_verifies_only_its_own_scheme() {
+        let Some(db) = connect().await else { return };
+        let (mail, phone) = (seed_tenant(&db).await, seed_tenant(&db).await);
+        let endpoints = HashMap::from([
+            (
+                PROVIDER.to_owned(),
+                Endpoint {
+                    tenant_id: mail,
+                    provider: PROVIDER.to_owned(),
+                    secret: Secret::new(SECRET),
+                },
+            ),
+            (
+                TELEPHONY_PROVIDER.to_owned(),
+                Endpoint {
+                    tenant_id: phone,
+                    provider: TELEPHONY_PROVIDER.to_owned(),
+                    secret: Secret::new(AUTH_TOKEN),
+                },
+            ),
+        ]);
+        let router = router(
+            db.clone(),
+            Credentials::from_master_key(MASTER),
+            Webhooks::new(endpoints),
+            ORIGIN,
+        );
+
+        // A correctly signed Twilio delivery, posted to the email endpoint.
+        let form = twilio_form("SM_cross", "+33612345678", "hello");
+        let (status, _) = call(
+            &router,
+            signed_twilio(PROVIDER, AUTH_TOKEN, &callback_url(PROVIDER), &form),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A correctly signed Standard Webhooks delivery, posted to the
+        // telephony endpoint.
+        let (status, _) = call(
+            &router,
+            signed_to(
+                TELEPHONY_PROVIDER,
+                SECRET,
+                "msg_cross",
+                &payload("email_cross"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        assert!(
+            stored(&db, mail).await.is_empty(),
+            "a cross-scheme delivery was queued"
+        );
+        assert!(
+            stored(&db, phone).await.is_empty(),
+            "a cross-scheme delivery was queued"
+        );
+
+        // The two controls, each on its own endpoint and its own scheme.
+        let (status, _) = call(
+            &router,
+            signed_to(PROVIDER, SECRET, "msg_ok", &payload("email_ok")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _) = call(
+            &router,
+            signed_twilio(
+                TELEPHONY_PROVIDER,
+                AUTH_TOKEN,
+                &callback_url(TELEPHONY_PROVIDER),
+                &form,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(stored(&db, mail).await.len(), 1);
+        assert_eq!(stored(&db, phone).await.len(), 1);
+    }
+
+    /// **The migration and the route, together.** A tenant registers a
+    /// telephony endpoint through the real platform path — which mints an
+    /// opaque `whe_…` and seals the auth token — and a signed callback to that
+    /// address is accepted.
+    ///
+    /// This is the production shape, and it is the one `0053`'s
+    /// `webhook_endpoints_provider_is_wired` CHECK made impossible until `0069`
+    /// widened it: a row naming a provider with no reader is eight retries and
+    /// a dead letter per customer message, so the CHECK refused the value until
+    /// the reader existed. It exists, so a `twilio` row must now be storable —
+    /// and a provider with still no reader must still be refused, or the CHECK
+    /// has stopped meaning anything.
+    #[tokio::test]
+    async fn a_stored_telephony_endpoint_is_registrable_and_verifies() {
+        let Some(db) = connect().await else { return };
+        let credentials = Credentials::from_master_key(MASTER);
+        let tenant = seed_tenant(&db).await;
+
+        let (path, _) = agentos_app::webhooks::register(
+            &db,
+            &credentials,
+            tenant,
+            TELEPHONY_PROVIDER,
+            AUTH_TOKEN.to_owned(),
+            &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+            Utc::now(),
+        )
+        .await
+        .expect("a telephony endpoint must be registrable once its ingest exists");
+
+        // Still a fence, not a formality: a provider nothing reads is refused
+        // by the table.
+        assert!(
+            agentos_app::webhooks::register(
+                &db,
+                &credentials,
+                seed_tenant(&db).await,
+                "stripe",
+                "sk_whatever".to_owned(),
+                &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
+                Utc::now(),
+            )
+            .await
+            .is_err(),
+            "an endpoint was stored for a provider no handler reads; every delivery to it is a \
+             dead letter"
+        );
+
+        let router = router(db.clone(), credentials, Webhooks::default(), ORIGIN);
+        let form = twilio_form("SM_stored", "+33612345678", "hello");
+
+        // The forgery first, so an accepted delivery below is the signature and
+        // not an endpoint that verifies nothing.
+        let (status, _) = call(
+            &router,
+            signed_twilio(&path, "not-our-auth-token", &callback_url(&path), &form),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(stored(&db, tenant).await.is_empty(), "a forgery was queued");
+
+        let (status, _) = call(
+            &router,
+            signed_twilio(&path, AUTH_TOKEN, &callback_url(&path), &form),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let rows = stored(&db, tenant).await;
+        assert_eq!(rows.len(), 1);
+        // From the endpoint's `provider`, never from the opaque path — an
+        // `event_type` naming a minted path is an event type nothing handles.
+        assert_eq!(rows[0].0, format!("webhook.{TELEPHONY_PROVIDER}.received"));
     }
 }
