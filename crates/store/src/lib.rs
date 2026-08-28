@@ -12,6 +12,7 @@ pub mod calendar; // le calendrier: a moment an employee promised, and the claim
 pub mod capability; // wave K: the tool an employee is missing, derived from the refusals
 pub mod db; // U6
 pub mod employee; // U7
+pub mod files; // le classeur: the bytes somebody gave us, kept as they are
 pub mod halt; // wave J: the switch that stops a whole company
 pub mod idempotency; // U10
 pub mod initiative;
