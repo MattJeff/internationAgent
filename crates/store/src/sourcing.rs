@@ -1316,7 +1316,7 @@ mod tests {
         DateTime::from_timestamp(secs, 0).expect("valid timestamp")
     }
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Currency::Usd).expect("non-zero")
     }
 
@@ -1376,7 +1376,7 @@ mod tests {
                 incoterm: Some("FOB"),
                 destination_country: "DE",
                 currency: Currency::Usd,
-                target_unit_price: Some(usd(12)),
+                target_unit_price: Some(usd_minor(12)),
                 closes_at: Some(now + TimeDelta::days(7)),
             },
         )
@@ -1389,9 +1389,9 @@ mod tests {
             &NewQuote {
                 rfq_id: g.rfq,
                 supplier_id: g.supplier,
-                unit_price: usd(11),
+                unit_price: usd_minor(11),
                 quantity: 10_000,
-                freight: Some(usd(40_000)),
+                freight: Some(usd_minor(40_000)),
                 duties: None,
                 other_fees: None,
                 lead_time_days: Some(21),
@@ -1421,7 +1421,7 @@ mod tests {
                 negotiation_id: g.negotiation,
                 party: Party::Buyer,
                 message_id: None,
-                unit_price: Some(usd(10)),
+                unit_price: Some(usd_minor(10)),
                 quantity: Some(10_000),
                 lead_time_days: Some(21),
                 incoterm: Some("FOB"),
@@ -1442,9 +1442,9 @@ mod tests {
                 quote_id: Some(g.quote),
                 employee_id: None,
                 approval_id: None,
-                unit_price: usd(10),
+                unit_price: usd_minor(10),
                 quantity: 10_000,
-                freight: Some(usd(40_000)),
+                freight: Some(usd_minor(40_000)),
                 duties: None,
                 incoterm: Some("FOB"),
                 issued_at: now,
@@ -1607,7 +1607,7 @@ mod tests {
             &NewQuote {
                 rfq_id: their.rfq,
                 supplier_id: mine.supplier,
-                unit_price: usd(1),
+                unit_price: usd_minor(1),
                 quantity: 1,
                 freight: None,
                 duties: None,
@@ -1684,7 +1684,7 @@ mod tests {
                 &NewQuote {
                     rfq_id: graph.rfq,
                     supplier_id,
-                    unit_price: usd(unit),
+                    unit_price: usd_minor(unit),
                     quantity: 10_000,
                     freight: Money::new(freight, Currency::Usd).ok(),
                     duties: None,
@@ -1709,9 +1709,9 @@ mod tests {
         // dear:         10 * 10_000 + 10_000 = 110_000
         // mid:           9 * 10_000 + 200_000 = 290_000
         assert_eq!(suppliers, vec![dear, graph.supplier, mid]);
-        assert_eq!(live[0].landed_total, usd(110_000));
-        assert_eq!(live[0].unit_price, usd(10));
-        assert_eq!(live[2].landed_total, usd(290_000));
+        assert_eq!(live[0].landed_total, usd_minor(110_000));
+        assert_eq!(live[0].unit_price, usd_minor(10));
+        assert_eq!(live[2].landed_total, usd_minor(290_000));
 
         // The two columns a landed-cost comparison cannot be built without: the
         // term the price is quoted on, and the instant the window opened. The
@@ -1978,7 +1978,7 @@ mod tests {
                 negotiation_id: replied,
                 party: Party::Supplier,
                 message_id: None,
-                unit_price: Some(usd(9)),
+                unit_price: Some(usd_minor(9)),
                 quantity: Some(10_000),
                 lead_time_days: Some(28),
                 incoterm: Some("FOB"),
@@ -2043,7 +2043,7 @@ mod tests {
                     negotiation_id: graph.negotiation,
                     party,
                     message_id: None,
-                    unit_price: Some(usd(10 - n as u64)),
+                    unit_price: Some(usd_minor(10 - n as u64)),
                     quantity: Some(10_000),
                     lead_time_days: None,
                     incoterm: None,
@@ -2106,7 +2106,7 @@ mod tests {
             &NewQuote {
                 rfq_id: graph.rfq,
                 supplier_id: graph.supplier,
-                unit_price: usd(10),
+                unit_price: usd_minor(10),
                 quantity: 1,
                 freight: Money::new(100, Currency::Eur).ok(),
                 duties: None,
@@ -2164,17 +2164,17 @@ mod tests {
                 quote_id: None,
                 employee_id: None,
                 approval_id: None,
-                unit_price: usd(250),
+                unit_price: usd_minor(250),
                 quantity: 400,
-                freight: Some(usd(9_000)),
-                duties: Some(usd(1_000)),
+                freight: Some(usd_minor(9_000)),
+                duties: Some(usd_minor(1_000)),
                 incoterm: Some("DDP"),
                 issued_at: now,
             },
         )
         .await
         .expect("purchase order");
-        assert_eq!(total, usd(250 * 400 + 9_000 + 1_000));
+        assert_eq!(total, usd_minor(250 * 400 + 9_000 + 1_000));
         tx.rollback().await.expect("rollback");
 
         drop_tenant(&db, tenant).await;
@@ -2269,7 +2269,7 @@ mod tests {
                 incoterm: Some("DDP"),
                 destination_country: "DE",
                 currency: Currency::Usd,
-                target_unit_price: Some(usd(12)),
+                target_unit_price: Some(usd_minor(12)),
                 closes_at: Some(closes_at),
             },
         )
@@ -2306,7 +2306,7 @@ mod tests {
                 &NewQuote {
                     rfq_id: rfq,
                     supplier_id: supplier,
-                    unit_price: usd(11),
+                    unit_price: usd_minor(11),
                     quantity: 10_000,
                     freight: None,
                     duties: None,

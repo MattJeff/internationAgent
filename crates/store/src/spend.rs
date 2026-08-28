@@ -487,7 +487,7 @@ mod tests {
         tx.commit().await.expect("commit teardown");
     }
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Usd).expect("positive")
     }
 
@@ -540,7 +540,7 @@ mod tests {
         let Some(db) = db().await else { return };
         let (tenant, employee) = seed(&db, "nocaps").await;
 
-        let err = reserve_committed(&db, tenant, employee, usd(1))
+        let err = reserve_committed(&db, tenant, employee, usd_minor(1))
             .await
             .expect_err("no caps means no spending");
         assert!(
@@ -563,7 +563,7 @@ mod tests {
         set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(10_000), usd(4_000), count(3)).unwrap(),
+            SpendCaps::new(usd_minor(10_000), usd_minor(4_000), count(3)).unwrap(),
         )
         .await
         .expect("set caps");
@@ -572,27 +572,27 @@ mod tests {
         // Round-trips.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let stored = caps(&mut tx, employee, Usd).await.expect("read").unwrap();
-        assert_eq!(stored.daily_total(), usd(10_000));
-        assert_eq!(stored.per_transaction(), usd(4_000));
+        assert_eq!(stored.daily_total(), usd_minor(10_000));
+        assert_eq!(stored.per_transaction(), usd_minor(4_000));
         assert_eq!(stored.daily_transactions(), count(3));
         // Caps are per currency: EUR has none, so EUR cannot be spent.
         assert!(caps(&mut tx, employee, Eur).await.expect("read").is_none());
         tx.rollback().await.expect("rollback");
 
         // Too big for one transaction, even though it fits in the day.
-        let err = reserve_committed(&db, tenant, employee, usd(4_001))
+        let err = reserve_committed(&db, tenant, employee, usd_minor(4_001))
             .await
             .expect_err("over per-transaction max");
         assert!(matches!(err, CapExceeded::PerTransaction { .. }), "{err}");
 
         // Two legal ones fit; the third pushes the daily total over.
-        reserve_committed(&db, tenant, employee, usd(4_000))
+        reserve_committed(&db, tenant, employee, usd_minor(4_000))
             .await
             .expect("first");
-        reserve_committed(&db, tenant, employee, usd(4_000))
+        reserve_committed(&db, tenant, employee, usd_minor(4_000))
             .await
             .expect("second");
-        let err = reserve_committed(&db, tenant, employee, usd(4_000))
+        let err = reserve_committed(&db, tenant, employee, usd_minor(4_000))
             .await
             .expect_err("over daily total");
         assert!(matches!(err, CapExceeded::DailyTotal { .. }), "{err}");
@@ -614,16 +614,16 @@ mod tests {
         set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(1_000_000), usd(4_000), count(3)).unwrap(),
+            SpendCaps::new(usd_minor(1_000_000), usd_minor(4_000), count(3)).unwrap(),
         )
         .await
         .expect("raise caps");
         tx.commit().await.expect("commit caps");
 
-        reserve_committed(&db, tenant, employee, usd(1))
+        reserve_committed(&db, tenant, employee, usd_minor(1))
             .await
             .expect("third");
-        let err = reserve_committed(&db, tenant, employee, usd(1))
+        let err = reserve_committed(&db, tenant, employee, usd_minor(1))
             .await
             .expect_err("over daily count");
         assert!(matches!(err, CapExceeded::DailyCount { .. }), "{err}");
@@ -641,23 +641,23 @@ mod tests {
         set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(10_000), usd(10_000), count(5)).unwrap(),
+            SpendCaps::new(usd_minor(10_000), usd_minor(10_000), count(5)).unwrap(),
         )
         .await
         .expect("set caps");
         tx.commit().await.expect("commit caps");
 
-        let a = reserve_committed(&db, tenant, employee, usd(6_000))
+        let a = reserve_committed(&db, tenant, employee, usd_minor(6_000))
             .await
             .expect("a");
-        let b = reserve_committed(&db, tenant, employee, usd(4_000))
+        let b = reserve_committed(&db, tenant, employee, usd_minor(4_000))
             .await
             .expect("b");
         assert_eq!(bucket(&db, tenant, employee).await, (10_000, 2));
 
         // The day is full.
         assert!(
-            reserve_committed(&db, tenant, employee, usd(1))
+            reserve_committed(&db, tenant, employee, usd_minor(1))
                 .await
                 .is_err()
         );
@@ -713,7 +713,7 @@ mod tests {
         set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(10_000), usd(6_000), count(9)).unwrap(),
+            SpendCaps::new(usd_minor(10_000), usd_minor(6_000), count(9)).unwrap(),
         )
         .await
         .expect("set caps");
@@ -725,14 +725,14 @@ mod tests {
         // all by itself — which would let a lock-free implementation pass for
         // the wrong reason. The interesting case is the second payment of the
         // day onwards, and that is what this sets up.
-        reserve_committed(&db, tenant, employee, usd(1_000))
+        reserve_committed(&db, tenant, employee, usd_minor(1_000))
             .await
             .expect("warm-up");
 
         // First payment: reserved, but the transaction stays open, exactly as
         // it would while the payment intent is being written next to it.
         let mut first = db.tenant_tx(tenant).await.expect("tenant tx");
-        reserve(&mut first, employee, DAY, usd(6_000))
+        reserve(&mut first, employee, DAY, usd_minor(6_000))
             .await
             .expect("first reservation");
 
@@ -742,7 +742,7 @@ mod tests {
             let db = db.clone();
             async move {
                 let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-                let outcome = reserve(&mut tx, employee, DAY, usd(6_000)).await;
+                let outcome = reserve(&mut tx, employee, DAY, usd_minor(6_000)).await;
                 // Commit either way: if the implementation wrongly granted it,
                 // the damage must be visible in the bucket rather than rolled
                 // back by a tidy test.
@@ -802,7 +802,12 @@ mod tests {
             employee,
             // The count cap is deliberately far out of reach: this test is
             // about the total, and a count refusal would mask it.
-            SpendCaps::new(usd(DAILY), usd(AMOUNT), count(ATTEMPTS as u32 * 2)).unwrap(),
+            SpendCaps::new(
+                usd_minor(DAILY),
+                usd_minor(AMOUNT),
+                count(ATTEMPTS as u32 * 2),
+            )
+            .unwrap(),
         )
         .await
         .expect("set caps");
@@ -819,7 +824,7 @@ mod tests {
                     // not the time spent queueing for a pool connection.
                     let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
                     let start = Instant::now();
-                    let outcome = reserve(&mut tx, employee, DAY, usd(AMOUNT)).await;
+                    let outcome = reserve(&mut tx, employee, DAY, usd_minor(AMOUNT)).await;
                     let ok = match outcome {
                         Ok(_) => {
                             tx.commit().await.expect("commit");

@@ -1426,9 +1426,9 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
     let db = Db::connect(&server.database_url).await.expect("connect");
     let gate = PolicyGate::new(db.clone());
     let cfo = Principal::employee(server.tenant, employee_of("cfo"));
-    let usd = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
+    let usd_minor = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
     let payment = |minor: u64| PaymentCreate {
-        amount: usd(minor),
+        amount: usd_minor(minor),
         payee: "Cabinet Dubois".to_owned(),
     };
 

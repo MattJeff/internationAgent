@@ -618,8 +618,8 @@ pub async fn activate(tx: &mut TenantTx<'_>, version_id: Uuid) -> Result<(), Sto
 ///   default.
 pub fn default_ceiling() -> PolicyLimits {
     // Infallible: `Money::new` rejects zero only, and none of these is zero.
-    let usd = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
-    let spend = SpendLimits::try_new(usd(50_000), usd(200_000), usd(10_000))
+    let usd_minor = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
+    let spend = SpendLimits::try_new(usd_minor(50_000), usd_minor(200_000), usd_minor(10_000))
         .expect("10_000 <= 50_000 <= 200_000");
 
     PolicyLimits {

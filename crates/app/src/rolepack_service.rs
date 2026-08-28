@@ -933,9 +933,9 @@ impl RolePack {
                 // approval and the day's total.
                 spend: Some(
                     SpendLimits::try_new(
-                        usd(10_000), // per transaction
-                        usd(25_000), // per day — the structuring stop
-                        usd(1),      // above this, a human signs off: i.e. always
+                        usd_major(10_000), // per transaction
+                        usd_major(25_000), // per day — the structuring stop
+                        usd_major(1),      // above this, a human signs off: i.e. always
                     )
                     .expect("the finance pack's spend caps are coherent"),
                 ),
@@ -1464,7 +1464,7 @@ impl RolePack {
     }
 }
 
-fn usd(major: u64) -> Money {
+fn usd_major(major: u64) -> Money {
     Money::from_major(major, Currency::Usd).expect("a non-zero usd amount")
 }
 
@@ -2630,10 +2630,12 @@ mod tests {
             },
             ActionKind::A2aSend => Action::A2aSend { peer: domain() },
             ActionKind::PaymentCreate => Action::PaymentCreate {
-                amount: usd(1),
+                amount: usd_major(1),
                 payee: "acct-supplier".to_owned(),
             },
-            ActionKind::InvoiceIssue => Action::InvoiceIssue { amount: usd(1) },
+            ActionKind::InvoiceIssue => Action::InvoiceIssue {
+                amount: usd_major(1),
+            },
             ActionKind::ContractSign => Action::ContractSign {
                 title: "an agreement".to_owned(),
             },
@@ -3115,7 +3117,7 @@ mod tests {
             evaluate(
                 &role_only_policy(&pack),
                 &Action::PaymentCreate {
-                    amount: usd(20),
+                    amount: usd_major(20),
                     payee: "acct-supplier".to_owned(),
                 },
                 &ctx(),
@@ -3223,10 +3225,27 @@ mod tests {
 
         let policy = role_only_policy(&pack);
         let pay = |major: u64| Action::PaymentCreate {
-            amount: usd(major),
+            amount: usd_major(major),
             payee: "acct-supplier".to_owned(),
         };
         let ctx = ctx();
+
+        // The caps in minor units — see the same guard in `crate::rolepack`.
+        // Every other assertion in this test speaks `usd_major`, so a wrong
+        // conversion inside that helper moves the caps and the payments by the
+        // same factor and none of them notices. One dollar is the threshold
+        // this pack's whole argument rests on, and one hundred is how the
+        // database spells it.
+        let spend = pack.limits().spend.expect("finance has spend caps");
+        assert_eq!(
+            (
+                spend.max_per_transaction().minor(),
+                spend.max_per_day().minor(),
+                spend.approval_above().minor(),
+            ),
+            (1_000_000, 2_500_000, 100),
+            "$10,000 a transaction, $25,000 a day, $1 unsupervised"
+        );
 
         for major in [1, 200, 5_000, 10_000] {
             assert!(
@@ -3256,7 +3275,7 @@ mod tests {
                 &policy,
                 &pay(2_000),
                 &ActionCtx {
-                    spent_today: Some(usd(24_000)),
+                    spent_today: Some(usd_major(24_000)),
                     ..ctx.clone()
                 },
             ),

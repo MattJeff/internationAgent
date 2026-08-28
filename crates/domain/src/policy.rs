@@ -1893,7 +1893,7 @@ mod tests {
         Slug::parse(s).unwrap()
     }
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Usd).unwrap()
     }
 
@@ -1911,7 +1911,10 @@ mod tests {
     /// evaluator that needs `Channel::Internal` went untested. Ask the enum.
     fn permissive() -> PolicyLimits {
         PolicyLimits {
-            spend: Some(SpendLimits::try_new(usd(50_000), usd(200_000), usd(50_000)).unwrap()),
+            spend: Some(
+                SpendLimits::try_new(usd_minor(50_000), usd_minor(200_000), usd_minor(50_000))
+                    .unwrap(),
+            ),
             allowed_channels: Channel::ALL.into_iter().collect(),
             allowed_calling_codes: [CallingCode::new(1).unwrap(), CallingCode::new(86).unwrap()]
                 .into_iter()
@@ -1972,10 +1975,12 @@ mod tests {
                 peer: domain("partner.example.com"),
             },
             Action::PaymentCreate {
-                amount: usd(100),
+                amount: usd_minor(100),
                 payee: "acct-supplier".to_owned(),
             },
-            Action::InvoiceIssue { amount: usd(100) },
+            Action::InvoiceIssue {
+                amount: usd_minor(100),
+            },
             Action::ContractSign {
                 title: "supply agreement".into(),
             },
@@ -2323,7 +2328,7 @@ mod tests {
     #[test]
     fn fifty_small_payments_cannot_walk_past_the_daily_cap() {
         let policy = effective(&permissive()); // 50_000 per tx, 200_000 per day
-        let each = usd(9_999);
+        let each = usd_minor(9_999);
 
         let mut spent: Option<Money> = None;
         let mut allowed = 0u32;
@@ -2377,16 +2382,16 @@ mod tests {
             payee: "acct-supplier".to_owned(),
         };
 
-        assert!(evaluate(&policy, &pay(usd(5_000)), &ctx).is_allow());
+        assert!(evaluate(&policy, &pay(usd_minor(5_000)), &ctx).is_allow());
         assert!(matches!(
-            evaluate(&policy, &pay(usd(50_000)), &ctx),
+            evaluate(&policy, &pay(usd_minor(50_000)), &ctx),
             Decision::RequireApproval {
                 reason: ApprovalReason::PaymentAboveThreshold,
                 ..
             }
         ));
         assert_eq!(
-            evaluate(&policy, &pay(usd(50_001)), &ctx),
+            evaluate(&policy, &pay(usd_minor(50_001)), &ctx),
             Decision::Deny {
                 reason: DenyReason::PerTransactionLimit
             }
@@ -2403,7 +2408,7 @@ mod tests {
             ..ctx.clone()
         };
         assert_eq!(
-            evaluate(&policy, &pay(usd(1_000)), &mixed),
+            evaluate(&policy, &pay(usd_minor(1_000)), &mixed),
             Decision::Deny {
                 reason: DenyReason::CurrencyMismatch
             }
@@ -2414,7 +2419,7 @@ mod tests {
             ..permissive()
         });
         assert_eq!(
-            evaluate(&broke, &pay(usd(1)), &ctx),
+            evaluate(&broke, &pay(usd_minor(1)), &ctx),
             Decision::Deny {
                 reason: DenyReason::NoSpendPolicy
             }
@@ -2431,7 +2436,7 @@ mod tests {
 
         // The headline case: a payment the policy would happily allow.
         let payment = Action::PaymentCreate {
-            amount: usd(100),
+            amount: usd_minor(100),
             payee: "acct-supplier".to_owned(),
         };
         assert!(evaluate(&policy, &payment, &ctx()).is_allow());
@@ -2454,7 +2459,7 @@ mod tests {
         // queue. The property is that the answer is a refusal.
         let escalating = [
             Action::PaymentCreate {
-                amount: usd(50_000),
+                amount: usd_minor(50_000),
                 payee: "acct-supplier".to_owned(),
             },
             Action::DataDelete {
@@ -2488,7 +2493,7 @@ mod tests {
         for (action, reason) in [
             (
                 Action::PaymentCreate {
-                    amount: usd(50_000),
+                    amount: usd_minor(50_000),
                     payee: "acct-supplier".to_owned(),
                 },
                 ApprovalReason::PaymentAboveThreshold,
@@ -2553,7 +2558,7 @@ mod tests {
             evaluate(
                 &policy,
                 &Action::PaymentCreate {
-                    amount: usd(50_001),
+                    amount: usd_minor(50_001),
                     payee: "acct-supplier".to_owned(),
                 },
                 &tainted
@@ -2635,7 +2640,10 @@ mod tests {
     #[test]
     fn a_lower_layer_can_only_tighten() {
         let platform = PolicyLimits {
-            spend: Some(SpendLimits::try_new(usd(10_000), usd(50_000), usd(5_000)).unwrap()),
+            spend: Some(
+                SpendLimits::try_new(usd_minor(10_000), usd_minor(50_000), usd_minor(5_000))
+                    .unwrap(),
+            ),
             allowed_domains: [domain("example.com")].into_iter().collect(),
             max_new_contacts_per_day: 10,
             allow_file_upload: true,
@@ -2643,7 +2651,10 @@ mod tests {
         };
         // A tenant that tries to grant itself more of everything.
         let greedy_tenant = PolicyLimits {
-            spend: Some(SpendLimits::try_new(usd(999_999), usd(999_999), usd(999_999)).unwrap()),
+            spend: Some(
+                SpendLimits::try_new(usd_minor(999_999), usd_minor(999_999), usd_minor(999_999))
+                    .unwrap(),
+            ),
             allowed_domains: [domain("example.com"), domain("anything.com")]
                 .into_iter()
                 .collect(),
@@ -2656,9 +2667,12 @@ mod tests {
             EffectivePolicy::try_new(&platform, &greedy_tenant, &platform, &platform).unwrap();
         let limits = effective.limits();
 
-        assert_eq!(limits.spend.unwrap().max_per_transaction(), usd(10_000));
-        assert_eq!(limits.spend.unwrap().max_per_day(), usd(50_000));
-        assert_eq!(limits.spend.unwrap().approval_above(), usd(5_000));
+        assert_eq!(
+            limits.spend.unwrap().max_per_transaction(),
+            usd_minor(10_000)
+        );
+        assert_eq!(limits.spend.unwrap().max_per_day(), usd_minor(50_000));
+        assert_eq!(limits.spend.unwrap().approval_above(), usd_minor(5_000));
         assert_eq!(limits.max_new_contacts_per_day, 10);
         assert_eq!(limits.allowed_domains, [domain("example.com")].into());
         assert!(!limits.allowed_domains.contains(&domain("anything.com")));
@@ -3054,7 +3068,7 @@ mod tests {
             evaluate(
                 &policy,
                 &Action::PaymentCreate {
-                    amount: usd(1),
+                    amount: usd_minor(1),
                     payee: "acct-supplier".to_owned(),
                 },
                 &ctx()
@@ -3068,21 +3082,25 @@ mod tests {
     #[test]
     fn incoherent_spend_limits_are_rejected_at_construction() {
         assert_eq!(
-            SpendLimits::try_new(usd(1_000), usd(10_000), usd(5_000)),
+            SpendLimits::try_new(usd_minor(1_000), usd_minor(10_000), usd_minor(5_000)),
             Err(PolicyError::ApprovalAboveTransactionCap {
-                approval_above: usd(5_000),
-                max_per_transaction: usd(1_000),
+                approval_above: usd_minor(5_000),
+                max_per_transaction: usd_minor(1_000),
             })
         );
         assert_eq!(
-            SpendLimits::try_new(usd(10_000), usd(1_000), usd(500)),
+            SpendLimits::try_new(usd_minor(10_000), usd_minor(1_000), usd_minor(500)),
             Err(PolicyError::TransactionAboveDailyCap {
-                max_per_transaction: usd(10_000),
-                max_per_day: usd(1_000),
+                max_per_transaction: usd_minor(10_000),
+                max_per_day: usd_minor(1_000),
             })
         );
         assert_eq!(
-            SpendLimits::try_new(usd(1_000), Money::new(10_000, Eur).unwrap(), usd(500)),
+            SpendLimits::try_new(
+                usd_minor(1_000),
+                Money::new(10_000, Eur).unwrap(),
+                usd_minor(500)
+            ),
             Err(PolicyError::MixedCurrency {
                 left: Usd,
                 right: Eur
@@ -3379,7 +3397,10 @@ mod tests {
     /// is not two extremes.
     fn ceiling() -> PolicyLimits {
         PolicyLimits {
-            spend: Some(SpendLimits::try_new(usd(50_000), usd(200_000), usd(10_000)).unwrap()),
+            spend: Some(
+                SpendLimits::try_new(usd_minor(50_000), usd_minor(200_000), usd_minor(10_000))
+                    .unwrap(),
+            ),
             allowed_channels: [Channel::Email, Channel::Internal, Channel::Web]
                 .into_iter()
                 .collect(),
@@ -3449,7 +3470,9 @@ mod tests {
             (
                 "a spend policy of almost nothing",
                 PolicyLimits {
-                    spend: Some(SpendLimits::try_new(usd(1), usd(1), usd(1)).unwrap()),
+                    spend: Some(
+                        SpendLimits::try_new(usd_minor(1), usd_minor(1), usd_minor(1)).unwrap(),
+                    ),
                     ..permissive()
                 },
             ),
@@ -3487,7 +3510,7 @@ mod tests {
         let mut out = Vec::new();
         for trust in [TrustLabel::Trusted, TrustLabel::Untrusted] {
             for contact in [ContactStanding::Known, ContactStanding::New] {
-                for (new_today, spent) in [(0, None), (1_000, Some(usd(199_999)))] {
+                for (new_today, spent) in [(0, None), (1_000, Some(usd_minor(199_999)))] {
                     for directs_subject in [false, true] {
                         out.push(ActionCtx {
                             trust,
@@ -3540,11 +3563,11 @@ mod tests {
                 peer: domain("elsewhere.test"),
             },
             Action::PaymentCreate {
-                amount: usd(1),
+                amount: usd_minor(1),
                 payee: "acct-supplier".to_owned(),
             },
             Action::PaymentCreate {
-                amount: usd(49_999),
+                amount: usd_minor(49_999),
                 payee: "acct-supplier".to_owned(),
             },
             Action::ContractSign {
@@ -3694,7 +3717,7 @@ mod tests {
 
         // A budget of one cent: nearly every payment is refused and one is not.
         let almost_broke = effective(&PolicyLimits {
-            spend: Some(SpendLimits::try_new(usd(1), usd(1), usd(1)).unwrap()),
+            spend: Some(SpendLimits::try_new(usd_minor(1), usd_minor(1), usd_minor(1)).unwrap()),
             ..permissive()
         });
         assert!(!always_denies(&almost_broke, ActionKind::PaymentCreate));
@@ -3702,7 +3725,7 @@ mod tests {
             !evaluate(
                 &almost_broke,
                 &Action::PaymentCreate {
-                    amount: usd(50_000),
+                    amount: usd_minor(50_000),
                     payee: "acct-supplier".to_owned(),
                 },
                 &ctx
