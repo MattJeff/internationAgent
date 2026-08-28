@@ -55,10 +55,18 @@ pub fn router(db: Db) -> Router {
         .with_state(db)
 }
 
+/// Longest title `work_items_title_shape` accepts, in characters.
+///
+/// Restated here rather than read off the table, and the restatement is what the
+/// test below pins: the alternative is a round trip to `information_schema` per
+/// request to learn a number that changes in a migration. If it ever moves, this
+/// constant moves with it in the same commit.
+const MAX_TITLE: usize = 200;
+
 /// A new item.
 #[derive(Deserialize)]
 struct NewItem {
-    /// What to do, in one line. Bounded by the table, not here.
+    /// What to do, in one line. 1 to 200 characters, as the table demands.
     title: String,
     /// Who does it. Absent or null is the shared board.
     #[serde(default)]
@@ -138,9 +146,16 @@ async fn post(
     Json(body): Json<NewItem>,
 ) -> Result<Response, ApiError> {
     let title = body.title.trim();
-    if title.is_empty() {
+    // Both ends of `work_items_title_shape`, and it has to be both. Refusing
+    // only the empty one left the other to the `CHECK`, which arrives as a
+    // `23514` in `StoreError::Database` and comes out of `ApiError` as a **500**
+    // — "we broke" — for a body the founder fixes by shortening a sentence.
+    // `char_length` is what the constraint counts, so `chars()` is what this
+    // counts; `.len()` would refuse a 70-character Japanese title.
+    if title.is_empty() || title.chars().count() > MAX_TITLE {
         return Err(ApiError::bad_request(
-            "an item needs a title: it is the sentence an employee reads off its brief",
+            "an item needs a title of 1 to 200 characters: it is the sentence an employee \
+             reads off its brief",
         ));
     }
 
@@ -419,6 +434,53 @@ mod tests {
             2,
             "a closed item is still on the board: the founder needs to see what got done"
         );
+    }
+
+    /// **A title this table will not take is the caller's mistake, not ours.**
+    ///
+    /// `POST` already refuses an empty title here rather than at the table, so
+    /// the other end of `work_items_title_shape` has to be refused here too:
+    /// left to the `CHECK`, a 201-character title comes back as a `23514` in
+    /// [`StoreError::Database`], which [`ApiError`] answers **500** — "we
+    /// broke" — for a body the founder can fix by shortening a sentence. Both
+    /// ends of one constraint, one answer.
+    #[tokio::test]
+    async fn a_title_the_table_will_not_take_is_a_400_and_not_a_500() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the work board needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+
+        for title in ["", "   ", &"x".repeat(201)] {
+            let (status, problem) = h
+                .send(
+                    "POST",
+                    "/v1/work",
+                    SECRET_A,
+                    Some(json!({ "title": title })),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a title of {} characters answered {status}: {problem}",
+                title.chars().count()
+            );
+        }
+
+        // …and the longest one the table does take still lands.
+        let (status, _) = h
+            .send(
+                "POST",
+                "/v1/work",
+                SECRET_A,
+                Some(json!({ "title": "x".repeat(200) })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "200 characters is the bound");
     }
 
     /// A board is one company's, and an assignee is too.
