@@ -628,6 +628,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
+    use crate::telephony::OpenWindow;
     use agentos_domain::action::E164;
     use agentos_domain::ids::{EmployeeId, Slug, TenantId};
     use base64::Engine as _;
@@ -1447,6 +1448,68 @@ mod tests {
             .await
             .expect("template sent");
         assert_eq!(twilio.state().messages, 1);
+    }
+
+    /// **The guard on the real adapter, which had none.**
+    ///
+    /// `TelephonyProvider::send_whatsapp` requires every implementation to
+    /// refuse a `FreeForm` whose window has expired since it was minted — a
+    /// window is a value a caller can hold across a turn, not a lease. The mock
+    /// is checked for it in `telephony::tests`; this adapter carried the same
+    /// four lines with nothing asserting them, so deleting them was a green
+    /// change that puts free text on Meta's platform outside the window.
+    ///
+    /// Both halves, because either alone passes for the wrong reason: an open
+    /// window must still reach the wire, and a shut one must not. `messages`
+    /// counts what the fake actually received, so a refusal that still POSTed
+    /// would fail the second assertion rather than the first.
+    #[tokio::test]
+    async fn free_form_whose_window_expired_in_the_queue_never_reaches_the_wire() {
+        let twilio = FakeTwilio::start().await;
+        let client = twilio.client();
+        let from = E164::parse("+15005550006").expect("e164");
+        let to = E164::parse("+14158675309").expect("e164");
+        let free = |window| OutboundWhatsapp::FreeForm {
+            from: from.clone(),
+            to: to.clone(),
+            body: "on its way".to_owned(),
+            window,
+        };
+
+        // Minted a minute ago against a message from a minute before that: open
+        // now, and it goes.
+        let now = Utc::now();
+        let open = OpenWindow::since_last_inbound(Some(now - TimeDelta::minutes(2)), now)
+            .expect("two minutes is inside the window");
+        client
+            .send_whatsapp(&key("wa:open"), &free(open))
+            .await
+            .expect("an open window sends");
+        assert_eq!(twilio.state().messages, 1);
+
+        // Minted while it was genuinely open — `since_last_inbound` would hand
+        // back `None` otherwise and there would be nothing to test — and
+        // expired by the time we send. This is the queue, expressed.
+        let then = now - TimeDelta::hours(23);
+        let stale = OpenWindow::since_last_inbound(
+            Some(then - TimeDelta::hours(23) - TimeDelta::minutes(59)),
+            then,
+        )
+        .expect("it was open when it was minted");
+        assert!(stale.expires_at() <= now, "the fixture never expired");
+
+        assert_eq!(
+            client.send_whatsapp(&key("wa:stale"), &free(stale)).await,
+            Err(ProviderError::Terminal {
+                code: "window_closed"
+            }),
+            "a window that expired in the queue still sent free text"
+        );
+        assert_eq!(
+            twilio.state().messages,
+            1,
+            "the expired free-form message was POSTed anyway"
+        );
     }
 
     // -- error classification ----------------------------------------------

@@ -127,6 +127,33 @@ pub struct OpenWindow {
 
 impl OpenWindow {
     /// How long a customer's message keeps the window open.
+    ///
+    /// # FOUNDER'S QUESTION, LEFT OPEN: where does the 24 come from?
+    ///
+    /// **Not from us.** This is Meta's rule about Meta's platform, and this
+    /// repository does not source it. `SPEC.md` and `docs/PROVIDERS.md` both
+    /// state "24 hours", and neither cites anything — they are restatements of
+    /// this constant, so the three of them agreeing proves only that somebody
+    /// typed it three times. The one place it is decided is here.
+    ///
+    /// It is a number the founder owns because it is a number Meta can change
+    /// and has reorganised before, and because a wrong value fails in the
+    /// expensive direction: too long and every send in the overhang is a policy
+    /// violation on somebody else's platform, which is an account standing
+    /// problem rather than an error code. Too short only costs messages that
+    /// would have been legal.
+    ///
+    /// The answer is a citation, in a comment, beside the number — the URL and
+    /// the date it was read — so the next person can tell "checked" from
+    /// "assumed". If it turns out to differ by messaging category, this stops
+    /// being one constant and becomes an argument.
+    ///
+    /// **And the 24 is not the whole of the rule.** Meta measures from when
+    /// *Meta* received the customer's message; every clock this workspace holds
+    /// is later than that. `agentos_app::effects::Effects::whatsapp_window` is
+    /// where the window is derived and where the second open question — the
+    /// safety margin — is written down. Named in prose rather than linked
+    /// because this crate is below that one and must stay there.
     pub const DURATION: TimeDelta = TimeDelta::hours(24);
 
     /// The window state: `Some` while free-form text is allowed, `None` when
@@ -286,6 +313,27 @@ pub trait TelephonyProvider: Send + Sync {
     ) -> Result<ProviderMessageId, ProviderError>;
 
     /// Send a WhatsApp message. Same idempotency rule as [`Self::send_sms`].
+    ///
+    /// # An implementor MUST re-check the window, and that was convention
+    ///
+    /// [`OutboundWhatsapp::FreeForm`] carries an [`OpenWindow`], which proves
+    /// the window was open **when the message was built** and nothing more. It
+    /// is a value, not a lease: a caller can hold one across a turn or a queue,
+    /// and by the time the bytes reach the wire it may have expired. So every
+    /// implementation of this method refuses `FreeForm` whose
+    /// [`OpenWindow::expires_at`] is at or before its own idea of now, with
+    /// [`ProviderError::Terminal`] `"window_closed"` — free text after that is a
+    /// policy violation on Meta's platform, not a 4xx to shrug at.
+    ///
+    /// Both adapters in this crate do it and neither said so here, which made
+    /// the rule a thing you learn by reading two `impl`s. The Meta adapter
+    /// `docs/PROVIDERS.md` says is not built will read this instead.
+    ///
+    /// It is checked *here*, at the last hop, and not one layer up in
+    /// `agentos_app::effects`, because this is the only place that runs
+    /// immediately before the send. A third copy would be a third place for the
+    /// rule to drift; what belongs one layer up is deriving the window, which
+    /// is `Effects::whatsapp_window`.
     async fn send_whatsapp(
         &self,
         key: &IdempotencyKey,

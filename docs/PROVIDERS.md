@@ -429,6 +429,15 @@ be sent. `OutboundWhatsapp::FreeForm` carries an `OpenWindow`, and an
 `OpenWindow` can only be obtained while the window is genuinely open. A free-text
 send outside the window is not a runtime error — it is unspellable.
 
+Since the telephony ingest landed (`0069`) there is a way to obtain one outside a
+test: `agentos_app::effects::Effects::whatsapp_window` reads the last inbound
+WhatsApp message on the thread and mints the proof. Two numbers it depends on are
+**not sourced anywhere in this repository** and are written up as open questions
+in the code rather than restated here: the 24 itself, on `OpenWindow::DURATION`,
+and the safety margin for the fact that our clock is later than Meta's, on
+`whatsapp_window`. The paragraph above is a restatement; those two doc comments
+are where the answers go.
+
 **SMS de-duplication is process-local.** The Messages API has no idempotency
 header at all, so the adapter keeps an in-process map from idempotency key to
 message SID. It stops a retry *inside one process* from double-texting; it does
