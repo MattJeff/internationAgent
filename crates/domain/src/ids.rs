@@ -93,6 +93,11 @@ uuid_newtype!(
     /// See `migrations/0061_work_items.sql`.
     WorkItemId
 );
+uuid_newtype!(
+    /// One moment an employee undertook, in that employee's own diary.
+    /// See `migrations/0063_appointments.sql`.
+    AppointmentId
+);
 
 // ---------------------------------------------------------------------------
 // Slug

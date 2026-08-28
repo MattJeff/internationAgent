@@ -4,6 +4,9 @@ pub mod autonomy;
 // wave M: what we may charge for — seats and connectors, by the day, derived
 // from the trail. The counter, deliberately not the collection.
 pub mod billing;
+// le calendrier: the founder promises a moment and sees what has been promised.
+// The employee's half is `agentos_app::calendar` and `loops::initiative`.
+pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
 // wave K: the founder picks a window and gets a quote — effort and money, never

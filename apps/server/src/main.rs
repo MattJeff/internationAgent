@@ -571,6 +571,12 @@ fn app(
             // Before it there was nowhere in this product for an operator to
             // put one piece of work before another.
             .merge(routes::work::router(db.clone()))
+            // And beside `work` for the same reason it sits beside
+            // `initiative`: those two say how often a seat acts and what is
+            // waiting for it, and this one is the third question neither could
+            // answer — *when*. Before it, nothing in this product could name an
+            // hour.
+            .merge(routes::calendar::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
