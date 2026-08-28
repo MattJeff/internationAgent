@@ -931,7 +931,10 @@ mod tests {
         assert!(
             !rendered.contains(SLUG_CONSTRAINT),
             "`{SLUG_CONSTRAINT}` is a table's internals and names nothing the caller can act \
-             on. It belongs on the `tracing::warn!` this arm writes, where the operator gets \
+             on. It is meant to go to the `tracing::warn!` this arm writes instead — and \
+             note that nothing here pins that half: deleting the field from the log leaves \
+             this test green, so the sentence is a statement of intent and not a guarantee. \
+             What this assertion does hold is that the operator gets \
              it — the caller gets the status and the code: {rendered}"
         );
 

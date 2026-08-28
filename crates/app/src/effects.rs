@@ -3394,7 +3394,10 @@ mod tests {
             .await
             .expect("under every cap, the team's included");
 
-        // The charge landed on both ledgers, or the assertion below is vacuous.
+        // The charge landed on the **team** ledger, or the assertion below is
+        // vacuous. One ledger, not both: an earlier version of this line said
+        // both and only one is asserted, which is the kind of sentence that
+        // survives because nobody re-reads a comment next to a passing test.
         let day = Utc::now().date_naive();
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
         assert_eq!(
