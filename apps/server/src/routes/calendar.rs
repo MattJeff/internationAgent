@@ -96,8 +96,20 @@ struct AppointmentView {
     local_time: String,
     subject: String,
     /// When it stopped being a promise. Null is still ahead; earlier than `at`
-    /// is a cancellation and later is a promise kept.
+    /// is a cancellation, and later is **the hour having come round** — which is
+    /// not the same as it having been kept. Read `outcome` for that.
     rang_at: Option<DateTime<Utc>>,
+    /// What became of it, in `0072`'s vocabulary. `turn` is the only value that
+    /// says something actually happened; `no_charter`, `no_model`, `clarify`,
+    /// `no_work`, `over_budget`, `unreadable_charter` and `error` each name a
+    /// reason the hour came round and nothing was done, and every one of them is
+    /// something to go and fix. `cancelled` is a seat that left.
+    ///
+    /// **Null beside a non-null `rang_at` means nobody ever said**: the claim
+    /// consumed the promise, and the process that was going to record the
+    /// outcome did not get there. Not a synonym for success — see `0072` for why
+    /// it is this way round and not the other.
+    outcome: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -111,6 +123,7 @@ impl From<calendar::Appointment> for AppointmentView {
             local_time: appointment.local_time,
             subject: appointment.subject,
             rang_at: appointment.rang_at,
+            outcome: appointment.outcome,
             created_at: appointment.created_at,
         }
     }
