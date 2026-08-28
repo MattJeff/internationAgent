@@ -5355,11 +5355,24 @@ mod tests {
         .await
         .expect("charter the employee");
 
-        // One document, whose only distinguishing word is this company's. The
+        // One document, whose only distinguishing word is this company's.
+        //
+        // It is **not** retrieved on the turn below, and the assertion further
+        // down says so. The comment here used to claim the opposite — "the
         // recall query is the inbound message, which carries the same word, so
-        // the full-text leg of `search_hybrid` has something real to match —
-        // a knowledge assertion over two stores that never retrieve anything
-        // proves nothing about either.
+        // the full-text leg has something real to match" — and it was false in
+        // two steps. The recall query is not the body, it is the whole framed
+        // message including the `from:` and `subject:` lines; and
+        // `websearch_to_tsquery` ANDs every lexeme in it, so a chunk would have
+        // to contain 'accounts', the sender's domain, 'subject', 're' and the
+        // question. The text leg matched nothing here, ever. What put the
+        // document in the prompt was the vector leg — a SHA-256 ranking of the
+        // one chunk this tenant owns, which cannot be wrong because there is
+        // nothing to be wrong about. Now that `retrieve` no longer consults a
+        // leg that has no opinion, the recall is empty and visibly so.
+        //
+        // The ingest stays: it is what makes the *absence* below a measurement
+        // rather than a tautology about an empty store.
         knowledge::ingest(
             &mut tx,
             Embedder::default(),
@@ -5692,10 +5705,31 @@ mod tests {
             // And it did get its own — otherwise the scan above passes on an
             // empty prompt.
             assert!(whole.contains(&mine.address), "{whole}");
+
+            // **What this build's memory actually does on the turn path**,
+            // pinned here because this is the only test in the workspace that
+            // recalls against a real inbound message rather than a search
+            // phrase. The document is on file, it answers the question, and it
+            // does not arrive: the recall query is the whole framed message and
+            // `websearch_to_tsquery` ANDs every lexeme of it, so the text leg —
+            // the only leg `retrieve` consults while `Embedder::is_semantic()`
+            // is false — matches nothing an email could ever match.
+            //
+            // This assertion is the inverse of the one that used to be here. The
+            // old one passed on the vector leg: a SHA-256 ranking of the single
+            // chunk this tenant owns, which cannot pick wrongly because there is
+            // no second chunk to pick. It read as "recall works" and meant
+            // "there was only one thing to return".
+            //
+            // It goes red the day retrieval reaches a turn — an embedder, or a
+            // query built from the message instead of quoting it — and that is
+            // when somebody should be made to come back and assert the presence
+            // again, with a corpus of more than one chunk behind it.
             assert!(
-                whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
-                "{}'s turn did not recall its own document, so the scan above \
-                 proves nothing about the other company's: {whole}",
+                !whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
+                "{}'s turn recalled its own document, which this build cannot do — \
+                 retrieval reaches a turn now, so assert the *presence* here and give \
+                 this tenant more than one chunk so the assertion means something: {whole}",
                 mine.address
             );
 

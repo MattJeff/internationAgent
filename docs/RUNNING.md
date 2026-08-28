@@ -338,26 +338,39 @@ somebody kept it.
 truth about the *credential* — there is nothing to set. What it says beside it is
 the part that matters:
 
-> `MOCK — a SHA-256 hash (mock-sha256-1536), not semantics: retrieval returns
-> something and it is not the right thing. This build ships no real embedder, so
-> no credential changes it.`
+> `MOCK — a SHA-256 hash (mock-sha256-1536), not semantics. Retrieval therefore
+> runs on word matching alone: an employee finds a document that repeats the
+> words of the question and finds nothing otherwise, which on an inbound email is
+> most of the time. This build ships no real embedder, so no credential changes
+> it.`
 
 Checked rather than taken on trust: `agentos_providers::embedder::Embedder` has
 **one variant**, `Mock`, and it is the default. There is no second one to switch
 to.
 
 So `knowledge` — what an employee recalls before it answers — ingests, chunks,
-stores and retrieves, and the ranking it retrieves by is a hash of the text
-rather than its meaning. Everything around it is real: the tenant isolation, the
-chunking, the `source_id`, the storage. The one thing that makes retrieval
-*retrieval* is not.
+stores and retrieves, and it cannot rank by meaning. Everything around it is
+real: the tenant isolation, the chunking, the `source_id`, the storage. The one
+thing that makes retrieval *retrieval* is not.
+
+**What changed since this section was written.** It used to say the ranking *is*
+a hash, and it was: `retrieve` fused a hash-ranked vector leg with the full-text
+leg, and because the vector leg always returns a full `LIMIT` worth of rows, a
+turn asking a question its store could not answer got five confident, scored,
+unrelated passages and was told they had been "selected by matching". It no
+longer does — `Embedder::is_semantic()` is `false`, and `retrieve` runs the
+full-text leg alone. The symptom an operator sees is now an *empty* recall rather
+than a wrong one. The gap itself is unchanged and this section stays: there is
+still no semantic retrieval on this build.
 
 **Why it belongs on this map rather than in a backlog.** It is the only piece of
-the running company that is wired, green, exercised by tests, and wrong at the
-same time — every other gap here is either absent (nothing to mistake for
+the running company that is wired, green, exercised by tests, and short of what
+its name promises — every other gap here is either absent (nothing to mistake for
 working) or off behind a switch. A reader who sees `knowledge` in the node table
-and the doctor's `[OK]` will conclude an employee has memory. It has recall that
-returns something.
+and the doctor's `[OK]` will conclude an employee has memory. It has word search
+over documents somebody uploaded, and on the turn path — where the query is the
+counterparty's whole email and `websearch_to_tsquery` ANDs every lexeme in it —
+that search almost never matches anything.
 
 **It is not a credential and not a wave.** A real embedder is a provider
 integration with a per-call cost, which makes it the same decision as every other

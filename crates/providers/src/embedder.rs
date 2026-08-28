@@ -41,6 +41,25 @@ impl Embedder {
     /// a Postgres error three layers down.
     pub const DIM: usize = 1536;
 
+    /// **Whether the distance between two of these vectors means anything.**
+    ///
+    /// `false` is not a caveat to note in a doc comment, it is a branch a
+    /// caller has to take. A hash embedder's nearest neighbours are an
+    /// arbitrary draw from the corpus, and they are an arbitrary draw that
+    /// arrives *sorted*, with a score attached, in the shape of an answer. Rank
+    /// by them and a `LIMIT 5` is five confident unrelated passages rather than
+    /// nothing — which is the worse of the two, because nothing is visibly
+    /// nothing. `agentos_app::knowledge::retrieve` is the caller that branches,
+    /// and it drops the vector leg entirely when this is `false`.
+    ///
+    /// Exhaustive on purpose: a real backend cannot be added without answering
+    /// this, and the answer decides whether retrieval ranks by meaning at all.
+    pub const fn is_semantic(self) -> bool {
+        match self {
+            Self::Mock => false,
+        }
+    }
+
     /// Embed a batch, preserving order.
     ///
     /// The result has exactly `inputs.len()` rows, each exactly [`Self::DIM`]
@@ -166,6 +185,14 @@ mod tests {
             dot(&a, &b)
         );
         assert!(dot(&a, &c).abs() < 0.2);
+
+        // The same fact, in the form a caller can branch on. "cat" and "kitten"
+        // being orthogonal is the evidence; `is_semantic` is what retrieval
+        // reads, and the two must not be able to disagree.
+        assert!(
+            !Embedder::Mock.is_semantic(),
+            "a backend whose nearest neighbours are a hash draw claimed to rank by meaning"
+        );
     }
 
     #[test]
