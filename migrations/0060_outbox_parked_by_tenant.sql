@@ -1,0 +1,104 @@
+-- 0060_outbox_parked_by_tenant: `0057` gave the claim its index back and took
+-- the operator's away.
+--
+-- WHAT `0057` DROPPED, AND WHO ELSE WAS READING IT
+--
+-- `0057` replaced `outbox_events_tenant_due_idx (tenant_id, available_at, id)
+-- where published_at is null` with `outbox_events_claimable_idx`, the same
+-- columns plus `and attempt_count < 8`, and dropped the old one — correctly, for
+-- the reason it gives: a third index on the hottest table in the system is a
+-- write on every enqueue, every claim and every publish, and nothing read the
+-- old shape *any more*.
+--
+-- One statement did. `outbox::requeue_dead_letters` is
+--
+--     UPDATE outbox_events SET attempt_count = 0, available_at = $1
+--      WHERE published_at IS NULL AND attempt_count >= $2::int
+--        AND NOT starts_with(coalesce(last_error, ''), $3)
+--
+-- run inside a `TenantTx`, so row-level security adds `tenant_id = <this
+-- tenant>` as a fourth qual. That is a tenant-leading read of `outbox_events`
+-- asking for **the other half** of `attempt_count`: exactly the half
+-- `outbox_events_claimable_idx` excludes, and exactly the shape the dropped
+-- index served. After `0057` there is no index in the table that leads with
+-- `tenant_id`, so the planner falls back to `outbox_events_due_idx
+-- (available_at, id) where published_at is null` — which is every tenant's
+-- unpublished rows — and filters `tenant_id` out of the result.
+--
+-- `0057` did check this reader and measured it at 2.2 s on both sides. That
+-- measurement is right and its shape is the wrong one: it reads *one tenant's
+-- 100 000 dead letters out of 100 100 rows*, where the statement updates almost
+-- every row it looks at and no index can help. The shape that actually runs is
+-- the opposite — a tenant with **few or no** dead letters, on a deployment where
+-- somebody else has a lot — and there the whole cost is rows this tenant does
+-- not own.
+--
+-- MEASURED, PostgreSQL 17, one table, 300 100 rows (49 MB), 20 tenants. Tenant A
+-- has never connected a model and holds 100 000 parked rows; tenant B is being
+-- onboarded and holds five live rows and no dead letters. `requeue_dead_letters`
+-- as tenant B, median of three:
+--
+--                                        plan                         B's cost
+--     ------------------------------------------------------------------------
+--     before 0057   outbox_events_tenant_due_idx, 5 rows examined       0.10 ms
+--     after  0057   outbox_events_due_idx, 100 100 removed by filter   59.2  ms
+--     with this     outbox_events_tenant_parked_idx, 0 rows examined    0.01 ms
+--
+-- 590×, and the number is **A's row count**, not B's. That is `0046`'s own
+-- failure — one tenant's rows becoming every other tenant's latency — arriving
+-- through the door `0057` opened while closing the same one for the claim. It
+-- lands on a synchronous HTTP path and on the worst one: `store::policy::activate`
+-- calls `requeue_dead_letters`, `install_layer` and `rollback_layer` both go
+-- through it, and `POST /v1/companies` installs one layer per role — so a
+-- customer's first minute on the platform pays this once per role for a backlog
+-- belonging to a customer they have never heard of. `model_access::connect`
+-- (`POST /v1/model`) is the second caller.
+--
+-- WHY THIS IS NOT THE INDEX `0057` DELETED, PUT BACK
+--
+-- Because `0057`'s argument against a third index is right and this one does not
+-- attract it. The index it dropped was partial on `published_at IS NULL` alone,
+-- so it carried **every live row** — 5 776 kB at the measurement above, an entry
+-- written on every enqueue and rewritten on every claim. This one is partial on
+-- `attempt_count >= 8` as well, which is the exact complement of
+-- `outbox_events_claimable_idx`: the two together hold each unpublished row
+-- once, never twice.
+--
+-- What that buys on the hot paths is that they never write to it. An enqueue
+-- lands `attempt_count = 0` and does not match; a claim moves a row from `n` to
+-- `n+1` and matches neither before nor after, for every `n` under the cap. Only
+-- `park` and the eighth claim add an entry, and `requeue_dead_letters` and
+-- `mark_done` remove one — hundreds of rows where the claim path is millions.
+-- 704 kB for tenant A's 100 000 above, against 5 776 kB for the shape `0057`
+-- refused. Measured after adding it: the claim is unchanged at ~1 ms and still
+-- on `outbox_events_claimable_idx`, and tenant A's own revival is unchanged at
+-- 2.1 s — it now reaches its 100 000 rows through this index instead of through
+-- a bitmap over the wide one, which is the same work.
+--
+-- `(tenant_id)` and nothing else. `requeue_dead_letters` has no `ORDER BY`, no
+-- `LIMIT` and no `available_at` qual — it takes the whole set — so a second
+-- column would be bytes per entry that no reader can use.
+--
+-- THE `8` IS `outbox::MAX_ATTEMPTS`, AND THE QUERY STILL BINDS IT AS `$2`
+--
+-- Same trade as `0057` and the same two consequences. A partial index is usable
+-- only when the planner can prove the query implies its predicate, and about `$2`
+-- it can prove that only from the parameter's value — so only from a **custom**
+-- plan. Measured rather than assumed: eight consecutive executions of the
+-- prepared statement at `plan_cache_mode = auto` against the table above, eight
+-- custom plans, eight index scans, 0.01–0.36 ms.
+--
+-- An applied migration is immutable, so `MAX_ATTEMPTS` moving needs a new
+-- migration here too — and only in one direction. *Raising* it is safe by
+-- implication: `attempt_count >= 9` implies `attempt_count >= 8`, so the planner
+-- keeps this index and merely reads a few extra entries it then filters.
+-- *Lowering* it is what breaks the proof, and the failure is silent and correct
+-- and slow, exactly as `0057` describes.
+-- `revival_does_not_walk_another_tenants_dead_letters` in
+-- `crates/store/src/outbox.rs` EXPLAINs the shipped statement — `REQUEUE_SQL`,
+-- the same lifting `CLAIM_SQL` got and for the same reason — and fails when the
+-- rows examined stop being this tenant's.
+
+create index if not exists outbox_events_tenant_parked_idx
+  on outbox_events (tenant_id)
+  where published_at is null and attempt_count >= 8;

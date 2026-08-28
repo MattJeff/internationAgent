@@ -963,19 +963,30 @@ pub async fn requeue_dead_letters(
     // simply burned its eight attempts against an unreachable provider — and
     // `starts_with(NULL, …)` is NULL, which under `NOT` would quietly exclude
     // every one of them. Those are the rows this function was written for.
-    let revived = sqlx::query(
-        "UPDATE outbox_events SET attempt_count = 0, available_at = $1 \
-         WHERE published_at IS NULL AND attempt_count >= $2::int \
-           AND NOT starts_with(coalesce(last_error, ''), $3)",
-    )
-    .bind(now)
-    .bind(MAX_ATTEMPTS)
-    .bind(UNREMEDIABLE)
-    .execute(&mut ***tx)
-    .await?;
+    let revived = sqlx::query(REQUEUE_SQL)
+        .bind(now)
+        .bind(MAX_ATTEMPTS)
+        .bind(UNREMEDIABLE)
+        .execute(&mut ***tx)
+        .await?;
 
     Ok(revived.rows_affected())
 }
+
+/// The statement [`requeue_dead_letters`] runs, lifted out of it so a test can
+/// `EXPLAIN` the bytes that actually ship rather than a second copy of them that
+/// is free to drift. [`CLAIM_SQL`] is the same lifting for the same reason.
+///
+/// **There is no `WHERE tenant_id` in it and there must not be**, which is what
+/// makes the index this reads a non-obvious one: the tenant qual is row-level
+/// security's, added to the plan rather than to the text, so anybody reading
+/// this string alone sees a whole-table update and anybody reading the plan sees
+/// a tenant-leading one. `migrations/0060_outbox_parked_by_tenant.sql` is that
+/// index, and `revival_does_not_walk_another_tenants_dead_letters` is the test
+/// this constant exists for.
+const REQUEUE_SQL: &str = "UPDATE outbox_events SET attempt_count = 0, available_at = $1 \
+                           WHERE published_at IS NULL AND attempt_count >= $2::int \
+                             AND NOT starts_with(coalesce(last_error, ''), $3)";
 
 #[cfg(test)]
 mod tests {
@@ -1287,6 +1298,93 @@ mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// **The other half of `attempt_count`, and `0057` took its index away.**
+    ///
+    /// [`requeue_dead_letters`] asks `attempt_count >= MAX_ATTEMPTS` — exactly
+    /// what `outbox_events_claimable_idx` excludes — inside a [`TenantTx`],
+    /// which is what makes it a *tenant-leading* read even though
+    /// [`REQUEUE_SQL`] contains no `tenant_id`: row-level security puts the qual
+    /// in the plan rather than in the text. `0057` dropped the only index that
+    /// led with `tenant_id`, so the fallback is `outbox_events_due_idx` — every
+    /// tenant's unpublished rows, with this tenant's filtered out of them.
+    ///
+    /// `0057` did look at this reader and measured it at 2.2 s unchanged, in the
+    /// shape where one tenant holds 100 000 of 100 100 rows and the statement
+    /// updates nearly everything it touches. The shape that runs is the other
+    /// one: `store::policy::activate` calls this on every `install_layer`, and
+    /// `POST /v1/companies` installs one per role — so the tenant doing it is
+    /// nearly always the one with **no** dead letters, and every row it examines
+    /// belongs to somebody else. Measured at 59 ms against 100 000 parked rows
+    /// owned by another tenant, against 0.10 ms before `0057`.
+    ///
+    /// So the assertion is the one that measures the complaint — rows read to
+    /// find this tenant's — and not an index name. It goes red three ways and
+    /// they are the three that matter: `0060`'s index missing, its predicate and
+    /// [`MAX_ATTEMPTS`] parting company so the planner drops it, and anybody
+    /// widening it back to `published_at IS NULL` alone.
+    ///
+    /// It EXPLAINs [`REQUEUE_SQL`] itself, not a copy, for
+    /// [`a_tenants_dead_letters_are_not_scanned_by_every_claim`]'s reason.
+    #[tokio::test]
+    async fn revival_does_not_walk_another_tenants_dead_letters() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+
+        /// Enough that walking them is unmistakable in the plan, few enough that
+        /// one INSERT is instant.
+        const PARKED: i64 = 5_000;
+
+        // The customer who never connected a model.
+        let noisy = seed_tenant(&db, "parked-noisy").await;
+        seed_parked(&db, noisy, PARKED, at(T0)).await;
+        // The customer being onboarded: live mail, no dead letters, and about to
+        // have a policy layer installed.
+        let onboarding = seed_tenant(&db, "parked-onboarding").await;
+        seed_due(&db, onboarding, 5, at(T0)).await;
+
+        // As the tenant, not as admin: the qual under test is RLS's, and
+        // `admin_tx_bypassing_rls` would remove the very thing being measured.
+        //
+        // ANALYZE runs the UPDATE for real, so this transaction is rolled back.
+        // `AssertSqlSafe`, and the audit is that both halves are compile-time
+        // constants of this module — a literal `EXPLAIN` prefix and
+        // [`REQUEUE_SQL`]. No value reaches the string.
+        let mut tx = db.tenant_tx(onboarding).await.expect("tenant tx");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {REQUEUE_SQL}"
+        )))
+        .bind(at(T0))
+        .bind(MAX_ATTEMPTS)
+        .bind(UNREMEDIABLE)
+        .fetch_all(&mut **tx)
+        .await
+        .expect("explain the revival");
+        tx.rollback().await.expect("rollback the explained revival");
+
+        let plan = plan.join("\n");
+        let discarded: i64 = plan
+            .split("Rows Removed by Filter: ")
+            .skip(1)
+            .map(|tail| {
+                tail.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("0")
+                    .parse::<i64>()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            discarded < PARKED / 10,
+            "reviving a tenant with no dead letters read {discarded} rows that \
+             are not its own; another tenant's {PARKED} parked rows are being \
+             walked on every `install_layer`. Plan:\n{plan}"
+        );
+
+        drop_tenant(&db, noisy).await;
+        drop_tenant(&db, onboarding).await;
     }
 
     // -- enqueue ----------------------------------------------------------
