@@ -1008,6 +1008,110 @@ UPDATE employee_resources
 Clearing the binding first loses the only pointer to the thing you are paying
 for. Do not.
 
+### The other kind of stuck: a send nobody got an answer to
+
+A stranded resource is something we are still **paying** for. An *unsettled
+send* is the other shape: a request that left this process and never came back
+with an answer, so nothing in this system can say whether a person received it.
+It is what the write-ahead row in `provider_intents` is written for.
+
+#### Finding them
+
+On the seat, and there is no list of its own — see
+`routes::employees::EmployeeView::unsettled_calls`:
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8090/v1/employees/$EMPLOYEE_ID" | jq .unsettled_calls
+```
+
+```json
+[
+  {
+    "intent_kind": "sms_send",
+    "provider": "telephony",
+    "idempotency_key": "employee:019905c2-…:step:effect:019905d1-…",
+    "started_at": "2026-08-29T04:11:07.881293Z"
+  }
+]
+```
+
+`[]` is the normal case. A request only appears once it has been outstanding for
+**five minutes** (`SETTLING`, in `routes::employees`), which is well past the
+60-second `REQUEST_TIMEOUT` every adapter builds its HTTP client with.
+
+Every seat at once, per tenant, in SQL:
+
+```sql
+SELECT employee_id, intent_kind, provider, idempotency_key, created_at
+FROM   provider_intents
+WHERE  state = 'in_flight' AND step IS NULL
+  AND  created_at < now() - interval '5 minutes'
+ORDER  BY created_at;
+```
+
+`step IS NULL` is the whole of what separates a send from a provisioning step.
+A stuck *step* has the machinery earlier in this section and is not this list.
+
+**Read this list as pessimistic: most rows on it are sends that never
+happened.** A row is left open by `ProviderError::Retryable`, and that class is
+dominated by requests that never reached the provider at all — a refused
+connection, a DNS failure, a 503 from an edge that forwarded nothing — beside
+the one member that genuinely is ambiguous, a read timeout after the bytes went
+out. Nothing on this side of the socket can tell them apart, so all of them are
+reported. **A row means *go and check*. It never means *this went out twice*.**
+
+#### Clearing one
+
+1. **Find out who it was to.** The key ends in the Policy Gate `decision_id`,
+   and that is the join:
+
+   ```sql
+   SELECT action_kind, payload ->> 'counterparty' AS recipient, occurred_at
+   FROM   audit_log
+   WHERE  decision_id = '<the uuid after `:effect:` in the key>';
+   ```
+
+   The recipient is deliberately not copied onto `provider_intents` — it is
+   already written once, under that tenant's RLS, and a second copy is the one
+   somebody forgets to redact.
+
+2. **Look for the message at the provider, by recipient and time.** Not by the
+   key: for `sms_send` and `whatsapp_send` the key never leaves this process
+   (`TwilioTelephony::create` keeps it in a process-local map; the Messages API
+   has no field to put it in), so the Twilio console is searched on `To` and the
+   `started_at` minute. This step is a human in a browser on purpose — there is
+   no API call this system could make instead, which is the entire reason the
+   row exists.
+
+3. **Close the row by hand with what you learned.** Nothing re-sends and nothing
+   retries; this is bookkeeping, and whether to send the message again is a
+   separate decision taken the normal way.
+
+```sql
+-- it did go out
+UPDATE provider_intents
+   SET state = 'succeeded', external_id = '<the provider''s own id>',
+       updated_at = now()
+ WHERE idempotency_key = '<key>' AND state = 'in_flight';
+
+-- it never left
+UPDATE provider_intents
+   SET state = 'failed', last_error = 'settled by hand: not at the provider',
+       updated_at = now()
+ WHERE idempotency_key = '<key>' AND state = 'in_flight';
+```
+
+Update, never `DELETE` — the same rule as an abandoned dead letter in §5. The
+row is the record that somebody looked.
+
+**Why this is written down at all.** A list that is never emptied stops being
+opened, and then the one row that mattered sits in it unread beside four hundred
+that did not. Nothing in the system will empty it: no loop reads
+`provider_intents` for sends, and there is deliberately no reaper here — a
+reaper would have to invent an answer, and inventing one is the failure this
+whole path was built to stop.
+
 ### The other kind of stuck: an overdue external wait
 
 A step in `pending_external` that never resolves (a rejected Twilio bundle looks

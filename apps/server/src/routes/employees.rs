@@ -182,11 +182,20 @@ struct EmployeeView<'a> {
     overdue: Vec<Step>,
     /// Provider requests this seat sent more than [`SETTLING`] ago and never
     /// learned the outcome of. Empty is the normal case; a non-empty list is
-    /// also somebody's morning, and a louder one — each entry is a message that
-    /// may or may not have reached a person, and **no API on any of these paths
-    /// can be asked which**. Somebody has to look in the provider's console.
+    /// also somebody's morning — each entry is a request this system can say
+    /// neither happened nor did not, and **no API on any of these paths can be
+    /// asked which**. Somebody has to look in the provider's console.
     ///
-    /// This is the reader half of `agentos_app::effects::SEND_UNSETTLED`. It is
+    /// **Read it as pessimistic, because it is.** The failure that leaves a row
+    /// here is `ProviderError::Retryable`, and most of that class never reached
+    /// the provider at all: a refused connection, a DNS failure and a 503 from
+    /// an edge that forwarded nothing all land in it, beside the one case that
+    /// really is ambiguous — a read timeout after the request bytes went out.
+    /// Nothing here can tell them apart, so it reports them all. A row means
+    /// *go and check*, never *this went out twice*.
+    ///
+    /// This is the reader half of the write-ahead fence
+    /// `agentos_app::effects::Effects::send_sms` documents. It is
     /// here rather than on a route of its own because this endpoint is already
     /// the one that "says what is actually true" about a seat, and a surface
     /// nobody visits would leave `provider_intents` exactly as unread as it was
@@ -475,8 +484,13 @@ const SETTLING: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 /// [`EmployeeView::unsettled_calls`].
 ///
 /// Its own transaction rather than [`load`]'s, and its own round trip: `load` is
-/// on every lifecycle write in this module and this read is only owed to the two
-/// handlers that render a whole employee.
+/// on every lifecycle write in this module and this read is owed only to the
+/// handler that renders a whole employee without writing one.
+///
+/// [`set_lifecycle`] deliberately does **not** call this. It has a transaction
+/// open already and calls [`provisioning::unsettled_calls`] inside it, so that
+/// a failed read fails the whole request instead of turning a committed
+/// termination into a 5xx.
 async fn unsettled(
     db: &Db,
     principal: &Principal,
@@ -597,13 +611,28 @@ async fn set_lifecycle(
         },
     )
     .await?;
+    // Read, not assumed empty, and read **before the commit** — in the same
+    // transaction as the lifecycle move it is being rendered beside.
+    //
+    // Read at all, because suspending a seat does not answer the requests it
+    // already sent and a terminated seat with an unsettled text is exactly the
+    // one somebody stops looking at. Not `Vec::new()` and not
+    // `.unwrap_or_default()`: an empty list is a *claim* — "this seat owes
+    // nobody a look" — and both of those spellings make it without having
+    // looked, on the one response an operator reads while ending a seat.
+    //
+    // Here rather than after `commit` because of what the failure costs, which
+    // is the smaller of the two things it could have cost and still worth
+    // moving. A pool that is exhausted for the two milliseconds after the
+    // commit never endangered the write — the termination is durable either
+    // way — it made the *answer* wrong: 5xx for something that happened, after
+    // which the natural retry gets `illegal_lifecycle`, which reads as "someone
+    // else terminated it". Inside the transaction the two agree again: an error
+    // means nothing was committed and the call is safe to repeat.
+    let unsettled = provisioning::unsettled_calls(&mut tx, id, now - SETTLING).await?;
     tx.commit().await?;
 
     tracing::info!(%id, %from, %to, "lifecycle changed");
-    // Read, not assumed empty. Suspending a seat does not answer the requests it
-    // already sent, and a terminated seat with an unsettled text is exactly the
-    // one somebody stops looking at.
-    let unsettled = unsettled(db, principal, id, now).await?;
     Ok(Json(EmployeeView::of(&employee, now, unsettled)).into_response())
 }
 
@@ -1661,6 +1690,39 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The same list on the response that **ends** the seat, which is the one
+        // an operator reads last and the one on which an empty array would be
+        // taken as final. `set_lifecycle` renders it from a real read inside its
+        // own transaction; a `Vec::new()` there, or an `unwrap_or_default()`
+        // over a read that failed, would answer `[]` here and this is what says
+        // so out loud.
+        let (status, ended) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{}/terminate", id.as_uuid()),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{ended}");
+        assert_eq!(ended["lifecycle"], json!("terminated"));
+        let calls = ended["unsettled_calls"]
+            .as_array()
+            .expect("the field is always an array");
+        assert_eq!(
+            calls.len(),
+            1,
+            "ending the seat does not answer the request it left in flight: {calls:?}"
+        );
+        assert!(
+            calls[0]["idempotency_key"]
+                .as_str()
+                .expect("a key")
+                .ends_with("effect:overdue"),
+            "and it is the same overdue row, bounded by the same grace: {calls:?}"
+        );
 
         h.teardown().await;
     }
