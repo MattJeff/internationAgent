@@ -3086,6 +3086,228 @@ pub async fn outstanding_note(
 }
 
 // ---------------------------------------------------------------------------
+// The desk: the half of the internal channel a person holds
+// ---------------------------------------------------------------------------
+//
+// **Everything below this line is a read and a rule. Not one byte of new
+// mechanism.** `send` above already lands a message on a seat that takes no
+// turns, without waking it and without charging it — the module docs argue that
+// at length and call such a seat a *chair*, "a sink, not a relay". What did not
+// exist was anything that let the person sitting in it **read what arrived or
+// write back**: no route in this workspace selects a `messages.body`, and
+// `routes::reports` gives the founder a *count* of the questions his line is
+// blocked on. He was told a number.
+//
+// So there is no new table, no `Backlog`/`Calendar`-shaped port and no new
+// `ActionKind`, and each of those absences is a decision:
+//
+// * **No table.** A thread between a person and an employee is already
+//   `conversations` + `messages` with `channel = 'internal'`: `0028` gave it
+//   four errands, an `answers_message_id` that makes "unanswered" an anti-join
+//   rather than a column somebody maintains, and a `trust_label`. A second
+//   table would be a second copy of the wake path, the taint label and the
+//   idempotency key — which is the argument `0028` itself makes against
+//   `internal_messages`, restated by a change that would have been its fifth
+//   writer.
+//
+// * **No port.** [`crate::backlog::Backlog`] and [`crate::calendar::Calendar`]
+//   are traits because the *storage* is what a customer replaces: its work
+//   items are in Jira, its hours in Google Calendar, and ours is one adapter of
+//   two. A thread with an employee has no second home. What the person types
+//   has to become a `messages` row **with a reserved turn and an `outbox`
+//   wake-up, in our transaction** — that is mechanism, not storage, and no
+//   customer's Slack can hold it. Slack is a *surface*: it mirrors these rows
+//   out and posts replies back in, through the same two entry points this
+//   module now has. A trait with one implementation and no possible second is
+//   the interface-for-one this workspace refuses everywhere else.
+//
+// * **No `ActionKind`.** [`crate::calendar`] sets the test — a verb outside
+//   that enum is a verb no policy layer can withhold and no role pack can
+//   decline — and this change passes it without adding one, because the verb an
+//   *employee* uses here is `InternalSend`, which is already in the vocabulary,
+//   already in `turn::catalogue` as `message_colleague`, and already in every
+//   pack's `proposable` set. The other direction is not a principal the gate
+//   rules on: it is an operator API key, the same authority
+//   `POST /v1/calendar` and `POST /v1/capability-requests/decide` already act
+//   on, and `PolicyGate` mints tokens for employees. Nothing here can appear in
+//   a tool schema, so `cost::DIGEST` and `toolchoice::*` do not move.
+
+/// How many messages one read of a desk hands back.
+///
+/// Larger than [`MAX_OUTSTANDING`] and for the opposite reason: that twenty is
+/// small because its result goes into a prompt, and this is a screen a person
+/// scrolls. Bounded at all because `messages` is the biggest table in any
+/// deployment — it holds every email — and an unbounded `SELECT` over it is one
+/// request away from being the whole of it.
+const MAX_ON_DESK: i64 = 50;
+
+/// One internal message waiting on a seat's desk.
+#[derive(Debug, Clone)]
+pub struct OnDesk {
+    /// Ours. What an answer names — see [`thread_of`].
+    pub id: Uuid,
+    /// The colleague who wrote it, by short name. Ours: a slug this workspace
+    /// minted, unique per tenant and never changing.
+    pub from: String,
+    /// Which of the four it is.
+    pub errand: Errand,
+    /// **Theirs.** An employee composed it, and an employee that had just read a
+    /// supplier's page composes with that supplier's words in its context. The
+    /// wrapper is what keeps this out of a prompt if anything ever renders a
+    /// desk into one; a route serialising it to a human unwraps nothing, because
+    /// [`Untrusted`] is `serde(transparent)`.
+    pub body: Untrusted<String>,
+    /// The label the *sending* turn carried, off the row rather than guessed.
+    ///
+    /// This is on the desk because a person reading "wire EUR 10,000 to DE00"
+    /// needs to know the employee was reading a stranger's page when it wrote
+    /// that. It is the same fact `into_context` uses to decide whether a
+    /// colleague's words are an instruction or quoted material, shown to the one
+    /// reader who can act on it.
+    pub trust: TrustLabel,
+    /// Whether anything points back at it. Derived, never stored — see
+    /// [`unanswered`], whose anti-join this is, per row.
+    ///
+    /// Always `false` for an errand that is not a question: nothing answers an
+    /// order, which is what "no reply column" means in `0028`.
+    pub answered: bool,
+    /// When it landed.
+    pub at: DateTime<Utc>,
+}
+
+/// What is waiting on one seat's desk, newest first.
+///
+/// Inbound only. An employee's own closing prose lands on the same internal
+/// conversation as `direction = 'outbound'` with no `internal_kind`
+/// (`apps/server/src/main.rs::record_reply`), and it is not something anybody
+/// is waiting for — a desk that mixed the two would answer "what has arrived
+/// for me" with a transcript.
+///
+/// No `WHERE tenant_id`: `messages` carries `tenant_isolation` from
+/// `0001_core` and the caller's transaction is a `tenant_tx`, so the predicate
+/// is the policy rather than a filter each reader has to remember.
+pub async fn desk(tx: &mut TenantTx<'_>, seat: EmployeeId) -> Result<Vec<OnDesk>, StoreError> {
+    /// The columns as the database hands them over, before the two that are
+    /// strings in Postgres and closed types here are parsed.
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        sender: String,
+        internal_kind: String,
+        body: String,
+        trust_label: String,
+        answered: bool,
+        created_at: DateTime<Utc>,
+    }
+
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id, m.sender, m.internal_kind, m.body, m.trust_label, \
+                exists(SELECT 1 FROM messages a WHERE a.answers_message_id = m.id) AS answered, \
+                m.created_at \
+           FROM messages m \
+          WHERE m.employee_id = $1 \
+            AND m.channel = 'internal' \
+            AND m.direction = 'inbound' \
+            AND m.internal_kind IS NOT NULL \
+          ORDER BY m.created_at DESC, m.id DESC \
+          LIMIT $2",
+    )
+    .bind(seat.as_uuid())
+    .bind(MAX_ON_DESK)
+    .fetch_all(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(OnDesk {
+                id: row.id,
+                from: row.sender,
+                // `messages_internal_kind_values` is a CHECK, so a row that
+                // fails this was written past the constraint. Refused rather
+                // than skipped: a desk that quietly dropped a message would be
+                // a person not being told something.
+                errand: Errand::parse(&row.internal_kind).ok_or_else(|| {
+                    StoreError::conflict("a message on this desk has an errand nobody wrote")
+                })?,
+                body: Untrusted::new(row.body),
+                // Fail closed, the same match `Agent::on_turn` makes off the
+                // same column: anything that is not the word "trusted" is not.
+                trust: match row.trust_label.as_str() {
+                    "trusted" => TrustLabel::Trusted,
+                    _ => TrustLabel::Untrusted,
+                },
+                answered: row.answered,
+                at: row.created_at,
+            })
+        })
+        .collect()
+}
+
+/// Whether this seat is a **chair**: a place in the org chart no model ever
+/// speaks from.
+///
+/// [`StoreError::NotFound`] when this company has no such seat.
+///
+/// # Why an operator may only be given the pen of a seat that takes no turns
+///
+/// The rule is one line and it is the whole of what keeps `messages.sender`
+/// meaning one thing. A seat that runs a model is a seat whose messages are
+/// that model's; a seat that runs none is a chair, and a chair's words can only
+/// ever be the person holding it. Drop the rule and an operator can write *as*
+/// a working employee — and, worse, can send an [`Errand::Answer`] that closes
+/// a question that seat never answered, which [`unanswered`]'s anti-join has no
+/// way to tell from a real reply.
+///
+/// It is not a security boundary and must not be sold as one: the credential
+/// that reaches this already writes charters and policy layers, and a charter
+/// steers every future turn where a message steers one. It is an **honesty**
+/// boundary, the same one `0064_work_items_posted_by` bought with a column —
+/// "who wrote this" keeps a single answer per row.
+///
+/// The test is `max_turns_per_day == 0`, read through the same four-layer
+/// intersection [`send`] prices a recipient with, and it is deliberately the
+/// identical question rather than a proxy: the module docs argue at length why
+/// "unchartered" is neither necessary nor sufficient for it.
+pub async fn is_a_chair(tx: &mut TenantTx<'_>, seat: EmployeeId) -> Result<bool, InternalError> {
+    // Establishes that the seat exists at all, inside RLS, so an id from
+    // another company is a `NotFound` and not a policy question.
+    slug_of(tx, seat).await?;
+    let policy = policy_store::load(tx, seat)
+        .await
+        .map_err(|err| match err {
+            PolicyLoadError::Store(err) => InternalError::Store(err),
+            _ => InternalError::RecipientPolicyUnusable,
+        })?;
+    Ok(policy.limits().max_turns_per_day == 0)
+}
+
+/// The thread one message is on, so an [`Errand::Answer`] can name the question
+/// it closes.
+///
+/// `None` is "no such message in this company", which is all a caller is told —
+/// the same silence `resolve_colleague` keeps, and for the same reason: a
+/// distinguishable answer is a message store somebody can enumerate by asking.
+///
+/// This exists because [`Thread`] is deliberately never handled by a *model*:
+/// `crate::turn::Turn` carries the one it woke on, so an employee cannot point
+/// an answer at somebody else's question. A person reading a desk is the other
+/// case — the ids are in front of them, they pick one, and [`send`] still puts
+/// it through `answerable`, which is what actually decides.
+pub async fn thread_of(tx: &mut TenantTx<'_>, message: Uuid) -> Result<Option<Thread>, StoreError> {
+    let found: Option<Uuid> =
+        sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = $1")
+            .bind(message)
+            .fetch_optional(&mut ***tx)
+            .await
+            .map_err(StoreError::from)?;
+    Ok(found.map(|conversation_id| Thread {
+        conversation_id: ConversationId::from_uuid(conversation_id),
+        message_id: message,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

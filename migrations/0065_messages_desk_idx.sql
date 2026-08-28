@@ -1,0 +1,76 @@
+-- 0065_messages_desk_idx: one seat's desk, read as a range scan instead of as
+-- every email the company ever received.
+--
+-- **There is no table here, and the absence is the design.** The third internal
+-- tool — a thread between a person and an employee — asked for one and did not
+-- need it: `conversations` + `messages` with `channel = 'internal'` already IS
+-- that thread. `0028_internal_channel.sql` gave it four errands, an
+-- `answers_message_id` that makes "unanswered" an anti-join rather than a column
+-- somebody maintains, and a `trust_label`; `crates/app/src/inbound.rs::send`
+-- already writes the row, reserves the recipient's turn and queues the wake-up
+-- in one transaction, and already **lands a message on a seat that takes no
+-- turns without waking it** — which is what a chair a person sits in is.
+--
+-- What was missing was a window and a pen, and both are HTTP:
+-- `GET /v1/employees/{id}/desk` reads what arrived, `POST` writes back from that
+-- seat. Neither needs a column. `0028`'s own argument against an
+-- `internal_messages` table is the argument against a `founder_threads` one, and
+-- this change would have been its fifth writer: a second table means a second
+-- copy of the wake path, a second outbox event type, a second handler, and a
+-- second place for the trust label to be forgotten.
+--
+-- ---------------------------------------------------------------------------
+-- SO WHY A MIGRATION AT ALL
+-- ---------------------------------------------------------------------------
+--
+-- Because of which table this is. `0061_work_items.sql` wrote a `ponytail:` note
+-- refusing a covering index for the board, on the grounds that "a board is a
+-- thing a human types into by hand" — and it is right, because `work_items`
+-- holds nothing but board rows.
+--
+-- `messages` is the opposite: it is the largest table in any deployment and it
+-- is dominated by **email**. The desk read is
+--
+--     WHERE employee_id = $1 AND channel = 'internal' AND direction = 'inbound'
+--     ORDER BY created_at DESC
+--
+-- and without this index that is a sequential scan of every message the company
+-- has ever exchanged with anybody, run on every load of the one screen a person
+-- keeps open. The two indexes `0028` added are partial on
+-- `internal_kind = 'question'` and on `answers_message_id`, which serve the
+-- anti-join and cannot serve this.
+--
+-- Partial, so it costs nothing on the email rows that are the overwhelming
+-- majority of this table — the same shape and the same argument as
+-- `messages_internal_questions_idx`. `created_at desc` because a desk is read
+-- newest first and `LIMIT 50`; with the ordering baked in, the read is a range
+-- scan of one seat's internal traffic and stops after fifty rows.
+--
+-- `direction` is in the predicate rather than left to the query. An employee's
+-- own closing prose lands on the same internal conversation as an outbound row
+-- with a NULL `internal_kind` (`apps/server/src/main.rs::record_reply`), and a
+-- desk deliberately does not show it — so those rows must not be in the index
+-- the desk scans either.
+--
+-- ---------------------------------------------------------------------------
+-- NO RLS STATEMENTS, AND THAT IS NOT AN OMISSION
+-- ---------------------------------------------------------------------------
+--
+-- `messages` has had row-level security since `0001_core`, and an index is not a
+-- new object a policy can be attached to — it inherits the table's, exactly as
+-- `0028` says its own two columns do. Every reader added by this change goes
+-- through `Db::tenant_tx`, so one company's desk is invisible to another's by
+-- the table's policy rather than by a `WHERE` clause a refactor can drop. Nothing
+-- here grants anything: `app_role`'s rights on `messages` are unchanged, which
+-- means this change cannot widen them.
+--
+-- And no DELETE question to answer, for the same reason. `0061` refused the verb
+-- for the board because a closed item is the evidence somebody asked for
+-- something; a message is that evidence with a stronger claim on it — it is what
+-- `unanswered` derives from, so deleting a question would silently stop an
+-- employee being reminded it is blocked. Nobody had to decide it here, because
+-- this change adds no grant and `messages` never had one.
+
+create index if not exists messages_desk_idx
+  on messages (employee_id, created_at desc)
+  where channel = 'internal' and direction = 'inbound';
