@@ -46,10 +46,19 @@
 //!
 //! Sequentially the bucket and the old aggregate agree exactly —
 //! [`tests::the_bucket_and_the_audit_aggregate_count_the_same_set`] walks the
-//! same sequence past both and compares them at every step — so the set this
-//! charges for is the set the gate always charged for. Where they differ, the
-//! bucket is the larger number, and it is larger by exactly the concurrent
+//! same sequence past both and compares them at every step. Where they differ,
+//! the bucket is the larger number, and it is larger by exactly the concurrent
 //! decisions the aggregate could not see.
+//!
+//! **Over sending actions.** The aggregate is the wider set and stays wider:
+//! `app::gate::counterparty` files an A2A peer under the same key, because the
+//! trail has to record who called, while `evaluate`'s A2A arm asks
+//! `allowed_a2a_peers` and never the ceiling. So the gate charges this ledger
+//! for the actions `domain::policy::spends_contact_budget` names — the ones the
+//! ceiling actually rules on — and a peer advances the aggregate alone. Charging
+//! it here as well was a refusal nobody wrote: on the shipped
+//! `max_new_contacts_per_day: 0` it closed the whole A2A endpoint, inbound
+//! included.
 //!
 //! # Which day
 //!

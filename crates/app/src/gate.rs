@@ -94,7 +94,7 @@ use agentos_domain::action::{Action, ActionCtx, Actor, ContactStanding};
 use agentos_domain::employee::Lifecycle;
 use agentos_domain::ids::{ApprovalId, DecisionId, EmployeeId, TenantId};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{Decision, DenyReason, SpendLimits, evaluate};
+use agentos_domain::policy::{Decision, DenyReason, SpendLimits, evaluate, spends_contact_budget};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
@@ -802,24 +802,42 @@ impl PolicyGate {
     /// [`agentos_store::turns`] and [`agentos_store::spend`] both reserve under
     /// a row lock, and this now does too.
     ///
-    /// # Which decisions are charged, and it is exactly the old set
+    /// # Which decisions are charged, and it is the set the *rule* refuses on
     ///
-    /// One slot when — and only when — this audit row is about to add a
-    /// counterparty the trail has never carried: [`counterparty`] answers
-    /// `Some` (so the row will land under [`COUNTERPARTY_KEY`] at all) and the
+    /// One slot when — and only when — [`spends_contact_budget`] says this
+    /// action's arm of `evaluate` consults `max_new_contacts_per_day`, and the
     /// standing read a moment ago said [`ContactStanding::New`] (so it is not
-    /// already in the aggregate). Those are the two conditions under which the
-    /// aggregate's `count(*)` would go up by one, so the bucket goes up by one
-    /// in the same cases and in no others. `agentos_store::outreach`'s
-    /// `the_bucket_and_the_audit_aggregate_count_the_same_set` walks a sequence
-    /// past both and compares them at every step.
+    /// already in the aggregate).
     ///
-    /// A payment is not an approach and never charges: [`counterparty`] is
-    /// `None` for it, and — this is the arm that would have been wrong —
-    /// [`Self::contacts`] reports `New` for an action with no counterparty at
-    /// all, because `bool_or(counterparty = NULL)` is NULL. Reserving on the
-    /// standing alone would have made every payment, every browse and every
-    /// message to a colleague spend one of the day's strangers.
+    /// **Not [`counterparty`], which is the wider set and was wrong here.** That
+    /// one answers what the audit row records, and it says `Some` for
+    /// [`Action::A2aSend`] — correctly: the trail has to know which peer called.
+    /// But `evaluate`'s A2A arm asks `allowed_a2a_peers` and never
+    /// `channel_rules`, so the ceiling has never ruled on a peer. Reserving on
+    /// "has a counterparty" therefore *invented* a refusal the policy does not
+    /// express, and on the shipped default — every role pack in `docs/` ships
+    /// `max_new_contacts_per_day: 0` — it refused every A2A call there is,
+    /// inbound ones included: `crate::a2a::GateInterceptor::before` authorises
+    /// each incoming call as an `Action::A2aSend`. The ledger behind a ceiling
+    /// may refuse where the ceiling refuses and nowhere else.
+    ///
+    /// A payment is not an approach and never charges, and neither does a browse
+    /// or a message to a colleague: [`Self::contacts`] reports `New` for an
+    /// action with no counterparty at all, because `bool_or(counterparty =
+    /// NULL)` is NULL, so reserving on the standing alone would have spent a
+    /// stranger on every one of them.
+    ///
+    /// # The bucket is therefore *narrower* than the aggregate, on purpose
+    ///
+    /// An A2A peer still advances the trail's `count(*)` — [`counterparty`] is
+    /// unchanged, so the aggregate the rule reads still counts it, exactly as it
+    /// did before this ledger existed. Taking it out of the aggregate as well
+    /// would hand the email budget a slot back, and that is a ceiling widening.
+    /// The two counters differ only where the bucket declines to refuse, which
+    /// leaves the stricter of the two saying the same thing it always said.
+    /// `agentos_store::outreach`'s
+    /// `the_bucket_and_the_audit_aggregate_count_the_same_set` walks the
+    /// sending actions past both and compares them at every step.
     ///
     /// # The aggregate is still what the rule reads
     ///
@@ -856,7 +874,7 @@ impl PolicyGate {
         policy: &agentos_domain::policy::EffectivePolicy,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
-        if standing != ContactStanding::New || counterparty(action).is_none() {
+        if standing != ContactStanding::New || !spends_contact_budget(action) {
             return Ok(Outcome::Allow { reservation: None });
         }
         match outreach::reserve(tx, principal.employee_id, now.date_naive(), policy, 1).await {
@@ -1093,10 +1111,18 @@ impl PolicyGate {
 /// Who an action addresses, as a stable string. `None` for actions that have
 /// no counterparty — a payment is not a contact.
 ///
-/// This function *is* the cold-outreach budget: [`PolicyGate::contacts`]
-/// aggregates the trail on the [`COUNTERPARTY_KEY`] it writes, so anything
-/// returning `Some` here spends `max_new_contacts_per_day` the first time it is
-/// allowed, and is measured against it forever after.
+/// This function is the cold-outreach budget's **counter**:
+/// [`PolicyGate::contacts`] aggregates the trail on the [`COUNTERPARTY_KEY`] it
+/// writes, so anything returning `Some` here advances `new_contacts_today` the
+/// first time it is allowed, and is measured against it forever after.
+///
+/// It is **not** the set the ceiling refuses on, and the difference cost a
+/// working A2A endpoint once. `evaluate`'s A2A arm asks `allowed_a2a_peers` and
+/// never `channel_rules`, so a peer counts here and is never ruled on — which is
+/// why [`PolicyGate::take_contact`] charges
+/// [`spends_contact_budget`](agentos_domain::policy::spends_contact_budget)'s
+/// narrower set and not this one. Widening either direction is a policy change:
+/// dropping a peer from this key would hand the email budget a slot back.
 fn counterparty(action: &Action) -> Option<String> {
     match action {
         Action::EmailSend { to } => Some(to.to_string()),
@@ -1976,6 +2002,78 @@ mod tests {
             Some(DenyReason::ContactBudgetExhausted.code())
         );
         assert_eq!(rows[before].2[COUNTERPARTY_KEY], json!("b@example.com"));
+    }
+
+    /// **The ledger must not refuse what the rule never measured.**
+    ///
+    /// [`counterparty`] answers `Some` for [`Action::A2aSend`] — a peer is a
+    /// counterparty and the trail says so — but `evaluate_rules`' A2A arm asks
+    /// `allowed_a2a_peers` and **never `channel_rules`**, so
+    /// `max_new_contacts_per_day` has never had an opinion about A2A. Charging
+    /// the bucket on `counterparty(action).is_some()` therefore invents a
+    /// refusal: `ContactBudgetError::NoBudget` on the shipped default of `0`,
+    /// and `Exhausted` once the day's email has spent it.
+    ///
+    /// It is not a hypothetical path. `a2a::GateInterceptor::before` authorises
+    /// every **inbound** call as `Action::A2aSend { peer }`, so on a policy that
+    /// grants peers and no cold outreach — which is every role pack in `docs/`,
+    /// all of which ship `max_new_contacts_per_day: 0` — the whole A2A endpoint
+    /// answers `unsupported_operation` to everybody.
+    #[tokio::test]
+    async fn a_peer_call_is_not_a_cold_approach_and_does_not_need_the_budget() {
+        let Some(db) = db().await else { return };
+        let peer = Action::A2aSend {
+            peer: agentos_domain::action::Domain::parse("partner.example").expect("domain"),
+        };
+        let peers = BTreeSet::from([
+            agentos_domain::action::Domain::parse("partner.example").expect("domain")
+        ]);
+
+        // 1. The shipped default: peers granted, cold outreach off. The rule
+        //    allows this call and the ledger must not take it back.
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_a2a_peers: peers.clone(),
+                max_new_contacts_per_day: 0,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+        gate.authorize(&principal, peer.clone())
+            .await
+            .expect("a peer on the allowlist is not a stranger this budget rules on");
+
+        // 2. And a budget the day's email has spent must not close the endpoint
+        //    either: `evaluate` allows the peer whatever `new_contacts_today`
+        //    says, so the reservation is the only thing that could refuse.
+        let other = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &other,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email]),
+                allowed_a2a_peers: peers,
+                max_new_contacts_per_day: 1,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+        gate.authorize(&other, email("a@example.com"))
+            .await
+            .expect("the day's one stranger");
+        gate.authorize(&other, peer)
+            .await
+            .expect("a peer call is not the day's second stranger");
+        assert_eq!(
+            strangers_today(&db, &other, Utc::now().date_naive()).await,
+            1,
+            "the bucket counts the set the ceiling rules on, and A2A is not in it"
+        );
     }
 
     /// What `outreach_buckets` says this employee has been cleared to reach.
