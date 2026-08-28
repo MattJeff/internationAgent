@@ -2526,6 +2526,7 @@ mod tests {
 
     use super::*;
     use crate::auth::ApiKeys;
+    use chrono::SubsecRound;
 
     /// Long enough for `ApiKeys::MIN_SECRET_LEN`, and distinct per tenant.
     const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -4506,7 +4507,13 @@ mod tests {
             "https://agentos.test",
         );
         let server = Slug::parse("gh-oauth").expect("slug");
-        let expires_at = Utc::now() + chrono::TimeDelta::hours(1);
+        // `timestamptz` holds microseconds, and the assertion below compares
+        // this instant against the one the refresh loop selects on after a
+        // round trip. macOS hands out a microsecond clock so nothing is lost;
+        // Linux hands out nanoseconds and the last three digits go. Three
+        // sibling tests carried this same defect and were green on every
+        // laptop for as long as they existed.
+        let expires_at = (Utc::now() + chrono::TimeDelta::hours(1)).trunc_subsecs(6);
         let sealed = oauth::Sealed {
             access: h
                 .credentials

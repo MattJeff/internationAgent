@@ -147,10 +147,14 @@ trap cleanup EXIT INT TERM
 # whole job is to produce one exact compiler error, and editing them fails
 # the comparison for a reason that has nothing to do with clocks.
 #
-# Anything that compares an instant against its own round trip goes red. That
-# sweep found exactly two in `agentos-store`; it has not been run on the other
-# crates, because CI stops at the first failing package and has never reached
-# them.
+# Anything that compares an instant against its own round trip goes red.
+#
+# **Run it one crate at a time.** A single failure stops the whole suite, so a
+# workspace-wide sweep reports the first crate and stays silent about the rest —
+# which is exactly how the first attempt concluded the class was closed after
+# covering four crates of six. Swept individually and to completion: two sites
+# in `agentos-store`, two in `agentos-app`, one in `agentos-server`, none in
+# `agentos-domain`, `agentos-providers` or `agentos-eval`. All five fixed.
 
 # --- guard: an applied migration is immutable, and only a long-lived database
 # can say so -------------------------------------------------------------------
