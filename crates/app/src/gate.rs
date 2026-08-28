@@ -94,7 +94,7 @@ use agentos_domain::action::{Action, ActionCtx, Actor, ContactStanding};
 use agentos_domain::employee::Lifecycle;
 use agentos_domain::ids::{ApprovalId, DecisionId, EmployeeId, TenantId};
 use agentos_domain::money::{Currency, Money};
-use agentos_domain::policy::{Decision, DenyReason, evaluate};
+use agentos_domain::policy::{Decision, DenyReason, SpendLimits, evaluate};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::approvals::{self, ApprovalError, NewApproval};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
@@ -680,8 +680,13 @@ impl PolicyGate {
         match evaluate(&policy, action, &ctx) {
             Decision::Allow => match action {
                 // 5. A permitted payment consumes the headroom it was measured
-                //    against, here, before the caller can be told yes.
-                Action::PaymentCreate { amount } => self.reserve(tx, principal, *amount, now).await,
+                //    against, here, before the caller can be told yes — and the
+                //    day's ceiling is re-compared under the lock that takes it,
+                //    because the one at step 4 was read without one.
+                Action::PaymentCreate { amount } => {
+                    let day_cap = policy.limits().spend.map(SpendLimits::max_per_day);
+                    self.reserve(tx, principal, *amount, day_cap, now).await
+                }
                 _ => Ok(Outcome::Allow { reservation: None }),
             },
             Decision::Deny { reason } => Ok(Outcome::Deny(reason)),
@@ -825,11 +830,30 @@ impl PolicyGate {
     /// been written yet, and "every outcome is audited" is not negotiable — so
     /// it rolls back to a savepoint instead. The reservation vanishes, the
     /// ruling is still recorded, and one commit still covers both.
+    ///
+    /// # And why the day's policy cap is asked twice
+    ///
+    /// `day_cap` is the `max_per_day` the ruling was made against, re-compared
+    /// here — because the *first* comparison was made on [`Self::spent_today`],
+    /// which is a bare `SELECT` and therefore takes no lock. Two payments
+    /// decided at the same instant read the same headroom and both spend it,
+    /// and the ledger does not catch it: `spend_caps.daily_total_minor` is a
+    /// different number, written by `PUT /v1/employees/{id}/spend-caps`, and a
+    /// deployment whose ledger cap is the looser of the two crosses the policy's
+    /// day ceiling with nothing failing. `org::reserve` has just taken the
+    /// bucket row lock, so re-asking under it is the same question with a
+    /// serialisable answer, and it costs one indexed row read on the allow path.
+    ///
+    /// `None` on the redemption path, which deliberately does not re-read the
+    /// policy at all — see [`Self::redeem_approval`]. That path has never
+    /// enforced `max_per_day`, and teaching it to is a policy change rather than
+    /// a race fix.
     async fn reserve(
         &self,
         tx: &mut TenantTx<'_>,
         principal: &Principal,
         amount: Money,
+        day_cap: Option<Money>,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
         sqlx::query("SAVEPOINT gate_reservation")
@@ -840,13 +864,27 @@ impl PolicyGate {
         let refused = match org::reserve(tx, principal.employee_id, now.date_naive(), amount).await
         {
             Ok(reservation) => {
-                sqlx::query("RELEASE SAVEPOINT gate_reservation")
-                    .execute(&mut ***tx)
-                    .await
-                    .map_err(|e| Denied::Unavailable(e.into()))?;
-                return Ok(Outcome::Allow {
-                    reservation: Some(reservation),
-                });
+                // The same read as step 3, now under the lock and including this
+                // transaction's own increment.
+                let over = match (
+                    day_cap,
+                    self.spent_today(tx, principal, amount.currency(), now)
+                        .await?,
+                ) {
+                    (Some(cap), Some(total)) => total.minor() > cap.minor(),
+                    _ => false,
+                };
+                if over {
+                    DenyReason::DailyLimit
+                } else {
+                    sqlx::query("RELEASE SAVEPOINT gate_reservation")
+                        .execute(&mut ***tx)
+                        .await
+                        .map_err(|e| Denied::Unavailable(e.into()))?;
+                    return Ok(Outcome::Allow {
+                        reservation: Some(reservation),
+                    });
+                }
             }
             Err(
                 TeamSpendRefused::Store(err) | TeamSpendRefused::Employee(CapExceeded::Store(err)),
@@ -932,7 +970,13 @@ impl PolicyGate {
                 // ledger cap still applies, and burning the approval on a
                 // refusal is deliberate — the next attempt needs a fresh human
                 // decision rather than a retry loop against the cap.
-                Action::PaymentCreate { amount } => self.reserve(tx, principal, *amount, now).await,
+                //
+                // `None`: no policy was loaded on this path and that is the
+                // documented choice above, so there is no `max_per_day` to
+                // re-compare. Named rather than defaulted.
+                Action::PaymentCreate { amount } => {
+                    self.reserve(tx, principal, *amount, None, now).await
+                }
                 _ => Ok(Outcome::Allow { reservation: None }),
             },
             Err(ApprovalError::ActionMismatch { .. }) => {
@@ -1357,21 +1401,47 @@ mod tests {
         spent
     }
 
-    /// How many backends are stuck on a lock inside a statement that touches
-    /// `spend_buckets` — which is how the concurrency test below knows a
-    /// decision is genuinely mid-flight rather than merely slow.
+    /// The backend behind a transaction, so a test can name the thing it is
+    /// deliberately holding.
+    async fn backend_pid(tx: &mut TenantTx<'_>) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut ***tx)
+            .await
+            .expect("read the backend pid")
+    }
+
+    /// How many backends are queued behind `blocker` — which is how the
+    /// concurrency tests below know a decision is genuinely mid-flight rather
+    /// than merely slow.
+    ///
+    /// Keyed on the blocking pid rather than on the query text, and that is not
+    /// tidiness: **two tests in this module hold a `spend_buckets` row at the
+    /// same time**, in the same database, because `scripts/test.sh` gives one
+    /// database per package and not per test. A predicate that counted
+    /// *anybody's* waiter would let each of them end its wait on the other's
+    /// decision, release its hold early, and assert against a decision that had
+    /// not reached the ledger yet.
+    ///
+    /// Recursive, and that is the whole reason this is not a one-liner:
+    /// `pg_blocking_pids` reports the sessions *directly* ahead of a waiter, and
+    /// a second waiter for the same row queues on the first waiter's tuple lock
+    /// rather than on the holder. Asking only about direct blockers counts one
+    /// where there are two, forever — which is a twenty-second timeout, not a
+    /// wrong answer, but only because the deadline is there.
     ///
     /// Asked through an admin transaction on purpose: `pg_stat_activity` hides
-    /// other sessions' `query` text from a non-superuser, and `tenant_tx` runs
-    /// as `app_role`.
-    async fn waiting_on_a_bucket(db: &Db) -> i64 {
+    /// other sessions from a non-superuser, and `tenant_tx` runs as `app_role`.
+    async fn blocked_by(db: &Db, blocker: i32) -> i64 {
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-              WHERE datname = current_database() \
-                AND wait_event_type = 'Lock' \
-                AND query ILIKE '%spend_buckets%'",
+            "WITH RECURSIVE queued(pid) AS ( \
+                 SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+               UNION \
+                 SELECT a.pid FROM pg_stat_activity a \
+                   JOIN queued q ON q.pid = ANY(pg_blocking_pids(a.pid))) \
+             SELECT count(*) FROM queued",
         )
+        .bind(blocker)
         .fetch_one(&mut *tx)
         .await
         .expect("read pg_stat_activity");
@@ -2069,6 +2139,7 @@ mod tests {
             .expect("inside every cap");
 
         let mut holder = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let blocker = backend_pid(&mut holder).await;
         sqlx::query(
             "SELECT reserved_minor FROM spend_buckets \
               WHERE employee_id = $1 AND day = $2 AND currency = 'EUR' FOR UPDATE",
@@ -2089,7 +2160,7 @@ mod tests {
         // slow — a green result from a decision that never started proves
         // nothing.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while waiting_on_a_bucket(&db).await == 0 {
+        while blocked_by(&db, blocker).await == 0 {
             assert!(
                 Instant::now() < deadline,
                 "the decision never reached the ledger"
@@ -2144,6 +2215,102 @@ mod tests {
             .await
             .expect_err("the new cap is 1_000");
         assert_eq!(err.code(), DenyReason::PerTransactionLimit.code());
+    }
+
+    /// Two payments that are each legal on their own do not become legal
+    /// together because they were decided at the same time.
+    ///
+    /// The policy's `max_per_day` and the ledger's `spend_caps.daily_total` are
+    /// **two different numbers**, written on two different screens: the first
+    /// comes out of the four policy layers, the second out of
+    /// `PUT /v1/employees/{id}/spend-caps`. `spend::reserve` compares against
+    /// the second under a row lock, and until this test the first was compared
+    /// against a bare `SELECT` — which takes no lock, so two decisions read the
+    /// same headroom and both spent it. Here the ledger's cap is deliberately
+    /// enormous, so it can refuse nothing and the only ceiling in play is the
+    /// policy's €300.
+    ///
+    /// Arranged rather than raced, exactly like the test above: a third
+    /// transaction holds the bucket row, both decisions read their headroom
+    /// (that read does *not* block — it is the defect), both then queue on the
+    /// reservation, and the hold is released once both are demonstrably there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_payments_decided_at_once_cannot_cross_the_policy_s_day_cap() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        // A ledger that will never be the refusal: 10_000 against a daily total
+        // of 1_000_000 leaves the policy's 30_000 as the only ceiling.
+        give_caps(&db, &principal, 1_000_000, 50_000).await;
+        let gate = gate(&db, &principal).await;
+
+        // €100 of the day's €300, and a bucket row to hold.
+        gate.authorize(&principal, payment(10_000))
+            .await
+            .expect("inside every cap");
+
+        let mut holder = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let blocker = backend_pid(&mut holder).await;
+        sqlx::query(
+            "SELECT reserved_minor FROM spend_buckets \
+              WHERE employee_id = $1 AND day = $2 AND currency = 'EUR' FOR UPDATE",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .bind(Utc::now().date_naive())
+        .fetch_one(&mut **holder)
+        .await
+        .expect("hold the bucket");
+
+        // Each of these is 10_000 + 15_000 = 25_000, under the day's 30_000.
+        // Both is 40_000, over it.
+        let in_flight: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                let principal = principal.clone();
+                tokio::spawn(async move { gate.authorize(&principal, payment(15_000)).await })
+            })
+            .collect();
+
+        // Both are genuinely queued on the bucket, which means both have
+        // already read the headroom they were measured against.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while blocked_by(&db, blocker).await < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "both decisions never reached the ledger together"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        holder.rollback().await.expect("release the bucket");
+
+        let mut allowed = 0;
+        for task in in_flight {
+            match task.await.expect("join") {
+                Ok(token) => {
+                    allowed += 1;
+                    assert_eq!(
+                        token.reservation().expect("reserved").amount().minor(),
+                        15_000
+                    );
+                }
+                Err(err) => assert_eq!(
+                    err.code(),
+                    DenyReason::DailyLimit.code(),
+                    "the day's ceiling is the only thing that can refuse this"
+                ),
+            }
+        }
+
+        assert_eq!(
+            allowed, 1,
+            "both payments were allowed: the day's policy cap was decided on a \
+             read that takes no lock"
+        );
+        assert_eq!(
+            reserved_today(&db, &principal).await,
+            25_000,
+            "the bucket is over the policy's max_per_day of 30_000"
+        );
+        assert_eq!(reservation_count(&db, &principal).await, 2);
     }
 
     #[test]

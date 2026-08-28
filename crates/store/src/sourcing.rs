@@ -386,10 +386,16 @@ pub struct OpenRfq {
 /// nobody has answered" is whether an open `rfqs` row exists. The buyer reads
 /// this before deciding, and an employee that has one is past asking.
 ///
-/// One row, not all of them: an employee runs one objective, and the plan
-/// `RolePack::plan` recomputes is that objective's. A second open round for the
-/// same employee is an operator having re-chartered mid-round, and the newest
-/// is the one the current objective belongs to.
+/// One row, and now there can only be one: `rfqs_one_open_round_per_employee_idx`
+/// in `0056` is a partial unique index on exactly this predicate. It has to be,
+/// because *this read cannot enforce it*. `app::vertical::purchasing_turn` runs
+/// it in a transaction it rolls back before the mail run and writes the `rfqs`
+/// row in a later one, so two concurrent turns of one employee both read "no
+/// round" and both opened one — and the second hid every quote the first was
+/// answered with, because this returns the newest and `Material::read` reads
+/// nothing else. The `LIMIT 1` stays: it is what makes the row optional, and
+/// `employee_id` is nullable so a round that outlived its employee is exempt
+/// from the index by construction.
 pub async fn open_rfq(
     tx: &mut TenantTx<'_>,
     employee_id: EmployeeId,
