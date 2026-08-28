@@ -216,6 +216,15 @@ pub struct NewEvent {
     /// W3C `traceparent` of the transaction that produced the event, so the
     /// asynchronous handler continues the caller's trace rather than starting
     /// an orphan one.
+    ///
+    /// **Nothing in production sets it.** It is `Some` at two call sites in the
+    /// workspace, both in this module's own tests; every enqueue that ships
+    /// leaves it `None`, because no request handler extracts the header and
+    /// there is no `opentelemetry` dependency to give the value meaning. Said
+    /// here because a reader downstream may not — `apps/server`'s provisioning
+    /// loop spent one sequential scan of this table per claimed row, five times
+    /// a second, reading a key that is never written. This is the slot to fill
+    /// when a trace context becomes real; it is not evidence that one is.
     pub traceparent: Option<String>,
 }
 

@@ -56,9 +56,10 @@
 //! `allowed_a2a_peers` and never the ceiling. So the gate charges this ledger
 //! for the actions `domain::policy::spends_contact_budget` names — the ones the
 //! ceiling actually rules on — and a peer advances the aggregate alone. Charging
-//! it here as well was a refusal nobody wrote: on the shipped
-//! `max_new_contacts_per_day: 0` it closed the whole A2A endpoint, inbound
-//! included.
+//! it here as well was a refusal nobody wrote: it closed the whole A2A
+//! endpoint, inbound included — outright on the two role packs that ship
+//! `max_new_contacts_per_day: 0`, and partway through the day on the three that
+//! ship `5`, `5` and `20`.
 //!
 //! # Which day
 //!
@@ -93,9 +94,14 @@ use crate::db::{StoreError, TenantTx};
 #[derive(Debug, Error)]
 pub enum ContactBudgetError {
     /// The intersected policy allows this employee no cold outreach at all.
-    /// Fails closed by design — `PolicyLimits::default()` is zero, and every
-    /// role pack in `docs/` ships zero, so cold outreach is something an
-    /// operator turns on rather than something a deployment starts with.
+    /// Fails closed by design — `PolicyLimits::default()` is zero, so cold
+    /// outreach is something an operator turns on rather than something a
+    /// deployment starts with.
+    ///
+    /// This used to add "and every role pack in `docs/` ships zero", which is
+    /// not true of any version of this tree: two of the five do (`direction`,
+    /// `growth`), two ship `5` and one ships `20`. The default is what fails
+    /// closed; the packs are an operator's answer and they vary.
     #[error("no contact budget: the effective policy allows 0 new contacts per day")]
     NoBudget,
 
