@@ -431,8 +431,22 @@ pub async fn gone_quiet(
 }
 
 // ---------------------------------------------------------------------------
-// Beliefs
+// Beliefs — NOT WIRED
 // ---------------------------------------------------------------------------
+//
+// Nothing outside `#[cfg(test)]` calls [`consolidate_belief`] or
+// [`beliefs_about`], and `psyche_beliefs` / `psyche_belief_episodes` are
+// therefore tables nothing writes. That is a decision rather than an oversight
+// and the argument is written down once, in `agentos_app::psyche`'s closing
+// section: the only subject with three concordant episodes in this product is
+// "slow to answer", which is the expectation restated, and a belief that adds
+// no information is a second place for the same fact to be wrong.
+//
+// Kept because the genealogy is the expensive half and it is correct: the
+// deferred trigger that refuses a belief with no founding episodes is what
+// makes "why do you open 12% below their ask?" answerable eighteen months
+// later. Wire this the day an employee observes something that is *not* a
+// restatement — a lead time missed, a spec substituted.
 
 /// MPCP's `croyance`: what repeated episodes of one polarity consolidated into.
 #[derive(Debug, Clone, PartialEq)]
@@ -619,8 +633,19 @@ pub async fn beliefs_about(
 }
 
 // ---------------------------------------------------------------------------
-// Expectations
+// Expectations — NOT WIRED
 // ---------------------------------------------------------------------------
+//
+// Nothing outside `#[cfg(test)]` calls [`save_expectation`] or
+// [`expectations_about`]; `psyche_expectations` is a table nothing writes. The
+// argument is in `agentos_app::psyche`'s closing section and it is about units,
+// not about effort: this schema is MPCP's *sign-valued* model — `expectation`
+// is CHECKed to `[-1, 1]` and the Welford runs over `|surprise|` — while the
+// domain ships the magnitude-valued replacement `docs/PSYCHE_PORT.md` §5.2
+// argues for, whose expectation is in hours. "23 hours" does not fit
+// `[-1, 1]`, so writing here would mean either a lie about the units or a
+// migration. The app folds the episodes instead, which costs neither and
+// cannot disagree with the log it came from.
 
 /// MPCP's `attente` (Rescorla-Wagner) plus its `precision` (Welford), for one
 /// `(counterparty, dimension)`.

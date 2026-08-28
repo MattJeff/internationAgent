@@ -1,8 +1,8 @@
 //! Persistence for the shared number pool: `0010_phone_pool.sql` in Rust.
 //!
 //! The schema comment is the design document — read it first. What this module
-//! adds is the two operations that have to be atomic and the two lookups that
-//! decide who an inbound message reaches.
+//! adds is the two operations that have to be atomic: claiming a seat and
+//! giving it back.
 //!
 //! # Why `allocate_atomic` is one statement
 //!
@@ -20,17 +20,21 @@
 //! cached counter here would be a second copy of a fact that can only ever
 //! disagree with the first.
 //!
-//! # Inbound routing
+//! # Inbound routing is not here, and `counterparty_affinity` is dead
 //!
-//! [`resolve_inbound`] is the whole rule: affinity first, longest-standing
-//! live allocation second. Both are total orders over immutable columns, so
-//! the same inbound message routes to the same employee every time, on every
-//! replica. Nothing here is decided by row order.
+//! This module used to own the routing too — `resolve_inbound` (affinity
+//! first, longest-standing live allocation second) and `touch_affinity`
+//! (upsert into `counterparty_affinity`, return the incumbent). Nothing outside
+//! `#[cfg(test)]` ever called either of them. The rule that ships is
+//! `agentos_app::inbound::resolve_phone_recipient`, one `ORDER BY` over
+//! `employee_resources` joined to `conversations`, and it reads the affinity
+//! off the `conversations` row the landing transaction has already written —
+//! which is why the second table never got a writer.
 //!
-//! [`touch_affinity`] returns the *incumbent*, which is not necessarily the
-//! employee you passed in. That is the arbitration rule and it is the primary
-//! key doing the work: whoever spoke to the counterparty first on that number
-//! keeps them.
+//! **`counterparty_affinity` (`0010_phone_pool.sql`) is therefore a table
+//! nothing writes and nothing reads.** An applied migration is immutable, so
+//! it is still there; do not build on it. The affinity is
+//! `conversations.(employee_id, channel, external_ref)`.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -161,6 +165,24 @@ pub async fn register(
 /// drained before release.
 ///
 /// [`StoreError::NotFound`] when no such number is visible to this tenant.
+///
+/// # NOT WIRED — nothing outside `#[cfg(test)]` calls this
+///
+/// [`register`]'s `ON CONFLICT (tenant_id, e164) DO UPDATE SET state = …` is
+/// the transition that ships: `POST /v1/pool/numbers` with a number already in
+/// the pool is how `pending_regulatory` becomes `active` when the bundle
+/// clears, which is one endpoint for "the operator writes the number down
+/// again" instead of two. This `UPDATE` is the older, narrower way to say the
+/// same thing and it lost.
+///
+/// It is kept rather than deleted for one reason, and the reason is a gap
+/// rather than a plan: that endpoint accepts only `active` and
+/// `pending_regulatory`, so **nothing in this workspace can put a number into
+/// `suspended` or `released`.** `pool_ops::numbers` filters out `released` and
+/// `allocate_atomic` takes only `active`; both are guards on a value no writer
+/// here produces. Draining a number before giving it back is the operation
+/// that is missing, and this is the statement it will need. Wire it, or delete
+/// both it and the two states — do not leave a third writer.
 pub async fn set_state(
     tx: &mut TenantTx<'_>,
     number_id: Uuid,
@@ -326,88 +348,6 @@ pub async fn release(
     .bind(now)
     .fetch_optional(&mut ***tx)
     .await?)
-}
-
-// ---------------------------------------------------------------------------
-// Affinity and inbound routing
-// ---------------------------------------------------------------------------
-
-/// Record that `counterparty` spoke to `employee` on `number_id`, and return
-/// **whoever actually owns that counterparty on that number**.
-///
-/// The returned id is the incumbent, which differs from `employee` exactly
-/// when someone else got there first. Callers must route on the return value,
-/// not on what they passed in: that is the arbitration rule, and the primary
-/// key on `(tenant, number, counterparty)` is what enforces it. A later
-/// contact only advances `last_seen`.
-pub async fn touch_affinity(
-    tx: &mut TenantTx<'_>,
-    number_id: Uuid,
-    counterparty: &str,
-    employee: EmployeeId,
-    now: DateTime<Utc>,
-) -> Result<EmployeeId, StoreError> {
-    let held: Uuid = sqlx::query_scalar(
-        "INSERT INTO counterparty_affinity \
-             (tenant_id, number_id, counterparty, employee_id, first_seen, last_seen) \
-         VALUES ($1, $2, $3, $4, $5, $5) \
-         ON CONFLICT (tenant_id, number_id, counterparty) DO UPDATE \
-             SET last_seen = greatest(counterparty_affinity.last_seen, excluded.last_seen) \
-         RETURNING employee_id",
-    )
-    .bind(tx.tenant_id().as_uuid())
-    .bind(number_id)
-    .bind(counterparty)
-    .bind(employee.as_uuid())
-    .bind(now)
-    .fetch_one(&mut ***tx)
-    .await?;
-    Ok(EmployeeId::from_uuid(held))
-}
-
-/// Who an inbound message to `number` from `counterparty` belongs to.
-///
-/// 1. The incumbent, if this counterparty has used this number before. A
-///    supplier who has been dealing with Lena keeps reaching Lena, because
-///    Lena is where the trust links, expectations and dated beliefs about that
-///    supplier live and a colleague has none of them.
-/// 2. Otherwise the longest-standing live allocation on the number, ordered by
-///    `(allocated_at, employee_id)` — both immutable, so first contact is
-///    deterministic rather than "whichever row came back first".
-///
-/// `None` means the number is not ours or nobody is allocated to it; the
-/// caller decides whether that is a 404 or a human's problem.
-pub async fn resolve_inbound(
-    tx: &mut TenantTx<'_>,
-    number: &E164,
-    counterparty: &str,
-) -> Result<Option<EmployeeId>, StoreError> {
-    // RLS scopes both queries to the tenant; there is no tenant predicate to
-    // forget here because there is no way to run them outside `tenant_tx`.
-    let incumbent: Option<Uuid> = sqlx::query_scalar(
-        "SELECT c.employee_id FROM counterparty_affinity c \
-         JOIN phone_numbers n ON n.id = c.number_id \
-         WHERE n.e164 = $1 AND c.counterparty = $2",
-    )
-    .bind(number.as_str())
-    .bind(counterparty)
-    .fetch_optional(&mut ***tx)
-    .await?;
-    if let Some(id) = incumbent {
-        return Ok(Some(EmployeeId::from_uuid(id)));
-    }
-
-    let first_contact: Option<Uuid> = sqlx::query_scalar(
-        "SELECT a.employee_id FROM number_allocations a \
-         JOIN phone_numbers n ON n.id = a.number_id \
-         WHERE n.e164 = $1 AND a.released_at IS NULL \
-         ORDER BY a.allocated_at, a.employee_id \
-         LIMIT 1",
-    )
-    .bind(number.as_str())
-    .fetch_optional(&mut ***tx)
-    .await?;
-    Ok(first_contact.map(EmployeeId::from_uuid))
 }
 
 #[cfg(test)]
@@ -689,130 +629,6 @@ mod tests {
         drop_tenant(&db, tenant).await;
     }
 
-    // -- routing -----------------------------------------------------------
-
-    #[tokio::test]
-    async fn inbound_prefers_affinity_then_the_oldest_allocation() {
-        let Some(db) = db().await else { return };
-        let (tenant, staff) = seed(&db, "route", &["lena", "alex"]).await;
-        let shared = E164::parse("+33555555555").expect("e164");
-        let number = add_number(&db, tenant, &pooled("+33555555555", 5)).await;
-
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let lena = allocate_atomic(&mut tx, staff[0], FR, Utc::now())
-            .await
-            .expect("allocate")
-            .expect("seat");
-        allocate_atomic(&mut tx, staff[1], FR, Utc::now())
-            .await
-            .expect("allocate")
-            .expect("seat");
-        assert_eq!(lena.number_id, number);
-
-        // First contact from an unknown supplier: the longest-standing
-        // allocation, which is Lena.
-        assert_eq!(
-            resolve_inbound(&mut tx, &shared, "supplier-x")
-                .await
-                .expect("resolve"),
-            Some(staff[0])
-        );
-
-        // Alex answers a different supplier and becomes its incumbent.
-        let held = touch_affinity(&mut tx, number, "supplier-y", staff[1], Utc::now())
-            .await
-            .expect("affinity");
-        assert_eq!(held, staff[1]);
-        assert_eq!(
-            resolve_inbound(&mut tx, &shared, "supplier-y")
-                .await
-                .expect("resolve"),
-            Some(staff[1]),
-            "affinity must beat the first-contact rule"
-        );
-
-        // Lena tries to take supplier-y over. The incumbent wins, and says so.
-        let held = touch_affinity(&mut tx, number, "supplier-y", staff[0], Utc::now())
-            .await
-            .expect("affinity");
-        assert_eq!(held, staff[1], "whoever spoke first keeps the counterparty");
-        assert_eq!(
-            resolve_inbound(&mut tx, &shared, "supplier-y")
-                .await
-                .expect("resolve"),
-            Some(staff[1])
-        );
-
-        // A number nobody owns routes nowhere.
-        assert_eq!(
-            resolve_inbound(
-                &mut tx,
-                &E164::parse("+33999999999").expect("e164"),
-                "supplier-x"
-            )
-            .await
-            .expect("resolve"),
-            None
-        );
-        tx.commit().await.expect("commit");
-
-        drop_tenant(&db, tenant).await;
-    }
-
-    #[tokio::test]
-    async fn affinity_survives_reallocation_to_another_number() {
-        let Some(db) = db().await else { return };
-        let (tenant, staff) = seed(&db, "moved", &["lena"]).await;
-        let old = E164::parse("+33666666666").expect("e164");
-        let old_id = add_number(&db, tenant, &pooled("+33666666666", 1)).await;
-        add_number(&db, tenant, &pooled("+33777777777", 1)).await;
-
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let seat = allocate_atomic(&mut tx, staff[0], FR, Utc::now())
-            .await
-            .expect("allocate")
-            .expect("seat");
-        assert_eq!(seat.number_id, old_id);
-        touch_affinity(&mut tx, old_id, "supplier-z", staff[0], Utc::now())
-            .await
-            .expect("affinity");
-
-        // Move Lena to the other number: release, take the old one out of the
-        // pool, allocate again.
-        release(&mut tx, staff[0], FR, Utc::now())
-            .await
-            .expect("release")
-            .expect("freed");
-        set_state(&mut tx, old_id, NumberState::Suspended, Utc::now())
-            .await
-            .expect("suspend");
-        let moved = allocate_atomic(&mut tx, staff[0], FR, Utc::now())
-            .await
-            .expect("allocate")
-            .expect("new seat");
-        assert_eq!(moved.e164.as_str(), "+33777777777");
-
-        // The supplier who knows the old number still reaches Lena, even
-        // though nobody is allocated to that number any more.
-        assert_eq!(
-            resolve_inbound(&mut tx, &old, "supplier-z")
-                .await
-                .expect("resolve"),
-            Some(staff[0]),
-            "affinity is the relationship memory; re-allocation must not erase it"
-        );
-        // ...and without affinity that same number routes nowhere.
-        assert_eq!(
-            resolve_inbound(&mut tx, &old, "supplier-unknown")
-                .await
-                .expect("resolve"),
-            None
-        );
-        tx.commit().await.expect("commit");
-
-        drop_tenant(&db, tenant).await;
-    }
-
     // -- isolation ---------------------------------------------------------
 
     #[tokio::test]
@@ -820,8 +636,6 @@ mod tests {
         let Some(db) = db().await else { return };
         let (a, a_staff) = seed(&db, "iso-a", &["lena"]).await;
         let (b, _) = seed(&db, "iso-b", &["alex"]).await;
-        let shared = E164::parse("+33888888888").expect("e164");
-
         let a_pooled = pooled("+33888888888", 2);
         let a_number = add_number(&db, a, &a_pooled).await;
         let mut tx = db.tenant_tx(a).await.expect("tx");
@@ -829,9 +643,21 @@ mod tests {
             .await
             .expect("allocate")
             .expect("seat");
-        touch_affinity(&mut tx, a_number, "supplier-a", a_staff[0], Utc::now())
-            .await
-            .expect("affinity");
+        // Raw, because no Rust in this workspace writes this table any more —
+        // see the module header. The row still has to exist for the count below
+        // to be evidence of RLS rather than evidence of an empty table.
+        sqlx::query(
+            "INSERT INTO counterparty_affinity \
+                 (tenant_id, number_id, counterparty, employee_id, first_seen, last_seen) \
+             VALUES ($1, $2, 'supplier-a', $3, $4, $4)",
+        )
+        .bind(a.as_uuid())
+        .bind(a_number)
+        .bind(a_staff[0].as_uuid())
+        .bind(Utc::now())
+        .execute(&mut **tx)
+        .await
+        .expect("affinity");
         tx.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(b).await.expect("tx");
@@ -846,14 +672,7 @@ mod tests {
                 .expect("count");
             assert_eq!(seen, 0, "tenant B must not see A's rows: {sql}");
         }
-        // Not by primary key either, and not through the routing entry points.
-        assert_eq!(
-            resolve_inbound(&mut tx, &shared, "supplier-a")
-                .await
-                .expect("resolve"),
-            None,
-            "an inbound to A's number must not route to anyone in B"
-        );
+        // Not by primary key either.
         assert!(matches!(
             set_state(&mut tx, a_number, NumberState::Released, Utc::now()).await,
             Err(StoreError::NotFound)

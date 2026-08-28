@@ -1497,6 +1497,13 @@ impl Effects {
 
         let detail = Some(json!({
             "payee": instruction.payee,
+            // `PaymentInstruction::memo` says it lands in the audit row, and
+            // until this line it did not: the field was built by `Turn::perform`
+            // from the model's own arguments, handed to the port, and read by
+            // nothing this side of an adapter that does not exist yet. An
+            // operator asking "what was that payment for" now has the answer
+            // here rather than only on a statement nobody in this system sees.
+            "memo": instruction.memo,
             "minor": amount.minor(),
             "currency": amount.currency().code(),
             "provider_message_id": paid.as_ref().ok().map(ProviderMessageId::as_str),

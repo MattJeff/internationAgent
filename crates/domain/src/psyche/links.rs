@@ -26,6 +26,25 @@
 //!   cleared: a scar, not a mood. Later kept promises still raise confidence,
 //!   but the link stays visibly broken and can never read as `Close` again.
 //!
+//! # NOT WIRED — only [`BASE_CONFIDENCE`] is read outside `#[cfg(test)]`
+//!
+//! `grep -rn 'TrustLedger\|TrustEvent\|appraise' apps crates` finds this file,
+//! `apps/server/tests/sourcing_e2e.rs`, and nothing else. The ledger, the
+//! events, the shock absorber and the appraisal are exercised by their tests
+//! and by no caller.
+//!
+//! That is a decision, not a gap, and the argument is written down once in
+//! `agentos_app::psyche`'s closing section: a [`TrustEvent`] is a commitment
+//! whose fulfilment we watched, and this product has no purchase order, no
+//! shipment and no inspection — so there is no honest event to feed it.
+//! `agentos_app::psyche` writes two timestamps to `psyche_trust` ("we are
+//! waiting since", "they last spoke at") and leaves `trust` on
+//! [`BASE_CONFIDENCE`], which is what `psyche_trust_needs_evidence` permits and
+//! what an opinion with no evidence behind it should look like.
+//!
+//! Read the rest of this header as a specification of what happens the day
+//! those events exist, not as a description of what runs today.
+//!
 //! # Where this may and may not be used
 //!
 //! Trust ranks the queue and colours the wording. It is never an input to

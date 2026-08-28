@@ -359,9 +359,15 @@ impl Identity {
     /// This employee's published key set, built from the same query the
     /// unauthenticated JWKS endpoint runs.
     ///
-    /// Here so that a caller wanting to publish the document — the HTTP route,
-    /// a test proving a signature verifies against what is published — cannot
-    /// build it from a different source than the one strangers actually read.
+    /// **A test affordance, and nothing outside `#[cfg(test)]` calls it.** The
+    /// route that publishes the document — `apps/server/src/routes/well_known.rs`
+    /// — reaches `signing::published_keys` and `identity::jwks` itself, because
+    /// it has no employee credential and therefore no [`IdentityService`] to
+    /// ask. So this is not the one door onto the document, it is the door a
+    /// test with a principal in hand can use to read exactly what a stranger
+    /// would: same query, same `jwks()`, no second source of truth invented.
+    /// Delete it the day no test needs it.
+    ///
     /// Empty when the employee is not `active`; see `agentos_store::signing`.
     pub async fn published_jwks(&self) -> Result<Value, IdentityError> {
         let mut tx = self

@@ -35,9 +35,17 @@
 //! `DELETE IncomingPhoneNumbers/{sid}` — and the one thing this unit must never
 //! do is delete a number four colleagues are still working on. A slot's
 //! external id is not a sid and can never name one, so the delete cannot
-//! resolve; and [`release_slot`], the path a termination should take, does not
-//! reach a provider at all. The number is the tenant's property, and no
-//! employee leaving is an instruction to give it back.
+//! resolve; and `ProvisioningEngine::release_step`, which is the path a
+//! termination actually takes, short-circuits the provider call entirely for a
+//! binding [`is_pooled`] answers for. The number is the tenant's property, and
+//! no employee leaving is an instruction to give it back.
+//!
+//! This module used to carry a second releaser, `release_slot`, saying the same
+//! thing one level up. Nothing outside `#[cfg(test)]` ever called it — the
+//! engine's own path both frees the `number_allocations` row and clears the
+//! binding in one commit, which `release_slot` could not do because it never
+//! knew the region — so it is gone rather than kept as a plausible-looking
+//! alternative for somebody to wire by mistake.
 //!
 //! # Where the pool itself is written down
 //!
@@ -55,7 +63,7 @@
 //! rows with `provider = "phone-pool"` are the third thing: a *seat* on a number
 //! from the first table, which is what [`occupancy`] counts.
 //!
-//! # Inbound routing, and why affinity is correctness
+//! # Inbound routing is not here
 //!
 //! A supplier texts the shared number. Which employee gets it? The one that
 //! supplier has been talking to, always: since wave 8 an employee holds trust
@@ -63,35 +71,28 @@
 //! counterparty ([`agentos_domain::psyche`]), and a colleague holds none of
 //! them. Routing the supplier elsewhere silently throws the relationship away.
 //!
-//! The affinity is not a new table. It is the `conversations` row that already
-//! records `(employee, channel, counterparty)` and is already maintained by
-//! [`crate::inbound::conversation_for`]. [`route_inbound`] reads it under two
-//! rules, both deterministic and neither a function of row order:
+//! That rule lives in [`crate::inbound::resolve_phone_recipient`], which is what
+//! [`crate::inbound::land_inbound_text`] calls — read that function's own
+//! NOT WIRED note before assuming a message reaches either of them today. This
+//! module had a `route_inbound` of its own that said the same thing and that
+//! nothing outside `#[cfg(test)]` ever called, not even the lander. It was not
+//! merely redundant — it was **narrower**: two queries instead of one,
+//! `step = 'phone'` hard-coded so a pooled WhatsApp slot could not route at all,
+//! `provider = 'phone-pool'` so a dedicated number could not either, and no
+//! `state = 'ready'` filter, so a released slot still counted. It is deleted;
+//! the argument for the tie-breaks lives on `resolve_phone_recipient`.
 //!
-//! * **Oldest conversation wins.** Two employees genuinely talking to one
-//!   supplier on one number is an ambiguity, and the tie-break is the employee
-//!   who has held the relationship longest — the one with the most psyche
-//!   behind it. Ties on the timestamp break on the conversation id, which is a
-//!   v7 uuid, so the order is total.
-//! * **First contact goes to the emptiest desk**, tie-broken by employee id.
-//!   An unknown number has no relationship to preserve, so the rule is load,
-//!   not luck: `ORDER BY count(*), employee_id` over the slot holders on that
-//!   number. Lowest-id-wins alone would pile every new supplier onto one
-//!   employee.
-//!
-//! ponytail: least-loaded is counted from `conversations` on every call rather
-//! than kept as a cursor. A pool is five to ten numbers and a tenant is a
-//! hundred employees; when that count shows up in a profile, the upgrade is a
-//! `last_assigned_at` column and `ORDER BY` it.
+//! What is left here is the operator's view of the same fact: [`affinities`]
+//! lists who currently holds which counterparty on which number, including the
+//! rows that are no longer routable, and [`reassign`] moves one deliberately.
 
 use std::collections::BTreeMap;
 
 use agentos_domain::action::E164;
-use agentos_domain::employee::{Employee, ProviderBinding, ResourceState, Step};
+use agentos_domain::employee::ProviderBinding;
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::message::Channel;
 use agentos_store::db::{StoreError, TenantTx};
-use agentos_store::employee as employee_store;
 // The pool's own storage. Re-exported rather than restated so a caller that
 // registers a number and a caller that lists one share one vocabulary.
 pub use agentos_store::phone_pool::{NewNumber, NumberState, register};
@@ -143,6 +144,13 @@ pub fn is_pooled(binding: &ProviderBinding) -> bool {
 }
 
 /// The number half of a slot's external id, or `None` if it is not one.
+///
+/// Only `#[cfg(test)]` reads it, and deliberately: it is [`slot_binding`]'s
+/// inverse, and the encoding test at the bottom of this file is what proves the
+/// two agree. Production never needs to take a slot id apart — the SQL that
+/// wants the number half spells `split_part(external_id, '/', 1)` inline,
+/// because it needs it as a column and not as a value. Delete both halves of
+/// the round trip together, or neither.
 pub fn slot_number(binding: &ProviderBinding) -> Option<E164> {
     if !is_pooled(binding) {
         return None;
@@ -203,13 +211,6 @@ impl PoolNumber {
             regulatory: Regulatory::NotRequired,
             capacity,
         }
-    }
-
-    /// Record the bundle this number rests on.
-    #[must_use]
-    pub fn with_regulatory(mut self, regulatory: Regulatory) -> Self {
-        self.regulatory = regulatory;
-        self
     }
 
     /// The number itself.
@@ -327,94 +328,6 @@ pub enum PoolError {
     /// no affinity to move. See [`reassign`] on why one is not invented.
     #[error("no affinity for that counterparty on that number")]
     NoAffinity,
-}
-
-// ---------------------------------------------------------------------------
-// Releasing a slot
-// ---------------------------------------------------------------------------
-
-/// What giving a slot back came to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlotRelease {
-    /// The slot is free. The number is untouched and still the tenant's.
-    Freed {
-        /// The number the employee was routed over, for the audit line.
-        number: E164,
-    },
-    /// Nothing was allocated, or this ran twice. Idempotent, like every other
-    /// release in this system.
-    AlreadyFree,
-    /// The employee holds a number of its own, not a pooled slot. The caller
-    /// must use `ProvisioningEngine::release_step`, which gives the number back
-    /// to the provider — because for a dedicated number, that is correct.
-    Dedicated,
-}
-
-/// Free one employee's pooled slot. **Never calls the provider.**
-///
-/// # Do not add a provider call here
-///
-/// A pooled number belongs to the tenant and four colleagues are still sending
-/// from it. `TelephonyProvider::release` is `DELETE IncomingPhoneNumbers/{sid}`
-/// — it does not "release our share", there is no share, it takes the number
-/// off the account. Doing that when one employee is terminated silently cuts
-/// off every other employee on it and loses a French number whose bundle took a
-/// human review to obtain. There is nothing to give back on termination:
-/// clearing the binding *is* the release, exactly as it is for
-/// `Step::Whatsapp`, whose company sender is shared the same way.
-///
-/// The write order that matters elsewhere — ask the provider, then forget the
-/// id — has nothing to order here, which is why this is one transaction and has
-/// no lease.
-///
-/// # Affinities are kept
-///
-/// This does not touch the terminated employee's `conversations`. Dropping them
-/// would delete the record of who has been talking to whom, which is the input
-/// to every handover decision an operator makes afterwards; keeping them costs
-/// nothing, because [`route_inbound`] only ever routes to an `active` employee,
-/// so a terminated employee's suppliers stop reaching it the moment the
-/// lifecycle moves. They surface in [`affinities`] as un-routable, which is the
-/// prompt to hand them over deliberately with [`reassign`] — and a deliberate
-/// handover is the only kind that lets somebody notice that Lena's three years
-/// of trust links about that supplier do not travel with the routing.
-pub async fn release_slot(
-    tx: &mut TenantTx<'_>,
-    employee_id: EmployeeId,
-    now: DateTime<Utc>,
-) -> Result<SlotRelease, PoolError> {
-    let stored = employee_store::load(tx, employee_id).await?;
-    let mut employee = stored.employee;
-
-    let Some(binding) = employee.resource(Step::Phone).binding().cloned() else {
-        return Ok(SlotRelease::AlreadyFree);
-    };
-    if !is_pooled(&binding) {
-        return Ok(SlotRelease::Dedicated);
-    }
-    let number = slot_number(&binding).ok_or_else(|| {
-        StoreError::Database(sqlx::Error::Decode(
-            format!("pooled slot {:?} has no number", binding.external_id()).into(),
-        ))
-    })?;
-
-    // `Employee::release` is the only thing that clears a binding. No provider
-    // call precedes it here, and none should ever be added — see above.
-    employee.release(Step::Phone, now);
-    disable(&mut employee, now);
-    employee_store::update(tx, &employee, stored.version).await?;
-
-    Ok(SlotRelease::Freed { number })
-}
-
-/// `Disabled` is the domain's word for "deliberately off for this employee",
-/// which is what a freed slot is. A refusal is logged rather than propagated:
-/// the binding is already gone, and failing the release now would leave the
-/// caller retrying something that has already happened.
-fn disable(employee: &mut Employee, now: DateTime<Utc>) {
-    if let Err(err) = employee.set_resource(Step::Phone, ResourceState::Disabled, now) {
-        tracing::warn!(error = %err, "pooled slot freed, but the row could not be disabled");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,67 +488,6 @@ pub async fn affinities(
         .collect())
 }
 
-/// The employee an inbound message on `number` from `counterparty` belongs to.
-///
-/// Both rules are in the module docs and both are total orders, so this cannot
-/// be decided by the order Postgres happens to return rows in. `None` means the
-/// number has no employee able to take the message — every slot holder is
-/// suspended or terminated — which the caller must surface rather than drop.
-pub async fn route_inbound(
-    tx: &mut TenantTx<'_>,
-    number: &E164,
-    counterparty: &str,
-) -> Result<Option<EmployeeId>, StoreError> {
-    // 1. Affinity: the employee that has held this relationship longest, among
-    //    the ones allocated to this number and able to answer.
-    let held: Option<Uuid> = sqlx::query_scalar(
-        "SELECT c.employee_id \
-           FROM conversations c \
-           JOIN employees e ON e.id = c.employee_id AND e.lifecycle = 'active' \
-           JOIN employee_resources r \
-             ON r.employee_id = c.employee_id AND r.step = 'phone' \
-          WHERE c.external_ref = $2 \
-            AND c.channel = ANY($4) \
-            AND r.provider = $3 \
-            AND r.external_id = $1 || $5 || c.employee_id::text \
-          ORDER BY c.created_at, c.id \
-          LIMIT 1",
-    )
-    .bind(number.as_str())
-    .bind(counterparty)
-    .bind(PHONE_POOL)
-    .bind(PHONE_CHANNELS.as_slice())
-    .bind(SLOT_SEP.to_string())
-    .fetch_optional(&mut ***tx)
-    .await?;
-    if let Some(id) = held {
-        return Ok(Some(EmployeeId::from_uuid(id)));
-    }
-
-    // 2. First contact: the emptiest desk on this number, then the lowest id.
-    let fresh: Option<Uuid> = sqlx::query_scalar(
-        "SELECT r.employee_id \
-           FROM employee_resources r \
-           JOIN employees e ON e.id = r.employee_id AND e.lifecycle = 'active' \
-           LEFT JOIN conversations c \
-             ON c.employee_id = r.employee_id AND c.channel = ANY($3) \
-          WHERE r.step = 'phone' \
-            AND r.provider = $2 \
-            AND split_part(r.external_id, $4, 1) = $1 \
-          GROUP BY r.employee_id \
-          ORDER BY count(c.id), r.employee_id \
-          LIMIT 1",
-    )
-    .bind(number.as_str())
-    .bind(PHONE_POOL)
-    .bind(PHONE_CHANNELS.as_slice())
-    .bind(SLOT_SEP.to_string())
-    .fetch_optional(&mut ***tx)
-    .await?;
-
-    Ok(fresh.map(EmployeeId::from_uuid))
-}
-
 /// What a reassignment moved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Reassigned {
@@ -748,10 +600,10 @@ pub async fn reassign(
 #[cfg(test)]
 mod tests {
     use agentos_domain::action::Domain;
+    use agentos_domain::employee::{Employee, ResourceState, Step};
     use agentos_domain::ids::{Slug, TenantId};
-    use agentos_providers::EnsureCtx;
-    use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
     use agentos_store::db::Db;
+    use agentos_store::employee as employee_store;
 
     use super::*;
 
@@ -880,11 +732,17 @@ mod tests {
         id
     }
 
-    async fn binding_of(db: &Db, tenant: TenantId, id: EmployeeId) -> Option<ProviderBinding> {
+    /// Who a conversation row belongs to now. The thread *is* the routing, so
+    /// this is what a reassignment has to have changed.
+    async fn owner_of(db: &Db, tenant: TenantId, conversation: Uuid) -> Uuid {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let stored = employee_store::load(&mut tx, id).await.expect("load");
+        let owner: Uuid = sqlx::query_scalar("SELECT employee_id FROM conversations WHERE id = $1")
+            .bind(conversation)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("owner");
         tx.rollback().await.expect("rollback");
-        stored.employee.resource(Step::Phone).binding().cloned()
+        owner
     }
 
     // -- the encoding ------------------------------------------------------
@@ -911,104 +769,6 @@ mod tests {
         let dedicated = ProviderBinding::new("twilio", "PN0000000000000001");
         assert!(!is_pooled(&dedicated));
         assert_eq!(slot_number(&dedicated), None);
-    }
-
-    // -- releasing ---------------------------------------------------------
-
-    /// The headline: terminating frees the slot and the number stays.
-    #[tokio::test]
-    async fn terminating_frees_the_slot_and_leaves_the_number_alone() {
-        let Some(db) = db().await else { return };
-        let tenant = new_tenant(&db).await;
-        let lena = allocate(&db, tenant, "lena").await;
-        let alex = allocate(&db, tenant, "alex").await;
-
-        // A provider that has actually sold the tenant this number. It is here
-        // to be *not* called: `release_slot` takes no adapter, and if a future
-        // edit gives it one, this count is what fails.
-        let telephony = MockTelephony::new(Utc::now(), "token");
-        telephony
-            .ensure_number(
-                &EnsureCtx::new(
-                    tenant,
-                    lena,
-                    Slug::parse("pool").expect("slug"),
-                    Step::Phone.as_str(),
-                ),
-                &Region::new("FR"),
-            )
-            .await
-            .expect("buy the pooled number");
-        assert_eq!(telephony.number_count(), 1);
-
-        terminate(&db, tenant, lena).await;
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let released = release_slot(&mut tx, lena, Utc::now())
-            .await
-            .expect("release");
-        tx.commit().await.expect("commit");
-
-        assert_eq!(released, SlotRelease::Freed { number: number() });
-        assert_eq!(binding_of(&db, tenant, lena).await, None, "slot not freed");
-        assert_eq!(
-            binding_of(&db, tenant, alex).await,
-            Some(slot_binding(&number(), alex)),
-            "a colleague lost its allocation"
-        );
-        assert_eq!(
-            telephony.number_count(),
-            1,
-            "the number was given back to the provider; four colleagues just lost their line"
-        );
-
-        // Occupancy reflects it: one seat free, the number still listed.
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let seats = occupancy(&mut tx).await.expect("occupancy");
-        tx.rollback().await.expect("rollback");
-        assert_eq!(seats[NUMBER].len(), 1);
-        assert_eq!(seats[NUMBER][0].employee_id, alex.as_uuid());
-    }
-
-    /// Releasing is idempotent, and the last employee leaving is not a delete
-    /// either — the pool still holds the number, with nobody on it.
-    #[tokio::test]
-    async fn releasing_twice_is_fine_and_the_last_leaver_keeps_the_number() {
-        let Some(db) = db().await else { return };
-        let tenant = new_tenant(&db).await;
-        let lena = allocate(&db, tenant, "lena").await;
-        add_pool_number(&db, tenant, NUMBER, 10).await;
-
-        for expected in [
-            SlotRelease::Freed { number: number() },
-            SlotRelease::AlreadyFree,
-            SlotRelease::AlreadyFree,
-        ] {
-            let mut tx = db.tenant_tx(tenant).await.expect("tx");
-            let report = release_slot(&mut tx, lena, Utc::now())
-                .await
-                .expect("release");
-            tx.commit().await.expect("commit");
-            assert_eq!(report, expected);
-        }
-
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let seats = occupancy(&mut tx).await.expect("occupancy");
-        let pool = numbers(&mut tx).await.expect("numbers");
-        tx.rollback().await.expect("rollback");
-
-        assert!(!seats.contains_key(NUMBER), "nobody is on it: {seats:?}");
-        let still = pool
-            .iter()
-            .find(|pooled| pooled.number() == &number())
-            .expect("an empty number left the pool; the tenant owns it, not its last occupant");
-        assert_eq!(still.capacity(), 10);
-        assert!(still.allocatable());
-        assert_eq!(
-            still.regulatory(),
-            &Regulatory::Approved {
-                bundle: "BU-fr-1".to_owned()
-            }
-        );
     }
 
     /// The load is a per-tenant read, and it is RLS that scopes it: the same
@@ -1080,85 +840,26 @@ mod tests {
         );
     }
 
-    /// A dedicated number is refused here rather than half-released: giving it
-    /// back is right for that employee, and only `release_step` can.
+    // -- affinity, as an operator sees it -----------------------------------
+
+    /// Where an inbound message *lands* is `inbound::resolve_phone_recipient`'s
+    /// question and it has its own test. This one is about the other half: the
+    /// row an operator has to look at afterwards. A terminated employee's
+    /// affinity is kept — it is the record of who knew whom, and the input to
+    /// every handover decision — and it reads as un-routable, which is the
+    /// prompt to hand it over deliberately rather than let it rot.
     #[tokio::test]
-    async fn a_dedicated_number_is_not_this_functions_business() {
-        let Some(db) = db().await else { return };
-        let tenant = new_tenant(&db).await;
-        let raj = allocate(&db, tenant, "raj").await;
-
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        // The external id carries the employee so that a re-run against the
-        // same database does not collide on the global `(provider, external_id)`
-        // index — the very index the slot encoding exists to satisfy.
-        sqlx::query(
-            "UPDATE employee_resources SET provider = 'twilio', external_id = $2 \
-              WHERE employee_id = $1 AND step = 'phone'",
-        )
-        .bind(raj.as_uuid())
-        .bind(format!("PN{}", raj.as_uuid().simple()))
-        .execute(&mut **tx)
-        .await
-        .expect("make it dedicated");
-        let report = release_slot(&mut tx, raj, Utc::now())
-            .await
-            .expect("release");
-        tx.commit().await.expect("commit");
-
-        assert_eq!(report, SlotRelease::Dedicated);
-        assert!(
-            binding_of(&db, tenant, raj).await.is_some(),
-            "the binding was cleared without anybody cancelling the number"
-        );
-    }
-
-    // -- routing -----------------------------------------------------------
-
-    /// Continuity, arbitration and the fallback, in one flow.
-    #[tokio::test]
-    async fn a_supplier_keeps_reaching_the_employee_that_has_known_it_longest() {
+    async fn a_terminated_employees_affinity_is_kept_and_reads_as_un_routable() {
         let Some(db) = db().await else { return };
         let tenant = new_tenant(&db).await;
         let lena = allocate(&db, tenant, "lena").await;
-        let alex = allocate(&db, tenant, "alex").await;
-
-        // Nobody has ever spoken to this supplier: first contact goes to a
-        // desk, deterministically, and the same one every time.
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let first = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
-        let again = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
-        tx.rollback().await.expect("rollback");
-        assert_eq!(first, again, "first contact is not deterministic");
-        assert!(first.is_some());
-
-        // Lena has been talking to it for a year; Alex answered it once
-        // yesterday. Lena holds the psyche, so Lena keeps the supplier.
         talk(&db, tenant, lena, 365 * 24 * 3600).await;
-        talk(&db, tenant, alex, 24 * 3600).await;
 
-        let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
-        tx.rollback().await.expect("rollback");
-        assert_eq!(owner, Some(lena), "the newer thread stole the relationship");
-
-        // Lena leaves. The affinity is kept — it is the record of who knew whom
-        // — but nothing routes to somebody who cannot answer.
         terminate(&db, tenant, lena).await;
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
         let rows = affinities(&mut tx, None, 50).await.expect("affinities");
         tx.rollback().await.expect("rollback");
 
-        assert_eq!(owner, Some(alex), "routed to a terminated employee");
         let orphaned = rows
             .iter()
             .find(|row| row.employee_id == lena.as_uuid())
@@ -1171,9 +872,10 @@ mod tests {
         assert_eq!(orphaned.counterparty, SUPPLIER);
     }
 
-    /// Reassigning moves the relationship, and the next message follows it.
+    /// Reassigning moves the thread itself, and there is nothing left to move
+    /// the second time.
     #[tokio::test]
-    async fn a_reassignment_changes_where_the_next_message_lands() {
+    async fn a_reassignment_moves_the_thread_and_only_once() {
         let Some(db) = db().await else { return };
         let tenant = new_tenant(&db).await;
         let lena = allocate(&db, tenant, "lena").await;
@@ -1181,23 +883,17 @@ mod tests {
         let held = talk(&db, tenant, lena, 90 * 24 * 3600).await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        assert_eq!(
-            route_inbound(&mut tx, &number(), SUPPLIER)
-                .await
-                .expect("route"),
-            Some(lena)
-        );
         let moved = reassign(&mut tx, &number(), SUPPLIER, alex, Utc::now())
             .await
             .expect("reassign");
-        let after = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
         tx.commit().await.expect("commit");
 
         assert_eq!(moved.conversations, vec![held], "the thread did not move");
         assert_eq!(moved.from, vec![lena.as_uuid()]);
-        assert_eq!(after, Some(alex), "the next message still lands on Lena");
+        // The thread *is* the routing — `resolve_phone_recipient` reads
+        // `conversations.employee_id` — so moving the row is what makes the next
+        // message land on Alex, and this is the row.
+        assert_eq!(owner_of(&db, tenant, held).await, alex.as_uuid());
 
         // Nothing left to move the second time: the endpoint says so rather
         // than reporting a successful no-op.
@@ -1214,24 +910,27 @@ mod tests {
         let tenant = new_tenant(&db).await;
         let lena = allocate(&db, tenant, "lena").await;
         let outsider = allocate(&db, tenant, "mira").await;
-        talk(&db, tenant, lena, 3600).await;
+        let held = talk(&db, tenant, lena, 3600).await;
 
-        // Mira gives her slot up, so she is no longer reachable on the number.
+        // Mira is taken off the number, so she is no longer reachable on it.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        release_slot(&mut tx, outsider, Utc::now())
+        sqlx::query("DELETE FROM employee_resources WHERE employee_id = $1 AND step = 'phone'")
+            .bind(outsider.as_uuid())
+            .execute(&mut **tx)
             .await
-            .expect("release");
+            .expect("take mira off the number");
         let refused = reassign(&mut tx, &number(), SUPPLIER, outsider, Utc::now()).await;
-        let owner = route_inbound(&mut tx, &number(), SUPPLIER)
-            .await
-            .expect("route");
         tx.commit().await.expect("commit");
 
         assert!(
             matches!(refused, Err(PoolError::NotAllocated)),
             "{refused:?}"
         );
-        assert_eq!(owner, Some(lena), "a refused reassignment moved something");
+        assert_eq!(
+            owner_of(&db, tenant, held).await,
+            lena.as_uuid(),
+            "a refused reassignment moved something"
+        );
     }
 
     /// RLS, not a `WHERE` clause we might forget: another tenant's slots and

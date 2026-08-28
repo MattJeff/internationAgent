@@ -8,6 +8,23 @@
 //! isolated episodes dilute, `N` concordant ones become a durable belief that
 //! keeps pushing after the episodes stop being interesting.
 //!
+//! # NOT WIRED — nothing outside `#[cfg(test)]` uses this module
+//!
+//! `grep -rn 'beliefs::\|BeliefJournal\|consolidate' apps crates` finds this
+//! file and its own tests. `agentos_store::psyche::consolidate_belief` has no
+//! caller either, so `psyche_beliefs` and `psyche_belief_episodes` are tables
+//! nothing writes.
+//!
+//! Deliberate, and the argument is in `agentos_app::psyche`'s closing section:
+//! the only subject with `N_CONSOLIDATION` concordant episodes in this product
+//! is "slow to answer", which is the expectation restated, and a belief that
+//! adds no information is a second place for the same fact to be wrong. What
+//! is missing is not the code below — it is an employee that observes a lead
+//! time missed or a spec substituted.
+//!
+//! So read the section below as the specification it is. It describes what a
+//! belief *would* mean here, not a judgement any employee is forming today.
+//!
 //! # What this is for
 //!
 //! A purchasing agent's moat is what it accumulates about suppliers. This
