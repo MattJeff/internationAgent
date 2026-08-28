@@ -712,14 +712,14 @@ async fn adopt_or_create_tenant(
                 // into `detail` it read as `tenants_slug_key. Pick another
                 // slug…`, which told the caller a table's internals and told
                 // them nothing they could act on.
-                // NOT COVERED: no test in this workspace reaches this arm, so
-                // nothing pins the property the arm exists for — that
-                // `tenants_slug_key` stays out of the body. `error.rs` tests
-                // exactly that rule for every other path; this one is the
-                // exception, and it is the path that was leaking. A test wants
-                // two `POST /v1/companies` on one slug and an assertion on the
-                // absence of the constraint name, not on the presence of the
-                // message.
+                // Covered by
+                // `tests::a_slug_another_company_holds_is_refused_without_naming_the_constraint`,
+                // which reaches it the only way anything can — two keys, two
+                // companies with no row yet, one slug — and asserts on the
+                // **absence** of `tenants_slug_key` rather than on the presence
+                // of the sentence beside it. Restore the interpolation and that
+                // test reproduces the leak verbatim; `error.rs` pins the same
+                // rule for every path that does go through `From<StoreError>`.
                 _ => {
                     tracing::warn!(conflict = %what, %slug, "a company was stood up under a slug another tenant holds");
                     Err(ApiError::conflict(
@@ -760,4 +760,196 @@ async fn read_role_layer(
             principal.tenant_id.as_uuid()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use agentos_domain::ids::TenantId;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request as HttpRequest, header};
+    use chrono::SubsecRound;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::auth::{ApiKeys, Keyring, TEST_MASTER_KEY};
+
+    const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The name PostgreSQL gives the bare `unique` on `tenants.slug` in
+    /// `0001_core.sql`. It is what `StoreError::from` puts in
+    /// [`StoreError::Conflict`] — `e.constraint()` and nothing else — and it is
+    /// the string this route must not answer with.
+    ///
+    /// Written out rather than read from `pg_constraint`: a rename would be a
+    /// migration, and a test that follows the rename silently would stop being
+    /// able to say which string it saw leak.
+    const SLUG_CONSTRAINT: &str = "tenants_slug_key";
+
+    /// `docs/orizn-roles/direction.json` — every field present and every one of
+    /// them empty, which is the shortest thing `crate::policy::parse_limits`
+    /// accepts. A partial document is a `400` before any write, so this has to
+    /// be whole for the test to reach the tenant row at all.
+    fn empty_layer() -> Value {
+        json!({
+            "spend": null,
+            "allowed_channels": [],
+            "allowed_calling_codes": [],
+            "allowed_domains": [],
+            "denied_domains": [],
+            "allowed_mcp_tools": [],
+            "allowed_a2a_peers": [],
+            "allowed_models": ["claude-haiku-4-5"],
+            "max_new_contacts_per_day": 0,
+            "max_turns_per_day": 0,
+            "allow_file_upload": false,
+            "allow_credential_change": false,
+            "allow_data_delete": false,
+            "allow_lead_upload": false
+        })
+    }
+
+    async fn post(app: &Router, secret: &str, body: &Value) -> (StatusCode, Value) {
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/companies")
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let response = app.clone().oneshot(req).await.expect("service");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// **A slug another company already holds is a 409 that does not name the
+    /// constraint that refused it.**
+    ///
+    /// The `_` arm of [`adopt_or_create_tenant`]'s conflict, which nothing in
+    /// this workspace reached until this test. `error.rs` pins the same rule —
+    /// a constraint name never crosses into a body — for every path that goes
+    /// through `From<StoreError>`; this handler builds its own [`ApiError`] and
+    /// therefore has to keep the split itself, which is exactly why it is the
+    /// one that leaked: `detail` read `tenants_slug_key. Pick another slug…`,
+    /// a table's internals sent to somebody who can do nothing with them.
+    ///
+    /// # Two keys, and neither tenant has a row when the test starts
+    ///
+    /// The same key twice cannot reach this arm and it is not an accident: the
+    /// second call re-reads its own `tenants` row, finds its own slug and
+    /// returns `Ok` — a replay is a repair. What the arm is about is a *second
+    /// company* asking for a handle the first one took, so it needs two
+    /// principals, and both of them start with no row so that each POST is the
+    /// insert that races.
+    ///
+    /// # The assertion is on the **absence** of the name, not the presence of
+    /// the sentence
+    ///
+    /// `detail.contains("Pick another `slug`")` would be green against the code
+    /// that leaked, because that body contained both. The status and the code
+    /// are asserted beside it for the other half of the same discipline: an
+    /// absence on its own is satisfied by a 500 with an empty body, which is
+    /// not this arm at all.
+    #[tokio::test]
+    async fn a_slug_another_company_holds_is_refused_without_naming_the_constraint() {
+        // This module's own database — `loops::private_db`'s mechanism and its
+        // reasons. Needed here for one of them: the route refuses before it
+        // reaches a tenant row unless a platform ceiling is installed, and that
+        // ceiling is `tenant_id IS NULL`, one row for the whole database.
+        // Installing it into the suite's shared one is the collision
+        // `crates/app/tests/scoped_deletes.rs` exists to refuse.
+        let Some(db) = crate::loops::private_db("companies").await else {
+            return;
+        };
+        policy::install_ceiling(&db, &policy::default_ceiling(), "companies route tests")
+            .await
+            .expect("install a ceiling");
+
+        let a = TenantId::new_v7(Utc::now());
+        let b = TenantId::new_v7(Utc::now());
+        // Parsed into the keyring, deliberately not inserted into `tenants`:
+        // `POST /v1/companies` is the route that writes that row, and a key for
+        // a tenant that does not exist yet is the state it is written for.
+        let keys = ApiKeys::parse(&format!(
+            "ops-a:{}:{SECRET_A},ops-b:{}:{SECRET_B}",
+            a.as_uuid(),
+            b.as_uuid()
+        ))
+        .expect("keyring");
+        let app = crate::with_api_stack(
+            router(db.clone()),
+            db.clone(),
+            Keyring::new(keys, db.clone(), TEST_MASTER_KEY),
+        );
+
+        // Derived from A's uuid rather than a literal: this database outlives
+        // the test binary by design — it is dropped by `scripts/test.sh` at the
+        // end of the run, not between tests — so a fixed slug would make a
+        // second run inside one run's database fail on the *first* POST, which
+        // is the arm's own answer arriving for the wrong reason.
+        let slug = format!("co-{}", &a.as_uuid().simple().to_string()[..12]);
+        let body = json!({
+            "slug": slug,
+            "name": "First",
+            "window_ends_at": (Utc::now() + chrono::Duration::days(30)).trunc_subsecs(6),
+            "org": {
+                "domain": "agents.example.com",
+                "rows": [{
+                    "team": "direction",
+                    "name": "Direction",
+                    "mission": "the root of the chart, and the only row this test needs",
+                    "head": "founder",
+                    "title": "CEO"
+                }]
+            },
+            "roles": { "direction": empty_layer() }
+        });
+
+        let (status, stood_up) = post(&app, SECRET_A, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "the first company has to stand up, or the second one is not racing anybody: \
+             {stood_up}"
+        );
+
+        let (status, refused) = post(&app, SECRET_B, &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            refused["code"],
+            json!("tenant_slug_taken"),
+            "the second company must be told the handle is taken, and by this arm: {refused}"
+        );
+
+        let rendered = refused.to_string();
+        assert!(
+            !rendered.contains(SLUG_CONSTRAINT),
+            "`{SLUG_CONSTRAINT}` is a table's internals and names nothing the caller can act \
+             on. It belongs on the `tracing::warn!` this arm writes, where the operator gets \
+             it — the caller gets the status and the code: {rendered}"
+        );
+
+        // The other half of the arm's own sentence, "nothing was written".
+        // Read through RLS, which is the read the handler itself makes: B is
+        // still a tenant with no row, so the refusal cost it nothing and a
+        // second attempt under another slug is still a first attempt.
+        let mut tx = db.tenant_tx(b).await.expect("tenant tx");
+        let theirs: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(b.as_uuid())
+            .fetch_optional(&mut **tx)
+            .await
+            .expect("read the second company back");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            theirs, None,
+            "the refusal says nothing was written, and a half-built tenant would make that \
+             sentence false"
+        );
+    }
 }
