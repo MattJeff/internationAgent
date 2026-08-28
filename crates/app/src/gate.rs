@@ -483,15 +483,46 @@ impl PolicyGate {
     /// action cannot be swapped for a different one between the click and the
     /// call.
     ///
-    /// The policy is deliberately not re-evaluated: it already said "ask a
-    /// human", and asking it again would only ask again. The things that *are*
-    /// re-checked are the ones a human decision cannot substitute for, and
-    /// there are **three**: the company has not been stopped, the employee is
-    /// still active, and the ledger still has the headroom. The halt is the one
-    /// this sentence used to miss — it was written before `waveJ-j2` put the
-    /// arm below in, and the item it left out is the one with the widest blast
-    /// radius. A list in a doc comment is a list that has to be re-counted
-    /// every time the code below it grows an arm.
+    /// # An approval is a bearer token, not a dated judgement
+    ///
+    /// The policy is deliberately not re-evaluated, and the reason this comment
+    /// used to give was the wrong one. It said the policy had already answered
+    /// "ask a human", so asking again would only ask again — which is false of
+    /// most rows this method sees. **Four call sites file approvals `evaluate`
+    /// never ruled on at all**: `crate::provisioning`'s reconciliation request
+    /// and the three escalations in `server::loops::provisioning`. Their action
+    /// is an `Action::McpCall` on a synthetic `provisioning/<step>` tool that no
+    /// tenant's `allowed_mcp_tools` names, so re-evaluating here would answer
+    /// `no_rule` and take away the button an operator presses to say *I have
+    /// dealt with this by hand*. Re-judging is not asking the same question
+    /// twice; for those rows it is asking a question that was never asked, of an
+    /// action the evaluator provably refuses.
+    /// `an_approval_no_evaluator_ever_ruled_on_is_still_redeemable` is that
+    /// claim against a real database, and it turns red the day somebody adds the
+    /// re-evaluation.
+    ///
+    /// Nor would re-judging catch the case it looks like it would. The trust
+    /// label here comes from the action *presented to this method* — an
+    /// operator's authenticated request body, therefore `Trusted` — never from
+    /// the turn that filed the approval. A row born from a hostile page before
+    /// the taint wire was fixed would be re-evaluated as trusted and pass, so
+    /// closing that would take provenance stored on the row rather than a second
+    /// `evaluate`. It is not stored, because after the fix no such row can be
+    /// filed: `an_untrusted_turn_puts_no_line_in_the_approval_queue`.
+    ///
+    /// What this does cost, named rather than hidden: a policy that *narrows*
+    /// between the click and the redemption is not honoured here. A lowered
+    /// `max_per_day` (see [`Self::reserve`]) or an `allow_credential_change`
+    /// turned off after the approval was filed will not stop it being spent.
+    ///
+    /// The things that *are* checked are the ones a human decision cannot
+    /// substitute for, and there are **four**: the company has not been
+    /// stopped, the employee is still active, the action presented here is not
+    /// itself derived from untrusted text, and the ledger still has the
+    /// headroom. The halt is the one this sentence used to miss — it was written
+    /// before `waveJ-j2` put the arm below in, and the item it left out is the
+    /// one with the widest blast radius. A list in a doc comment is a list that
+    /// has to be re-counted every time the code below it grows an arm.
     pub async fn redeem_approval<A: Authorizable>(
         &self,
         principal: &Principal,
@@ -528,6 +559,28 @@ impl PolicyGate {
         let outcome = match halt::halted(&mut tx).await.map_err(Denied::Unavailable)? {
             Some(halt) => Outcome::Halted(halt.reason),
             None => match self.lifecycle(&mut tx, principal).await? {
+                // **The taint, on the one mint that took `Authorizable` and
+                // never asked it anything.** `authorize` reads the label off
+                // the type; this method used only `to_action`, so
+                // `redeem_approval::<Untrusted<_>>` would have spent a human's
+                // click on an action a document composed — the failure the
+                // whole `Untrusted<T>` apparatus exists to prevent, at the one
+                // point where a human has already said yes to something else.
+                //
+                // Nothing does that today: the only caller is
+                // `routes::approvals::approve`, whose action comes from an
+                // operator's authenticated body. The executor this method
+                // exists to serve is what would, and a door is cheapest to
+                // close before anyone walks through it.
+                //
+                // `UntrustedInput` rather than a [`RedemptionFailure`]: nothing
+                // about the redemption was wrong — the nonce, the hash and the
+                // deadline are all fine — the action is one the policy refuses.
+                // And refused, not burned: the approval is still pending, like
+                // the halt's refusal above.
+                Some(Lifecycle::Active) if action.trust().is_untrusted() => {
+                    Outcome::Deny(DenyReason::UntrustedInput)
+                }
                 Some(Lifecycle::Active) => {
                     self.redeem(&mut tx, principal, approval_id, nonce, &subject, now)
                         .await?
@@ -1351,8 +1404,8 @@ mod tests {
     use std::num::NonZeroU32;
     use std::time::{Duration, Instant};
 
-    use agentos_domain::action::{Channel, EmailAddress};
-    use agentos_domain::ids::Slug;
+    use agentos_domain::action::{Channel, DataScope, EmailAddress, McpTool};
+    use agentos_domain::ids::{SecretRef, Slug};
     use agentos_domain::money::Currency;
     use agentos_domain::policy::{PolicyLimits, SpendLimits};
     use agentos_store::policy::Scope;
@@ -1672,6 +1725,19 @@ mod tests {
         count
     }
 
+    /// How many approval rows this employee has, in any state.
+    async fn queued(db: &Db, principal: &Principal) -> i64 {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM approvals WHERE employee_id = $1")
+                .bind(principal.employee_id.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count approvals");
+        tx.commit().await.expect("commit read");
+        count
+    }
+
     /// The nonce, read the way the approval UI reads it: out of the row, never
     /// out of the gate's return value.
     async fn nonce_of(db: &Db, principal: &Principal, id: ApprovalId) -> String {
@@ -1953,6 +2019,194 @@ mod tests {
         assert_eq!(rows[2].2[DENIED_KEY], json!("approval_bad_nonce"));
         assert_eq!(rows[3].0.as_deref(), Some("allow"));
         assert_eq!(rows[4].2[DENIED_KEY], json!("approval_already_decided"));
+    }
+
+    /// **The approval queue is not a surface a stranger can write on.**
+    ///
+    /// Every arm of `evaluate` that answers `RequireApproval` — a payment over
+    /// the threshold, a contract signature, a credential change, a bulk erase —
+    /// is `Risk::High`, so the taint wire refuses it *before* `request_approval`
+    /// is reached and no row is filed. Asserted against the real table rather
+    /// than against a `Decision`, because the failure this guards is not a value
+    /// in an enum: it is a line in the founder's queue carrying an amount and a
+    /// payee a stranger chose, presented as their own employee's proposal.
+    ///
+    /// The second half is what stops this passing on a gate that simply stopped
+    /// escalating: the same four actions from a *trusted* turn still file their
+    /// four rows.
+    ///
+    /// **It is also why `approvals` has no provenance column.** A column saying
+    /// where the request came from would read `trusted` on every row this build
+    /// can write — the gate's, by the wire above, and the four
+    /// `server::loops::provisioning` files, which are composed here from step
+    /// names and employee ids. A column with one value is not information; this
+    /// test is the claim such a column would have been documenting, checked once
+    /// instead of restated on every row forever.
+    ///
+    /// Not covered, and named because the list below is written out rather than
+    /// derived from `ActionKind::ALL`: a *future* arm answering `RequireApproval`
+    /// for a `Risk::Low` action would slip past the wire unseen here.
+    /// `domain::policy`'s own suite owns that half.
+    #[tokio::test]
+    async fn an_untrusted_turn_puts_no_line_in_the_approval_queue() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allow_credential_change: true,
+                allow_data_delete: true,
+                ..limits()
+            },
+        )
+        .await;
+
+        // One per arm of `evaluate` that can answer `RequireApproval`. The
+        // payment is over `approval_above` and under both caps, so it is the
+        // escalating arm being tested rather than a refusal.
+        let escalating = [
+            payment(25_000),
+            Action::ContractSign {
+                title: "supply agreement".to_owned(),
+            },
+            Action::CredentialChange {
+                secret: SecretRef::new(principal.tenant_id, principal.employee_id, "bank-token")
+                    .expect("secret name"),
+            },
+            Action::DataDelete {
+                scope: DataScope::AllForEmployee {
+                    id: principal.employee_id,
+                },
+            },
+        ];
+
+        for action in &escalating {
+            let err = gate
+                .authorize(&principal, Untrusted::new(action.clone()))
+                .await
+                .expect_err("a high-risk action from untrusted text is not authorised");
+            assert_eq!(
+                err.code(),
+                DenyReason::UntrustedInput.code(),
+                "{} reached a human on the strength of untrusted text",
+                action.kind()
+            );
+        }
+        assert_eq!(
+            queued(&db, &principal).await,
+            0,
+            "a hostile page filed a row in the approval queue"
+        );
+
+        for action in &escalating {
+            assert!(
+                matches!(
+                    gate.authorize(&principal, action.clone()).await,
+                    Err(Denied::PendingApproval(_))
+                ),
+                "a trusted {} lost its approval path",
+                action.kind()
+            );
+        }
+        assert_eq!(queued(&db, &principal).await, 4);
+    }
+
+    /// **A human's click is not spendable on an action a document composed.**
+    ///
+    /// The trust label rides on the type at every mint the gate has — except
+    /// that `redeem_approval` took the `Authorizable` bound and read only
+    /// `to_action` from it, so an executor that redeemed an `Untrusted<Action>`
+    /// would have got a token. No caller does that today, which is exactly why
+    /// the arm is cheap; the executor this method exists for is the one that
+    /// could.
+    ///
+    /// And the approval survives — refused, not burned, like the halt's
+    /// refusal — so the same nonce still spends on the trusted action.
+    #[tokio::test]
+    async fn a_redemption_from_untrusted_text_is_refused_and_the_approval_survives() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = gate(&db, &principal).await;
+        let action = Action::ContractSign {
+            title: "supply agreement".to_owned(),
+        };
+
+        let Denied::PendingApproval(id) = gate
+            .authorize(&principal, action.clone())
+            .await
+            .expect_err("a contract signature always needs a human")
+        else {
+            panic!("expected a pending approval");
+        };
+        let nonce = nonce_of(&db, &principal, id).await;
+
+        let err = gate
+            .redeem_approval(&principal, id, &nonce, Untrusted::new(action.clone()))
+            .await
+            .expect_err("an approval is not spendable on untrusted text");
+        assert_eq!(err.code(), DenyReason::UntrustedInput.code());
+
+        gate.redeem_approval(&principal, id, &nonce, action)
+            .await
+            .expect("the approval was refused, not burned: the same nonce still works");
+    }
+
+    /// **The half that would break if the redemption re-judged.**
+    ///
+    /// `crate::provisioning` and `server::loops::provisioning` file approvals
+    /// directly, for actions `evaluate` was never asked about: the row is a
+    /// question for an operator — *the worker died mid-call, go reconcile at the
+    /// provider* — wearing an `Action::McpCall` because `Action` has no
+    /// "reconcile" variant to wear. No tenant's `allowed_mcp_tools` names that
+    /// tool, which the first assertion below establishes rather than assumes.
+    ///
+    /// Redeeming it is how the operator clears the item. Teaching
+    /// [`PolicyGate::redeem_approval`] to call `evaluate` would answer
+    /// `no_rule` here and leave that queue unclearable — the shape of mistake a
+    /// security fix makes when it is drawn wider than the hole it is closing.
+    #[tokio::test]
+    async fn an_approval_no_evaluator_ever_ruled_on_is_still_redeemable() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = gate(&db, &principal).await;
+        let action = Action::McpCall {
+            tool: McpTool::new(
+                Slug::parse("provisioning").expect("slug"),
+                Slug::parse("reconcile-mailbox").expect("slug"),
+            ),
+        };
+
+        let err = gate
+            .authorize(&principal, action.clone())
+            .await
+            .expect_err("no policy layer names a reconcile tool");
+        assert_eq!(err.code(), DenyReason::NoRule.code());
+
+        // The row a provisioning loop files, in its own shape: no `evaluate`,
+        // no `Decision`, a reason written for a human.
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let requested = approvals::create(
+            &mut tx,
+            &NewApproval {
+                employee_id: Some(principal.employee_id),
+                action: &action,
+                requested_by: "provisioning-engine",
+                required_role: "reconciler",
+                reason: Some("the worker died mid-call; reconcile at the provider"),
+                expires_at: now + APPROVAL_TTL,
+            },
+            now,
+        )
+        .await
+        .expect("file the approval");
+        tx.commit().await.expect("commit");
+
+        gate.redeem_approval(&principal, requested.id(), requested.nonce(), action)
+            .await
+            .expect("an operator must still be able to clear a reconciliation item");
     }
 
     #[tokio::test]
