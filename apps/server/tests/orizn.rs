@@ -809,9 +809,18 @@ async fn assert_the_company_is_orizn(db: &Db, tenant: TenantId, seats: &HashMap<
         // **The four switches, which are not numbers and were read by nothing.**
         //
         // Everything above and below compares a count, a set or a ruling. These
-        // four are booleans, `docs/ORIZN.md` argues each one off by name, and
-        // until this loop existed no assertion in the workspace read them off a
-        // standing company: flipping `allow_lead_upload` to `true` in
+        // four are booleans, and until this loop existed no assertion in the
+        // workspace read them off a standing company.
+        //
+        // An earlier version of this comment said `docs/ORIZN.md` argues each
+        // one off by name. **It does not name any of them** — `grep` finds zero
+        // occurrences of all four — and that is worth more than the correction:
+        // these are four switches in force on the running company that the
+        // document describing that company never mentions. The test is now the
+        // only thing that reads them, which is a thin place to keep a fact.
+        //
+        // The measurement that motivated the loop stands: flipping
+        // `allow_lead_upload` to `true` in
         // `docs/orizn-ceiling.json` **and** `docs/orizn-roles/sales-development.json`
         // — the two documents this file feeds to the real installer — left all
         // three tests here green. That switch is the difference between the

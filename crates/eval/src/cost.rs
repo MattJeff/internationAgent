@@ -1013,6 +1013,16 @@ mod tests {
                 seats().iter().any(|s| s.role == *role && s.turns > 0),
                 "{role} is excused from being worked and is not billed either — delete the line"
             );
+            // And the symmetric half, which the first version of this guard was
+            // missing: an excuse also goes stale when its subject *starts*
+            // being worked. Without this, giving `growth` a charter leaves the
+            // name here for ever and the next reader takes an excused seat for
+            // a covered one — the exact failure the loop above exists to
+            // prevent, pointed the other way.
+            assert!(
+                !worked.contains(role),
+                "{role} is worked by a charter now and still listed as an                  extrapolation — delete the line, and re-record, because the                  figures in this file were sampled without it"
+            );
         }
     }
 
