@@ -471,24 +471,72 @@ async fn fail(db: &Db, event: &OutboxEvent, failure: &Failure) {
 /// passed rather than assumed; the one-argument form assumes `$1`, and here
 /// that is an integer. `a_stopped_company_is_not_a_poller_that_is_behind` is
 /// what notices if any of it stops being true.
+///
+/// # A tenant's dead letters cost this nothing, and `0057` is why — it just did
+/// not know it
+///
+/// `migrations/0057_outbox_claimable.sql` measured this probe at **14.1 ms**
+/// against one tenant's 100 000 parked rows and named it as the reader it was
+/// leaving behind, on the grounds that it "still reads the wide one" and is a
+/// `max()` over the whole queue that no per-tenant index answers. The first half
+/// stopped being true the moment that migration ran, and nothing measured it
+/// again.
+///
+/// The clause below is `attempt_count < $1::int`, which is the *same* predicate
+/// `outbox_events_claimable_idx` is partial on. A custom plan knows `$1` is 8
+/// and the planner proves the implication exactly as it does for the claim, so
+/// this is an **index-only scan of the claim's own index** — which holds only
+/// the rows a poller could still take. Re-measured on PostgreSQL 17, 20 tenants,
+/// 5 due rows each, one tenant holding every parked row, median of nine, `$1`
+/// bound (ten consecutive executions of the prepared statement: ten custom
+/// plans, ten scans of that index):
+///
+/// ```text
+///     parked rows (one tenant)      lag_secs
+///     ------------------------------------------
+///                            0       0.26 ms
+///                      100 000       0.16 ms
+///                      500 000       0.11 ms
+///                    1 000 000       0.13 ms
+/// ```
+///
+/// Flat, and flat for the reason that matters: the cost is proportional to the
+/// rows a poller could still claim, never to the rows it never will. A backlog
+/// of 100 100 *claimable* rows is 54 ms, and that is this probe reporting on
+/// work that exists rather than on work that is over.
+///
+/// So nothing was added: no second index on the hottest table, no second shape
+/// of this query, and no third site holding [`MAX_ATTEMPTS`] in agreement. What
+/// was missing is that the property is **load-bearing and accidental** —
+/// deleting the `attempt_count` clause reads like a simplification, and in the
+/// cases where it does not change the answer it silently costs a sequential
+/// scan: **9.8 ms at 100 000 parked rows against 0.16, and unbounded from
+/// there.** `dead_letters_do_not_cost_the_readiness_probe` is what turns that
+/// back into a failure somebody sees.
 pub async fn lag_secs(db: &Db) -> Result<i64, StoreError> {
     // Cross-tenant: the backlog is not any one tenant's.
     let mut tx = db.admin_tx_bypassing_rls().await?;
-    let lag: Option<i64> = sqlx::query_scalar(concat!(
-        "SELECT max(extract(epoch FROM now() - e.available_at))::bigint \
-           FROM outbox_events e \
-          WHERE e.published_at IS NULL \
-            AND e.available_at <= now() \
-            AND e.attempt_count < $1::int \
-            AND ",
-        agentos_store::not_stopped!("e.tenant_id", "now()"),
-    ))
-    .bind(MAX_ATTEMPTS)
-    .fetch_one(&mut *tx)
-    .await?;
+    let lag: Option<i64> = sqlx::query_scalar(LAG_SQL)
+        .bind(MAX_ATTEMPTS)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.rollback().await?;
     Ok(lag.unwrap_or(0))
 }
+
+/// The statement [`lag_secs`] runs, hoisted out of it so a test can `EXPLAIN`
+/// **the shipped one**. `agentos_store::outbox`'s `CLAIM_SQL` is a constant for
+/// the same reason, and it is the same reason: a test that measures a second
+/// spelling of the query measures nothing about the first.
+const LAG_SQL: &str = concat!(
+    "SELECT max(extract(epoch FROM now() - e.available_at))::bigint \
+       FROM outbox_events e \
+      WHERE e.published_at IS NULL \
+        AND e.available_at <= now() \
+        AND e.attempt_count < $1::int \
+        AND ",
+    agentos_store::not_stopped!("e.tenant_id", "now()"),
+);
 
 #[cfg(test)]
 mod tests {
@@ -1391,5 +1439,111 @@ mod tests {
 
             drop_tenant(&db, tenant).await;
         }
+    }
+
+    /// **The readiness probe does not walk a tenant's dead letters either — and
+    /// it stopped doing so by accident, which is why this exists.**
+    ///
+    /// `migrations/0057_outbox_claimable.sql` measured [`lag_secs`] at 14.1 ms
+    /// against 100 000 parked rows and left it alone on the stated grounds that
+    /// it "still reads the wide one". It does not: `attempt_count < $1::int` is
+    /// the predicate `outbox_events_claimable_idx` is partial on, and a custom
+    /// plan proves the implication from the bound value exactly as the claim's
+    /// does. Re-measured, it is 0.16 ms at 100 000 parked and 0.13 ms at a
+    /// million — flat — while the sequential-scan fallback is 9.8 ms at 100 000
+    /// and grows without a ceiling. `/readyz` is what a load balancer asks
+    /// before sending traffic, so the thing at the end of that road is a
+    /// deployment whose replicas leave rotation because one customer never
+    /// connected a model, which is the exact failure this probe's own docs
+    /// refuse to have.
+    ///
+    /// Nothing enforced it. The claim's
+    /// `a_tenants_dead_letters_are_not_scanned_by_every_claim` passes whatever
+    /// this statement does, and the two behavioural lag tests above pass a
+    /// sequential scan happily — they assert the *number*, and for the drift
+    /// that matters the number is identical either way. Measured, not assumed:
+    /// of the answer-preserving rewrites of this one clause,
+    /// `NOT (attempt_count >= $1)`, `$1 > attempt_count`, `attempt_count <= 7`
+    /// and `BETWEEN 0 AND 7` all keep the index — PostgreSQL's prover is better
+    /// than it is given credit for — while `attempt_count::bigint < $1::bigint`,
+    /// `coalesce(attempt_count, 0) < $1` and `attempt_count NOT IN (…)` all
+    /// silently fall to a sequential scan with the same answer. A cast is one
+    /// keystroke and there is nothing else in the workspace that would notice.
+    ///
+    /// **One assertion, and the second one was written and then deleted.** The
+    /// claim's test pairs the index name with a `Rows Removed by Filter` bound,
+    /// because its plan has two nodes that can read the index and a name can be
+    /// right in one of them. This plan has a single scan node, so no mutation of
+    /// this query makes that second assertion fire while the first passes — the
+    /// only thing that could is a future migration *widening*
+    /// `outbox_events_claimable_idx`, which turns
+    /// `a_tenants_dead_letters_are_not_scanned_by_every_claim` red on the very
+    /// same index. A second copy of a guard that already exists is a second
+    /// thing to keep true.
+    ///
+    /// It `EXPLAIN`s [`LAG_SQL`] itself, with the bind [`lag_secs`] uses, so it
+    /// is the shipped statement and the shipped parameter and not a retyping of
+    /// either.
+    #[tokio::test]
+    async fn dead_letters_do_not_cost_the_readiness_probe() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let tenant = seed_tenant(&db).await;
+
+        /// Enough that walking them is unmistakable in the plan, few enough
+        /// that one INSERT is instant.
+        const PARKED: i64 = 5_000;
+
+        // Exactly what `outbox::park` leaves: unpublished, attempts burnt, and
+        // `available_at` *not moved*, so they sort ahead of anything claimable.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outbox_events \
+                 (id, tenant_id, aggregate_type, aggregate_id, event_type, payload, \
+                  created_at, available_at, attempt_count, last_error) \
+             SELECT gen_random_uuid(), $1, 'employee', gen_random_uuid(), $2, '{}'::jsonb, \
+                    now(), now() - g * interval '1 second', $4::int, \
+                    'this employee''s policy permits no model at all' \
+               FROM generate_series(1, $3::bigint) g",
+        )
+        .bind(tenant.as_uuid())
+        .bind(EVENT)
+        .bind(PARKED)
+        .bind(MAX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await
+        .expect("seed parked");
+        tx.commit().await.expect("commit parked seed");
+
+        // One claimable row, behind all of them in `available_at` order, so the
+        // probe has an answer to find and has to get past the dead letters to
+        // find it.
+        enqueue(&db, tenant, 1, Utc::now() - TimeDelta::seconds(30)).await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        // `AssertSqlSafe`, and the audit is that both halves are compile-time
+        // constants of this module — a literal `EXPLAIN` prefix and [`LAG_SQL`].
+        // No value reaches the string.
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {LAG_SQL}"
+        )))
+        .bind(MAX_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain the lag probe");
+        tx.rollback().await.expect("rollback the explained probe");
+
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("outbox_events_claimable_idx"),
+            "/readyz no longer reads the index that excludes dead letters, so every \
+             probe on every replica now walks all {PARKED} of them — and every one \
+             the deployment ever produces after that, because nothing deletes them. \
+             The answer is unchanged, which is why nothing else here goes red. \
+             Plan:\n{plan}"
+        );
+
+        drop_tenant(&db, tenant).await;
     }
 }
