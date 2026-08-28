@@ -60,8 +60,20 @@
 //! payment's *amount*, and both of those fields were always in the action.
 //! Neither mutated a payee, and neither could.
 //! [`tests::approving_a_payment_to_one_payee_does_not_authorise_another`] is
-//! the one that can, and it is the test this paragraph is really about: it
-//! would have been green on the old code, which is exactly why it had to exist.
+//! the one that can, and it is the test this paragraph is really about: it goes
+//! **red** against the old behaviour — approve toward A, present B, and the old
+//! hash matched, so the redemption succeeded and the assertion failed. A test
+//! that fails against the defect is the only kind worth adding here.
+//!
+//! # One remainder, and it is a real one: the hash is byte-exact
+//!
+//! `canonical_json` hashes bytes, so the same payee written in NFC and in NFD —
+//! `Duboîs` typed two ways, which is what the test above deliberately uses — are
+//! two different approvals. A client that normalises differently from the one
+//! that filed the request gets `approval_action_mismatch` on a restatement that
+//! is correct to any human reading it. Nothing here normalises, and the fix is
+//! a normalisation at the parse site rather than at the hash, so that what is
+//! stored is what was meant.
 //!
 //! One layer down, `Effects::pay` no longer takes a payee either — it reads it
 //! off the token. Otherwise the ruling would have named A while the payment

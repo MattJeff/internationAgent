@@ -1448,6 +1448,17 @@ impl Buyer {
                             // going to be refused for its taint before any
                             // rule reads a field, and this is what the audit
                             // row will name as the payee that was refused.
+                            //
+                            // Deliberately not `trim`ed and not bounded by
+                            // `MAX_FIELD_CHARS`, which the model's `pay` and
+                            // the 402 path both apply. Those two build a payee
+                            // that can reach an approval row and be hashed;
+                            // this one cannot reach either, because the arm
+                            // below is the only outcome — the action is
+                            // untrusted and high risk, so the taint wire denies
+                            // it before a rule reads a field. Bounding a string
+                            // whose only reader is an audit row would be a
+                            // third copy of a rule that has two.
                             payee: order.supplier.to_string(),
                         }),
                     )
