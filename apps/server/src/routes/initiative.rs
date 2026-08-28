@@ -102,9 +102,9 @@ struct SetInitiative {
 /// The objective, tagged by role.
 ///
 /// No two roles' objectives share a field — one is a purchase, one a sales
-/// beat, one a support queue, one a content brief, one a period close — so this
-/// is a tagged union rather than a struct where fifteen columns out of eighteen
-/// are null for any given employee. The tags are the role packs' own `name()`s,
+/// beat, one a support queue, one a content brief, one a period close, one a
+/// repository — so this is a tagged union rather than a struct where most
+/// columns are null for any given employee. The tags are the role packs' own `name()`s,
 /// and they have to stay that way: `Charter::role` writes one of these strings
 /// into `employee_charters.role` and `Charter::of` reads it back.
 ///
@@ -188,6 +188,20 @@ pub(crate) enum ObjectiveBody {
         /// question back and not a rejection.
         #[serde(default)]
         max_age_days: u32,
+    },
+    #[serde(rename = "engineering")]
+    Engineering {
+        #[serde(default)]
+        repository: String,
+        /// The command that proves a change works. Optional here and a `Gap`
+        /// there, for `escalate_to`'s reason: an operator who has not decided
+        /// gets the question back, not a rejection. There is no `country()` and
+        /// no other parse on any field of this variant — the argument is on
+        /// `rolepack_service::Changes`, and it is `Corridors`' argument.
+        #[serde(default)]
+        checks: Option<String>,
+        #[serde(default)]
+        reviewer: Option<String>,
     },
 }
 
@@ -286,6 +300,17 @@ impl ObjectiveBody {
                     destinations,
                     passports,
                     max_age_days,
+                },
+            }),
+            ObjectiveBody::Engineering {
+                repository,
+                checks,
+                reviewer,
+            } => Ok(Charter::Engineering {
+                objective: rolepack_service::Changes {
+                    repository,
+                    checks,
+                    reviewer,
                 },
             }),
         }

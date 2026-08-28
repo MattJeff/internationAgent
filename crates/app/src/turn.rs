@@ -382,7 +382,7 @@ pub(crate) const BROWSE_RISK: Risk = Risk::Low;
 /// call.
 ///
 /// The cost of being wrong about that was not one absent tool. Every one of the
-/// six role packs lists [`ActionKind::BrowserRead`], every one of their
+/// seven role packs lists [`ActionKind::BrowserRead`], every one of their
 /// briefings tells the employee to go and read somebody's page, and a live dry
 /// run against the real model produced the same sentence from every seat: *I
 /// have no tool that reads anything.* `proof_of_need` — the machine that turns a
@@ -3505,6 +3505,12 @@ mod tests {
             (
                 "entry-requirements",
                 crate::rolepack_service::RolePack::entry_requirements()
+                    .proposable()
+                    .clone(),
+            ),
+            (
+                "engineering",
+                crate::rolepack_service::RolePack::engineering()
                     .proposable()
                     .clone(),
             ),

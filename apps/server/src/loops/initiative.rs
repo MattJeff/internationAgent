@@ -461,13 +461,14 @@ pub(crate) fn plan_of(charter: &Charter) -> Result<Vec<(&'static str, String)>, 
                     .collect()),
             }
         }
-        // The four packs in `rolepack_service` share one `Task` and one
+        // The five packs in `rolepack_service` share one `Task` and one
         // `Stage`, so they share one arm each and one helper — the branch above
         // is written twice because the two older packs have neither in common.
         Charter::Support { objective } => service_plan(objective.plan()),
         Charter::Growth { objective } => service_plan(objective.plan()),
         Charter::Finance { objective } => service_plan(objective.plan()),
         Charter::EntryRequirements { objective } => service_plan(objective.plan()),
+        Charter::Engineering { objective } => service_plan(objective.plan()),
     }
 }
 
@@ -1500,14 +1501,23 @@ async fn vertical_step(
             }
         },
 
-        // The four service packs. No vertical operation exists for any of them
+        // The five service packs. No vertical operation exists for any of them
         // — there is no `vertical::support_turn` to call, not a decision made
         // here — so the employee takes the ordinary turn it always took, and
         // `Charter::brief` still tells it which stage its own plan makes due.
+        //
+        // `Engineering` belongs on this arm for a sharper version of the same
+        // reason. A vertical is Rust doing the world-facing part before the
+        // model writes about it, and everything this seat touches in a
+        // repository is an `Action::McpCall` whose server and tool an operator
+        // named — so there is nothing here for a hard-coded vertical to call,
+        // and one that guessed a tool name would be this binary claiming to
+        // know a vendor's surface.
         Charter::Support { .. }
         | Charter::Growth { .. }
         | Charter::Finance { .. }
-        | Charter::EntryRequirements { .. } => None,
+        | Charter::EntryRequirements { .. }
+        | Charter::Engineering { .. } => None,
     }
 }
 
