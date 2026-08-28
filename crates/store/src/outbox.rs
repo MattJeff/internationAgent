@@ -694,6 +694,30 @@ pub async fn mark_failed(
     Ok(())
 }
 
+/// Prefix on a [`park`] reason meaning: **no operator verb can change this
+/// answer, so do not hand it back.** [`requeue_dead_letters`] skips these.
+///
+/// One constant rather than a pattern each side guesses at, and it lives here
+/// because this is where it is read. The only writer today is
+/// `apps/server/src/main.rs`'s `on_turn`, for a turn that exhausted
+/// `app::turn::Budgets` — a hardcoded `Default` that the workspace's one
+/// `with_budgets` call site only ever *narrows*, so a revival is arithmetically
+/// certain to spend `max_turns` model calls and reach the same number.
+///
+/// **A reason is not this unless the *code* says so, not the situation.** A bad
+/// API key and a policy that permits no model are both terminal and neither is
+/// this: an operator fixes them by connecting a model or writing a layer, which
+/// are precisely the two verbs that call [`requeue_dead_letters`]. The test is
+/// not "can this attempt succeed", it is "is there anything an operator could
+/// do that would make it succeed" — and if a turn budget ever becomes something
+/// policy can raise, whatever verb raises it is the one that should revive these
+/// rows, targeted, rather than this marker coming off.
+///
+/// It reads as prose on purpose: it is the first thing on the line an operator
+/// sees in [`dead_letters`], and it is the sentence that tells them retrying by
+/// hand is not the answer.
+pub const UNREMEDIABLE: &str = "unremediable: ";
+
 /// The handler failed in a way no retry can change. Stop, without losing it.
 ///
 /// The third answer, between [`mark_done`] and [`mark_failed`]. `mark_failed`
@@ -709,9 +733,10 @@ pub async fn mark_failed(
 /// unpublished, with the reason attached, and no poller picks it up again.
 /// `greatest` because a park must never *lower* an attempt count.
 ///
-/// Not a one-way door: [`requeue_dead_letters`] is the operator's verb for
-/// giving a parked row its attempts back once whatever made it impossible —
-/// the employee that was never hired, the address nobody owns — has been fixed.
+/// Not a one-way door — unless the reason starts with [`UNREMEDIABLE`].
+/// [`requeue_dead_letters`] is the operator's verb for giving a parked row its
+/// attempts back once whatever made it impossible — the employee that was never
+/// hired, the address nobody owns — has been fixed.
 ///
 /// This used to be spelled privately in `apps/server/src/loops/inbound.rs`, and
 /// then the outbox poller needed the same three-way decision. One spelling,
@@ -777,19 +802,42 @@ pub async fn dead_letters(
 /// the customer's employees will never answer, on a system whose entire premise
 /// is that they do.
 ///
-/// # It is untargeted, and that is deliberate
+/// # It is untargeted except for one exclusion
 ///
 /// This requeues *every* exhausted event the tenant has, not the ones that died
-/// of `NoModel`. The alternative is matching on `last_error`, which means
-/// pattern-matching a human sentence that any refactor is free to reword — a
-/// filter that silently stops matching is worse than no filter, because the
-/// symptom is the same permanent silence this function exists to end.
+/// of `NoModel`. The alternative — deciding, per row, whether the operator's fix
+/// addresses the reason it died — means pattern-matching a human sentence that
+/// any refactor is free to reword, and a filter of that shape that silently
+/// stops matching is worse than no filter: the symptom is the same permanent
+/// silence this function exists to end.
 ///
-/// The cost of being untargeted is bounded and small: a genuinely poisoned event
-/// fails eight more times over the same two hours and returns to exactly where
-/// it was, with a fresh `last_error` saying so. The trigger is not automatic —
-/// it is a person deliberately connecting a model — so there is no loop here,
-/// only a retry a human asked for.
+/// The one exception is [`UNREMEDIABLE`], and it inverts that argument rather
+/// than ignoring it. It is an **exclusion**, not an inclusion, so its failure
+/// mode is the safe one: a marker that stopped matching would revive the row and
+/// let it repark, which is exactly the behaviour of the day before this existed,
+/// not a new permanent silence. And it is a constant this module owns, shared
+/// with the one writer, rather than a sentence read back by guesswork.
+///
+/// # Why an exclusion is needed at all
+///
+/// Because the "returns to exactly where it was" bound this function used to
+/// claim is not true of every terminal failure. It is true of a poisoned
+/// payload, which fails again in microseconds. It is **false** of a turn that
+/// exhausted `app::turn::Budgets` — those are a hardcoded `Default` that no
+/// operator lever raises, so reviving one buys `max_turns` fresh model calls, on
+/// the customer's own key, to arrive at the identical number and park again. And
+/// the trigger is not the rare deliberate act the paragraph above assumed:
+/// `policy::activate` runs on every `install_layer` and every `rollback_layer`,
+/// which is once per step of onboarding. Nothing converged and every pass was
+/// billed.
+///
+/// So a writer that knows no operator verb can change its answer says so, and
+/// this leaves the row where it is: still unpublished, still in
+/// [`dead_letters`], still carrying the reason — visible and free, instead of
+/// invisible and expensive. What it costs is that a turn which genuinely needs a
+/// bigger budget stays stuck; it was stuck before too, because there is no lever
+/// to unstick it, and the row naming its ceiling is what tells an operator one
+/// has to be built.
 ///
 /// # What it does not touch
 ///
@@ -809,12 +857,19 @@ pub async fn requeue_dead_letters(
     // `TenantTx`, so the tenant filter is the database's. That also means this
     // cannot revive another tenant's stuck mail, which a `Db`-level verb taking
     // a tenant id could have been talked into.
+    //
+    // `coalesce` because a dead letter may carry no reason at all — a row that
+    // simply burned its eight attempts against an unreachable provider — and
+    // `starts_with(NULL, …)` is NULL, which under `NOT` would quietly exclude
+    // every one of them. Those are the rows this function was written for.
     let revived = sqlx::query(
         "UPDATE outbox_events SET attempt_count = 0, available_at = $1 \
-         WHERE published_at IS NULL AND attempt_count >= $2::int",
+         WHERE published_at IS NULL AND attempt_count >= $2::int \
+           AND NOT starts_with(coalesce(last_error, ''), $3)",
     )
     .bind(now)
     .bind(MAX_ATTEMPTS)
+    .bind(UNREMEDIABLE)
     .execute(&mut ***tx)
     .await?;
 
@@ -1602,6 +1657,102 @@ mod tests {
 
         drop_tenant(&db, mine).await;
         drop_tenant(&db, theirs).await;
+    }
+
+    /// **The exclusion, and the thing it must not have become.**
+    ///
+    /// [`UNREMEDIABLE`] exists because one terminal cause has no operator
+    /// remedy: a turn that exhausted `app::turn::Budgets`, which is a hardcoded
+    /// `Default` nothing raises. Reviving one buys `max_turns` model calls to
+    /// reach the identical number, and both callers of
+    /// [`requeue_dead_letters`] are untargeted — `policy::activate` runs on
+    /// every `install_layer` — so it was billed once per policy write forever.
+    ///
+    /// Two rows, and the *second* is the one that catches the dangerous
+    /// mistake. A predicate that excluded everything — `starts_with` against a
+    /// NULL `last_error` is NULL, and `NOT NULL` is NULL, which drops the row —
+    /// would turn this verb back into the one-way door it was written to
+    /// replace, and every assertion about the marked row would still pass. So a
+    /// plain dead letter with no reason at all comes back in the same call.
+    #[tokio::test]
+    async fn an_unremediable_dead_letter_is_left_where_it_is_and_the_others_still_come_back() {
+        let Some(db) = db().await else { return };
+        let _guard = OUTBOX_LOCK.lock().await;
+        clear_outbox(&db).await;
+        let tenant = seed_tenant(&db, "unremediable").await;
+
+        let ceiling = enqueue_committed(&db, tenant, &event(1), at(T0)).await;
+        let ordinary = enqueue_committed(&db, tenant, &event(2), at(T0)).await;
+        // No reason at all: a row that simply burned eight attempts. This is
+        // the `coalesce` in the predicate, and it is a real state — `claim`
+        // hands a row back seven times whatever the handler said.
+        let silent = enqueue_committed(&db, tenant, &event(3), at(T0)).await;
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        park(
+            &mut admin,
+            ceiling,
+            &format!("{UNREMEDIABLE}the turn hit a ceiling: max_turns"),
+        )
+        .await
+        .expect("park the blown ceiling");
+        park(&mut admin, ordinary, "no model is connected")
+            .await
+            .expect("park the ordinary one");
+        sqlx::query("UPDATE outbox_events SET attempt_count = $2 WHERE id = $1")
+            .bind(silent)
+            .bind(MAX_ATTEMPTS)
+            .execute(&mut *admin)
+            .await
+            .expect("exhaust without a reason");
+        admin.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let revived = requeue_dead_letters(&mut tx, at(T0 + 2))
+            .await
+            .expect("requeue");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            revived, 2,
+            "the two remediable dead letters did not both come back; an exclusion that \
+             excludes everything is the one-way door this verb replaced"
+        );
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let claimed: Vec<Uuid> = claim(&mut admin, 10, at(T0 + 3))
+            .await
+            .expect("claim")
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(claimed.contains(&ordinary), "a named reason still revives");
+        assert!(
+            claimed.contains(&silent),
+            "and so does a row with no reason"
+        );
+        assert!(
+            !claimed.contains(&ceiling),
+            "a turn parked on a ceiling no operator can raise was handed back; the poller \
+             will spend the whole budget again to park it a second time"
+        );
+
+        // Still a dead letter, still carrying its reason: the operator who has
+        // to decide whether a bigger budget is worth building reads it here.
+        let dead = dead_letters(&mut admin, 10).await.expect("dead letters");
+        let row = dead
+            .iter()
+            .find(|row| row.id == ceiling)
+            .expect("the parked turn vanished from the dead-letter queue");
+        assert!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|why| why.contains("max_turns")),
+            "the row no longer names the ceiling that stopped it: {:?}",
+            row.last_error
+        );
+        admin.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
     }
 
     /// The ordinary path: claim, succeed, and it is gone for good.
