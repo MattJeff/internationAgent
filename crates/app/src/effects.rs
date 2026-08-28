@@ -508,6 +508,19 @@ pub struct InvoiceDraft {
     pub opportunity_id: Uuid,
     /// What it is for, in one line; ends up on the invoice and in the audit row.
     pub memo: String,
+    /// When payment is due, if a term was agreed. `None` carries no date, and
+    /// **there is no default**: "net 30" is a commercial agreement between two
+    /// companies, not a fact about software. See
+    /// `migrations/0071_an_invoice_needs_a_number.sql`.
+    pub due_at: Option<DateTime<Utc>>,
+    /// What the document is made of. Empty means the memo is the whole
+    /// description; otherwise the lines must total the amount on the token,
+    /// which the store refuses and the database refuses again at commit.
+    ///
+    /// A line can carry a tax rate and nothing in this workspace supplies one:
+    /// see [`agentos_store::invoices::Line::tax_rate_bp`], which is where that
+    /// question is left open for the founder.
+    pub lines: Vec<invoices::Line>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,11 +1732,15 @@ impl Effects {
         let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
         let written = invoices::issue(
             &mut tx,
-            id,
-            draft.opportunity_id,
-            self.principal.employee_id,
-            amount,
-            &draft.memo,
+            invoices::Draft {
+                id,
+                opportunity_id: draft.opportunity_id,
+                issued_by: self.principal.employee_id,
+                amount,
+                memo: &draft.memo,
+                due_at: draft.due_at,
+                lines: &draft.lines,
+            },
         )
         .await;
         match written {
@@ -2697,6 +2714,8 @@ mod tests {
         InvoiceDraft {
             opportunity_id,
             memo: "March".to_owned(),
+            due_at: None,
+            lines: Vec::new(),
         }
     }
 
@@ -3072,7 +3091,7 @@ mod tests {
             register[0].amount,
             Money::new(120_000, Currency::Eur).unwrap()
         );
-        assert_eq!(register[0].issued_by, principal.employee_id);
+        assert_eq!(register[0].issued_by, Some(principal.employee_id));
         assert_eq!(register[0].paid_at, None);
 
         let rows = effect_rows(&db, &principal).await;
