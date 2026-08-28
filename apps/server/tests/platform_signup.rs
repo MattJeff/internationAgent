@@ -728,6 +728,55 @@ async fn a_providers_signing_secret_is_usable_and_findable_nowhere() {
         );
     }
 
+    // **A signature that is well formed and wrong.** The refusal above this one
+    // carries no `webhook-signature` header at all, so `verify_signature`
+    // answers `MissingHeader` on its first line and the MAC is never reached —
+    // which means every assertion in this file used to pass with the comparison
+    // deleted. Measured: `matched |= true` in `providers::email`, all three
+    // tests here green, and the `202` above green too, because a genuine
+    // delivery is accepted either way. This is the arm that only a forged
+    // delivery triggers: same endpoint, same headers, same bytes, signed with a
+    // secret this deployment never registered.
+    let forged_body = r#"{"type":"email.received","created_at":"2026-08-24T10:00:00Z","data":{"email_id":"email_forged","from":"ap@supplier.example","to":["lena@agents.example.com"]}}"#;
+    let forged_timestamp = chrono::Utc::now().timestamp().to_string();
+    let forged = sign_webhook(
+        &Secret::new("whsec_a-secret-this-deployment-never-registered"),
+        "msg_forged",
+        &forged_timestamp,
+        forged_body.as_bytes(),
+    );
+    // The raw `curl`, as above: the harness's `post` cannot carry the three
+    // headers this scheme needs.
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-X",
+            "POST",
+            "-H",
+            "webhook-id: msg_forged",
+            "-H",
+            &format!("webhook-timestamp: {forged_timestamp}"),
+            "-H",
+            &format!("webhook-signature: {forged}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            forged_body,
+            &format!("{}/v1/webhooks/{}", server.base, tenants[0].1),
+        ])
+        .output()
+        .expect("curl");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "401",
+        "a delivery signed with the wrong secret was accepted: the MAC is not \
+         being compared, only the headers counted"
+    );
+
     // The refusal paths, so they have run with the secret in hand and had their
     // chance to render it.
     let (status, unverified) = server.post(

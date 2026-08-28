@@ -772,15 +772,30 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // -- the loops drive it forward on their own ----------------------------
     server.await_provisioned(&id);
     let employee = server.await_active(&id);
-    let health = employee["health"].as_str().unwrap_or_default().to_owned();
-    assert!(
-        health == "online" || health == "degraded",
-        "the employee did not converge: {employee:#}"
-    );
 
-    // Per resource, because "degraded" is only the right answer for the right
-    // reason: every *blocking* step ready, and whatever is not ready is an
-    // optional channel that says exactly what it is waiting on.
+    // **Every step by name, and the state each one is supposed to reach here.**
+    //
+    // This used to be "the four blocking steps are `ready`, and nothing is
+    // `pending` or `provisioning`", which admitted `failed` for all seven of
+    // the others. Measured: making `Step::Browser` answer
+    // `ProviderError::Terminal` left the employee active, left `health` at
+    // `degraded` — an optional step was already failing, so the field did not
+    // move — and left this test green. A vertical whose browser never
+    // provisions is not a degradation the agent card should be advertising.
+    //
+    // The two that are not `ready` are written down rather than tolerated,
+    // because each is a different sentence:
+    //
+    // * `phone` is `disabled` — this deployment has no number pool, and a
+    //   channel switched off on purpose is not a degradation;
+    // * `whatsapp` is `failed`, for `no_whatsapp_sender`:
+    //   `AGENTOS_WHATSAPP_SENDER` is unset and `provisioning::bind` answers
+    //   `Terminal` for it. It is deliberately **not** `pending_external` —
+    //   nothing was ever submitted to a provider, so there is nothing to wait
+    //   for and nothing for the sweeper to chase.
+    //
+    // A new step is a line here, on the same argument the `loop_name` count at
+    // the end of this test is asserted on rather than only its names.
     let mut states: Vec<(String, String)> = employee["resources"]
         .as_array()
         .expect("resources")
@@ -793,23 +808,35 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
         })
         .collect();
     states.sort();
-    eprintln!("--- resource states: {states:?}");
+    let expected: Vec<(String, String)> = [
+        ("a2a", "ready"),
+        ("browser", "ready"),
+        ("company_knowledge", "ready"),
+        ("email", "ready"),
+        ("identity", "ready"),
+        ("mcp", "ready"),
+        ("permissions", "ready"),
+        ("phone", "disabled"),
+        ("vault", "ready"),
+        ("wallet", "ready"),
+        ("whatsapp", "failed"),
+    ]
+    .into_iter()
+    .map(|(step, state)| (step.to_owned(), state.to_owned()))
+    .collect();
+    assert_eq!(
+        states, expected,
+        "the provisioning loop converged this employee to a different company: {employee:#}"
+    );
 
-    for blocking in ["identity", "email", "vault", "permissions"] {
-        let state = states
-            .iter()
-            .find(|(step, _)| step == blocking)
-            .map(|(_, state)| state.as_str());
-        assert_eq!(
-            state,
-            Some("ready"),
-            "{blocking} is a blocking step and it is {state:?}: {employee:#}"
-        );
-    }
-    for (step, state) in &states {
-        assert_ne!(state, "pending", "{step} was never attempted");
-        assert_ne!(state, "provisioning", "{step} is still held by a worker");
-    }
+    // And `health` is the field those states imply. `degraded` because
+    // `whatsapp` is failed and `Employee::resource_health` counts an optional
+    // step that is neither ready nor disabled as a degradation; `online` here
+    // would mean the field had stopped reading the optional steps at all.
+    assert_eq!(
+        employee["health"], "degraded",
+        "the health field does not follow from the resource map above: {employee:#}"
+    );
 
     // Provisioned means *active*: an employee the gate would refuse every
     // action for is a row, not an employee.
@@ -978,16 +1005,25 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // the frontier moved: a published row with no failures behind it. A
     // complaint that is retried is a complaint on its way to the dead-letter
     // queue, and `last_error` is where the old behaviour would show up.
-    let retried = server
+    //
+    // Counted **present and clean**, not "no dirty row": the predicate is
+    // `payload->>'event_id' = 'msg_e2e_2'`, and the day the route files a
+    // delivery under a different key — or takes the id from the body instead of
+    // the `webhook-id` header, which is what the telephony arm already does —
+    // the old spelling matched nothing and passed. An assertion of absence over
+    // a set nothing proves is non-empty is the failure mode this file's
+    // neighbour `platform_signup.rs` guards its own searches against.
+    let published = server
         .count(
             "SELECT count(*) FROM outbox_events \
               WHERE payload->>'event_id' = 'msg_e2e_2' \
-                AND (published_at IS NULL OR attempt_count > 1 OR last_error IS NOT NULL)",
+                AND published_at IS NOT NULL AND attempt_count <= 1 \
+                AND last_error IS NULL",
         )
         .await;
     assert_eq!(
-        retried, 0,
-        "the stored complaint was retried or left unpublished; \
+        published, 1,
+        "the stored complaint was never found, retried, or left unpublished; \
          `Err` in on_webhook is eight attempts and then a dead letter"
     );
     eprintln!("--- the spam complaint was recorded on the trail, not dead-lettered");
@@ -1757,6 +1793,31 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
     // key holds is its label, and `may_decide` refuses four eyes that are one
     // pair. This is the only path in the binary that mints a payment token from
     // a request.
+    //
+    // The second credential is only load-bearing if the first one is refused,
+    // and until this call existed nothing here asked: deleting `may_decide`'s
+    // role check left every assertion below green, because `APPROVER_SECRET`
+    // works with or without it. `ops` is the key that created the employee,
+    // wrote the caps and read the queue — it can see this approval and it may
+    // not decide it.
+    let approve_body = r#"{"action":{"action":"payment_create","amount":{"minor":25000,"currency":"USD"},"payee":"Cabinet Dubois"}}"#;
+    let (status, refused) = server.post(
+        &format!("/v1/approvals/{}/approve", approval.as_uuid()),
+        Some(SECRET),
+        approve_body,
+    );
+    assert_eq!(
+        status, 403,
+        "the requesting deployment's own operator key approved a payment: \
+         one credential is both hands: {refused:#}"
+    );
+    assert_eq!(refused["code"], "role_required", "{refused:#}");
+    assert_eq!(
+        server.count(held).await,
+        0,
+        "a refused approval took the day's headroom anyway"
+    );
+
     let (status, redeemed) = server.curl(
         "POST",
         &format!("/v1/approvals/{}/approve", approval.as_uuid()),
@@ -1767,9 +1828,10 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         // body that leaves it out is a 422 before the hash is ever computed,
         // and one that names another account is `approval_action_mismatch` —
         // `routes::approvals` proves the second half.
-        Some(
-            r#"{"action":{"action":"payment_create","amount":{"minor":25000,"currency":"USD"},"payee":"Cabinet Dubois"}}"#,
-        ),
+        //
+        // The *same* body the `ops` key was refused above, so the only
+        // difference between the 403 and this 200 is which credential sent it.
+        Some(approve_body),
     );
     assert_eq!(status, 200, "the approval could not be spent: {redeemed:#}");
     assert_eq!(redeemed["state"], "redeemed", "{redeemed:#}");
