@@ -1757,6 +1757,46 @@ impl Agent {
                 // `tracing::error!` was the entire trace. The way back is
                 // `outbox::requeue_dead_letters`, which both
                 // `model_access::connect` and `policy::activate` already call.
+                //
+                // **And that way back is what this arm had to be split for.**
+                // A blown ceiling is terminal like the rest, but it is the one
+                // terminal cause with *no operator remedy at all*. `Budgets` is
+                // a `Default` — ten turns, twenty tool calls, two hundred
+                // thousand tokens — and the only `with_budgets` in this binary
+                // is `routes::interview`, which sets `max_turns: 1` to buy
+                // exactly one round trip. That is a narrowing, in code, on a
+                // path that enqueues nothing; there is no surface at all,
+                // policy or otherwise, that *raises* one. So no verb an
+                // operator can run changes this answer. Both callers of
+                // `requeue_dead_letters` are untargeted, and `policy::activate`
+                // runs on every `install_layer` — which `POST /v1/companies`
+                // does once per role — so this row came back, spent the whole
+                // ceiling again on the customer's key to reach the identical
+                // number, and parked. Per policy write, forever.
+                //
+                // `outbox::UNREMEDIABLE` is the store's own word for "do not
+                // hand this back"; the reason still names the ceiling, so the
+                // row is as diagnosable as before and merely no longer free to
+                // resurrect. `Budget::Deadline` cannot reach here — the arm
+                // above takes it — which matters, because a deadline *is*
+                // remediable by another replica and marking it would retire
+                // in-flight mail on every deploy.
+                Err(Failed {
+                    error: err @ TurnError::BudgetExceeded(_),
+                    ..
+                }) => {
+                    tracing::error!(
+                        %conversation_id, %employee_id, code = err.code(), error = %err,
+                        "the agent turn exhausted a ceiling no configuration can raise; \
+                         parking the message and leaving it parked"
+                    );
+                    return Err(Failure::Terminal(format!(
+                        "{}the turn hit a ceiling no configuration change can raise, so \
+                         reviving it would only buy it again: {}",
+                        agentos_store::outbox::UNREMEDIABLE,
+                        err.code()
+                    )));
+                }
                 Err(Failed { error: err, .. }) => {
                     tracing::error!(
                         %conversation_id, %employee_id, code = err.code(), error = %err,
@@ -3228,6 +3268,20 @@ mod tests {
             poller.await.expect("the poller task");
         }
 
+        /// One outbox row's `attempt_count`. `MAX_ATTEMPTS` is a dead letter
+        /// and `0` is a row the poller will claim again — the whole difference
+        /// a requeue makes.
+        async fn attempts(&self, event: Uuid) -> i32 {
+            let mut tx = self.db.tenant_tx(self.tenant).await.expect("tx");
+            let count = sqlx::query_scalar("SELECT attempt_count FROM outbox_events WHERE id = $1")
+                .bind(event)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the event back");
+            tx.rollback().await.expect("rollback");
+            count
+        }
+
         async fn count(&self, sql: &'static str) -> i64 {
             let mut tx = self.db.tenant_tx(self.tenant).await.expect("tx");
             let n: i64 = sqlx::query_scalar(sql)
@@ -3433,6 +3487,160 @@ mod tests {
             "a turn cut short by this replica shutting down was not handed back: a \
              rolling deploy would park every message that happened to be in flight, \
              and no operator verb brings those back: {verdict:?}"
+        );
+
+        landed.teardown().await;
+    }
+
+    /// **A ceiling nobody can raise must not be revived, because reviving it
+    /// buys the whole ceiling again on the customer's key.**
+    ///
+    /// The loop this closes, link by link. `Budgets` is a `Default` — ten
+    /// turns, twenty tool calls, two hundred thousand tokens — that neither
+    /// `Agent::on_turn` nor `loops::initiative` overrides, and the workspace's
+    /// only `with_budgets` (`routes::interview`, `max_turns: 1`) *narrows*, so
+    /// **no lever that raises one exists at all**. A turn that exhausts one is
+    /// `Failure::Terminal` and parks, correctly. But both callers of
+    /// `outbox::requeue_dead_letters` — `model_access::connect` and
+    /// `policy::activate`, which every `install_layer` and every
+    /// `rollback_layer` goes through — revive *every* parked row of the tenant
+    /// without looking at why. So the next policy write resurrects the turn,
+    /// it spends `max_turns` model calls to arrive at the same number, and it
+    /// parks again. Onboarding installs a layer per role, so that is once per
+    /// step, forever, and nothing converges.
+    ///
+    /// The fix is not a filter on which rows may come back — an inclusion
+    /// filter that stops matching after a refactor is permanent silence, which
+    /// is the failure `requeue_dead_letters` was written to end. It is an
+    /// **exclusion**, keyed on [`agentos_store::outbox::UNREMEDIABLE`], which
+    /// the writer and the reader share as one constant. If it ever stopped
+    /// matching, the row would merely be revived and repark — today's
+    /// behaviour, not a worse one.
+    ///
+    /// What is asserted here is the loop and its price, not just the verdict:
+    /// the second run's model calls are the number an operator pays for
+    /// nothing, and it is the assertion that goes red if the exclusion is
+    /// dropped.
+    #[tokio::test]
+    async fn a_turn_parked_on_a_ceiling_no_lever_can_raise_is_not_revived_by_a_policy_change() {
+        let Some(landed) =
+            land_a_message("Walk me through the whole catalogue, line by line.").await
+        else {
+            return;
+        };
+        let event = landed.turn_event().await;
+
+        // A model that never stops asking for a tool. The tool does not exist,
+        // so `Turn::propose` refuses it before the gate is consulted and no
+        // effect runs at all — every round trip here is pure model spend, which
+        // is exactly what the revival was buying.
+        let looping = || {
+            Arc::new(agentos_app::mocks::ScriptedLlm::looping(vec![Ok(
+                LlmResponse::tool_use("toolu_1", "no_such_tool", json!({}), Usage::new(10, 5, 0)),
+            )]))
+        };
+        let ceiling = agentos_app::turn::Budgets::default().max_turns as usize;
+
+        let first = looping();
+        let verdict = landed
+            .take_turn(&event, first.clone(), CancellationToken::new())
+            .await;
+        let Err(Failure::Terminal(why)) = &verdict else {
+            panic!("a turn that exhausted `max_turns` was not parked: {verdict:?}");
+        };
+        assert!(
+            why.contains(Budget::Turns.code()),
+            "the parked row does not say which ceiling stopped it: {why}"
+        );
+        assert_eq!(
+            first.calls(),
+            ceiling,
+            "the run cost the whole turn budget, which is what a revival buys again"
+        );
+
+        // The park itself, through the store's own verb — `take_turn` rolls
+        // back, and it is `loops::outbox::fail` that writes this.
+        let mut tx = landed.db.tenant_tx(landed.tenant).await.expect("tenant tx");
+        agentos_store::outbox::park(&mut tx, event.id, why)
+            .await
+            .expect("park the turn");
+        tx.commit().await.expect("commit the park");
+        assert_eq!(
+            landed.attempts(event.id).await,
+            agentos_store::outbox::MAX_ATTEMPTS,
+            "a terminal failure did not dead-letter the row"
+        );
+
+        // The operator writes a policy layer — one step of onboarding, or any
+        // edit at all. The limits are the harness's plus a per-day turn budget,
+        // which changes nothing this turn reads: `Agent::on_turn` reserves no
+        // turn (the arrival of the message is the reservation) and the layer
+        // still names every model. What is under test is that `activate` calls
+        // `requeue_dead_letters` at all, not what the layer said.
+        //
+        // Asserted to be a real version and not `Installed::Unchanged`: an
+        // identical layer short-circuits before `activate`, so a test that
+        // reinstalled the harness's own limits would pass without the revival
+        // ever being attempted. It did, on the first run of this test.
+        let installed = agentos_store::policy::install_layer(
+            &landed.db,
+            landed.tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                allowed_channels: std::collections::BTreeSet::from([Channel::Email]),
+                max_new_contacts_per_day: 100,
+                allowed_models: agentos_domain::policy::ModelId::ALL.into_iter().collect(),
+                max_turns_per_day: 7,
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+            "an ordinary policy edit",
+        )
+        .await
+        .expect("install the layer");
+        assert!(
+            matches!(installed, agentos_store::policy::Installed::Version(_)),
+            "the layer was unchanged, so `activate` never ran and this test asserts \
+             nothing: {installed:?}"
+        );
+
+        assert_eq!(
+            landed.attempts(event.id).await,
+            agentos_store::outbox::MAX_ATTEMPTS,
+            "a policy edit revived a turn parked on a ceiling no policy can raise; the \
+             poller will now spend the whole turn budget again, on the customer's key, to \
+             reach the same number and park a second time — and once per policy write, \
+             forever"
+        );
+
+        // And the proof that the revival was never free: run the same event
+        // again, as the poller would have, and count what it costs.
+        let second = looping();
+        let again = landed
+            .take_turn(&event, second.clone(), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(&again, Err(Failure::Terminal(_))),
+            "the revived turn ended somewhere new: {again:?}"
+        );
+        assert_eq!(
+            second.calls(),
+            ceiling,
+            "the second run buys the whole ceiling again and lands on the same number"
+        );
+
+        // The row is still visible to whoever alerts on dead letters. This is
+        // the whole trade: the turn stays stuck — it was stuck before, and no
+        // lever to unstick it exists — but it is stuck *and free*, with
+        // `last_error` naming the ceiling for the operator who has to decide
+        // whether a bigger budget is worth building.
+        let mut tx = landed.db.tenant_tx(landed.tenant).await.expect("tenant tx");
+        let dead = agentos_store::outbox::dead_letters(&mut tx, 10)
+            .await
+            .expect("dead letters");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            dead.iter().any(|row| row.id == event.id),
+            "the parked turn vanished from the dead-letter queue; nothing alerts on it now"
         );
 
         landed.teardown().await;
