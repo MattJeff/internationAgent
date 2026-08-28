@@ -4,14 +4,20 @@
 //! The gate is fail-closed: with no `platform` layer `store::policy::load`
 //! answers `NoPlatformLayer`, every action for every tenant is denied, `main`
 //! warns at boot and `/readyz` refuses. Everything about that was already true
-//! and visible. What did not exist was a way to *fix* it — no route writes
-//! `policy_layers` at all — so a fresh install could not be made to work without
-//! hand-written SQL. This is that missing half.
+//! and visible. What did not exist was a way to *fix* it — when this module was
+//! written no route wrote `policy_layers` at all — so a fresh install could not
+//! be made to work without hand-written SQL. This is that missing half.
+//!
+//! One route writes `policy_layers` now: `POST /v1/companies`, and only where
+//! the tenant has no such layer (`409 role_layer_exists` otherwise). "Both
+//! arguments survived, and it turned out they were about *replacing*" below is
+//! the whole story; the sentence above is kept in the past tense rather than
+//! deleted because it is why this module exists.
 //!
 //! Four verbs, and each closes a step `docs/ORIZN.md` used to have to spell as
 //! `psql`:
 //!
-//! | verb | the row nothing else wrote |
+//! | verb | the row nothing else wrote when this was written |
 //! |---|---|
 //! | `install <ceiling.json>` | the platform ceiling |
 //! | `new-tenant <slug> <name>` | the `tenants` row **and** its active `policy_versions` row |

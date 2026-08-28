@@ -365,8 +365,9 @@ Then, from another shell:
 KEY=0123456789abcdef0123456789abcdef
 
 curl -s localhost:8090/livez                      # -> ok
-curl -s localhost:8090/readyz                     # -> {"ready":true,"outbox_lag_secs":0}
-# ...but 503 {"error":"no_platform_policy"} until §1.5 has been run.
+curl -s localhost:8090/readyz   # -> {"ready":true,"outbox_lag_secs":0,"mock_adapters":[…]}
+# ...but 503 with `"code":"no_platform_policy"` until §1.5 has been run — the
+# error bodies are problem+json, see §/readyz below.
 curl -s -H "Authorization: Bearer $KEY" localhost:8090/v1/whoami
 # -> {"tenant_id":"00000000-...-0001","actor":"ops"}
 
@@ -755,16 +756,21 @@ killed and restarted into the same slow database, now with a cold pool.
 ### `/readyz`
 
 ```json
-{"ready": true, "outbox_lag_secs": 0}
+{"ready": true, "outbox_lag_secs": 0, "mock_adapters": []}
 ```
 
-or
+or, and **these bodies are RFC 9457 problem details** — `application/problem+json`,
+the reason is in `code`, never in an `error` key, which is what this block used
+to show:
 
 ```json
-503 {"error":"database","message":"this replica is not ready"}
-503 {"error":"no_platform_policy","message":"this replica is not ready"}
-503 {"error":"outbox_lag","message":"this replica is not ready"}
+503 {"type":"/problems/database","title":"this replica is not ready","status":503,"code":"database"}
+503 {"type":"/problems/no_platform_policy","title":"this replica is not ready","status":503,"code":"no_platform_policy"}
+503 {"type":"/problems/outbox_lag","title":"this replica is not ready","status":503,"code":"outbox_lag"}
 ```
+
+So the thing to alert on is `.code`, and `jq -r .code` is the one-liner.
+`apps/server/src/error.rs` builds every error body in this system the same way.
 
 Three questions, one round trip each:
 
@@ -1287,18 +1293,31 @@ Standard Webhooks / Svix scheme only. Twilio's HMAC-SHA1-over-the-callback-URL
 scheme is implemented in `agentos_providers::telephony` and is not reachable from
 the HTTP surface — there is no telephony ingest at the other end of the queue.
 
-**One webhook endpoint per provider per deployment**, because registrations are
-process configuration rather than a table. A deployment whose tenants each hold
-their own provider account needs a `webhook_endpoints` table.
+**One webhook endpoint per provider per deployment *in the environment*.**
+`AGENTOS_WEBHOOK_SECRETS` is a `HashMap` keyed on the path segment, so it holds
+one registration per provider for the whole deployment and a second entry on one
+path is a boot failure. That is no longer the ceiling it used to be: the
+`webhook_endpoints` table (`migrations/0053`, `POST /v1/platform/webhooks`) is
+where a second tenant behind the same provider account is registered, on an
+opaque minted path. §470's table entry has said so for some time while this
+sentence went on calling the table hypothetical.
 
-**API keys cannot be issued or revoked without a restart.** The keyring is an
-environment variable. It has the properties that matter — the secret is never in
-the database, rotation is a redeploy, unset authenticates nobody.
+**API keys are issued and revoked at runtime, without a restart.**
+`POST /v1/platform/keys` issues one and `DELETE /v1/platform/keys/{id}` revokes
+it; `auth::Keyring` reads the environment first and then `api_keys`, on every
+authenticated request with no cache, which is what makes revocation instant
+rather than eventually-consistent. The environment keyring still exists and
+still works — unset authenticates nobody — and neither half stores a secret, only
+its hash. This entry used to read "cannot be issued or revoked without a
+restart", which was true of the environment half alone.
 
-**No tenant endpoint and no dead-letter endpoint.** Those are SQL. There *is* a
-stranded-resource endpoint (§6) and a knowledge *ingest* endpoint
+**No dead-letter endpoint.** That is SQL. There *is* a stranded-resource
+endpoint (§6) and a knowledge *ingest* endpoint
 (`POST /v1/knowledge/documents`) — but no knowledge *search* endpoint; retrieval
-happens inside a turn.
+happens inside a turn. There is also a tenant endpoint, `POST /v1/platform/tenants`,
+behind `AGENTOS_PLATFORM_KEYS` — this entry named it as missing alongside the
+others. What has no route, and cannot have one, is a tenant creating a tenant:
+every route on the tenant surface derives its tenant from the API key.
 
 **`/metrics` is mounted, and unauthenticated by design.** `apps/server/src/metrics.rs`
 builds a Prometheus router with six families and `app()` merges it beside
@@ -1309,10 +1328,13 @@ credential, and every number it exposes is a cross-tenant aggregate.
 tier that can see a client address. `/metrics` tells a stranger the
 deny-reason mix and the depth of the approval queue.
 
-One family is not real: `agentos_llm_tokens_total` reads zero everywhere,
-because `metrics::record_llm_usage` has no production caller yet. The other
-five carry live numbers. The complementary operational reads remain `/readyz`,
-`/v1/inventory/stranded` and SQL.
+All six carry live numbers. `agentos_llm_tokens_total` was the last to:
+`metrics::record_llm_usage` is called from `main.rs`'s turn handler on both its
+exits, the failed turn and the finished one. This paragraph, `README.md` and
+`SPEC.md` §27 all said it had no production caller — one sentence, three
+documents, and fixing any one of them alone would have read like a correction
+while two copies went on lying. The complementary operational reads remain
+`/readyz`, `/v1/inventory/stranded` and SQL.
 
 **Company knowledge is plaintext and Markdown only, on a hash embedder.** No URL
 fetching, no PDF parsing, no file upload, no malware or content-type validation.

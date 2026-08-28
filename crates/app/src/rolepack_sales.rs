@@ -880,8 +880,10 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means a
-    /// fourteenth action cannot be added without someone deciding here whether
-    /// a sales employee may propose it.
+    /// sixteenth action cannot be added without someone deciding here whether
+    /// a sales employee may propose it. There are fifteen today
+    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 15]`); this said
+    /// "fourteenth" after both `charter_set` and `internal_send` had landed.
     #[test]
     fn the_sales_role_cannot_propose_an_action_outside_its_allowlist() {
         let sales = sales();

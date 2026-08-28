@@ -148,8 +148,15 @@
 //! A human, and the audit row names them. That is not enforced by a role check
 //! here — it is enforced by there being nothing for an employee to reach it
 //! with. No `Action` variant rules on a halt, so `PolicyGate` cannot mint a
-//! token for one; `Effects` exposes no method; `agentos_store::halt` is called
-//! from exactly two readers and this one writer; and every HTTP caller is an
+//! token for one; `Effects` exposes no method; `agentos_store::halt` has two
+//! readers — `agentos_app::gate::PolicyGate` and
+//! `agentos_app::model_access::connected`, both on `halt::halted` — and two
+//! writers, and both writers are operator routes in this binary: this file, and
+//! `routes::companies::create_company`, which may write a company's **first**
+//! window through `halt::set_window` and answers `409 window_exists` rather than
+//! replacing one. (That second writer is why this sentence used to say "this one
+//! writer" and stopped being true: `POST /v1/companies` gives a company its
+//! clock, and a clock is a halt with a date on it.) Every HTTP caller is an
 //! operator API key (`crate::auth`), never a seat. A tenant cannot halt another
 //! tenant because the write goes through `tenant_tx` and `company_halts` has RLS
 //! forced with `with check` — Postgres refuses it, not a handler.

@@ -907,7 +907,9 @@ nothing and the seller had nobody to write to. The lists are Smartlead exports
 in `~/Desktop/VOYAGEURS`:
 
 ```sh
-IMPORT="$BIN import --tenant $TENANT"
+# `$BIN` — nothing above this line ever set it, so every command in this block
+# used to run as a bare `import`. Same binary as steps 1–5, spelled the same way.
+IMPORT="agentos-server import --tenant $TENANT"
 
 # Look first. --dry-run does every judgement and commits nothing.
 $IMPORT --segment relocation --country PH --dry-run \

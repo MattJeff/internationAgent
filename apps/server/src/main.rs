@@ -203,7 +203,7 @@ enum BootError {
 }
 
 fn main() -> ExitCode {
-    // All three subcommands run before `Config::from_env`, and for the same
+    // All four subcommands run before `Config::from_env`, and for the same
     // reason: `doctor` answers "what do I still need to make this work?",
     // `policy` installs the one thing it cannot answer for, `flow` writes the one
     // piece of material the sales vertical cannot invent, and `import` loads a

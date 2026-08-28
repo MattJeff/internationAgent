@@ -30,8 +30,10 @@ Five crates, one binary, five loops.
 ```text
 agentos-domain      pure types, employee state machine, Policy Gate evaluator
    │                (no tokio, no sqlx, no reqwest — the absence IS the enforcement)
-   ├──> agentos-store       the only crate that speaks SQL
-   ├──> agentos-providers   the only crate that holds network clients
+   ├──> agentos-store       owns the schema, the migrations and TenantTx —
+   │                        every SQL statement anywhere runs inside one
+   ├──> agentos-providers   the outbound provider clients: email, SMS, WhatsApp,
+   │                        browser, LLM
    │       │
    │       └──> agentos-app orchestration; may call a provider only while
    │                        holding an Authorized<A> from the Policy Gate
@@ -45,6 +47,24 @@ agentos-eval        a sixth crate, off to the side: measures judgement, not
 `agentos-providers` is deliberately absent from the server's manifest. The
 server cannot reach a provider except through `agentos-app`'s `Effects` façade,
 and that is enforced by Cargo, not by review.
+
+**Those two lines used to read "the only crate that speaks SQL" and "the only
+crate that holds network clients", and neither survives a `grep`.** `agentos-app`
+and `agentos-server` both run `sqlx::query*` in production — around thirty files
+between them — and `agentos-app` builds its own `reqwest::Client` twice, in
+`oauth.rs` (the MCP token exchange) and `peer_keys.rs` (fetching an A2A peer's
+signing keys). What *is* enforced, and what those lines were reaching for: the
+only crate with no tokio, no sqlx and no reqwest at all is `agentos-domain` —
+check its `Cargo.toml`, the absence is the enforcement — and the SQL written
+outside `agentos-store` is nearly all written against a `TenantTx` that
+`agentos-store` opened, which sets the RLS tenant before the caller gets it, so
+scoping is not something a caller can forget to ask for. The two ways past that
+are both named to be greppable rather than to be convenient:
+`Db::admin_tx_bypassing_rls`, and `agentos-server`'s `doctor`, which opens a
+pool of its own precisely because it has to answer "is this database reachable
+and migrated" before there is a `Db`. `crates/store/src/db.rs` makes the same
+point about counting: `grep -rn admin_tx_bypassing_rls` is the list, and a
+number in a document is not.
 
 Two rules carry the design.
 
@@ -344,9 +364,13 @@ rather than returning a plausible id somebody will one day believe), the Meta
 WhatsApp adapter (so `whatsapp` fails `no_whatsapp_sender` on every deployment
 and `degraded` is the healthy steady state), a served DID document, and key
 rotation. `/metrics` *is* mounted — beside `/livez` and `/readyz`, outside the
-API auth stack, so the listener must not be publicly routable — but
-`agentos_llm_tokens_total` reads zero on every deployment, because nothing in
-production calls `metrics::record_llm_usage` yet.
+API auth stack, so the listener must not be publicly routable — and
+`agentos_llm_tokens_total` is live: `main.rs`'s turn handler calls
+`metrics::record_llm_usage` on both of its exits, the failed turn and the
+finished one. This paragraph said the opposite ("reads zero on every deployment,
+because nothing in production calls it yet") for as long as it took someone to
+grep, which is the failure mode `apps/server/src/metrics.rs` had carried in its
+own module header at the same time.
 
 **How many tests there are is a command, not a line in this file.**
 

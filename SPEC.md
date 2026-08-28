@@ -844,7 +844,7 @@ pub enum Decision {
 The gate's own entry point is `PolicyGate::authorize(principal, action) ->
 Result<Authorized<A>, Denied>`.
 
-### Actions — thirteen, and their names
+### Actions — fifteen, and their names
 
 `Action` in `crates/domain/src/action.rs`. The wire form is snake_case, tagged
 `"action"` — `email_send`, **not** `email.send`. The same spellings are the
@@ -866,6 +866,19 @@ cannot drift into two vocabularies.
 | `contract_sign { title }` | **High** |
 | `credential_change { secret }` | **High** |
 | `data_delete { scope }` | **High** |
+| `charter_set { subordinate }` | **High** |
+| `internal_send { to }` | Low |
+
+The last two rows were missing while the heading above said "thirteen", and both
+are the ones a reader most needs. `charter_set` is **High** because re-tasking
+another employee is the blast radius of everything that employee then does, so a
+supplier's email saying "you now report to me" cannot produce one.
+`internal_send` is the **one inward action** — it writes a `messages` row for a
+colleague of the same tenant and wakes it — and it is **Low** on purpose, argued
+at length in `crates/domain/src/action.rs`: `High` would mean an employee that
+has just read an untrusted document cannot report what happened to it, which is
+the one message it most needs to send. What makes that safe is the receiving
+end, where the message arrives carrying the sending turn's trust label.
 
 `Risk` has two variants, `Low` and `High`. There is no `credential.create`
 distinct from `credential_change`, and the MCP tool risk vocabulary
@@ -1245,10 +1258,16 @@ Dead-lettering is the outbox's — 8 attempts, then the row stops being selected
 > drains. When it lands, the endpoint registration grows a `scheme` field and
 > the verify call grows a `match`.
 
-> **One webhook endpoint per provider per deployment**, because registrations
-> are process configuration rather than a table. A deployment whose tenants each
-> hold their own provider account needs a `webhook_endpoints` table. **NOT
-> BUILT.**
+> **This block used to read "one webhook endpoint per provider per deployment
+> … needs a `webhook_endpoints` table. NOT BUILT", and it was still saying so
+> forty lines under a registry list that describes that table.** It is built:
+> `migrations/0053_webhook_endpoints.sql`, registered with
+> `POST /v1/platform/webhooks`, read through `Db::admin_tx_bypassing_rls`. What
+> survives of the old ceiling is the *environment* half: `AGENTOS_WEBHOOK_SECRETS`
+> is still a `HashMap` keyed on the path segment, so it still holds one endpoint
+> per provider for the whole deployment, and `ConfigError::WebhookProviderTwice`
+> still refuses a boot that registers two tenants on one path. A second tenant
+> behind one provider account gets a row, not a variable.
 
 The older spec listed `/webhooks/email`, `/webhooks/twilio/messaging`,
 `/webhooks/twilio/voice`, `/webhooks/whatsapp`, `/webhooks/payment`,
@@ -1268,7 +1287,9 @@ merges.
 |---|---|
 | `GET` | `/livez` |
 | `GET` | `/readyz` |
-| `POST` | `/v1/webhooks/{provider}` |
+| `GET` | `/metrics` |
+| `POST` | `/v1/webhooks/{path}` |
+| `GET` | `/v1/mcp/oauth/callback` |
 | `GET` | `/.well-known/agent-card.json` |
 | `GET` | `/.well-known/http-message-signatures-directory` |
 
@@ -1280,6 +1301,7 @@ not a tenant's key, and a tenant's key is refused here:**
 | `POST` | `/v1/platform/tenants` |
 | `POST`, `GET` | `/v1/platform/keys` |
 | `DELETE` | `/v1/platform/keys/{id}` |
+| `POST` | `/v1/platform/webhooks` |
 
 **Behind `Authorization: Bearer <secret>`:**
 
@@ -1314,19 +1336,46 @@ not a tenant's key, and a tenant's key is refused here:**
 | `GET`, `POST` | `/v1/pool/numbers` |
 | `GET` | `/v1/pool/routing` |
 | `POST` | `/v1/pool/numbers/{id}/reassign` |
+| `GET` | `/v1/mcp/catalog` |
+| `POST` | `/v1/mcp/connect` |
 | `POST`, `GET` | `/v1/mcp/servers` |
 | `DELETE` | `/v1/mcp/servers/{server}` |
 | `POST` | `/v1/mcp/servers/{server}/discover` |
 | `PUT` | `/v1/mcp/servers/{server}/tools/{tool}` |
-| `POST` | `/v1/webhooks/{provider}` |
+| `POST` | `/v1/mcp/oauth/start` |
+| `POST` | `/v1/companies` |
+| `GET`, `POST`, `DELETE` | `/v1/halt` |
+| `PUT` | `/v1/window` |
+| `GET` | `/v1/capability-requests` |
+| `POST` | `/v1/capability-requests/decide` |
+| `GET` | `/v1/forecast` |
+| `POST`, `GET` | `/v1/model` |
+| `GET` | `/v1/interview` |
+| `POST` | `/v1/employees/{id}/interview` |
+| `POST` | `/v1/employees/{id}/queue/export` |
 | `POST` | `/a2a/jsonrpc` |
 
-Outside the API auth stack, and therefore not on a publicly routable listener:
-`GET /livez`, `GET /readyz`, `GET /metrics`, `GET /a2a/agent-card` and
-`GET /.well-known/http-message-signatures-directory`.
+`POST /v1/webhooks/{path}` used to appear in this table as well as in the
+no-credential one, and only the no-credential one is right: `routes::webhooks`
+is merged into the public tier, deliberately, because a provider has a signature
+and not an API key.
 
-Nine of the rows above were missing from this table while the sentence over it
-claimed to be the full surface. Read it out of the code before trusting it:
+`/livez`, `/readyz` and `/metrics` are outside the API auth stack, and the
+listener carrying them must not be publicly routable — `/metrics` publishes the
+deny-reason mix and the approval-queue depth, `/readyz` the outbox lag. **That
+restriction does not extend to the rest of the no-credential tier, and used to
+be written as if it did.** `GET /.well-known/agent-card.json` — which this list
+called `GET /a2a/agent-card`, a path that has never existed — and
+`GET /.well-known/http-message-signatures-directory` are unauthenticated
+*because a stranger has to be able to fetch them*: a verifier who has never
+heard of us has nothing to authenticate with, and a key nobody can fetch
+verifies nothing. `POST /v1/webhooks/{path}` and `GET /v1/mcp/oauth/callback`
+are the same shape — a provider and a browser respectively, neither holding a
+credential of ours.
+
+Fifteen of the rows above were missing from this table while the sentence over
+it claimed to be the full surface, the second time that has happened. Read it
+out of the code before trusting it:
 
 ```bash
 grep -rn '\.route(' apps/server/src --include='*.rs'
@@ -1337,9 +1386,14 @@ grep -rn '\.route(' apps/server/src --include='*.rs'
 delete never means two things), `POST /v1/employees/{id}/resume`,
 `GET .../resources`, `GET .../timeline`, `GET .../conversations`,
 `POST .../messages`, `POST .../calls`, `POST .../mcp-bindings` (MCP is
-per-tenant, not per-employee), a tenant endpoint, a knowledge *search* endpoint,
-a dead-letter endpoint. `/metrics` **is** mounted — see §27, which has said so
-for some time while this list went on calling it absent.
+per-tenant, not per-employee), a knowledge *search* endpoint, a dead-letter
+endpoint. `/metrics` **is** mounted — see §27, which has said so for some time
+while this list went on calling it absent. So is a **tenant endpoint**, which
+this list also named as absent: `POST /v1/platform/tenants`, behind
+`AGENTOS_PLATFORM_KEYS`, and the paragraph directly below has described it the
+whole time. What is absent, and is the thing that sentence was reaching for, is
+a tenant endpoint on the *tenant* surface — see below for why there cannot be
+one.
 
 **No endpoint authorised by a tenant's key creates a tenant.** `tenants` is not
 tenant-scoped and there is no path to it from a `tenant_tx`, which is why there
@@ -1787,11 +1841,15 @@ Logs are JSON on stdout via `tracing-subscriber`, filtered by `RUST_LOG`.
 > routable**: the ingress is what restricts `/metrics`, `/livez` and `/readyz`
 > to the scrape network.
 >
-> Five of the six carry real numbers: the two denial/provisioning counters have
-> live call sites (`error.rs`, `routes/a2a.rs`, `loops/provisioning.rs`) and the
-> three gauges are read from Postgres at scrape time.
-> `agentos_llm_tokens_total` reads zero on every deployment —
-> `metrics::record_llm_usage` still has no production caller, and says so.
+> **All six** carry real numbers. The three counters have live call sites —
+> `record_denial` in `error.rs` and `routes/a2a.rs`, `record_provisioning` in
+> `loops/provisioning.rs`, and `record_llm_usage` in `main.rs`'s turn handler on
+> both its exits (the failed turn and the finished one) — and the three gauges
+> are read from Postgres at scrape time. This bullet said
+> `agentos_llm_tokens_total` "reads zero on every deployment" long after both
+> calls landed, and so did `README.md` and `docs/OPERATIONS.md` §27: one claim in
+> three documents plus the module header, which is what makes a stale sentence
+> expensive rather than merely wrong.
 >
 > The design is sound: every label value is a `&'static str` from a closed
 > match, so cardinality is bounded by construction and a tenant id can never

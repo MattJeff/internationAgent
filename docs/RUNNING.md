@@ -111,19 +111,28 @@ inert anyway: it cannot take a turn, be claimed by the outbox or the initiative
 loop, or have a token minted for it, because all four read `halted()`.
 
 **What is genuinely open is provisioning, and it spends real money.**
-`loops/provisioning.rs`'s claim filters neither `company_halts` nor
-`company_windows`, and runs on `admin_tx_bypassing_rls`. So the eleven resources
-a hire leaves `pending` — mailboxes, phone numbers — are bought for a company
-that is stopped. This module argues, correctly, that half-covering convergence
-is worse than not covering it: interrupting one leaves resources bought and
-unbound, which is what `GET /v1/inventory/stranded` exists to find.
+**That gap is closed, and this paragraph described it as open long after.**
+`loops/provisioning.rs`'s `CLAIM_SQL` now ends in `not_stopped!("r.tenant_id")`,
+so a stopped company's `pending`, `failed` and `pending_external` rows are not
+claimed at all and nothing is bought for a company that is stopped. It still
+runs on `admin_tx_bypassing_rls`, which is why the predicate is spelled into the
+SQL rather than asked of a per-tenant reader.
 
-That argument was written when a stop was rare, brief, and thrown by a human who
-meant to lift it. Since `0054` a company stops **by itself, on a date, and can
-stay stopped for weeks**, which turns "we buy anyway" from an hour's tolerance
-into a standing bill. The wedge the old argument misses: *not starting* a
-convergence that has bought nothing yet strands nothing at all, and is not the
-same act as interrupting one in flight.
+The old argument — half-covering convergence is worse than not covering it,
+because interrupting one leaves resources bought and unbound, which is what
+`GET /v1/inventory/stranded` exists to find — was written when a stop was rare,
+brief, and thrown by a human who meant to lift it. Since `0054` a company stops
+**by itself, on a date, and can stay stopped for weeks**, which turned "we buy
+anyway" from an hour's tolerance into a standing bill. The wedge that resolved
+it: *not starting* a convergence that has bought nothing yet strands nothing at
+all, and is not the same act as interrupting one in flight.
+
+**What is still open, named rather than implied.** The one row a stopped company
+*does* still get claimed for is a `provisioning` row whose lease has lapsed —
+a provider call whose outcome nobody knows, and the only reconciler of one is
+`converge`. `converge` takes an employee and not a step list, so that employee's
+other pending steps converge with it. Closing that last gap is the resumable
+state machine, and it is still not built.
 
 There is still no backfill for companies that predate `0054`, because a backfill
 needs a default duration, and a duration is a price.
@@ -134,13 +143,23 @@ emergency stop respects the window with no change, and no second list of callers
 has to be kept in sync. A manual halt beats a window that is still open; a
 window can only close, never re-open.
 
-**The exception is the price of that shape, and it has already been paid.** Two
-statements are cross-tenant SQL driven by `tenants` with an injected clock —
-`outbox::claim_of` and `initiative::claim_due` — so they cannot ask a per-tenant
-reader and spell the predicate out instead. The halt clause landed in one and
-the window clause in the other, and for a while a company whose month had ended
-still had its employees claimed and their cadence spent. Anything added to
-`halt::halted()` has to be copied into both by hand.
+**The exception is the price of that shape, and it has been paid twice.** Some
+statements are cross-tenant and cannot open a per-tenant transaction, so they
+cannot ask `halt::halted()` and must spell the predicate into their own SQL. The
+halt clause once landed in one and the window clause in the other, and for a
+while a company whose month had ended still had its employees claimed and their
+cadence spent — which is what "copy it by hand into both" costs.
+
+**It is no longer copied by hand, and there are no longer two.**
+`agentos_store::not_stopped!` is the one spelling of the predicate, pasted at
+compile time, and it has **four** call sites: `store::outbox::claim_of`,
+`store::initiative::claim_due`, `server::loops::outbox::lag_secs` and
+`server::loops::provisioning`'s `CLAIM_SQL`. Two of those did not exist when
+this paragraph said "two … by hand". The macro takes the clock as an argument
+because the pollers inject a movable `now` and `lag_secs` reads the
+transaction's own `now()`; passing the wrong one does not typecheck, which is
+how the second arm was found. Anything added to `halt::halted()` still has to
+be added to the macro — but to the macro, once.
 
 **Three doors now demand an opt-out declaration, and nobody reads the answers.**
 `LeadSink::opted_out` has always been a required trait method. The MCP catalogue

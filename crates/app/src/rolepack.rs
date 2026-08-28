@@ -774,8 +774,11 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means
-    /// a fourteenth action cannot be added without someone deciding here
-    /// whether a buyer may propose it.
+    /// a sixteenth action cannot be added without someone deciding here
+    /// whether a buyer may propose it. (There are fifteen —
+    /// `Action::ALL_DISCRIMINANTS` is `[ActionKind; 15]`. This said "fourteenth"
+    /// while `charter_set` and `internal_send` had both already landed, which is
+    /// an ordinal that dates itself; the property it names does not.)
     #[test]
     fn the_buyer_cannot_propose_an_action_outside_its_allowlist() {
         let buyer = buyer();

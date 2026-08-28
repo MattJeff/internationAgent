@@ -69,11 +69,19 @@ adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
           embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
 ```
 
-Adding a new provider is a change to `crates/app/src/mocks.rs` (the only file
-that may name a concrete provider type — the binary must not depend on
-`agentos-providers`, and that absence is what makes the capability token
-unforgeable), plus a row in `PROVIDER_CREDENTIALS` in `config.rs`. Forgetting
-the second is a compile error, not a provider that ships as a mock.
+Adding a new provider is a change to `crates/app/src/mocks.rs`, plus a row in
+`PROVIDER_CREDENTIALS` in `config.rs`. Forgetting the second is a compile error,
+not a provider that ships as a mock.
+
+What is enforced is the *crate* boundary, not the file: `apps/server` has no
+`agentos-providers` in its manifest, so the binary cannot name a concrete
+provider type at all, and that absence is what makes the capability token
+unforgeable. This paragraph used to say `mocks.rs` was the only file that may
+name one, and there is a second: `crates/app/src/model_access.rs` builds an
+`AnthropicLlm` per turn, around **the tenant's own stored key**. That is
+precisely the thing `mocks.rs` cannot do — it selects adapters from process
+configuration, and a customer's credential is a row, not configuration — so it
+is a second site by construction rather than by drift.
 
 ---
 

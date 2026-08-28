@@ -43,17 +43,23 @@
 //! [`crate::loops::outbox::lag_secs`], the poller's own definition, so this
 //! endpoint and `/readyz` can never disagree about whether the queue is behind.
 //!
-//! Each counter has exactly one production call site, and each is the place the
-//! event funnels through rather than a place it happens to pass:
+//! Every counter's production call sites are one per *surface*, and each is the
+//! place the event funnels through rather than a place it happens to pass. That
+//! is the property worth holding — not a count, which has already been wrong
+//! here twice:
 //!
 //! * [`record_denial`] — `impl From<Denied> for ApiError` in
-//!   [`crate::error`], and `routes::a2a::denied` for the JSON-RPC surface.
+//!   [`crate::error`], and `routes::a2a::denied` for the JSON-RPC surface,
+//!   which does not build an `ApiError`.
 //! * [`record_provisioning`] — `loops::provisioning`'s `drive`, which is where
 //!   the engine's reports come back.
-//! * [`record_llm_usage`] — still test-only, and deliberately left alone;
-//!   token persistence is landing on that path separately. Until it does,
-//!   `agentos_llm_tokens_total` reads zero, which is a lie with a known
-//!   expiry date rather than an unknown one.
+//! * [`record_llm_usage`] — the turn handler in `main.rs`, on both of its exits:
+//!   the failed turn and the finished one. Both are needed and neither is a
+//!   funnel for the other — a turn that dies mid-model-call has still spent the
+//!   tokens, and billing it on only one exit is the same undercount as not
+//!   billing it at all. `agentos_llm_tokens_total` therefore does **not** read
+//!   zero any more; this bullet said "still test-only" long after both calls
+//!   landed, which was the last of the three counters to stop being a lie.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
