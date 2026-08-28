@@ -1504,8 +1504,13 @@ the database, and rotation is a deploy rather than a migration.
 - `Db` does not expose its pool. No accessor, no `Deref`, no `pub(crate)` leak.
   The only public way to a connection is `tenant_tx`; the escape hatch is
   `Db::admin_tx_bypassing_rls`, named so it cannot appear in a diff unnoticed.
-  Its legitimate callers are migrations, the outbox poller and the provisioning
-  loop's claims — all cross-tenant by nature.
+  What legitimately needs it is a *shape* — a loop that is cross-tenant by
+  definition, a read of a row belonging to no tenant, a lookup that runs before
+  anybody knows who is asking, and the separately-authenticated platform
+  operator surface. `docs/OPERATIONS.md` sets those out. This line used to name
+  "migrations, the outbox poller and the provisioning loop's claims"; there are
+  twenty-six callers outside tests, and migrations was never one of them —
+  `Db::migrate` opens no transaction at all.
 - **`tenant_id` comes from the API key and from nothing else.** A row belonging
   to another tenant is invisible to RLS, surfaces as `NotFound`, and is answered
   **404** — not 403, which would confirm the id exists.

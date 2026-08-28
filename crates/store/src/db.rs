@@ -533,6 +533,258 @@ mod tests {
         tx.rollback().await.expect("rollback");
     }
 
+    /// **Every table in the schema is confined, and confined against its owner.**
+    ///
+    /// Asked of `pg_class` and `pg_policies` rather than of the migrations, for
+    /// the reason the foreign-key sweep above is: a `.sql` file says what
+    /// somebody wrote, and a later migration can quietly take it back. This
+    /// says what Postgres built.
+    ///
+    /// # The three ways a table stops being confined, and why each is silent
+    ///
+    /// **No `enable`.** The loud one. Any behavioural test that reads across
+    /// tenants catches it.
+    ///
+    /// **`enable` without `force`.** The quiet one, and the reason this test
+    /// reads a catalog instead of writing rows. RLS does not apply to the table
+    /// **owner**, and this deployment migrates as `postgres`, which owns every
+    /// table here. `Db::tenant_tx` opens with `SET LOCAL ROLE app_role` to stop
+    /// being the owner, so a behavioural test through `tenant_tx` passes on a
+    /// table with no `force` — it is testing a role that was never the owner in
+    /// the first place. What it does not cover is every other way this database
+    /// is reached: `psql` on the box, a migration's own `do $$` block, a job
+    /// somebody adds next year that forgets the `SET LOCAL ROLE`. `force` is
+    /// what makes the policy a property of the table rather than of the
+    /// caller's discipline, and only `relforcerowsecurity` can see it.
+    ///
+    /// **A `USING` with no `WITH CHECK`.** The asymmetric one. `USING` decides
+    /// which rows are *visible*; `WITH CHECK` decides which rows may be
+    /// *written*. A policy with only the first lets a tenant `INSERT` a row
+    /// stamped with somebody else's `tenant_id` — a row it then cannot see,
+    /// which is exactly why nobody notices. `0062` exists because that clause
+    /// pair was got subtly wrong on two tables that had all three of these.
+    ///
+    /// One `ALL` policy per table carrying both clauses is the shape the whole
+    /// schema uses. A table that deliberately wants a different one — a
+    /// narrower `FOR SELECT` policy beside it, as `policy_versions` and
+    /// `policy_layers` have since `0062` — keeps its `ALL` policy and adds to
+    /// it, so it still passes here.
+    #[tokio::test]
+    async fn every_table_forces_row_level_security_and_checks_its_writes() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+
+        // `_sqlx_migrations` is the migrator's own bookkeeping: no `tenant_id`,
+        // no customer data, and not ours to police.
+        let unconfined: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text \
+                 || CASE WHEN NOT c.relrowsecurity \
+                         THEN ' — no ENABLE ROW LEVEL SECURITY' ELSE '' END \
+                 || CASE WHEN c.relrowsecurity AND NOT c.relforcerowsecurity \
+                         THEN ' — no FORCE ROW LEVEL SECURITY (the owner bypasses the policy)' \
+                         ELSE '' END \
+                 || CASE WHEN NOT EXISTS ( \
+                        SELECT 1 FROM pg_policies p \
+                         WHERE p.schemaname = 'public' AND p.tablename = c.relname \
+                           AND p.cmd = 'ALL' \
+                           AND p.qual IS NOT NULL AND p.with_check IS NOT NULL) \
+                         THEN ' — no ALL policy carrying both USING and WITH CHECK' \
+                         ELSE '' END \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind = 'r' \
+                AND c.relname <> '_sqlx_migrations' \
+                AND (NOT c.relrowsecurity \
+                     OR NOT c.relforcerowsecurity \
+                     OR NOT EXISTS ( \
+                        SELECT 1 FROM pg_policies p \
+                         WHERE p.schemaname = 'public' AND p.tablename = c.relname \
+                           AND p.cmd = 'ALL' \
+                           AND p.qual IS NOT NULL AND p.with_check IS NOT NULL)) \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query pg_class and pg_policies");
+        assert!(
+            unconfined.is_empty(),
+            "these tables do not confine one tenant's rows to that tenant, which is the \
+             promise the whole product rests on. Add the missing half in a NEW migration \
+             — an applied one cannot be edited: {unconfined:#?}"
+        );
+
+        // A view runs with its **owner's** permissions unless it is declared
+        // `security_invoker`, and every view here is owned by the role that owns
+        // the tables underneath it. So an ordinary view over a confined table is
+        // a hole straight through every policy above — the table is forced, the
+        // view is queried as `app_role`, and the rows come back anyway. Same
+        // class as a missing `force`, one relkind over, and equally invisible to
+        // a test that only reads tables.
+        let leaky_views: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm') \
+                AND coalesce((SELECT option_value \
+                                FROM pg_options_to_table(c.reloptions) \
+                               WHERE option_name = 'security_invoker'), 'false') <> 'true' \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query pg_class for views");
+        assert!(
+            leaky_views.is_empty(),
+            "these views are not `security_invoker`, so they run as their owner and return \
+             every tenant's rows through a table that forces row-level security. Materialised \
+             views cannot be `security_invoker` at all and must not be built over tenant \
+             data: {leaky_views:?}"
+        );
+
+        // Both assertions above are satisfied forever by a database with no
+        // tables in it, which is precisely what this test would be asking if it
+        // ran before the migrator did.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = 'public' AND c.relkind = 'r' \
+                AND c.relname <> '_sqlx_migrations'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+        assert!(
+            total >= 60,
+            "only {total} tables in `public`; this test is asking an unmigrated database"
+        );
+
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **A tenant cannot take the platform policy rows away from everybody
+    /// else** — the hole `0062` closes.
+    ///
+    /// `0006_policy.sql` gives `policy_versions` and `policy_layers` a wider
+    /// `USING` than `WITH CHECK` so that the rows belonging to no tenant
+    /// (`tenant_id IS NULL`) are readable by all of them, and says in a comment
+    /// that this makes those rows "read-only to every tenant". It did not.
+    /// Postgres checks an UPDATE's `USING` against the **old** row and its
+    /// `WITH CHECK` against the **new** one, so rewriting the platform row in
+    /// place was refused — but *re-parenting* it satisfied both halves and made
+    /// it the tenant's own. Every other tenant then has no ceiling at all,
+    /// which is the deployment-wide floor on spend, on outbound contact and on
+    /// which models may be called.
+    ///
+    /// `policy_layers` survived by accident, on the `policy_layers_platform_is_global`
+    /// check constraint; `policy_versions` had nothing and this is what it costs
+    /// to prove it. Both are asserted, because the constraint is defence in
+    /// depth and this test is about the policy.
+    #[tokio::test]
+    async fn platform_policy_rows_survive_a_tenant_that_wants_them() {
+        // A database of its own: the platform rows belong to no tenant, so a
+        // test that writes them is not scoped to one and cannot share with a
+        // test that is.
+        let Some(db) = private_db("platformpolicy").await else {
+            return;
+        };
+
+        let tenant = TenantId::new_v7(Utc::now());
+        let version = Uuid::now_v7();
+        let layer = Uuid::now_v7();
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("t-{}", tenant.as_uuid().simple()))
+            .execute(&mut *admin)
+            .await
+            .expect("tenant");
+        // Not active: `policy_versions_one_active_idx` allows one active
+        // platform version, and this database's fixtures may already have it.
+        sqlx::query(
+            "INSERT INTO policy_versions (id, tenant_id, label, active) \
+             VALUES ($1, NULL, 'a ceiling somebody installed', false)",
+        )
+        .bind(version)
+        .execute(&mut *admin)
+        .await
+        .expect("platform version");
+        sqlx::query(
+            "INSERT INTO policy_layers (id, version_id, tenant_id, layer, max_new_contacts_per_day) \
+             VALUES ($1, $2, NULL, 'platform', 5)",
+        )
+        .bind(layer)
+        .bind(version)
+        .execute(&mut *admin)
+        .await
+        .expect("platform layer");
+        admin.commit().await.expect("commit");
+
+        // Reading it is the half that must keep working: `policy::load`
+        // intersects this ceiling into every tenant's limits on every decision,
+        // so a fix that hid it would deny every action in the deployment.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let readable: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM policy_versions WHERE id = $1")
+                .bind(version)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read");
+        assert_eq!(
+            readable, 1,
+            "a tenant must still read the platform ceiling; without it `policy::load` \
+             answers NoPlatformLayer and every action in the deployment is refused"
+        );
+
+        tx.commit().await.expect("commit");
+
+        // And this is the half that must not. Spelled twice as literals rather
+        // than once over a `format!`: sqlx only accepts a `&'static str`
+        // without an `AssertSqlSafe` audit, and a table name interpolated into
+        // a statement is the habit this crate does not want in reach even in a
+        // test.
+        //
+        // A transaction each, because the two tables fail differently.
+        // `policy_layers` also carries `policy_layers_platform_is_global`, so
+        // it may fail *loudly* on the constraint — which aborts the
+        // transaction and would take the other assertion down with it. Either
+        // outcome is a pass: what must not happen is a row moving.
+        for (table, sql) in [
+            (
+                "policy_versions",
+                "UPDATE policy_versions SET tenant_id = $1 WHERE tenant_id IS NULL",
+            ),
+            (
+                "policy_layers",
+                "UPDATE policy_layers SET tenant_id = $1 WHERE tenant_id IS NULL",
+            ),
+        ] {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let stolen = sqlx::query(sql)
+                .bind(tenant.as_uuid())
+                .execute(&mut **tx)
+                .await
+                .map_or(0, |done| done.rows_affected());
+            assert_eq!(
+                stolen, 0,
+                "a tenant re-parented {stolen} platform row(s) of `{table}` to itself; \
+                 every other tenant in this deployment just lost its policy ceiling"
+            );
+            let _ = tx.rollback().await;
+        }
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let still_platform: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM policy_versions WHERE id = $1 AND tenant_id IS NULL",
+        )
+        .bind(version)
+        .fetch_one(&mut *admin)
+        .await
+        .expect("read back");
+        assert_eq!(
+            still_platform, 1,
+            "the platform policy version no longer belongs to the platform"
+        );
+        admin.rollback().await.expect("rollback");
+    }
+
     /// **The migrator this build carries is the directory on disk.**
     ///
     /// # The bug this exists to stop coming back

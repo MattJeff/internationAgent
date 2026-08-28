@@ -1129,8 +1129,32 @@ accessor, no `Deref`, no `pub(crate)` leak. The only public way to a connection
 is `tenant_tx`.
 
 The escape hatch is `Db::admin_tx_bypassing_rls`, named so it cannot appear in a
-diff unnoticed. Three legitimate callers: migrations, the outbox poller and the
-provisioning loop's claims — all cross-tenant by nature.
+diff unnoticed. This paragraph used to read "three legitimate callers:
+migrations, the outbox poller and the provisioning loop's claims", and it was
+wrong twice. There are **twenty-six outside tests**, counted — and *migrations
+was never one of them*: `Db::migrate` runs sqlx's migrator against the pool and
+opens no transaction at all.
+
+What is legitimate is a **shape**, not a list, which is why the list kept going
+stale while the shape never did:
+
+- a loop that is cross-tenant by definition — outbox, inbound, initiative,
+  provisioning, the MCP rebinder, `/metrics`. The queue is nobody's.
+- a read of a row that belongs to no tenant — the platform policy ceiling,
+  whose `tenant_id` is `NULL`.
+- a lookup that runs *before* anybody knows who is asking, and whose whole job
+  is to answer that: `api_keys::lookup` given a bearer token,
+  `webhooks::lookup` given a delivery path, `routes::a2a::discover` given an
+  unauthenticated peer. All three open `SET TRANSACTION READ ONLY` or hand
+  their answer straight to a `tenant_tx`, so the widest thing they can do is
+  read one row and narrow.
+- the platform operator surface, `routes/platform.rs`, which crosses tenants on
+  purpose and is authenticated by a *different keyring* — `PlatformPrincipal`
+  is a distinct Rust type from `auth::Principal`, and no handler accepts both.
+
+`grep -rn admin_tx_bypassing_rls` is the list. A number in a document is not,
+and the number that was here read as reassurance while being off by an order of
+magnitude.
 
 **`tenant_id` comes from the API key and from nothing else.** `Principal` is
 built in exactly one place, from the `Authorization` header, and is not
