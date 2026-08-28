@@ -18,6 +18,7 @@ pub mod model_access; // wave H: whose model this tenant thinks with
 pub mod model_usage; // le grand livre des jetons
 pub mod org; // wave 13: teams and sections
 pub mod outbox; // U9
+pub mod outreach; // le troisième plafond quotidien: les inconnus qu'on approche
 pub mod phone_pool;
 pub mod policy; // U41
 pub mod provisioning; // U8
