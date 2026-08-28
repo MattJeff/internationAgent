@@ -1,0 +1,65 @@
+-- 0064_work_items_posted_by: the board gets a second class of writer, so "who
+-- put this here" gets a second answer.
+--
+-- `0061` deliberately shipped without this column and
+-- `apps/server/src/routes/work.rs` wrote down the condition under which it
+-- would be wrong to keep leaving it out:
+--
+--   > No `posted_by` and no audit row. Every writer here holds an operator API
+--   > key, so the answer would be the same string on every row … whose widening
+--   > belongs in the change that gives an *employee* a way to post — at which
+--   > point "who put this here" starts having two answers and becomes worth a
+--   > column.
+--
+-- That change is this one. `add_work_item` lets an employee file work for
+-- itself and for the seats it directly manages, so a board now mixes rows the
+-- founder typed with rows a model wrote, and the two are otherwise identical
+-- text in identical columns.
+--
+-- ---------------------------------------------------------------------------
+-- WHY THIS IS THE ONLY RECORD, AND THEREFORE WHY IT EXISTS
+-- ---------------------------------------------------------------------------
+--
+-- Posting is not an `Action` — `crates/app/src/effects.rs::post_work` argues
+-- that at length — so no ruling is made and `audit_events` gets no row. There
+-- is no other trace anywhere in this schema that an employee wrote anything
+-- here. Without this column the founder looking at forty new items on a
+-- report's board cannot tell whether he wrote them, whether that report's
+-- manager did, or whether a turn that had just read a hostile page did; and
+-- `work_items` has no ceiling, which is precisely the failure the org-chart
+-- guard bounds and this column makes visible.
+--
+-- One column and not an audit vocabulary. `AuditKind` is a closed enum whose
+-- rows are *rulings*, and a row there for something no gate ruled on would be a
+-- decision with no decision in it. What actually changed is that a row of this
+-- table has an author, so the author is a column of this table.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT THE COLUMN IS AND IS NOT
+-- ---------------------------------------------------------------------------
+--
+-- **Nullable, and null means the founder.** Every row that exists today was
+-- written through `POST /v1/work` by an operator API key, and there is exactly
+-- one of those per tenant — so backfilling a uuid would mean inventing an
+-- employee that did not write it. Null is the honest value for "an operator,
+-- through the API", and it stays the value that surface writes.
+--
+-- **Not a permission.** Nothing reads this to decide anything. Who may file for
+-- whom is `may_message(.., Errand::Order)` asked at write time against the org
+-- chart as it is at that instant; this column records what happened, and a
+-- reader that started authorising from it would be reading a fact from the past
+-- as a right in the present.
+--
+-- `on delete set null` and never `cascade`, for `assignee_id`'s reason one
+-- column over: terminating the employee that wrote an item must not delete the
+-- item. The work outlives the seat that thought of it — which is the whole of
+-- what `0061` is for.
+
+alter table work_items
+  add column if not exists posted_by uuid references employees (id) on delete set null;
+
+-- `0061` indexed `assignee_id` because `on delete set null` from `employees`
+-- scans this table by it and the tenant index cannot serve that. This is the
+-- second such foreign key and the same scan, so it is the same index.
+create index if not exists work_items_posted_by_idx
+  on work_items (posted_by);

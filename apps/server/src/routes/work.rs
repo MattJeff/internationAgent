@@ -19,14 +19,22 @@
 //! ordering beside the customer's real one. So they are the internal tool's own
 //! administration surface, exactly as `POST /v1/knowledge/documents` is.
 //!
-//! # What is deliberately not recorded
+//! # What is recorded, and what still is not
 //!
-//! **No `posted_by` and no audit row.** Every writer here holds an operator API
-//! key, so the answer would be the same string on every row, and
-//! `AuditKind` is a closed vocabulary whose widening belongs in the change that
-//! gives an *employee* a way to post — at which point "who put this here" starts
-//! having two answers and becomes worth a column. `0037`'s
-//! `prospect_flow_proposals` leaves the same field out for the same reason.
+//! **`posted_by`, and still no audit row.** This paragraph used to say the
+//! column was not worth having, on the grounds that every writer here holds an
+//! operator API key and the answer would be the same string on every row — and
+//! it named the change that would make it worth having: the one that gives an
+//! *employee* a way to post. That change happened (`add_work_item`,
+//! `Effects::post_work`), so the column exists, `0064` carries the argument, and
+//! **this surface always writes null**, which is what "an operator, through the
+//! API" honestly looks like.
+//!
+//! No audit row still, and now for a stronger reason than "one writer": posting
+//! is not an `Action`, nothing rules on it, and `AuditKind`'s rows are rulings.
+//! A row there for a decision nobody made would be worse than the gap.
+//! `0037`'s `prospect_flow_proposals` leaves the same field out for its own
+//! version of the first reason.
 
 use agentos_app::backlog::{Backlog, BacklogError, PgBacklog};
 use agentos_domain::ids::{EmployeeId, WorkItemId};
@@ -101,6 +109,13 @@ struct ItemView {
     title: String,
     assignee_id: Option<Uuid>,
     ordinal: Option<i64>,
+    /// Who wrote it: an employee's id, or null for this endpoint's own writes.
+    ///
+    /// The reader `0064` exists for. A board now mixes rows the founder typed
+    /// with rows a model filed through `add_work_item`, the text is otherwise
+    /// indistinguishable, and nothing else anywhere records the difference —
+    /// posting is not an `Action`, so there is no audit row to cross-check.
+    posted_by: Option<Uuid>,
     closed_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
 }
@@ -112,6 +127,7 @@ impl From<backlog::Item> for ItemView {
             title: item.title,
             assignee_id: item.assignee_id.map(|e| e.as_uuid()),
             ordinal: item.ordinal,
+            posted_by: item.posted_by.map(|e| e.as_uuid()),
             closed_at: item.closed_at,
             created_at: item.created_at,
         }
@@ -161,7 +177,10 @@ async fn post(
 
     let board = PgBacklog::new(db, principal.tenant_id);
     let id = board
-        .post(title, body.assignee_id.map(EmployeeId::from_uuid))
+        // `None` for the author, and it is the value this surface always
+        // passes: every writer here holds an operator API key, and `0064` calls
+        // null exactly that rather than inventing an employee to blame.
+        .post(title, body.assignee_id.map(EmployeeId::from_uuid), None)
         .await
         .map_err(refusal)?;
 

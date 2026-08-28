@@ -2198,6 +2198,69 @@ pub async fn may_message(
     }
 }
 
+/// **Whose day this employee may put work into**: its own, and the seats it
+/// directly manages. `None` is its own, and the answer is the seat the item
+/// will actually be filed against.
+///
+/// # Why this is [`Errand::Order`]'s relation and not a fourth one
+///
+/// Filing work for a colleague *is* an order with a slower clock. It says "do
+/// this" and it says it into somebody else's day; the only difference from
+/// [`Errand::Order`] is that a message wakes them now and a board item waits
+/// until their next turn. Two verbs that mean the same thing to the person on
+/// the other end must not have two reachability rules, because the day they
+/// disagree the wider one is the one an employee reaches for — and a rule the
+/// gate has never seen is not a rule anybody would notice drifting.
+///
+/// So this asks [`may_message`], with the errand that goes **down the line, one
+/// link, and nothing else**. It inherits, for free and by construction:
+///
+/// * **a peer is refused.** A team-mate can be questioned and handed a thread;
+///   it cannot be given an order, and it cannot be given work. `work_items` has
+///   no ceiling of any kind, so an employee that could file against a peer could
+///   bury one — and the org chart is the bound that costs no invented number.
+/// * **a manager is refused.** Escalation is a `question`, which spends the
+///   asker's own turn and lands as something the manager may ignore. An item on
+///   a manager's board is work the report put there.
+/// * **a report's report is refused.** One link, never a walk, exactly as
+///   [`agentos_store::org::manager_of`] and `directs` are one link.
+/// * **a terminated seat, either end, is refused**, because `directs` joins
+///   `employees` on `lifecycle = 'active'` twice.
+///
+/// # Why self is a case above the ruling rather than inside it
+///
+/// [`may_message`] refuses `from == to` outright, and it is right to: an
+/// employee that can message itself can wake itself forever, one turn at a
+/// time. A work item wakes nobody — it is read by a turn the cadence had
+/// already scheduled — so the arithmetic that refusal protects does not apply,
+/// and a note to self is the cheapest thing on this whole surface. It is
+/// answered here, before the ruling, so that neither rule has to be softened
+/// for the other's sake.
+///
+/// [`InternalError::Unreachable`] for every refusal, and for "no such
+/// colleague" too, for its own reason: three distinguishable answers are an org
+/// chart an employee can enumerate by asking. A refusal here reads exactly like
+/// a refused message, which is the same silence `resolve_colleague` keeps.
+pub async fn may_assign(
+    tx: &mut TenantTx<'_>,
+    from: EmployeeId,
+    to: Option<&Slug>,
+) -> Result<EmployeeId, InternalError> {
+    let Some(to) = to else {
+        return Ok(from);
+    };
+    let target = resolve_colleague(tx, to)
+        .await?
+        .ok_or(InternalError::Unreachable)?;
+    if target == from {
+        return Ok(from);
+    }
+    if !may_message(tx, from, target, Errand::Order).await? {
+        return Err(InternalError::Unreachable);
+    }
+    Ok(target)
+}
+
 /// **Who this employee may be told about**: its manager, its direct reports and
 /// its team-mates, each with the relation that makes it reachable.
 ///
