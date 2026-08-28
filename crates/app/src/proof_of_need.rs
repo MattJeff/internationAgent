@@ -178,9 +178,11 @@
 //!   parser is monolingual.
 //!
 //! And a rule that changed yesterday is not a rule that has been wrong for a
-//! year: [`RuleAge`] rides along on the evidence so the message can say which
-//! it is. A prospect who can answer "that changed last night" dismisses the
+//! year. A prospect who can answer "that changed last night" dismisses the
 //! whole approach; one who is told "this changed 14 months ago" books a call.
+//! [`RuleAge`] is that distinction, computed and carried on every
+//! [`Evidence`] — **and no sentence reads it yet.** See [`RuleAge`]'s own note
+//! before assuming a message says which it is.
 //!
 //! # Where the truth comes from is a dependency we can point at
 //!
@@ -1355,6 +1357,21 @@ impl ConsularFee {
 }
 
 /// How long the correct rule has been the correct rule.
+///
+/// # NOT WIRED — computed on every [`Evidence`], read by no sentence
+///
+/// [`Evidence::rule_age`] is filled by [`Prober::check`] and
+/// [`is_long_standing`](RuleAge::is_long_standing) has no caller outside
+/// `#[cfg(test)]`. So a claim never says "this changed 14 months ago" today; it
+/// says what is wrong and how to see it again, and nothing about the rule's age.
+///
+/// Kept rather than deleted because it is the cheap half of a sales argument
+/// the module header makes and still believes: the arithmetic is three lines
+/// over a date the [`Answer`] already carries, and re-deriving it later would
+/// cost more than carrying it. Wiring it is a change to the **wording of a
+/// message a prospect reads**, which is not a refactor — it needs somebody who
+/// owns that sentence. Until then this is a value on a struct, not a claim in
+/// an email.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleAge {
     /// The source does not date the rule. Say nothing about its age.

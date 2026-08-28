@@ -1089,6 +1089,20 @@ const fn telephony_scope(channel: Channel) -> Option<(Step, &'static [&'static s
 /// affinity [`resolve_phone_recipient`] reads next time, so writing it in a
 /// second transaction would lose the relationship exactly when the first
 /// message from a new supplier is the one that established it.
+///
+/// # NOT WIRED — there is no telephony ingest yet
+///
+/// Nothing outside `#[cfg(test)]` calls this, and by consequence nothing calls
+/// [`resolve_phone_recipient`] either: `apps/server/src/loops/inbound.rs`
+/// drains `webhook.*.received` for email only, and
+/// `apps/server/src/routes/webhooks.rs` says the other half of it — Twilio's
+/// HMAC-SHA1-over-the-callback-URL signature scheme is not wired into the
+/// ingest endpoint "because there is no telephony ingest on the other end of
+/// the queue to read the row".
+///
+/// So this is the reader that half is waiting for, not a path a message takes
+/// today. The paragraph above describes what happens when it is called, not
+/// what happens now. Outbound SMS and WhatsApp are wired; the reply is not.
 pub async fn land_inbound_text(
     tx: &mut TenantTx<'_>,
     telephony: &dyn TelephonyProvider,

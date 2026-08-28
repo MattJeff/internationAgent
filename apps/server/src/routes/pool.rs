@@ -29,7 +29,8 @@
 //!
 //! With a dedicated number per employee, "who does this supplier reach?" has a
 //! trivial answer: the owner of the number they dialled. Pool the numbers and
-//! that answer moves into [`agentos_app::pool_ops::route_inbound`]'s arbitration
+//! that answer moves into
+//! [`agentos_app::inbound::resolve_phone_recipient`]'s arbitration
 //! rules, where nobody can see it. A mis-route then looks like an employee
 //! ignoring a supplier, and the operator has no way to tell the two apart.
 //! `GET /v1/pool/routing` is the difference between a diagnosable system and a
@@ -810,13 +811,42 @@ mod tests {
     }
 
     /// Where the next inbound from `SUPPLIER` on the pooled number would land.
+    ///
+    /// Asked of the router a Twilio webhook actually reaches, not of a
+    /// pool-shaped restatement of it: what this endpoint changes is only worth
+    /// asserting against the code that decides for real.
     async fn lands_on(db: &Db, tenant: TenantId) -> Option<EmployeeId> {
+        let supplier = E164::parse(SUPPLIER).expect("e164");
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let owner = pool_ops::route_inbound(&mut tx, &pooled(), SUPPLIER)
-            .await
-            .expect("route");
+        let owner = agentos_app::inbound::resolve_phone_recipient(
+            &mut tx,
+            &pooled(),
+            &supplier,
+            agentos_domain::message::Channel::Sms,
+        )
+        .await;
         tx.rollback().await.expect("rollback");
-        owner
+        owner.ok()
+    }
+
+    /// Hand a pooled slot back, the way `ProvisioningEngine::release_step`
+    /// does: clear the binding and disable the row. No provider is called —
+    /// the number is the tenant's and stays.
+    async fn give_up_slot(db: &Db, tenant: TenantId, employee_id: EmployeeId) {
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let stored = employee_store::load(&mut tx, employee_id)
+            .await
+            .expect("load");
+        let mut employee = stored.employee;
+        employee.release(Step::Phone, now);
+        employee
+            .set_resource(Step::Phone, ResourceState::Disabled, now)
+            .expect("disable");
+        employee_store::update(&mut tx, &employee, stored.version)
+            .await
+            .expect("update");
+        tx.commit().await.expect("commit");
     }
 
     // -- auth ---------------------------------------------------------------
@@ -1041,11 +1071,7 @@ mod tests {
         assert_eq!(row["employees"][0]["slug"], "lena");
 
         // The last employee leaves.
-        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
-        pool_ops::release_slot(&mut tx, lena, Utc::now())
-            .await
-            .expect("release");
-        tx.commit().await.expect("commit");
+        give_up_slot(&h.db, h.a, lena).await;
 
         let (status, page) = h.get("/v1/pool/numbers", Some(SECRET_A)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1242,11 +1268,7 @@ mod tests {
 
         // An employee that is not on this number. Mira gives her slot up first.
         let mira = allocate(&h.db, h.a, "mira").await;
-        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
-        pool_ops::release_slot(&mut tx, mira, Utc::now())
-            .await
-            .expect("release");
-        tx.commit().await.expect("commit");
+        give_up_slot(&h.db, h.a, mira).await;
 
         let (status, problem) = h
             .post(

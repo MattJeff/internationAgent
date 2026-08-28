@@ -635,15 +635,15 @@ impl ProvisioningEngine {
     /// Put this employee on a number the tenant already owns.
     ///
     /// `Ok(None)` means the region has numbers but no room on any of them, and
-    /// the caller falls through to the provider. [`PoolError::Full`] and
-    /// [`PoolError::AwaitingBundle`] are deliberately not told apart here: both
+    /// the caller falls through to the provider. "Full" and "every number is
+    /// still awaiting its bundle" are deliberately not told apart here: both
     /// say the same thing to this engine — *ask for another number* — and the
     /// adapter answers with the bundle to poll and when to expect it, which is
-    /// the wait, spelled the one way this system spells waits.
-    /// [`PoolError::Empty`] is the third one, and it is nobody's wait: a
-    /// deployment pooling a region it never bought into provisions nobody, so
-    /// it fails loudly rather than quietly buying a dedicated number and
-    /// looking like it worked.
+    /// the wait, spelled the one way this system spells waits. "The tenant owns
+    /// no number in this region at all" is the third one, and it is nobody's
+    /// wait: a deployment pooling a region it never bought into provisions
+    /// nobody, so the `count(*)` below tells it apart and it fails loudly rather
+    /// than quietly buying a dedicated number and looking like it worked.
     ///
     /// # Nothing here reaches a provider
     ///
@@ -661,10 +661,6 @@ impl ProvisioningEngine {
     /// seat this employee already holds, and
     /// `number_allocations_live_employee_region_key` refuses a second live one
     /// even to a worker that raced past that check. Ensure twice, one slot.
-    ///
-    /// [`PoolError::Full`]: agentos_domain::phone_pool::PoolError::Full
-    /// [`PoolError::AwaitingBundle`]: agentos_domain::phone_pool::PoolError::AwaitingBundle
-    /// [`PoolError::Empty`]: agentos_domain::phone_pool::PoolError::Empty
     async fn take_pooled_slot(
         &self,
         employee: &Employee,

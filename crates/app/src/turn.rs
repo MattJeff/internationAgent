@@ -1305,13 +1305,6 @@ impl Turn {
         self
     }
 
-    /// Cap on tokens generated per model turn.
-    #[must_use]
-    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
     /// Run until the model stops asking for tools, or a budget stops it.
     ///
     /// `cancel` is the wall clock: the caller decides what a deadline is and

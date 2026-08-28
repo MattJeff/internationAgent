@@ -166,11 +166,6 @@ impl Initiative {
             Initiative::Barred { .. } => "barred",
         }
     }
-
-    /// Convenience for the claim predicate.
-    pub const fn is_due(self) -> bool {
-        matches!(self, Initiative::Due)
-    }
 }
 
 /// May this employee start a turn of its own?
