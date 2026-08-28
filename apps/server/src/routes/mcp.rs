@@ -2191,7 +2191,12 @@ async fn refresh_tokens(
             return;
         }
     };
-    let written = oauth::refresh_due(&mut tx, credentials, clients, Utc::now()).await;
+    // `catalog::CATALOG` and not `state.catalog`: the binder loop is not a
+    // route and holds no `McpState`. The array is the same one in every build
+    // that runs — see `catalog::find_in`, and `McpState::catalog` above, which
+    // is that same constant threaded a different way for the same reason.
+    let written =
+        oauth::refresh_due(&mut tx, credentials, clients, catalog::CATALOG, Utc::now()).await;
     // Committed unconditionally, and the `if written == 0 { rollback }` that
     // used to stand here is deleted rather than corrected.
     //

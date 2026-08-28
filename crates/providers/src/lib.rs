@@ -305,9 +305,29 @@ impl ProviderError {
     ///
     /// ponytail: still a hand-written list, and a list does not force itself to
     /// grow — the same residual `DenyReason::ALL` carries and
-    /// `reason_codes_are_stable_and_unique` names. Closing it needs
-    /// `mem::variant_count`, which is nightly. What it buys today is that the
-    /// *rule* is written once instead of twice.
+    /// `reason_codes_are_stable_and_unique` names. What it buys today is that
+    /// the *rule* is written once instead of twice.
+    ///
+    /// # What was tried, so nobody re-derives it
+    ///
+    /// `mem::variant_count` is nightly. A derive (`strum`, `enum-iterator`)
+    /// closes it and costs a dependency in the crate every adapter links.
+    /// A `macro_rules!` that declares the enum *and* its specimens in one
+    /// invocation closes it with no dependency and is the only stable answer
+    /// that actually does — the price is that this enum's per-variant
+    /// `#[error(…)]`, its per-field docs and its doc links disappear behind a
+    /// macro body, in the most-read error type in the workspace.
+    ///
+    /// What does **not** work is the near-miss worth naming, because it looks
+    /// like the answer: a `const fn` returning each variant's declaration index
+    /// plus a `const` block asserting `ALL[i]` sits at `i`. It fires when a
+    /// variant is inserted in the middle and stays silent when one is appended
+    /// at the end — which is how variants are usually added. A guard that
+    /// misses the common case while reading as coverage is worse than this
+    /// sentence, so this sentence is what is here.
+    ///
+    /// The residual is therefore open on purpose, and [`Self::code`] carries
+    /// the reminder at the one door a new variant is forced through.
     const ALL: &'static [Self] = &[
         Self::Retryable {
             after: Duration::ZERO,
@@ -407,6 +427,23 @@ impl ProviderError {
     }
 
     /// Low-cardinality label for metrics. Never interpolate provider text here.
+    ///
+    /// # If you are here because the compiler sent you, `ProviderError::ALL` is
+    /// owed a specimen too
+    ///
+    /// This match and [`is_retryable`](Self::is_retryable) are the **only** two
+    /// places a new variant fails the build, and neither of them touches `ALL`.
+    /// Measured over `--workspace --all-targets`, not assumed: a fifth variant
+    /// raises exactly two `E0004`s, one here and one there, and nothing
+    /// downstream matches this enum exhaustively at all. Answering both compiles
+    /// clean with `ALL` untouched — [`RETRYABLE_CODES`] then stays two entries
+    /// long while a retryable failure is worth five provider calls, and
+    /// `CLAIM_SQL` parks it after one. Nothing anywhere is red.
+    ///
+    /// So the obligation is written at the door the compiler opens rather than
+    /// only at the enum, which is a place nobody is made to read. It is still an
+    /// obligation and not a check; see `ProviderError::ALL` for what was tried
+    /// and why stable Rust has nothing better that is worth its price.
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Retryable { .. } => "retryable",
