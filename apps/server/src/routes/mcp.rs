@@ -2119,10 +2119,17 @@ async fn rebind(
 
 /// Every tenant with at least one configured server.
 ///
-/// Cross-tenant by nature, like the outbox poller, which is why this is the
-/// third legitimate `admin_tx_bypassing_rls` in the codebase: there is no
-/// tenant to scope to until this query answers. It reads one column of one
-/// table and writes nothing.
+/// Cross-tenant by nature, like the outbox poller, and legitimately so: there
+/// is no tenant to scope to until this query answers. It reads one column of
+/// one table and writes nothing.
+///
+/// This used to say "the third `admin_tx_bypassing_rls` in the codebase". There
+/// are twenty-six outside tests, and there were already more than three when
+/// that was written. `crates/store/src/db.rs` asks for the escape hatch to be
+/// justified where it is used and *not* counted — a number in a doc comment is
+/// wrong the day after it is written, and the last one was wrong in the
+/// direction that reads as reassurance. `grep -rn admin_tx_bypassing_rls` is
+/// the list.
 async fn rebind_all(
     db: &Db,
     fleets: &Fleets,
