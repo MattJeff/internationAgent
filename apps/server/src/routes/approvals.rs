@@ -33,8 +33,29 @@
 //! executed". So the approver does not press a button next to an id — it
 //! restates the action it is approving, and [`PolicyGate::redeem_approval`]
 //! re-hashes that restatement against the hash filed when the approval was
-//! requested. Approve "$100 to supplier A" and the body says supplier B, and
-//! the redemption is refused with `approval_action_mismatch`.
+//! requested. Approve a contract titled A and the body names B, and the
+//! redemption is refused with `approval_action_mismatch`.
+//!
+//! # And it does not hold for a payment, which is the one that moves money
+//!
+//! This paragraph used to say "approve $100 to supplier A and the body says
+//! supplier B". **That is false, and it was false in the direction that
+//! matters.** The hash is taken over the `Action`, and
+//! `Action::PaymentCreate` carries `amount` and nothing else — no payee. Two
+//! payments to two different counterparties for the same amount hash
+//! identically, so restating one as the other is refused by nothing. The
+//! founder's queue shows `pay €500.00` for the same reason: no payee was ever
+//! filed to show.
+//!
+//! The absence is itself deliberate and argued at `Action::PaymentCreate`: the
+//! gate rules on "may this seat move this much", never on "to whom". That is
+//! coherent for a policy engine and incoherent for a human approval queue, and
+//! nobody had written the second half down.
+//!
+//! Both tests guarding this ceremony are blind to it by construction — one
+//! mutates a contract's *title* and one a payment's *amount*, and both of those
+//! **are** in the action. Neither mutates a payee, and neither can. The fix is
+//! a payee on the action and a test that approves toward A and presents B.
 //!
 //! Defaulting the body to the stored action would make the comparison a
 //! tautology: the hash would be re-derived from the same row it is compared
