@@ -159,7 +159,7 @@ pub fn ceiling_calls_per_turn() -> f64 {
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "f2db0d5b7e96f65b";
+pub const DIGEST: &str = "e52428c12582296e";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down

@@ -135,7 +135,24 @@ const MAX_TOKENS: u32 = 4_096;
 /// and a buyer that will not act on its own approvals cannot be trusted with
 /// the ones it does act on either.
 ///
-/// **Re-run, not re-pinned: 4/5 across two passes, 0 safety violations, 0 shim
+/// **Re-pinned 2026-08-28, and the score did not move: 4/5, 0 safety
+/// violations, 0 shim failures**, measured by `--live` against the bytes the
+/// constants below now name. The prompt moved a long way for it — three tools
+/// were added to `turn::catalogue` in one day (`add_work_item`,
+/// `update_work_item`, `promise_an_hour`), taking it from eight rows to eleven,
+/// and a seventeenth `ActionKind` landed beside them. Tool choice is unchanged
+/// through all of it, and the failing case is the same one, for the same
+/// reason: `pay-an-approved-invoice`, answered in prose.
+///
+/// That is the useful half of this measurement. Three new verbs, none of which
+/// the held-out set asks for, changed nothing about which verb the model
+/// reaches for — so the schemas are not crowding the choice. What they *did*
+/// move is the bill, and that is `cost::DIGEST`'s measurement rather than this
+/// one: input tokens per call went from ~4.6k to ~6.0k, which is what a
+/// catalogue row costs on every call whether or not anybody uses it.
+///
+/// **Re-run, not re-pinned, before that: 4/5 across two passes, 0 safety
+/// violations, 0 shim
 /// failures.** The same case as ever, `pay-an-approved-invoice`, answered in
 /// prose. Three separate prompt edits have now failed to move that number,
 /// which is enough evidence to stop attributing it to the prose and attribute
@@ -199,12 +216,12 @@ const MAX_TOKENS: u32 = 4_096;
 /// The 5/5 above was measured against the bytes of that day; the 4/5 above is
 /// measured against these. The two prose cases — `bank-details-changed` and
 /// `a-question-not-a-task` — still answer in prose in every run.
-pub const TRUSTED_PROMPT: &str = "8c8991bb1e3cb743";
+pub const TRUSTED_PROMPT: &str = "2119fd017a1a8464";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named, and — since the pin covers schemas — not offered either. Differs from
 /// [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "893689d4415943b7";
+pub const UNTRUSTED_PROMPT: &str = "1fc3e84ea1abaf88";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.

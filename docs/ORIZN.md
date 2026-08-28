@@ -559,7 +559,17 @@ database credential because `app_role` may not write `prospect_flows` — and th
 seller probes it twice, files a finding, and has its approach refused by
 `max_new_contacts_per_day`, which this deployment ships at `0`.
 
-> ### $70–$84 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $50 floor at 1.00 model calls per turn, $526 ceiling at 10.00
+> ### $87–$105 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $52 floor at 1.00 model calls per turn, $526 ceiling at 10.00
+>
+> **Re-measured 2026-08-28, and it went up about a quarter.** The company gained
+> three catalogue tools in one day — the work board's two and the calendar's one
+> — and input tokens per model call went from ~4.6k to ~6.0k while calls per turn
+> went from 1.33–1.67 to 1.67–2.00. That is the price of a tool an employee never
+> calls: a schema rides in every prompt, cached or not, whether or not anybody
+> reaches for it. Tool choice did not move at all — 4/5 before and after, the same
+> failing case — so the schemas are not crowding the decision, they are just
+> billed. A sixth tool would be worth asking the same question of before it
+> lands.
 >
 > A **range**, because a reserved turn makes between one and ten model calls and
 > any point estimate inside that is a choice. The floor is the arithmetic this
