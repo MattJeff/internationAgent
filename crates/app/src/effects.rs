@@ -2764,7 +2764,7 @@ mod tests {
     use agentos_providers::{FaultMode, ProviderBinding};
     use agentos_store::org;
     use agentos_store::spend::SpendCaps;
-    use chrono::TimeDelta;
+    use chrono::{SubsecRound, TimeDelta};
     use url::Url;
     use uuid::Uuid;
 
@@ -3545,7 +3545,12 @@ mod tests {
         // One inbound message, through the ingest that writes the row rather
         // than by hand — the shape of that row is what the query reads.
         let telephony = MockTelephony::new(Utc::now(), "token");
-        let landed_at = Utc::now();
+        // Microsecond-truncated: `timestamptz` keeps six digits, Linux's clock
+        // offers nine, and macOS's often offers six — so a round-trip
+        // comparison passes on a developer's machine and goes red on CI. Third
+        // time this repository has paid that; `inbound.rs` and `prospects.rs`
+        // carry the same line for the same reason.
+        let landed_at = Utc::now().trunc_subsecs(6);
         let form = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("MessageSid", "WA_effects")
             .append_pair("From", &format!("whatsapp:{}", them.as_str()))
@@ -3612,6 +3617,8 @@ mod tests {
                 .expect("the read succeeds")
                 .is_none(),
             "a message from 25 hours ago left the window open"
+        );
+    }
 
     /// A number the fixture policy grants, for the two write-ahead tests.
     fn a_number() -> E164 {
