@@ -8,6 +8,7 @@ pub mod approvals; // U13
 pub mod audit; // U11
 pub mod backlog; // le carnet: work that outlives the turn that wrote it down
 pub mod billing; // wave M: what we may charge for — seats and connectors, derived from the trail
+pub mod calendar; // le calendrier: a moment an employee promised, and the claim that rings it
 pub mod capability; // wave K: the tool an employee is missing, derived from the refusals
 pub mod db; // U6
 pub mod employee; // U7
