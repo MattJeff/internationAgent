@@ -1,8 +1,9 @@
 # The company, running
 
-*Last walked: 2026-08-28 (fourth pass, after waves R through V. CI is green
-end to end for the first time — including the three jobs that had been skipped
-behind a failing suite since before this map existed.)*
+*Last walked: 2026-08-28 (fifth pass, after waves C and D. The first two of the
+founder's five internal tools are in — a shared work queue an employee can post
+to, claim from and sign off, and a calendar that can promise an hour and be
+woken by it.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -198,6 +199,41 @@ gap at all: the decided target is people who *already have a SaaS*, and they
 arrive with a stack, a server and a problem rather than a blank page. Left
 unbuilt on purpose until somebody who is not the founder asks for it.
 
+## The five internal tools, and where each one stands
+
+The founder named five things a company cannot run without, and asked for them
+built rather than integrated: *if the customer wants Slack and Salesforce they
+plug them in, and if they want the AI to run the company on its own tools, that
+has to exist too.* Each is a **port first and a table second** — an internal
+tool that cannot become an integration is not worth building, because the day a
+customer brings their own, the adapter has to have somewhere to plug in.
+
+| # | Tool | State on the date above |
+|---|---|---|
+| 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. |
+| 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. |
+| 3 | **A thread with a human** | Not built. Today the founder's only channel to an employee is approve-or-refuse. |
+| 4 | **Invoicing** | Not built. The company buys end to end and the selling path stops at the opportunity. |
+| 5 | **A file store** | Not built. `knowledge` stores to retrieve; nothing keeps *the signed contract, as it is*. |
+
+**The one thing both built tools still wait on is the same thing**, and it is
+not code: the catalogue line in `turn.rs::catalogue()` that lets a model reach
+the verb. Both are written out in full, in place, as comments — because
+applying them moves `toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}`, and the
+only thing entitled to re-pin those is a live measurement. The measurement
+harness is proven (`cargo run -p agentos-eval -- --live`, five prompts through
+the host's `claude` CLI, no key and no spend); running it is a deliberate act,
+not a wave's.
+
+**Two holes are named and open.** `0061` promises in writing that a terminated
+employee's items *go back on the board unassigned*, and the referential action
+that would do it never fires — termination is a column (`lifecycle =
+'terminated'`), never a `DELETE`. The item stays assigned to somebody who will
+never be briefed again, while `GET /v1/work` still shows it assigned: work
+stops silently. The calendar has the mirror of it — its claim filters
+`lifecycle = 'active'`, so a departed employee's promise never rings and sits
+`rang_at IS NULL` for good.
+
 ## Not on the map, deliberately
 
 **A success percentage.** Step 8 as originally stated returns "a % estimate of
@@ -233,9 +269,18 @@ hides its blanks is a map that lies.
   ends. Needed twice over: `POST /v1/org` still hires where there is no window,
   and there is no backfill for companies that predate `0054` — both blocked on
   the same number, and a duration is a price, so nobody here may invent it.
-- **`max_new_contacts_per_day: 0` ships in one of `docs/orizn-roles/*.json`.**
-  It is a real value with a real effect, and worth a look: a role that must
-  never approach a stranger, or a ceiling nobody filled in?
+- ~~**`max_new_contacts_per_day: 0` ships in one of `docs/orizn-roles/*.json`.**~~
+  **Decided 2026-08-28, and the question was the wrong one.** Two packs ship 0,
+  and both are right: `growth` and `direction` have no outbound channel, so a
+  cold-contact budget is a budget the channel rules refuse to spend, and
+  `direction` is a figurehead seat with no channels and no turns, existing so
+  the org chart's reporting lines are real. The prospecting seat's 5 a day is a
+  warming schedule, not caution — a new sending domain that jumps to volume is
+  classified as spam. **What is actually open is that nothing ramps**: the
+  ceiling is a static number in a policy document, no path raises it as the
+  domain ages, and there is no deliverability measurement to raise it against.
+  Right the first week, wrong by the sixth month, and only a hand edit changes
+  it. See `docs/ORIZN.md`.
 - **How long can Resend re-deliver a webhook we have not acknowledged?** One
   number, two decisions: it is the floor under any retention on
   `outbox_events` — the row *is* the deduplication record, so deleting one and
