@@ -9,6 +9,9 @@ pub mod billing;
 pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
 pub mod employees; // U31
+// le classeur: the founder files a document and gets those exact bytes back.
+// `knowledge` next door indexes in order to find again; this one keeps.
+pub mod files;
 // wave K: the founder picks a window and gets a quote — effort and money, never
 // a chance of success. Beside `usage` and `turns` in spirit: those two report
 // what already happened, this one is the same arithmetic pointed forwards.

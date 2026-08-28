@@ -622,6 +622,12 @@ fn app(
                 ports.clone(),
             ))
             .merge(routes::knowledge::router(db.clone()))
+            // Beside `knowledge`, deliberately, because the pair is the whole
+            // distinction: that one indexes a document so a turn can find what
+            // resembles a question, and this one keeps the bytes so a person can
+            // get the signed contract back. Neither substitutes for the other,
+            // and until this router existed only the first half was here.
+            .merge(routes::files::router(db.clone()))
             // The pool has a source now: `phone_numbers`, written by this
             // router's own `POST /v1/pool/numbers` and read per request. It
             // used to be unmountable because its router wanted a `Pool` built
