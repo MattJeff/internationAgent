@@ -1,0 +1,195 @@
+error[E0308]: mismatched types
+  --> tests/ui/effects_untrusted_action.rs:46:35
+   |
+46 |     let _ = effects.issue_invoice(ok, draft).await;
+   |                     ------------- ^^ expected `Authorized<InvoiceIssue>`, found `Authorized<Untrusted<InvoiceIssue>>`
+   |                     |
+   |                     arguments to this method are incorrect
+   |
+   = note: expected struct `Authorized<agentos_app::effects::InvoiceIssue>`
+              found struct `Authorized<agentos_domain::untrusted::Untrusted<agentos_app::effects::InvoiceIssue>>`
+note: method defined here
+  --> src/effects.rs
+   |
+   |     pub async fn issue_invoice(
+   |                  ^^^^^^^^^^^^^
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == EmailSend`
+  --> tests/ui/effects_untrusted_action.rs:21:35
+   |
+21 |     let _ = Effects::send_email::<Untrusted<Action>>;
+   |                                   ^^^^^^^^^^^^^^^^^ expected `EmailSend`, found `Action`
+   |
+note: required by a bound in `Effects::send_email`
+  --> src/effects.rs
+   |
+   |     pub async fn send_email<A: Subject<Of = EmailSend>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::send_email`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == EmailSend`
+  --> tests/ui/effects_untrusted_action.rs:22:35
+   |
+22 |     let _ = Effects::stage_lead::<Untrusted<Action>>;
+   |                                   ^^^^^^^^^^^^^^^^^ expected `EmailSend`, found `Action`
+   |
+note: required by a bound in `Effects::stage_lead`
+  --> src/effects.rs
+   |
+   |     pub async fn stage_lead<A: Subject<Of = EmailSend>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::stage_lead`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == SmsSend`
+  --> tests/ui/effects_untrusted_action.rs:23:33
+   |
+23 |     let _ = Effects::send_sms::<Untrusted<Action>>;
+   |                                 ^^^^^^^^^^^^^^^^^ expected `SmsSend`, found `Action`
+   |
+note: required by a bound in `Effects::send_sms`
+  --> src/effects.rs
+   |
+   |     pub async fn send_sms<A: Subject<Of = SmsSend>>(
+   |                                      ^^^^^^^^^^^^ required by this bound in `Effects::send_sms`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == WhatsappSend`
+  --> tests/ui/effects_untrusted_action.rs:24:38
+   |
+24 |     let _ = Effects::send_whatsapp::<Untrusted<Action>>;
+   |                                      ^^^^^^^^^^^^^^^^^ expected `WhatsappSend`, found `Action`
+   |
+note: required by a bound in `Effects::send_whatsapp`
+  --> src/effects.rs
+   |
+   |     pub async fn send_whatsapp<A: Subject<Of = WhatsappSend>>(
+   |                                           ^^^^^^^^^^^^^^^^^ required by this bound in `Effects::send_whatsapp`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == CallPlace`
+  --> tests/ui/effects_untrusted_action.rs:25:35
+   |
+25 |     let _ = Effects::place_call::<Untrusted<Action>>;
+   |                                   ^^^^^^^^^^^^^^^^^ expected `CallPlace`, found `Action`
+   |
+note: required by a bound in `Effects::place_call`
+  --> src/effects.rs
+   |
+   |     pub async fn place_call<A: Subject<Of = CallPlace>>(
+   |                                        ^^^^^^^^^^^^^^ required by this bound in `Effects::place_call`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == BrowserWrite`
+  --> tests/ui/effects_untrusted_action.rs:26:37
+   |
+26 |     let _ = Effects::browse_write::<Untrusted<Action>>;
+   |                                     ^^^^^^^^^^^^^^^^^ expected `BrowserWrite`, found `Action`
+   |
+note: required by a bound in `Effects::browse_write`
+  --> src/effects.rs
+   |
+   |     pub async fn browse_write<A: Subject<Of = BrowserWrite>>(
+   |                                          ^^^^^^^^^^^^^^^^^ required by this bound in `Effects::browse_write`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == BrowserRead`
+  --> tests/ui/effects_untrusted_action.rs:27:34
+   |
+27 |     let _ = Effects::read_page::<Untrusted<Action>>;
+   |                                  ^^^^^^^^^^^^^^^^^ expected `BrowserRead`, found `Action`
+   |
+note: required by a bound in `Effects::read_page`
+  --> src/effects.rs
+   |
+   |     pub async fn read_page<A: Subject<Of = BrowserRead>>(
+   |                                       ^^^^^^^^^^^^^^^^ required by this bound in `Effects::read_page`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == BrowserRead`
+  --> tests/ui/effects_untrusted_action.rs:28:43
+   |
+28 |     let _ = Effects::discover_prospects::<Untrusted<Action>>;
+   |                                           ^^^^^^^^^^^^^^^^^ expected `BrowserRead`, found `Action`
+   |
+note: required by a bound in `Effects::discover_prospects`
+  --> src/effects.rs
+   |
+   |     pub async fn discover_prospects<A: Subject<Of = BrowserRead>>(
+   |                                                ^^^^^^^^^^^^^^^^ required by this bound in `Effects::discover_prospects`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == BrowserRead`
+  --> tests/ui/effects_untrusted_action.rs:29:37
+   |
+29 |     let _ = Effects::propose_flow::<Untrusted<Action>>;
+   |                                     ^^^^^^^^^^^^^^^^^ expected `BrowserRead`, found `Action`
+   |
+note: required by a bound in `Effects::propose_flow`
+  --> src/effects.rs
+   |
+   |     pub async fn propose_flow<A: Subject<Of = BrowserRead>>(
+   |                                          ^^^^^^^^^^^^^^^^ required by this bound in `Effects::propose_flow`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == McpCall`
+  --> tests/ui/effects_untrusted_action.rs:30:34
+   |
+30 |     let _ = Effects::call_tool::<Untrusted<Action>>;
+   |                                  ^^^^^^^^^^^^^^^^^ expected `McpCall`, found `Action`
+   |
+note: required by a bound in `Effects::call_tool`
+  --> src/effects.rs
+   |
+   |     pub async fn call_tool<A: Subject<Of = McpCall>>(
+   |                                       ^^^^^^^^^^^^ required by this bound in `Effects::call_tool`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == PaymentCreate`
+  --> tests/ui/effects_untrusted_action.rs:31:28
+   |
+31 |     let _ = Effects::pay::<Untrusted<Action>>;
+   |                            ^^^^^^^^^^^^^^^^^ expected `PaymentCreate`, found `Action`
+   |
+note: required by a bound in `Effects::pay`
+  --> src/effects.rs
+   |
+   |     pub async fn pay<A: Subject<Of = PaymentCreate>>(
+   |                                 ^^^^^^^^^^^^^^^^^^ required by this bound in `Effects::pay`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == InternalSend`
+  --> tests/ui/effects_untrusted_action.rs:32:38
+   |
+32 |     let _ = Effects::send_internal::<Untrusted<Action>>;
+   |                                      ^^^^^^^^^^^^^^^^^ expected `InternalSend`, found `Action`
+   |
+note: required by a bound in `Effects::send_internal`
+  --> src/effects.rs
+   |
+   |     pub async fn send_internal<A: Subject<Of = InternalSend>>(
+   |                                           ^^^^^^^^^^^^^^^^^ required by this bound in `Effects::send_internal`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == InternalSend`
+  --> tests/ui/effects_untrusted_action.rs:33:30
+   |
+33 |     let _ = Effects::brief::<Untrusted<Action>>;
+   |                              ^^^^^^^^^^^^^^^^^ expected `InternalSend`, found `Action`
+   |
+note: required by a bound in `Effects::brief`
+  --> src/effects.rs
+   |
+   |     pub async fn brief<A: Subject<Of = InternalSend>>(
+   |                                   ^^^^^^^^^^^^^^^^^ required by this bound in `Effects::brief`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == AppointmentBook`
+  --> tests/ui/effects_untrusted_action.rs:34:34
+   |
+34 |     let _ = Effects::book_hour::<Untrusted<Action>>;
+   |                                  ^^^^^^^^^^^^^^^^^ expected `AppointmentBook`, found `Action`
+   |
+note: required by a bound in `Effects::book_hour`
+  --> src/effects.rs
+   |
+   |     pub async fn book_hour<A: Subject<Of = AppointmentBook>>(
+   |                                       ^^^^^^^^^^^^^^^^^^^^ required by this bound in `Effects::book_hour`
+
+error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == A2aSend`
+  --> tests/ui/effects_untrusted_action.rs:35:46
+   |
+35 |     let _ = agentos_app::a2a::sign_request::<Untrusted<Action>>;
+   |                                              ^^^^^^^^^^^^^^^^^ expected `A2aSend`, found `Action`
+   |
+note: required by a bound in `sign_request`
+  --> src/a2a.rs
+   |
+   | pub async fn sign_request<A: crate::effects::Subject<Of = crate::effects::A2aSend>>(
+   |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `sign_request`
