@@ -168,8 +168,6 @@ use agentos_domain::money::{Currency, Money, MoneyError};
 use agentos_domain::untrusted::Untrusted;
 use serde::Deserialize;
 
-use crate::effects::PaymentInstruction;
-
 /// The most of a 402 body this build will parse.
 ///
 /// Borrowed from `peer_keys::MAX_DIRECTORY_BYTES`, which caps the other place
@@ -191,7 +189,12 @@ pub const MAX_CHALLENGE_BYTES: usize = 64 * 1024;
 /// Enforced before anything opens a transaction, for the reason `turn.rs` gives
 /// on `add_work_item`: a CHECK violation surfaces as `StoreError::Database`,
 /// which costs a whole run rather than one refusal.
-const MAX_FIELD_CHARS: usize = 200;
+///
+/// `pub(crate)` because `turn.rs`'s `pay` arm applies it to the payee a *model*
+/// names, on the same argument this module applies it to the payee a *server*
+/// names. Two spellings of one bound would be the drift the paragraph above
+/// refuses.
+pub(crate) const MAX_FIELD_CHARS: usize = 200;
 
 /// One on-chain asset the operator has told this deployment how to read.
 ///
@@ -238,31 +241,39 @@ pub const PRICED_ASSETS: &[Asset] = &[];
 
 /// A 402 read to the point where the Policy Gate could rule on it.
 ///
-/// Exactly the two arguments `Effects::pay` takes — the amount, which becomes
-/// the subject of an [`Action::PaymentCreate`], and the instruction, which
-/// stays on the side because a payee is not something the gate has an opinion
-/// about. There is no third field, and specifically no scheme, network or
-/// deadline: those are the *transport's* problem and the transport does not
-/// exist. A struct that carried them would be guessing at the shape of code
-/// nobody has written.
+/// Exactly what `Effects::pay` needs, split the way that method splits it —
+/// [`Self::action`], which is what the gate rules on and what an approval
+/// hashes, and the memo, which no rule and no hash is taken over. There is no
+/// fourth field, and specifically no scheme, network or deadline: those are the
+/// *transport's* problem and the transport does not exist. A struct that
+/// carried them would be guessing at the shape of code nobody has written.
+///
+/// `payee` used to sit beside the memo on an `effects::PaymentInstruction`, "on
+/// the side because a payee is not something the gate has an opinion about".
+/// The gate still has none. The approval hash and the human reading the queue do,
+/// and a 402 is exactly the case where the payee is a *stranger's* string — so
+/// it is on the action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Demand {
     /// What the server wants, in a currency this deployment named.
     pub amount: Money,
-    /// Where it wants it and what for.
-    pub instruction: PaymentInstruction,
+    /// The address it wants it at.
+    pub payee: String,
+    /// What it is charging for; ends up in the audit row.
+    pub memo: String,
 }
 
 impl Demand {
     /// The action the gate would rule on.
     ///
     /// Takes `&self` rather than consuming, so a caller can put the action in
-    /// front of the gate and still hold the instruction for the effect — the
-    /// same reason `a2a::sign_request` borrows its token.
+    /// front of the gate and still hold the memo for the effect — the same
+    /// reason `a2a::sign_request` borrows its token.
     #[must_use]
-    pub const fn action(&self) -> Action {
+    pub fn action(&self) -> Action {
         Action::PaymentCreate {
             amount: self.amount,
+            payee: self.payee.clone(),
         }
     }
 }
@@ -452,10 +463,8 @@ fn read_terms(terms: &TermsWire, assets: &[Asset]) -> Result<Demand, ChallengeEr
 
     Ok(Demand {
         amount,
-        instruction: PaymentInstruction {
-            payee: payee.to_owned(),
-            memo,
-        },
+        payee: payee.to_owned(),
+        memo,
     })
 }
 
@@ -858,7 +867,7 @@ mod tests {
             .expect("the second term is priceable")
             .into_inner_for_rendering();
         assert_eq!(picked.amount, Money::new(2, Currency::Usd).expect("2c"));
-        assert_eq!(picked.instruction.memo, "Second choice");
+        assert_eq!(picked.memo, "Second choice");
 
         // Priced asset, unpayable amount: the operator learns that rather than
         // "no terms", which would send them looking at the wrong table.
@@ -886,7 +895,7 @@ mod tests {
         let described = demand(&challenge("10000"), &[USDC])
             .expect("priced")
             .into_inner_for_rendering();
-        assert_eq!(described.instruction.memo, "One visa rule lookup");
+        assert_eq!(described.memo, "One visa rule lookup");
 
         let bare = body(json!({
             "x402Version": 1,
@@ -900,7 +909,6 @@ mod tests {
             demand(&bare, &[USDC])
                 .expect("priced")
                 .into_inner_for_rendering()
-                .instruction
                 .memo,
             "https://api.example.com/lookup"
         );

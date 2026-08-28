@@ -1283,6 +1283,12 @@ impl Order {
     /// The amount and the supplier are *in* the text on purpose: the approval
     /// record hashes the action, so a swapped payee or a nudged total produces
     /// a different hash and a refused redemption.
+    ///
+    /// This line was the workaround for
+    /// [`Action::PaymentCreate`](agentos_domain::action::Action::PaymentCreate)
+    /// not carrying a payee, and it is why that field now exists. It stays: a
+    /// commitment is not a payment, the text is what a human reads, and a
+    /// `ContractSign` still has one field to put it in.
     pub fn commitment(&self) -> String {
         format!(
             "purchase order {}: {} × {} from {} for {}",
@@ -1436,6 +1442,13 @@ impl Buyer {
                         &self.principal,
                         Untrusted::new(Action::PaymentCreate {
                             amount: order.total,
+                            // The supplier's address, because that is the only
+                            // counterparty this crate knows — a purchase order
+                            // has no provider account on it. The action is
+                            // going to be refused for its taint before any
+                            // rule reads a field, and this is what the audit
+                            // row will name as the payee that was refused.
+                            payee: order.supplier.to_string(),
                         }),
                     )
                     .await

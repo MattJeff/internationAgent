@@ -2090,7 +2090,10 @@ mod tests {
                 ),
             },
             ActionKind::A2aSend => Action::A2aSend { peer: domain() },
-            ActionKind::PaymentCreate => Action::PaymentCreate { amount: usd(1) },
+            ActionKind::PaymentCreate => Action::PaymentCreate {
+                amount: usd(1),
+                payee: "acct-supplier".to_owned(),
+            },
             ActionKind::InvoiceIssue => Action::InvoiceIssue { amount: usd(1) },
             ActionKind::ContractSign => Action::ContractSign {
                 title: "an agreement".to_owned(),
@@ -2540,7 +2543,10 @@ mod tests {
         assert_eq!(
             evaluate(
                 &role_only_policy(&pack),
-                &Action::PaymentCreate { amount: usd(20) },
+                &Action::PaymentCreate {
+                    amount: usd(20),
+                    payee: "acct-supplier".to_owned(),
+                },
                 &ctx(),
             ),
             Decision::Deny {
@@ -2645,7 +2651,10 @@ mod tests {
         assert!(pack.may_propose(ActionKind::PaymentCreate));
 
         let policy = role_only_policy(&pack);
-        let pay = |major: u64| Action::PaymentCreate { amount: usd(major) };
+        let pay = |major: u64| Action::PaymentCreate {
+            amount: usd(major),
+            payee: "acct-supplier".to_owned(),
+        };
         let ctx = ctx();
 
         for major in [1, 200, 5_000, 10_000] {

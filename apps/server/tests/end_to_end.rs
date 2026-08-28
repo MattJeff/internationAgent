@@ -1220,9 +1220,7 @@ const CHART: [(&str, &str, &str, &str, &str, &str); 7] = [
 async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
     use std::sync::Arc;
 
-    use agentos_app::effects::{
-        EffectError, Effects, InternalNote, InternalSend, PaymentCreate, PaymentInstruction,
-    };
+    use agentos_app::effects::{EffectError, Effects, InternalNote, InternalSend, PaymentCreate};
     use agentos_app::gate::{Denied, PolicyGate, Principal};
     use agentos_app::inbound::Errand;
     use agentos_app::rolepack::CountryCode;
@@ -1381,7 +1379,10 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
     let gate = PolicyGate::new(db.clone());
     let cfo = Principal::employee(server.tenant, employee_of("cfo"));
     let usd = |minor: u64| Money::new(minor, Currency::Usd).expect("non-zero");
-    let payment = |minor: u64| PaymentCreate { amount: usd(minor) };
+    let payment = |minor: u64| PaymentCreate {
+        amount: usd(minor),
+        payee: "Cabinet Dubois".to_owned(),
+    };
 
     let (status, refused) = server.get("/readyz", None);
     assert_eq!(
@@ -1700,13 +1701,7 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         "an allowed payment holds the day's headroom until it settles"
     );
     let attempted = Effects::new(db.clone(), ports.clone(), cfo.clone())
-        .pay(
-            token,
-            &PaymentInstruction {
-                payee: "Cabinet Dubois".to_owned(),
-                memo: "August bookkeeping".to_owned(),
-            },
-        )
+        .pay(token, "August bookkeeping")
         .await;
     // This build has no payment adapter — `mocks::ports_for` binds `payments`
     // to a stub that refuses rather than a fake that pretends. So the furthest
@@ -1766,7 +1761,15 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         "POST",
         &format!("/v1/approvals/{}/approve", approval.as_uuid()),
         &[("Authorization", format!("Bearer {APPROVER_SECRET}"))],
-        Some(r#"{"action":{"action":"payment_create","amount":{"minor":25000,"currency":"USD"}}}"#),
+        // Hand-written rather than serialised from `payment(25_000)`, because
+        // the point of this endpoint is that the approver restates the action
+        // from its own side. The `payee` is part of that restatement now: a
+        // body that leaves it out is a 422 before the hash is ever computed,
+        // and one that names another account is `approval_action_mismatch` —
+        // `routes::approvals` proves the second half.
+        Some(
+            r#"{"action":{"action":"payment_create","amount":{"minor":25000,"currency":"USD"},"payee":"Cabinet Dubois"}}"#,
+        ),
     );
     assert_eq!(status, 200, "the approval could not be spent: {redeemed:#}");
     assert_eq!(redeemed["state"], "redeemed", "{redeemed:#}");

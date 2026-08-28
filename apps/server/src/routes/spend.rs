@@ -470,6 +470,7 @@ mod tests {
     fn payment(minor: u64) -> Action {
         Action::PaymentCreate {
             amount: Money::new(minor, Eur).expect("nonzero"),
+            payee: "acct-supplier".to_owned(),
         }
     }
 

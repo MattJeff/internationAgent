@@ -226,17 +226,22 @@ where
 /// One subject per effect: the newtype the gate rules on and the effect method
 /// accepts, in both trust flavours.
 macro_rules! subject {
-    ($(#[$doc:meta])* $name:ident { $field:ident : $ty:ty } => $variant:ident) => {
+    ($(#[$doc:meta])* $name:ident {
+        $($(#[$fdoc:meta])* $field:ident : $ty:ty),+ $(,)?
+    } => $variant:ident) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $name {
-            /// The parsed counterparty of the effect, as the gate ruled on it.
-            pub $field: $ty,
+            $(
+                $(#[$fdoc])*
+                /// Parsed, as the gate was shown it.
+                pub $field: $ty,
+            )+
         }
 
         impl Authorizable for $name {
             fn to_action(&self) -> Action {
-                Action::$variant { $field: self.$field.clone() }
+                Action::$variant { $($field: self.$field.clone()),+ }
             }
 
             /// Trusted: this value was built by our own code from our own
@@ -321,18 +326,29 @@ subject!(
     McpCall { tool: McpTool } => McpCall
 );
 subject!(
-    /// Move money.
-    PaymentCreate { amount: Money } => PaymentCreate
+    /// Move money: how much, and to whom.
+    ///
+    /// The only two-field subject here, and the payee is the reason
+    /// [`PaymentInstruction`] no longer carries one. See
+    /// [`Effects::pay`].
+    PaymentCreate {
+        amount: Money,
+        /// Where it goes. The gate has no opinion about this; the approval
+        /// hash and the human's queue line do.
+        payee: String,
+    } => PaymentCreate
 );
 subject!(
     /// Ask a customer for money: the same axis as [`PaymentCreate`], pointed the
     /// other way.
     ///
-    /// The subject is the amount and nothing else, exactly as it is for a
-    /// payment — which deal is billed rides on [`InvoiceDraft`] the way a payee
-    /// rides on a [`PaymentInstruction`]. `Money` and not an integer, because a
-    /// figure whose currency was implied is a figure the customer reads in
-    /// theirs.
+    /// The subject is the amount and nothing else, and it is now the asymmetry
+    /// with [`PaymentCreate`] rather than the parallel: which deal is billed
+    /// rides on [`InvoiceDraft`], because `agentos_store::invoices` refuses an
+    /// `opportunity_id` that is not this company's `closed_won` row and a payee
+    /// has no such check to lean on. `Action::InvoiceIssue` carries the
+    /// argument in full. `Money` and not an integer, because a figure whose
+    /// currency was implied is a figure the customer reads in theirs.
     InvoiceIssue { amount: Money } => InvoiceIssue
 );
 subject!(
@@ -502,10 +518,22 @@ pub struct InternalNote {
     pub thread: Option<Thread>,
 }
 
-/// Where the money goes and what it is for. The amount is on the token.
+/// What the payment provider is handed: where the money goes and what for.
+///
+/// **Built by [`Effects::pay`] and by nothing else** — the payee is copied off
+/// the token there, never taken from the caller. That is the whole reason this
+/// struct is still a struct instead of a `memo: &str` parameter: it is the
+/// provider port's argument, and the port should keep seeing a payee.
+///
+/// It used to be the caller's argument, with the payee on it, while the amount
+/// came off the token. Those were two sources of truth for one payment, and
+/// only one of them had been ruled on — so "the gate authorised A, the port was
+/// handed B" was a call away. It is now unrepresentable rather than merely
+/// refused, which is the move `Calendar::book` makes for whose hour is spent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaymentInstruction {
-    /// The payee, in whatever form the payment provider identifies one.
+    /// The payee, in whatever form the payment provider identifies one. Copied
+    /// from [`PaymentCreate::payee`] on the authorising token.
     pub payee: String,
     /// What the payment is for; ends up on the statement and in the audit row.
     pub memo: String,
@@ -1683,18 +1711,38 @@ impl Effects {
         self.record(&ok, detail, called).await
     }
 
-    /// Move the money the token authorises, then settle or release the
-    /// reservation it carries.
+    /// Move the money the token authorises **to the payee it authorises**, then
+    /// settle or release the reservation it carries.
+    ///
+    /// # Why this takes a memo and not an instruction
+    ///
+    /// Both halves of the payment now come off the token, and the caller is
+    /// left with the one field no ruling and no approval hash is taken over:
+    /// the memo, which is a sentence for a statement and an audit row.
+    ///
+    /// It used to take a whole [`PaymentInstruction`], amount from the token
+    /// and payee from the argument. A human approving `pay EUR 500.00` in the
+    /// queue was told by `routes::approvals` that restating the action wrong
+    /// would be refused — and it would not have been, because the payee was in
+    /// neither the action nor the hash. Putting it on
+    /// [`agentos_domain::action::Action::PaymentCreate`] closed that; leaving
+    /// this signature alone would have reopened it one layer down, where the
+    /// gate rules on A and the port is handed B. There is nothing here to
+    /// compare, because there is nothing to disagree with.
     pub async fn pay<A: Subject<Of = PaymentCreate>>(
         &self,
         ok: Authorized<A>,
-        instruction: &PaymentInstruction,
+        memo: &str,
     ) -> Result<ProviderMessageId, EffectError> {
-        let amount = ok.action().subject().amount;
+        let PaymentCreate { amount, payee } = ok.action().subject().clone();
+        let instruction = PaymentInstruction {
+            payee,
+            memo: memo.to_owned(),
+        };
         let paid = self
             .ports
             .payments
-            .pay(&self.key_for(&ok), amount, instruction)
+            .pay(&self.key_for(&ok), amount, &instruction)
             .await
             .map_err(EffectError::Provider);
 
@@ -2450,6 +2498,11 @@ mod tests {
     struct MockPayments {
         fault: Option<ProviderError>,
         keys: Mutex<Vec<String>>,
+        /// Every payee the port was handed. There is no way for a caller to
+        /// put one in here that the gate did not rule on, and that is the
+        /// claim `the_payee_the_provider_sees_is_the_one_on_the_token` makes
+        /// against a running database rather than against this doc comment.
+        payees: Mutex<Vec<String>>,
     }
 
     impl MockPayments {
@@ -2467,6 +2520,10 @@ mod tests {
         fn keys(&self) -> Vec<String> {
             self.keys.lock().expect("poisoned").clone()
         }
+
+        fn payees(&self) -> Vec<String> {
+            self.payees.lock().expect("poisoned").clone()
+        }
     }
 
     #[async_trait]
@@ -2475,12 +2532,16 @@ mod tests {
             &self,
             key: &IdempotencyKey,
             _amount: Money,
-            _instruction: &PaymentInstruction,
+            instruction: &PaymentInstruction,
         ) -> Result<ProviderMessageId, ProviderError> {
             self.keys
                 .lock()
                 .expect("poisoned")
                 .push(key.as_str().to_owned());
+            self.payees
+                .lock()
+                .expect("poisoned")
+                .push(instruction.payee.clone());
             match &self.fault {
                 Some(err) => Err(err.clone()),
                 None => Ok(ProviderMessageId::new("pay_0001")),
@@ -2803,17 +2864,17 @@ mod tests {
     }
 
     fn euros(minor: u64) -> PaymentCreate {
+        euros_to(minor, "acct_supplier")
+    }
+
+    fn euros_to(minor: u64, payee: &str) -> PaymentCreate {
         PaymentCreate {
             amount: Money::new(minor, Currency::Eur).expect("nonzero"),
+            payee: payee.to_owned(),
         }
     }
 
-    fn invoice() -> PaymentInstruction {
-        PaymentInstruction {
-            payee: "acct_supplier".to_owned(),
-            memo: "invoice 42".to_owned(),
-        }
-    }
+    const MEMO: &str = "invoice 42";
 
     fn billed(minor: u64) -> InvoiceIssue {
         InvoiceIssue {
@@ -3177,17 +3238,36 @@ mod tests {
         );
 
         let token = gate(&db)
-            .authorize(&principal, euros(15_000))
+            .authorize(
+                &principal,
+                euros_to(15_000, "acct_the_one_that_was_ruled_on"),
+            )
             .await
             .expect("under every cap");
         assert!(token.reservation().is_some(), "the gate reserved");
         let decision_id = token.decision_id();
 
-        effects.pay(token, &invoice()).await.expect("the mock pays");
+        effects.pay(token, MEMO).await.expect("the mock pays");
         assert_eq!(
             reservation_states(&db, &principal).await,
             vec!["settled".to_owned()]
         );
+
+        // **The payee the provider was handed is the payee the gate ruled on**,
+        // and it is not a comparison this method makes — `pay` reads it off the
+        // token and there is no argument for a caller to pass a different one.
+        // The audit row says the same thing, so "what left the building" and
+        // "what an operator can later read" cannot come apart either.
+        assert_eq!(
+            payments.payees(),
+            vec!["acct_the_one_that_was_ruled_on".to_owned()]
+        );
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(
+            rows[0].1["detail"]["payee"],
+            json!("acct_the_one_that_was_ruled_on")
+        );
+        assert_eq!(rows[0].1["detail"]["memo"], json!(MEMO));
 
         // The de-duplication token is the decision: a retry of *this* payment
         // hits the provider's idempotency cache instead of paying twice.
@@ -3214,7 +3294,7 @@ mod tests {
             .expect("under every cap");
 
         let err = effects
-            .pay(token, &invoice())
+            .pay(token, MEMO)
             .await
             .expect_err("the payment provider refused");
         assert_eq!(err.code(), "bad_request");

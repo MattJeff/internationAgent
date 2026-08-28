@@ -961,6 +961,7 @@ mod tests {
                 &policy,
                 &Action::PaymentCreate {
                     amount: Money::from_major(1, Currency::Usd).expect("amount"),
+                    payee: "acct-supplier".to_owned(),
                 },
                 &ctx,
             ),

@@ -940,7 +940,10 @@ mod tests {
     fn a_payment_above_the_buyers_cap_never_happens_unsupervised() {
         let policy = role_only_policy();
         let ctx = ctx();
-        let pay = |major: u64| Action::PaymentCreate { amount: usd(major) };
+        let pay = |major: u64| Action::PaymentCreate {
+            amount: usd(major),
+            payee: "acct-supplier".to_owned(),
+        };
 
         // Under the approval threshold: the buyer settles a sample invoice.
         assert!(evaluate(&policy, &pay(400), &ctx).is_allow());

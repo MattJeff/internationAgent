@@ -864,13 +864,14 @@ mod tests {
         ) -> Result<String, A2AError> {
             let proposal = message.map(|_| Action::PaymentCreate {
                 amount: Money::new(5_000_000, Currency::Eur).expect("nonzero"),
+                payee: "acct-supplier".to_owned(),
             });
 
             match self.gate.authorize(&self.principal, proposal).await {
                 Ok(token) => {
                     // Only reachable if the gate handed out a capability token,
                     // which is the failure this whole module exists to prevent.
-                    if let Action::PaymentCreate { amount } =
+                    if let Action::PaymentCreate { amount, .. } =
                         token.into_action().into_inner_for_rendering()
                     {
                         self.paid.lock().expect("poisoned").push(amount.minor());
@@ -1211,6 +1212,7 @@ mod tests {
                 &principal,
                 Action::PaymentCreate {
                     amount: Money::new(5_000_000, Currency::Eur).expect("nonzero"),
+                    payee: "acct-supplier".to_owned(),
                 },
             )
             .await

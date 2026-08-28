@@ -33,29 +33,40 @@
 //! executed". So the approver does not press a button next to an id — it
 //! restates the action it is approving, and [`PolicyGate::redeem_approval`]
 //! re-hashes that restatement against the hash filed when the approval was
-//! requested. Approve a contract titled A and the body names B, and the
-//! redemption is refused with `approval_action_mismatch`.
+//! requested. Approve "€500 to supplier A" and the body says supplier B, and
+//! the redemption is refused with `approval_action_mismatch`.
 //!
-//! # And it does not hold for a payment, which is the one that moves money
+//! # That sentence was false for a payment until this wave, and it was false in the direction that mattered
 //!
-//! This paragraph used to say "approve $100 to supplier A and the body says
-//! supplier B". **That is false, and it was false in the direction that
-//! matters.** The hash is taken over the `Action`, and
-//! `Action::PaymentCreate` carries `amount` and nothing else — no payee. Two
-//! payments to two different counterparties for the same amount hash
-//! identically, so restating one as the other is refused by nothing. The
-//! founder's queue shows `pay €500.00` for the same reason: no payee was ever
-//! filed to show.
+//! The hash is taken over the `Action`, and `Action::PaymentCreate` carried
+//! `amount` and nothing else — **no payee**. Two payments to two different
+//! counterparties for the same amount hashed identically, so restating one as
+//! the other was refused by nothing, on the one verb in the enum that moves
+//! money. The founder's queue read `pay EUR 500.00` for the same reason: no
+//! payee had ever been filed, so none could be shown, and the human was being
+//! asked to approve an amount.
 //!
-//! The absence is itself deliberate and argued at `Action::PaymentCreate`: the
-//! gate rules on "may this seat move this much", never on "to whom". That is
-//! coherent for a policy engine and incoherent for a human approval queue, and
-//! nobody had written the second half down.
+//! The absence was deliberate and argued on the variant: the gate rules on "may
+//! this seat move this much", never on "to whom". That is still true and the
+//! evaluator is unchanged — `payee` is read by one line of the payment arm, the
+//! summary, and by no condition anywhere. What the argument missed is that an
+//! `Action` is not only a rule's input; it is also the thing this route hashes
+//! and the thing a human reads. `Action::PaymentCreate` carries the whole
+//! argument, including why this is the same kind of field as `ContractSign`'s
+//! `title` rather than the self-description the enum refuses.
 //!
-//! Both tests guarding this ceremony are blind to it by construction — one
-//! mutates a contract's *title* and one a payment's *amount*, and both of those
-//! **are** in the action. Neither mutates a payee, and neither can. The fix is
-//! a payee on the action and a test that approves toward A and presents B.
+//! Both tests guarding this ceremony were blind to it by construction — the one
+//! below mutates a contract's *title*, `agentos_app::gate`'s sibling mutates a
+//! payment's *amount*, and both of those fields were always in the action.
+//! Neither mutated a payee, and neither could.
+//! [`tests::approving_a_payment_to_one_payee_does_not_authorise_another`] is
+//! the one that can, and it is the test this paragraph is really about: it
+//! would have been green on the old code, which is exactly why it had to exist.
+//!
+//! One layer down, `Effects::pay` no longer takes a payee either — it reads it
+//! off the token. Otherwise the ruling would have named A while the payment
+//! provider was handed B, and this route's promise would have been true and
+//! useless.
 //!
 //! Defaulting the body to the stored action would make the comparison a
 //! tautology: the hash would be re-derived from the same row it is compared
@@ -766,6 +777,72 @@ mod tests {
         }
     }
 
+    /// €500 to somebody. Two arguments, because the whole point of the test
+    /// below is that the second one moves the hash.
+    fn pay(minor: u64, payee: &str) -> Action {
+        Action::PaymentCreate {
+            amount: agentos_domain::money::Money::new(minor, agentos_domain::money::Currency::Eur)
+                .expect("nonzero"),
+            payee: payee.to_owned(),
+        }
+    }
+
+    /// Replace [`seed`]'s grants-nothing layer with one that lets a €500
+    /// payment through to a *human* rather than to a denial, and give the seat
+    /// the ledger headroom the redemption spends.
+    ///
+    /// **Both halves, because a payment is refused by two different things.**
+    /// The policy layer decides `RequireApproval`; the `spend_caps` row is what
+    /// `PolicyGate::reserve` takes the money against when the approval is
+    /// redeemed, and without it the redemption answers `no_spend_policy` —
+    /// which would have left the test asserting a mismatch that was refused for
+    /// the wrong reason. That is why the test below redeems the *approved*
+    /// action at the end and demands a 200: it is the line that says the
+    /// earlier refusal was the payee.
+    ///
+    /// The three policy numbers are chosen against the two thresholds
+    /// `policy::evaluate`'s payment arm compares, and the fixture is silently
+    /// wrong if they are not: €500 must be `<= max_per_transaction` and
+    /// `<= max_per_day` or the answer is a *deny* with a limit reason, and
+    /// `>= approval_above` or it is a plain *allow*. Only the strip between
+    /// them files an approval, so [`file`]'s "expected a pending approval"
+    /// panic re-checks these constants on every run.
+    async fn may_spend_up_to_500(db: &Db, tenant: TenantId, employee: EmployeeId) {
+        let eur = |minor| {
+            agentos_domain::money::Money::new(minor, agentos_domain::money::Currency::Eur)
+                .expect("nonzero")
+        };
+        let limits = agentos_domain::policy::PolicyLimits {
+            spend: Some(
+                agentos_domain::policy::SpendLimits::try_new(
+                    eur(50_000),
+                    eur(100_000),
+                    eur(10_000),
+                )
+                .expect("coherent"),
+            ),
+            ..agentos_domain::policy::PolicyLimits::default()
+        };
+        agentos_store::policy::install(db, tenant, agentos_store::policy::Scope::Tenant, &limits)
+            .await
+            .expect("install the spend layer");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        agentos_store::spend::set_caps(
+            &mut tx,
+            employee,
+            agentos_store::spend::SpendCaps::new(
+                eur(100_000),
+                eur(50_000),
+                std::num::NonZeroU32::new(10).expect("nonzero"),
+            )
+            .expect("coherent"),
+        )
+        .await
+        .expect("set caps");
+        tx.commit().await.expect("commit caps");
+    }
+
     /// File a real approval by asking the gate for something it has to escalate.
     async fn file(gate: &PolicyGate, principal: &GatePrincipal, action: &Action) -> ApprovalId {
         match gate.authorize(principal, action.clone()).await {
@@ -939,6 +1016,66 @@ mod tests {
         let (status, body) = call(&app, &uri, SECRET, Some(json!({ "action": approved }))).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], json!("approval_already_decided"));
+    }
+
+    /// **The same ceremony, for the one action that moves money.**
+    ///
+    /// The test above mutates a contract's *title*; `agentos_app::gate`'s
+    /// sibling mutates a payment's *amount*. Both fields were always on the
+    /// `Action`, so both tests were green on the day the payee was not — and
+    /// the swap this module's headline actually describes, approve €500 to A
+    /// and present B, was refused by nothing. Neither test could have caught
+    /// it: there was no payee to mutate.
+    ///
+    /// Two payees one accent apart, because that is the swap a human skimming
+    /// a queue does not see and a hash does.
+    #[tokio::test]
+    async fn approving_a_payment_to_one_payee_does_not_authorise_another() {
+        let Some(db) = db().await else { return };
+        let gate = PolicyGate::new(db.clone());
+        let (tenant, employee) = seed(&db).await;
+        may_spend_up_to_500(&db, tenant, employee).await;
+
+        let approved = pay(50_000, "Cabinet Dubois");
+        let id = file(&gate, &GatePrincipal::employee(tenant, employee), &approved).await;
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+
+        // First: the queue says who is being paid. It read `pay EUR 500.00`
+        // and stopped, because no payee had ever been filed to show — which is
+        // a human being asked to approve an amount, not a payment.
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &queue["approvals"][0];
+        assert_eq!(row["id"], json!(id.as_uuid().to_string()));
+        assert_eq!(
+            row["summary"],
+            json!("pay EUR 500.00 to \"Cabinet Dubois\"")
+        );
+        assert_eq!(row["action"]["payee"], json!("Cabinet Dubois"));
+
+        // Then the swap: same kind, same amount, same currency, same id, same
+        // nonce — a different account.
+        let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
+        let (status, body) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "action": pay(50_000, "Cabinet Duboîs") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+        assert_eq!(body["code"], json!("approval_action_mismatch"));
+        assert_eq!(
+            state_of(&db, tenant, id).await,
+            "pending",
+            "a refused swap must not burn the approval"
+        );
+
+        // And what the human did approve still goes through, so the refusal
+        // above is the payee and not the fixture being unredeemable.
+        let (status, body) = call(&app, &uri, SECRET, Some(json!({ "action": approved }))).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(state_of(&db, tenant, id).await, "redeemed");
     }
 
     #[tokio::test]

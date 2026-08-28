@@ -716,7 +716,7 @@ impl PolicyGate {
             (u32::MAX, ContactStanding::New)
         };
         let spent_today = match action {
-            Action::PaymentCreate { amount } => {
+            Action::PaymentCreate { amount, .. } => {
                 self.spent_today(tx, principal, amount.currency(), now)
                     .await?
             }
@@ -754,7 +754,7 @@ impl PolicyGate {
                 //    against, here, before the caller can be told yes — and the
                 //    day's ceiling is re-compared under the lock that takes it,
                 //    because the one at step 4 was read without one.
-                Action::PaymentCreate { amount } => {
+                Action::PaymentCreate { amount, .. } => {
                     let day_cap = policy.limits().spend.map(SpendLimits::max_per_day);
                     self.reserve(tx, principal, *amount, day_cap, now).await
                 }
@@ -1213,7 +1213,7 @@ impl PolicyGate {
                 // `None`: no policy was loaded on this path and that is the
                 // documented choice above, so there is no `max_per_day` to
                 // re-compare. Named rather than defaulted.
-                Action::PaymentCreate { amount } => {
+                Action::PaymentCreate { amount, .. } => {
                     self.reserve(tx, principal, *amount, None, now).await
                 }
                 _ => Ok(Outcome::Allow { reservation: None }),
@@ -1275,6 +1275,14 @@ fn counterparty(action: &Action) -> Option<String> {
         | Action::BrowserWrite { .. }
         | Action::FileUpload { .. }
         | Action::McpCall { .. }
+        // `None`, and it now has a `payee` sitting right there to write under
+        // this key, which is exactly why the arm says so out loud. A payee is a
+        // provider's account handle, not somebody this company is approaching:
+        // charging it to `max_new_contacts_per_day` would let the accounts
+        // payable run stop the sales seat from emailing a prospect. The field
+        // was put on the action for the approval hash and the queue line, and
+        // `spends_contact_budget` in the domain is the other side of the same
+        // answer.
         | Action::PaymentCreate { .. }
         // `None`, and it is the entry here with the most plausible-looking wrong
         // answer after `InternalSend`. An invoice *does* address somebody, so
@@ -1508,7 +1516,14 @@ mod tests {
     }
 
     fn payment(minor: u64) -> Action {
-        Action::PaymentCreate { amount: eur(minor) }
+        payment_to(minor, "acct-supplier")
+    }
+
+    fn payment_to(minor: u64, payee: &str) -> Action {
+        Action::PaymentCreate {
+            amount: eur(minor),
+            payee: payee.to_owned(),
+        }
     }
 
     fn spend_limits(per_txn: u64, per_day: u64, approval: u64) -> Option<SpendLimits> {
@@ -1975,6 +1990,28 @@ mod tests {
         ));
         assert_eq!(reservation_count(&db, &principal).await, 0);
 
+        // **The swap this method exists for, and the one this test could not
+        // spell until `PaymentCreate` grew a payee.** Same amount, same
+        // currency, same kind — a different account. The line above mutates a
+        // number every spend rule reads, so it would still have been refused by
+        // `evaluate` if the hash had missed it; this one mutates a field *no
+        // rule reads at all*, so the hash is the only thing standing in front
+        // of it.
+        let err = gate
+            .redeem_approval(
+                &principal,
+                approval_id,
+                &nonce,
+                payment_to(25_000, "acct-somebody-else"),
+            )
+            .await
+            .expect_err("the approved payee was swapped");
+        assert!(matches!(
+            err,
+            Denied::Redemption(RedemptionFailure::ActionMismatch)
+        ));
+        assert_eq!(reservation_count(&db, &principal).await, 0);
+
         // A bad nonce is refused too, and the approval survives both attempts.
         let err = gate
             .redeem_approval(&principal, approval_id, "not-the-nonce", approved.clone())
@@ -2011,14 +2048,16 @@ mod tests {
         ));
         assert_eq!(reservation_count(&db, &principal).await, 1);
 
-        // One row per outcome: request, mismatch, bad nonce, redeem, replay.
+        // One row per outcome: request, the two mismatches, bad nonce, redeem,
+        // replay.
         let rows = audit_rows(&db, &principal).await;
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert_eq!(rows[0].0.as_deref(), Some("require_approval"));
         assert_eq!(rows[1].2[DENIED_KEY], json!("approval_action_mismatch"));
-        assert_eq!(rows[2].2[DENIED_KEY], json!("approval_bad_nonce"));
-        assert_eq!(rows[3].0.as_deref(), Some("allow"));
-        assert_eq!(rows[4].2[DENIED_KEY], json!("approval_already_decided"));
+        assert_eq!(rows[2].2[DENIED_KEY], json!("approval_action_mismatch"));
+        assert_eq!(rows[3].2[DENIED_KEY], json!("approval_bad_nonce"));
+        assert_eq!(rows[4].0.as_deref(), Some("allow"));
+        assert_eq!(rows[5].2[DENIED_KEY], json!("approval_already_decided"));
     }
 
     /// **The approval queue is not a surface a stranger can write on.**

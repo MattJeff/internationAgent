@@ -611,6 +611,15 @@ impl fmt::Display for ActionKind {
 ///
 /// Each variant carries the *parsed* subject of the effect and nothing else.
 /// No variant carries a self-description that the gate then trusts.
+///
+/// "Subject" is what the effect is *done to*, not what the evaluator happens to
+/// read. Two variants carry a field no rule consults — `ContractSign::title`
+/// and `PaymentCreate::payee` — and they are not exceptions to the rule above,
+/// because an `Action` is hashed by `agentos_store::approvals` and rendered to
+/// the human who approves it. A field left off here is a substitution that
+/// ceremony cannot refuse. What the rule forbids is narrower and unchanged: a
+/// caller's *claim about a rule input*, which is why `CallPlace` has no
+/// `country` and `CharterSet` has no "I am their manager".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
@@ -643,8 +652,46 @@ pub enum Action {
     A2aSend {
         peer: Domain,
     },
-    /// Money out. The subject is the **amount**, and the payee lives on
-    /// `app::effects::PaymentInstruction` for the module rule above.
+    /// Money out. The subject is **how much and to whom**, and it takes both
+    /// because a payment is the one effect where either half alone is a
+    /// different act.
+    ///
+    /// # Why `payee` is here even though the gate never reads it
+    ///
+    /// It used to carry `amount` alone, and the argument for that was sound as
+    /// far as it went: [`crate::policy::evaluate`] rules on "may this seat move
+    /// this much", never on "to whom", so a payee is a field no rule consults.
+    ///
+    /// What that argument missed is that the `Action` is not only the rule's
+    /// input. It is also **the thing an approval hashes** — see
+    /// `agentos_store::approvals`, whose whole purpose is that "approve A, then
+    /// execute B" is refused — and **the thing the founder's queue renders**.
+    /// With the payee off it, two payments to two different counterparties for
+    /// the same amount hashed identically, so restating one as the other was
+    /// refused by nothing, and the queue line read `pay EUR 500.00` with no way
+    /// to say who was being paid. A human approving that is approving an amount,
+    /// not a payment.
+    ///
+    /// So this is a field the evaluator has no condition on, exactly like
+    /// [`Action::ContractSign`]'s `title` two variants down, and for exactly
+    /// that variant's reason. It is not the self-description the module header
+    /// refuses: a self-description is a *claim about a rule input* the gate
+    /// would then trust — `CallPlace`'s absent `country`, `CharterSet`'s absent
+    /// "I am their manager". A payee is a claim about nothing. Passing a false
+    /// one buys no permission; it only makes the hash and the queue line
+    /// disagree with the money, which is the failure being closed.
+    ///
+    /// `agentos_app::sourcing::Order::commitment` is the proof that this was
+    /// always needed: it formats the supplier and the total *into a
+    /// `ContractSign` title* so that "a swapped payee or a nudged total
+    /// produces a different hash". That workaround exists because this field
+    /// did not.
+    ///
+    /// A bare `String`, and not a parsed newtype, because a payee is whatever
+    /// the payment provider calls an account and nothing in this crate can
+    /// check one — the same reason `app::effects::PaymentInstruction` had it as
+    /// a `String`. It is bounded and rejected-when-empty at each parse site
+    /// instead (`app::turn`'s `pay` arm, `app::x402::read_terms`).
     ///
     /// **An HTTP `402 Payment Required` is one of these**, and that is a
     /// decision rather than an omission. A 402 arrives *inside* an effect the
@@ -663,17 +710,28 @@ pub enum Action {
     /// the two decisions about money that are still open.
     PaymentCreate {
         amount: Money,
+        /// Where the money goes, as the payment provider identifies an
+        /// account. Display-only to the gate; load-bearing to the hash.
+        payee: String,
     },
     /// Ask a customer to pay us. Money in the other direction, and the one
     /// outbound act this enum was missing.
     ///
-    /// The subject is the **amount**, and nothing else, for the module rule
-    /// above: a variant carries the parsed subject of its effect and no
-    /// self-description the gate then trusts. Which deal it bills lives on the
-    /// body (`app::effects::InvoiceDraft`), exactly as a payee lives on a
-    /// `PaymentInstruction` rather than on [`Action::PaymentCreate`] — and the
-    /// gate has no opinion about which of a company's own won deals is being
-    /// invoiced, only about whether this seat may bill at all.
+    /// The subject is the **amount**, and nothing else. Which deal it bills
+    /// lives on the body (`app::effects::InvoiceDraft`), and the gate has no
+    /// opinion about which of a company's own won deals is being invoiced, only
+    /// about whether this seat may bill at all.
+    ///
+    /// **This is now the asymmetry with [`Action::PaymentCreate`], which does
+    /// carry its counterparty, so the difference has to earn itself.** A payee
+    /// is a string nothing here can check, so the only place a mistake in it
+    /// can be caught is a human reading the queue line — which is why it is on
+    /// the action and in the hash. An `opportunity_id` is a row in *our own*
+    /// table, and `agentos_store::invoices` refuses one that is not this
+    /// company's or is not `closed_won`; that refusal catches the substitution
+    /// a hash would catch, at the moment of the write, without a human. Put it
+    /// here the day an invoice can name a counterparty this workspace cannot
+    /// look up.
     ///
     /// `Money` and not a bare integer, so a currency cannot be omitted: an
     /// invoice whose currency was implied is a figure the customer reads in

@@ -1455,6 +1455,7 @@ mod tests {
         let principal = ActingPrincipal::employee(tenant, employee);
         let proposal = Untrusted::new(stored.to_owned()).map(|_| Action::PaymentCreate {
             amount: Money::new(5_000_000, Currency::Eur).expect("nonzero"),
+            payee: "acct-supplier".to_owned(),
         });
         let refusal = gate(&db)
             .authorize(&principal, proposal)
@@ -1469,6 +1470,7 @@ mod tests {
                 &principal,
                 Action::PaymentCreate {
                     amount: Money::new(5_000_000, Currency::Eur).expect("nonzero"),
+                    payee: "acct-supplier".to_owned(),
                 },
             )
             .await

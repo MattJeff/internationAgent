@@ -1663,7 +1663,10 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
         }
 
-        Action::PaymentCreate { amount } => {
+        // `payee` is read by exactly one line of this arm, the summary, and by
+        // no condition anywhere in it. That is the whole of the gate's opinion
+        // about who gets the money: none. See `Action::PaymentCreate`.
+        Action::PaymentCreate { amount, payee } => {
             let Some(limits) = spend else {
                 return Decision::deny(DenyReason::NoSpendPolicy);
             };
@@ -1692,7 +1695,11 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             if amount.minor() >= limits.approval_above().minor() {
                 return Decision::RequireApproval {
                     reason: ApprovalReason::PaymentAboveThreshold,
-                    summary: format!("pay {amount}"),
+                    // `{payee:?}` and not `{payee}`, exactly as the contract
+                    // arm quotes its title: this string came off a model or off
+                    // a 402 body, and an unquoted one would let it dress itself
+                    // up as the rest of the sentence in the founder's queue.
+                    summary: format!("pay {amount} to {payee:?}"),
                 };
             }
             Decision::Allow
@@ -1964,7 +1971,10 @@ mod tests {
             Action::A2aSend {
                 peer: domain("partner.example.com"),
             },
-            Action::PaymentCreate { amount: usd(100) },
+            Action::PaymentCreate {
+                amount: usd(100),
+                payee: "acct-supplier".to_owned(),
+            },
             Action::InvoiceIssue { amount: usd(100) },
             Action::ContractSign {
                 title: "supply agreement".into(),
@@ -2324,7 +2334,14 @@ mod tests {
                 spent_today: spent,
                 ..ctx()
             };
-            let decision = evaluate(&policy, &Action::PaymentCreate { amount: each }, &ctx);
+            let decision = evaluate(
+                &policy,
+                &Action::PaymentCreate {
+                    amount: each,
+                    payee: "acct-supplier".to_owned(),
+                },
+                &ctx,
+            );
 
             if decision.is_allow() {
                 allowed += 1;
@@ -2355,7 +2372,10 @@ mod tests {
     fn payment_limits_and_thresholds() {
         let policy = effective(&permissive()); // tx 50_000, day 200_000, approval >= 50_000
         let ctx = ctx();
-        let pay = |m: Money| Action::PaymentCreate { amount: m };
+        let pay = |m: Money| Action::PaymentCreate {
+            amount: m,
+            payee: "acct-supplier".to_owned(),
+        };
 
         assert!(evaluate(&policy, &pay(usd(5_000)), &ctx).is_allow());
         assert!(matches!(
@@ -2410,7 +2430,10 @@ mod tests {
         };
 
         // The headline case: a payment the policy would happily allow.
-        let payment = Action::PaymentCreate { amount: usd(100) };
+        let payment = Action::PaymentCreate {
+            amount: usd(100),
+            payee: "acct-supplier".to_owned(),
+        };
         assert!(evaluate(&policy, &payment, &ctx()).is_allow());
         assert_eq!(
             evaluate(&policy, &payment, &tainted),
@@ -2432,6 +2455,7 @@ mod tests {
         let escalating = [
             Action::PaymentCreate {
                 amount: usd(50_000),
+                payee: "acct-supplier".to_owned(),
             },
             Action::DataDelete {
                 scope: DataScope::AllForEmployee {
@@ -2465,6 +2489,7 @@ mod tests {
             (
                 Action::PaymentCreate {
                     amount: usd(50_000),
+                    payee: "acct-supplier".to_owned(),
                 },
                 ApprovalReason::PaymentAboveThreshold,
             ),
@@ -2528,7 +2553,8 @@ mod tests {
             evaluate(
                 &policy,
                 &Action::PaymentCreate {
-                    amount: usd(50_001)
+                    amount: usd(50_001),
+                    payee: "acct-supplier".to_owned(),
                 },
                 &tainted
             ),
@@ -3025,7 +3051,14 @@ mod tests {
 
         assert!(policy.limits().spend.is_none());
         assert_eq!(
-            evaluate(&policy, &Action::PaymentCreate { amount: usd(1) }, &ctx()),
+            evaluate(
+                &policy,
+                &Action::PaymentCreate {
+                    amount: usd(1),
+                    payee: "acct-supplier".to_owned(),
+                },
+                &ctx()
+            ),
             Decision::Deny {
                 reason: DenyReason::NoSpendPolicy
             }
@@ -3506,9 +3539,13 @@ mod tests {
             Action::A2aSend {
                 peer: domain("elsewhere.test"),
             },
-            Action::PaymentCreate { amount: usd(1) },
+            Action::PaymentCreate {
+                amount: usd(1),
+                payee: "acct-supplier".to_owned(),
+            },
             Action::PaymentCreate {
                 amount: usd(49_999),
+                payee: "acct-supplier".to_owned(),
             },
             Action::ContractSign {
                 title: "nda".into(),
@@ -3665,7 +3702,8 @@ mod tests {
             !evaluate(
                 &almost_broke,
                 &Action::PaymentCreate {
-                    amount: usd(50_000)
+                    amount: usd(50_000),
+                    payee: "acct-supplier".to_owned(),
                 },
                 &ctx
             )

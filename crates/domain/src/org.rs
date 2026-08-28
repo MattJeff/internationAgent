@@ -886,7 +886,10 @@ mod tests {
             },
         )
         .unwrap();
-        let pay = Action::PaymentCreate { amount: usd(4_500) };
+        let pay = Action::PaymentCreate {
+            amount: usd(4_500),
+            payee: "acct-supplier".to_owned(),
+        };
         for who in [employee(2), employee(3)] {
             let ctx = ActionCtx {
                 trust: TrustLabel::Trusted,

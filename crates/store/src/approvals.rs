@@ -331,8 +331,15 @@ pub async fn create(
 
     // Only one action variant carries money; the rest leave the columns NULL,
     // which the `approvals_amount_has_currency` check requires to be in step.
+    //
+    // The payee is deliberately **not** lifted out into a column beside these
+    // two. `amount_minor` and `currency` are here because `approvals` has a
+    // CHECK on them and operators report on them; the payee needs neither, and
+    // it is already in the `action` jsonb — which is the copy the hash is taken
+    // over. A second copy in a column is a copy that can disagree with the one
+    // the ceremony checks.
     let (amount_minor, currency) = match req.action {
-        Action::PaymentCreate { amount } => (
+        Action::PaymentCreate { amount, .. } => (
             Some(i64::try_from(amount.minor()).map_err(|_| ApprovalError::AmountOutOfRange)?),
             Some(amount.currency().code()),
         ),
@@ -530,8 +537,13 @@ mod tests {
     }
 
     fn pay(minor: u64) -> Action {
+        pay_to(minor, "acct_supplier_a")
+    }
+
+    fn pay_to(minor: u64, payee: &str) -> Action {
         Action::PaymentCreate {
             amount: Money::new(minor, Currency::Eur).expect("nonzero"),
+            payee: payee.to_owned(),
         }
     }
 
@@ -591,9 +603,12 @@ mod tests {
 
     #[test]
     fn actions_canonicalise_to_stable_bytes() {
+        // Three keys now, sorted ascending by byte order like every other
+        // object here: the payee is inside the bytes the hash is taken over,
+        // which is the whole of the fix `Action::PaymentCreate` argues for.
         assert_eq!(
             canonical_json(&pay(10_000)).unwrap(),
-            r#"{"action":"payment_create","amount":{"currency":"EUR","minor":10000}}"#
+            r#"{"action":"payment_create","amount":{"currency":"EUR","minor":10000},"payee":"acct_supplier_a"}"#
         );
         assert_eq!(
             canonical_json(&Action::SmsSend {
@@ -616,6 +631,15 @@ mod tests {
                 domain: Domain::parse("example.com").unwrap()
             })
             .unwrap()
+        );
+        // **Same amount, different counterparty.** This is the pair the module
+        // header has claimed since it was written — "pay €100 to supplier A"
+        // against "pay €100 to supplier B" — and until `Action::PaymentCreate`
+        // grew a payee these two produced the *same* bytes, so the one example
+        // the module leads with was the one case it did not cover.
+        assert_ne!(
+            canonical_json(&pay_to(10_000, "acct_supplier_a")).unwrap(),
+            canonical_json(&pay_to(10_000, "acct_supplier_b")).unwrap()
         );
     }
 

@@ -2848,6 +2848,7 @@ mod tests {
                         agentos_domain::money::Currency::Usd,
                     )
                     .expect("non-zero"),
+                    payee: "acct-supplier".to_owned(),
                 };
                 (
                     agentos_domain::policy::evaluate(&policy, &pay(4_500), &ctx),
