@@ -1365,10 +1365,22 @@ fetching, no PDF parsing, no file upload, no malware or content-type validation.
 The embedder is a SHA-256 hash with no semantics, so retrieval quality is not a
 thing this build has yet.
 
-**No voice, no payments, no WhatsApp adapter.** `Channel::Voice` is a policy
-channel with no runtime behind it; the payment port refuses with
-`not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on every
-deployment, which is why `degraded` is the healthy steady state.
+**No payments, no WhatsApp adapter, and a voice half.** The payment port
+refuses with `not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on
+every deployment, which is why `degraded` is the healthy steady state.
+
+`Channel::Voice` is no longer a policy channel with *nothing* behind it, and it
+is still not a phone call anybody would want to receive. `TelephonyProvider::
+place_call` dials — mock and Twilio, both held to the shared contract suite —
+and `telephony_twilio::SILENT_TWIML` is the whole of what the callee hears: the
+phone rings, they answer, the call ends. Speech synthesis, recognition and a
+turn-taking loop exist nowhere in this tree. So no employee can reach it
+(`call_place` is not in `turn::catalogue`, and `turn::UNSERVED` says why), no
+tenant could authorise it if one could (`default_ceiling` grants neither
+`voice` nor a calling code, and layers only narrow), and no route in this build
+accepts the status callback that would say whether the phone was answered — a
+successful `place_call` means a carrier agreed to dial and never that anybody
+picked up.
 
 **No key rotation.** One signing key per employee is the primary key of the
 table and `UPDATE` is revoked, so rotation is delete-then-insert with no overlap

@@ -208,10 +208,19 @@ pub const UNSERVED: [(ActionKind, &str); 11] = [
     ),
     (
         ActionKind::CallPlace,
-        "the buyer and the seller both propose it and no adapter can place a call: \
-         `TelephonyProvider` has `send_sms`, `send_whatsapp`, `ensure_number` and `release`, and \
-         nothing that dials. A voice tool is a voice adapter — a call, a synthesised turn-taking \
-         loop and a transcript — and not a row here.",
+        "the buyer and the seller both propose it, an adapter dials now, and what the call says \
+         does not exist. `TelephonyProvider::place_call` is built end to end — `OutboundCall`, \
+         `MockTelephony`, `TwilioTelephony` against a hermetic fake, the `CallPlace` subject, \
+         `Effects::place_call`, the audit row — and the entry stays because the *sentence this \
+         reason used to give was only half of it*: a call is an adapter AND a synthesised \
+         turn-taking loop, the adapter arrived and the loop did not. `telephony_twilio::\
+         SILENT_TWIML` is the whole of what a callee hears, so a row here would hand a model the \
+         power to make a stranger's phone ring and say nothing, which is a nuisance call with an \
+         audit trail. Two further things are false today and each would be enough on its own: \
+         `store::policy::default_ceiling` grants neither `Channel::Voice` nor any calling code and \
+         layers only narrow, so no tenant could authorise one; and the outcome — busy, no answer, \
+         a machine, a decline — arrives on a status callback no route in this build accepts, so \
+         `Ok` means a carrier agreed to dial and can never mean anybody answered.",
     ),
     (
         ActionKind::BrowserWrite,
@@ -1003,6 +1012,55 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
         //   c. record the per-case scores beside the digests, in the same commit
         //      as the digests. The constants and the numbers move together or
         //      neither moves.
+        //
+        // ===================================================================
+        // WHERE `place_call` WOULD GO, AND WHY NO SCHEMA IS WRITTEN OUT HERE
+        // ===================================================================
+        //
+        // The dialling half now exists — `TelephonyProvider::place_call`,
+        // `OutboundCall`, `Effects::place_call`, the `CallPlace` subject and
+        // the audit row — so the sentence `UNSERVED` used to give for
+        // `ActionKind::CallPlace` ("no adapter can place a call") has stopped
+        // being true and has been rewritten rather than left to rot.
+        //
+        // Unlike `issue_invoice` above, **the row is deliberately not written
+        // out**, and the difference between the two is the difference between
+        // a measurement and a missing machine. That block is a finished tool
+        // waiting on a digest somebody has to buy with a live model run; this
+        // one would be a schema for a verb whose payload does not exist yet. A
+        // call placed today is `telephony_twilio::SILENT_TWIML` — it rings,
+        // the callee says hello, and nothing answers. Handing that to a model
+        // is a robocall with a decision id, and no wording of a description
+        // field fixes it.
+        //
+        // Writing the schema anyway would also guarantee it is wrong. The one
+        // argument such a tool must take is what the call *says*, and the shape
+        // of that argument is decided by the machine that speaks it — a script
+        // for a synthesiser, a persona for a realtime model, a template id — so
+        // any JSON written here before that machine exists is a guess that has
+        // to be rewritten by the person who builds it. `OutboundCall` has no
+        // field for it for exactly this reason.
+        //
+        // WHAT THE DAY IT SHIPS COSTS, SO NOBODY RE-DERIVES IT
+        //
+        //   * `; 11]` becomes `; 12]`, `const PLACE_CALL: &str = "place_call";`
+        //     joins the tool names, the `ActionKind::CallPlace` entry leaves
+        //     `UNSERVED` (`[…; 10]`), and `Turn::propose`/`Turn::perform` gain
+        //     an arm that parses an `E164`, builds `CallPlace { to }` and hands
+        //     the token plus the employee's own number to `Effects::place_call`.
+        //   * `Risk::Low`, matching `Action::risk`, and that is a decision
+        //     rather than a copy: `High` would withhold the verb from every
+        //     turn that has read anything from outside, which is precisely the
+        //     turn that has just been asked to call somebody back.
+        //   * `EngineConfig::provision_phone` flips to `true` in the same
+        //     commit or `the_shipped_default_matches_what_this_build_can_actually_use`
+        //     goes red — it asserts the biconditional, on purpose.
+        //   * `default_ceiling` still grants no `Channel::Voice` and no calling
+        //     code, and layers only narrow, so the tool would reach nothing
+        //     until an operator's ceiling says otherwise. That is a separate,
+        //     deliberate decision and not a step in this list.
+        //   * the same re-measure the block above spells out, which NOBODY IN
+        //     AN AGENT WAVE MAY RUN.
     ]
 }
 

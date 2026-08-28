@@ -92,6 +92,28 @@ pub struct OutboundSms {
     pub body: String,
 }
 
+/// A call to place.
+///
+/// **There is no field for what the call says, and the absence is this port's
+/// honest edge.** Placing a call is dialling — one number, another number, and
+/// a carrier that rings the second from the first. What a call *says* is a
+/// different machine entirely: speech synthesis, recognition, barge-in, and a
+/// turn-taking loop over a bidirectional media stream. None of those exists
+/// anywhere in this workspace, so a `script` or `voice` field here would be a
+/// place to put words nothing can speak, and every adapter would have to
+/// decide on its own what to do with them.
+///
+/// The adapters below dial and hang up. See [`TelephonyProvider::place_call`],
+/// which is where the two halves of "an employee phoned somebody" are told
+/// apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundCall {
+    /// The employee's own number.
+    pub from: E164,
+    /// The counterparty.
+    pub to: E164,
+}
+
 /// Proof that the WhatsApp 24-hour customer-service window is open.
 ///
 /// The field is private and the only constructor is
@@ -268,6 +290,44 @@ pub trait TelephonyProvider: Send + Sync {
         &self,
         key: &IdempotencyKey,
         message: &OutboundWhatsapp,
+    ) -> Result<ProviderMessageId, ProviderError>;
+
+    /// Dial `call.to` from `call.from`. Same idempotency rule as
+    /// [`Self::send_sms`]: re-dialling with the same `key` returns the first
+    /// attempt's id instead of ringing somebody twice.
+    ///
+    /// # What comes back is a call that was **accepted**, never one that was
+    /// **answered**
+    ///
+    /// This is the one place in this module where the obvious reading of `Ok`
+    /// is wrong, so it is written down rather than left to be discovered. The
+    /// id is the carrier's handle for the *attempt*, handed over the instant it
+    /// agrees to dial and long before the phone has finished ringing. Busy, no
+    /// answer, an answering machine, and a human who declined are all states
+    /// the call reaches **after** this future resolves, and not one of them is
+    /// expressible in this return type. They arrive on the provider's status
+    /// callback, and this workspace has no route that accepts one — see
+    /// `agentos_app::inbound::land_inbound_text`, which is the telephony ingest
+    /// and is documented as not wired.
+    ///
+    /// So a caller that reports "I called them" on `Ok` is reporting something
+    /// this signature never said. What it did say is "the carrier took the
+    /// request".
+    ///
+    /// # What *is* here: the refusal to dial at all
+    ///
+    /// A number that routes nowhere, a country the account is not enabled to
+    /// call, a number the carrier will not connect. Those are refused
+    /// synchronously, they are [`ProviderError::Terminal`], and they are facts
+    /// about the counterparty rather than about us — a retry cannot fix any of
+    /// them and the number will not become dialable by asking again.
+    /// Everything else that fails here is transport, and transport is
+    /// [`ProviderError::Retryable`] for [`Self::send_sms`]'s reason: the
+    /// request may even have landed, which is why the key exists.
+    async fn place_call(
+        &self,
+        key: &IdempotencyKey,
+        call: &OutboundCall,
     ) -> Result<ProviderMessageId, ProviderError>;
 
     /// Authenticate an inbound webhook. `url` is the full callback URL as the
@@ -552,6 +612,9 @@ struct MockState {
     numbers: BTreeMap<String, String>,
     /// idempotency key -> message sid.
     sent: BTreeMap<String, ProviderMessageId>,
+    /// Every call that actually reached the wire, in order. A replayed key
+    /// must not add a row here — that is the whole assertion.
+    dialled: Vec<OutboundCall>,
     /// Regions whose regulatory bundle is not approved yet.
     awaiting_bundle: BTreeSet<Region>,
     next: u32,
@@ -612,19 +675,34 @@ impl MockTelephony {
         self.state().numbers.len()
     }
 
+    /// Every call that reached this provider, in order — the mock's answer to
+    /// the question the hermetic Twilio fake answers with its `messages`
+    /// counter: *did the replay ring anybody?*
+    ///
+    /// It records the whole [`OutboundCall`] and not a count, because
+    /// `from` and `to` are the same type and the seam that fills them in lives
+    /// in another crate. A caller that swapped the two would compile, would
+    /// return `Ok`, and would have phoned the employee from the stranger.
+    pub fn dialled(&self) -> Vec<OutboundCall> {
+        self.state().dialled.clone()
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, MockState> {
         self.state.lock().expect("mock state mutex poisoned")
     }
 
-    fn record_send(&self, key: &IdempotencyKey, prefix: &str) -> ProviderMessageId {
+    /// The id for this key, and whether this attempt is the *first* one under
+    /// it. The flag is what lets [`MockTelephony::place_call`] log a wire
+    /// event for a real send and stay silent for a replay.
+    fn record_send(&self, key: &IdempotencyKey, prefix: &str) -> (ProviderMessageId, bool) {
         let mut state = self.state();
         if let Some(existing) = state.sent.get(key.as_str()) {
-            return existing.clone();
+            return (existing.clone(), false);
         }
         state.next += 1;
         let id = ProviderMessageId::new(format!("{prefix}{:016}", state.next));
         state.sent.insert(key.as_str().to_owned(), id.clone());
-        id
+        (id, true)
     }
 }
 
@@ -684,7 +762,7 @@ impl TelephonyProvider for MockTelephony {
         if sms.body.is_empty() {
             return Err(ProviderError::Terminal { code: "empty_body" });
         }
-        let id = self.record_send(key, "SM");
+        let (id, _) = self.record_send(key, "SM");
         self.fault.check_after()?;
         Ok(id)
     }
@@ -716,7 +794,25 @@ impl TelephonyProvider for MockTelephony {
                 }
             }
         }
-        let id = self.record_send(key, "MM");
+        let (id, _) = self.record_send(key, "MM");
+        self.fault.check_after()?;
+        Ok(id)
+    }
+
+    async fn place_call(
+        &self,
+        key: &IdempotencyKey,
+        call: &OutboundCall,
+    ) -> Result<ProviderMessageId, ProviderError> {
+        self.fault.check_before()?;
+        // No body to be empty and no window to have closed: the two things a
+        // message can be wrong about do not exist for a call. What is left is
+        // the dial itself, and the double's job is to record that it happened
+        // exactly once per key.
+        let (id, fresh) = self.record_send(key, "CA");
+        if fresh {
+            self.state().dialled.push(call.clone());
+        }
         self.fault.check_after()?;
         Ok(id)
     }
@@ -813,6 +909,48 @@ pub async fn contract_suite<P: TelephonyProvider + ?Sized>(provider: &P) {
         "distinct keys must produce distinct messages"
     );
 
+    // -- dialling is idempotent on the key, exactly as sending is ----------
+    //
+    // The expensive mistake here is not a duplicate row, it is a stranger's
+    // phone ringing twice because a turn was retried. So the key rule is the
+    // same one `send_sms` gets, held to the same assertions.
+    let call = OutboundCall {
+        from: E164::parse("+15005550006").expect("valid e164"),
+        to: E164::parse("+14158675309").expect("valid e164"),
+    };
+    // Its own key, and never the one the SMS above used: in this workspace a
+    // key is derived from a gate decision (`Effects::key_for`), so one key can
+    // never stand for both a message and a call, and a suite that pretended
+    // otherwise would be asserting against a collision no deployment can reach.
+    let call_key = IdempotencyKey::for_step(employee_id, "call:1");
+    let dialled = provider
+        .place_call(&call_key, &call)
+        .await
+        .expect("first dial");
+    assert_eq!(
+        provider
+            .place_call(&call_key, &call)
+            .await
+            .expect("replayed dial"),
+        dialled,
+        "the same idempotency key must return the same call id, not ring twice"
+    );
+    assert_ne!(
+        provider
+            .place_call(&IdempotencyKey::for_step(employee_id, "call:2"), &call)
+            .await
+            .expect("distinct dial"),
+        dialled,
+        "distinct keys must produce distinct calls"
+    );
+    // A call id is not a message id, and an adapter that answered a dial out of
+    // its message table would pass every assertion above while handing back the
+    // sid of the SMS sent under the same key one block up.
+    assert_ne!(
+        dialled, sent,
+        "a call and a message under different keys must not share an id"
+    );
+
     // -- release is idempotent and tolerant of an already-gone number ------
     // All three are the same desired state, so all three succeed. `DELETE` is
     // what actually stops the monthly charge, and an adapter that reported a
@@ -871,6 +1009,14 @@ mod tests {
         contract_suite(&mock).await;
         // Two numbers were bought and exactly one of them was given back.
         assert_eq!(mock.number_count(), 1);
+        // Three dials went in under two keys, so exactly two phones rang. The
+        // suite's `assert_eq!` proves the replay got the same *id*; this is the
+        // other half, and it is the half that costs somebody a ringing phone.
+        let dialled = mock.dialled();
+        assert_eq!(dialled.len(), 2, "the replayed dial rang somebody again");
+        assert_eq!(dialled[0], dialled[1], "the same call, placed twice");
+        assert_eq!(dialled[0].to.as_str(), "+14158675309");
+        assert_eq!(dialled[0].from.as_str(), "+15005550006");
     }
 
     #[tokio::test]

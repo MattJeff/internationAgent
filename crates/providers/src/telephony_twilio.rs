@@ -41,8 +41,9 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 
 use crate::telephony::{
-    InboundCtx, OutboundSms, OutboundWhatsapp, PROVIDER, ParseError, ProviderMessageId, Region,
-    SigError, TelephonyProvider, WebhookBody, normalize_twilio_form, verify_twilio_signature,
+    InboundCtx, OutboundCall, OutboundSms, OutboundWhatsapp, PROVIDER, ParseError,
+    ProviderMessageId, Region, SigError, TelephonyProvider, WebhookBody, normalize_twilio_form,
+    verify_twilio_signature,
 };
 use crate::{EnsureCtx, ProviderBinding, ProviderError, Provisioned, Secret};
 
@@ -70,6 +71,28 @@ pub const API_ROOT: &str = "https://api.twilio.com";
 
 /// The bundle status that will never become approved on its own.
 const REJECTED: &str = "twilio-rejected";
+
+/// What a call placed by this adapter does once the callee picks up: nothing,
+/// then hangs up.
+///
+/// **Twilio will not create a call without instructions.** `POST /Calls`
+/// requires either a `Url` it fetches TwiML from or inline `Twiml`, and there
+/// is no "just connect" option — a call has to be told what to do. So this
+/// constant is not a placeholder for a missing feature, it is the *whole*
+/// answer this build has, written out where the wire can be read.
+///
+/// The instruction is `<Hangup/>` and not an empty `<Response/>`, which behave
+/// identically at the carrier: the difference is that one of them says what it
+/// means. A future reader diffing this file should be able to tell "we chose
+/// silence" from "somebody left the body blank".
+///
+/// **A `Url` is deliberately not used.** Pointing a call at a callback would
+/// mean this deployment answering an HTTP request from Twilio mid-call and
+/// composing TwiML on the spot, which is the voice half — speech synthesis,
+/// recognition, a turn-taking loop — and none of it exists here. See
+/// [`crate::telephony::OutboundCall`], which has no field for what to say for
+/// the same reason.
+const SILENT_TWIML: &str = "<Response><Hangup/></Response>";
 
 /// Error codes Twilio returns when a purchase needs an approved regulatory
 /// bundle.
@@ -260,10 +283,18 @@ impl TwilioTelephony {
         }
     }
 
-    /// POST one message, de-duplicating on the idempotency key.
-    async fn create_message(
+    /// POST one resource that reaches a person — a message or a call —
+    /// de-duplicating on the idempotency key.
+    ///
+    /// `tail` is the collection: `Messages.json` or `Calls.json`. One method
+    /// and not two, because the de-duplication is the part that matters and a
+    /// second copy of it is a second place for the lock to be forgotten. The
+    /// two collections answer the same shape — a `sid` on a 201 — and the sid
+    /// is opaque to everything above this line.
+    async fn create(
         &self,
         key: &IdempotencyKey,
+        tail: &str,
         form: &[(&str, String)],
     ) -> Result<ProviderMessageId, ProviderError> {
         if let Some(already) = self
@@ -277,7 +308,7 @@ impl TwilioTelephony {
         }
 
         let body = self
-            .call(self.http.post(self.account_url("Messages.json")).form(form))
+            .call(self.http.post(self.account_url(tail)).form(form))
             .await?;
         let sid = body["sid"].as_str().ok_or(ProviderError::Terminal {
             code: "no_message_sid",
@@ -392,8 +423,9 @@ impl TelephonyProvider for TwilioTelephony {
         key: &IdempotencyKey,
         sms: &OutboundSms,
     ) -> Result<ProviderMessageId, ProviderError> {
-        self.create_message(
+        self.create(
             key,
+            "Messages.json",
             &[
                 ("From", sms.from.as_str().to_owned()),
                 ("To", sms.to.as_str().to_owned()),
@@ -452,7 +484,29 @@ impl TelephonyProvider for TwilioTelephony {
                 ]
             }
         };
-        self.create_message(key, &form).await
+        self.create(key, "Messages.json", &form).await
+    }
+
+    async fn place_call(
+        &self,
+        key: &IdempotencyKey,
+        call: &OutboundCall,
+    ) -> Result<ProviderMessageId, ProviderError> {
+        // `Twiml` inline rather than `Url`: see `SILENT_TWIML`. There is no
+        // `StatusCallback` either, and its absence is the honest one — nothing
+        // in this deployment can receive the answer, so pointing Twilio at a
+        // route that does not exist would buy a 404 on every call and a log
+        // line that reads like a bug.
+        self.create(
+            key,
+            "Calls.json",
+            &[
+                ("From", call.from.as_str().to_owned()),
+                ("To", call.to.as_str().to_owned()),
+                ("Twiml", SILENT_TWIML.to_owned()),
+            ],
+        )
+        .await
     }
 
     fn verify_webhook(
@@ -510,6 +564,14 @@ mod tests {
         purchases: usize,
         /// Message POSTs that reached the wire.
         messages: usize,
+        /// The `Twiml` of every call POST that reached the wire, in order.
+        /// What a call *says* is the whole question this build answers with
+        /// silence, so the assertion is on the body and not on a count.
+        calls: Vec<String>,
+        /// The whole form of the last call POST, for the assertions about what
+        /// is **absent** from it — a `Url`, a `StatusCallback`. A key that was
+        /// never sent cannot be seen in `calls` above.
+        last_call_form: Option<BTreeMap<String, String>>,
         /// Refuse purchases until a bundle is approved.
         regulated: bool,
         /// (sid, status) of the account's bundle for the country.
@@ -649,6 +711,21 @@ mod tests {
                 state.messages += 1;
                 (201, json!({"sid": format!("SM{:016}", state.messages)}))
             }
+            ("POST", p) if p.ends_with("/Calls.json") => {
+                // Twilio's own 400 for a create with neither `Url` nor `Twiml`.
+                // The fake refuses it because the adapter must never send one:
+                // a call with no instructions is not a silent call, it is a
+                // rejected request that still counted as an attempt upstream.
+                let Some(twiml) = request.form.get("Twiml") else {
+                    return (
+                        400,
+                        json!({"code": 21_205, "message": "Url is not a valid URL"}),
+                    );
+                };
+                state.calls.push(twiml.clone());
+                state.last_call_form = Some(request.form.clone());
+                (201, json!({"sid": format!("CA{:016}", state.calls.len())}))
+            }
             _ => (404, json!({"code": 20_404, "message": "not found"})),
         }
     }
@@ -779,6 +856,73 @@ mod tests {
         // Three sends, one of them a replay of a key already used: the replay
         // must never have reached Twilio.
         assert_eq!(state.messages, 2, "the replayed send was sent again");
+        // Three dials, same shape, and the assertion that costs a stranger a
+        // second ringing phone if it ever goes.
+        assert_eq!(
+            state.calls.len(),
+            2,
+            "the replayed dial rang somebody again"
+        );
+        // And what every one of them said. **Not `assert_eq!(twiml,
+        // SILENT_TWIML)`** — that was the first version of this assertion and
+        // it proved nothing: it compares the wire against the same constant the
+        // wire came from, so editing the constant to `<Say>Hello</Say>` left it
+        // green. A mutation that does not turn an assertion red is an assertion
+        // that is not there.
+        //
+        // So: the literal, pinned here on purpose, and then the property. The
+        // literal catches an edit to `SILENT_TWIML`; the property catches an
+        // adapter that grew a voice some other way — a second constant, a
+        // `Url` callback, a verb appended at the call site.
+        for twiml in &state.calls {
+            assert_eq!(twiml, "<Response><Hangup/></Response>");
+            for verb in ["<Say", "<Play", "<Gather", "<Record", "<Dial", "<Sms"] {
+                assert!(
+                    !twiml.contains(verb),
+                    "a placed call is silent in this build, and this one carries {verb}: {twiml}"
+                );
+            }
+        }
+    }
+
+    /// The other half of "the call says nothing": nothing may fetch what it
+    /// says from somewhere else.
+    ///
+    /// `Url` and `Twiml` are alternatives at Twilio, and a `Url` would point
+    /// the carrier at a route in this deployment that composes speech on the
+    /// spot — the voice half, arriving through the back door as a config
+    /// string rather than as a reviewed feature. `StatusCallback` is absent for
+    /// a different reason and asserted here beside it: no route in this build
+    /// accepts one, so sending it would buy a 404 per call and an `Ok` that
+    /// still cannot say whether anybody answered.
+    #[tokio::test]
+    async fn a_placed_call_fetches_nothing_and_calls_nothing_back() {
+        let twilio = FakeTwilio::start().await;
+        twilio
+            .client()
+            .place_call(
+                &key("call:1"),
+                &OutboundCall {
+                    from: E164::parse("+15005550006").expect("e164"),
+                    to: E164::parse("+14158675309").expect("e164"),
+                },
+            )
+            .await
+            .expect("the fake takes it");
+
+        let form = twilio.state().last_call_form.clone().expect("a call POST");
+        assert!(form.contains_key("Twiml"), "the instructions are inline");
+        for absent in [
+            "Url",
+            "StatusCallback",
+            "StatusCallbackEvent",
+            "MachineDetection",
+        ] {
+            assert!(
+                !form.contains_key(absent),
+                "a placed call must not carry {absent}: {form:?}"
+            );
+        }
     }
 
     // -- reconcile before create -------------------------------------------
