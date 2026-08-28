@@ -88,13 +88,21 @@ const PROVIDERS: [(&str, &str, &str); 3] = [
 /// without changing what runs is worse than no check.
 ///
 /// It keeps a line of its own, unlike the plaintext secret vault (which is
-/// named only in [`Config::adapter_summary`]), because retrieval *answering
-/// with the wrong documents* is a thing an operator will otherwise debug for a
-/// day.
+/// named only in [`Config::adapter_summary`]), because *an employee that never
+/// finds its documents* is a thing an operator will otherwise debug for a day.
+///
+/// The wording is the symptom, and the symptom changed. It used to read
+/// "retrieval returns something and it is not the right thing", which was
+/// accurate while `agentos_app::knowledge::retrieve` fused a hash-ranked vector
+/// leg into every answer. It no longer does — see the retrieval section of that
+/// module — so the operator now sees an empty recall rather than a wrong one,
+/// and this line has to say which.
 const PERMANENT_MOCK: (&str, &str) = (
     "embedder",
-    "MOCK — a SHA-256 hash (`mock-sha256-1536`), not semantics: retrieval returns something and \
-     it is not the right thing. This build ships no real embedder, so no credential changes it.",
+    "MOCK — a SHA-256 hash (`mock-sha256-1536`), not semantics. Retrieval therefore runs on word \
+     matching alone: an employee finds a document that repeats the words of the question and \
+     finds nothing otherwise, which on an inbound email is most of the time. This build ships no \
+     real embedder, so no credential changes it.",
 );
 
 /// Every migration this binary carries, so "are the migrations applied?" is

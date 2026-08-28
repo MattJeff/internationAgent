@@ -436,11 +436,23 @@ pub async fn search_text(
     Ok(rows.iter().map(hit).collect())
 }
 
-/// Both legs, fused with Reciprocal Rank Fusion. **This is the one to call.**
+/// Both legs, fused with Reciprocal Rank Fusion. **Only correct when the
+/// embedding actually means something.**
 ///
 /// Each leg contributes `1 / (RRF_K + rank)` to a chunk's score, so a chunk
 /// both legs like outranks one that only a single leg loves. Ties break on
 /// `chunk_id` so the order is stable across runs.
+///
+/// The precondition is not a nicety. [`search_vector`] always returns `limit`
+/// rows if the tenant has that many — it ranks whatever it is given and there is
+/// no threshold below which it declines — so fusing it in when the vectors are a
+/// hash pads every answer out to `limit` with chunks drawn by digest, scored and
+/// sorted like the real ones. The caller that knows which backend produced the
+/// query vector is `agentos_app::knowledge::retrieve`, and it calls
+/// [`search_text`] alone rather than this when
+/// `Embedder::is_semantic()` is false. Nothing in this crate can check that: a
+/// `vector(1536)` does not know where it came from, which is the same reason
+/// [`Search::model`] has to be bound rather than inferred.
 pub async fn search_hybrid(
     tx: &mut TenantTx<'_>,
     search: &Search<'_>,
