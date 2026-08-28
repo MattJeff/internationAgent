@@ -1,9 +1,8 @@
 # The company, running
 
-*Last walked: 2026-08-28 (sixth pass, after wave E. **All five of the founder's
-internal tools are in** — work board, calendar, a desk to talk to a human,
-invoicing, a file store — and the catalogue rows for the first two have been
-measured live rather than guessed.)*
+*Last walked: 2026-08-29 (seventh pass, after waves F through N. All five
+internal tools are in, and the sweep that followed them found the most serious
+defect of the programme — see "What the sweep found", below.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -332,6 +331,50 @@ inherits an hour. So it is cancelled in the only vocabulary 0063 gave —
 `rang_at` written *before* `at` — and only for hours still ahead, because
 stamping `now` on an hour already past would manufacture a record saying
 somebody kept it.
+
+## What the sweep found, and it is worth reading before trusting the gate
+
+**The taint wire was forgotten in exactly the branch its own comment swore it
+could not be.** `evaluate` refuses a high-risk action derived from untrusted
+text — a web page, an inbound email, an MCP result — and the comment said the
+check is applied after the rules "so it cannot be forgotten in one branch". The
+expression ended in `&& decision.is_allow()`, so an action answering
+`RequireApproval` was not tainted at all. That is the answer for payments,
+contract signatures, credential changes, bulk erasure and charters.
+
+The path was live, traced link by link: an inbound email taints the turn, the
+model guesses the name `pay`, `propose` hands it over because it is a bare
+`match name` that never consults `visible`, the gate answers `RequireApproval`
+instead of denying, and a row lands in the founder's queue carrying an amount
+and a payee a stranger chose, presented as the employee's own proposal.
+
+Three things made it worse than a latent bug. The repository already knew —
+`action.rs` said `ContractSign` *slips past the taint wire*, written as
+behaviour. In the shipped Orizn configuration it never fired for a payment at
+all, because `approval_above` is $1 and one cent for finance, so **every**
+injection took the escalating branch. And it was tested: the property test
+asserted `!decision.is_allow()`, which `RequireApproval` satisfies.
+
+Both layers are closed now — the gate denies, and `propose` refuses a name that
+was not offered to this turn — and the seal's real protection turned out to be
+sixteen `Subject<Of = X>` bounds that nothing tested. Relaxing one left five
+harnesses green while an untrusted token could act.
+
+**And the approval ceremony could not see who was being paid.** It promised that
+restating an approved payment with a different payee is refused; the hash is over
+the `Action`, and `Action::PaymentCreate` carried `amount` and nothing else. Two
+payments to different counterparties for the same amount hashed identically, and
+the queue showed `pay EUR 500.00` because no payee had ever been filed. Fixed,
+and `Effects::pay` now builds the instruction from the token so the gate and the
+provider cannot be handed different names.
+
+**The lesson generalises, and it is the one to carry forward.** Five defects on
+five unrelated surfaces survived a green test because the assertion admitted more
+than its author believed: `!is_allow()` admits an escalation; a race harness held
+a transaction production never holds; `contains("no such tool")` admits "that
+tool exists but not for you"; two ceremony tests mutated fields that were in the
+action and none mutated the one that was not. **Ask what an assertion admits, not
+whether it is green.**
 
 ## Not on the map, deliberately
 
