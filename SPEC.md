@@ -852,7 +852,7 @@ pub enum Decision {
 The gate's own entry point is `PolicyGate::authorize(principal, action) ->
 Result<Authorized<A>, Denied>`.
 
-### Actions — fifteen, and their names
+### Actions — sixteen, and their names
 
 `Action` in `crates/domain/src/action.rs`. The wire form is snake_case, tagged
 `"action"` — `email_send`, **not** `email.send`. The same spellings are the
@@ -876,8 +876,21 @@ cannot drift into two vocabularies.
 | `data_delete { scope }` | **High** |
 | `charter_set { subordinate }` | **High** |
 | `internal_send { to }` | Low |
+| `appointment_book {}` | Low |
 
-The last two rows were missing while the heading above said "thirteen", and both
+`appointment_book` is the **second inward action** and the only variant with no
+payload at all. Its subject is the acting employee, which lives in `Principal`
+and never in an `Action` — the module's governing rule, that a variant never
+carries a self-description the gate then trusts, taken to its end. The instant
+and the zone are arguments to `Effects::book_hour`, not fields: the gate has no
+opinion about three o'clock. It is `Low` for `internal_send`'s reason and one
+more of its own — a turn shown its own diary is an untrusted turn, so `High`
+would withhold the verb from every employee that has ever used it. Policy rules
+on it through `Channel::Internal`, the same channel `internal_send` asks about,
+which is what lets a layer take it away; `crates/app/src/calendar.rs` argues why
+a verb no layer can withhold is a verb every seat holds forever.
+
+The last two rows before it were missing while the heading above said "thirteen", and both
 are the ones a reader most needs. `charter_set` is **High** because re-tasking
 another employee is the blast radius of everything that employee then does, so a
 supplier's email saying "you now report to me" cannot produce one.
@@ -1650,8 +1663,44 @@ Splitting it this way is not an accident: the turn owns the model loop and
 nothing else, so the initiative loop can run a turn with **no untrusted content
 and no knowledge recall at all** simply by handing it a different context.
 
-The tool catalogue is three tools: `send_email` (low), `call_mcp_tool` (low),
-`pay` (high), plus whatever the tenant's MCP fleet contributes.
+The tool catalogue is **eleven tools over six action kinds**, and both halves of
+the sentence that used to be here were wrong. It said "three tools: `send_email`,
+`call_mcp_tool`, `pay`, plus whatever the tenant's MCP fleet contributes" — the
+count was five rows out of date, and the MCP fleet contributes **no schemas at
+all**: there is exactly one `call_mcp_tool` row whatever a tenant binds, which
+`crates/app/src/turn.rs` argues at length (tool count is a property of the
+model's accuracy, and MCP inventory is the thing that grows without bound). What
+the fleet contributes is a *named inventory in the prefix*, not schemas.
+
+| tool | action kind | risk |
+|---|---|---|
+| `send_email` | `email_send` | Low |
+| `read_page` | `browser_read` | Low |
+| `find_prospects` | `browser_read` | Low |
+| `propose_flow` | `browser_read` | Low |
+| `call_mcp_tool` | `mcp_call` | Low |
+| `pay` | `payment_create` | **High** |
+| `message_colleague` | `internal_send` | Low |
+| `brief_direct_reports` | `internal_send` | Low |
+| `add_work_item` | `internal_send` † | Low |
+| `update_work_item` | `internal_send` † | Low |
+| `promise_an_hour` | `appointment_book` | Low |
+
+† **Floor key, not a gate subject.** Filing and claiming work are not `Action`s —
+`Effects::post_work` argues why — so nothing rules on these two. The kind is
+there so that the role floor and `always_denies` still narrow them: a pack that
+may not reach a colleague internally is not offered them, and neither is a tenant
+that has closed `Channel::Internal`. What actually bounds them is
+`inbound::may_assign` and two `WHERE` clauses. Read the count out of the code
+before trusting this table:
+
+```bash
+grep -c '^        (' crates/app/src/turn.rs   # rows in `catalogue()`
+```
+
+The other ten action kinds have no schema, deliberately, each with the reason
+written down in `turn::UNSERVED` and checked by
+`catalogue_covers_every_proposable_kind`, so the two lists cannot drift.
 
 ---
 

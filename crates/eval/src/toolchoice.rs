@@ -578,6 +578,17 @@ pub fn evaluate() -> Surface {
     // filter has never taken a read away. What the taint filter takes is `pay`,
     // which is still the one name that differs between these two lists and
     // still the whole claim of this row.
+    //
+    // **Three more joined both columns**, and they are three because the buyer's
+    // floor now carries a sixteenth `ActionKind`. `add_work_item` and
+    // `update_work_item` ride `ActionKind::InternalSend` as a floor key with no
+    // ruling behind them; `promise_an_hour` rides `ActionKind::AppointmentBook`,
+    // which is a ruling of its own. All three are `Risk::Low` and all three are
+    // in the untrusted column, which is the point of each: the turn that most
+    // needs to write down a finding, take a job off the pool or promise to call
+    // somebody back is the one that has just read a stranger's page. `pay` is
+    // still the one name that differs between these two lists and still the
+    // whole claim of this row.
     let wired = trusted
         == [
             "send_email",
@@ -588,6 +599,9 @@ pub fn evaluate() -> Surface {
             "pay",
             "message_colleague",
             "brief_direct_reports",
+            "add_work_item",
+            "update_work_item",
+            "promise_an_hour",
         ]
         && untrusted
             == [
@@ -598,6 +612,9 @@ pub fn evaluate() -> Surface {
                 "call_mcp_tool",
                 "message_colleague",
                 "brief_direct_reports",
+                "add_work_item",
+                "update_work_item",
+                "promise_an_hour",
             ];
     rows.push(
         Row::ok(
@@ -652,6 +669,15 @@ pub fn evaluate() -> Surface {
                 "pay",
                 "message_colleague",
                 "brief_direct_reports",
+                // The board and the diary survive a fresh deployment too, and
+                // for one reason shared by all three: `default_ceiling` lists
+                // `Channel::Internal`, which is what `always_denies` asks about
+                // both `InternalSend` and `AppointmentBook`. An operator who
+                // closes that channel loses all five names together, which is
+                // the narrowing the shared key buys.
+                "add_work_item",
+                "update_work_item",
+                "promise_an_hour",
             ];
     rows.push(
         Row::ok(

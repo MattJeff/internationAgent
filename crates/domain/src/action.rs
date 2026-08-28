@@ -550,11 +550,12 @@ pub enum ActionKind {
     DataDelete,
     CharterSet,
     InternalSend,
+    AppointmentBook,
 }
 
 impl ActionKind {
     /// Every discriminant. Iterate this to prove a rule covers the whole space.
-    pub const ALL: [ActionKind; 15] = [
+    pub const ALL: [ActionKind; 16] = [
         ActionKind::EmailSend,
         ActionKind::SmsSend,
         ActionKind::WhatsappSend,
@@ -570,6 +571,7 @@ impl ActionKind {
         ActionKind::DataDelete,
         ActionKind::CharterSet,
         ActionKind::InternalSend,
+        ActionKind::AppointmentBook,
     ];
 
     /// Stable metric label.
@@ -590,6 +592,7 @@ impl ActionKind {
             ActionKind::DataDelete => "data_delete",
             ActionKind::CharterSet => "charter_set",
             ActionKind::InternalSend => "internal_send",
+            ActionKind::AppointmentBook => "appointment_book",
         }
     }
 }
@@ -691,12 +694,39 @@ pub enum Action {
     InternalSend {
         to: Slug,
     },
+
+    /// Undertake one moment of **your own** time: the second inward action.
+    ///
+    /// **Payload-free, and the emptiness is the argument.** Every other variant
+    /// carries the parsed subject of its effect; this one's subject is the
+    /// acting employee, and the acting employee is in
+    /// [`ActionCtx::actor`] and never in an `Action` — the module rule again, a
+    /// variant never carries a self-description the gate then trusts. An
+    /// `employee` field here would be a caller's claim about whose hour is
+    /// being spent, which is exactly the claim
+    /// [`crate::action`]'s header refuses. The instant is not the subject
+    /// either: the gate has no opinion about three o'clock, and
+    /// `PolicyLimits` has no field to measure one against.
+    ///
+    /// What keeps that honest is one seam over, in `app::calendar`:
+    /// `Calendar::book` takes no employee at all, and a `PgCalendar` is built
+    /// per seat, so "spend somebody else's hour" is unrepresentable rather than
+    /// merely refused.
+    ///
+    /// It is an `Action` — rather than a bare effect like posting work — for the
+    /// reason `app::calendar`'s module docs give: [`ActionKind`] is the alphabet
+    /// every role pack's `proposable` set is spelled with and the key
+    /// `app::turn`'s catalogue is written in, so a verb outside it is a verb no
+    /// policy layer can withhold and no role pack can decline. A finance clerk
+    /// would hold the same power to promise a stranger an hour as a seller,
+    /// forever, with nothing able to say no.
+    AppointmentBook {},
 }
 
 impl Action {
     /// Alias for [`ActionKind::ALL`], so `Action::ALL_DISCRIMINANTS` reads at
     /// the call site.
-    pub const ALL_DISCRIMINANTS: [ActionKind; 15] = ActionKind::ALL;
+    pub const ALL_DISCRIMINANTS: [ActionKind; 16] = ActionKind::ALL;
 
     /// Which discriminant this is. Exhaustive by construction — no `_` arm.
     pub const fn kind(&self) -> ActionKind {
@@ -716,6 +746,7 @@ impl Action {
             Action::DataDelete { .. } => ActionKind::DataDelete,
             Action::CharterSet { .. } => ActionKind::CharterSet,
             Action::InternalSend { .. } => ActionKind::InternalSend,
+            Action::AppointmentBook {} => ActionKind::AppointmentBook,
         }
     }
 
@@ -749,7 +780,19 @@ impl Action {
             // would protect nothing that is not already protected there, and
             // would break the only channel by which a tainted employee can
             // report what happened to it.
-            | Action::InternalSend { .. } => Risk::Low,
+            | Action::InternalSend { .. }
+            // Low, in `InternalSend`'s list and for its reason. What an
+            // appointment *becomes* is a turn whose brief carries the subject
+            // fenced — `loops::initiative::diary` and `kept_brief` keep the
+            // `Untrusted` wrapper on — so the danger is at the reader and is
+            // already handled there.
+            //
+            // `High` would mean an employee that has just read a supplier's
+            // email cannot promise to call them back, which is the feature; and
+            // a turn shown its own diary is an untrusted turn, so `High` here
+            // would withhold the verb from every employee that has ever used
+            // it — the filter deleting the thing it was meant to contain.
+            | Action::AppointmentBook {} => Risk::Low,
 
             Action::FileUpload { .. }
             | Action::PaymentCreate { .. }
@@ -1021,13 +1064,12 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ActionKind::ALL.len(), "duplicate discriminant");
-        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 15);
+        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 16);
     }
 
-    /// Thirteen of the fifteen actions leave the company. The two that do not
-    /// are `CharterSet` and this one, the internal channel, and it is
-    /// deliberately `Low`: see the paragraph on
-    /// [`Action::risk`].
+    /// Thirteen of the sixteen actions leave the company. The three that do not
+    /// are `CharterSet`, the internal channel and `AppointmentBook`; the latter
+    /// two are deliberately `Low`, see the paragraph on [`Action::risk`].
     #[test]
     fn talking_to_a_colleague_is_low_risk_and_has_no_counterparty() {
         let internal = Action::InternalSend {
@@ -1036,6 +1078,31 @@ mod tests {
         assert_eq!(internal.kind(), ActionKind::InternalSend);
         assert_eq!(internal.risk(), Risk::Low);
         assert_eq!(internal.kind().as_str(), "internal_send");
+    }
+
+    /// **Promising an hour carries no subject at all**, which is the security
+    /// property rather than an ergonomic one.
+    ///
+    /// Written as a compile-time assertion and not only as a value: this line
+    /// typechecks exactly while `AppointmentBook` has no fields, so adding an
+    /// `employee`, an `at` or a `zone` to it breaks the build here. That is the
+    /// strongest form "whose hour is spent is not something a caller may claim"
+    /// can take — the same shape as `_CALL_PLACE_TAKES_ONLY_A_NUMBER` above.
+    #[test]
+    fn promising_an_hour_names_nobody_and_is_low_risk() {
+        const _APPOINTMENT_TAKES_NOTHING: fn() -> Action = || Action::AppointmentBook {};
+
+        let hour = Action::AppointmentBook {};
+        assert_eq!(hour.kind(), ActionKind::AppointmentBook);
+        assert_eq!(hour.risk(), Risk::Low);
+        assert_eq!(hour.kind().as_str(), "appointment_book");
+        // The wire form has the tag and nothing else, so there is no field a
+        // forged payload could set — the `call_place` test below proves the
+        // same point for a variant that does have one.
+        assert_eq!(
+            serde_json::to_string(&hour).unwrap(),
+            r#"{"action":"appointment_book"}"#
+        );
     }
 
     #[test]

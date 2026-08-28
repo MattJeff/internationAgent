@@ -41,6 +41,17 @@ use agentos_domain::ids::{AppointmentId, EmployeeId, TenantId};
 
 use crate::db::{StoreError, TenantTx};
 
+/// The longest subject `appointments_subject_shape` accepts, named once so
+/// nothing upstream invents a second number.
+///
+/// [`crate::backlog::MAX_TITLE`]'s argument, for the other table, and the cost
+/// of not having had it was the same: the constraint is
+/// `char_length(btrim(subject)) between 1 and 200`, so an over-long line is a
+/// `23514` out of the driver, which [`StoreError`] classifies as `Database`,
+/// which ends whatever turn wrote it. Characters and not bytes, for
+/// `MAX_TITLE`'s reason.
+pub const MAX_SUBJECT: usize = 200;
+
 /// One row of `appointments`.
 ///
 /// `subject` is a plain `String` here and is wrapped by

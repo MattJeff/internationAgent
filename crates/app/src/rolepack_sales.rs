@@ -255,6 +255,15 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::InternalSend,
+                // `AppointmentBook` because this seat tells people it will do
+                // something at an hour and has, until now, had no way to be
+                // there. It is the sixteenth kind and it is here rather than in
+                // every pack: `growth` and `entry-requirements` reach nobody
+                // outside the company, so a promise they could make is a promise
+                // to nobody — see `rolepack_service`'s note on the two that
+                // decline it. That is what makes this a decision rather than a
+                // default.
+                ActionKind::AppointmentBook,
             ]
             .into_iter()
             .collect(),
@@ -880,9 +889,9 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means a
-    /// sixteenth action cannot be added without someone deciding here whether
-    /// a sales employee may propose it. There are fifteen today
-    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 15]`); this said
+    /// seventeenth action cannot be added without someone deciding here whether
+    /// a sales employee may propose it. There are sixteen today
+    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 16]`); this said
     /// "fourteenth" after both `charter_set` and `internal_send` had landed.
     #[test]
     fn the_sales_role_cannot_propose_an_action_outside_its_allowlist() {
@@ -894,6 +903,7 @@ mod tests {
             ActionKind::BrowserRead,
             ActionKind::McpCall,
             ActionKind::InternalSend,
+            ActionKind::AppointmentBook,
         ]
         .into_iter()
         .collect();

@@ -184,6 +184,13 @@ async fn book(
 /// outage.
 fn refusal(err: CalendarError) -> ApiError {
     match err {
+        // 400 rather than the 500 this used to be: the handler checked for an
+        // empty subject and nothing checked the other end, so a caller's long
+        // sentence hit `appointments_subject_shape` and came back as our fault.
+        CalendarError::SubjectShape => ApiError::bad_request(
+            "`subject` is 1 to 200 characters: it is the one line the employee reads when the \
+             moment arrives, not the briefing",
+        ),
         CalendarError::UnknownZone => ApiError::bad_request(
             "`at_zone` must be an IANA time zone name, like `Europe/Vienna`: it is whose \
              clock the promise was made against, and there is no default because the \

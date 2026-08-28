@@ -783,7 +783,7 @@ impl PolicyGate {
     /// when the trail outgrows the index" — a dilemma with two branches, keep
     /// the aggregate or materialise it, written when every decision needed the
     /// number. `spends_contact_budget` is the third branch and it arrived on
-    /// 2026-08-28 with waveV-v3: eleven of the fifteen action kinds — every
+    /// 2026-08-28 with waveV-v3: twelve of the sixteen action kinds — every
     /// `A2aSend`, every `McpCall`, every browse, every payment, every message
     /// to a colleague — have an arm of `evaluate` that provably cannot read
     /// `new_contacts_today`, and `policy`'s own
@@ -1218,6 +1218,11 @@ fn counterparty(action: &Action) -> Option<String> {
         // colleagues.
         | Action::CharterSet { .. } => None,
         | Action::InternalSend { .. } => None,
+        // Nobody at all. The only person an appointment reaches is the employee
+        // that made it, which is `Principal` and not a counterparty — the same
+        // rule as `InternalSend` above, one step further: a colleague is not a
+        // stranger, and yourself is not even a colleague.
+        | Action::AppointmentBook {} => None,
     }
 }
 

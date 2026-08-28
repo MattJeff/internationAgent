@@ -4,7 +4,7 @@
 //! violated and both of which are now enforced by the compiler:
 //!
 //! 1. **No default-open fallthrough.** [`evaluate`] matches every [`Action`]
-//!    variant by name. There is no `_` arm, so the day a sixteenth action is
+//!    variant by name. There is no `_` arm, so the day a seventeenth action is
 //!    added the build breaks instead of the action being silently permitted.
 //!    The old code ended in `_ => PolicyDecision::Allow`, which is how
 //!    "sign this contract" became a thing an employee could do unsupervised.
@@ -1026,7 +1026,10 @@ pub const fn spends_contact_budget(action: &Action) -> bool {
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }
         | Action::CharterSet { .. }
-        | Action::InternalSend { .. } => false,
+        | Action::InternalSend { .. }
+        // An hour promised reaches nobody at all — not even a colleague — so
+        // there is no counterparty for it to be the first contact with.
+        | Action::AppointmentBook {} => false,
     }
 }
 
@@ -1173,6 +1176,18 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         // channel exactly as long as its policy lists `Channel::Internal`, and
         // the shipped ceiling does.
         ActionKind::InternalSend => closed(Channel::Internal),
+        // ChannelNotAllowed / NoRule, on the same channel and deliberately so.
+        // An appointment reaches nobody outside the company, which is exactly
+        // what `Channel::Internal` already means, and it is the channel
+        // `turn::UNCHARTERED` leans on.
+        //
+        // The alternative was `false` — "no policy can withhold it" — and that
+        // is the widening `app::calendar`'s module docs refuse in as many
+        // words: a verb no layer can take away is a verb every seat holds
+        // forever. Sharing a channel with the internal one costs an operator
+        // who closes `Channel::Internal` the ability to let a seat keep its own
+        // diary, which is a *narrowing* and therefore the safe direction.
+        ActionKind::AppointmentBook => closed(Channel::Internal),
     }
 }
 
@@ -1509,6 +1524,33 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
                 ))
             }
         }
+
+        // **Byte-identical to the arm above**, and that is the decision rather
+        // than a copy waiting to be factored out. There is no `to` to read and
+        // no instant to judge: the whole of what this evaluator can say about
+        // an hour an employee undertakes is whether this policy lets that
+        // employee do anything that stays inside the company.
+        //
+        // No new `DenyReason` and no new `PolicyLimits` field. A
+        // `max_appointments_per_day` would be an invented number — the founder's
+        // brief refuses those — and the real ceiling already exists one seam
+        // over: an appointment spends a turn out of
+        // `PolicyLimits::max_turns_per_day` when it rings, reserved by
+        // `loops::initiative::handle` on the identical path a cadence turn
+        // takes.
+        //
+        // And **no migration**: `0006_policy` stores channels and limits, not
+        // action names, so a sixteenth kind adds no column and no row.
+        Action::AppointmentBook {} => {
+            if allowed_channels.contains(&Channel::Internal) {
+                Decision::Allow
+            } else {
+                Decision::deny(no_match(
+                    allowed_channels.is_empty(),
+                    DenyReason::ChannelNotAllowed,
+                ))
+            }
+        }
     }
 }
 
@@ -1639,6 +1681,7 @@ mod tests {
                 subordinate: EmployeeId::from_uuid(uuid::Uuid::from_u128(4)),
             },
             Action::InternalSend { to: slug("bruno") },
+            Action::AppointmentBook {},
         ]
     }
 
@@ -2964,7 +3007,7 @@ mod tests {
     /// Read the contrapositive and this is also the conservative direction:
     /// anything the gate does *not* deny forces the predicate to `false`, so a
     /// tool that is sometimes usable cannot be withheld. It iterates
-    /// `ActionKind::ALL` rather than the specimen list, so a sixteenth action
+    /// `ActionKind::ALL` rather than the specimen list, so a seventeenth action
     /// cannot be added without somebody deciding what this predicate says about
     /// it.
     #[test]

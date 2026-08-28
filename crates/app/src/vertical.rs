@@ -3908,7 +3908,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "message_colleague".to_owned(),
-                "brief_direct_reports".to_owned()
+                "brief_direct_reports".to_owned(),
+                // The work board arrived on the same key, which `UNCHARTERED`'s
+                // own docs now say out loud: `add_work_item` and
+                // `update_work_item` are keyed on `InternalSend` as a floor key,
+                // so a one-element floor admits four schemas. Still fail-closed
+                // — neither reaches outside the company — and still no
+                // `promise_an_hour`, which has a kind of its own that this floor
+                // does not list.
+                "add_work_item".to_owned(),
+                "update_work_item".to_owned(),
             ]
         );
     }

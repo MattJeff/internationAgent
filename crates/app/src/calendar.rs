@@ -61,7 +61,7 @@
 //! one caller today is behind `apps/server`'s `replay_idempotent` layer, and a
 //! key here would be a second lock on a door that has one.
 //!
-//! # Whose turn an appointment spends, and why it is not an `Action`
+//! # Whose turn an appointment spends, and why it IS an `Action`
 //!
 //! [`Action`](agentos_domain::action::Action) is how the gate mints the right to
 //! perform an effect, and `InternalSend` is in it for a precise reason the
@@ -69,95 +69,83 @@
 //! colleague's daily turn budget**. An appointment wakes somebody too, at an
 //! hour somebody chose, and it spends a turn out of the same
 //! `PolicyLimits::max_turns_per_day` — `loops::initiative::handle` reserves it
-//! before the turn runs, on the identical path a cadence turn takes. So the
-//! question is real and the analogy is exact.
+//! before the turn runs, on the identical path a cadence turn takes.
 //!
-//! **The gate has nothing to judge here, and it is still not the whole
-//! answer.** The backlog's argument was *a task wakes nobody*, and that one is
-//! unavailable: an appointment's entire purpose is to wake somebody. This one
-//! is that **the somebody is always the booker.** [`PgCalendar`] is built around
-//! one seat and [`Calendar::book`] takes no employee, so there is no argument
-//! for a caller to put another employee's id in. A `dyn Calendar` can only ever
-//! promise a moment of its holder's own time and spend a turn out of its
-//! holder's own budget — a budget it can already spend by existing on a cadence,
-//! and one the gate is not consulted about there either. What `InternalSend` is
-//! gated for is unrepresentable rather than ruled on.
+//! **The gate has nothing to judge about *whose* time is spent**, and that has
+//! not changed. The backlog's argument was *a task wakes nobody*, and it is
+//! unavailable here: an appointment's entire purpose is to wake somebody. The
+//! answer is that **the somebody is always the booker.** [`PgCalendar`] is built
+//! around one seat and [`Calendar::book`] takes no employee, so there is no
+//! argument for a caller to put another employee's id in. A `dyn Calendar` can
+//! only ever promise a moment of its holder's own time and spend a turn out of
+//! its holder's own budget — a budget it can already spend by existing on a
+//! cadence, and one the gate is not consulted about there either. What
+//! `InternalSend` is gated for is unrepresentable rather than ruled on, which is
+//! why [`Action::AppointmentBook`](agentos_domain::action::Action::AppointmentBook)
+//! carries no payload.
 //!
-//! So **it is not an [`Action`](agentos_domain::action::Action) today**, and
-//! the honest reason is narrower than that argument: *nothing an employee holds can create one.* The only write
-//! path is `POST /v1/calendar`, which is an operator with an API key — the same
-//! authority that already writes charters and cadences, not a principal the gate
-//! rules on — and `agentos_store::calendar::book`'s `EXISTS` is what keeps it
-//! inside its own company.
+//! **This module used to say "it is not an `Action` today", and the condition it
+//! attached to that has now happened.** The reason given was narrow and honest:
+//! *nothing an employee holds can create one* — the only write path was
+//! `POST /v1/calendar`, an operator with an API key, the same authority that
+//! writes charters and cadences and not a principal the gate rules on. Since
+//! `turn::catalogue` grew `promise_an_hour`, an employee holds exactly such a
+//! thing, so the sentence that followed applies:
 //!
 //! **The day an employee can book an hour, it must become one**, and not because
 //! the gate acquires a new judgement about whose time is spent.
 //! [`ActionKind`](agentos_domain::action::ActionKind) is not only the gate's
-//! vocabulary: it is the key
-//! [`turn::catalogue`](crate::turn) is written in and the alphabet every role
-//! pack's `proposable` set is spelled with. A verb outside it is a verb **no
-//! policy layer can withhold from a seat and no role pack can decline** — a
-//! finance clerk would hold the same power to promise a stranger an hour as a
-//! seller, forever, with nothing able to say no. That is a widening, so the
-//! verb arrives with a kind or it does not arrive.
+//! vocabulary: it is the key [`turn::catalogue`](crate::turn) is written in and
+//! the alphabet every role pack's `proposable` set is spelled with. A verb
+//! outside it is a verb **no policy layer can withhold from a seat and no role
+//! pack can decline** — a finance clerk would hold the same power to promise a
+//! stranger an hour as a seller, forever, with nothing able to say no. That is a
+//! widening, so the verb arrived with a kind.
 //!
-//! # The exact diff for that tool, which this change deliberately does not apply
+//! # What that cost, in full, so the next verb can be priced
 //!
-//! Applying it moves the tool catalogue, which moves
-//! `agentos_eval::toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}` — digests of
-//! the request as sent, whose remeasurement takes a real model call. So
-//! everything under the tool is built and the tool is not, and this is what to
-//! apply, in this order:
+//! `AppointmentBook` is the sixteenth
+//! [`ActionKind`](agentos_domain::action::ActionKind), and the whole of what it
+//! touched is:
 //!
-//! 1. `crates/domain/src/action.rs`
-//!    * `ActionKind`: add `AppointmentBook` as the sixteenth variant; `ALL`
-//!      becomes `[ActionKind; 16]` and gains the entry; `as_str` returns
-//!      `"appointment_book"`.
-//!    * `Action`: add `AppointmentBook {}` — **a payload-free variant, and the
-//!      emptiness is the argument.** Every other variant carries the parsed
-//!      subject of its effect; this one's subject is the acting employee, which
-//!      is in `Principal` and never in an `Action` (module rule: a variant never
-//!      carries a self-description the gate then trusts). The instant is not the
-//!      subject either — the gate has no opinion about three o'clock.
-//!    * `Action::kind` gains its arm; `Action::risk` returns `Risk::Low`, in
-//!      `InternalSend`'s list and for the same reason: what an appointment
-//!      *becomes* is a turn whose brief carries the subject fenced, so the
-//!      danger is at the reader and is already handled there. `High` would mean
-//!      an employee that has just read a supplier's email cannot promise to call
-//!      them back, which is the feature.
-//!    * `Action::ALL_DISCRIMINANTS: [ActionKind; 16]`.
-//! 2. `crates/domain/src/policy.rs`
-//!    * `always_denies`: `ActionKind::AppointmentBook => closed(Channel::Internal)`
-//!      — an appointment reaches nobody outside the company, which is exactly
-//!      what `Channel::Internal` already means, and it is the channel
-//!      `turn::UNCHARTERED` leans on.
-//!    * `evaluate_rules`: an `Action::AppointmentBook {}` arm, byte-identical to
-//!      `Action::InternalSend`'s — `allowed_channels.contains(&Channel::Internal)`
-//!      or `DenyReason::ChannelNotAllowed`. No new `DenyReason`, no new
-//!      `PolicyLimits` field, and **no migration**: `0006_policy` stores channels
-//!      and limits, not action names.
-//! 3. `crates/app/src/rolepack*.rs` — add `ActionKind::AppointmentBook` to the
-//!    `proposable` set of the packs that should have it, and to the
-//!    `not_proposable` half for the rest. The three
-//!    `every_kind_is_decided`-style tests fail until every pack has chosen,
-//!    which is the point of them.
-//! 4. `crates/app/src/turn.rs`
-//!    * `catalogue()` becomes `[…; 9]` with one entry: name `"promise_an_hour"`,
-//!      `ActionKind::AppointmentBook`, `Risk::Low`, a description saying that
-//!      it books a moment of *your own* time, that you will be woken then and
-//!      only then, that the zone is required and is the *other* person's, and
-//!      that nothing reminds you twice; schema
-//!      `{ at: string (RFC 3339), at_zone: string (IANA name), subject: string }`.
-//!    * `UNSERVED` stays at 10 and `catalogue_covers_every_proposable_kind`
-//!      re-partitions on its own.
-//!    * The executor is `Effects`-shaped and reaches [`Calendar::book`] with the
-//!      per-turn `PgCalendar` built from the principal's own tenant and employee
-//!      — never from the tool's arguments, which is what keeps every sentence
-//!      above true.
-//! 5. `crates/eval/src/toolchoice.rs` — re-pin `TRUSTED_PROMPT` and
-//!    `UNTRUSTED_PROMPT` from a real run. **This is the step that cannot be done
-//!    without a model call**, and it is why the four above are written down
-//!    rather than applied.
+//! * `crates/domain/src/action.rs` — the variant, `ALL`, `as_str`,
+//!   `Action::AppointmentBook {}`, `kind`, `risk` (`Low`, in `InternalSend`'s
+//!   list) and `ALL_DISCRIMINANTS`.
+//! * `crates/domain/src/policy.rs` — `spends_contact_budget` (false: it reaches
+//!   nobody), `always_denies` (`closed(Channel::Internal)`) and an
+//!   `evaluate_rules` arm byte-identical to `InternalSend`'s. **No new
+//!   `DenyReason`, no new `PolicyLimits` field, and no migration** —
+//!   `0006_policy` stores channels and limits rather than action names, and
+//!   `capability_decisions.action_kind` is a bare `text` column with no `CHECK`
+//!   enumerating them. That was checked rather than assumed.
+//! * `crates/app/src/gate.rs` — `counterparty` returns `None`: nobody is
+//!   contacted, so the cold-outreach budget is neither charged nor enlarged.
+//! * `crates/app/src/rolepack*.rs` — four packs take it and **two decline it**.
+//!   `growth` and `entry-requirements` reach nobody outside the company, so a
+//!   promise they could make is a promise to nobody. That split is the proof the
+//!   kind was worth minting: it is the first discriminant the four service packs
+//!   did not answer identically.
+//! * `crates/app/src/turn.rs` — one catalogue row, one `Proposal` arm, one
+//!   `propose` arm that parses the instant before the gate, and one `perform`
+//!   arm that goes through `gated!` like every other effect.
+//! * `crates/app/src/effects.rs` — a payload-free `AppointmentBook` subject
+//!   written out rather than produced by the `subject!` macro, and
+//!   `Effects::book_hour`, which builds its [`PgCalendar`] from the principal
+//!   and never from the tool's arguments. That is what keeps every sentence
+//!   above true.
+//!
+//! What it did **not** touch is the point: no migration, no new deny reason, no
+//! new policy field, and no widening — a layer that drops `Channel::Internal`
+//! takes the verb away, exactly as it takes `message_colleague` away.
+//!
+//! One consequence is measured elsewhere and deliberately not settled here.
+//! `agentos_eval::toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}` are digests of
+//! the request as sent, tool schemas included, so this row moved both of them.
+//! They are **not** re-pinned in the change that moved them: the pin is the
+//! certificate that the recorded tool-choice scores were measured against those
+//! bytes, and re-pinning without re-running `cargo run -p agentos-eval -- --live`
+//! would silently re-certify every recorded score against a prompt no model was
+//! ever shown. The constants and the numbers move together or neither moves.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -191,6 +179,28 @@ pub enum CalendarError {
     /// question — Google Calendar refuses an unknown zone too.
     #[error("no time zone by that name")]
     UnknownZone,
+    /// The words of the promise are blank, or longer than the column takes.
+    ///
+    /// **Its own arm for [`CalendarError::UnknownZone`]'s reason, and it was
+    /// found the way that one's sibling was.** `appointments_subject_shape` is
+    /// a `CHECK` — `char_length(btrim(subject)) between 1 and 200` — and
+    /// nothing above it asked, so an over-long line arrived as
+    /// [`StoreError::Database`]: a 500 for the founder's `POST /v1/calendar`,
+    /// and, once a turn could reach this port, the *end of the run* for an
+    /// employee, because `turn::performed` maps `Unavailable` to
+    /// `TurnError::Unavailable`. A model's long sentence would have cost it
+    /// every remaining turn of its day.
+    ///
+    /// It is refused here, at the one place both callers route through, rather
+    /// than in each of them: `agentos_store::calendar::MAX_SUBJECT` is the one
+    /// number, and the check sits beside [`CalendarError::UnknownZone`]'s for
+    /// the same reason — the caller is told *which* thing it named is wrong,
+    /// before anything opens a transaction.
+    #[error(
+        "a subject is 1 to {} characters",
+        agentos_store::calendar::MAX_SUBJECT
+    )]
+    SubjectShape,
 }
 
 /// One seat's diary: the moments this employee has undertaken.
@@ -209,6 +219,12 @@ pub trait Calendar: Send + Sync {
     /// There is no employee argument. See the module docs: that absence is what
     /// makes "spend somebody else's turn" unrepresentable rather than merely
     /// refused.
+    ///
+    /// `subject` is trimmed and bounded by the adapter — see
+    /// [`CalendarError::SubjectShape`] — because the bound is a fact about the
+    /// table one adapter writes rather than about the port. A connected diary
+    /// with a longer field of its own may say so; what it may not do is let an
+    /// unbounded string reach a constraint and take a turn down with it.
     async fn book(
         &self,
         at: DateTime<Utc>,
@@ -278,6 +294,15 @@ impl Calendar for PgCalendar {
         zone: &str,
         subject: &str,
     ) -> Result<AppointmentId, CalendarError> {
+        // Before the connection is taken, because it needs neither: the bound
+        // is the table's own and is named in one place. Trimmed here too, so
+        // the row and the sentence the employee is read back carry the string
+        // the caller meant — the `CHECK` measures `btrim(subject)` and the
+        // column would otherwise store the untrimmed one.
+        let subject = subject.trim();
+        if subject.is_empty() || subject.chars().count() > calendar::MAX_SUBJECT {
+            return Err(CalendarError::SubjectShape);
+        }
         let id = AppointmentId::new_v7(chrono::Utc::now());
         let mut tx = self.db.tenant_tx(self.tenant).await?;
         // Asked before the insert so the caller is told *which* thing it named

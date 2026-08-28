@@ -26,9 +26,16 @@
 //!
 //! # The vocabulary, and why it is this narrow
 //!
-//! A request names a pair: an [`ActionKind`] and a [`DenyReason`]. Fifteen
+//! A request names a pair: an [`ActionKind`] and a [`DenyReason`]. Sixteen
 //! values and twenty-one, two `const` arrays in `agentos-domain`, and **nothing
 //! else**. Not the tool name, not the domain, not the amount.
+//!
+//! Both counts are read off the arrays and not off this comment —
+//! `action_kind = ANY($1)` below binds [`ActionKind::ALL`] itself — so a new
+//! discriminant needs no migration here: `capability_decisions.action_kind` is
+//! a bare `text` column with no `CHECK` enumerating the names.
+//! `migrations/0049_capability_requests.sql` says "fifteen" in a comment beside
+//! it and, being applied, cannot be edited to say otherwise.
 //!
 //! That is the containment, and it is structural rather than an escaping rule.
 //! A tool name comes from an MCP server's `tools/list`; a domain comes from a
@@ -136,7 +143,7 @@ pub struct CapabilityRequest {
 ///   `app::secrets` also writes a denied ruling, under `action_kind =
 ///   'secret_accessed'` with `deny_reason_code = 'cross_tenant_secret'` — a
 ///   real refusal that is not an action and not a capability. Binding the
-///   fifteen is what keeps this a question about the action space.
+///   whole enum is what keeps this a question about the action space.
 /// * `deny_reason_code = ANY($2)` is [`DenyReason::GRANTABLE`].
 /// * `occurred_at > coalesce(decided_at, '-infinity')` is the whole of the
 ///   noise story: it filters *before* grouping, so `denials` counts refusals
