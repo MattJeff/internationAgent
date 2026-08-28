@@ -238,6 +238,28 @@ impl ResendEmailProvider {
     /// bounded (the outbox gives up after eight and dead-letters *with* a
     /// reason), so the schema-really-did-change case still ends somewhere a
     /// human looks; it just stops taking live mail with it.
+    ///
+    /// # The word really is gone, and it is not coming back as a code
+    ///
+    /// What that trade cost is real and worth naming: `last_error` is
+    /// `format!("{}: {err}", err.code())`, so a vendor that renamed a field and
+    /// a socket that died now produce the identical string, and the two ask an
+    /// operator for opposite things — a ticket with the vendor, or nothing at
+    /// all. The obvious repair is a distinct retryable code. It is not worth
+    /// its price, twice over:
+    ///
+    /// * [`ProviderError::Retryable`] has no `code` field, so this is a new
+    ///   field or a new variant — which means a specimen in
+    ///   [`ProviderError::ALL`], growing [`RETRYABLE_CODES`] past two, and
+    ///   `CLAIM_SQL` binding that list. A retryable code missing from it is a
+    ///   step given one attempt instead of five, silently. That constant's own
+    ///   docs exist because of exactly that failure; reopening the retry rule
+    ///   to improve a metrics label is the wrong direction of risk.
+    /// * The distinction is already on the row, in the column next to it. A
+    ///   reset socket clears on attempt two; a schema break fails identically
+    ///   until `attempt_count` hits the cap and `CLAIM_SQL` stops claiming it.
+    ///   "Retryable, and retried to the cap" *is* "the vendor changed
+    ///   something", and it needs no new vocabulary to read.
     async fn call_json<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,

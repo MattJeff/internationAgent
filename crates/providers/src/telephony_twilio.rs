@@ -116,9 +116,51 @@ pub struct TwilioTelephony {
     /// idempotency key -> the sid Twilio gave the first send.
     ///
     /// ponytail: process-local, because the Messages API has no idempotency
-    /// key to send. It stops a retry *inside one process* from double-texting;
-    /// it does not survive a restart. Move it into the store's idempotency
-    /// table the day duplicate sends across restarts show up.
+    /// key to send.
+    ///
+    /// # What it does not cover, which is the window that double-texts
+    ///
+    /// This used to say it "stops a retry inside one process from
+    /// double-texting". It stops a retry that follows a **successful** send:
+    /// the entry is written from the `sid`, so it exists only where we already
+    /// know the answer. The expensive window is the other one — the POST
+    /// landed at Twilio and the response did not reach us — and there the map
+    /// is empty by construction. `ApiError::transport` is retryable and says so
+    /// (*"the request may even have landed"*), so within one process, with no
+    /// restart involved, a read timeout on `POST /Messages` re-sends and the
+    /// customer is texted twice.
+    ///
+    /// One neighbouring case is already right and must stay right: a 2xx whose
+    /// body did not parse becomes `Terminal { no_message_sid }` and is *not*
+    /// retried, because a 2xx means Twilio accepted the message. That is the
+    /// asymmetry `find_number` argues — strict on lookup, lenient on create.
+    ///
+    /// # Why the store's table is not the small fix the backlog assumed
+    ///
+    /// The idempotency table already exists: `provider_intents`, unique on
+    /// `(tenant_id, provider, idempotency_key)`, with `state` defaulting to
+    /// `in_flight` — a write-ahead record, committed *before* the network call.
+    /// So the missing piece is not a migration. It is three other things:
+    ///
+    /// * `store::provisioning::begin_intent` takes a `Claim` — a leased
+    ///   `employee_resources` row and a `Step` — and hardcodes
+    ///   `intent_kind = 'provisioning_step'`. A send has none of that. It needs
+    ///   a sibling keyed on employee plus key alone.
+    /// * The write has to **commit** before the POST and a second one after it,
+    ///   and `Effects::send_sms` holds ports, not a transaction: today it calls
+    ///   the provider and then writes one audit row. That is the real work.
+    /// * Even then the guarantee is bounded. Twilio's Messages API has no
+    ///   idempotency header and no "did key K land" query, so a resumed
+    ///   `in_flight` row cannot recover the `sid`. The table turns a silent
+    ///   duplicate into a recorded ambiguity a human can settle — which is
+    ///   worth having, and is not the same sentence as "cannot double-send".
+    ///
+    /// It is not built here because **nothing in this build can reach it**:
+    /// `send_sms`, `send_whatsapp` and `place_call` have no non-test caller,
+    /// and `SmsSend`, `WhatsappSend` and `CallPlace` are all in
+    /// `agentos_app::turn::UNSERVED`. Build it with the first pack that
+    /// proposes one of them, not before — half an idempotency table reads like
+    /// a guarantee and is not one.
     sent: Mutex<BTreeMap<String, ProviderMessageId>>,
 }
 
@@ -254,12 +296,35 @@ impl TwilioTelephony {
             )
             .await?;
 
-        body["available_phone_numbers"][0]["phone_number"]
+        // Same guard as `find_number`, for the same reason and a different
+        // price. `call` hands back `Value::Null` for any 2xx whose body did not
+        // parse, and indexing `Null[0]["phone_number"]` is `Null` — so a
+        // connection reset mid-response used to read as *"Twilio has no local
+        // number to sell in this country"*.
+        //
+        // That word is what makes it expensive rather than merely wrong.
+        // `no_numbers_available` is `Terminal`, `CLAIM_SQL` claims a failed row
+        // only when `split_part(last_error, ':', 1)` is in `RETRYABLE_CODES`,
+        // and it is not — so the row is parked for good, on the first blip,
+        // with no sixth attempt and no sweep that will ever pick it up. The
+        // operator reads it and goes looking for inventory: another region,
+        // which is a customer-facing phone number in the wrong country, or a
+        // ticket with Twilio about stock that was never out.
+        //
+        // So: a list we could not read is a wait. A list that is really there
+        // and really empty is the honest terminal — that one no retry fixes.
+        let listed = body["available_phone_numbers"]
+            .as_array()
+            .ok_or_else(ProviderError::timeout)?;
+        let Some(first) = listed.first() else {
+            return Err(ProviderError::Terminal {
+                code: "no_numbers_available",
+            });
+        };
+        first["phone_number"]
             .as_str()
             .map(str::to_owned)
-            .ok_or(ProviderError::Terminal {
-                code: "no_numbers_available",
-            })
+            .ok_or_else(ProviderError::timeout)
     }
 
     /// The purchase was refused for regulatory reasons: find the bundle the
@@ -278,10 +343,25 @@ impl TwilioTelephony {
             Err(failed) => return failed.into(),
         };
 
-        let bundle = body["results"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        // And the third site of the same guard, with the most expensive lie of
+        // the three. `unwrap_or_default()` on an unreadable 2xx said *"this
+        // account has no bundle, and every one it ever had was rejected"* —
+        // `Terminal { no_regulatory_bundle }`, which parks the row exactly as
+        // above, and which reads as an instruction: go to the regulatory
+        // console and file one. That is company registration, a proof of
+        // address and an end-user identity document, then days of Twilio
+        // review — and if a bundle was already sitting there `in-review`, the
+        // operator has now filed a second, after which the `find` below picks
+        // between them by list order.
+        //
+        // A wait is the answer: `ensure_number` re-runs, the purchase is
+        // refused for the same regulatory reason, and this lookup runs again on
+        // a socket that works. Polling is already the protocol here.
+        let Some(results) = body["results"].as_array() else {
+            return ProviderError::timeout();
+        };
+
+        let bundle = results
             .iter()
             .find(|bundle| bundle["status"].as_str() != Some(REJECTED))
             .and_then(|bundle| bundle["sid"].as_str());
@@ -590,14 +670,22 @@ mod tests {
         last_call_form: Option<BTreeMap<String, String>>,
         /// Refuse purchases until a bundle is approved.
         regulated: bool,
+        /// Answer the number search with a list that is really there and really
+        /// empty — Twilio genuinely out of local stock in that country.
+        sold_out: bool,
         /// (sid, status) of the account's bundle for the country.
         bundle: Option<(String, String)>,
         /// Answer the next request with this status instead of doing the work.
         next_status: Option<u16>,
-        /// Answer the next request with a 200, a `Content-Length`, and then
-        /// hang up before the body — a connection reset mid-response, which is
-        /// the one thing a fake that always completes its writes cannot show.
-        cut_short_next: bool,
+        /// Answer with a 200, a `Content-Length`, and then hang up before the
+        /// body — a connection reset mid-response, which is the one thing a
+        /// fake that always completes its writes cannot show.
+        ///
+        /// Keyed on a path fragment and not on "the next request": every
+        /// interesting lookup here is the *second* or third call inside one
+        /// `ensure_number`, so a counter would encode the call order of the
+        /// method under test into the fixture.
+        cut_short_on: Option<&'static str>,
         /// Every `Authorization` header we were sent.
         auth: Vec<String>,
     }
@@ -642,7 +730,12 @@ mod tests {
             let (status, body, cut_short) = {
                 let mut state = state.lock().expect("fake state mutex poisoned");
                 state.auth.push(request.auth.clone());
-                let cut_short = std::mem::take(&mut state.cut_short_next);
+                let cut_short = state
+                    .cut_short_on
+                    .is_some_and(|want| request.path.contains(want));
+                if cut_short {
+                    state.cut_short_on = None;
+                }
                 let (status, body) = match state.next_status.take() {
                     Some(status) => (
                         status,
@@ -724,10 +817,14 @@ mod tests {
                 // reads the body, so 200 exercises the identical path.
                 (200, json!({}))
             }
-            ("GET", p) if p.contains("/AvailablePhoneNumbers/") => (
-                200,
-                json!({"available_phone_numbers": [{"phone_number": "+4930111222"}]}),
-            ),
+            ("GET", p) if p.contains("/AvailablePhoneNumbers/") => {
+                let stock = if state.sold_out {
+                    json!([])
+                } else {
+                    json!([{"phone_number": "+4930111222"}])
+                };
+                (200, json!({ "available_phone_numbers": stock }))
+            }
             ("GET", "/v2/RegulatoryCompliance/Bundles") => {
                 let results: Vec<Value> = state
                     .bundle
@@ -1062,7 +1159,7 @@ mod tests {
             .expect("first purchase");
         assert_eq!(twilio.state().numbers.len(), 1);
 
-        twilio.state().cut_short_next = true;
+        twilio.state().cut_short_on = Some("/IncomingPhoneNumbers.json");
         let cut_short = client
             .ensure_number(&ctx.clone().retry(), &Region::new("US"))
             .await
@@ -1089,6 +1186,73 @@ mod tests {
             "PN0000000000000001"
         );
         assert_eq!(twilio.state().purchases, 1);
+    }
+
+    /// The second lookup on the same path, whose lie is the more expensive of
+    /// the two because it is `Terminal`.
+    ///
+    /// `find_number`'s blip cost a duplicate number. This one costs the step:
+    /// `no_numbers_available` is not in `RETRYABLE_CODES`, and `CLAIM_SQL`
+    /// claims a `failed` row only when `split_part(last_error, ':', 1)` is —
+    /// so one reset socket on the search parked the employee's phone step for
+    /// good, on attempt one of five, with no sweep that ever picks it up
+    /// again. The operator reads "no numbers available" and goes hunting
+    /// inventory that was never out: another country's number in front of
+    /// customers, or a ticket with Twilio.
+    ///
+    /// The assertion that matters is `is_retryable`, because that is the
+    /// literal predicate the claim query runs. The second half — the retry on
+    /// a healthy socket buying exactly one number — is what proves the region
+    /// really did have stock all along.
+    #[tokio::test]
+    async fn a_search_whose_body_never_arrived_is_not_an_empty_catalogue() {
+        let twilio = FakeTwilio::start().await;
+        let client = twilio.client();
+        let ctx = ctx();
+        twilio.state().cut_short_on = Some("/AvailablePhoneNumbers/");
+
+        let cut_short = client
+            .ensure_number(&ctx, &Region::new("DE"))
+            .await
+            .expect_err("a body we never read is not an empty catalogue");
+
+        assert!(
+            cut_short.is_retryable(),
+            "`{}` is not in RETRYABLE_CODES, so CLAIM_SQL never claims this row again: {cut_short:?}",
+            cut_short.code()
+        );
+        assert_eq!(twilio.state().purchases, 0, "bought off an unread search");
+
+        // Same region, same fixture, a socket that finishes its writes: there
+        // was stock the whole time.
+        assert_eq!(
+            client
+                .ensure_number(&ctx.clone().retry(), &Region::new("DE"))
+                .await
+                .expect("the search was readable this time")
+                .external_id,
+            "PN0000000000000001"
+        );
+    }
+
+    /// The other half, and the one a lazy fix breaks: a list that really
+    /// arrived and is really empty is Twilio out of stock, and no retry fixes
+    /// that. `Terminal` is the honest word there, and it must survive.
+    #[tokio::test]
+    async fn a_catalogue_that_arrived_empty_is_still_terminal() {
+        let twilio = FakeTwilio::start().await;
+        twilio.state().sold_out = true;
+
+        assert_eq!(
+            twilio
+                .client()
+                .ensure_number(&ctx(), &Region::new("DE"))
+                .await,
+            Err(ProviderError::Terminal {
+                code: "no_numbers_available"
+            })
+        );
+        assert_eq!(twilio.state().purchases, 0);
     }
 
     #[tokio::test]
@@ -1178,6 +1342,51 @@ mod tests {
             number
         );
         assert_eq!(twilio.state().numbers.len(), 1);
+    }
+
+    /// The third site, whose lie an operator *acts on* rather than merely
+    /// reads.
+    ///
+    /// `no_regulatory_bundle` parks the row exactly as above, and its text is
+    /// an instruction: file one. That is a company registration, a proof of
+    /// address, an end-user identity document and days of Twilio review — for
+    /// a bundle that is sitting in the console already, in review, and whose
+    /// sid this lookup was one readable response away from returning. Filing
+    /// the second one also makes `pending_bundle`'s `find` choose between two
+    /// by list order.
+    #[tokio::test]
+    async fn a_bundle_lookup_whose_body_never_arrived_is_not_missing_paperwork() {
+        let twilio = FakeTwilio::start().await;
+        {
+            let mut state = twilio.state();
+            state.regulated = true;
+            state.bundle = Some(("BU7".to_owned(), "in-review".to_owned()));
+            state.cut_short_on = Some("/RegulatoryCompliance/Bundles");
+        }
+        let client = twilio.client();
+        let ctx = ctx();
+
+        let cut_short = client
+            .ensure_number(&ctx, &Region::new("DE"))
+            .await
+            .expect_err("a regulated country sells nothing yet");
+        assert!(
+            cut_short.is_retryable(),
+            "`{}` parks the row and sends a human to file a bundle that already exists: {cut_short:?}",
+            cut_short.code()
+        );
+
+        // The same call on a socket that finishes its writes: the bundle was
+        // there all along, and this is the answer the operator needed first.
+        let waiting = client
+            .ensure_number(&ctx.clone().retry(), &Region::new("DE"))
+            .await
+            .expect_err("still waiting on review");
+        let ProviderError::PendingExternal { poll_ref, .. } = &waiting else {
+            panic!("expected the bundle that was always there, got {waiting:?}");
+        };
+        assert_eq!(poll_ref, "BU7");
+        assert!(twilio.state().numbers.is_empty());
     }
 
     #[tokio::test]
