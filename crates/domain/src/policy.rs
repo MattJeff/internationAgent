@@ -517,6 +517,202 @@ pub const fn may_upload_leads(policy: &EffectivePolicy) -> bool {
     policy.limits().allow_lead_upload
 }
 
+// ---------------------------------------------------------------------------
+// Warming a sending domain
+// ---------------------------------------------------------------------------
+
+/// What the trail says about how our mail is being received.
+///
+/// The measured half of the cold-contact ceiling, and it is deliberately
+/// **three**-valued. A boolean here would have to answer "is the domain
+/// healthy?" for a deployment that has never seen a single delivery report,
+/// and both answers are lies: `true` says everything is fine on the strength of
+/// no evidence, `false` says something is wrong when nothing said so.
+///
+/// [`Unknown`](Self::Unknown) is the state that matters. `docs/ORIZN.md` asks
+/// for a ceiling that rises against a measurement of deliverability, and
+/// `crates/app/src/inbound.rs::record_refusal` carries the founder's open
+/// question about whether that measurement can arrive at all — whether the
+/// provider endpoint is subscribed to `email.bounced` and `email.complained`,
+/// which is a checkbox in somebody's dashboard that no code here can read. If
+/// it is unticked, every count below is zero and a two-valued measure would
+/// read that as a spotless record. So: no evidence is its own answer, and
+/// [`warmup_allowance`] treats it exactly as it treats a bad one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deliverability {
+    /// Nothing here can say. Either no mail has gone out in the window, or
+    /// nothing has ever demonstrated that a refusal would reach us if there
+    /// were one.
+    Unknown,
+    /// Refusals are below the threshold over a window with mail in it.
+    Healthy,
+    /// Refusals are at or above the threshold.
+    Unhealthy,
+}
+
+impl Deliverability {
+    /// Refusals per thousand approaches at which a domain stops being healthy.
+    ///
+    /// **Sourced, and it is the one number here that has a source.** Google's
+    /// and Yahoo's bulk sender requirements (in force since February 2024) tell
+    /// senders to keep the spam complaint rate below 0.3% and never to let it
+    /// reach 0.3%. Three per thousand is that, and the comparison is `>=`
+    /// because "never at or above" is what the requirement says.
+    ///
+    /// It is applied to permanent refusals as a whole — complaints *and* hard
+    /// bounces — which is stricter than the published pair, since the usual
+    /// guidance for hard bounces is nearer 2%. Stricter is the direction this
+    /// ledger is allowed to be wrong in: everything here only ever narrows, so
+    /// holding bounces to the complaint threshold costs a slower ramp and can
+    /// never cost a stranger an unwanted email.
+    ///
+    /// ponytail: integers, not a float. `refusals * 1000 >= approaches * 3` is
+    /// the same comparison with no rounding to argue about at 2am.
+    pub const MAX_REFUSALS_PER_MILLE: u64 = 3;
+
+    /// How far back [`measure`](Self::measure)'s two counts are taken.
+    ///
+    /// Long enough that the rate above has any resolution at all, short enough
+    /// that a fixed problem clears without an operator. Both halves of that are
+    /// weak at these volumes and the weakness is worth saying out loud: five
+    /// strangers a day over thirty days is 150 approaches, so the smallest
+    /// non-zero rate this can express is 1/150 — 0.67%, already over the
+    /// threshold. Below roughly 350 approaches in a window, "the rate is at or
+    /// above 0.3%" and "there was at least one complaint" are the same
+    /// sentence.
+    ///
+    /// That is the honest reading of it and it is left as it is: at a hundred
+    /// and fifty cold emails, one complaint really is the whole signal, and the
+    /// direction it pushes is downward.
+    pub const WINDOW_DAYS: i64 = 30;
+
+    /// Read the two counts, or decline to.
+    ///
+    /// `approaches` is how many strangers this tenant was cleared to reach in
+    /// the window and `refusals` how many permanent refusals came back over the
+    /// same one — the denominator being reservations rather than deliveries is
+    /// the only denominator this workspace has, and it is the larger of the two
+    /// possible ones, so the rate it produces is the smaller. That is the wrong
+    /// direction for a safety measure and it is bounded: a reservation that did
+    /// not turn into a send is a rounding error against a ceiling of five.
+    ///
+    /// `signal_confirmed` is the answer to "would we know?" — see
+    /// `migrations/0070_outreach_warmup.sql`, which holds both of the two things
+    /// that can make it true. Without it there is no measurement, only an
+    /// absence of one, and the two must not read the same.
+    pub const fn measure(approaches: u64, refusals: u64, signal_confirmed: bool) -> Self {
+        // Order matters: no confirmation means no reading, however clean the
+        // numbers look, because a silent endpoint produces the cleanest numbers
+        // there are. An empty window is the same answer for the same reason —
+        // zero out of zero is not a rate, and `0 >= 0` would have called it
+        // unhealthy on the first morning of every tenant.
+        if !signal_confirmed || approaches == 0 {
+            return Self::Unknown;
+        }
+        if refusals.saturating_mul(1_000) >= approaches.saturating_mul(Self::MAX_REFUSALS_PER_MILLE)
+        {
+            Self::Unhealthy
+        } else {
+            Self::Healthy
+        }
+    }
+}
+
+/// The floor of the warming schedule: what an enrolled tenant may take on a day
+/// nothing can be said about.
+///
+/// **One, and it cannot be zero.** Zero looks like the strictest and safest
+/// answer and it is a deadlock: the only thing that lifts
+/// [`Deliverability::Unknown`] without an operator is an observed refusal, a
+/// refusal requires mail, and mail requires an allowance. A tenant enrolled at
+/// zero can never send, therefore never bounce, therefore never be measured,
+/// therefore never leave zero. One is the smallest number that keeps the
+/// measurement reachable.
+pub const WARMUP_FLOOR: u32 = 1;
+
+/// How many strangers a warming sending domain may be shown today — **never
+/// more than the operator wrote.**
+///
+/// # This does not raise a ceiling, and it must not be read as if it did
+///
+/// A schedule that lifts a limit as a domain ages is the ordinary way to say
+/// this, and it is the one shape this workspace forbids. Allowlists intersect,
+/// denylists union, and a lower layer only ever narrows — a mechanism that let
+/// `max_new_contacts_per_day` become six where an operator wrote five would be
+/// the first thing here to unwrite an operator's document, driven by a row that
+/// an agent's own sending influences.
+///
+/// So this is a **second narrowing, applied under the first**. The operator's
+/// number is the destination; this is how much of it is released today, and the
+/// last line of the body is the whole safety argument:
+///
+/// ```text
+///     effective = min(max_new_contacts_per_day, floor + steps)
+/// ```
+///
+/// `warmup_allowance` may want a thousand and a seat written down as five still
+/// takes five. `the_warmup_never_returns_more_than_the_operator_wrote` sweeps
+/// the input space and says so; `agentos_store::outreach` says it again against
+/// a real database, because this returning the right number is worth nothing if
+/// the caller then compares against something else.
+///
+/// It takes an [`EffectivePolicy`] rather than a `u32` for
+/// [`turns_remaining`]'s reason, and the reason is louder here: a bare number
+/// argument is exactly how a caller would come to pass a single un-intersected
+/// layer, and a warming schedule bounded by the *tenant's* wish rather than by
+/// platform ∧ tenant ∧ role ∧ employee is a ramp that widens after all.
+///
+/// # The shape of the steps is not decided here
+///
+/// FOUNDER'S QUESTION, LEFT OPEN: **how fast should a warming domain be allowed
+/// to climb?** The step below is one more stranger per day of age, and it is
+/// not a schedule anybody publishes — it is the smallest increment above zero,
+/// chosen precisely because it is slower than every warm-up plan the sending
+/// platforms recommend, so it cannot be wrong in the direction that costs a
+/// domain. Every real schedule is a decision about somebody's tolerance for
+/// risk, which makes it the founder's and not this function's; a number
+/// invented here would be an industry practice with no industry behind it.
+///
+/// The place for the answer is the `steps` expression below and nowhere else —
+/// a multiplier, a table of plateaus, a doubling every third clean day. Note
+/// which way a change points: anything faster than `+1` releases the operator's
+/// own number sooner, and nothing written there can pass it.
+///
+/// `age_days` is calendar days since the operator's `warming_started_on`.
+/// Negative — a start date in the future — clamps to zero, which is the floor,
+/// which is the safe direction.
+pub const fn warmup_allowance(
+    policy: &EffectivePolicy,
+    age_days: i64,
+    measured: Deliverability,
+) -> u32 {
+    let steps = match measured {
+        // Both non-readings collapse to the same answer on purpose. An
+        // unmeasurable domain is not a healthy one, and this is the line that
+        // says so: "we cannot see" and "we can see and it is bad" release
+        // exactly the same amount, which is none of it.
+        Deliverability::Unknown | Deliverability::Unhealthy => 0,
+        Deliverability::Healthy => {
+            if age_days <= 0 {
+                0
+            } else if age_days >= u32::MAX as i64 {
+                u32::MAX
+            } else {
+                age_days as u32
+            }
+        }
+    };
+    let released = WARMUP_FLOOR.saturating_add(steps);
+    let written = policy.limits().max_new_contacts_per_day;
+    // The `min`. Everything above is a suggestion; this is the rule.
+    if written < released {
+        written
+    } else {
+        released
+    }
+}
+
 /// Which model this employee actually runs: the role's preference, bounded by
 /// the operator's allowlist.
 ///
@@ -579,6 +775,18 @@ pub enum DenyReason {
     ChannelNotAllowed,
     CallingCodeNotAllowed,
     ContactBudgetExhausted,
+    /// The operator's contact budget was not the thing that refused: the
+    /// sending domain is still warming, or its deliverability cannot be read.
+    ///
+    /// Its own code rather than [`DenyReason::ContactBudgetExhausted`], and the
+    /// difference is entirely in [`grantable`](Self::grantable). That one is
+    /// `true` because a human answers it by raising `max_new_contacts_per_day`.
+    /// This one is refused *under* that number by
+    /// [`warmup_allowance`] — the effective allowance is the `min` of the two —
+    /// so raising it changes nothing at all, and offering it as the remedy
+    /// would put the one question in front of the founder whose answer must not
+    /// be yes: "your domain is being complained about, shall we send more?"
+    SendingDomainWarming,
     DomainDenied,
     DomainNotAllowed,
     FileUploadNotAllowed,
@@ -633,6 +841,7 @@ impl DenyReason {
             DenyReason::ChannelNotAllowed => "channel_not_allowed",
             DenyReason::CallingCodeNotAllowed => "calling_code_not_allowed",
             DenyReason::ContactBudgetExhausted => "contact_budget_exhausted",
+            DenyReason::SendingDomainWarming => "sending_domain_warming",
             DenyReason::DomainDenied => "domain_denied",
             DenyReason::DomainNotAllowed => "domain_not_allowed",
             DenyReason::FileUploadNotAllowed => "file_upload_not_allowed",
@@ -706,6 +915,17 @@ impl DenyReason {
             // everywhere else. A denied domain is an answer, not a gap.
             DenyReason::DomainDenied => false,
 
+            // Not a policy either, and this is the one whose `false` is worth
+            // the most. It is refused *under* a limit an operator already
+            // wrote — `warmup_allowance` returns the `min` of the schedule and
+            // that number — so the only document a human could write in answer
+            // is one that changes nothing. The request it would generate reads
+            // "may I contact more strangers", on a day the trail says strangers
+            // are reporting us as spam, and the third time it is asked somebody
+            // says yes to a domain that then stops delivering for everybody.
+            // Time answers this one, or a fixed webhook subscription does.
+            DenyReason::SendingDomainWarming => false,
+
             // Not a permission at all: the secret belongs to another principal.
             // Widening cannot make it belong to this one, and a request to be
             // shown it is a boundary violation asking to be ratified.
@@ -757,11 +977,12 @@ impl DenyReason {
     };
 
     /// Every discriminant. Iterate it to prove a rule covers the whole space.
-    pub const ALL: [DenyReason; 21] = [
+    pub const ALL: [DenyReason; 22] = [
         DenyReason::NoRule,
         DenyReason::ChannelNotAllowed,
         DenyReason::CallingCodeNotAllowed,
         DenyReason::ContactBudgetExhausted,
+        DenyReason::SendingDomainWarming,
         DenyReason::DomainDenied,
         DenyReason::DomainNotAllowed,
         DenyReason::FileUploadNotAllowed,
@@ -2329,6 +2550,141 @@ mod tests {
         // nothing here exactly as it does everywhere else in this file.
         let unconfigured = effective(&PolicyLimits::default());
         assert_eq!(turns_remaining(&unconfigured, 0), 0);
+    }
+
+    // -- the warming schedule ----------------------------------------------
+
+    /// **The one property this whole mechanism is not allowed to break**, swept
+    /// rather than sampled.
+    ///
+    /// A ramp is a widening mechanism and nothing here may widen a policy. So
+    /// for every ceiling, every age including absurd ones, and every reading
+    /// including the ones that mean "we cannot see", the allowance is at most
+    /// what the operator wrote. Delete the `min` at the end of
+    /// `warmup_allowance` and this is the line that goes red.
+    #[test]
+    fn the_warmup_never_returns_more_than_the_operator_wrote() {
+        for written in [0, 1, 2, 5, 20, 1_000, u32::MAX] {
+            let policy = effective(&PolicyLimits {
+                max_new_contacts_per_day: written,
+                ..permissive()
+            });
+            for age in [i64::MIN, -1, 0, 1, 6, 29, 365, 100_000, i64::MAX] {
+                for measured in [
+                    Deliverability::Unknown,
+                    Deliverability::Healthy,
+                    Deliverability::Unhealthy,
+                ] {
+                    let allowed = warmup_allowance(&policy, age, measured);
+                    assert!(
+                        allowed <= written,
+                        "warmup released {allowed} where the operator wrote {written} \
+                         (age {age}, {measured:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Orizn's seller, and the mutation the founder asked for by name: a tenant
+    /// that caps at five stays at five whatever the measurement says.
+    ///
+    /// Both directions are here. The domain being old and spotless does not buy
+    /// a sixth stranger, and the domain being new or unreadable does not leave
+    /// the number where it was.
+    #[test]
+    fn a_seat_written_down_as_five_is_never_six_and_starts_at_the_floor() {
+        let sdr = effective(&PolicyLimits {
+            max_new_contacts_per_day: 5,
+            ..permissive()
+        });
+
+        // Six months old, clean trail: still five. The ceiling is the ceiling.
+        assert_eq!(warmup_allowance(&sdr, 180, Deliverability::Healthy), 5);
+        // Old enough for the schedule to want thousands: still five.
+        assert_eq!(warmup_allowance(&sdr, 10_000, Deliverability::Healthy), 5);
+        // The step is visible below the ceiling, which is what makes the two
+        // assertions above a `min` rather than a constant.
+        assert_eq!(warmup_allowance(&sdr, 0, Deliverability::Healthy), 1);
+        assert_eq!(warmup_allowance(&sdr, 3, Deliverability::Healthy), 4);
+        assert_eq!(warmup_allowance(&sdr, 4, Deliverability::Healthy), 5);
+
+        // And the half that matters more: age alone buys nothing. Six months on
+        // a domain nobody can measure releases exactly the floor.
+        assert_eq!(warmup_allowance(&sdr, 180, Deliverability::Unknown), 1);
+        assert_eq!(warmup_allowance(&sdr, 180, Deliverability::Unhealthy), 1);
+
+        // A seat with no budget at all keeps having none: the floor is a floor
+        // on the release, never on the written number.
+        let silent = effective(&PolicyLimits {
+            max_new_contacts_per_day: 0,
+            ..permissive()
+        });
+        assert_eq!(
+            warmup_allowance(&silent, 10_000, Deliverability::Healthy),
+            0
+        );
+    }
+
+    /// Not knowing is not the same fact as being fine, and the measure has to
+    /// say so out of the counts alone.
+    #[test]
+    fn silence_reads_as_unknown_and_never_as_healthy() {
+        // The failure the founder's open question describes: an endpoint that is
+        // not subscribed to `email.bounced` produces a thousand approaches and
+        // zero refusals, which is the cleanest record there is.
+        assert_eq!(
+            Deliverability::measure(1_000, 0, false),
+            Deliverability::Unknown
+        );
+        // The same counts, once something has demonstrated a refusal would
+        // reach us, are a real reading.
+        assert_eq!(
+            Deliverability::measure(1_000, 0, true),
+            Deliverability::Healthy
+        );
+        // A confirmed signal over an empty window is still not a reading.
+        assert_eq!(Deliverability::measure(0, 0, true), Deliverability::Unknown);
+
+        // The threshold, at the boundary the source states: below 0.3% is
+        // healthy, *at* 0.3% is not.
+        assert_eq!(
+            Deliverability::measure(1_000, 2, true),
+            Deliverability::Healthy
+        );
+        assert_eq!(
+            Deliverability::measure(1_000, 3, true),
+            Deliverability::Unhealthy
+        );
+        // At the volume this actually runs at, one complaint is the whole
+        // signal — 1/150 is 0.67%. Asserted rather than merely documented.
+        assert_eq!(
+            Deliverability::measure(150, 1, true),
+            Deliverability::Unhealthy
+        );
+        // Nothing wraps into a clean bill of health at the extremes.
+        assert_eq!(
+            Deliverability::measure(u64::MAX, u64::MAX, true),
+            Deliverability::Unhealthy
+        );
+    }
+
+    /// The warming refusal must never be offered to a human as something to
+    /// grant. See `DenyReason::grantable`: the document that would answer it
+    /// does not exist, and the question it would ask is "shall we send more
+    /// mail from a domain that is being reported as spam".
+    #[test]
+    fn a_warming_domain_is_not_a_capability_a_human_can_grant() {
+        assert!(!DenyReason::SendingDomainWarming.grantable());
+        assert!(!DenyReason::GRANTABLE.contains(&DenyReason::SendingDomainWarming));
+        // And it is a different fact from the budget being spent, which *is*
+        // grantable — sharing a code would have made raising the ceiling look
+        // like the remedy for both.
+        assert!(DenyReason::ContactBudgetExhausted.grantable());
+        assert_ne!(
+            DenyReason::SendingDomainWarming.code(),
+            DenyReason::ContactBudgetExhausted.code()
+        );
     }
 
     /// The whole mechanism, in one function's worth of assertions.

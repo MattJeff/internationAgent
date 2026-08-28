@@ -944,7 +944,21 @@ impl PolicyGate {
         match outreach::reserve(tx, principal.employee_id, now.date_naive(), policy, 1).await {
             Ok(_) => Ok(Outcome::Allow { reservation: None }),
             Err(ContactBudgetError::Store(err)) => Err(Denied::Unavailable(err)),
-            // Both refusals share a reason because they share a remedy — an
+            // **The one refusal here that is not the operator's number.** The
+            // tenant is enrolled in the warming schedule of `0070` and today
+            // releases only part of what they wrote — because the sending
+            // domain is young, or because nothing can read its deliverability.
+            // Its own code because `DenyReason::ContactBudgetExhausted` is
+            // `grantable`, and the grant it offers is "raise
+            // `max_new_contacts_per_day`", which cannot lift this: the
+            // allowance is already the `min` of the schedule and that number.
+            // Same code, and the capability surface would put "shall we mail
+            // more strangers" in front of a human on the day the trail says
+            // strangers are reporting us.
+            Err(ContactBudgetError::Warming { .. }) => {
+                Ok(Outcome::Deny(DenyReason::SendingDomainWarming))
+            }
+            // The other two share a reason because they share a remedy — an
             // operator raising `max_new_contacts_per_day`. `NoBudget` is
             // unreachable from here anyway: a ceiling of zero is `0 >= 0`, and
             // `evaluate` refused above.
@@ -1975,6 +1989,60 @@ mod tests {
         gate.authorize(&principal, email("a@example.com"))
             .await
             .expect("a known counterparty costs nothing");
+    }
+
+    /// **The same wall, a different door, and the difference is what a human is
+    /// asked afterwards.**
+    ///
+    /// The tenant above is refused by the number an operator wrote, and
+    /// `ContactBudgetExhausted` is `grantable` because raising it is a real
+    /// remedy. This one is refused *under* that number by the warming schedule
+    /// of `0070`: five is written, the domain's deliverability cannot be read,
+    /// and one is released. Raising the five changes nothing —
+    /// `warmup_allowance` returns the `min` of the two — so sharing a code would
+    /// put "shall we mail more strangers" in front of the founder as the fix for
+    /// a domain nobody can vouch for.
+    #[tokio::test]
+    async fn a_warming_domain_refuses_with_its_own_code_and_not_the_operators() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email]),
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+
+        // Enrolled and old, with `refusal_events_confirmed_at` left NULL and no
+        // refusal ever recorded: the founder's checkbox, unanswered.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outreach_warmup (tenant_id, warming_started_on) \
+             VALUES ($1, current_date - 400)",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("enrol");
+        tx.commit().await.expect("commit enrolment");
+
+        gate.authorize(&principal, email("a@example.com"))
+            .await
+            .expect("the floor is one, and it is not zero");
+        let err = gate
+            .authorize(&principal, email("b@example.com"))
+            .await
+            .expect_err("an unmeasurable domain releases the floor and no more");
+        assert_eq!(
+            err.code(),
+            DenyReason::SendingDomainWarming.code(),
+            "five is written and one was released; the operator's number is not the wall"
+        );
     }
 
     /// **The same budget, reserved rather than counted.**
