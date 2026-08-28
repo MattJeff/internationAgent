@@ -1521,6 +1521,20 @@ mod tests {
         // find it.
         enqueue(&db, tenant, 1, Utc::now() - TimeDelta::seconds(30)).await;
 
+        // A planner with no statistics is a planner reading a different table,
+        // and this test asserts which index it picks. `agentos_store::outbox`'s
+        // `analyze_outbox` carries the argument and the failure it cost: the
+        // claim's twin guard was red about one full run in three, on a plan the
+        // fixture produced rather than the code.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("ANALYZE outbox_events")
+            .execute(&mut *tx)
+            .await
+            .expect("analyze outbox_events");
+        // Committed: `pg_statistic` rows are ordinary rows and a rollback takes
+        // the statistics out again with them.
+        tx.commit().await.expect("commit analyze");
+
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         // `AssertSqlSafe`, and the audit is that both halves are compile-time
         // constants of this module — a literal `EXPLAIN` prefix and [`LAG_SQL`].

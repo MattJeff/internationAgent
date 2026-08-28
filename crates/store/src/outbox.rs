@@ -1201,6 +1201,42 @@ mod tests {
         tx.commit().await.expect("commit parked seed");
     }
 
+    /// Give the planner statistics before asserting on a plan.
+    ///
+    /// The two tests below assert *which index* the planner reaches for, and a
+    /// planner with no statistics is a planner reading a different table. This
+    /// module shares one private database across all of its tests, so by the
+    /// time either of them runs `outbox_events` carries whatever `pg_statistic`
+    /// rows the last autovacuum happened to write — and everybody else here
+    /// stamps `Utc::now()` while these two seed at [`T0`], 2023. The stale
+    /// histogram then says almost nothing satisfies `available_at <= T0`,
+    /// `outbox_events_due_idx` costs out as a near-empty range scan, and the
+    /// claim plans onto it and throws the 5 000 dead letters away by hand:
+    /// `Rows Removed by Filter: 5000`, which is the exact failure these tests
+    /// exist to catch, produced by the fixture instead of by the code.
+    ///
+    /// Whether that happens depends on autovacuum's naptime against the run, so
+    /// it was red about one full run in three, green in isolation every time,
+    /// and green again on a re-run — the worst shape a guard can have, because
+    /// the next reader's first move is to re-run it. Reproduced deterministically
+    /// by seeding `now()`-stamped rows, `ANALYZE`, deleting them and seeding
+    /// this fixture: red every time, and green every time with the line below.
+    ///
+    /// Production never asks the question this way. `outbox_events` is written
+    /// continuously, so its statistics are the ones the planner ought to have,
+    /// and this is what puts the test in that position rather than in one no
+    /// deployment is ever in.
+    async fn analyze_outbox(db: &Db) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("ANALYZE outbox_events")
+            .execute(&mut *tx)
+            .await
+            .expect("analyze outbox_events");
+        // Committed rather than rolled back: `pg_statistic` rows are ordinary
+        // rows, and a rollback would take the statistics out again with them.
+        tx.commit().await.expect("commit analyze");
+    }
+
     /// **A tenant's dead letters must cost the claim nothing, and until
     /// `0057_outbox_claimable` they cost it everything.**
     ///
@@ -1255,6 +1291,7 @@ mod tests {
         seed_parked(&db, tenant, PARKED, at(T0 - 1)).await;
         // One claimable row, behind all of them in `available_at` order.
         seed_due(&db, tenant, 1, at(T0)).await;
+        analyze_outbox(&db).await;
 
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         // ANALYZE runs the UPDATE for real, so this transaction is rolled back
@@ -1386,6 +1423,17 @@ mod tests {
         // have a policy layer installed.
         let onboarding = seed_tenant(&db, "parked-onboarding").await;
         seed_due(&db, onboarding, 5, at(T0)).await;
+        // Unlike the claim's, this call is **not** proven by a mutation: removing
+        // it leaves this test green against every stale-statistics fixture that
+        // was tried, including one that forces `n_distinct(tenant_id) = 1`.
+        // `outbox_events_tenant_parked_idx` leads with the qual's own column and
+        // holds only parked rows, so nothing costed out cheaper than it. Kept
+        // anyway, and the distinction matters: this is a *precondition*, not a
+        // second assertion — it asserts nothing, and it removes a class of
+        // nondeterminism that the identically shaped test above was measured
+        // suffering from. Deleting it would leave two guards of the same shape
+        // disagreeing about what they need to be true before they measure.
+        analyze_outbox(&db).await;
 
         // As the tenant, not as admin: the qual under test is RLS's, and
         // `admin_tx_bypassing_rls` would remove the very thing being measured.

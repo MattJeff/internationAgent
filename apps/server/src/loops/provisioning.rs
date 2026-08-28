@@ -978,21 +978,95 @@ fn release_reason(employee: &Employee, step: Step, attempts: i32) -> String {
 /// `finish_step`, because `agentos-store` is another unit's crate. It is one
 /// statement, it is idempotent, and the events are still unpublished — the
 /// outbox poller reads the payload it will actually send.
+///
+/// # The second reader `0057` took an index away from, and `0060` did not put
+/// one back for
+///
+/// `migrations/0057_outbox_claimable.sql` dropped `outbox_events_tenant_due_idx
+/// (tenant_id, available_at, id) where published_at is null` and replaced it
+/// with the same shape plus `and attempt_count < 8`.
+/// `migrations/0060_outbox_parked_by_tenant.sql` then found that
+/// `outbox::requeue_dead_letters` had been reading the dropped one and gave the
+/// **`>= 8`** half its index back, opening with the sentence that decides this
+/// function too: *after `0057` there is no index in the table that leads with
+/// `tenant_id`*.
+///
+/// This statement is the other reader of that index and nobody looked. It runs
+/// on a `TenantTx`, so row-level security adds `tenant_id = <this tenant>` to
+/// the plan, and it asked for **neither** half of `attempt_count` — so the
+/// planner could prove neither partial index applied and fell all the way to a
+/// sequential scan of the whole table. Measured, PostgreSQL 17, 100 095 rows,
+/// one tenant holding 100 000 parked ones and the running tenant holding five
+/// live rows and no dead letters:
+///
+/// ```text
+///     index available                         plan                    cost
+///     ---------------------------------------------------------------------
+///     before 0057  outbox_events_tenant_due_idx, 5 rows examined      0.09 ms
+///     after  0057  Seq Scan, 100 095 rows removed by filter          13.34 ms
+///     with the clause below                                           0.30 ms
+/// ```
+///
+/// `0046`'s own failure a third time — one customer's rows becoming every other
+/// customer's latency — and here it lands on the loop that provisions a new
+/// company's employees, once per converge per employee.
+///
+/// # The clause is `attempt_count < MAX_ATTEMPTS`, and it narrows nothing that
+/// is read
+///
+/// It is the predicate `outbox_events_claimable_idx` is partial on, so the
+/// planner proves the implication from the bound value exactly as
+/// `outbox::claim_of` and `loops::outbox::lag_secs` do, and the scan becomes
+/// this tenant's claimable rows and nothing else — **narrower** than the index
+/// `0057` dropped, which carried the parked ones too.
+///
+/// What it stops stamping is a dead letter, and the paragraph above is why that
+/// is right rather than merely cheap: the stamp exists so the poller carries the
+/// trace onto the payload *it will actually send*, and a parked row is one the
+/// poller will never take. A revived one is delivered under a trace from a
+/// converge that finished hours earlier, which is a worse answer than none.
+///
+/// This is the fourth site holding `MAX_ATTEMPTS` in step with `0057`'s
+/// predicate, and the cost of forgetting is the same as the other three and no
+/// worse than the line above this one: the planner silently drops the index and
+/// the statement goes back to today's sequential scan, with the same answer.
+/// `stamping_a_trace_does_not_walk_another_tenants_dead_letters` is what turns
+/// that back into a failure somebody sees.
+///
+// ponytail: the ceiling is a tenant with a large *claimable* backlog — a
+// prospect import — whose own rows this then scans, because there is no index on
+// `aggregate_id` and this is the only reader that wants one. That is the tenant
+// paying for its own queue, which is the bar every claim in this workspace is
+// held to; the upgrade, if it ever matters, is `(tenant_id, aggregate_id) where
+// published_at is null and attempt_count < 8` and it is a fourth index on the
+// hottest table in the system, which `0057` and `0060` both refused for less.
 async fn stamp_trace(db: &Db, work: &Work, traceparent: &str) -> Result<(), StoreError> {
     let mut tx = db.tenant_tx(work.tenant_id).await?;
-    sqlx::query(
-        "UPDATE outbox_events \
-            SET payload = jsonb_set(payload, '{traceparent}', to_jsonb($2::text), true) \
-          WHERE aggregate_id = $1 \
-            AND published_at IS NULL \
-            AND payload->>'traceparent' IS NULL",
-    )
-    .bind(work.employee_id.as_uuid())
-    .bind(traceparent)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query(STAMP_SQL)
+        .bind(work.employee_id.as_uuid())
+        .bind(traceparent)
+        .bind(agentos_store::outbox::MAX_ATTEMPTS)
+        .execute(&mut **tx)
+        .await?;
     tx.commit().await
 }
+
+/// The statement [`stamp_trace`] runs, lifted out of it so a test can `EXPLAIN`
+/// the bytes that actually ship rather than a second copy of them that is free
+/// to drift. `outbox::CLAIM_SQL`, `outbox::REQUEUE_SQL` and
+/// [`super::outbox::lag_secs`]'s `LAG_SQL` are the same lifting for the same
+/// reason.
+///
+/// **There is no `WHERE tenant_id` in it and there must not be**: the tenant qual
+/// is row-level security's, added to the plan rather than to the text, so
+/// anybody reading this string alone sees a whole-table update and anybody
+/// reading the plan sees a tenant-leading one.
+const STAMP_SQL: &str = "UPDATE outbox_events \
+                            SET payload = jsonb_set(payload, '{traceparent}', to_jsonb($2::text), true) \
+                          WHERE aggregate_id = $1 \
+                            AND published_at IS NULL \
+                            AND payload->>'traceparent' IS NULL \
+                            AND attempt_count < $3::int";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2018,6 +2092,151 @@ mod tests {
         assert_eq!(
             stamped, 2,
             "the asynchronous work must stay on the trace that caused it"
+        );
+    }
+
+    /// **A tenant's dead letters must cost this stamp nothing, and until the
+    /// clause in [`STAMP_SQL`] they cost it the whole table.**
+    ///
+    /// [`stamp_trace`] carries the argument and the numbers. The short version:
+    /// `0057` dropped `outbox_events_tenant_due_idx`, the only index leading
+    /// with `tenant_id` over unpublished rows; `0060` found
+    /// `outbox::requeue_dead_letters` reading it and gave the `>= 8` half back;
+    /// this statement is the other reader and it asked for neither half, so the
+    /// planner could prove no partial index applied and fell to a sequential
+    /// scan of every tenant's rows — 100 095 removed by filter, 13.3 ms, once
+    /// per converge per employee, against 0.09 ms before `0057`.
+    ///
+    /// The assertion is the work done per stamp — rows read to find this
+    /// tenant's — and not an index name, for
+    /// `revival_does_not_walk_another_tenants_dead_letters`' reason: a name can
+    /// be right in the wrong node, and the rows are the complaint.
+    ///
+    /// **What it was watched go red against, and what it did not.** Replacing
+    /// the clause with an answer-preserving `$3::int IS NOT NULL` — which is the
+    /// statement exactly as it shipped before this — puts it back on a
+    /// `Seq Scan` and 5 000 rows removed by filter, which is this test's whole
+    /// reason to exist. `MAX_ATTEMPTS` moving *up* without a migration does the
+    /// same: measured in `psql` against 200 095 rows, `attempt_count < 9` cannot
+    /// be proved to imply `< 8`, the planner drops
+    /// `outbox_events_claimable_idx` and the statement goes back to the
+    /// sequential scan — with the same answer, and nothing else in the tree
+    /// would say so. Moving it *down* is safe by implication, as `0057`
+    /// describes and as `< 5` was measured confirming.
+    ///
+    /// It did **not** go red against `attempt_count < $3::bigint`, the one
+    /// keystroke `dead_letters_do_not_cost_the_readiness_probe` was written for:
+    /// casting the *parameter* keeps `int48lt` inside the integer opfamily and
+    /// PostgreSQL still proves the implication. That test's list is about
+    /// casting the *column* — `attempt_count::bigint < $1::bigint` — which is a
+    /// different expression and does fall. Recorded rather than papered over:
+    /// green was the correct answer, and the assertion that catches the real
+    /// break is the one above it.
+    ///
+    /// It `EXPLAIN`s [`STAMP_SQL`] itself, with the binds [`stamp_trace`] uses,
+    /// so it is the shipped statement and the shipped parameters and not a
+    /// retyping of either.
+    #[tokio::test]
+    async fn stamping_a_trace_does_not_walk_another_tenants_dead_letters() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+
+        /// Enough that walking them is unmistakable in the plan, few enough
+        /// that one INSERT is instant.
+        const PARKED: i64 = 5_000;
+
+        // The customer who never connected a model, and the customer being
+        // onboarded right now — which is the tenant this loop is converging.
+        let noisy = seed(&db, "noisy").await;
+        let onboarding = seed(&db, "vera").await;
+
+        // Exactly what `outbox::park` leaves: unpublished, attempts burnt, and
+        // `available_at` not moved.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outbox_events \
+                 (id, tenant_id, aggregate_type, aggregate_id, event_type, payload, \
+                  created_at, available_at, attempt_count, last_error) \
+             SELECT gen_random_uuid(), $1, 'employee', $2, 'employee.provisioned', \
+                    '{}'::jsonb, now(), now() - g * interval '1 second', $4::int, \
+                    'this employee''s policy permits no model at all' \
+               FROM generate_series(1, $3::bigint) g",
+        )
+        .bind(noisy.tenant_id().as_uuid())
+        .bind(noisy.id().as_uuid())
+        .bind(PARKED)
+        .bind(agentos_store::outbox::MAX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await
+        .expect("seed parked");
+        tx.commit().await.expect("commit parked seed");
+
+        // ...and what a converge of the onboarding tenant leaves: live events
+        // for its own employee, with no trace on them yet.
+        let mut tx = db.tenant_tx(onboarding.tenant_id()).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO outbox_events \
+                 (id, tenant_id, aggregate_type, aggregate_id, event_type, payload) \
+             SELECT gen_random_uuid(), $1, 'employee', $2, 'employee.step.ready', \
+                    '{\"step\":\"email\"}'::jsonb \
+               FROM generate_series(1, 5)",
+        )
+        .bind(onboarding.tenant_id().as_uuid())
+        .bind(onboarding.id().as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("seed live");
+        tx.commit().await.expect("commit live seed");
+
+        // A planner with no statistics is a planner reading a different table.
+        // `agentos_store::outbox`'s `analyze_outbox` carries what that cost the
+        // two guards in that module.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("ANALYZE outbox_events")
+            .execute(&mut *tx)
+            .await
+            .expect("analyze outbox_events");
+        tx.commit().await.expect("commit analyze");
+
+        // As the tenant, not as admin: the qual under test is RLS's, and
+        // `admin_tx_bypassing_rls` would remove the very thing being measured.
+        //
+        // ANALYZE runs the UPDATE for real, so this transaction is rolled back.
+        // `AssertSqlSafe`, and the audit is that both halves are compile-time
+        // constants of this module — a literal `EXPLAIN` prefix and
+        // [`STAMP_SQL`]. No value reaches the string.
+        let mut tx = db.tenant_tx(onboarding.tenant_id()).await.expect("tx");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {STAMP_SQL}"
+        )))
+        .bind(onboarding.id().as_uuid())
+        .bind("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .bind(agentos_store::outbox::MAX_ATTEMPTS)
+        .fetch_all(&mut **tx)
+        .await
+        .expect("explain the stamp");
+        tx.rollback().await.expect("rollback the explained stamp");
+
+        let plan = plan.join("\n");
+        let discarded: i64 = plan
+            .split("Rows Removed by Filter: ")
+            .skip(1)
+            .map(|tail| {
+                tail.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("0")
+                    .parse::<i64>()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            discarded < PARKED / 10,
+            "stamping one tenant's trace read {discarded} rows that are not its \
+             own; another tenant's {PARKED} parked rows are being walked on every \
+             converge of every employee. Plan:\n{plan}"
         );
     }
 
