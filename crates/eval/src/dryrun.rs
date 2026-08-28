@@ -1619,9 +1619,32 @@ fn verdict(passes: &[Vec<Ran>], failures: &[&'static str]) -> Surface {
              turned; whether the email was worth sending is a human reading the transcript",
             "the model. A new snapshot behind the same name moves every sampled row and no pin \
              in this repository can see it happen",
-            "the BUYER's vertical. `vertical::purchasing_turn` needs a sourcing round in the \
-             database and no charter here is a buyer's, so `international-buyer` is priced in \
-             `cost.rs` and worked nowhere. The seller's is now run",
+            "the BUYER's vertical — and it is in no figure above either, which this line used to \
+             get backwards. `vertical::purchasing_turn` needs `suppliers` rows to canvass, then an \
+             open `rfqs` row and `quotes` against it to compare, and no charter here is a buyer's. \
+             There is also nothing to seed them WITH: every writer of `suppliers`, \
+             `supplier_contacts` and `quotes` in this workspace lives inside a `mod tests`, and \
+             no CLI verb or route creates one — where the seller had `agentos-server flow set` \
+             and `revenue::set_prospect_flow` to copy, the buyer's ingest half does not exist. \
+             What is NOT true is that the seat is billed: `cost::seats()` reads \
+             `docs/orizn-roles/*.json` and there is no `international-buyer.json`, so \
+             `cost::preference`'s buyer arm is as dead as its `engineering` one and the seat \
+             contributes exactly $0. `docs/ORIZN.md` says why, in a section called `the pack Orizn \
+             does not need`: Orizn sources nothing, so a purchasing round seeded here would be \
+             invented suppliers quoting invented prices, and the number it produced would be about \
+             a company nobody deployed. What DOES work the buy side is \
+             `apps/server/tests/sourcing_e2e.rs` — the real binary, a real database, a whole \
+             round on a scripted model — and `vertical.rs`'s own database-backed tests of \
+             `purchasing_turn`. So what nothing covers is a real model taking a purchasing turn, \
+             not the vertical itself. The seller's vertical is run",
+            "`growth`, which IS priced and is worked nowhere — the shape the line above wrongly \
+             attributed to the buyer. `docs/orizn-roles/growth.json` reserves 10 of the 66 \
+             reserved turns a day the bill is summed over, on `claude-sonnet-5`, and \
+             `cost::charters()` charters `sdr`, `support` and `books` only. So growth's share of \
+             every dollar figure here is those three seats' tokens multiplied by growth's turn \
+             budget, and `rolepack_service::RolePack::growth()`'s own prompt and plan have never \
+             been weighed by anything. `direction` is the honest neighbour: no charter and no \
+             turns, so it contributes nothing to extrapolate",
             "whether one seeded prospect is a pipeline. The seller works a real flow through the \
              real prober, and it works the same one shape every pass: a confirmed flow, a panel \
              that reproduces, no MCP authority. Nothing here samples a flaky widget, a bot \

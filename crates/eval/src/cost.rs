@@ -225,6 +225,14 @@ pub struct Seat {
 /// `direction`.
 fn preference(role: &str) -> Option<ModelId> {
     Some(match role {
+        // **Dead, exactly like `ENGINEERING` below, and for the same reason:**
+        // there is no `docs/orizn-roles/international-buyer.json`, so [`seats`]
+        // never asks about this name and no figure in this file moves by a
+        // cent for it. `docs/ORIZN.md`'s "the pack Orizn does not need" is the
+        // decision behind that absence — Orizn sells an API and sources
+        // nothing. Saying so here because the arm on its own reads like a
+        // priced seat, and `dryrun`'s unmeasured list asserted for three days
+        // that it was one.
         "international-buyer" => rolepack::RolePack::international_buyer().model(),
         "sales-development" => rolepack_sales::RolePack::sales_development().model(),
         rolepack_service::CUSTOMER_SUCCESS => {
@@ -958,6 +966,52 @@ mod tests {
                  guess rather than a reading",
                 seat.role,
                 seat.turns
+            );
+        }
+    }
+
+    /// **Every seat this file bills was either worked by the run that produced
+    /// the numbers, or is named here as an extrapolation.**
+    ///
+    /// `measured_usd` multiplies one sample's tokens by *every* seat's turn
+    /// budget, so a seat with turns and no charter is priced out of some other
+    /// seat's turns. That is not automatically wrong — a seat with no vertical
+    /// takes the same shape of turn as its neighbours — but it is a claim, and
+    /// an unstated claim in a published bill is how `$76` happened.
+    ///
+    /// The list is what stops a *new* priced seat from arriving silently. Write
+    /// `docs/orizn-roles/international-buyer.json` and this goes red, which is
+    /// correct twice over: a purchasing turn reads quotes and compares, so
+    /// pricing it off a conversational sample would understate it, and
+    /// `dryrun` would first need `suppliers`, `supplier_contacts` and `quotes`
+    /// rows — for which this workspace has no writer outside a `mod tests`.
+    /// `DIGEST` also moves on that edit; this says *which* seat and *why*
+    /// rather than "something changed".
+    #[test]
+    fn every_billed_seat_is_worked_by_the_dry_run_or_named_as_an_extrapolation() {
+        /// Priced, unchartered, and stated. See `dryrun`'s unmeasured list.
+        const UNWORKED: &[&str] = &["growth"];
+
+        let worked: Vec<&str> = charters().iter().map(|(_, c)| c.role()).collect();
+        for seat in seats().iter().filter(|seat| seat.turns > 0) {
+            assert!(
+                worked.contains(&seat.role.as_str()) || UNWORKED.contains(&seat.role.as_str()),
+                "{} reserves {} turns a day on {} and no charter in `charters()` works it, so \
+                 every figure in this file prices it with tokens sampled from {worked:?}. Give it \
+                 a charter and re-record, or add it to UNWORKED and say so in `dryrun`'s \
+                 unmeasured list",
+                seat.role,
+                seat.turns,
+                seat.model,
+            );
+        }
+        // And the list does not outlive its subject: a name in it that is no
+        // longer billed is a stale excuse, which reads exactly like a covered
+        // seat.
+        for role in UNWORKED {
+            assert!(
+                seats().iter().any(|s| s.role == *role && s.turns > 0),
+                "{role} is excused from being worked and is not billed either — delete the line"
             );
         }
     }
