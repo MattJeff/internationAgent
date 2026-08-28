@@ -429,9 +429,21 @@ be sent. `OutboundWhatsapp::FreeForm` carries an `OpenWindow`, and an
 `OpenWindow` can only be obtained while the window is genuinely open. A free-text
 send outside the window is not a runtime error — it is unspellable.
 
+**And the window names the person it is with.** An expiry alone proves that *a*
+window is open somewhere, which is the wrong sentence: a window derived
+legitimately for a customer who wrote to us this morning would otherwise carry
+free text to a stranger who never did, with nothing forged. So `OpenWindow`
+holds the counterparty, `OutboundWhatsapp::FreeForm` has **no recipient field of
+its own** and reads it off the window, and an adapter — including the Meta one
+that does not exist yet — is never handed a pair it could get wrong. The one
+place two independent facts still meet is `Effects::send_whatsapp`, where the
+gate's ruling and the window are compared once; a mismatch is
+`whatsapp_window_mismatch` and never reaches a provider.
+
 Since the telephony ingest landed (`0069`) there is a way to obtain one outside a
 test: `agentos_app::effects::Effects::whatsapp_window` reads the last inbound
-WhatsApp message on the thread and mints the proof. Two numbers it depends on are
+WhatsApp message on the thread and mints the proof, stamped with the number it
+was asked about. Two numbers it depends on are
 **not sourced anywhere in this repository** and are written up as open questions
 in the code rather than restated here: the 24 itself, on `OpenWindow::DURATION`,
 and the safety margin for the fact that our clock is later than Meta's, on

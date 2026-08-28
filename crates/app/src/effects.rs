@@ -161,6 +161,22 @@ pub const NO_PROSPECT: &str = "no_such_prospect";
 /// audit row should say which of them moved.
 pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 
+/// [`LEAD_NOT_THE_RULED_ADDRESS`] one channel over: the WhatsApp window handed
+/// to [`Effects::send_whatsapp`] is somebody else's.
+///
+/// The window proves a *conversation* is open, and a conversation has two ends.
+/// Deriving one legitimately for a customer who wrote to us and then spending
+/// it on a stranger who did not is the one way a genuine proof can still
+/// produce an illegal send — nobody forged anything, the number simply changed
+/// between the derivation and the ruling.
+///
+/// Unreachable from `crate::turn` today, which has no `send_whatsapp` arm at
+/// all; the procedure written out in `turn::catalogue` derives the window from
+/// the same `to` it then gates on. It is a named refusal rather than an
+/// assertion for [`LEAD_NOT_THE_RULED_ADDRESS`]'s reason — the two facts are
+/// separated by a gate call, and the audit row should say which of them moved.
+pub const WHATSAPP_WINDOW_NOT_THEIRS: &str = "whatsapp_window_mismatch";
+
 /// What [`Effects::issue_invoice`] answers when the deal it was handed is not
 /// this company's, or is not one anybody won.
 ///
@@ -481,13 +497,15 @@ pub struct RenderedSms {
 /// window has to stay unspellable here too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderedWhatsapp {
-    /// Free text. Only expressible while the window is open.
+    /// Free text. Only expressible while the window is open — and only ever
+    /// addressable to [`OpenWindow::peer`], which is what
+    /// [`RenderedWhatsapp::addressed_to`] checks against the token.
     FreeForm {
         /// The employee's own WhatsApp sender.
         from: E164,
         /// Body text.
         body: String,
-        /// Proof the window was open.
+        /// Proof the window was open, and with whom.
         window: OpenWindow,
     },
     /// A pre-approved template. Always allowed.
@@ -502,15 +520,34 @@ pub enum RenderedWhatsapp {
 }
 
 impl RenderedWhatsapp {
-    /// Address it to the number on the token.
-    fn addressed_to(self, to: E164) -> OutboundWhatsapp {
-        match self {
-            Self::FreeForm { from, body, window } => OutboundWhatsapp::FreeForm {
-                from,
-                to,
-                body,
-                window,
-            },
+    /// Address it to the number on the token, or refuse.
+    ///
+    /// **`None` is the seam this returns a `Result`-shaped answer for**, and it
+    /// is the only place two independent facts about one message meet: the
+    /// gate ruled on a recipient, and the window was derived for a
+    /// counterparty. Both are honest apart; a message where they disagree is
+    /// one person's consent spent on another, and the send it would produce is
+    /// free text to somebody who never wrote to us — legal-looking on the wire
+    /// and a policy violation on Meta's platform.
+    ///
+    /// It cannot be a comparison further down. `OutboundWhatsapp::FreeForm`
+    /// carries no recipient beside the window's, so the port is never handed
+    /// the pair at all — which is the whole reason the mismatch cannot survive
+    /// an adapter that forgets. And it cannot be further up either: the token
+    /// exists only here. So the check is here, once, in the constructor that
+    /// every send must pass through, rather than in a caller that could skip
+    /// it.
+    ///
+    /// A template needs no window and may open a conversation, so it is simply
+    /// addressed to the ruled number.
+    fn addressed_to(self, to: E164) -> Option<OutboundWhatsapp> {
+        Some(match self {
+            Self::FreeForm { from, body, window } => {
+                if *window.peer() != to {
+                    return None;
+                }
+                OutboundWhatsapp::FreeForm { from, body, window }
+            }
             Self::Template {
                 from,
                 name,
@@ -521,7 +558,7 @@ impl RenderedWhatsapp {
                 name,
                 variables,
             },
-        }
+        })
     }
 }
 
@@ -1058,6 +1095,15 @@ impl Effects {
     /// third copy of the rule would be a third place for it to drift, and the
     /// one that matters is the one nearest the send.
     ///
+    /// **What does not decay is who it is with.** The proof carries `to`, so a
+    /// window minted here is a window with *them* and expires as one. That half
+    /// is settled at this call and never re-asked at the wire, for the mirror
+    /// image of the reason above: an answer that cannot change between two
+    /// points belongs at the earlier one. [`Effects::send_whatsapp`] compares it
+    /// against the ruled recipient once — the only place the token and the
+    /// window are both in scope — and `OutboundWhatsapp::FreeForm` has no second
+    /// recipient for an adapter to prefer.
+    ///
     /// # FOUNDER'S QUESTION, LEFT OPEN: what is the safety margin?
     ///
     /// The lag above is real and it is unobservable from here — nothing in a
@@ -1089,18 +1135,30 @@ impl Effects {
                 .map_err(EffectError::Unavailable)?;
         tx.commit().await.map_err(EffectError::Unavailable)?;
 
-        Ok(OpenWindow::since_last_inbound(last, Utc::now()))
+        // `to` twice on purpose: the clock is read *for* them, and the proof is
+        // stamped *with* them, so a window can never be spent on anybody else.
+        Ok(OpenWindow::since_last_inbound(to, last, Utc::now()))
     }
 
     /// Send the rendered WhatsApp message to the number on the token.
     ///
-    /// Same fence and the same bounded promise as [`Self::send_sms`].
+    /// Same fence and the same bounded promise as [`Self::send_sms`], plus one
+    /// refusal that has no counterpart there: free text whose
+    /// [`OpenWindow`] was derived for somebody other than the number the gate
+    /// ruled on is [`WHATSAPP_WINDOW_NOT_THEIRS`] and never reaches a provider.
+    /// It is refused **before** [`Self::begin_send`], because there is nothing
+    /// to be unsure about — no request leaves, so no row should say one might
+    /// have. The audit row is still written, by the same
+    /// [`Self::record`] call [`Self::stage_lead`] makes for its own mismatch.
     pub async fn send_whatsapp<A: Subject<Of = WhatsappSend>>(
         &self,
         ok: Authorized<A>,
         body: RenderedWhatsapp,
     ) -> Result<ProviderMessageId, EffectError> {
-        let message = body.addressed_to(ok.action().subject().to.clone());
+        let Some(message) = body.addressed_to(ok.action().subject().to.clone()) else {
+            let refused = Err(EffectError::Refused(WHATSAPP_WINDOW_NOT_THEIRS));
+            return self.record(&ok, message_detail(&refused), refused).await;
+        };
 
         self.begin_send(&ok, TELEPHONY_PORT).await?;
         let sent = self
@@ -2953,11 +3011,22 @@ mod tests {
                 // two that do and can make nothing else pass. `evaluate`'s
                 // `SmsSend` arm asks the channel *and* the calling code, so the
                 // `+1` below is load-bearing for it too.
+                // `Channel::Whatsapp` last, on the same terms and for exactly
+                // one test — `a_window_with_one_number_cannot_carry_free_text_
+                // to_another`, which needs the *gate* to say yes so that what
+                // refuses the send is the window binding and nothing else. It
+                // is emphatically not a claim about a deployment:
+                // `store::policy::default_ceiling` grants no `Channel::Whatsapp`
+                // and no calling code, layers only narrow, and this database has
+                // no platform layer at all — which is precisely why
+                // `turn::UNSERVED`'s entry may not say that its own line is all
+                // that stands between an employee and a WhatsApp message.
                 allowed_channels: BTreeSet::from([
                     Channel::Email,
                     Channel::Web,
                     Channel::Voice,
                     Channel::Sms,
+                    Channel::Whatsapp,
                 ]),
                 allowed_calling_codes: BTreeSet::from([
                     CallingCode::new(1).expect("+1 is a calling code")
@@ -3574,6 +3643,13 @@ mod tests {
             landed_at + OpenWindow::DURATION,
             "the expiry is 24h from their message, not from now"
         );
+        // **Whose window it is**, asserted here for the reason
+        // `a_payment_settles_on_success` asserts the payee: this method reads
+        // the clock for `them` and stamps the proof with `them` out of one
+        // variable, so no caller can pass a different number — and the
+        // assertion is still the only thing saying that the number on the proof
+        // is the counterparty rather than our own sender.
+        assert_eq!(window.peer(), &them);
 
         // And it is theirs alone: another number on the same sender has none.
         assert!(
@@ -3618,6 +3694,98 @@ mod tests {
                 .is_none(),
             "a message from 25 hours ago left the window open"
         );
+    }
+
+    /// **A window with one number must not carry free text to another.**
+    ///
+    /// `OpenWindow` used to be one field — an expiry — so what it proved was
+    /// *a* window is open, never *this* window with *this* person.
+    /// `since_last_inbound` was already the only constructor, so nothing could
+    /// forge one; what was possible was spending a genuine one on somebody
+    /// else. Derive a window legitimately for a customer who wrote to us this
+    /// morning, gate a `WhatsappSend` on a stranger who never has, and the
+    /// message goes out as free text on a conversation that was never opened —
+    /// legal-looking on the wire, a policy violation on Meta's platform, and
+    /// nobody forged anything.
+    ///
+    /// Unreachable today: `ActionKind::WhatsappSend` is in `turn::UNSERVED` and
+    /// there is no caller. That is the argument for the test rather than
+    /// against it — the defect survives the day the verb is switched on, which
+    /// is the day nobody reads this path again.
+    ///
+    /// **Both halves, because either alone passes for the wrong reason.** A
+    /// build that refused every WhatsApp message satisfies the first
+    /// assertion and nothing else; a build that sent every one satisfies the
+    /// last. The two numbers are both `+1` and the fixture grants
+    /// `Channel::Whatsapp`, so the gate says yes to each of them and what tells
+    /// them apart is the binding alone — not a denial that would have refused
+    /// either way.
+    #[tokio::test]
+    async fn a_window_with_one_number_cannot_carry_free_text_to_another() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let phone = Arc::new(MockTelephony::new(Utc::now(), "token"));
+        let effects = Effects::new(db.clone(), ports_dialling(phone), principal.clone());
+        let gate = gate(&db);
+
+        let wrote_to_us = a_number();
+        let stranger = E164::parse("+14155550123").expect("e164");
+        assert_ne!(wrote_to_us, stranger, "the fixture must be two people");
+
+        // Genuinely open and genuinely theirs — the same mint
+        // `Effects::whatsapp_window` performs, on the same constructor, since
+        // there is no other one.
+        let now = Utc::now();
+        let window =
+            OpenWindow::since_last_inbound(&wrote_to_us, Some(now - TimeDelta::minutes(5)), now)
+                .expect("five minutes ago is inside the window");
+        assert!(
+            window.expires_at() > now + TimeDelta::hours(23),
+            "the fixture window must still be open at the send, or this test refuses for the \
+             wrong reason"
+        );
+        let free = |window| RenderedWhatsapp::FreeForm {
+            from: E164::parse("+15005550006").expect("e164"),
+            body: "on its way".to_owned(),
+            window,
+        };
+
+        let ok = gate
+            .authorize(
+                &principal,
+                WhatsappSend {
+                    to: stranger.clone(),
+                },
+            )
+            .await
+            .expect("the gate allows the stranger: whatsapp and +1 are both granted");
+        let err = effects
+            .send_whatsapp(ok, free(window.clone()))
+            .await
+            .expect_err("one person's window carried free text to another");
+        assert_eq!(err.code(), WHATSAPP_WINDOW_NOT_THEIRS);
+        assert!(
+            intent_rows(&db, &principal).await.is_empty(),
+            "nothing was sent, so nothing may be left in flight for a person to settle"
+        );
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "a refusal is recorded too: {rows:?}");
+        assert_eq!(rows[0].1["outcome"], json!("error"));
+        assert_eq!(rows[0].1["error"], json!(WHATSAPP_WINDOW_NOT_THEIRS));
+
+        // The same window, the same body, addressed to the person it is
+        // actually with.
+        let ok = gate
+            .authorize(&principal, WhatsappSend { to: wrote_to_us })
+            .await
+            .expect("the same policy allows the number that wrote to us");
+        effects
+            .send_whatsapp(ok, free(window))
+            .await
+            .expect("their own window sends");
+        let rows = intent_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "one send, one row: {rows:?}");
+        assert_eq!(rows[0].0, "whatsapp_send");
     }
 
     /// A number the fixture policy grants, for the two write-ahead tests.
