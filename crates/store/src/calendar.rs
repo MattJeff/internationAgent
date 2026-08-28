@@ -401,7 +401,12 @@ pub async fn cancel_outstanding(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use chrono::{SubsecRound, TimeDelta};
+    use tokio::sync::{Barrier, Mutex};
 
     use super::*;
     use crate::db::Db;
@@ -828,5 +833,387 @@ mod tests {
             refused.is_err(),
             "a zone this server's tzdata does not know must not reach the table"
         );
+    }
+
+    // -- contention --------------------------------------------------------
+    //
+    // Two replicas ringing at the same instant, on two connections, against one
+    // database. Everything below is the shape `crate::outbox` and
+    // `crate::initiative` already use for their own claims — a barrier releases
+    // two real transactions at once, and a second, *asymmetric* arrangement
+    // widens the window between one claim's snapshot and its first row lock —
+    // and it is written a third time here rather than shared because the shared
+    // part is `tokio::sync::Barrier` and the different part is every line around
+    // it: a poller's batch is per-tenant round-robin over a queue, this one is
+    // `DISTINCT ON (tenant_id)` over a diary, and the two fixtures have nothing
+    // in common but the word "claim".
+    //
+    // **The two tests are not one test run twice, and the difference is the
+    // whole reason both exist.** The first holds both claiming transactions open
+    // across the claim, which is the only arrangement where `SKIP LOCKED` is
+    // doing anything at all — and it is *not* the arrangement the initiative
+    // loop runs in, because that loop commits before the first turn. Measured on
+    // this file's own subject: with the `rang_at IS NULL` recheck deleted from
+    // `due`, the first test stays green and the second goes red. A suite with
+    // only the first would have said the claim was covered.
+
+    /// [`claim_due`] is cross-tenant by design, so a test that rings sees every
+    /// appointment any test running beside it has written — and the two below
+    /// count rows rather than filter them, because "the batch was exactly four"
+    /// is the assertion. So they take a database of their own, and one lock
+    /// between them.
+    static CONTENTION_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// The instant the two contention fixtures are measured from. Everything
+    /// they write is due at [`NOW`], and nothing else lives in that database.
+    const T0: i64 = 1_800_000_000;
+
+    /// The clock both replicas are given. Far enough past [`T0`] that every row
+    /// either test seeds is due, so the claim's `at <= $1` never decides
+    /// anything and the assertions are about the lock.
+    const NOW: i64 = T0 + 1_000_000;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("a valid instant")
+    }
+
+    async fn contention_db() -> Option<Db> {
+        crate::db::private_db("calcontention").await
+    }
+
+    /// Everything either contention test left behind, by the slug
+    /// [`seed_tenant`] mints. Scoped even though the database is private:
+    /// `crates/app/tests/scoped_deletes.rs` refuses an unscoped `DELETE`
+    /// anywhere in the workspace, and it is right to.
+    async fn clear_diaries(db: &Db) {
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query("DELETE FROM tenants WHERE slug LIKE 'cal-%'")
+            .execute(&mut *admin)
+            .await
+            .expect("clear the diaries");
+        admin.commit().await.expect("commit clear");
+    }
+
+    /// A company, a seat, and nothing else. Both tests want many of these.
+    async fn seed_company(db: &Db, label: &str) -> (TenantId, EmployeeId) {
+        let tenant = seed_tenant(db).await;
+        let seat = seed_employee(db, tenant, label).await;
+        (tenant, seat)
+    }
+
+    /// `count` outstanding promises for one seat, the first at `first_at` and
+    /// each `step_secs` after the one before.
+    ///
+    /// One statement, because the second test wants thousands of them: they are
+    /// what makes the claim's `DISTINCT ON` phase long enough to commit inside.
+    async fn seed_promises(
+        db: &Db,
+        tenant: TenantId,
+        seat: EmployeeId,
+        count: i64,
+        first_at: DateTime<Utc>,
+        step_secs: i64,
+    ) {
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query(
+            "INSERT INTO appointments (id, tenant_id, employee_id, at, at_zone, subject) \
+             SELECT gen_random_uuid(), $1, $2, \
+                    $3::timestamptz + (g - 1) * interval '1 second' * $5::bigint, \
+                    'Europe/Paris', 'a promise made in bulk' \
+               FROM generate_series(1, $4::bigint) g",
+        )
+        .bind(tenant.as_uuid())
+        .bind(seat.as_uuid())
+        .bind(first_at)
+        .bind(count)
+        .bind(step_secs)
+        .execute(&mut *admin)
+        .await
+        .expect("seed promises");
+        admin.commit().await.expect("commit seed");
+    }
+
+    /// The planner has to see the rows the second test seeds, or it plans for an
+    /// empty table and the claim takes a different shape than the one being
+    /// measured. Committed rather than rolled back: `pg_statistic` rows are
+    /// ordinary rows. Copied from `crate::outbox::tests::analyze_outbox`, which
+    /// carries the same sentence for the same reason.
+    async fn analyze_appointments(db: &Db) {
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query("ANALYZE appointments")
+            .execute(&mut *admin)
+            .await
+            .expect("analyze appointments");
+        admin.commit().await.expect("commit analyze");
+    }
+
+    /// **Two replicas ringing at the same instant take disjoint promises, and
+    /// neither one waits for the other.**
+    ///
+    /// Both transactions are open before either claims and both are held open
+    /// after — the second barrier is what forces the row locks to overlap, and
+    /// it is the only arrangement in which `SKIP LOCKED` can be observed doing
+    /// anything. Serialise the two and this passes with the clause deleted.
+    ///
+    /// Eight companies with one due promise each, four to a replica, because
+    /// `DISTINCT ON (tenant_id)` offers **one appointment per company**: a
+    /// second replica's batch cannot come out of a busy company's diary, only
+    /// out of the companies the first replica did not reach. So the fixture that
+    /// makes this claim contended at all is *many companies*, where the outbox's
+    /// is many rows — and a test that seeded one company with eight promises
+    /// would watch the second replica come back empty and call it a bug.
+    ///
+    /// The timeout is the second assertion and not a safety net. Delete
+    /// `SKIP LOCKED` and the second replica does not come back wrong, it does
+    /// not come back at all: it blocks on the first replica's row locks, which
+    /// are held until it has claimed, which it cannot do. Without the timeout
+    /// that is a suite that hangs rather than a suite that fails, and the
+    /// difference between those two is an afternoon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_replicas_ringing_at_once_take_disjoint_promises_and_neither_waits() {
+        let Some(db) = contention_db().await else {
+            return;
+        };
+        let _guard = CONTENTION_LOCK.lock().await;
+        clear_diaries(&db).await;
+
+        const COMPANIES: i64 = 8;
+        /// Half each. A batch of `COMPANIES` would let whichever replica wins
+        /// the race take the lot and leave the other with nothing — correct
+        /// behaviour, and it proves nothing about `SKIP LOCKED`.
+        const BATCH: i64 = COMPANIES / 2;
+
+        for n in 0..COMPANIES {
+            let (tenant, seat) = seed_company(&db, "replica").await;
+            // Distinct instants, so the order the two replicas walk the seats in
+            // is the fixture's and not the ids' random bits.
+            seed_promises(&db, tenant, seat, 1, at(T0 - n), 1).await;
+        }
+
+        let ready = Arc::new(Barrier::new(2));
+        let rung = Arc::new(Barrier::new(2));
+
+        let replica = |db: Db, ready: Arc<Barrier>, rung: Arc<Barrier>| async move {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            // The premise, and it is the one a contention test gets wrong by
+            // accident: two tasks are not two workers unless they are on two
+            // connections. Spawned onto one, everything below would be
+            // measuring this test's own scheduling and `SKIP LOCKED` would
+            // never be asked a question.
+            let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("backend pid");
+            ready.wait().await;
+            let got = claim_due(&mut tx, BATCH, at(NOW)).await.expect("claim");
+            // Hold the locks until the other replica has claimed too.
+            rung.wait().await;
+            tx.commit().await.expect("commit");
+            (backend, got)
+        };
+
+        let a = tokio::spawn(replica(db.clone(), ready.clone(), rung.clone()));
+        let b = tokio::spawn(replica(db.clone(), ready, rung));
+        let ((pid_a, a), (pid_b, b)) = tokio::time::timeout(Duration::from_secs(20), async move {
+            (a.await.expect("replica a"), b.await.expect("replica b"))
+        })
+        .await
+        .expect(
+            "a replica never came back: the second one is waiting on row locks the first \
+             one holds until it has claimed, and it never will. That is `FOR UPDATE` \
+             without `SKIP LOCKED` — two replicas on one database stop being a supported \
+             configuration and become a deadlock",
+        );
+
+        assert_ne!(
+            pid_a, pid_b,
+            "both replicas ran on backend {pid_a}: one connection, so the two \
+             claims were serialised by the pool and nothing below is about \
+             contention"
+        );
+
+        let ids_a: HashSet<AppointmentId> = a.iter().map(|k| k.id).collect();
+        let ids_b: HashSet<AppointmentId> = b.iter().map(|k| k.id).collect();
+
+        assert!(
+            ids_a.is_disjoint(&ids_b),
+            "the same promise was rung by both replicas: {:?}",
+            &ids_a & &ids_b
+        );
+        // Both filled their batch, so the second replica was not blocked behind
+        // the first one's locks — it stepped over them onto other companies.
+        assert_eq!(ids_a.len(), BATCH as usize, "replica A's batch");
+        assert_eq!(ids_b.len(), BATCH as usize, "replica B's batch");
+        assert_eq!(
+            ids_a.len() + ids_b.len(),
+            COMPANIES as usize,
+            "nothing was dropped on the floor and nothing was rung twice"
+        );
+
+        // A third replica at the same instant gets nothing: every promise the
+        // fixture wrote has been kept.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let leftovers = claim_due(&mut admin, 100, at(NOW)).await.expect("claim");
+        admin.rollback().await.expect("rollback");
+        assert!(
+            leftovers.is_empty(),
+            "a promise that rang must not ring again: {:?}",
+            leftovers.iter().map(|k| k.id).collect::<Vec<_>>()
+        );
+
+        clear_diaries(&db).await;
+    }
+
+    /// **The test above cannot catch a promise rung twice, and the mutation
+    /// proves it: with `rang_at IS NULL` deleted from `due`, that test stays
+    /// green and this one goes red.**
+    ///
+    /// `apps/server`'s initiative loop commits the claim *before* the first
+    /// turn, so in production the first replica's row locks are gone within
+    /// milliseconds and `SKIP LOCKED` has nothing left to skip. What holds the
+    /// appointment from there is `rang_at`, a column the second replica has to
+    /// actually re-read — and `seated` reads `appointments` **unlocked** under
+    /// the statement's snapshot while `due` is the only node that locks. When a
+    /// row it reaches has meanwhile been rung and committed by the other
+    /// replica, `SKIP LOCKED` does not skip it — nothing holds it any more — and
+    /// `READ COMMITTED`'s recheck (`EvalPlanQual`) walks to the new row version
+    /// and re-runs *only the quals present under the `LockRows` node*. With
+    /// `a2.id = s.id` alone that still holds, the row is taken a second time,
+    /// and the outer `UPDATE` — whose own `WHERE` is the join and nothing else —
+    /// **overwrites the `rang_at` the first replica just wrote**. Two turns for
+    /// one promise, which is two model calls the customer is billed for, and the
+    /// only record that it happened twice has been overwritten by the second
+    /// one. This is `crate::outbox::claim_of`'s four-month double-charge, in the
+    /// third table to be given the same query shape.
+    ///
+    /// # Why this is an interleaving that is arranged rather than raced for
+    ///
+    /// The window is "after the second replica's snapshot, before its first row
+    /// lock", and in this statement that window is a whole phase: `seated` is
+    /// `MATERIALIZED` and completes before `due` locks anything. Here it is
+    /// widened by the *data* rather than by the batch size, and that is forced
+    /// by the query rather than chosen — `seated` has no `LIMIT` for the two
+    /// claims' limits to differ over, and `DISTINCT ON (tenant_id)` cannot stop
+    /// early, so both replicas read every due row whatever they were asked for.
+    /// So the two statements cost the *same*, and the ordering comes from
+    /// starting them a few milliseconds apart: the first reaches its lock at
+    /// `S`, commits at `S + ε`, and the second — whose snapshot was taken at
+    /// `Δ` — reaches its own lock at `S + Δ`. Every `Δ` between `ε` and `S` is
+    /// the defect's window. Measured on this machine with `EXPLAIN (ANALYZE)`
+    /// over a fixture of this shape, `S` is 20–32 ms against 21 606 due rows;
+    /// [`COMPANIES`] × [`PADDING`] is 18 000 of them and `Δ` is 3 ms, so there
+    /// is most of an order of magnitude of margin on both sides.
+    ///
+    /// It is still an interleaving and not a proof. The ordering where the
+    /// second replica's snapshot is taken *after* the first has committed
+    /// asserts nothing — it simply sees three fewer due promises and rings the
+    /// next three — and that is not a failure, which is why there are
+    /// [`ROUNDS`] of it. Measured with the recheck deleted: red in the first
+    /// round on 10 runs of 10. With it: 10 green runs of 10, and 50 rounds
+    /// inside them.
+    ///
+    /// [`ROUNDS`]: a_promise_rung_mid_statement_is_not_rung_a_second_time
+    /// [`PADDING`]: a_promise_rung_mid_statement_is_not_rung_a_second_time
+    /// [`COMPANIES`]: a_promise_rung_mid_statement_is_not_rung_a_second_time
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_promise_rung_mid_statement_is_not_rung_a_second_time() {
+        let Some(db) = contention_db().await else {
+            return;
+        };
+        let _guard = CONTENTION_LOCK.lock().await;
+        clear_diaries(&db).await;
+
+        /// Twice the batch, so that in the healthy interleaving the second
+        /// replica has three companies of its own to reach and comes back
+        /// **full** — a batch that came back empty would satisfy "nothing was
+        /// rung twice" without the statement having locked anything at all.
+        const COMPANIES: i64 = 6;
+        const BATCH: i64 = COMPANIES / 2;
+        const ROUNDS: i64 = 5;
+        /// Promises per company that are due but never the earliest, so they are
+        /// scanned by `seated` and never seated. They are the window: the scan
+        /// and sort of `COMPANIES × PADDING` rows is what the first replica's
+        /// commit has to fit inside.
+        const PADDING: i64 = 3_000;
+
+        for i in 0..COMPANIES {
+            let (tenant, seat) = seed_company(&db, "midring").await;
+            // One contested promise per round, an hour apart, each company's
+            // offset by `i` seconds so the six of them have a stable order.
+            seed_promises(&db, tenant, seat, ROUNDS, at(T0 + i), 3_600).await;
+            // …and the bulk, after every contested row and before `NOW`.
+            seed_promises(&db, tenant, seat, PADDING, at(T0 + 100_000), 1).await;
+        }
+        analyze_appointments(&db).await;
+
+        for round in 0..ROUNDS {
+            let ready = Arc::new(Barrier::new(2));
+            let first = tokio::spawn({
+                let db = db.clone();
+                let ready = ready.clone();
+                async move {
+                    let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+                    // Two workers means two connections; see the test above.
+                    let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("backend pid");
+                    ready.wait().await;
+                    let got = claim_due(&mut tx, BATCH, at(NOW)).await.expect("claim");
+                    tx.commit().await.expect("commit first");
+                    (backend, got)
+                }
+            });
+
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            let pid_second: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("backend pid");
+            ready.wait().await;
+            // Into the other replica's scan rather than alongside its snapshot:
+            // level, this one can reach `due` first, and then it is the *other*
+            // one that meets a lock still held — which is the case the test
+            // above already covers.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            let second = claim_due(&mut tx, BATCH, at(NOW)).await.expect("claim");
+            tx.commit().await.expect("commit second");
+
+            let (pid_first, first) = first.await.expect("the first replica");
+            assert_ne!(
+                pid_first, pid_second,
+                "round {round}: both claims ran on backend {pid_first}, so they were \
+                 serialised by the connection pool and no snapshot ever straddled \
+                 anybody's commit"
+            );
+
+            let ids_first: HashSet<AppointmentId> = first.iter().map(|k| k.id).collect();
+            let ids_second: HashSet<AppointmentId> = second.iter().map(|k| k.id).collect();
+            assert!(
+                ids_first.is_disjoint(&ids_second),
+                "round {round}: the same promise was rung by both replicas — the lock \
+                 re-read a version the other one had already rung, and the second \
+                 `UPDATE` has overwritten the `rang_at` that says when it really \
+                 rang: {:?}",
+                &ids_first & &ids_second
+            );
+            // Both came back full, which is what makes the line above an
+            // assertion about the lock rather than about an empty batch. It
+            // holds in both interleavings: whether the second replica's snapshot
+            // was taken before or after the first replica committed, there are
+            // six companies with a promise due and it may have three of them.
+            assert_eq!(
+                ids_first.len(),
+                BATCH as usize,
+                "round {round}: the first replica's batch"
+            );
+            assert_eq!(
+                ids_second.len(),
+                BATCH as usize,
+                "round {round}: the second replica's batch"
+            );
+        }
+
+        clear_diaries(&db).await;
     }
 }

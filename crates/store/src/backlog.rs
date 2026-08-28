@@ -460,6 +460,7 @@ pub async fn unassign_all(tx: &mut TenantTx<'_>, who: EmployeeId) -> Result<u64,
 mod tests {
     use agentos_domain::ids::TenantId;
     use chrono::SubsecRound;
+    use uuid::Uuid;
 
     use super::*;
     use crate::db::Db;
@@ -838,6 +839,216 @@ mod tests {
             "a held item stays held: there is no timeout that gives it back"
         );
         tx.rollback().await.expect("rollback");
+    }
+
+    /// **[`claim`]'s docs say the mutual exclusion is read committed and that
+    /// repeatable read would answer `40001` instead. Both halves are asked here
+    /// rather than believed.**
+    ///
+    /// The claim above it is a claim about a *setting*, not about the statement,
+    /// and it is the kind that is true when it is written and false later
+    /// without a line of this file changing: `default_transaction_isolation` is
+    /// a `postgresql.conf` line, a `PGOPTIONS` in a deployment unit, an `ALTER
+    /// DATABASE … SET`. So the level is read back from the transaction
+    /// [`crate::db::Db::tenant_tx`] actually hands out — `SHOW
+    /// transaction_isolation`, on the connection, inside the transaction — and
+    /// not deduced from the absence of a `SET` in `tenant_tx`.
+    ///
+    /// # What the second half is worth knowing
+    ///
+    /// `tenant_tx` pins no isolation level, and that is not an omission with no
+    /// consequence: it means the level is whatever the deployment's default is,
+    /// and this statement's *answer to the caller changes with it*. At read
+    /// committed the loser is told `false` — "somebody else has it", which is a
+    /// sentence a model can act on. Turn the same deployment's default up to
+    /// repeatable read and the identical call raises `40001`, which
+    /// [`StoreError`] classifies as [`StoreError::Serialization`] and which
+    /// ends the turn that made it. Nothing in this crate would report that
+    /// change; the second half of this test is what does.
+    ///
+    /// It is reached by connecting a second [`Db`] to the same database with
+    /// `options=-c default_transaction_isolation=repeatable read`, which is
+    /// exactly how an operator would do it, rather than by issuing a `SET` the
+    /// product never issues. That also proves the first half from the other
+    /// side: `tenant_tx` inherits the default, so a doctored default arrives
+    /// intact.
+    ///
+    /// # The interleaving is waited for rather than slept through
+    ///
+    /// [`the sibling test`](two_employees_reach_for_one_item_and_exactly_one_gets_it)
+    /// sleeps 150 ms and says — correctly — that the sleep cannot make it flaky,
+    /// because both interleavings assert the same thing. That is true of the
+    /// `false` and false of the `40001`: repeatable read only raises it when the
+    /// loser's **snapshot predates the winner's commit**, and a contender that
+    /// arrived late reads the assigned row and answers `false` like everybody
+    /// else. So this one does not sleep — it asks PostgreSQL whether the
+    /// contender is blocked yet, through [`crate::db::wait_until_blocked`], and
+    /// commits the winner only once it is. A run in which the arrangement did
+    /// not happen fails there, saying so, instead of passing quietly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_exclusion_is_read_committed_and_repeatable_read_would_change_the_answer() {
+        let Some((db, tenant, _)) = fixture().await else {
+            return;
+        };
+        let ada = seed_employee(&db, tenant, "ada-isolation").await;
+        let bob = seed_employee(&db, tenant, "bob-isolation").await;
+        let now = Utc::now().trunc_subsecs(6);
+
+        // The premise, read from the transaction the product hands out.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let level: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("show transaction_isolation");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            level, "read committed",
+            "`claim`'s exclusion is read committed re-evaluating the loser's \
+             WHERE against the committed row. This deployment is at `{level}`, \
+             where the same call answers a model something else entirely — see \
+             the second half of this test for what."
+        );
+
+        // -- read committed: the loser blocks, then is told it lost -----------
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let item = post(&mut tx, WorkItemId::new_v7(now), "nobody's yet", None, None)
+            .await
+            .expect("post");
+        tx.commit().await.expect("commit");
+
+        let mut a = db.tenant_tx(tenant).await.expect("tx a");
+        assert!(
+            claim(&mut a, item.id, ada).await.expect("claim"),
+            "A takes it, and holds the row lock until it commits"
+        );
+        let (lost, held_by) = contend(&db, tenant, item.id, bob, a).await;
+        assert!(
+            matches!(lost, Ok(false)),
+            "at read committed the loser is told it lost, and that is a sentence \
+             an employee can act on: {lost:?}"
+        );
+        assert_eq!(held_by, Some(ada), "the winner is still holding it");
+
+        // -- repeatable read: the identical call raises 40001 -----------------
+        let strict = repeatable_read_db().await;
+        let mut tx = strict.tenant_tx(tenant).await.expect("tx");
+        let level: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("show transaction_isolation");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            level, "repeatable read",
+            "the second half of this test needs a connection that is actually at \
+             repeatable read; `tenant_tx` inherits the default and this one did not \
+             arrive"
+        );
+
+        let mut tx = strict.tenant_tx(tenant).await.expect("tx");
+        let second = post(
+            &mut tx,
+            WorkItemId::new_v7(now),
+            "also nobody's",
+            None,
+            None,
+        )
+        .await
+        .expect("post");
+        tx.commit().await.expect("commit");
+
+        let mut a = strict.tenant_tx(tenant).await.expect("tx a");
+        assert!(
+            claim(&mut a, second.id, ada).await.expect("claim"),
+            "A takes the second item too"
+        );
+        let (lost, held_by) = contend(&strict, tenant, second.id, bob, a).await;
+        assert!(
+            matches!(lost, Err(StoreError::Serialization)),
+            "under repeatable read the same call cannot answer `false` — the row \
+             it selected under its own snapshot was updated underneath it, so \
+             PostgreSQL raises 40001 and the caller gets a retryable error \
+             instead of an answer. `claim`'s docs say so and this is the proof; \
+             what came back was {lost:?}"
+        );
+        assert_eq!(
+            held_by,
+            Some(ada),
+            "…and the item is still A's: the loser changed nothing either way"
+        );
+    }
+
+    /// Reach for `item` as `who` on a second connection while `winner` still
+    /// holds it, wait until that reach is genuinely blocked, then let the winner
+    /// commit. Returns what the loser was told, and who ends up holding the row.
+    ///
+    /// Both halves of the test above need exactly this and differ only in which
+    /// [`Db`] they are given, which is the whole point: the statement, the
+    /// interleaving and the assertions are identical, and the isolation level is
+    /// the only thing that moves.
+    async fn contend(
+        db: &Db,
+        tenant: TenantId,
+        item: WorkItemId,
+        who: EmployeeId,
+        winner: TenantTx<'_>,
+    ) -> (Result<bool, StoreError>, Option<EmployeeId>) {
+        let (send_pid, pid) = tokio::sync::oneshot::channel();
+        let loser = tokio::spawn({
+            let db = db.clone();
+            async move {
+                let mut b = db.tenant_tx(tenant).await.expect("tx b");
+                // Read before the statement that blocks: a blocked backend
+                // reports nothing until it is unblocked.
+                let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut **b)
+                    .await
+                    .expect("backend pid");
+                send_pid
+                    .send(backend)
+                    .expect("the test is waiting for this");
+                let got = claim(&mut b, item, who).await;
+                // A 40001 aborts the transaction, and a COMMIT on an aborted
+                // transaction is a rollback wearing the wrong name.
+                match &got {
+                    Ok(_) => b.commit().await.expect("commit b"),
+                    Err(_) => b.rollback().await.expect("rollback b"),
+                }
+                got
+            }
+        });
+
+        crate::db::wait_until_blocked(db, pid.await.expect("the contender's pid")).await;
+        winner.commit().await.expect("commit the winner");
+        let got = loser.await.expect("the contender finishes");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let holder: Option<Uuid> =
+            sqlx::query_scalar("SELECT assignee_id FROM work_items WHERE id = $1")
+                .bind(item.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the assignee back");
+        tx.rollback().await.expect("rollback");
+        (got, holder.map(EmployeeId::from_uuid))
+    }
+
+    /// The same database, on a connection whose **default** isolation level is
+    /// `repeatable read` — the shape an operator's `postgresql.conf` or
+    /// `PGOPTIONS` has, rather than a `SET` this product never issues.
+    ///
+    /// Percent-encoded because sqlx decodes the query value before handing it to
+    /// the startup packet: this arrives at the server as
+    /// `-c default_transaction_isolation=repeatable\ read`, and the backslash is
+    /// how libpq's options string escapes a space *inside* a value. Without it
+    /// the connection fails with `invalid value for parameter`.
+    async fn repeatable_read_db() -> Db {
+        let url = std::env::var("DATABASE_URL").expect("`fixture` already checked this");
+        let sep = if url.contains('?') { '&' } else { '?' };
+        Db::connect(&format!(
+            "{url}{sep}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read"
+        ))
+        .await
+        .expect("connect at repeatable read")
     }
 
     /// **Closing is the assignee's word and nobody else's**, it is idempotent on

@@ -418,6 +418,62 @@ pub(crate) async fn private_db(suffix: &str) -> Option<Db> {
     Some(db)
 }
 
+/// Block until the backend `pid` is waiting on a lock somebody else holds.
+///
+/// # Which of this crate's claims this is for
+///
+/// Four statements in this crate hand work to one worker and not two, and they
+/// split in half over exactly this function. [`crate::outbox::claim_of`],
+/// [`crate::initiative::claim_due`] and [`crate::calendar::claim_due`] take
+/// `FOR UPDATE … SKIP LOCKED`, so a second worker **never** waits — their
+/// contention tests assert the opposite of this, that both batches came back
+/// full while the other transaction was still open. [`crate::backlog::claim`]
+/// has no `SKIP LOCKED` and no lease: the second employee blocks on the row
+/// lock, and read committed re-evaluating its `WHERE` against the committed
+/// version is the whole of the mutual exclusion. So the wait is not an
+/// implementation detail there, it *is* the mechanism, and a test that wants to
+/// see it has to know when it has started.
+///
+/// # Why not a sleep
+///
+/// A sleep lies in both directions: too short and the contender has not reached
+/// the lock, so the test asserts an interleaving it did not create and passes
+/// for the wrong reason; too long and every run pays a second for a wait that is
+/// over in a millisecond. `pg_blocking_pids` is PostgreSQL's own answer to "is
+/// this backend stuck behind another one", so the race can proceed the instant
+/// the arrangement it wants actually exists.
+///
+/// The pid is the contender's own `pg_backend_pid()`, read on its connection
+/// *before* it issues the statement that blocks — it can report nothing after.
+/// Polled from a third connection, because the two in the race are both busy.
+///
+/// Panics rather than returning: a contender that never blocks has taken the
+/// test's premise away, and a contention test that hangs instead of failing is
+/// the difference between a red run and an afternoon.
+#[cfg(test)]
+pub(crate) async fn wait_until_blocked(db: &Db, pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let blocked: bool = sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1)) > 0")
+            .bind(pid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ask pg_blocking_pids who is waiting");
+        tx.rollback().await.expect("rollback the probe");
+        if blocked {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backend {pid} never blocked on anybody's lock. The contention this \
+             test is about did not happen, so whatever it asserts next is about \
+             an interleaving that was never created."
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
