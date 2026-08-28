@@ -1,0 +1,113 @@
+-- 0068_a_departure_is_a_column_not_a_delete: 0061 is wrong about who hands the
+-- work back, and this file is the only place that can say so.
+--
+-- **There is no DDL below and that is the whole point.** The schema is right;
+-- the sentence written next to it is not, and a sentence in an applied
+-- migration cannot be edited — sqlx records a checksum per file, so changing a
+-- comment in 0061 makes every database that already ran it refuse to start with
+-- `VersionMismatch`, while every fresh database keeps passing and shows nothing.
+-- That has already cost this repository one outage, over a comment in 0041.
+-- So the correction is a new file, and the fix itself is in Rust.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT 0061 SAYS, AND WHY IT IS FALSE
+-- ---------------------------------------------------------------------------
+--
+-- `0061_work_items.sql`, under "WHY `assignee_id` IS NULLABLE":
+--
+--   > `on delete set null` and not `cascade`: an employee being terminated must
+--   > not delete the work it was holding. The item goes back on the board
+--   > unassigned, which is the correct reading of "the person who had this has
+--   > left".
+--
+-- The column is right. The referential action is right. **The action never
+-- fires**, because nothing in this workspace ever deletes an employee.
+-- Termination is a *column*:
+--
+--     UPDATE employees SET lifecycle = 'terminated' WHERE id = $1
+--
+-- written by `routes::employees::set_lifecycle` and by nothing else in
+-- production — every other spelling of that statement in the tree is inside a
+-- `#[cfg(test)]` module. `employees` has no DELETE path at all; the only row
+-- that would take one down is its `tenants` row, which cascades the work item
+-- away in the same breath and is a different event entirely.
+--
+-- So an item held by a terminated seat kept its `assignee_id` forever, and both
+-- reads that could have found it are shaped so they cannot:
+--
+--   * `backlog::open_for` is only ever asked about an employee that is *due*,
+--     and `initiative::claim_due` filters `lifecycle = 'active'`. A terminated
+--     seat is never due, so its items appear in no brief, ever again.
+--   * `backlog::unclaimed` wants `assignee_id IS NULL`, which this row is not.
+--
+-- The item still reads as *assigned* on `GET /v1/work`. Nothing is deleted,
+-- nothing errors, and the work simply stops. Reproduced against a real database
+-- before this file was written:
+--
+--     UPDATE employees SET lifecycle = 'terminated' WHERE id = <ada>;
+--      title                 | back_on_the_board | lifecycle
+--      chase the tariff code | f                 | terminated
+--
+-- `agentos_store::backlog::unassign_all` is the statement 0061 believed the
+-- foreign key was, and `routes::employees::set_lifecycle` runs it in the same
+-- transaction that writes the lifecycle. Two clauses of it are decisions rather
+-- than mechanics, and both are argued where the function is:
+--
+--   * **`closed_at IS NULL`.** `backlog::close` can only be reached by the
+--     assignee, so a closed item's `assignee_id` is the only record of *who did
+--     it*. Handing that back would erase evidence to no purpose.
+--   * **`posted_by` is not touched.** 0064 makes it a register of who wrote the
+--     row down, not a claim on it — `amend` already refuses to move it for the
+--     same reason. Somebody who has left still filed what they filed.
+--
+-- Termination only. A suspension is reversible and `POST /v1/employees/{id}/
+-- suspend` is documented as pausing a seat "without releasing anything it
+-- owns"; that sentence is the only thing distinguishing the two verbs.
+--
+-- ---------------------------------------------------------------------------
+-- 0063 HAS THE SAME FACT AND THE OPPOSITE ANSWER, AND IT IS STILL RIGHT
+-- ---------------------------------------------------------------------------
+--
+-- `appointments.employee_id` is `on delete cascade`, and 0063 argues why: an
+-- appointment is a moment **this seat** undertook, `employee_id` is NOT NULL,
+-- there is no such thing as an unassigned appointment, and nothing else can keep
+-- it. That reasoning survives this file intact. Nobody inherits an hour: the
+-- founder has not said that a line manager takes over a promise, and `org` and
+-- `inbound::may_message` only ever answer who may *reach* whom, never who
+-- *becomes* whom. Inventing an heir here would be answering, on his behalf, a
+-- question he has not been asked.
+--
+-- But the same cascade never fires either, for the same reason, and what is left
+-- is a row that lies. `calendar::claim_due` filters `e.lifecycle = 'active'`, so
+-- a departed seat's appointment can never ring; `rang_at` stays NULL forever;
+-- and NULL is what the founder's diary renders as *still ahead*.
+--
+-- So the promise is **settled** rather than reassigned, in the vocabulary 0063
+-- already defined: "Cancelling is `rang_at` written *before* `at`". No new
+-- column, no new route, and the grant 0063 wrote already allows the UPDATE.
+-- `agentos_store::calendar::cancel_outstanding` is it, beside the work items in
+-- the same transaction.
+--
+-- Its `at > now` is the clause that keeps it honest and is not an optimisation.
+-- `rang_at` *after* `at` means **kept, late** — the gap between the two is the
+-- only thing in this schema that can say a promise was kept at all — so stamping
+-- `now` onto an hour that has already gone by would forge a record that somebody
+-- did something. An overdue promise of a departed seat therefore keeps its NULL
+-- and stays visibly overdue, which is the smaller untruth: it credits nobody
+-- with anything.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT THIS FILE DELIBERATELY DOES NOT DO
+-- ---------------------------------------------------------------------------
+--
+-- It does not add a trigger. The correction belongs in the one transaction that
+-- writes the lifecycle, where it is visible to whoever reads that handler; a
+-- trigger would be a second, invisible writer of two tables that already have
+-- their rules written down in Rust, and it would fire for the test helpers that
+-- move the column by hand — which are the seven statements that made this defect
+-- look like it had seven homes when it has one.
+--
+-- It does not change `on delete set null` or `on delete cascade`. Both are the
+-- right answer to the question they were asked; they are simply answers to a
+-- question nothing asks. The day something does delete an employee, both fire
+-- and both are correct.

@@ -204,6 +204,36 @@ impl From<sqlx::Error> for PolicyLoadError {
 /// direction: a dashboard reporting a turn budget the gate does not enforce.
 /// Deleting the parameter is what makes the two genuinely one rule; a caller
 /// that wants an employee under a role layer puts it on a team.
+///
+/// # A trap, if you ever add `FOR UPDATE` to a statement that reads the ceiling
+///
+/// **`0062` made this read strict only while it stays a plain `SELECT`.** That
+/// migration split `policy_versions`/`policy_layers`' one `ALL` policy into an
+/// `ALL` policy over the tenant's own rows plus `platform_readable`, which is
+/// `FOR SELECT USING (tenant_id IS NULL)`. That is a narrowing and everything it
+/// claims is true — but a `SELECT ... FOR UPDATE` is a *locking* read, and
+/// PostgreSQL does not consult a `FOR SELECT` policy for it. So the platform
+/// rows simply are not there:
+///
+/// ```text
+/// SELECT id FROM policy_versions WHERE tenant_id IS NULL FOR UPDATE
+///   before 0062: 1 row
+///   after  0062: 0 rows, and no error
+/// ```
+///
+/// Measured against a real database with both policy shapes in turn, not
+/// reasoned from the manual. No caller in this workspace locks these rows —
+/// the platform ceiling is written only by `install_ceiling` and
+/// `rollback_ceiling`, both under `Db::admin_tx_bypassing_rls`, whose role has
+/// `rolbypassrls` and is untouched by any of this. So it is not a defect; it is
+/// a hole in the floor with nothing standing on it.
+///
+/// The failure mode if somebody ever does stand on it is the expensive kind: a
+/// lock taken in a `TenantTx` returns no row, which reads as *there is no
+/// platform ceiling*, and the honest handling of that is to deny everything.
+/// A `FOR UPDATE` on a platform row belongs in an admin transaction, where the
+/// two writers already are — not in a tenant one with a policy added to let it
+/// through, which would be `0062` undone.
 const SELECT_ACTIVE_LAYERS: &str = "\
     SELECT l.id, l.layer, l.spend_currency, l.max_per_transaction_minor, \
            l.max_per_day_minor, l.approval_above_minor, l.allowed_channels, \

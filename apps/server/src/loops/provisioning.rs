@@ -27,6 +27,7 @@
 //! | never `release_not_supported`             | **structural**, not transient — see below |
 //! | `release_attempt_count`, `release_attempted_at` | the release's **own** budget, not provisioning's |
 //! | one attempt past the cap escalates        | a human is asked once, then the sweep goes quiet |
+//! | a `step` this build cannot name escalates **at once** | there is no adapter to retry, so waiting for the cap is only silence |
 //! | `FOR UPDATE ... SKIP LOCKED`              | two replicas do not both call the provider |
 //!
 //! **`release_not_supported` is never retried.** Resend's sending domain is
@@ -417,14 +418,34 @@ impl<C: Converge> ProvisioningLoop<C> {
         // exactly as in `claim`: `release_steps` walks them in dependency order
         // in one pass, and asking per row would release the vault before the
         // browser profile whose credentials live in it.
+        let (claimed, unrecognised) = claim_releases(&self.db, &self.cfg, now).await?;
         let mut grouped: Vec<(TenantId, EmployeeId, Vec<Release>)> = Vec::new();
-        for row in claim_releases(&self.db, &self.cfg, now).await? {
+        for row in claimed {
             if let Some((_, _, steps)) =
                 grouped.iter_mut().find(|(_, id, _)| *id == row.employee_id)
             {
                 steps.push(row);
             } else {
                 grouped.push((row.tenant_id, row.employee_id, vec![row]));
+            }
+        }
+
+        // A row this build cannot name goes straight to a person. Per row and
+        // not grouped, because there is no `release_steps` pass to batch it into
+        // — nothing is going to be called for it at all.
+        for row in &unrecognised {
+            match escalate_unrecognised(&self.db, &self.cfg, row, now).await {
+                Ok(true) => tracing::error!(
+                    tenant = %row.tenant_id,
+                    employee = %row.employee_id.as_uuid(),
+                    step = %row.step,
+                    "a terminated employee holds a resource for a step this build does not \
+                     know; a human has to cancel it at the provider"
+                ),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(error = %err, "could not escalate an unrecognised step");
+                }
             }
         }
 
@@ -693,8 +714,8 @@ async fn reap(
     let mut employee = stored.employee;
     let mut escalated = Vec::with_capacity(overdue.len());
     for step in overdue {
-        let action = escalation_action(ESCALATION_SERVER, step);
-        if !already_asked(&mut tx, &employee, &action).await? {
+        let action = escalation_action(ESCALATION_SERVER, step.as_str());
+        if !already_asked(&mut tx, employee.id(), &action).await? {
             let reason = escalation_reason(&employee, step, now);
             approvals::create(
                 &mut tx,
@@ -735,7 +756,7 @@ async fn reap(
 /// `approvals::create` hashes, so the two can only ever agree.
 async fn already_asked(
     tx: &mut agentos_store::db::TenantTx<'_>,
-    employee: &Employee,
+    employee: EmployeeId,
     action: &Action,
 ) -> Result<bool, ApprovalError> {
     let canonical = approvals::canonical_json(action)?;
@@ -746,7 +767,7 @@ async fn already_asked(
             AND action->>'action_hash' = encode(sha256(convert_to($2::text, 'UTF8')), 'hex') \
           LIMIT 1",
     )
-    .bind(employee.id().as_uuid())
+    .bind(employee.as_uuid())
     .bind(&canonical)
     .fetch_optional(&mut ***tx)
     .await
@@ -763,8 +784,16 @@ async fn already_asked(
 /// is the question being asked ([`ESCALATION_SERVER`], [`RELEASE_SERVER`], the
 /// engine's own `provisioning`) so that three different questions about one
 /// step hash differently and none of them suppresses the others.
-fn escalation_action(server: &str, step: Step) -> Action {
-    let name = Slug::parse(&step.as_str().replace('_', "-"))
+///
+/// `&str` and not [`Step`], because one caller has no `Step` to pass: a step
+/// name this build does not recognise is exactly the row [`sweep`] must escalate
+/// rather than drop, and it only ever exists as text. The `or_else` was already
+/// here for a name that will not slugify and now carries that case too — two
+/// unrecognised names that both fall back to `step` hash alike and the second is
+/// suppressed by [`already_asked`], which is one question for two anomalies and
+/// is the direction to fail in.
+fn escalation_action(server: &str, step: &str) -> Action {
+    let name = Slug::parse(&step.replace('_', "-"))
         .or_else(|_| Slug::parse("step"))
         .expect("`step` is a valid slug");
     Action::McpCall {
@@ -850,17 +879,53 @@ UPDATE employee_resources AS r
         FOR UPDATE OF c SKIP LOCKED)
  RETURNING r.tenant_id, r.employee_id, r.step, r.release_attempt_count";
 
-/// Take a batch of resources a terminated employee is still being billed for.
+/// A claimed row whose `step` this build has never heard of.
+///
+/// `employee_resources.step` is bare `text` with no CHECK, so the value is
+/// whatever wrote the row — and during a rolling deploy that can be the *next*
+/// build, which knows a step this one has no [`Step`] variant for. It is still a
+/// provider resource somebody is being billed for.
+///
+/// It cannot be released here: there is no adapter to call for a step that does
+/// not exist in this binary, so a retry is not a thing that could succeed. That
+/// makes it the same shape as `release_not_supported` — structurally impossible
+/// rather than transiently failing — and it gets the same answer: a human, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unrecognised {
+    tenant_id: TenantId,
+    employee_id: EmployeeId,
+    /// The step as the database spells it. Kept as text on purpose: it is the
+    /// only thing that says which row an operator has to go and look at.
+    step: String,
+}
+
+/// Take a batch of resources a terminated employee is still being billed for,
+/// and separately whatever came back that this build cannot name.
 ///
 /// Cross-tenant, like [`claim`] and the outbox poller: an unreleased resource
 /// is not any one tenant's problem. Everything downstream of it runs in a
 /// [`agentos_store::db::Db::tenant_tx`], so the escape hatch is this statement
 /// and nothing else.
+///
+/// # Why the second half of the pair exists
+///
+/// This used to be one `filter_map` whose `?` dropped a row with an unknown
+/// step, with no log and no other trace. By then [`SWEEP_SQL`] had already spent
+/// one of that row's `release_attempt_count`, so the silence was not free: after
+/// [`LoopConfig::max_attempts`] ticks the row failed the claim's own
+/// `release_attempt_count <= $2` and stopped being claimed at all — never
+/// released, never escalated, still billed, and nothing anywhere said so.
+///
+/// A log line would have been the smaller change and is the wrong one: a log has
+/// no mutation that can be observed failing, so nothing could hold it in place.
+/// An approval is a row, which a test can look for. It also goes to the same
+/// person, through the same [`RELEASE_SERVER`] question, as every other resource
+/// this sweep gives up on.
 async fn claim_releases(
     db: &Db,
     cfg: &LoopConfig,
     now: DateTime<Utc>,
-) -> Result<Vec<Release>, StoreError> {
+) -> Result<(Vec<Release>, Vec<Unrecognised>), StoreError> {
     let mut tx = db.admin_tx_bypassing_rls().await?;
     let rows: Vec<(Uuid, Uuid, String, i32)> = sqlx::query_as(SWEEP_SQL)
         .bind(now)
@@ -872,20 +937,78 @@ async fn claim_releases(
         .await?;
     tx.commit().await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|(tenant_id, employee_id, step, attempt)| {
-            Some(Release {
-                tenant_id: TenantId::from_uuid(tenant_id),
-                employee_id: EmployeeId::from_uuid(employee_id),
-                // Text the build has never heard of means the database
-                // disagrees with it about what steps exist. Skip the row rather
-                // than guess which resource is being billed.
-                step: Step::ALL.into_iter().find(|s| s.as_str() == step)?,
+    let mut claimed = Vec::with_capacity(rows.len());
+    let mut unrecognised = Vec::new();
+    for (tenant_id, employee_id, step, attempt) in rows {
+        let tenant_id = TenantId::from_uuid(tenant_id);
+        let employee_id = EmployeeId::from_uuid(employee_id);
+        match Step::ALL.into_iter().find(|s| s.as_str() == step) {
+            Some(step) => claimed.push(Release {
+                tenant_id,
+                employee_id,
+                step,
                 attempt,
-            })
-        })
-        .collect())
+            }),
+            None => unrecognised.push(Unrecognised {
+                tenant_id,
+                employee_id,
+                step,
+            }),
+        }
+    }
+    Ok((claimed, unrecognised))
+}
+
+/// Ask a human about a resource this build cannot even name, once.
+///
+/// [`escalate_release`] next door and deliberately not merged with it: that one
+/// starts from an [`Employee`], reads `employee.resource(step).binding()` for
+/// the provider and the external id, and there is no `Step` here to read a
+/// binding *with*. So the reason names the row instead and sends the operator to
+/// `GET /v1/inventory/stranded`, which selects `r.step` as text and is therefore
+/// the one screen in the product that can already display it.
+///
+/// Not gated on [`LoopConfig::max_attempts`], unlike the stuck-release path.
+/// Attempts buy retries and there is no retry here — the step does not exist in
+/// this binary — so waiting five ticks to say so would only be five ticks of
+/// silence. [`already_asked`] is what keeps it to one question.
+async fn escalate_unrecognised(
+    db: &Db,
+    cfg: &LoopConfig,
+    row: &Unrecognised,
+    now: DateTime<Utc>,
+) -> Result<bool, ApprovalError> {
+    let mut tx = db.tenant_tx(row.tenant_id).await?;
+    let action = escalation_action(RELEASE_SERVER, &row.step);
+    if already_asked(&mut tx, row.employee_id, &action).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let reason = format!(
+        "terminated employee {} holds a resource for step \"{}\", which this build does not \
+         recognise — most likely a newer version wrote the row during a rolling deploy. Nothing \
+         here can release it: there is no adapter for a step this binary has no name for, so it \
+         will not be retried and it is still being billed. It is listed under \
+         GET /v1/inventory/stranded with its provider and external id; cancel it there by hand, \
+         then clear the binding.",
+        row.employee_id.as_uuid(),
+        row.step,
+    );
+    approvals::create(
+        &mut tx,
+        &NewApproval {
+            employee_id: Some(row.employee_id),
+            action: &action,
+            requested_by: SWEEPER_ACTOR,
+            required_role: OPERATOR_ROLE,
+            reason: Some(&reason),
+            expires_at: now + cfg.approval_ttl,
+        },
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// The employee, but only if it really is terminated.
@@ -923,8 +1046,8 @@ async fn escalate_release(
     let mut asked = Vec::new();
 
     for release in exhausted {
-        let action = escalation_action(RELEASE_SERVER, release.step);
-        if already_asked(&mut tx, employee, &action).await? {
+        let action = escalation_action(RELEASE_SERVER, release.step.as_str());
+        if already_asked(&mut tx, employee.id(), &action).await? {
             continue;
         }
         let reason = release_reason(employee, release.step, release.attempt);
@@ -2234,6 +2357,122 @@ mod tests {
         );
     }
 
+    /// Version drift, which the schema permits and the claim cannot see:
+    /// `employee_resources.step` is bare `text` with no CHECK, so a newer build
+    /// mid-deploy can write a step name this one has no `Step` for.
+    ///
+    /// That row used to be dropped by a `filter_map` with no log — after
+    /// `SWEEP_SQL` had already spent one of its `release_attempt_count`. Past the
+    /// cap it stopped being claimed, so it was never released, never escalated,
+    /// and still billed, with nothing anywhere saying so. The assertion is an
+    /// approval and not a log line on purpose: a row is a thing a test can watch
+    /// stop appearing.
+    ///
+    /// It escalates on the **first** tick rather than at the cap, because
+    /// attempts pay for retries and there is no retry available — no adapter
+    /// exists in this binary for a step it cannot name.
+    ///
+    /// # The reason nothing else releases either, which this test pins
+    ///
+    /// The drifted row does not only cost itself. `employee::load` requires the
+    /// aggregate to be *total* — exactly `Step::ALL.len()` rows, every one of
+    /// them a name it can parse — so the twelfth row makes the **whole
+    /// employee** undecodable, `load_terminated` returns the decode error, and
+    /// `give_back` logs and returns without releasing any of the eleven steps it
+    /// does understand. That is the aggregate's stated invariant and this change
+    /// does not touch it; it is why the escalation is not a nicety. For an
+    /// employee in this state the approval is the *only* thing that happens at
+    /// all, and before it there was nothing at all.
+    #[tokio::test]
+    async fn a_step_this_build_cannot_name_is_escalated_rather_than_dropped() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "drift").await;
+        bind_all(&db, &employee).await;
+
+        terminate(&db, &employee).await;
+        // A twelfth resource row, bound and billed, whose step is a name this
+        // build has never heard of.
+        //
+        // Written *after* the termination only because `terminate` here is a
+        // helper that goes through `employee::load`, which refuses the aggregate
+        // for the same reason the sweep will. The row it leaves behind is
+        // identical either way, and the ordering is a fact about the fixture
+        // rather than about the deployment — where the newer build writes the
+        // row and the seat is terminated later, or not at all.
+        exec(
+            &db,
+            &employee,
+            "INSERT INTO employee_resources \
+                 (employee_id, tenant_id, step, state, provider, external_id, updated_at) \
+             SELECT $1, e.tenant_id, 'voice_mailbox', 'ready', 'mock', 'ext-voice-mailbox', \
+                    now() - interval '1 hour' \
+               FROM employees e WHERE e.id = $1",
+        )
+        .await;
+
+        let engine = FakeEngine::ready(&db);
+        let sweeper = ProvisioningLoop::new(db.clone(), engine.clone()).with_config(fast());
+        let cancel = CancellationToken::new();
+        let now = Utc::now();
+        sweeper.tick(now, &cancel).await.expect("tick");
+
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1 AND state = 'pending'"
+            )
+            .await,
+            1,
+            "a resource this build cannot name was dropped in silence"
+        );
+        let reason: String = scalar(
+            &db,
+            &employee,
+            "SELECT reason FROM approvals WHERE employee_id = $1",
+        )
+        .await;
+        assert!(
+            reason.contains("voice_mailbox"),
+            "the operator has no way to find the row without its step: {reason}"
+        );
+
+        // And nothing was released, because the twelfth row makes the whole
+        // aggregate undecodable — see this test's docs. Asserted rather than
+        // shrugged at: it is the measure of how much the silence was hiding.
+        assert_eq!(
+            engine.releases().len(),
+            0,
+            "an employee this build cannot decode must not be handed to the release path"
+        );
+        assert_eq!(
+            still_bound(&db, &employee).await,
+            12,
+            "everything this seat holds is still bound, and only the approval says so"
+        );
+
+        // An hour later the row is cold and claimable again — and it is still
+        // one question, not one per tick.
+        sweeper
+            .tick(now + TimeDelta::hours(1), &cancel)
+            .await
+            .expect("tick");
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1 AND state = 'pending'"
+            )
+            .await,
+            1,
+            "one unreadable resource, one question"
+        );
+    }
+
     /// Two replicas, one terminated employee. Release is idempotent by
     /// contract, so this is about not wasting provider calls and not corrupting
     /// the attempt count that bounds them.
@@ -2506,7 +2745,7 @@ mod tests {
         let now = Utc::now();
 
         assert_eq!(
-            claim_releases(&db, &cfg, now).await.expect("claim").len(),
+            claim_releases(&db, &cfg, now).await.expect("claim").0.len(),
             11,
             "a NULL release_attempted_at falls back to updated_at, which is cold"
         );
@@ -2524,6 +2763,7 @@ mod tests {
             claim_releases(&db, &cfg, now)
                 .await
                 .expect("claim")
+                .0
                 .is_empty(),
             "a release attempted a moment ago must not be retried on the next tick"
         );
@@ -2531,7 +2771,11 @@ mod tests {
         // ... and once the release itself has gone cold, it is work again.
         let later = now + TimeDelta::hours(1);
         assert_eq!(
-            claim_releases(&db, &cfg, later).await.expect("claim").len(),
+            claim_releases(&db, &cfg, later)
+                .await
+                .expect("claim")
+                .0
+                .len(),
             11
         );
         assert_eq!(

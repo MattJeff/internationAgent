@@ -334,6 +334,60 @@ pub async fn claim_due(
         .collect())
 }
 
+/// Settle every promise one seat has left outstanding and cannot now keep.
+/// Returns how many rows were settled.
+///
+/// # The board's problem, and deliberately not the board's answer
+///
+/// [`crate::backlog::unassign_all`] is the twin of this and they do opposite
+/// things, because `0063` already decided the difference and this is only the
+/// `UPDATE` side of that decision. A work item is work **the company** wants
+/// done, so it goes back on a board somebody else reads. An appointment is a
+/// moment **this seat** undertook: `employee_id` is NOT NULL, there is no
+/// spelling of an unassigned appointment, and 0063's own words are that "nothing
+/// else can keep it". Handing it to a manager would need a rule nobody has
+/// written — the founder has not said that a line manager inherits an hour, and
+/// `org::manager_of` answering the question is not the same as him answering it.
+/// `inbound::may_message` and `directs` are the only places the chart carries
+/// authority today and both are about *reaching* somebody, never about
+/// *becoming* them.
+///
+/// What is left is the row itself, and left alone it is a lie. `claim_due`
+/// filters `lifecycle = 'active'`, so a terminated seat's appointment can never
+/// ring; `rang_at` stays NULL forever, and NULL is the value [`diary`] renders
+/// to the founder as *still ahead*. So the promise is **settled** here, using
+/// the only vocabulary `0063` gave: `rang_at` written **before** `at` is a
+/// cancellation, and no second column is needed.
+///
+/// `at > $2` is what keeps this honest, and it is the reason this is not simply
+/// "everything still NULL". `rang_at` **after** `at` means *kept late* — the gap
+/// between the two is the only thing in the schema that can say a promise was
+/// kept at all — so stamping `now` onto a moment that has already gone by would
+/// forge a record that somebody did something. A past-due promise of a departed
+/// seat keeps its NULL and stays visibly overdue in the diary, which is a
+/// smaller untruth than a manufactured "kept": nobody is credited with anything.
+///
+/// Termination only, in the transaction that writes it, for
+/// [`crate::backlog::unassign_all`]'s reason. A suspension is reversible, and a
+/// seat that comes back keeps the hours it promised — late, and told so by
+/// `kept_brief`.
+pub async fn cancel_outstanding(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    let settled = sqlx::query(
+        "UPDATE appointments SET rang_at = $2 \
+          WHERE employee_id = $1 AND rang_at IS NULL AND at > $2",
+    )
+    .bind(employee.as_uuid())
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?
+    .rows_affected();
+    Ok(settled)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{SubsecRound, TimeDelta};
