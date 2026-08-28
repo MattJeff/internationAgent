@@ -621,11 +621,28 @@ pub async fn reserve(
 /// fails otherwise, so a replayed release cannot reach the team decrement
 /// twice; the bucket's non-negative CHECK is the backstop if it ever does.
 ///
+/// **This is the verb `crates/app`'s executor owes a failed payment**, and the
+/// one it did not call. `PolicyGate::reserve` takes the reservation through
+/// [`reserve`] — two buckets — and `effects::record` released it through
+/// [`spend::release`], which is one. The employee got its headroom back and the
+/// *team* row kept the charge until midnight, refusing every colleague on the
+/// team with `team_daily_limit` for money that never moved.
+/// `effects::a_failed_payment_gives_the_team_its_headroom_back_too` is the test;
+/// the one beside it could not see this because its fixture seats nobody on a
+/// team.
+///
 /// ponytail: the team is re-read from the roster rather than recorded on the
 /// reservation, so an employee moved between reserving and releasing credits
-/// its new team. Conservative in the direction that matters (nothing is
-/// over-granted) and vanishingly rare. Upgrade path if it ever bites: carry the
-/// team id on the reservation row.
+/// **its new team**. That sentence used to end "conservative in the direction
+/// that matters (nothing is over-granted)", and only its first half is true:
+/// the old team keeps a charge it should not, which is the safe half, while the
+/// new team's shared row goes down by an amount it never reserved — so every
+/// seat on it gets that much extra day. `team_spend_buckets_nonnegative` bounds
+/// the damage at the row's own balance and turns the rest into a constraint
+/// violation on the release path rather than a negative bucket. It needs an
+/// operator to move a seat between a reservation and a provider failure, which
+/// is why it is left named rather than closed. Upgrade path if it ever bites:
+/// carry the team id on the reservation row.
 pub async fn release(tx: &mut TenantTx<'_>, reservation: &Reservation) -> Result<(), StoreError> {
     spend::release(tx, reservation).await?;
 
