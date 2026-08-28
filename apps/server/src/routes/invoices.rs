@@ -245,6 +245,15 @@ async fn paid(
     Ok(Json(json!({ "id": id, "state": "paid" })).into_response())
 }
 
+/// Longest `memo` `invoices_memo_shape` accepts, in characters.
+///
+/// Restated here rather than read off the table, and the restatement is what the
+/// test below pins — `routes::work::MAX_TITLE`'s argument: the alternative is a
+/// round trip to `information_schema` per request to learn a number that changes
+/// in a migration. If it ever moves, this constant moves with it in the same
+/// commit.
+const MAX_MEMO: usize = 200;
+
 /// What a credit note says. The currency is not in it: a credit note is
 /// denominated by the invoice it corrects, so a second answer here could only
 /// disagree with the first.
@@ -287,6 +296,23 @@ async fn credit(
     Path(id): Path<Uuid>,
     Json(body): Json<CreditBody>,
 ) -> Result<Response, ApiError> {
+    // Both ends of `invoices_memo_shape`, and it has to be both, before a number
+    // is claimed. Left to the `CHECK`, a blank line or a 201-character sentence
+    // arrives as a `23514` in `StoreError::Database` and comes out of `ApiError`
+    // as a **500** — "we broke" — for a body the founder fixes by shortening a
+    // sentence. `char_length` is what the constraint counts, so `chars()` is
+    // what this counts; `.len()` would refuse a 70-character Japanese memo.
+    // Trimmed here as well as measured, for `PgCalendar::book`'s reason: the
+    // `CHECK` measures `btrim(memo)` and the column would otherwise store the
+    // untrimmed one.
+    let memo = body.memo.trim();
+    if memo.is_empty() || memo.chars().count() > MAX_MEMO {
+        return Err(ApiError::bad_request(
+            "a credit note needs a memo of 1 to 200 characters: it is the one line that says why \
+             a demand this company already made is being withdrawn",
+        ));
+    }
+
     let note = InvoiceId::new_v7(Utc::now());
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let written = invoices::credit(
@@ -294,7 +320,7 @@ async fn credit(
         note,
         InvoiceId::from_uuid(id),
         body.amount_minor,
-        &body.memo,
+        memo,
     )
     .await;
     match written {
@@ -538,6 +564,71 @@ mod tests {
         // The register still shows it: what came in is half of what a founder
         // reads at the end of a month.
         assert_eq!(body["invoices"].as_array().expect("array").len(), 1);
+    }
+
+    /// **A memo this table will not take is the caller's mistake, not ours.**
+    ///
+    /// `credit` puts `memo` straight into `invoices` and `invoices_memo_shape`
+    /// is `char_length(btrim(memo)) between 1 and 200`. Left to the `CHECK`, a
+    /// blank line or a 201-character sentence arrives as a `23514` in
+    /// [`StoreError::Database`], which [`ApiError`] answers **500** — "we
+    /// broke" — for a body the founder fixes by shortening a sentence. It is
+    /// the defect `routes::work` found on `title` and
+    /// `agentos_app::calendar` found on `subject`, on the third column of the
+    /// same shape.
+    ///
+    /// The last assertion is the half a length check alone would not prove:
+    /// a refused memo must not have claimed a number, or the run this table
+    /// exists to keep gap-free acquires a hole for every typo.
+    #[tokio::test]
+    async fn a_credit_note_memo_the_table_will_not_take_is_a_400_and_not_a_500() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the register needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let invoice = issued(&db, h.a).await;
+        let uri = format!("/v1/invoices/{}/credit", invoice.as_uuid());
+
+        for memo in ["", "   ", &"x".repeat(201)] {
+            let (status, problem) = h
+                .send_json(
+                    "POST",
+                    &uri,
+                    SECRET_A,
+                    json!({"amount_minor": 1, "memo": memo}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a memo of {} characters answered {status}: {problem}",
+                memo.chars().count()
+            );
+        }
+
+        // …and the longest one the table does take still lands.
+        let (status, note) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 1, "memo": "m".repeat(200)}),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "200 characters is the bound: {note}"
+        );
+        assert_eq!(
+            note["number"],
+            json!(2),
+            "the three refusals took no number with them: a run with a gap in it is the \
+             failure 0071 exists to prevent"
+        );
     }
 
     /// **The correction, end to end**: what the founder can do about an invoice

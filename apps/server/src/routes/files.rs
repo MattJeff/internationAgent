@@ -108,6 +108,16 @@ pub fn router(db: Db) -> Router {
         .with_state(db)
 }
 
+/// Longest `name` and `content_type` the table accepts, in characters.
+///
+/// One number for two columns because `files_name_shape` and
+/// `files_content_type_shape` are the same constraint written twice. Restated
+/// here rather than read off the table, and the restatement is what the test
+/// below pins — `routes::work::MAX_TITLE`'s argument: the alternative is a round
+/// trip to `information_schema` per request to learn a number that changes in a
+/// migration. If it ever moves, this constant moves with it in the same commit.
+const MAX_FIELD: usize = 200;
+
 /// A document somebody is filing.
 #[derive(Deserialize)]
 struct Deposit {
@@ -215,18 +225,28 @@ async fn deposit(
     principal: Principal,
     Json(body): Json<Deposit>,
 ) -> Result<Response, ApiError> {
+    // All three ends of `files_name_shape` and `files_content_type_shape`, and
+    // it has to be all three. Refusing only the empty one left the rest to the
+    // `CHECK`s, which arrive as a `23514` in `StoreError::Database` and come out
+    // of `ApiError` as a **500** — "we broke" — for a name the caller fixes by
+    // shortening it or retyping it without the newline they pasted in.
+    // `char_length` is what the constraints count, so `chars()` is what this
+    // counts; `.len()` would refuse a 70-character Japanese filename.
     let name = body.name.trim();
-    if name.is_empty() {
+    if name.is_empty() || name.chars().count() > MAX_FIELD || name.contains(char::is_control) {
         return Err(ApiError::bad_request(
-            "a file needs a name: it is the only address it will have, and there is no id \
-             beside it",
+            "a file needs a name of 1 to 200 characters with no control characters in it: it is \
+             the only address it will have, and there is no id beside it",
         ));
     }
     let content_type = body.content_type.trim();
-    if content_type.is_empty() {
+    if content_type.is_empty()
+        || content_type.chars().count() > MAX_FIELD
+        || content_type.contains(char::is_control)
+    {
         return Err(ApiError::bad_request(
-            "`content_type` is required: it is what the depositor says the bytes are, and \
-             nothing else records it",
+            "`content_type` is 1 to 200 characters with no control characters in it: it is what \
+             the depositor says the bytes are, and nothing else records it",
         ));
     }
     let bytes = B64.decode(body.content.as_bytes()).map_err(|_| {
@@ -514,6 +534,93 @@ mod tests {
             let (status, refused) = h.send("POST", "/v1/files", SECRET_A, Some(body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {refused}");
         }
+    }
+
+    /// **A name this table will not take is the caller's mistake, not ours.**
+    ///
+    /// `POST` already refuses a blank name and a blank `content_type` here
+    /// rather than at the table, so the rest of `files_name_shape` and
+    /// `files_content_type_shape` has to be refused here too. Left to the
+    /// `CHECK`, a 201-character name — or one with a newline in it, which is
+    /// what a filename pasted out of a terminal carries — arrives as a `23514`
+    /// in [`StoreError::Database`], which [`ApiError`] answers **500**: "we
+    /// broke", for a body the caller fixes by shortening or retyping a name.
+    ///
+    /// The constraint is not hypothetical from this side either:
+    /// `agentos_app::inbound::ingest_email` names these two by name as the
+    /// reason it classifies an attachment failure rather than propagating it.
+    /// That is the other writer; this is the one with a caller to answer.
+    #[tokio::test]
+    async fn a_name_or_a_type_the_table_will_not_take_is_a_400_and_not_a_500() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the classeur needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let content = B64.encode(b"the bytes are never the problem here");
+
+        for (label, name, content_type) in [
+            (
+                "a name past the bound",
+                "x".repeat(201),
+                "text/plain".to_owned(),
+            ),
+            // Not a curiosity: a filename pasted out of a terminal or lifted
+            // from a mail header carries these, and `files_name_shape` refuses
+            // them by regex rather than by length.
+            (
+                "a name with a newline in it",
+                "in\nvoice.pdf".to_owned(),
+                "text/plain".to_owned(),
+            ),
+            ("a type past the bound", "y.pdf".to_owned(), "z".repeat(201)),
+            (
+                "a type with a control character",
+                "w.pdf".to_owned(),
+                "text/plain\u{7f}".to_owned(),
+            ),
+        ] {
+            let (status, problem) = h
+                .send(
+                    "POST",
+                    "/v1/files",
+                    SECRET_A,
+                    Some(json!({
+                        "name": name,
+                        "content_type": content_type,
+                        "content": content,
+                    })),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label} answered {status}: {problem}"
+            );
+        }
+
+        // …and the longest pair the table does take still lands, so the guard
+        // above is the constraint's bound and not a tighter one somebody
+        // invented beside it.
+        let (status, filed) = h
+            .send(
+                "POST",
+                "/v1/files",
+                SECRET_A,
+                Some(json!({
+                    "name": "n".repeat(200),
+                    "content_type": "t".repeat(200),
+                    "content": content,
+                })),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "200 characters is the bound: {filed}"
+        );
     }
 
     /// A classeur is one company's, and "not yours" is spelled exactly like

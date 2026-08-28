@@ -658,6 +658,29 @@ async fn a_providers_signing_secret_is_usable_and_findable_nowhere() {
         "two customers were given one address"
     );
 
+    // **The other half of the arm that answers a `provider` nothing reads.** It
+    // is `webhook_endpoints_provider_is_wired` doing the refusing, and the route
+    // now names the SQLSTATE rather than treating every driver error as this
+    // case — so this assertion is what stops the narrowing from having taken the
+    // real refusal away with the wrong one. A 500 here means the CHECK stopped
+    // being reported as the caller's mistake; a 201 means the CHECK is gone.
+    //
+    // `slack` and not `twilio`: `0069` widened that constraint to two providers,
+    // so the obvious second name is now *accepted*, and an assertion written
+    // against it would have pinned nothing.
+    let (status, refused) = server.post(
+        "/v1/platform/webhooks",
+        Some(PLATFORM_SECRET),
+        &format!(
+            r#"{{"tenant_id":"{}","provider":"slack","secret":"{WEBHOOK_SECRET}"}}"#,
+            tenants[0].0
+        ),
+    );
+    assert_eq!(
+        status, 400,
+        "a provider with no ingest is the caller's mistake: {refused}"
+    );
+
     // A delivery each, with the same provider event id — the shape a shared
     // provider account produces. Signed with the shared secret, so the signature
     // cannot be what separates them.
