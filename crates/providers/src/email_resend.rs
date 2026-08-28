@@ -222,6 +222,22 @@ impl ResendEmailProvider {
         ))
     }
 
+    /// [`Self::call`], then the body.
+    ///
+    /// A body that did not arrive is [`ProviderError::timeout`] and **not**
+    /// terminal, which is the same answer [`Self::call`] gives a socket that
+    /// dies before the headers and the same one `fetch_attachment`'s own
+    /// `.bytes()` already gave a byte stream cut short. It used to be
+    /// `Terminal { code: "malformed_response" }`, and the price of that word
+    /// was paid on the inbound path: `ingest_email` wraps this in
+    /// `InboundError::Provider`, whose `is_retryable` forwards straight to
+    /// here, and both inbound seams **park** what they are told is unretryable.
+    /// So one reset connection in the middle of a `GET /emails/{id}` — a
+    /// message that is sitting there and would be readable a second later —
+    /// dead-lettered a customer's email on its first attempt. `Retryable` is
+    /// bounded (the outbox gives up after eight and dead-letters *with* a
+    /// reason), so the schema-really-did-change case still ends somewhere a
+    /// human looks; it just stops taking live mail with it.
     async fn call_json<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
@@ -230,9 +246,7 @@ impl ResendEmailProvider {
             .await?
             .json::<T>()
             .await
-            .map_err(|_| ProviderError::Terminal {
-                code: "malformed_response",
-            })
+            .map_err(|_| ProviderError::timeout())
     }
 }
 
@@ -508,6 +522,11 @@ mod tests {
         next: u64,
         /// When set, every route answers with this status instead.
         force_status: Option<u16>,
+        /// Answer the next request with its status line and `Content-Length`,
+        /// then hang up before the body — a connection reset mid-response,
+        /// which is the one thing a fake that always finishes its writes
+        /// cannot show.
+        cut_short_next: bool,
     }
 
     struct FakeResend {
@@ -574,13 +593,15 @@ mod tests {
                         .then(|| value.trim().to_owned())
                 })
                 .unwrap_or_default();
-            let (status, payload, content_type) = {
+            let (status, payload, content_type, cut_short) = {
                 let mut state = state.lock().expect("not poisoned");
                 state.seen.push(line.clone());
-                match state.force_status {
+                let cut_short = std::mem::take(&mut state.cut_short_next);
+                let (status, payload, content_type) = match state.force_status {
                     Some(code) => (code, b"{}".to_vec(), "application/json"),
                     None => route(&line, &idempotency_key, &body, addr, &mut state),
-                }
+                };
+                (status, payload, content_type, cut_short)
             };
 
             let mut head = format!(
@@ -592,6 +613,11 @@ mod tests {
             }
             head.push_str("\r\n");
             let mut out = head.into_bytes();
+            if cut_short {
+                // Head only, promising a body, then the socket goes away.
+                let _ = stream.write_all(&out).await;
+                return;
+            }
             out.extend_from_slice(&payload);
             if stream.write_all(&out).await.is_err() {
                 return;
@@ -914,6 +940,43 @@ mod tests {
         assert_eq!(
             p.fetch_attachment(&id, "att_missing").await,
             Err(ProviderError::Terminal { code: "not_found" })
+        );
+    }
+
+    /// A body that never arrived is not the message being unreadable.
+    ///
+    /// This is the mail half of the same question the status mapping answers:
+    /// `ingest_email` wraps whatever `fetch_inbound` returns in
+    /// `InboundError::Provider`, whose `is_retryable` forwards straight to
+    /// [`ProviderError::is_retryable`], and both inbound seams **park** what
+    /// they are told is unretryable. So the terminal reading of a reset
+    /// connection was a customer's email dead-lettered on attempt one over a
+    /// busy minute — the same sentence `a_late_body_is_retryable_and_a_bad_
+    /// address_is_not` keeps for the database, applied to the socket.
+    ///
+    /// The assertion is `is_retryable` and not "it failed": every wrong answer
+    /// here is also a failure, and only one of them is retried.
+    #[tokio::test]
+    async fn a_retrieve_whose_body_never_arrived_is_a_wait_not_a_refusal() {
+        let fake = FakeResend::start().await;
+        let p = fake.provider();
+        let id = ProviderMessageId::new("email_2");
+
+        fake.state.lock().expect("not poisoned").cut_short_next = true;
+        let cut_short = p
+            .fetch_inbound(&id)
+            .await
+            .expect_err("the socket died mid-body");
+        assert!(
+            cut_short.is_retryable(),
+            "a body cut short parks the customer's mail on attempt one: {cut_short:?}"
+        );
+
+        // And the message really was readable a moment later, which is the
+        // whole reason parking it was wrong.
+        assert_eq!(
+            p.fetch_inbound(&id).await.expect("readable").from,
+            "Accounts <ap@supplier.example>"
         );
     }
 
