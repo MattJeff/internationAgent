@@ -1591,12 +1591,22 @@ const BARE_REFUSAL_WORDS: usize = 8;
 /// So this errs toward suppressing — with one exception that matters more than
 /// the rule. A polite refusal in prose ("merci, mais non", "not for us right
 /// now") is **not** matched here, and that is deliberate rather than a gap in
-/// the vocabulary list. Any inbound message already ends the follow-up sequence
-/// one line up in [`land`], via
+/// the vocabulary list. On **email**, any inbound message already ends the
+/// follow-up sequence one line up in [`land`], via
 /// [`stop_follow_up`](agentos_store::revenue::stop_follow_up) — so the person
 /// who says "thanks but no" is not chased again either way. What a suppression
 /// adds on top is *permanent, cross-campaign, cannot-be-re-imported*, and
-/// reading that out of "not right now" claims more than they said. It is the
+/// reading that out of "not right now" claims more than they said.
+///
+/// **That half of the argument does not hold on a phone channel, and saying so
+/// is the point of this paragraph.** `stop_follow_up` is
+/// `WHERE email = $1`; a number matches no row, so an inbound SMS or WhatsApp
+/// ends nothing. On those channels a missed STOP costs the chase as well as the
+/// message, which makes the false negative dearer than the email case this
+/// argument was written for — and it is still the cheaper of the two errors,
+/// because the other one is for ever. The fix is a `stop_follow_up` keyed on
+/// the channel's own address rather than on `email`, and it belongs in the
+/// change that gives `contacts.phone` a follow-up column, not here. It is the
 /// same argument [`crate::queue::reconcile_opt_outs`] makes for recording a
 /// platform unsubscribe as [`Scope::Tenant`](agentos_store::revenue::Scope)
 /// rather than `Global`: record the claim they made, not the larger one we
@@ -1618,19 +1628,37 @@ const BARE_REFUSAL_WORDS: usize = 8;
 /// SMS was already refused on email's phrase list or was never a refusal at
 /// all, and no body that email suppresses stops being suppressed.
 ///
-/// What it gives up, named rather than left to be discovered: `"Stop please"`,
-/// `"stop merci"` and `"STOP STOP"` are refusals on email and are not refusals
-/// by text. `words == ["stop"]` and not `words.iter().all(…)` on purpose — the
+/// What it gives up, named rather than left to be discovered — and it is more
+/// than the three that first got written down. `"Stop please"`, `"stop merci"`,
+/// `"STOP STOP"`, `"stop texting me"`, `"stop sending me these"`, a trailing
+/// `"stop."`, an emoji beside it, and — the one that is not like the others —
+/// **`"STOP ALL"`**, which is a carrier-level opt-out keyword rather than
+/// somebody's phrasing. On that last one the operator may suppress at their end
+/// while we go on believing we were never told, which is the one shape of false
+/// negative that does not get caught by the next message. It is listed here
+/// rather than added to the rule because adding keywords one at a time is how a
+/// list stops being an argument; the honest fix is to match the carrier
+/// keywords as a named set, and that is a decision about which carriers this
+/// deployment is on. `words == ["stop"]` and not `words.iter().all(…)` on purpose — the
 /// `all` form needs its own `is_empty` guard or a body with no words at all
 /// becomes an opt-out, and what it buys is the emphatic repeat, which is a
 /// false *negative*: the cheap error, caught by the next message.
 ///
 /// The direction is chosen by the asymmetry and not by taste. A **missed** STOP
 /// sends one more message to somebody who does not want it — unpleasant,
-/// repairable, and the next STOP catches it. It does not even leave the chase
-/// running: `stop_follow_up` fires in [`land`] on *any* inbound message, before
-/// this classifier is consulted at all, so the sequence is over either way and
-/// what a missed refusal loses is only the permanent, cross-campaign half. An
+/// repairable, and the next STOP catches it. On **email** it does not even
+/// leave the chase running: `stop_follow_up` fires in [`land`] on any inbound
+/// message, before this classifier is consulted, so the sequence is over either
+/// way and what a missed refusal loses is only the permanent, cross-campaign
+/// half.
+///
+/// **On the very channels this narrowing is about, that consolation is false.**
+/// `stop_follow_up` is `WHERE email = $1`, so a phone number matches no row and
+/// an inbound text ends no sequence. A missed STOP by text costs the chase as
+/// well. It is still the cheaper error — the other one is for ever — but the
+/// margin is thinner here than the email case this argument grew up in, and
+/// pretending otherwise would be arguing from the wrong population twice over.
+/// An
 /// **invented** STOP makes a customer unreachable forever, on every channel at
 /// once, through a row nobody can delete. Those two do not cost the same, so
 /// they must not be traded at the same rate.
