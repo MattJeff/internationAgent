@@ -98,7 +98,23 @@ fi
 # cleanup pattern and in anything an operator types by hand at 2am. Postgres
 # already has an opinion about the case of a bare identifier and this agrees
 # with it.
-RUN_ID=$(printf '%s' "${RUN_ID:-$$}" | tr '[:upper:]' '[:lower:]')
+#
+# `$$` alone is not unique enough, and the failure it caused was expensive to
+# read. The cleanup trap below drops every database matching this run's id, so
+# two runs that share one are two runs where whichever finishes first deletes
+# the other's databases mid-suite. That reads as `3D000: database
+# "ci_agentosapp_37123" does not exist` — 283 instant failures that look like a
+# broken migration and are not the code at all.
+#
+# PIDs are unique among *live* processes, which is why this looks safe and is
+# not: a suite runs for the better part of an hour, cargo and rustc spawn
+# thousands of processes inside it, and macOS wraps at 99999. A second run
+# started an hour later can legitimately be handed the number the first one is
+# still using. Folding in the checkout — the same hash the migration ledger
+# uses, for the same reason — makes a collision need both the same PID and the
+# same worktree, which is one run.
+RUN_ID=$(printf '%s' "${RUN_ID:-$$$(printf '%s' "$PWD" | shasum | cut -c1-6)}" |
+  tr '[:upper:]' '[:lower:]')
 
 log=$(mktemp)
 # Drop this run's databases whichever way we leave — including the ^C that
