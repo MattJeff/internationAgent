@@ -212,13 +212,15 @@ customer brings their own, the adapter has to have somewhere to plug in.
 |---|---|---|
 | 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. |
 | 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. |
-| 3 | **A thread with a human** | Not built. Today the founder's only channel to an employee is approve-or-refuse. |
+| 3 | **A thread with a human** | **Built, and it needed no table.** Half the mechanism was already here: a zero-turn seat is delivered to without being woken, which is the founder's own seat, so escalations already landed on a real desk. What was missing was a window and a pen — nothing read `messages.body`, and `/v1/reports` gave a *count* of questions owed rather than a sentence. `/v1/desk/{id}` reads it and writes back; 0065 is one partial index. |
 | 4 | **Invoicing** | Not built. The company buys end to end and the selling path stops at the opportunity. |
 | 5 | **A file store** | Not built. `knowledge` stores to retrieve; nothing keeps *the signed contract, as it is*. |
 
-**The one thing both built tools still wait on is the same thing**, and it is
+**The one thing tools 1 and 2 still wait on is the same thing**, and it is
 not code: the catalogue line in `turn.rs::catalogue()` that lets a model reach
-the verb. Both are written out in full, in place, as comments — because
+the verb. (Tool 3 needed none — the verb an employee uses to answer the founder
+is `InternalSend`, already in the vocabulary and already in every role pack.)
+Both are written out in full, in place, as comments — because
 applying them moves `toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}`, and the
 only thing entitled to re-pin those is a live measurement. The measurement
 harness is proven (`cargo run -p agentos-eval -- --live`, five prompts through
