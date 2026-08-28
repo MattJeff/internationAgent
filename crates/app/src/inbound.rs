@@ -1469,13 +1469,58 @@ const REFUSAL_PHRASES: [&str; 12] = [
     "ne plus me contacter",
 ];
 
-/// Longest typed reply, in words, in which a bare `stop` still means STOP.
+/// Longest typed reply, in words, in which a bare `stop` still means STOP —
+/// **on [`Channel::Email`], and on that channel only.**
 ///
 /// `stop` is the word our own footer asks for and also an ordinary English and
 /// French verb — "we need to stop using our current provider" is a sales lead,
 /// not an opt-out. The bound is what separates the two: somebody obeying the
 /// footer types the word and little else, and eight words leaves room for
 /// "Stop please, we are not interested thank you".
+///
+/// # The population that argument is about, and the one it is not
+///
+/// Read the sentence above again and notice what it assumes: a **reply to cold
+/// outbound mail**. In that population a reply is rare, a *short* reply is
+/// rarer still, and a short reply carrying the exact word our own footer asked
+/// for is almost always somebody doing what the footer asked. Eight words is
+/// not a measurement, but it is a bound over a population where almost nothing
+/// short arrives for any other reason.
+///
+/// Two things carry that argument on email and **neither of them exists on a
+/// telephony channel**:
+///
+/// * **[`reply_only`] does the discriminating, not the number.** On mail the
+///   bound is applied to what somebody typed *above the quoted original*, which
+///   is a few characters in a body that is usually fifty lines. A text message
+///   has no quoted original, so [`reply_only`] returns the whole body and the
+///   bound is applied to the entire message.
+/// * **Short is the exception on email and the rule on SMS.** Practically every
+///   text message ever sent is eight words or fewer. So on a conversational
+///   channel `words.len() <= 8` selects ~everything, the rule collapses to
+///   *"the body contains the word `stop` anywhere"*, and the population it
+///   selects from is not "people answering a cold approach" but "everyone we
+///   have a thread with" — `land_inbound_text` lands a supplier mid-negotiation
+///   and a customer answering a delivery question through the same door.
+///
+/// And the premise underneath both of them, which is the one that settles it:
+/// **this build never sends the footer by text.** `Effects::send_sms` has no
+/// caller, there is no `sms_send` row in `crate::turn::catalogue`, and
+/// `store::policy::default_ceiling` grants neither `sms` nor `whatsapp` — so no
+/// message carrying [`crate::vertical::OPT_OUT`] has ever gone out on this
+/// channel. "Somebody obeying the footer types the word and little else" is not
+/// merely a weaker argument here; there is no footer, so there is nobody
+/// obeying it, and a `stop` arriving by text has no instruction of ours behind
+/// it at all.
+///
+/// The messages that collapse are ordinary, not adversarial: *"stop je te
+/// rappelle"*, *"can you stop by tomorrow?"*, *"ok stop the truck at gate 3"*,
+/// *"stop sending the 40ft, send 20ft"*. Each is four to seven words, each
+/// contains `stop`, and each would write a permanent `suppressions` row against
+/// that person's number.
+///
+/// So the bound is not widened, narrowed or re-derived for that channel: it is
+/// **not applied there at all**. See [`refuses_contact`].
 const BARE_REFUSAL_WORDS: usize = 8;
 
 /// Does this message ask us to stop writing to this person?
@@ -1493,6 +1538,18 @@ const BARE_REFUSAL_WORDS: usize = 8;
 /// append-only and `contacts_reject_suppressed` refuses to re-import them.
 /// Bounded, but not reversible.
 ///
+/// "Not reversible" is stronger than a missing GRANT, and it is worth spelling
+/// out once because everything below is chosen against it. `0011` revokes
+/// `UPDATE` and `DELETE` on `suppressions` from `app_role`, *and* carries a
+/// `suppressions_append_only` trigger that raises `restrict_violation` on both
+/// — a trigger binds superusers, which no GRANT ever does. The insert fires
+/// `suppressions_deactivate_contacts`, which sets `active = false` on every
+/// `contacts` row holding that address, and `contacts_reject_suppressed` then
+/// raises `P0002` on any INSERT or UPDATE that would make one active again. So
+/// a human re-importing the contact by hand does not get them back either: the
+/// row is refused for as long as it carries the suppressed address. Undoing one
+/// is dropping a trigger in psql, which is schema surgery and not an operation.
+///
 /// So this errs toward suppressing — with one exception that matters more than
 /// the rule. A polite refusal in prose ("merci, mais non", "not for us right
 /// now") is **not** matched here, and that is deliberate rather than a gap in
@@ -1507,12 +1564,80 @@ const BARE_REFUSAL_WORDS: usize = 8;
 /// rather than `Global`: record the claim they made, not the larger one we
 /// could infer.
 ///
+/// # Why the channel is an argument
+///
+/// Because the two errors above are weighed against a *population*, and the
+/// channel is what names it. The phrase list is a fact about language and is
+/// matched identically everywhere — "unsubscribe" and "ne me contactez plus"
+/// mean one thing wherever they appear. The **bare word** is not: it is a
+/// frequency argument about replies to cold mail, spelled out in full on
+/// [`BARE_REFUSAL_WORDS`], and on a conversational channel every premise of it
+/// is false. So on anything that is not [`Channel::Email`] the bare word counts
+/// only when it is the **whole message** — exactly that word, alone, which is
+/// what a carrier's own opt-out keyword is and what our footer asks for.
+///
+/// This is a narrowing and only a narrowing: every body that this refuses on
+/// SMS was already refused on email's phrase list or was never a refusal at
+/// all, and no body that email suppresses stops being suppressed.
+///
+/// What it gives up, named rather than left to be discovered: `"Stop please"`,
+/// `"stop merci"` and `"STOP STOP"` are refusals on email and are not refusals
+/// by text. `words == ["stop"]` and not `words.iter().all(…)` on purpose — the
+/// `all` form needs its own `is_empty` guard or a body with no words at all
+/// becomes an opt-out, and what it buys is the emphatic repeat, which is a
+/// false *negative*: the cheap error, caught by the next message.
+///
+/// The direction is chosen by the asymmetry and not by taste. A **missed** STOP
+/// sends one more message to somebody who does not want it — unpleasant,
+/// repairable, and the next STOP catches it. It does not even leave the chase
+/// running: `stop_follow_up` fires in [`land`] on *any* inbound message, before
+/// this classifier is consulted at all, so the sequence is over either way and
+/// what a missed refusal loses is only the permanent, cross-campaign half. An
+/// **invented** STOP makes a customer unreachable forever, on every channel at
+/// once, through a row nobody can delete. Those two do not cost the same, so
+/// they must not be traded at the same rate.
+///
+/// # Open, and it is the founder's call rather than this function's
+///
+/// The narrowing above removes the ordinary false positives. It does not remove
+/// the last one: a supplier who answers *"stop"* and nothing else to a question
+/// that was not about being contacted ("20ft or 40ft?") is one word from
+/// permanent. The remedy that would close it is **a human confirming before a
+/// `phone` row is written** — and that is an approval queue an operator has to
+/// empty every day, on a channel whose whole point is that it is fast, so it is
+/// a cost decision and not an implementation detail.
+///
+/// Left open deliberately, with the path written down so that deciding it is an
+/// afternoon rather than a design:
+///
+/// * `agentos_store::approvals` is the wrong shape and it is worth knowing why
+///   before reaching for it — its token is bound to the sha256 of one
+///   [`agentos_domain::action::Action`] and re-hashed at redemption, and a
+///   suppression authorises no action, so there is nothing to hash. The same
+///   argument this module already makes about escalations.
+/// * The nearest existing queue is `work_items` (`0061`, `0064`), posted from
+///   the `Some` arm in [`land`] **instead of** the `suppress` call, and it does
+///   not fit as it stands: the table's only content column is `title`, bounded
+///   at 200 characters, and that string is read into a model's prompt. A
+///   counterparty's number in a `title` is personal data in a context window,
+///   which is the one thing this file spends its length avoiding. So the row
+///   would have to carry an opaque reference and the number would have to be
+///   found through `messages` under RLS — i.e. **`work_items` needs a column**,
+///   and that is the migration this decision costs, not zero.
+/// * The cost of turning it on is that a genuine STOP is not final until a
+///   human looks — so the follow-up sequence stopping (`stop_follow_up`, which
+///   runs either way) is what has to hold the line in the meantime, and one
+///   unworked item is somebody still receiving campaign mail.
+///
+/// Until that is decided, the row is written here as it is for email, and the
+/// narrowing above is what keeps it from being written wrongly.
+///
 /// # Untrusted, and read as such
 ///
 /// The body is third-party text and hostile by default. It is classified, never
 /// rendered: nothing here formats it, logs it, or puts it in a prompt, and the
 /// only thing that leaves this function is a `bool`.
-pub fn refuses_contact(body: &Untrusted<String>) -> bool {
+pub fn refuses_contact(channel: Channel, body: &Untrusted<String>) -> bool {
     // Reading it to classify it, which is what this exit is for.
     let raw = body.expose_for_parsing();
 
@@ -1531,7 +1656,20 @@ pub fn refuses_contact(body: &Untrusted<String>) -> bool {
     // body would suppress every single person who replies.
     let typed = flatten(reply_only(raw));
     let words: Vec<&str> = typed.split(' ').filter(|word| !word.is_empty()).collect();
-    words.len() <= BARE_REFUSAL_WORDS && words.contains(&"stop")
+    match channel {
+        // The one population `BARE_REFUSAL_WORDS` is an argument about.
+        Channel::Email => words.len() <= BARE_REFUSAL_WORDS && words.contains(&"stop"),
+        // Everything else. Enumerated rather than `_` so that a new channel is
+        // a compile error somebody has to think about, which is the same choice
+        // `suppressible` makes two functions down and for the same reason: what
+        // this decides is permanent.
+        Channel::Sms
+        | Channel::Whatsapp
+        | Channel::Voice
+        | Channel::A2a
+        | Channel::Web
+        | Channel::Internal => words == ["stop"],
+    }
 }
 
 /// Lower-case words separated by single spaces, and nothing else.
@@ -1913,7 +2051,16 @@ pub async fn land(
         // decision about how much a stranger's one word is allowed to cost, not
         // an implementation detail, so the address-level row is what is written
         // and the wider claim is left visible here.
-        if refuses_contact(&message.body_text) {
+        //
+        // **The channel goes in, and it is not decoration.** The bare-word half
+        // of the rule was argued about replies to cold mail and nothing else;
+        // `land_inbound_text` handed it a conversational population without the
+        // argument being reopened, and on that population it fires on "stop je
+        // te rappelle". `refuses_contact` reads the channel and applies the
+        // narrow rule off email. The one question this could not answer on its
+        // own — whether a human confirms before a `phone` row is written — is
+        // written out in full on that function and is deliberately open.
+        if refuses_contact(message.channel, &message.body_text) {
             match suppressible(message.channel, &from) {
                 Some((channel, address)) => {
                     revenue_store::suppress(
@@ -4841,6 +4988,17 @@ mod tests {
     /// 3. an ordinary text from the same number writes nothing. Without this the
     ///    test would pass against a `land` that suppressed every inbound text,
     ///    and `suppressions` takes no DELETE — that mistake is not reversible.
+    ///
+    /// The third claim has since grown the case that actually catches it, and
+    /// "yes, we can ship on the 4th" never would have: **a text that contains
+    /// the word `stop` and is not a refusal.** `BARE_REFUSAL_WORDS` bounds the
+    /// email rule at eight words, practically every text message ever sent is
+    /// shorter than that, and this ingest handed that rule a conversational
+    /// population without the argument being reopened — so "can you stop by
+    /// tomorrow" wrote a permanent row against a customer's number. This is that
+    /// bug, through the real door, in SQL rather than in a unit assertion:
+    /// `refuses_contact` reads `message.channel`, and if it stops doing so the
+    /// row appears here.
     #[tokio::test]
     async fn a_stop_by_sms_suppresses_the_number_and_an_ordinary_text_does_not() {
         let Some(db) = db().await else { return };
@@ -4871,6 +5029,29 @@ mod tests {
             "an ordinary text suppressed the person who sent it, permanently"
         );
 
+        // A customer arranging a visit. Five words, one of them `stop`, and
+        // nothing about it asks us to go away — the email bound reads it as an
+        // opt-out and on this channel it must not.
+        let visitor = number(13);
+        text(
+            &db,
+            tenant,
+            &telephony,
+            &form(
+                "SM_visit",
+                visitor.as_str(),
+                &pool,
+                "Can you stop by tomorrow?",
+            ),
+            now,
+        )
+        .await
+        .expect("the ordinary text lands");
+        assert!(
+            suppressions_of(&db, tenant).await.is_empty(),
+            "a customer asking us to visit is now unreachable for good, on a table with no DELETE"
+        );
+
         // Somebody else types the word the footer asks for.
         let refuser = number(11);
         let landed = text(
@@ -4886,8 +5067,8 @@ mod tests {
         // It is a message like any other: stored, and the employee is woken. A
         // refusal we swallowed would be a refusal nobody could answer.
         assert!(!landed.duplicate);
-        assert_eq!(messages(&db, tenant).await, 2);
-        assert_eq!(turns(&db, tenant).await, 2);
+        assert_eq!(messages(&db, tenant).await, 3);
+        assert_eq!(turns(&db, tenant).await, 3);
 
         let rows = suppressions_of(&db, tenant).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -6962,7 +7143,13 @@ mod tests {
          > not write to you or anyone else at your company.\n";
 
     fn refuses(body: &str) -> bool {
-        refuses_contact(&Untrusted::new(body.to_owned()))
+        refuses_contact(Channel::Email, &Untrusted::new(body.to_owned()))
+    }
+
+    /// The same question on the channel the eight-word bound was never an
+    /// argument about.
+    fn refuses_by_text(body: &str) -> bool {
+        refuses_contact(Channel::Sms, &Untrusted::new(body.to_owned()))
     }
 
     /// **The promise, read the way a real reply arrives.**
@@ -7047,5 +7234,70 @@ mod tests {
             !refuses(QUOTED_ORIGINAL),
             "our own message, echoed back, suppressed the person we sent it to"
         );
+    }
+
+    /// **The eight-word bound is not applied on a conversational channel, and
+    /// these are the messages that says.**
+    ///
+    /// Every body here is four to seven words, every one of them contains
+    /// `stop`, and every one of them was suppressed before the channel was an
+    /// argument to `refuses_contact` — permanently, on a table with no DELETE,
+    /// against a number `contacts_reject_suppressed` then refuses to re-import.
+    /// They are ordinary supplier and customer traffic, not adversarial input:
+    /// that is the whole point, because the bound was a frequency argument
+    /// about replies to cold mail and this is not that population.
+    ///
+    /// The mirror half is what stops this from being a rule that recognises
+    /// nothing: the same bodies must still be refusals **on email**, where the
+    /// argument holds and `reply_only` does the discriminating — so a mutation
+    /// that simply deleted the bare-word rule fails this test rather than
+    /// passing it.
+    #[test]
+    fn a_text_that_merely_contains_stop_is_not_an_opt_out() {
+        for body in [
+            "stop je te rappelle",
+            "Can you stop by tomorrow?",
+            "ok stop the truck at gate 3",
+            "stop sending the 40ft, send 20ft",
+            "arrête, stop, c'est trop drôle",
+            "Non-stop 24h ?",
+        ] {
+            assert!(
+                !refuses_by_text(body),
+                "a text message was read as a permanent opt-out: {body:?}"
+            );
+            // And the bound still means what it meant where it was argued.
+            assert!(
+                refuses(body),
+                "the email rule stopped recognising a bounded bare STOP: {body:?}"
+            );
+        }
+    }
+
+    /// **What a text still has to be for the row to be written.**
+    ///
+    /// The word alone, however it was punctuated or capitalised — which is what
+    /// a carrier's own opt-out keyword is and what `vertical::OPT_OUT` asks
+    /// for — plus the phrase list, which is a fact about language and is
+    /// matched on every channel identically.
+    #[test]
+    fn a_bare_stop_by_text_is_still_final() {
+        for body in ["STOP", "stop", "  Stop.  ", "Stop!"] {
+            assert!(
+                refuses_by_text(body),
+                "somebody did exactly what the footer asked and was not recorded: {body:?}"
+            );
+        }
+        for body in [
+            "Unsubscribe",
+            "Please stop contacting me",
+            "Ne me contactez plus s'il vous plaît.",
+            "do not contact me again",
+        ] {
+            assert!(
+                refuses_by_text(body),
+                "a phrase that means nothing else stopped counting by text: {body:?}"
+            );
+        }
     }
 }

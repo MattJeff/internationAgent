@@ -7482,18 +7482,24 @@ mod tests {
     /// it was written to close, and a silent, append-only one.
     #[test]
     fn our_own_opt_out_footer_is_never_read_as_a_refusal() {
+        // The channel this footer travels on, and the one whose bare-word rule
+        // is bounded rather than exact — i.e. the harder half of the claim.
+        let by_mail = agentos_domain::message::Channel::Email;
         assert!(
-            !crate::inbound::refuses_contact(&Untrusted::new(OPT_OUT.to_owned())),
+            !crate::inbound::refuses_contact(by_mail, &Untrusted::new(OPT_OUT.to_owned())),
             "the sentence we put at the bottom of every message reads as an opt-out"
         );
 
         // And quoted back, line by line, under an ordinary interested reply.
         let quoted: String = OPT_OUT.lines().map(|line| format!("> {line}\n")).collect();
         assert!(
-            !crate::inbound::refuses_contact(&Untrusted::new(format!(
-                "Sounds interesting — can we talk Thursday?\n\n\
-                 On Tue, 3 Jun 2026 at 09:12, Lena <lena@sender.example> wrote:\n{quoted}"
-            ))),
+            !crate::inbound::refuses_contact(
+                by_mail,
+                &Untrusted::new(format!(
+                    "Sounds interesting — can we talk Thursday?\n\n\
+                     On Tue, 3 Jun 2026 at 09:12, Lena <lena@sender.example> wrote:\n{quoted}"
+                ))
+            ),
             "a prospect who said yes was read as having opted out"
         );
     }

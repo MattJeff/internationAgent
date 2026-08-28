@@ -276,7 +276,15 @@ over the top-level field.
 sending domain. Suppressing `ap@supplier.example` for one tenant would silently
 stop every other tenant's employees mailing them. Per-tenant suppression has to
 be **our own table**, checked before `send`. The provider does not give it to us
-and no caller should assume it does. That table does not exist yet.
+and no caller should assume it does.
+
+That table is `suppressions` (`migrations/0011_revenue.sql`), and the check is
+not application code that could forget: `opportunity_events_reject_suppressed`
+raises `P0002` on the `outreach_sent` row *before* it is written, and
+`contacts_reject_suppressed` refuses to re-import or reactivate a suppressed
+contact at all. `scope` is `tenant` or `global`, so the account-scoped list this
+paragraph warns about is not the one that binds. It holds `phone` as well as
+`email` — a STOP by text lands there through `inbound::land`.
 
 **The sending domain cannot be released.** `ensure_identity` reconciles on the
 domain *name* (Resend domains have no free-form metadata field to stamp the

@@ -1246,10 +1246,18 @@ different thing.
 `no_whatsapp_sender` on every deployment and `degraded` is the healthy steady
 state for an otherwise online employee.
 
-**Twilio's inbound signature scheme is implemented and not reachable.**
-`/v1/webhooks/{provider}` speaks the Svix scheme only, and there is no telephony
-ingest at the other end of the queue, so an SMS reply to an employee's number is
-not delivered anywhere. Outbound SMS is real; inbound is not.
+**Inbound telephony is wired end to end, and one provider setting is what still
+stops it.** `/v1/webhooks/{provider}` speaks *two* schemes and the endpoint's
+`provider` picks — `twilio` gets Twilio's HMAC-SHA1-over-the-callback-URL,
+anything else gets Svix (`migrations/0069` widened the CHECK that used to refuse
+the value). The reader is `main::on_telephony_webhook` →
+`inbound::land_inbound_text`: routing, thread, message and the agent turn all
+commit together. What is missing is one line at the *other* end:
+`TwilioTelephony::ensure_number` posts `PhoneNumber` and `FriendlyName` and **no
+`SmsUrl`**, so a number this build bought is a number Twilio was never told
+where to deliver for. Nothing arrives — not because the ingest is absent, but
+because the number points nowhere. The phone entry further down this section
+says the same thing from the purchase's side.
 
 **The Policy Gate reads its limits from Postgres, and an empty database grants
 nothing.** The gate loads `policy_layers` per decision, so a cap an operator
@@ -1292,10 +1300,22 @@ reaches `online`; `degraded` is the healthy steady state on this build.
 **No phone number is bought at all.** `EngineConfig::default()` sets
 `provision_phone: false`, so `Step::Phone` settles as `StepReport::NotWired` and
 the resource row lands in `disabled` with the reason on it — no provider call, no
-external id, no monthly invoice. It used to buy one per employee, and nothing in
-this build can send or receive on a number: no `sms_send` or `call_place` row in
-`turn::catalogue`, both listed in `turn::UNSERVED`, and the platform ceiling
-grants neither `sms` nor `voice`, which layers can only narrow.
+external id, no monthly invoice. It used to buy one per employee.
+
+**Nothing in this build can *send* on a number**: no `sms_send` or `call_place`
+row in `turn::catalogue`, both listed in `turn::UNSERVED`, and the platform
+ceiling grants neither `sms` nor `voice`, which layers can only narrow. Three
+independent reasons, any one of them enough.
+
+**Receiving is a different sentence now, and it has exactly one hole.** The
+ingest exists — `/v1/webhooks/{provider}` verifies Twilio's own scheme,
+`main::on_telephony_webhook` reads the row and `inbound::land_inbound_text`
+lands the message and wakes the employee. The hole is at the purchase:
+`TwilioTelephony::ensure_number` sets **no `SmsUrl`** on the number it buys, so
+Twilio has no address to POST to and the verified door is never knocked on. That
+is one form field in one POST, and it is not set because setting it points a
+live carrier at this deployment — a decision with a bill and a public origin
+behind it, not a default.
 
 `disabled` does not degrade an optional channel, so this costs no health. The
 switch is Rust and reachable from no environment variable on purpose: turning it
@@ -1319,10 +1339,19 @@ select employee_id, external_id, provider, state
 **Phone numbers, if ever bought again, are bought in `US`.**
 `EngineConfig::default()` hard-codes `Region::new("US")` and nothing overrides it.
 
-**One webhook signature scheme.** `/v1/webhooks/{provider}` verifies the
-Standard Webhooks / Svix scheme only. Twilio's HMAC-SHA1-over-the-callback-URL
-scheme is implemented in `agentos_providers::telephony` and is not reachable from
-the HTTP surface — there is no telephony ingest at the other end of the queue.
+**Two webhook signature schemes, and the endpoint's `provider` picks.**
+`twilio` gets Twilio's HMAC-SHA1 over the callback URL plus sorted form
+parameters; every other provider gets Standard Webhooks / Svix. There is no
+`scheme` field to set — it is a function of `provider`, deliberately, so the two
+cannot disagree. An endpoint registered under the wrong provider has its genuine
+deliveries answered **401**, which is visible; neither direction skips a check.
+
+The telephony arm needs one thing the other does not: **`PUBLIC_HOST` must be
+exactly the origin you pasted into the Twilio console**, because that scheme MACs
+the callback URL itself. A deployment whose idea of its own address differs by
+one character answers 401 to every genuine text. That is why a telephony
+verification failure logs the URL it signed over — it is our own configured
+string, not a secret, and it turns "everything 401s" into one line.
 
 **One webhook endpoint per provider per deployment *in the environment*.**
 `AGENTOS_WEBHOOK_SECRETS` is a `HashMap` keyed on the path segment, so it holds
