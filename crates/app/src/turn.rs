@@ -1010,6 +1010,49 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
         //      token. Both are the founder's to open, and opening them is a
         //      schema change with the pins that implies.
         //
+        //      AND THE ARM CARRIES A GUARD, WHICH IS `PAY`'S LINE VERBATIM
+        //
+        //      The `memo` above is a *description* — "at most 200 characters"
+        //      — and a description is not a bound. `memo` lands in
+        //      `invoices.memo`, whose `invoices_memo_shape` (0066) is
+        //      `char_length(btrim(memo)) between 1 and 200`, so a model that
+        //      writes 201 characters or a blank line reaches a `23514`, which
+        //      `agentos_store::invoices::issue` returns as
+        //      `StoreError::Database` and `Effects::issue_invoice` maps to
+        //      `EffectError::Unavailable` — "the register is broken, this was
+        //      not your fault", told to the one party that could have fixed it
+        //      by shortening a sentence. `routes::invoices::credit` refused
+        //      exactly this from the operator's side and answers 400; this is
+        //      the same column with the model on the other end of it.
+        //
+        //      So the `ISSUE_INVOICE` arm of `Turn::propose` carries, beside
+        //      `PAY`'s payee check and borrowing the same constant — whose own
+        //      docs say it *is* `invoices_memo_shape`'s bound, so nothing new
+        //      is declared and nothing can drift:
+        //
+        //        let memo = memo.trim();
+        //        if memo.is_empty() || memo.chars().count() > crate::x402::MAX_FIELD_CHARS {
+        //            return Err(format!(
+        //                "memo: one line saying what the invoice is for, 1 to {} \
+        //                 characters, and this one is {}",
+        //                crate::x402::MAX_FIELD_CHARS,
+        //                memo.chars().count()
+        //            ));
+        //        }
+        //
+        //      …and `InvoiceDraft { memo: memo.to_owned(), … }`, trimmed for
+        //      `routes::invoices::credit`'s reason: the CHECK measures
+        //      `btrim(memo)` and the column would otherwise store the untrimmed
+        //      one.
+        //
+        //      **Written here and not applied, for the reason the row is.**
+        //      `Turn::propose` matches no `issue_invoice` today and refuses any
+        //      name absent from this turn's request, and `Effects::issue_invoice`
+        //      has no caller outside this crate's own tests — so the guard would
+        //      be an unreachable branch in a workspace whose lints are
+        //      `-D warnings`, guarding a verb no model can name. It costs one
+        //      line on the day the row lands and nothing before it.
+        //
         // WHAT IS TRUE UNTIL THEN, SAID PLAINLY
         //
         // Nothing. `Turn::propose` matches no such name, so a model that

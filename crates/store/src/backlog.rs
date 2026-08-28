@@ -1032,6 +1032,18 @@ mod tests {
             }
         });
 
+        // Unbounded on purpose, and it is the one shape `crate::db::wait_at_barrier`
+        // was written for that does **not** need it. A `oneshot::Receiver`
+        // resolves when the value arrives *or when the sender is dropped*, and
+        // every way out of the task above drops it: the `send` on the happy
+        // path, and the drop of the future itself on either `expect` — a
+        // `tenant_tx` the pool never hands over (thirty seconds, sqlx's default
+        // `acquire_timeout`, which `db.rs` does not override) or a
+        // `pg_backend_pid()` against a server that has gone. So the signal is
+        // the peer's *existence*, not its good behaviour, and a peer that dies
+        // arrives here as `Err(RecvError)` and a named panic rather than a
+        // hang. `Barrier::wait` has no such drop signal, which is why the
+        // eleven sites that took a bound took one.
         crate::db::wait_until_blocked(db, pid.await.expect("the contender's pid")).await;
         winner.commit().await.expect("commit the winner");
         let got = loser.await.expect("the contender finishes");
