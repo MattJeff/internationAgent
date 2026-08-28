@@ -235,6 +235,13 @@ fn preference(role: &str) -> Option<ModelId> {
         rolepack_service::ENTRY_REQUIREMENTS => {
             rolepack_service::RolePack::entry_requirements().model()
         }
+        // No `docs/orizn-roles/engineering.json` today, so `seats` never asks
+        // about this one and the bill does not move. The arm is here anyway
+        // because this is the name-to-pack table: the day somebody writes that
+        // layer, the seat is priced off its pack rather than falling to
+        // `ModelId::UNCHARTERED`, which for an Opus seat would understate the
+        // month by the whole difference between the two rate cards.
+        rolepack_service::ENGINEERING => rolepack_service::RolePack::engineering().model(),
         _ => return None,
     })
 }

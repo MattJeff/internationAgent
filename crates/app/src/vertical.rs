@@ -198,7 +198,7 @@ impl CharterError {
 /// genuinely different. A trait here would be one method per pack with a
 /// different return type, which is a match written badly.
 ///
-/// # Why only two of the six variants carry their pack
+/// # Why only two of the seven variants carry their pack
 ///
 /// [`Charter::Purchasing`] and [`Charter::Sales`] hold a
 /// [`RolePack`](crate::rolepack::RolePack) because their plans *read* it — the
@@ -207,7 +207,7 @@ impl CharterError {
 /// that has narrowed the limits hands the narrowed pack back and the plan
 /// speaks about what that employee may really do.
 ///
-/// The four in [`crate::rolepack_service`] share one `RolePack` type between
+/// The five in [`crate::rolepack_service`] share one `RolePack` type between
 /// them and their plans read nothing off it, so carrying one would buy nothing
 /// and cost the invariant that matters here: with a shared type, a variant
 /// holding a pack is a variant that can hold the *wrong* pack, and
@@ -251,6 +251,12 @@ pub enum Charter {
         /// Which corridors this seat owns, and how stale a rule may get.
         objective: rolepack_service::Corridors,
     },
+    /// Writing and maintaining the software — proposed here, applied by a human.
+    Engineering {
+        /// Which repository this seat owns, how a change is proved, and who
+        /// applies it.
+        objective: rolepack_service::Changes,
+    },
 }
 
 impl Charter {
@@ -268,6 +274,7 @@ impl Charter {
             Charter::Growth { .. } => rolepack_service::GROWTH,
             Charter::Finance { .. } => rolepack_service::FINANCE,
             Charter::EntryRequirements { .. } => rolepack_service::ENTRY_REQUIREMENTS,
+            Charter::Engineering { .. } => rolepack_service::ENGINEERING,
         }
     }
 
@@ -282,6 +289,7 @@ impl Charter {
             Charter::EntryRequirements { .. } => {
                 rolepack_service::RolePack::entry_requirements().briefing()
             }
+            Charter::Engineering { .. } => rolepack_service::RolePack::engineering().briefing(),
         }
     }
 
@@ -308,6 +316,7 @@ impl Charter {
             Charter::EntryRequirements { .. } => {
                 rolepack_service::RolePack::entry_requirements().model()
             }
+            Charter::Engineering { .. } => rolepack_service::RolePack::engineering().model(),
         }
     }
 
@@ -343,6 +352,9 @@ impl Charter {
             Charter::EntryRequirements { .. } => rolepack_service::RolePack::entry_requirements()
                 .proposable()
                 .clone(),
+            Charter::Engineering { .. } => rolepack_service::RolePack::engineering()
+                .proposable()
+                .clone(),
         };
         SystemPrompt::new(format!("{identity}\n\n{}", self.briefing())).with_proposable(proposable)
     }
@@ -369,6 +381,7 @@ impl Charter {
             Charter::Growth { objective } => steps_of(&objective.plan()),
             Charter::Finance { objective } => steps_of(&objective.plan()),
             Charter::EntryRequirements { objective } => steps_of(&objective.plan()),
+            Charter::Engineering { objective } => steps_of(&objective.plan()),
         };
         format!(
             "Your standing objective, as a plan. Work it in order; a stage you cannot finish is \
@@ -425,6 +438,7 @@ impl Charter {
             Charter::Growth { objective } => service_questions(objective.gaps()),
             Charter::Finance { objective } => service_questions(objective.gaps()),
             Charter::EntryRequirements { objective } => service_questions(objective.gaps()),
+            Charter::Engineering { objective } => service_questions(objective.gaps()),
         }
     }
 
@@ -517,6 +531,9 @@ impl Charter {
             rolepack_service::ENTRY_REQUIREMENTS => Ok(Charter::EntryRequirements {
                 objective: corridors_objective(objective)?,
             }),
+            rolepack_service::ENGINEERING => Ok(Charter::Engineering {
+                objective: changes_objective(objective)?,
+            }),
             _ => Err(CharterError::Corrupt("role")),
         }
     }
@@ -568,6 +585,11 @@ impl Charter {
                 "destinations": objective.destinations,
                 "passports": objective.passports,
                 "max_age_days": objective.max_age_days,
+            }),
+            Charter::Engineering { objective } => json!({
+                "repository": objective.repository,
+                "checks": objective.checks,
+                "reviewer": objective.reviewer,
             }),
         }
     }
@@ -808,6 +830,26 @@ fn corridors_objective(raw: &Value) -> Result<rolepack_service::Corridors, Chart
             .and_then(Value::as_u64)
             .and_then(|days| u32::try_from(days).ok())
             .ok_or(CharterError::Corrupt("max_age_days"))?,
+    })
+}
+
+/// An engineering objective, re-parsed rather than deserialised.
+///
+/// Three plain strings, and no constructor to route them through: there is no
+/// `Repository` type and there deliberately is not one — the argument is on
+/// [`rolepack_service::Changes`], and it is [`rolepack_service::Corridors`]'
+/// argument. What is still checked is the *shape*: a key present and not a
+/// string is a named corruption rather than a field silently read as absent,
+/// which is what `optional_string` is for.
+fn changes_objective(raw: &Value) -> Result<rolepack_service::Changes, CharterError> {
+    Ok(rolepack_service::Changes {
+        repository: raw
+            .get("repository")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("repository"))?
+            .to_owned(),
+        checks: optional_string(raw.get("checks")).ok_or(CharterError::Corrupt("checks"))?,
+        reviewer: optional_string(raw.get("reviewer")).ok_or(CharterError::Corrupt("reviewer"))?,
     })
 }
 
@@ -3706,7 +3748,7 @@ mod tests {
 
     /// One charter per role pack in the workspace, complete enough to plan.
     ///
-    /// The list is the point: a sixth pack that nobody adds here is a pack the
+    /// The list is the point: a seventh pack that nobody adds here is a pack the
     /// round-trip and name-table tests below never see.
     fn every_charter() -> Vec<Charter> {
         vec![
@@ -3744,6 +3786,13 @@ mod tests {
                     destinations: "the Schengen area".to_owned(),
                     passports: vec!["IND".to_owned(), "NGA".to_owned()],
                     max_age_days: 90,
+                },
+            },
+            Charter::Engineering {
+                objective: rolepack_service::Changes {
+                    repository: "the visa API and its migrations".to_owned(),
+                    checks: Some("cargo test --workspace".to_owned()),
+                    reviewer: Some("the CTO".to_owned()),
                 },
             },
         ]
@@ -3952,6 +4001,7 @@ mod tests {
                 "growth",
                 "finance",
                 "entry-requirements",
+                "engineering",
             ]
         );
 
@@ -3970,6 +4020,11 @@ mod tests {
             "entry-requirement",
             "entry_requirements",
             "visa-data",
+            // And for the newest one: the plural, the underscore spelling of
+            // the function `docs/TEAMS.md` draws, and the job title.
+            "engineerings",
+            "produit_et_technologie",
+            "software-engineer",
         ] {
             assert!(
                 matches!(
