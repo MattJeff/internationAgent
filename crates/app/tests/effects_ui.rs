@@ -20,4 +20,13 @@ fn an_effect_cannot_be_performed_without_a_token() {
 
     // And the near miss: a real token, for a different effect.
     t.compile_fail("tests/ui/effects_wrong_token.rs");
+
+    // And the thing those two only pin for `send_email`: that *every* effect
+    // still names its own subject. The two cases above are about the token's
+    // provenance; this one is about the bound. `Untrusted<Action>` satisfies a
+    // bare `A: Subject` today — the blanket impl gives it `Of = Action` — so a
+    // bound written without its `Of =` would let a turn that read a stranger's
+    // email spend the resulting ruling on any effect it liked. Nothing else in
+    // this repo notices that edit; this file is the alarm.
+    t.compile_fail("tests/ui/effects_untrusted_action.rs");
 }
