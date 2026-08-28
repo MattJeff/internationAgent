@@ -943,9 +943,20 @@ pub async fn contract_suite<P: TelephonyProvider + ?Sized>(provider: &P) {
         dialled,
         "distinct keys must produce distinct calls"
     );
-    // A call id is not a message id, and an adapter that answered a dial out of
-    // its message table would pass every assertion above while handing back the
-    // sid of the SMS sent under the same key one block up.
+    // A call id is not a message id. **What this asserts is exactly its own
+    // message and no more: two *distinct* keys, one dialled and one sent, do
+    // not come back with the same id.** It is a cheap check that the two verbs
+    // keep separate id spaces, and it would catch an adapter that answered
+    // every request out of one table.
+    //
+    // It is deliberately not the stronger claim it used to be worded as —
+    // "handing back the sid of the SMS sent under the same key". No key here is
+    // the same: `send:1` and `call:1` differ, so nothing in this function
+    // replays one key across both verbs. The stronger test is not missing by
+    // oversight, it is refused by the argument at `call_key` above: a key is
+    // derived from a gate decision, one key cannot stand for both a message and
+    // a call, and asserting against a collision no deployment can reach would
+    // be a test defending an unreachable state.
     assert_ne!(
         dialled, sent,
         "a call and a message under different keys must not share an id"

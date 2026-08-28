@@ -101,6 +101,29 @@ And **Orizn is not enrolled**: no `outreach_warmup` row means nothing changes,
 which is how this landed without cutting a running business from five a day to
 one. Enrolling is one INSERT and it is a decision, not a default.
 
+**Read what that INSERT does before writing it, because it is larger than it
+sounds.** "One a day" is not one a day of *cold* mail. The daily file is built
+by `revenue::queueable`, whose `WHERE` is `touch_count < MAX_TOUCHES` — so it
+carries the follow-ups as well as the first approaches — and
+`routes/queue.rs` truncates that whole list to what `outreach::reserve`
+grants. A tenant enrolled on the day it starts reads `Unknown` (no refusal has
+ever arrived and no operator has confirmed the endpoint), `warmup_allowance`
+releases the `WARMUP_FLOOR` of 1, and the file of forty becomes a file of one —
+**relances included**. A prospect already mid-sequence is not exempt; there is
+no second bucket for people who have already been written to.
+
+Two more things follow from that and neither is obvious from the paragraph
+above. It **stays** at one until a refusal is actually observed or an operator
+writes `refusal_events_confirmed_at` in psql: age alone releases nothing,
+because `Unknown` and `Unhealthy` both multiply by zero, so a tenant whose
+Resend endpoint is not subscribed sits at one indefinitely rather than climbing
+out on its own. And the truncation is reported to nobody by default — a batch
+cut from forty to one returns `Ok(1)` and the caller shortens its list; only a
+batch cut to *nothing* raises `Warming`. `outreach::reserve` now logs every
+truncation at `INFO` for exactly this reason, and that log is the only thing
+standing between an enrolled tenant and a sales team wondering where the
+morning's mail went.
+
 
 | Function | Team slug | Head | Role pack | Turns/day |
 |---|---|---|---|---|

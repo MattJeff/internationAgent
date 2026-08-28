@@ -1545,9 +1545,11 @@ the database, and rotation is a deploy rather than a migration.
   definition, a read of a row belonging to no tenant, a lookup that runs before
   anybody knows who is asking, and the separately-authenticated platform
   operator surface. `docs/OPERATIONS.md` sets those out. This line used to name
-  "migrations, the outbox poller and the provisioning loop's claims"; there are
-  twenty-six callers outside tests, and migrations was never one of them —
-  `Db::migrate` opens no transaction at all.
+  "migrations, the outbox poller and the provisioning loop's claims", and it was
+  wrong twice: there are many more outside tests, and migrations was never one of
+  them — `Db::migrate` opens no transaction at all. `grep -rn
+  admin_tx_bypassing_rls` is the list; a count written here is not, and the one
+  that stood here went stale the first week it was true.
 - **`tenant_id` comes from the API key and from nothing else.** A row belonging
   to another tenant is invisible to RLS, surfaces as `NotFound`, and is answered
   **404** — not 403, which would confirm the id exists.

@@ -272,6 +272,30 @@ pub async fn reserve(
     };
 
     let granted = want.min(allowed.saturating_sub(taken));
+
+    // **Every truncation is logged, not only the one that refuses the batch
+    // whole.** This used to sit inside the `granted == 0` arm below, which is
+    // the rarest case: an export that asks for forty and is granted one takes
+    // the `Ok` path, the caller shortens its file to one, and until now nothing
+    // anywhere recorded that thirty-nine people were not written to. That is
+    // the silent ceiling this workspace refuses — and it is the *normal* case
+    // for an enrolled tenant, not the exceptional one, because
+    // `warmup_allowance` holds an unmeasured domain at `WARMUP_FLOOR`.
+    //
+    // Counts only, never an address. `allowed` against `written` is which wall
+    // it was: below it, the warming schedule; equal to it, the number the
+    // operator wrote and already knows about.
+    if granted < want {
+        tracing::info!(
+            want,
+            granted,
+            allowed,
+            written = limit,
+            taken,
+            "an outreach batch was cut to what today's ceiling leaves"
+        );
+    }
+
     if granted == 0 {
         // Which of the two refused. `<` and not `<=`, and that is the whole of
         // it: when the schedule released everything the operator wrote, the
@@ -282,15 +306,10 @@ pub async fn reserve(
         // `a_tenant_with_no_warmup_row_has_exactly_the_day_it_had_before` is the
         // line that catches it.
         if allowed < limit {
-            // Counts only, no addresses: this is the line that answers "why is
-            // the seller sending one a day", and the usual answer is that
-            // nothing has ever proved a bounce would reach us.
-            tracing::info!(
-                allowed,
-                written = limit,
-                taken,
-                "the sending domain is warming; today releases part of this seat's ceiling"
-            );
+            // The log for this is the one above, which has already fired:
+            // `granted == 0` is `granted < want` for every `want >= 1`, and
+            // `want == 0` returned at the top of the function. A second line
+            // here would double-log the same event.
             return Err(ContactBudgetError::Warming {
                 allowed,
                 written: limit,
