@@ -174,7 +174,17 @@ pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 /// all; the procedure written out in `turn::catalogue` derives the window from
 /// the same `to` it then gates on. It is a named refusal rather than an
 /// assertion for [`LEAD_NOT_THE_RULED_ADDRESS`]'s reason — the two facts are
-/// separated by a gate call, and the audit row should say which of them moved.
+/// separated by a gate call, so a refusal is a fact worth recording rather than
+/// a bug worth panicking on.
+///
+/// **What the row does not say, and the sentence here used to promise it did.**
+/// `message_detail` maps only the success case, so a refused send writes
+/// `detail: None` and **neither number reaches it**. Reading the row tells an
+/// operator that a window did not match, never which window or whose. Making it
+/// say so is a `detail` on the refusal branch carrying both — and that is a
+/// deliberate choice about putting a counterparty's phone number in an audit
+/// row, not an oversight to fix on the way past. The same gap sits on
+/// [`LEAD_NOT_THE_RULED_ADDRESS`], which predates this.
 pub const WHATSAPP_WINDOW_NOT_THEIRS: &str = "whatsapp_window_mismatch";
 
 /// What [`Effects::issue_invoice`] answers when the deal it was handed is not
