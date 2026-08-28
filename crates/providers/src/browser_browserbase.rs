@@ -287,12 +287,24 @@ impl BrowserbaseBrowser {
             .await?;
 
         // Accept both framings the API has shipped: `{"contexts": [...]}` and a
-        // bare array.
+        // bare array — but **one of them has to be there.** This ended in
+        // `.unwrap_or_default()`, which read a body with no array in it as the
+        // answer *"no context wears this key"*, and that is the answer that
+        // makes `ensure_context` create a second one. The damage is permanent
+        // rather than merely wasteful: from then on the lookup finds two and
+        // every future reconcile for that employee answers `duplicate_context`,
+        // terminally, with the login state split across two stores at random.
+        // `call` hands back `Value::Null` for any 2xx whose body did not parse,
+        // so one connection reset mid-response was enough.
+        //
+        // The guard is here and not in `call` because the other callers want
+        // the leniency: a create whose 2xx body is unreadable is a context that
+        // exists and whose id we never learned, and the honest repair for that
+        // is the next run's lookup — this one — not a re-POST.
         let items = body["contexts"]
             .as_array()
             .or_else(|| body.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .ok_or_else(ProviderError::timeout)?;
 
         let mut hits = items
             .iter()
@@ -502,6 +514,10 @@ mod tests {
         next_status: Option<u16>,
         /// Accept the request and never answer it.
         hang: bool,
+        /// Answer the next request with a 2xx, a `Content-Length`, and then
+        /// hang up before the body — a connection reset mid-response, which is
+        /// the one thing a fake that always completes its writes cannot show.
+        cut_short_next: bool,
         /// Every `X-BB-API-Key` we were sent.
         keys: Vec<String>,
     }
@@ -555,16 +571,18 @@ mod tests {
     async fn serve(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) {
         let mut buffer = Vec::new();
         while let Some(request) = read_request(&mut stream, &mut buffer).await {
-            let answered = {
+            let (answered, cut_short) = {
                 let mut state = state.lock().expect("fake state mutex poisoned");
                 state.keys.push(request.api_key.clone());
-                match (state.hang, state.next_status.take()) {
+                let cut_short = std::mem::take(&mut state.cut_short_next);
+                let answered = match (state.hang, state.next_status.take()) {
                     (true, _) => None,
                     (false, Some(status)) => {
                         Some((status, json!({"error": "injected", "status": status})))
                     }
                     (false, None) => Some(answer(&request, &mut state)),
-                }
+                };
+                (answered, cut_short)
             };
             // Accept the request and never answer it: the adapter's own
             // deadline has to be what ends this.
@@ -572,6 +590,13 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 return;
             };
+            if cut_short {
+                // Head only, promising a body, then the socket goes away.
+                let head = respond(status, &body);
+                let end = find(&head, b"\r\n\r\n").expect("a head") + 4;
+                let _ = stream.write_all(&head[..end]).await;
+                return;
+            }
             if stream.write_all(&respond(status, &body)).await.is_err() {
                 return;
             }
@@ -828,6 +853,59 @@ mod tests {
         assert_eq!(fake.state().creates, 1, "posted a second create");
         // And the tag we searched on is the one we stamped.
         assert_eq!(fake.state().contexts[0].1, ctx.tag());
+    }
+
+    /// The reconcile lookup's answer is only as good as the body it arrived in,
+    /// and a body that never arrived is not the answer "nothing wears this key".
+    ///
+    /// `find_context` maps a missing `contexts` array to `Ok(None)` and
+    /// `ensure_context` reads `Ok(None)` as "create one", so a connection reset
+    /// mid-response created a **second** context — and the damage does not stop
+    /// there, because it is permanent: from then on the lookup finds two and
+    /// every future `ensure_context` for that employee answers
+    /// `duplicate_context`, terminally, with the login state split across two
+    /// stores at random. Read as a wait instead, the retry runs the lookup
+    /// again and finds the one context that exists.
+    ///
+    /// The assertion is not "an error came back" — a `Terminal` satisfies that
+    /// and parks the employee's browser for good. It is the two facts that
+    /// matter: retryable, and nothing created.
+    #[tokio::test]
+    async fn a_lookup_whose_body_never_arrived_does_not_create_a_second_context() {
+        let fake = FakeBrowserbase::start().await;
+        let client = fake.client();
+        let ctx = ctx();
+
+        client.ensure_context(&ctx).await.expect("first create");
+        assert_eq!(fake.state().creates, 1);
+
+        fake.state().cut_short_next = true;
+        let cut_short = client
+            .ensure_context(&ctx.clone().retry())
+            .await
+            .expect_err("a body we never read is not an empty list");
+
+        assert!(
+            cut_short.is_retryable(),
+            "parking here abandons the context we already made: {cut_short:?}"
+        );
+        assert_eq!(
+            fake.state().creates,
+            1,
+            "created a second context off a lookup whose answer never arrived"
+        );
+        assert_eq!(fake.state().contexts.len(), 1);
+
+        // And the retry, on a healthy socket, reconciles onto the first one.
+        assert_eq!(
+            client
+                .ensure_context(&ctx.clone().retry().retry())
+                .await
+                .expect("reconciled")
+                .external_id,
+            "ctx_1"
+        );
+        assert_eq!(fake.state().creates, 1);
     }
 
     #[tokio::test]

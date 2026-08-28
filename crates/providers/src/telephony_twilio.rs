@@ -203,10 +203,26 @@ impl TwilioTelephony {
             )
             .await?;
 
-        let mut hits = body["incoming_phone_numbers"]
+        // **The list has to be there.** This was `.unwrap_or_default()`, which
+        // read a body it could not find an array in as the answer *"no number
+        // wears this key"* — and that is the one answer that makes
+        // `ensure_number` buy a second number, rebind the employee to it, and
+        // leave the first on the account billing monthly with nothing pointing
+        // at it. `call` hands back `Value::Null` for any 2xx whose body did not
+        // parse (a connection reset mid-response, a proxy's HTML), so a single
+        // network blip on the reconcile lookup was enough.
+        //
+        // "We could not read the answer" is a wait, not an empty list. The
+        // guard is here and not in `call` on purpose: `create` **relies** on an
+        // unreadable 2xx staying terminal, because a 2xx means Twilio accepted
+        // the message and a retry would text the person twice. One caller needs
+        // strictness and one needs leniency, so the strictness is written at
+        // the caller that needs it.
+        let listed = body["incoming_phone_numbers"]
             .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+            .ok_or_else(ProviderError::timeout)?;
+
+        let mut hits = listed
             .iter()
             .filter(|number| number["friendly_name"].as_str() == Some(tag));
 
@@ -578,6 +594,10 @@ mod tests {
         bundle: Option<(String, String)>,
         /// Answer the next request with this status instead of doing the work.
         next_status: Option<u16>,
+        /// Answer the next request with a 200, a `Content-Length`, and then
+        /// hang up before the body — a connection reset mid-response, which is
+        /// the one thing a fake that always completes its writes cannot show.
+        cut_short_next: bool,
         /// Every `Authorization` header we were sent.
         auth: Vec<String>,
     }
@@ -619,17 +639,26 @@ mod tests {
     async fn serve(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) {
         let mut buffer = Vec::new();
         while let Some(request) = read_request(&mut stream, &mut buffer).await {
-            let (status, body) = {
+            let (status, body, cut_short) = {
                 let mut state = state.lock().expect("fake state mutex poisoned");
                 state.auth.push(request.auth.clone());
-                match state.next_status.take() {
+                let cut_short = std::mem::take(&mut state.cut_short_next);
+                let (status, body) = match state.next_status.take() {
                     Some(status) => (
                         status,
                         json!({"code": 20_000, "message": "injected", "status": status}),
                     ),
                     None => answer(&request, &mut state),
-                }
+                };
+                (status, body, cut_short)
             };
+            if cut_short {
+                // Head only, promising a body, then the socket goes away.
+                let head = respond(status, &body);
+                let end = find(&head, b"\r\n\r\n").expect("a head") + 4;
+                let _ = stream.write_all(&head[..end]).await;
+                return;
+            }
             if stream.write_all(&respond(status, &body)).await.is_err() {
                 return;
             }
@@ -1003,6 +1032,63 @@ mod tests {
                 format!("{ACCOUNT}:{TOKEN}")
             );
         }
+    }
+
+    /// The reconcile lookup's answer is only as good as the body it arrived
+    /// in, and a body that never arrived is not the answer "nothing is tagged
+    /// with this key".
+    ///
+    /// This is the expensive half of the reconcile contract, and the one a fake
+    /// that always finishes its writes cannot show: `find_number` maps a
+    /// missing `incoming_phone_numbers` to `Ok(None)`, `ensure_number` reads
+    /// `Ok(None)` as "buy one", and a connection reset mid-response therefore
+    /// bought a **second** number, rebound the employee to it, and left the
+    /// first one on the account billing monthly with nothing pointing at it.
+    /// Read as a wait instead, the retry re-runs the lookup and finds what we
+    /// already paid for.
+    ///
+    /// What this asserts is deliberately not "an error came back" — a
+    /// `Terminal` would satisfy that and would park the step for good. It is
+    /// the two facts that cost money: retryable, and nothing bought.
+    #[tokio::test]
+    async fn a_lookup_whose_body_never_arrived_does_not_buy_a_second_number() {
+        let twilio = FakeTwilio::start().await;
+        let client = twilio.client();
+        let ctx = ctx();
+
+        client
+            .ensure_number(&ctx, &Region::new("US"))
+            .await
+            .expect("first purchase");
+        assert_eq!(twilio.state().numbers.len(), 1);
+
+        twilio.state().cut_short_next = true;
+        let cut_short = client
+            .ensure_number(&ctx.clone().retry(), &Region::new("US"))
+            .await
+            .expect_err("a body we never read is not an empty list");
+
+        assert!(
+            cut_short.is_retryable(),
+            "parking the step here strands the number we already bought: {cut_short:?}"
+        );
+        assert_eq!(
+            twilio.state().purchases,
+            1,
+            "bought a second number off a lookup whose answer never arrived"
+        );
+        assert_eq!(twilio.state().numbers.len(), 1);
+
+        // And the retry, on a healthy socket, reconciles onto the first one.
+        assert_eq!(
+            client
+                .ensure_number(&ctx.clone().retry().retry(), &Region::new("US"))
+                .await
+                .expect("reconciled")
+                .external_id,
+            "PN0000000000000001"
+        );
+        assert_eq!(twilio.state().purchases, 1);
     }
 
     #[tokio::test]
