@@ -54,6 +54,7 @@ use agentos_app::inbound::{
 };
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
+use agentos_app::model_access::NoModel;
 use agentos_app::prompt::SystemPrompt;
 use agentos_app::provisioning::{EngineConfig, ProvisioningEngine};
 use agentos_app::turn::{Budget, Context, Failed, Turn, TurnError};
@@ -1358,9 +1359,22 @@ impl Agent {
             // nobody wrote down is not a licence to write to counterparties in
             // the company's name, and if it were, omitting the charter row would
             // be how you opt out of the whole filter.
-            let charter = Charter::load(tx, employee_id)
-                .await
-                .map_err(|err| format!("could not load the employee's charter: {err}"))?;
+            //
+            // `CharterError` classifies itself and this used to discard the
+            // classification, the same way the model connection below did:
+            // `Corrupt` names the field of a stored objective that no longer
+            // parses back through the constructors it came in through, and
+            // those bytes are the same bytes on the eighth read. Seven retries
+            // of a `serde` refusal buy nothing and keep the message counted as
+            // backlog while they run. `Unavailable` is a store outage and stays
+            // retryable.
+            let charter = Charter::load(tx, employee_id).await.map_err(|err| {
+                let why = format!("could not load the employee's charter: {err}");
+                match err {
+                    agentos_app::vertical::CharterError::Unavailable(_) => Failure::Retry(why),
+                    agentos_app::vertical::CharterError::Corrupt(_) => Failure::Terminal(why),
+                }
+            })?;
 
             // Ours, from our own configuration, and byte-identical every turn:
             // this is the cached prefix. The role's briefing goes at the end of
@@ -1504,6 +1518,38 @@ impl Agent {
             //
             // `None` for the API origin: `model_access::ApiBase` says why that
             // argument exists and why this is not a place to read a variable.
+            //
+            // **The classification is the error's own, and it used to be
+            // thrown away.** `.map_err(|err| err.to_string())?` produced a
+            // `String`, and `From<String> for Failure` is `Failure::Retry` —
+            // so the four `NoModel` variants whose own documentation says
+            // "retrying will not fix it" were retried, seven more times, each
+            // one re-reading the same row to reach the same sentence. The
+            // arm two blocks up already parks an empty `allowed_models` on
+            // the first attempt; this is the same fact about the same tenant
+            // arriving through a different read.
+            //
+            // The split, and both halves matter:
+            //
+            // * **Terminal** for `NotConnected`, `HostModelIsNotTheirs` and
+            //   `KeyMissing`. Every one of them is fixed by somebody running
+            //   `POST /v1/model`, and `model_access::connect` calls
+            //   `outbox::requeue_dead_letters` in the same transaction — so
+            //   the parked message comes back the instant the remedy is
+            //   applied. Parking is not losing here; it is waiting somewhere
+            //   an operator can see it (`outbox::dead_letters`) instead of
+            //   burning the backoff schedule in the dark.
+            // * **Retry** for `CompanyHalted`, and this is the arm a blanket
+            //   `Terminal` would have broken. `outbox::claim_except` refuses a
+            //   stopped company's rows outright, so the only way this is ever
+            //   seen is a halt landing between the claim's commit and this
+            //   line — and `halt::release` calls no requeue, so parking on
+            //   that race would strand a customer's message until some
+            //   unrelated policy edit happened to revive it. Handed back, the
+            //   row simply is not claimed again until the halt lifts, which is
+            //   the property `claim_of` already defends.
+            // * **Retry** for `Unavailable`, which is a store outage and the
+            //   one thing here that another attempt genuinely fixes.
             let (llm, access) = agentos_app::model_access::for_turn(
                 tx,
                 &self.credentials,
@@ -1512,7 +1558,12 @@ impl Agent {
                 None,
             )
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| match err {
+                err @ (NoModel::Unavailable(_) | NoModel::CompanyHalted(_)) => {
+                    Failure::Retry(err.to_string())
+                }
+                err => Failure::Terminal(err.to_string()),
+            })?;
             tracing::debug!(
                 employee_id = %employee_id.as_uuid(),
                 path = %access.path,
@@ -3502,6 +3553,174 @@ mod tests {
             "a turn cut short by this replica shutting down was not handed back: a \
              rolling deploy would park every message that happened to be in flight, \
              and no operator verb brings those back: {verdict:?}"
+        );
+
+        landed.teardown().await;
+    }
+
+    /// **A tenant that has connected no model parks the message on the first
+    /// attempt; a tenant that is merely stopped hands it back.**
+    ///
+    /// `Agent::on_turn` reads the connection through
+    /// `model_access::for_turn`, whose `NoModel` says of itself that "every
+    /// variant is terminal … retrying will not fix it" — and then threw that
+    /// away with `.map_err(|err| err.to_string())?`, because
+    /// `From<String> for Failure` is `Failure::Retry`. So the most ordinary
+    /// state a tenant can be in — nobody has connected a model yet, or
+    /// `AGENTOS_MASTER_KEY` rotated under a stored one — bought seven more
+    /// attempts, each re-reading the same row to reach the same sentence,
+    /// with the customer's message counted as backlog the whole way. The
+    /// empty `allowed_models` arm forty lines above already parks on the
+    /// first attempt; this is the same fact about the same tenant arriving
+    /// through a different read.
+    ///
+    /// Parking is not losing: `model_access::connect` — the remedy this
+    /// error names — calls `outbox::requeue_dead_letters` in its own
+    /// transaction, so the message comes back the moment somebody connects a
+    /// model.
+    ///
+    /// # The halt is the other half, and it is why this is not a blanket
+    /// `Terminal`
+    ///
+    /// `outbox::claim_except` refuses a stopped company's rows, so
+    /// `CompanyHalted` is only ever seen when a halt lands between the
+    /// claim's commit and this read. `halt::release` calls no requeue, so
+    /// parking that race would strand a customer's message until an
+    /// unrelated policy edit revived it. Both arms are asserted together,
+    /// exactly as the terminal/deadline pair above is: the pair is what says
+    /// the handler distinguishes "nobody can fix this by waiting" from
+    /// "somebody deliberately pressed stop".
+    #[tokio::test]
+    async fn a_turn_no_model_can_be_billed_to_is_parked_but_a_halt_hands_it_back() {
+        let Some(landed) = land_a_message("Can you resend the revised quote?").await else {
+            return;
+        };
+        let event = landed.turn_event().await;
+
+        // The state every tenant is in before somebody connects one. Through
+        // the admin transaction because there is no disconnect verb and
+        // `app_role` holds no DELETE on this table — a tenant cannot take its
+        // own connection away, which is the point of the grant.
+        let mut tx = landed.db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenant_model_access WHERE tenant_id = $1")
+            .bind(landed.tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("disconnect the model");
+        tx.commit().await.expect("commit the disconnection");
+
+        // The empty script is the tripwire: `ScriptedLlm::new(vec![])` answers
+        // `ProviderError::Terminal`, so a turn that *reached* the model would
+        // also be terminal — and the assertion on the sentence is what says
+        // this one never got there.
+        let verdict = landed
+            .take_turn(
+                &event,
+                Arc::new(ScriptedLlm::new(vec![])),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(Failure::Terminal(why)) = &verdict else {
+            panic!(
+                "a turn for a tenant with no model connected is being retried, and no \
+                 retry can connect one: seven more attempts read the same row to reach \
+                 the same sentence: {verdict:?}"
+            );
+        };
+        assert!(
+            why.contains("connected no model"),
+            "the parked row does not name the remedy, or the turn reached the model \
+             after all: {why}"
+        );
+
+        // -- and a stop is handed back, not parked --------------------------
+        let now = Utc::now();
+        let mut tx = landed.db.tenant_tx(landed.tenant).await.expect("tenant tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &agentos_domain::model_access::ModelAccess {
+                path: agentos_domain::model_access::ModelPath::Cli,
+                model: ModelId::Opus5,
+                verified_at: now,
+            },
+            None,
+            now,
+        )
+        .await
+        .expect("reconnect the model");
+        agentos_store::halt::place(&mut tx, "stop everything", "operator:ops", now)
+            .await
+            .expect("place the halt")
+            .expect("the company was running");
+        tx.commit().await.expect("commit the halt");
+
+        let verdict = landed
+            .take_turn(
+                &event,
+                Arc::new(ScriptedLlm::new(vec![])),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(verdict, Err(Failure::Retry(_))),
+            "a message caught by a halt between the claim and the read was parked; \
+             releasing the halt requeues nothing, so it would sit there until some \
+             unrelated policy edit happened to revive it: {verdict:?}"
+        );
+
+        landed.teardown().await;
+    }
+
+    /// **A stored charter that no longer parses is read once, not eight
+    /// times.**
+    ///
+    /// The sibling of the arm above, in the same handler and with the same
+    /// cause: `CharterError` says which of its two variants a retry could
+    /// help, and `.map_err(|err| format!(…))?` threw the answer away, because
+    /// `From<String> for Failure` is `Failure::Retry`. `Corrupt` names a field
+    /// of a stored objective that no longer round-trips through the
+    /// constructors it came in through — a build that widened `Objective`, or
+    /// a row somebody edited — and those bytes parse the same way on the
+    /// eighth read.
+    ///
+    /// `routes::initiative::get` and the initiative loop both already treat an
+    /// unreadable charter as a fact about the row rather than as an outage;
+    /// this is the message-driven path saying the same thing.
+    #[tokio::test]
+    async fn a_turn_whose_charter_will_not_parse_is_parked_not_retried() {
+        let Some(landed) = land_a_message("Any update on the bolts?").await else {
+            return;
+        };
+        let event = landed.turn_event().await;
+
+        // The `role` still passes `employee_charters_role`; only the objective
+        // stopped being readable, which is the shape a schema change leaves.
+        let mut tx = landed.db.tenant_tx(landed.tenant).await.expect("tenant tx");
+        sqlx::query("UPDATE employee_charters SET objective = '{}'::jsonb")
+            .execute(&mut **tx)
+            .await
+            .expect("corrupt the stored objective");
+        tx.commit().await.expect("commit the corrupt charter");
+
+        // Empty script, so a turn that got as far as the model would be
+        // terminal too — and would not say "charter".
+        let verdict = landed
+            .take_turn(
+                &event,
+                Arc::new(ScriptedLlm::new(vec![])),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(Failure::Terminal(why)) = &verdict else {
+            panic!(
+                "an unreadable charter is being retried; the same `serde` refusal over the \
+                 same bytes, seven more times, with the message counted as backlog \
+                 throughout: {verdict:?}"
+            );
+        };
+        assert!(
+            why.contains("charter"),
+            "the parked row does not say the charter is what stopped it: {why}"
         );
 
         landed.teardown().await;
