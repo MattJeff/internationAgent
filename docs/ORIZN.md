@@ -37,6 +37,34 @@ that test is what says so.
 
 There are five role packs in this workspace. Orizn uses four of them.
 
+### The cold-contact ceilings, decided 2026-08-28
+
+The five packs carry `max_new_contacts_per_day` of 0, 0, 5, 5 and 20, and the
+spread looks wrong until you read it beside `allowed_channels`. It is not.
+
+**`growth` and `direction` are 0 because they have no outbound channel.**
+`growth` is `["internal", "web"]` — it reads and it talks to colleagues.
+`direction` is `[]` with `max_turns_per_day: 0`, which makes it a figurehead
+seat: it exists so the reporting lines in the org chart are real, and it never
+takes a turn. Both zeroes are the only coherent value, and raising either would
+create a budget the channel rules refuse anyway. **Do not "fix" them.**
+
+**The genuine oddity is the other way round.** `sales-development`, whose whole
+job is approaching strangers, has 5; `customer-success`, whose contacts are
+people the company already sells to, has 20 — and a *new* contact is rare for
+that seat by definition. If one of the two is mis-set it is the second.
+
+**Five a day for the seller is deliberate and stays.** A sending domain that
+jumps to volume is classified as spam, and `agents.example.com` is new. Five is
+a warming schedule, not a mistake.
+
+**What is missing is that nothing ramps.** The ceiling is a static number in a
+policy layer; there is no path that raises it as the domain ages, and no
+measurement of deliverability to raise it against. So the number is right for
+week one and wrong for month six, and the only thing that can change it is an
+operator editing a document. That is the gap worth closing before the number is.
+
+
 | Function | Team slug | Head | Role pack | Turns/day |
 |---|---|---|---|---|
 | Direction | `direction` | `founder` | **none** | 0 |
