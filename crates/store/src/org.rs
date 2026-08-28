@@ -772,7 +772,7 @@ mod tests {
         Slug::parse(s).expect("valid slug")
     }
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Usd).expect("positive")
     }
 
@@ -899,17 +899,22 @@ mod tests {
         set_member(&mut tx, employee, team, Some(section))
             .await
             .expect("set member");
-        set_budget(&mut tx, team, usd(100_000))
+        set_budget(&mut tx, team, usd_minor(100_000))
             .await
             .expect("set budget");
         spend::set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(50_000), usd(50_000), NonZeroU32::new(5).unwrap()).unwrap(),
+            SpendCaps::new(
+                usd_minor(50_000),
+                usd_minor(50_000),
+                NonZeroU32::new(5).unwrap(),
+            )
+            .unwrap(),
         )
         .await
         .expect("set caps");
-        reserve(&mut tx, employee, DAY, usd(1_000))
+        reserve(&mut tx, employee, DAY, usd_minor(1_000))
             .await
             .expect("reserve");
         tx.commit().await.expect("commit org");
@@ -1120,14 +1125,19 @@ mod tests {
         spend::set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(10_000), usd(10_000), NonZeroU32::new(9).unwrap()).unwrap(),
+            SpendCaps::new(
+                usd_minor(10_000),
+                usd_minor(10_000),
+                NonZeroU32::new(9).unwrap(),
+            )
+            .unwrap(),
         )
         .await
         .expect("caps");
         tx.commit().await.expect("commit");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let err = reserve(&mut tx, employee, DAY, usd(100))
+        let err = reserve(&mut tx, employee, DAY, usd_minor(100))
             .await
             .expect_err("no team budget means no spending");
         assert!(matches!(err, TeamSpendRefused::NoBudget { .. }), "{err}");
@@ -1154,17 +1164,22 @@ mod tests {
         set_member(&mut tx, employee, team, None)
             .await
             .expect("member");
-        set_budget(&mut tx, team, usd(10_000))
+        set_budget(&mut tx, team, usd_minor(10_000))
             .await
             .expect("budget");
         spend::set_caps(
             &mut tx,
             employee,
-            SpendCaps::new(usd(10_000), usd(10_000), NonZeroU32::new(9).unwrap()).unwrap(),
+            SpendCaps::new(
+                usd_minor(10_000),
+                usd_minor(10_000),
+                NonZeroU32::new(9).unwrap(),
+            )
+            .unwrap(),
         )
         .await
         .expect("caps");
-        let reservation = reserve(&mut tx, employee, DAY, usd(6_000))
+        let reservation = reserve(&mut tx, employee, DAY, usd_minor(6_000))
             .await
             .expect("reserve");
         tx.commit().await.expect("commit");
@@ -1226,7 +1241,7 @@ mod tests {
         let team = create_team(&mut tx, &slug("purchasing"), "Purchasing")
             .await
             .expect("team");
-        set_budget(&mut tx, team, usd(TEAM_BUDGET))
+        set_budget(&mut tx, team, usd_minor(TEAM_BUDGET))
             .await
             .expect("budget");
         for employee in &employees {
@@ -1238,7 +1253,12 @@ mod tests {
             spend::set_caps(
                 &mut tx,
                 *employee,
-                SpendCaps::new(usd(AMOUNT * 5), usd(AMOUNT), NonZeroU32::new(5).unwrap()).unwrap(),
+                SpendCaps::new(
+                    usd_minor(AMOUNT * 5),
+                    usd_minor(AMOUNT),
+                    NonZeroU32::new(5).unwrap(),
+                )
+                .unwrap(),
             )
             .await
             .expect("caps");
@@ -1286,7 +1306,7 @@ mod tests {
                     // survivor panic, which the join reports as a red test.
                     crate::db::wait_at_barrier(&gate, "one of the twelve employees").await;
                     let start = Instant::now();
-                    let outcome = reserve(&mut tx, employee, DAY, usd(AMOUNT)).await;
+                    let outcome = reserve(&mut tx, employee, DAY, usd_minor(AMOUNT)).await;
                     let granted = match outcome {
                         Ok(_) => {
                             tx.commit().await.expect("commit");
@@ -1379,7 +1399,7 @@ mod tests {
         let team = create_team(&mut tx, &slug("purchasing"), "Purchasing")
             .await
             .expect("team");
-        set_budget(&mut tx, team, usd(10_000))
+        set_budget(&mut tx, team, usd_minor(10_000))
             .await
             .expect("budget");
         for employee in [one, two] {
@@ -1389,7 +1409,12 @@ mod tests {
             spend::set_caps(
                 &mut tx,
                 employee,
-                SpendCaps::new(usd(50_000), usd(6_000), NonZeroU32::new(9).unwrap()).unwrap(),
+                SpendCaps::new(
+                    usd_minor(50_000),
+                    usd_minor(6_000),
+                    NonZeroU32::new(9).unwrap(),
+                )
+                .unwrap(),
             )
             .await
             .expect("caps");
@@ -1399,7 +1424,7 @@ mod tests {
         // *create* the row, and Postgres serialises that on the primary key all
         // by itself — which would let a lock-free implementation pass for the
         // wrong reason.
-        reserve(&mut tx, one, DAY, usd(1_000))
+        reserve(&mut tx, one, DAY, usd_minor(1_000))
             .await
             .expect("warm-up");
         tx.commit().await.expect("commit setup");
@@ -1407,7 +1432,7 @@ mod tests {
         // First member reserves and holds the transaction open, exactly as it
         // would while the payment intent is written next to it.
         let mut first = db.tenant_tx(tenant).await.expect("tenant tx");
-        reserve(&mut first, one, DAY, usd(6_000))
+        reserve(&mut first, one, DAY, usd_minor(6_000))
             .await
             .expect("first reservation");
 
@@ -1415,7 +1440,7 @@ mod tests {
             let db = db.clone();
             async move {
                 let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-                match reserve(&mut tx, two, DAY, usd(6_000)).await {
+                match reserve(&mut tx, two, DAY, usd_minor(6_000)).await {
                     // Commit the grant: if the implementation wrongly allowed
                     // it, the damage must show up in the bucket rather than be
                     // rolled back by a tidy test.

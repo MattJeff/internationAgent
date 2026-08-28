@@ -483,17 +483,17 @@ async fn stand_up(db: Db, passes: usize) -> Company {
         .iter()
         .find(|(slug, ..)| *slug == "books")
         .expect("the finance seat");
-    let usd = |minor| Money::new(minor, Currency::Usd).expect("usd");
+    let usd_minor = |minor| Money::new(minor, Currency::Usd).expect("usd");
     let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-    org::set_budget(&mut tx, finance.2, usd(100_000))
+    org::set_budget(&mut tx, finance.2, usd_minor(100_000))
         .await
         .expect("team budget");
     spend::set_caps(
         &mut tx,
         finance.1,
         spend::SpendCaps::new(
-            usd(100_000),
-            usd(50_000),
+            usd_minor(100_000),
+            usd_minor(50_000),
             std::num::NonZeroU32::new(2).expect("two"),
         )
         .expect("caps"),

@@ -507,7 +507,7 @@ mod tests {
         Domain::parse(s).unwrap()
     }
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Usd).unwrap()
     }
 
@@ -524,7 +524,7 @@ mod tests {
     }
 
     fn spend(tx: u64, day: u64, approval: u64) -> Option<SpendLimits> {
-        Some(SpendLimits::try_new(usd(tx), usd(day), usd(approval)).unwrap())
+        Some(SpendLimits::try_new(usd_minor(tx), usd_minor(day), usd_minor(approval)).unwrap())
     }
 
     /// A tenant layer wide enough that every team below it is visibly tighter.
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(eu.allowed_domains, [domain("alibaba.com")].into());
         assert_eq!(eu.allowed_mcp_tools, [tool("erp", "lookup")].into());
         assert!(!eu.allow_credential_change);
-        assert_eq!(eu.spend.unwrap().max_per_day(), usd(200_000));
+        assert_eq!(eu.spend.unwrap().max_per_day(), usd_minor(200_000));
 
         // A real narrowing does take effect.
         let apac = t.layer_for(Some(&slug("apac"))).unwrap();
@@ -867,7 +867,7 @@ mod tests {
             spend: spend(5_000, 5_000, 5_000),
             ..purchasing()
         };
-        let budget = TeamBudget::per_day(usd(8_000));
+        let budget = TeamBudget::per_day(usd_minor(8_000));
         let t = team("purchasing", per_employee, Some(budget));
 
         let caps_sum = t.limits().spend.unwrap().max_per_day().minor() * 2;
@@ -887,7 +887,7 @@ mod tests {
         )
         .unwrap();
         let pay = Action::PaymentCreate {
-            amount: usd(4_500),
+            amount: usd_minor(4_500),
             payee: "acct-supplier".to_owned(),
         };
         for who in [employee(2), employee(3)] {
@@ -900,26 +900,26 @@ mod tests {
         }
 
         // The team budget is what catches the second one.
-        let after_first = budget.charge(None, usd(4_500)).unwrap();
-        assert_eq!(after_first, usd(4_500));
+        let after_first = budget.charge(None, usd_minor(4_500)).unwrap();
+        assert_eq!(after_first, usd_minor(4_500));
         assert_eq!(
-            budget.charge(Some(after_first), usd(4_500)),
+            budget.charge(Some(after_first), usd_minor(4_500)),
             Err(OrgError::TeamBudgetExhausted {
-                cap: usd(8_000),
-                spent: Some(usd(4_500)),
-                requested: usd(4_500),
+                cap: usd_minor(8_000),
+                spent: Some(usd_minor(4_500)),
+                requested: usd_minor(4_500),
             })
         );
         // Exactly on the cap is still fine; one minor unit over is not.
         assert_eq!(
-            budget.charge(Some(after_first), usd(3_500)).unwrap(),
-            usd(8_000)
+            budget.charge(Some(after_first), usd_minor(3_500)).unwrap(),
+            usd_minor(8_000)
         );
-        assert!(budget.charge(Some(after_first), usd(3_501)).is_err());
+        assert!(budget.charge(Some(after_first), usd_minor(3_501)).is_err());
 
         // A ledger in another currency is a mismatch, never a free pass.
         assert_eq!(
-            budget.charge(Some(Money::new(1, Eur).unwrap()), usd(1)),
+            budget.charge(Some(Money::new(1, Eur).unwrap()), usd_minor(1)),
             Err(OrgError::CurrencyMismatch {
                 left: Usd,
                 right: Eur
@@ -927,7 +927,7 @@ mod tests {
         );
         // Overflow reads as exhaustion, not as a wrap.
         assert!(matches!(
-            budget.charge(Some(usd(u64::MAX)), usd(u64::MAX)),
+            budget.charge(Some(usd_minor(u64::MAX)), usd_minor(u64::MAX)),
             Err(OrgError::TeamBudgetExhausted { .. })
         ));
     }
@@ -941,12 +941,12 @@ mod tests {
                 spend: spend(50_000, 200_000, 10_000),
                 ..purchasing()
             },
-            Some(TeamBudget::per_day(usd(3_000))),
+            Some(TeamBudget::per_day(usd_minor(3_000))),
         );
         let clamped = t.limits().spend.unwrap();
-        assert_eq!(clamped.max_per_day(), usd(3_000));
-        assert_eq!(clamped.max_per_transaction(), usd(3_000));
-        assert_eq!(clamped.approval_above(), usd(3_000));
+        assert_eq!(clamped.max_per_day(), usd_minor(3_000));
+        assert_eq!(clamped.max_per_transaction(), usd_minor(3_000));
+        assert_eq!(clamped.approval_above(), usd_minor(3_000));
 
         // And the clamp is still a tightening of the tenant, not a widening.
         assert!(is_tighter_than(t.limits(), &tenant_layer()));
@@ -1062,7 +1062,7 @@ mod tests {
             (1u64..100_000, 1u64..100_000, 1u64..100_000).prop_map(|(a, b, c)| {
                 let mut v = [a, b, c];
                 v.sort_unstable();
-                SpendLimits::try_new(usd(v[1]), usd(v[2]), usd(v[0]))
+                SpendLimits::try_new(usd_minor(v[1]), usd_minor(v[2]), usd_minor(v[0]))
                     .expect("ordered by construction")
             }),
         )
@@ -1127,7 +1127,7 @@ mod tests {
     }
 
     fn any_budget() -> impl Strategy<Value = Option<TeamBudget>> {
-        proptest::option::of((1u64..100_000).prop_map(|m| TeamBudget::per_day(usd(m))))
+        proptest::option::of((1u64..100_000).prop_map(|m| TeamBudget::per_day(usd_minor(m))))
     }
 
     proptest! {

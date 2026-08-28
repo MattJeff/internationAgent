@@ -126,7 +126,7 @@ fn addr(raw: &str) -> EmailAddress {
     EmailAddress::parse(raw).expect("a valid address")
 }
 
-fn usd(minor: u64) -> Money {
+fn usd_minor(minor: u64) -> Money {
     Money::new(minor, Usd).expect("non-zero")
 }
 
@@ -650,7 +650,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     let objective = Objective {
         what: "M6x20 A2-70 stainless hex bolts".to_owned(),
         quantity: 2_000,
-        max_unit_price: Some(usd(900)),
+        max_unit_price: Some(usd_minor(900)),
         delivery_country: Some(RoleCountry::parse("us").expect("country")),
         requirements: vec!["RoHS".to_owned(), "ISO 9001".to_owned()],
     };
@@ -773,7 +773,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     let would_have_won = agentos_app::sourcing::landed_cost(&as_if_live, &lane(), &fx())
         .expect("comparable")
         .total;
-    assert_eq!(would_have_won, usd(1_502_724), "$15,027.24 delivered");
+    assert_eq!(would_have_won, usd_minor(1_502_724), "$15,027.24 delivered");
 
     let live: Vec<Quote<'_>> = [(&cny_exw, &list[0]), (&eur_ddp, &list[1])]
         .into_iter()
@@ -798,9 +798,17 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         ranked[0].supplier, list[1],
         "the dearer unit price landed cheaper: {ranked:#?}"
     );
-    assert_eq!(ranked[0].total, usd(1_684_800), "$16,848.00 delivered");
+    assert_eq!(
+        ranked[0].total,
+        usd_minor(1_684_800),
+        "$16,848.00 delivered"
+    );
     assert_eq!((ranked[0].duty_minor, ranked[0].legs_minor), (0, 0), "DDP");
-    assert_eq!(ranked[1].total, usd(1_711_760), "$17,117.60 delivered");
+    assert_eq!(
+        ranked[1].total,
+        usd_minor(1_711_760),
+        "$17,117.60 delivered"
+    );
     assert_eq!(
         (
             ranked[1].goods_minor,
@@ -1065,7 +1073,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         reference: "PO-8812-DEPOSIT".to_owned(),
         description: "30% deposit as demanded in the supplier's email".to_owned(),
         quantity: QUANTITY,
-        total: usd(DEPOSIT_MINOR),
+        total: usd_minor(DEPOSIT_MINOR),
     };
     let refused = buyer
         .place_order(&deposit, TrustLabel::Untrusted)
@@ -1142,7 +1150,7 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
 
     // A small one, for the carve-out that does not exist.
     let small = Order {
-        total: usd(1_000), // $10.00
+        total: usd_minor(1_000), // $10.00
         reference: "PO-8813".to_owned(),
         ..order.clone()
     };
@@ -1609,8 +1617,8 @@ fn the_shortlist_and_the_ranking_are_the_same_every_run() {
     for _ in 0..5 {
         assert_eq!(rank(&quotes, &lane(), &fx()).expect("comparable"), once);
     }
-    assert_eq!(once[0].total, usd(1_684_800));
-    assert_eq!(once[1].total, usd(1_711_760));
+    assert_eq!(once[0].total, usd_minor(1_684_800));
+    assert_eq!(once[1].total, usd_minor(1_711_760));
 }
 
 /// The RFQ the domain models, checked against the target it was written for.

@@ -295,9 +295,9 @@ impl RolePack {
                 // structuring stop.
                 spend: Some(
                     SpendLimits::try_new(
-                        usd(5_000),  // per transaction
-                        usd(20_000), // per day
-                        usd(1_000),  // above this, a human signs off
+                        usd_major(5_000),  // per transaction
+                        usd_major(20_000), // per day
+                        usd_major(1_000),  // above this, a human signs off
                     )
                     .expect("the buyer's spend caps are coherent"),
                 ),
@@ -548,7 +548,7 @@ impl RolePack {
     }
 }
 
-fn usd(major: u64) -> Money {
+fn usd_major(major: u64) -> Money {
     Money::from_major(major, Currency::Usd).expect("a non-zero usd amount")
 }
 
@@ -941,9 +941,27 @@ mod tests {
         let policy = role_only_policy();
         let ctx = ctx();
         let pay = |major: u64| Action::PaymentCreate {
-            amount: usd(major),
+            amount: usd_major(major),
             payee: "acct-supplier".to_owned(),
         };
+
+        // The caps, in minor units, and the unit is the whole point of the
+        // line. Everything below is written through `usd_major`, so if that
+        // helper's conversion were wrong the caps and the payments would move
+        // together by the same factor and every assertion would still pass —
+        // which is exactly what a mutation multiplying it by a hundred proved.
+        // This reads the numbers in the unit the column and the wire use, so
+        // it is the one assertion here a major/minor mix-up cannot survive.
+        let spend = buyer().limits().spend.expect("the buyer has spend caps");
+        assert_eq!(
+            (
+                spend.max_per_transaction().minor(),
+                spend.max_per_day().minor(),
+                spend.approval_above().minor(),
+            ),
+            (500_000, 2_000_000, 100_000),
+            "$5,000 a transaction, $20,000 a day, $1,000 unsupervised"
+        );
 
         // Under the approval threshold: the buyer settles a sample invoice.
         assert!(evaluate(&policy, &pay(400), &ctx).is_allow());
@@ -972,7 +990,7 @@ mod tests {
 
         // And the day's running total is the structuring stop.
         let busy = ActionCtx {
-            spent_today: Some(usd(19_000)),
+            spent_today: Some(usd_major(19_000)),
             ..ctx.clone()
         };
         assert_eq!(

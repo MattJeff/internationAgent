@@ -978,7 +978,7 @@ mod tests {
     use agentos_domain::policy::{Decision, DenyReason, SpendLimits, evaluate, turns_remaining};
     use agentos_domain::untrusted::TrustLabel;
 
-    fn usd(minor: u64) -> Money {
+    fn usd_minor(minor: u64) -> Money {
         Money::new(minor, Currency::Usd).expect("non-zero")
     }
 
@@ -1026,7 +1026,8 @@ mod tests {
         // The ceiling Orizn's runbook argues for, in miniature.
         let ceiling = PolicyLimits {
             spend: Some(
-                SpendLimits::try_new(usd(50_000), usd(200_000), usd(100)).expect("coherent"),
+                SpendLimits::try_new(usd_minor(50_000), usd_minor(200_000), usd_minor(100))
+                    .expect("coherent"),
             ),
             allowed_channels: [Channel::Email, Channel::Internal, Channel::Web].into(),
             allowed_domains: [domain("orizn.app")].into(),
@@ -1132,7 +1133,8 @@ mod tests {
 
         let tenant_layer = PolicyLimits {
             spend: Some(
-                SpendLimits::try_new(usd(50_000), usd(100_000), usd(100)).expect("coherent"),
+                SpendLimits::try_new(usd_minor(50_000), usd_minor(100_000), usd_minor(100))
+                    .expect("coherent"),
             ),
             // `Web` kept: this layer narrows spending and nothing else about
             // reach, and browsing is a channel now — dropping it here would
