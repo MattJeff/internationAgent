@@ -1041,16 +1041,32 @@ async fn connect(
         // `mcp::tests::a_hosted_binding_starts_a_bridge_and_never_names_its_address`.
         //
         // **What is left to write here, when the branch opens, and in what
-        // order.** The process cap is done and did not wait for this route:
-        // `hosted::BRIDGES_PER_TENANT` is the number and `app::mcp::Fleet::bind`
-        // applies it before any runtime is asked, so opening this branch cannot
-        // hand a tenant an unbounded number of containers whatever it writes.
-        // What is still owed *here* is the refusal a customer can read: count
-        // this tenant's rows on hosted connectors and answer 409 past the cap,
-        // in the same change that first lets one be written. Without it a
-        // customer is told "verified" about a row that will bind as
-        // `hosted_cap_reached` forever — a lie rather than a load, which is the
-        // whole reason this half is second and not first.
+        // order.** `hosted::BRIDGES_PER_TENANT` did not wait for this route:
+        // `app::mcp::Fleet::bind` applies it before any runtime is asked, so
+        // opening this branch cannot hand a tenant an unbounded number of
+        // containers *on one bind pass*.
+        //
+        // One pass is all it bounds, and that is the number this route has to
+        // be written against. The bind-time counter is a local that resets
+        // every pass and admits the alphabetically first handles; a bridge is
+        // leased, not stopped, so a customer who writes a hosted row sorting
+        // below their current ones starts a container and leaves the displaced
+        // one running for the runtime's idle TTL. `hosted::BRIDGES_PER_TENANT`
+        // has the arithmetic — `n` × TTL ÷ pass interval, and this loop rebinds
+        // on the nudge every mutation here sends, so the pass interval is one
+        // write.
+        //
+        // So the refusal owed here is not only the one a customer can read, it
+        // is the one that makes the ceiling true: count this tenant's rows on
+        // hosted connectors and answer 409 past the cap, in the same change
+        // that first lets one be written, with the cap **equal to**
+        // `BRIDGES_PER_TENANT` rather than a roomier number — and count hosted
+        // handles this tenant has retired inside the idle TTL as well, or
+        // `DELETE /v1/mcp/servers/{server}` refunds the slot while the
+        // container behind it is still alive and the cap counts rows the
+        // machine is not running. Without any of it a customer is also told
+        // "verified" about a row that will bind as `hosted_cap_reached`
+        // forever — a lie on top of the load.
         //
         // The count belongs in the same transaction as the INSERT below, and it
         // needs `pg_advisory_xact_lock(hashtextextended($tenant::text, 0))` in
