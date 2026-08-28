@@ -380,14 +380,28 @@ struct InitiativeView {
     /// Why it is barred, when it is. `barred` always means this is not `active`.
     lifecycle: Lifecycle,
     /// When it was last taken up, and how many times. Claims, not turns: a
-    /// worker killed mid-turn still counts here, so a `claims` that climbs while
-    /// `last_outcome` stays put is something dying.
+    /// worker killed mid-turn still counts here, which is what makes the pair
+    /// below readable.
     last_claimed_at: Option<DateTime<Utc>>,
     claims: i64,
-    /// What the poller decided last time: `turn`, `clarify`, `no_charter`,
-    /// `unreadable_charter`, `no_model`, `over_budget`, `error`.
+    /// What the poller decided about **the beat `last_claimed_at` names**:
+    /// `turn`, `clarify`, `no_charter`, `unreadable_charter`, `no_model`,
+    /// `no_work`, `over_budget`, `error`.
+    ///
+    /// `null` with `claims: 0` is an employee that has never acted. **`null`
+    /// with `claims` above zero is a beat that produced nothing** — running
+    /// right now, or gone with the worker that took it, told apart by how long
+    /// ago `last_claimed_at` was. It is never the beat before this one: the
+    /// claim clears these two columns, and `agentos_store::initiative::claim_due`
+    /// carries the argument.
+    ///
+    /// This used to read "a `claims` that climbs while `last_outcome` stays put
+    /// is something dying", and that sentence needed two reads a cadence apart
+    /// to say anything at all — while `no_charter` legitimately stays put
+    /// forever. One read answers it now.
     last_outcome: Option<String>,
     /// The detail behind it — for `clarify`, the question waiting on an answer.
+    /// Cleared with the code, so it never explains an outcome that is gone.
     last_detail: Option<String>,
     /// Which role's objective this employee carries, if any.
     role: Option<&'static str>,

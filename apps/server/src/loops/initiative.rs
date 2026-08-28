@@ -1040,6 +1040,17 @@ async fn sales_work_for(
 /// a process killed here can never be mistaken for one, and that a failure to
 /// record stays swallowed — the promise is already consumed either way, and
 /// stopping the loop over bookkeeping would cost every other employee its turn.
+///
+/// **Both arms now hold that property, and the cadence arm did not used to.**
+/// The claim commits before the turn on this side too, so a worker killed
+/// between the two left `employee_initiative.last_outcome` reporting the
+/// *previous* beat — an employee whose every beat died still reading `turn`,
+/// which is the one status an operator does not investigate.
+/// `agentos_store::initiative::claim_due` empties the two columns when it takes
+/// a beat up, so failing to reach the write below leaves NULL rather than a
+/// sentence about a turn that is gone. Same sense of silence as `0072`,
+/// re-established by the claim instead of inherited from a fresh row, because
+/// this table is one row per seat rather than one per beat.
 async fn record(db: &Db, due: &Woken, outcome: &Outcome, now: DateTime<Utc>) {
     let mut tx = match db.admin_tx_bypassing_rls().await {
         Ok(tx) => tx,

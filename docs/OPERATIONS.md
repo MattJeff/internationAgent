@@ -646,12 +646,31 @@ and it is the only write path that reads `policy_layers`. It runs the turn with
 charter and nothing else.
 
 Outcomes are written to `employee_initiative.last_outcome` and are a closed
-vocabulary: `no_charter`, `unreadable_charter`, `clarify`, `turn`, `error`,
-`over_budget`. `clarify` means the charter has a gap and the loop wrote the
-question down instead of spending a turn guessing — read `last_detail`.
+vocabulary: `no_charter`, `unreadable_charter`, `no_model`, `clarify`,
+`no_work`, `turn`, `error`, `over_budget`. `clarify` means the charter has a gap
+and the loop wrote the question down instead of spending a turn guessing — read
+`last_detail`.
+
+**`last_outcome` is about the beat `last_claimed_at` names, and NULL means that
+beat said nothing.** The claim empties the column when it takes a beat up and
+only the record at the end of the turn puts a word back, so a worker killed
+mid-turn leaves NULL rather than the previous beat's answer. Read the two
+columns together:
+
+* `claims = 0` — never acted. Set a cadence, or the employee is not `active`.
+* `last_outcome` set — that is what the last beat did, and `last_claimed_at` is
+  when.
+* **`last_outcome` NULL with `claims > 0` and `last_claimed_at` seconds ago** —
+  a turn is running. Normal.
+* **`last_outcome` NULL with `claims > 0` and `last_claimed_at` a whole cadence
+  ago** — the beat never came back. The worker died between the claim and the
+  record, or the record itself failed; `grep` the log for
+  `initiative outcome was not recorded`. If `claims` keeps climbing and the
+  column keeps coming back NULL, every beat is dying.
 
 ```sql
-SELECT employee_id, interval_secs, next_at, claims, last_outcome, last_detail
+SELECT employee_id, interval_secs, next_at, claims,
+       last_claimed_at, last_outcome, last_detail
 FROM   employee_initiative ORDER BY next_at;
 ```
 
