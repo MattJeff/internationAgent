@@ -419,9 +419,11 @@ cargo runs each package's test binary in parallel; several tests are
 cross-tenant by nature (the outbox poller reads every tenant's rows — that is
 its job), so two packages sharing one database see each other's fixtures and
 fail for reasons that have nothing to do with the code. `scripts/test.sh`
-creates one database per package (`ci_agentosdomain`, `ci_agentosstore`, …),
-applies the migrations, and runs each package's tests. There is no
-`--test-threads=1` any more: the tests isolate themselves, and serialising them
+creates one database per package, named `ci_<package>_<run id>`
+(`ci_agentosdomain_…`, `ci_agentosstore_…`), applies the migrations, and runs
+each package's tests. The run id is the shell's PID folded with the checkout:
+fixed names meant two concurrent runs dropped each other's databases mid-suite.
+There is no `--test-threads=1` any more: the tests isolate themselves, and serialising them
 only hid that.
 
 Two guards, both deliberate. It **refuses to start** without `psql` and a
@@ -468,6 +470,7 @@ That is deliberate.
 | `AGENTOS_API_KEYS` | empty | The operators' keyring, consulted **before** the `api_keys` table so a row cannot shadow it. Empty is fine when `AGENTOS_PLATFORM_KEYS` is set; empty *and* no platform key means every request is 401 and nothing can issue one, which the server warns about at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
 | `AGENTOS_PLATFORM_KEYS` | empty | **`/v1/platform/*` is 401 to everybody**, so nobody can sign up and no key can be issued or revoked without a redeploy. Format: `label:secret[,…]` — no tenant uuid, deliberately. Secret ≥ 32 chars. |
 | `AGENTOS_WEBHOOK_SECRETS` | empty | Empty **and** an empty `webhook_endpoints` table means every `/v1/webhooks/{path}` is a 404 and no inbound message can ever arrive. The server warns when the variable is empty. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). Consulted **before** the table so a row cannot shadow it. Holds **one tenant per provider** — two entries on one path is a boot failure; register the second customer with `POST /v1/platform/webhooks`. |
+| `AGENTOS_OAUTH_CLIENTS` | empty | **No connector is advertised by `GET /v1/mcp/catalog`**, so nobody can start an OAuth flow and nobody clicks a button that cannot work. Deployment scope and never tenant scope: a `client_secret` identifies *this product* to a provider, so it is the same value for every customer. Format: `connector:client_id:client_secret[,…]`; a malformed entry is a boot failure naming the position and never the value. This table said it was every variable while this one was missing from it. |
 | `EMAIL_API_KEY` | — | Unset runs `MockEmailProvider`. Set to the `re_…` key, it **builds the real Resend client**. |
 | `TELEPHONY_API_KEY` | — | Unset runs `MockTelephony`. Set to `ACxxxx:auth_token` — Twilio authenticates with both halves together — it **builds the real Twilio client**. Half of it is a boot failure. |
 | `BROWSER_API_KEY` | — | Unset runs `MockBrowser`. Set to `project-id:api-key`, it **builds the real Browserbase client with a live CDP driver**. Half of it is a boot failure. |
@@ -903,11 +906,15 @@ being billed for.
 
 ### How they happen
 
-Termination is two halves: the lifecycle move (immediate, HTTP) and the release
-of eleven provider resources (asynchronous, via the `employee.terminated`
-outbox event). If a provider is down, the release handler fails, the outbox
-retries eight times and dead-letters. Nothing retries after that — so the
-provisioning loop's **sweep** asks the database directly, every tick:
+Termination is two halves. The **lifecycle move** is immediate and HTTP — and
+since `0068` it also unassigns the seat's work items and cancels its
+outstanding appointments *in the same transaction*, because neither referential
+action fires when nothing ever deletes an employee row
+(`routes::employees::set_lifecycle`). The **release of eleven provider
+resources** is asynchronous, via the `employee.terminated` outbox event, and it
+is the half this section is about. If a provider is down, the release handler
+fails, the outbox retries eight times and dead-letters. Nothing retries after
+that — so the provisioning loop's **sweep** asks the database directly, every tick:
 *is there a terminated employee still holding a binding?*
 
 The sweep re-runs the release for anything with attempts left, and past the cap
@@ -1385,8 +1392,11 @@ restart loses in-flight mock mail.
 ## 10. Backup and restore
 
 The whole durable state of this system is the Postgres database. There is no
-other store: no file store, no queue, no cache. Blobs are `InMemoryBlobs` and do
-not survive a restart. Back up Postgres and you have backed up AgentOS.
+store beside it: no queue, no cache, and the file store (`files`, `0067`) is a
+`bytea` column in that same database rather than a bucket somewhere else.
+Inbound attachments are the exception and are not durable at all: the
+`BlobStore` behind them is `InMemoryBlobs` and does not survive a restart. Back
+up Postgres and you have backed up AgentOS.
 
 ### The important thing to understand first
 

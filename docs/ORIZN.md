@@ -613,9 +613,11 @@ raises the total by 30/66 of it. **Models are the multiplier**: the same turn
 costs $1/$5 per million on Haiku and $10/$50 on Fable, so the mix moves the bill
 by up to ten times without a single turn being added or removed. Moving the whole
 fleet to `claude-opus-5` — which is what this deployment did until the packs
-could name a model — costs $303–$560 rather than the $193–$357 above; the
-`the_company_bill_is_a_sum_over_seats_not_one_multiplication` test asserts that
-direction of the inequality so the claim cannot rot.
+could name a model — costs strictly more than the box above. This sentence used
+to publish both figures, and both were stale by the time anybody re-read them,
+which is the whole argument of this section. What is checked is the direction,
+by `the_company_bill_is_a_sum_over_seats_not_one_multiplication`, so the claim
+cannot rot.
 
 ---
 

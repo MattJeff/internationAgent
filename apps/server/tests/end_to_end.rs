@@ -1539,8 +1539,8 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
     );
 
     // **Its role's floor and its deployment's policy, not the catalogue.** The
-    // catalogue is five tools and this turn is offered two. None of the three
-    // absences is the taint filter: the order arrived as an
+    // catalogue is longer than what this turn is offered. None of the three
+    // absences named below is the taint filter: the order arrived as an
     // `Authorized<InternalSend>` rather than an `Untrusted<…>`, so the turn is
     // **trusted** and `turn::visible` is not taking anything away.
     //

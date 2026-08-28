@@ -2633,7 +2633,7 @@ mod tests {
         .await
         .expect("install the policy");
         // Our own browser handle, so the test can read the step log back; the
-        // other four ports are the development fakes, unmodified.
+        // other ports are the development fakes, unmodified.
         let browser = Arc::new(MockBrowser::new());
         browser.set_text(&flow().panel, panel);
         let ports = Arc::new(Ports {

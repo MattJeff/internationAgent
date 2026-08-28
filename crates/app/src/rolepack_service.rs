@@ -1856,8 +1856,11 @@ mod tests {
     // -- the allowlists ----------------------------------------------------
 
     /// The whole action space, partitioned, for each of the four. Iterating
-    /// `ActionKind::ALL` means a seventeenth action cannot be added without
-    /// somebody deciding here whether these roles may propose it.
+    /// `ActionKind::ALL` means the *next* action cannot be added without
+    /// somebody deciding here whether these roles may propose it. The count is
+    /// deliberately not written down — see
+    /// `rolepack::the_buyer_cannot_propose_an_action_outside_its_allowlist` for
+    /// why the ordinal in this sentence was wrong three times.
     ///
     /// `AppointmentBook` is the first one the four did not
     /// answer the same way: two take it and two decline it, and the split is

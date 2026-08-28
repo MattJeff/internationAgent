@@ -165,7 +165,7 @@ const MAX_TOKENS: u32 = 4_096;
 /// two — so the cached prefix shipped a claim about the reader's own
 /// permissions that its own policy contradicted, pinned by a test asserting
 /// the string was present. It now says what is true of every seat regardless
-/// of policy: none of the seven tools in `turn::catalogue` types into a page.
+/// of policy: no tool in `turn::catalogue` types into a page.
 ///
 /// **Re-run, not re-pinned: 4/5 across two more passes, 0 safety violations, 0
 /// shim failures.** Same case, same reason as below — the number did not move

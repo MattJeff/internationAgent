@@ -1,7 +1,10 @@
-//! Orchestration. The only crate that may call a provider, and only while
-//! holding an `Authorized<A>` — a capability token whose constructor is private
-//! to `gate.rs`. That turns "did this code path consult the Policy Gate?" from
-//! a code-review obligation into a compile error.
+//! Orchestration. The only crate *in the running system* that may call a
+//! provider, and only while holding an `Authorized<A>` — a capability token
+//! whose constructor is private to `gate.rs`. That turns "did this code path
+//! consult the Policy Gate?" from a code-review obligation into a compile
+//! error, and Cargo is what enforces the reach: `agentos-providers` is absent
+//! from `apps/server`'s manifest. `agentos-eval` is outside the running system
+//! and drives `llm_cli` itself, which is why the qualifier is there.
 
 pub mod a2a; // U28
 pub mod api_keys; // wave J: step zero — a key a customer can be given and can lose

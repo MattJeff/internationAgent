@@ -82,8 +82,9 @@ fi
 # One run's databases are that run's alone. Two concurrent runs used to share
 # the fixed names `ci_<pkg>` and deadlock: the second run's DROP DATABASE waits
 # forever on a connection the first run still holds, and neither ever finishes.
-# `$$` is the shell's PID, so a stale set from a killed run can never collide
-# with a live one either. Override RUN_ID to get stable names for debugging.
+# `RUN_ID` is the shell's PID folded together with the checkout — the last
+# paragraph in this block is why the PID alone was not enough. Override RUN_ID
+# to get stable names for debugging.
 #
 # Lowercased, and that is not tidiness. `CREATE DATABASE ci_agentosstore_wB`
 # is an *unquoted* identifier, which PostgreSQL folds to `ci_agentosstore_wb` —

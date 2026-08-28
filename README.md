@@ -31,7 +31,7 @@ Five crates, one binary, five loops.
 agentos-domain      pure types, employee state machine, Policy Gate evaluator
    │                (no tokio, no sqlx, no reqwest — the absence IS the enforcement)
    ├──> agentos-store       owns the schema, the migrations and TenantTx —
-   │                        every SQL statement anywhere runs inside one
+   │                        nearly every SQL statement anywhere runs inside one
    ├──> agentos-providers   the outbound provider clients: email, SMS, WhatsApp,
    │                        browser, LLM
    │       │
@@ -127,11 +127,11 @@ characters, no control characters, re-parsed on every read, and it grants nothin
 Every restriction is still a `policy_layers` row. You can draw all of this on a
 company that has been running for a year; there is no rebuild.
 
-**Employees talk to each other, and the channel has a shape.** `InternalSend` is
-the one action that does not leave the company, and it is an `Action` anyway,
-because waking a colleague spends that colleague's turn budget and only the gate
-may mint the right to spend one. An internal message costs one of the
-**recipient's** `max_turns_per_day`, reserved by the sender — which is what makes
+**Employees talk to each other, and the channel has a shape.** `InternalSend`
+never leaves the company, and it is an `Action` anyway, because waking a
+colleague spends that colleague's turn budget and only the gate may mint the
+right to spend one. An internal message costs one of the **recipient's**
+`max_turns_per_day`, reserved by the sender — which is what makes
 two employees unable to spin each other forever. It never touches the
 cold-outreach budget: a colleague is not a stranger, and a team that talked to
 itself all morning must still be able to answer its manager.
