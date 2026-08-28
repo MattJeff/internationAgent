@@ -806,6 +806,35 @@ async fn assert_the_company_is_orizn(db: &Db, tenant: TenantId, seats: &HashMap<
             "{role}: allowed_domains"
         );
 
+        // **The four switches, which are not numbers and were read by nothing.**
+        //
+        // Everything above and below compares a count, a set or a ruling. These
+        // four are booleans, `docs/ORIZN.md` argues each one off by name, and
+        // until this loop existed no assertion in the workspace read them off a
+        // standing company: flipping `allow_lead_upload` to `true` in
+        // `docs/orizn-ceiling.json` **and** `docs/orizn-roles/sales-development.json`
+        // — the two documents this file feeds to the real installer — left all
+        // three tests here green. That switch is the difference between the
+        // outreach queue being a CSV a founder reads before anybody is mailed
+        // and the same queue going straight to the sending platform, one gated
+        // call per stranger. Measured, not argued.
+        //
+        // On the loaded policy and not on the stored row, because the loader
+        // takes the AND: `true` here needs the ceiling *and* the role to say so,
+        // which is exactly the combination that would put it into effect.
+        for (field, on) in [
+            ("allow_file_upload", limits.allow_file_upload),
+            ("allow_credential_change", limits.allow_credential_change),
+            ("allow_data_delete", limits.allow_data_delete),
+            ("allow_lead_upload", limits.allow_lead_upload),
+        ] {
+            assert!(
+                !on,
+                "{role}: {field} is on for this seat, and docs/ORIZN.md argues it off — \
+                 a switch nobody at this company is entitled to should not exist"
+            );
+        }
+
         // **Can this seat actually do the thing the columns above describe?**
         //
         // The columns are values; this is the rule they produce. It is here
