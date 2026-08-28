@@ -5,6 +5,7 @@
 
 pub mod a2a; // U28
 pub mod api_keys; // wave J: step zero — a key a customer can be given and can lose
+pub mod backlog; // le carnet: the port a work board is reached through, ours or the customer's
 pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
 pub mod effects; // U21
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them

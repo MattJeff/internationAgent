@@ -88,6 +88,11 @@ uuid_newtype!(
     /// One recorded policy decision.
     DecisionId
 );
+uuid_newtype!(
+    /// One item on a company's shared work board.
+    /// See `migrations/0061_work_items.sql`.
+    WorkItemId
+);
 
 // ---------------------------------------------------------------------------
 // Slug
