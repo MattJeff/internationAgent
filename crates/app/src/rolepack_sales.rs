@@ -255,6 +255,15 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::InternalSend,
+                // `AppointmentBook` because this seat tells people it will do
+                // something at an hour and has, until now, had no way to be
+                // there. It is one of the two kinds added on 2026-08-28 and it is here rather than in
+                // every pack: `growth` and `entry-requirements` reach nobody
+                // outside the company, so a promise they could make is a promise
+                // to nobody — see `rolepack_service`'s note on the two that
+                // decline it. That is what makes this a decision rather than a
+                // default.
+                ActionKind::AppointmentBook,
             ]
             .into_iter()
             .collect(),
@@ -880,11 +889,10 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means a
-    /// seventeenth action cannot be added without someone deciding here whether
-    /// a sales employee may propose it. There are sixteen today
-    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 16]`); this said
-    /// "fourteenth" after both `charter_set` and `internal_send` had landed, and
-    /// "fifteenth" until `invoice_issue` did.
+    /// *next* action cannot be added without someone deciding here whether a
+    /// sales employee may propose it. The count is deliberately not written
+    /// down — see `rolepack::the_buyer_cannot_propose_an_action_outside_its_allowlist`
+    /// for why the ordinal in this sentence was wrong three times.
     #[test]
     fn the_sales_role_cannot_propose_an_action_outside_its_allowlist() {
         let sales = sales();
@@ -895,6 +903,7 @@ mod tests {
             ActionKind::BrowserRead,
             ActionKind::McpCall,
             ActionKind::InternalSend,
+            ActionKind::AppointmentBook,
         ]
         .into_iter()
         .collect();

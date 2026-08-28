@@ -452,7 +452,7 @@ const CAPABILITY_ROLE: &str = "approver";
 ///
 /// A row is: an employee **slug**, an `action_kind`, a `deny_reason`, a count,
 /// two timestamps, and the previous decision if there was one. That is the whole
-/// vocabulary — two closed enums from `agentos-domain`, fifteen values and
+/// vocabulary — two closed enums from `agentos-domain`, sixteen values and
 /// twenty-one, both `const` arrays this binary writes.
 ///
 /// There is no tool name and no domain, and their absence is the feature. A tool

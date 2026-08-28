@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::{DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId};
+use agentos_domain::ids::{AppointmentId, DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
@@ -61,12 +61,13 @@ use agentos_store::invoices;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use url::Url;
 use uuid::Uuid;
 
 use crate::backlog::{Backlog, BacklogError, PgBacklog, WorkAction};
+use crate::calendar::{Calendar, CalendarError, PgCalendar};
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 use crate::turn::WHOLE_PAGE;
@@ -170,6 +171,23 @@ pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 /// working. `migrations/0066_invoices.sql` argues why that ceiling is the
 /// structural one.
 pub const NO_WON_DEAL: &str = "no_won_deal";
+
+/// The zone a moment was promised in is not a name any tzdata knows.
+///
+/// A code, for [`NO_BROWSER`]'s reason and with the opposite advice: this one
+/// *is* worth trying again, because it is a typo in a field the model wrote.
+/// [`crate::calendar::CalendarError::UnknownZone`] argues at length why it is
+/// its own error rather than a not-found — a promise naming an employee that
+/// does not exist must stay silent, and a promise naming a zone the world does
+/// not have must say so.
+pub const UNKNOWN_ZONE: &str = "unknown_zone";
+
+/// The words of a promised hour are blank or longer than the column takes.
+///
+/// Also worth retrying, and also a fact about the caller's own string rather
+/// than about this deployment — see [`crate::calendar::CalendarError::SubjectShape`],
+/// which argues why the check lives in the adapter and not here.
+pub const BAD_SUBJECT: &str = "bad_subject";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -323,6 +341,52 @@ subject!(
     /// to say.
     InternalSend { to: Slug } => InternalSend
 );
+
+/// Undertake one moment of this employee's own time.
+///
+/// **Written out rather than produced by [`subject!`], because it has no
+/// field**, and the absence is the whole point rather than an inconvenience.
+/// Every other subject in this file carries the parsed counterparty of its
+/// effect; this one's counterparty is the acting employee, which lives in
+/// [`Principal`] and never in an [`Action`] — see
+/// [`Action::AppointmentBook`](agentos_domain::action::Action::AppointmentBook).
+///
+/// The instant, the zone and the subject line are not here either. They are
+/// arguments to [`Effects::book_hour`], the way a [`RenderedEmail`] is an
+/// argument beside an [`EmailSend`] token: the gate ruled on *whether this
+/// employee may promise an hour*, and it has no opinion about three o'clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppointmentBook;
+
+impl Authorizable for AppointmentBook {
+    fn to_action(&self) -> Action {
+        Action::AppointmentBook {}
+    }
+
+    /// Trusted: the value itself carries nothing a model chose. The turn's own
+    /// label is what decides which flavour is minted — see `turn::gated!`.
+    fn trust(&self) -> TrustLabel {
+        TrustLabel::Trusted
+    }
+}
+
+impl Authorizable for Untrusted<AppointmentBook> {
+    fn to_action(&self) -> Action {
+        self.expose_for_parsing().to_action()
+    }
+
+    fn trust(&self) -> TrustLabel {
+        self.taint()
+    }
+}
+
+impl Subject for AppointmentBook {
+    type Of = AppointmentBook;
+
+    fn subject(&self) -> &AppointmentBook {
+        self
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -1204,7 +1268,7 @@ impl Effects {
     /// scope-checked against the token exactly as a read is. Writing rows into
     /// this tenant's own `accounts` and `contacts` is not an
     /// [`Action`] and there is no kind for it — `knowledge::ingest` writes rows
-    /// with no ruling at all — so inventing a sixteenth [`ActionKind`] to cover
+    /// with no ruling at all — so inventing a further [`ActionKind`] to cover
     /// it would put a non-effect in the audit vocabulary.
     ///
     /// The bound on the rows is the policy's `max_new_contacts_per_day`, loaded
@@ -2033,6 +2097,78 @@ impl Effects {
             BacklogError::Unavailable(err) => EffectError::Unavailable(err),
             BacklogError::Provider(err) => EffectError::Provider(err),
         })
+    }
+
+    /// Promise one moment of this employee's own time.
+    ///
+    /// # Where the seat comes from, which is the whole security argument
+    ///
+    /// [`PgCalendar`] is built here, from `self.principal` — never from the
+    /// tool's arguments, which do not carry an employee and cannot be made to.
+    /// [`Calendar::book`] takes no employee either, so a `dyn Calendar` can only
+    /// ever promise a moment of its holder's own time and spend a turn out of
+    /// its holder's own budget. "Book an hour of somebody else's day" is
+    /// unrepresentable rather than refused, which is what
+    /// [`crate::calendar`]'s module docs mean by the absence being a security
+    /// property.
+    ///
+    /// # Why this one *is* an [`Action`] where posting work is not
+    ///
+    /// [`Effects::post_work`] refuses a discriminant that would add no rule, and
+    /// this one adds one: `always_denies` answers for it and
+    /// `evaluate_rules` has an arm, both on `Channel::Internal`, so a policy
+    /// layer can take the verb away from a seat. Posting work has no such
+    /// rule — its only bound is the org chart, which no `Action` can carry —
+    /// and inventing a kind for it would have put a decision in the trail that
+    /// nobody made.
+    ///
+    /// # The third adapter this reaches for
+    ///
+    /// ponytail: the third `PgCalendar::new` in the workspace, beside
+    /// `routes::calendar` and `loops::initiative`, and it is the same choice
+    /// `post_work` makes about `PgBacklog` for the same reason — all three say
+    /// "our own table", and the day a `calendar_bindings` row can say otherwise
+    /// one constructor replaces all three at once.
+    pub async fn book_hour<A: Subject<Of = AppointmentBook>>(
+        &self,
+        ok: Authorized<A>,
+        at: DateTime<Utc>,
+        zone: &str,
+        subject: &str,
+    ) -> Result<AppointmentId, EffectError> {
+        let booked = PgCalendar::new(
+            self.db.clone(),
+            self.principal.tenant_id,
+            self.principal.employee_id,
+        )
+        .book(at, zone, subject)
+        .await
+        // Total, with no `_` arm, so a fourth `CalendarError` has to be
+        // classified rather than defaulted. `UnknownZone` is `Refused` and not
+        // `Unavailable` on purpose: `Turn::performed` turns an `Unavailable`
+        // into the end of the run, and a mistyped zone must cost one tool
+        // result the model can correct — the same argument `Turn::propose`
+        // makes about an over-long work-item title.
+        .map_err(|err| match err {
+            CalendarError::Provider(err) => EffectError::Provider(err),
+            CalendarError::Unavailable(err) => EffectError::Unavailable(err),
+            CalendarError::UnknownZone => EffectError::Refused(UNKNOWN_ZONE),
+            CalendarError::SubjectShape => EffectError::Refused(BAD_SUBJECT),
+        });
+
+        // What the row says, and what it deliberately does not. The instant and
+        // the zone are ours — parsed by `Turn::propose`, formatted by chrono —
+        // and the *subject line* is not: it is free text the model wrote about
+        // whatever it has been reading, and `browse_detail` already sets the
+        // rule that nothing a stranger authored becomes an audit column. An
+        // operator who wants the words reads `appointments.subject`, which is
+        // the column that holds them, under the tenant's own RLS.
+        let detail = Some(json!({
+            "at": at.to_rfc3339(),
+            "at_zone": zone,
+            "appointment_id": booked.as_ref().ok().map(AppointmentId::as_uuid),
+        }));
+        self.record(&ok, detail, booked).await
     }
 
     /// The de-duplication token for one authorised effect.

@@ -518,6 +518,12 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::InternalSend,
+                // `AppointmentBook`, because "I will check back on Tuesday" is
+                // the sentence this seat says most, and until now it had no way
+                // to be there on Tuesday. It costs nothing anyone else has: the
+                // hour is this employee's own and the turn it spends is its own,
+                // out of a `max_turns_per_day` this layer already sets.
+                ActionKind::AppointmentBook,
             ]
             .into_iter()
             .collect(),
@@ -634,6 +640,14 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::InternalSend,
+                // `AppointmentBook` is ABSENT, and it is that kind's
+                // whole demonstration: a role pack can decline it. This seat
+                // reaches nobody outside the company — no `EmailSend`, no
+                // `CallPlace` — so there is no counterparty for it to promise an
+                // hour to, and `at_zone` ("the other person's city") would have
+                // no other person. What it wants instead is a line on the board
+                // that outlives the turn, which `add_work_item` already gives
+                // it, and which wakes nobody at three in the morning.
             ]
             .into_iter()
             .collect(),
@@ -780,6 +794,11 @@ impl RolePack {
                 ActionKind::PaymentCreate,
                 ActionKind::InvoiceIssue,
                 ActionKind::InternalSend,
+                // `AppointmentBook`, for customer success's reason with a
+                // deadline attached: a chaser that has to go out on the day
+                // terms fall due is the whole of this job, and an interval
+                // cadence cannot express a date.
+                ActionKind::AppointmentBook,
             ]
             .into_iter()
             .collect(),
@@ -960,6 +979,14 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::InternalSend,
+                // `AppointmentBook` is ABSENT, and it is that kind's
+                // whole demonstration: a role pack can decline it. This seat
+                // reaches nobody outside the company — no `EmailSend`, no
+                // `CallPlace` — so there is no counterparty for it to promise an
+                // hour to, and `at_zone` ("the other person's city") would have
+                // no other person. What it wants instead is a line on the board
+                // that outlives the turn, which `add_work_item` already gives
+                // it, and which wakes nobody at three in the morning.
             ]
             .into_iter()
             .collect(),
@@ -1829,8 +1856,15 @@ mod tests {
     // -- the allowlists ----------------------------------------------------
 
     /// The whole action space, partitioned, for each of the four. Iterating
-    /// `ActionKind::ALL` means a sixteenth action cannot be added without
+    /// `ActionKind::ALL` means a seventeenth action cannot be added without
     /// somebody deciding here whether these roles may propose it.
+    ///
+    /// `AppointmentBook` is the first one the four did not
+    /// answer the same way: two take it and two decline it, and the split is
+    /// the line between a seat that can reach a counterparty and one that
+    /// cannot. That is what makes the property this test asserts a property
+    /// rather than a formality — every previous kind was granted to all four or
+    /// to none.
     #[test]
     fn each_pack_proposes_exactly_what_its_job_needs_and_nothing_else() {
         let expected: [(&str, &[ActionKind]); 4] = [
@@ -1841,6 +1875,7 @@ mod tests {
                     ActionKind::BrowserRead,
                     ActionKind::McpCall,
                     ActionKind::InternalSend,
+                    ActionKind::AppointmentBook,
                 ],
             ),
             (
@@ -1860,6 +1895,7 @@ mod tests {
                     ActionKind::PaymentCreate,
                     ActionKind::InvoiceIssue,
                     ActionKind::InternalSend,
+                    ActionKind::AppointmentBook,
                 ],
             ),
             // The same three kinds as growth, and arrived at from the opposite
@@ -2068,6 +2104,7 @@ mod tests {
             ActionKind::CharterSet => Action::CharterSet {
                 subordinate: EmployeeId::new_v7(at(1_700_000_000)),
             },
+            ActionKind::AppointmentBook => Action::AppointmentBook {},
             ActionKind::InternalSend => Action::InternalSend {
                 to: Slug::parse("bruno").expect("slug"),
             },
@@ -2175,7 +2212,7 @@ mod tests {
         // offered it — including finance, whose job has nothing to do with
         // prospects. The `ponytail:` note on its catalogue row is the argument
         // for accepting that, and this table is where it becomes visible: if a
-        // sixteenth `ActionKind` is ever written for "write our own records",
+        // further `ActionKind` is ever written for "write our own records",
         // this is the column that thins out.
         let table: &[(&str, &[&str], &[&str])] = &[
             (
@@ -2189,6 +2226,9 @@ mod tests {
                     "pay",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
                 &[
                     "send_email",
@@ -2198,6 +2238,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
             ),
             // Sales sells; it does not settle. No `pay` at either label.
@@ -2211,6 +2254,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
                 &[
                     "send_email",
@@ -2220,6 +2266,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
             ),
             // The one this filter was built for: a refund is what this role is
@@ -2234,6 +2283,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
                 &[
                     "send_email",
@@ -2243,6 +2295,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
             ),
             // Growth has no `EmailSend` at all — content distribution over email
@@ -2257,6 +2312,8 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
                 ],
                 &[
                     "read_page",
@@ -2265,6 +2322,8 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
                 ],
             ),
             (
@@ -2278,6 +2337,9 @@ mod tests {
                     "pay",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
                 &[
                     "send_email",
@@ -2287,6 +2349,9 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
+                    "promise_an_hour",
                 ],
             ),
             // Identical to growth's row, and it has to be: the catalogue is
@@ -2304,6 +2369,8 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
                 ],
                 &[
                     "read_page",
@@ -2312,6 +2379,8 @@ mod tests {
                     "call_mcp_tool",
                     "message_colleague",
                     "brief_direct_reports",
+                    "add_work_item",
+                    "update_work_item",
                 ],
             ),
         ];

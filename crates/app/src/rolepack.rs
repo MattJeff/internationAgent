@@ -276,6 +276,15 @@ impl RolePack {
                 ActionKind::PaymentCreate,
                 ActionKind::ContractSign,
                 ActionKind::InternalSend,
+                // `AppointmentBook` because this seat tells people it will do
+                // something at an hour and has, until now, had no way to be
+                // there. It is one of the two kinds added on 2026-08-28 and it is here rather than in
+                // every pack: `growth` and `entry-requirements` reach nobody
+                // outside the company, so a promise they could make is a promise
+                // to nobody — see `rolepack_service`'s note on the two that
+                // decline it. That is what makes this a decision rather than a
+                // default.
+                ActionKind::AppointmentBook,
             ]
             .into_iter()
             .collect(),
@@ -774,12 +783,13 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means
-    /// a seventeenth action cannot be added without someone deciding here
-    /// whether a buyer may propose it. (There are sixteen —
-    /// `Action::ALL_DISCRIMINANTS` is `[ActionKind; 16]`. This said "fourteenth"
-    /// while `charter_set` and `internal_send` had both already landed, and
-    /// "sixteenth" until `invoice_issue` did; the property it names does not
-    /// date, which is why the count is read off the constant beside it.)
+    /// the *next* action cannot be added without someone deciding here whether
+    /// a buyer may propose it. The count deliberately is not written down: this
+    /// sentence said "fourteenth", then "fifteenth", then "sixteenth", and was
+    /// wrong at each of them within a wave — twice on the same afternoon, when
+    /// `invoice_issue` and `appointment_book` were added in parallel and both
+    /// were the sixteenth. Read it off `Action::ALL_DISCRIMINANTS`; the property
+    /// this test names does not date, and the ordinal always does.
     #[test]
     fn the_buyer_cannot_propose_an_action_outside_its_allowlist() {
         let buyer = buyer();
@@ -793,6 +803,7 @@ mod tests {
             ActionKind::PaymentCreate,
             ActionKind::ContractSign,
             ActionKind::InternalSend,
+            ActionKind::AppointmentBook,
         ]
         .into_iter()
         .collect();
