@@ -4723,6 +4723,103 @@ mod tests {
         let _ = seeded;
     }
 
+    /// How many rounds this employee has open, and how many quotes are visible
+    /// on the one the next turn would read.
+    async fn open_rounds(db: &Db, principal: &Principal) -> i64 {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rfqs WHERE employee_id = $1 AND state = 'open'",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count open rounds");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// Two turns of one employee, decided at the same time, open **one** round.
+    ///
+    /// `sourcing_store::open_rfq` carries the sentence "this is what stops an
+    /// RFQ going out twice", and [`purchasing_turn`] reads it in a transaction
+    /// it rolls back *before* the first letter — the `rfqs` row lands in a
+    /// later one, after N emails. Nothing serialised two turns across that gap,
+    /// and the bill is not one duplicate letter: [`Material::read`] reads only
+    /// the newest open round, so a second round hides every quote the first one
+    /// was answered with. That is supplier work thrown away.
+    ///
+    /// Arranged rather than raced, and the arrangement is the whole test. A
+    /// third transaction holds `negotiations`, which [`open_the_round`] writes
+    /// in the same transaction as the `rfqs` row and *after* it — so neither
+    /// turn can commit its round. The hold is released once both turns have
+    /// written to every supplier, and a turn only writes after it has read and
+    /// been told there is no open round. Both reads are therefore provably
+    /// inside the window before either write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_turns_at_once_do_not_open_two_rounds_for_one_employee() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_suppliers(&db, &principal, category(&objective)).await;
+        let now = Utc::now();
+
+        // `SHARE` conflicts with the `ROW EXCLUSIVE` an INSERT takes and with
+        // nothing a `SELECT` takes, so `close_expired_rounds` — which only
+        // reads this table — still runs.
+        let mut holder = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sqlx::query("LOCK TABLE negotiations IN SHARE MODE")
+            .execute(&mut **holder)
+            .await
+            .expect("hold the recipients table");
+
+        let release = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while email.sent_count() < 2 * seeded.len() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the two turns never both reached every supplier"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            holder
+                .rollback()
+                .await
+                .expect("release the recipients table");
+        };
+
+        let (first, second, ()) = tokio::join!(
+            purchasing_turn(&db, &buyer, &principal, &pack, &objective, now),
+            purchasing_turn(&db, &buyer, &principal, &pack, &objective, now),
+            release,
+        );
+
+        // Both letters went out and cannot be unsent — that is the price the
+        // module's docs already accept for writing the row after the send. What
+        // must not survive it is a second *round*.
+        assert_eq!(
+            email.sent_count(),
+            2 * seeded.len(),
+            "both turns wrote to every supplier"
+        );
+        assert_eq!(
+            open_rounds(&db, &principal).await,
+            1,
+            "two rounds are open at once: the second hides every quote the \
+             first is answered with"
+        );
+        // One turn opened the round; the other's `INSERT` lost on the unique
+        // index and rolled its whole transaction back. The loser is loud rather
+        // than silent — `loops::initiative` logs the code and lets the employee
+        // take an ordinary turn — which is the right size of alarm for two
+        // replicas asking one supplier list twice.
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one turn opens the round: {first:?} / {second:?}"
+        );
+    }
+
     /// Three days later the answers land as rows against that round — which is
     /// the only thing that changed — and the same plan compares instead of
     /// asking. No timer, no stored cursor, no scheduler.
