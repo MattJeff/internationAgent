@@ -107,9 +107,17 @@ pub struct Schedule {
     /// How many times it has been taken up. Counted by the claim, so a worker
     /// killed mid-turn still shows here.
     pub claims: i64,
-    /// What the poller decided last time: `turn`, `clarify`, `no_objective`, …
+    /// What the poller decided about **the beat this row is on** — `turn`,
+    /// `clarify`, `no_charter`, … — or `None` when that beat has not said
+    /// anything.
+    ///
+    /// `None` with `claims == 0` is an employee that has never been taken up.
+    /// `None` with `claims > 0` is a beat that rang and produced nothing: still
+    /// running, or gone with the worker that took it. It is never the beat
+    /// before — [`claim_due`] clears this, and its doc comment is the argument.
     pub last_outcome: Option<String>,
-    /// The detail behind it. Ours or the domain's words, never a third party's.
+    /// The detail behind it, cleared with it by the same claim. Ours or the
+    /// domain's words, never a third party's.
     pub last_detail: Option<String>,
 }
 
@@ -247,6 +255,72 @@ fn schedule_from_row(row: &PgRow) -> Result<Schedule, StoreError> {
 /// for as long as the claiming transaction is open; what actually keeps an
 /// employee to one worker is that the same `UPDATE` pushed `next_at` into the
 /// future.
+///
+/// # The claim clears the last outcome, and that is the whole of `0072`'s
+/// argument arriving at a table shaped the other way
+///
+/// The claim commits before the turn exists, so an outcome is necessarily
+/// written by a *second* transaction — [`record_outcome`] — and a worker killed
+/// between the two writes none. That crash is accepted above: it costs one
+/// slot, the same as every other missed slot. What it must not cost is the
+/// truth of the row.
+///
+/// Without this clause it did. `last_outcome` and `last_detail` kept the
+/// **previous** beat's words, so a seat whose every beat died went on reading
+/// `turn` — an operator asking "is this employee's cadence working" is answered
+/// *yes* by a turn that is gone, which is the silent failure nobody looks at
+/// precisely because the column says there is nothing to look at. And the row
+/// could not be caught out: the claim writes `updated_at` too, and
+/// `loops::initiative::tick` hands one `now` to the claim and to the record, so
+/// `updated_at` equals `last_claimed_at` after a beat that recorded *and* after
+/// a beat that died. There was no witness to compare against.
+///
+/// `0072` chose the sense of the silence for `appointments` and it is the same
+/// one here: **NULL means "it rang and nothing came back", never "it went
+/// well"**, and success is the value that has to be earned. What differs is the
+/// *mechanism*, because the two tables are shaped differently and the naive
+/// copy would have been wrong. An appointment is a row per beat, so 0072 gets
+/// NULL by writing nothing at claim time. This is a row per **seat**, so
+/// writing nothing at claim time is exactly what leaves the previous beat's
+/// answer standing: NULL has to be re-established, and the only statement that
+/// can do it is the one that takes the beat up.
+///
+/// So the inverse schema is refused here for 0072's reason and one more of its
+/// own: a `last_outcome` left alone on claim is a default of "whatever went
+/// well last time", which is the fatal direction — every lost beat declares
+/// itself kept, and it declares it in the words of a beat that really did
+/// succeed.
+///
+/// The alternatives were weighed and are worse:
+///
+/// * **A `last_outcome_at` beside it**, so a reader can see the outcome is
+///   older than the claim. That keeps the previous beat's sentence, which reads
+///   well — and it moves the correctness into *every reader*, where a reader
+///   that forgets the comparison is the original bug back again. One clause in
+///   the one statement all beats pass through is smaller than a rule every
+///   caller has to remember, and it makes the wrong reading unspellable rather
+///   than merely discouraged.
+/// * **A `'running'` code written at claim time.** It names the in-flight beat,
+///   at the price of a word written *before* anything happened, which a crash
+///   then freezes forever — and of a ninth code in a vocabulary
+///   `loops::initiative::Outcome::code` owns and `docs/OPERATIONS.md` prints.
+///   Two silences spelled differently in two tables one function writes is
+///   drift waiting to happen.
+///
+/// **What NULL still cannot say**, named rather than hidden: a beat in flight
+/// and a beat whose worker died look identical until the clock passes. Nothing
+/// can separate them from inside the row, because the process that would write
+/// the difference is the one that is gone — `appointments` has the same
+/// property and 0072 accepted it for the same reason. `last_claimed_at` is what
+/// an operator dates it by.
+///
+/// ponytail: so this row is a *last*, not a history — it cannot say "seven of
+/// the last ten beats died", only "the current one has not answered". The
+/// upgrade is a row per beat, inserted by this claim exactly as `appointments`
+/// is; the cost is 288 rows per seat per day at `MIN_INTERVAL`, its own RLS,
+/// policy, grants and the first pruning job in this schema, and it buys a
+/// *rate* that nothing today reads. Build it when somebody asks the rate, not
+/// before.
 ///
 /// # A stopped company's employees are not claimed at all
 ///
@@ -445,6 +519,8 @@ pub async fn claim_due(
                     employee_initiative_next_at($1::timestamptz, i.interval_secs), \
                 last_claimed_at = $1::timestamptz, \
                 claims          = i.claims + 1, \
+                last_outcome    = NULL, \
+                last_detail     = NULL, \
                 updated_at      = $1::timestamptz \
            FROM due d \
            JOIN employees e ON e.id = d.employee_id \
@@ -481,6 +557,13 @@ fn due_from_row(row: &PgRow) -> Result<Due, StoreError> {
 /// What this adds is the sentence that makes a stalled employee diagnosable
 /// without reading logs — which for the `clarify` outcome is the whole feature,
 /// because that sentence is a question somebody has to answer.
+///
+/// **The only thing that puts a word in these two columns**, and
+/// [`claim_due`] empties them at the top of every beat, so not reaching this
+/// call leaves the row saying nothing rather than saying the beat before.
+/// A caller that fails here — `loops::initiative::record` logs and swallows —
+/// leaves exactly the same NULL a crash does, which is the honest answer in
+/// both cases.
 ///
 /// Takes a `&mut PgConnection` because the poller holds one.
 pub async fn record_outcome(
@@ -1238,6 +1321,154 @@ mod tests {
         assert_eq!(stored.last_detail.as_deref(), Some("how many units?"));
         assert_eq!(stored.claims, 1);
         assert_eq!(stored.last_claimed_at, Some(at(T0)));
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **A beat that evaporated must not leave the row reporting the beat
+    /// before it.**
+    ///
+    /// The crash [`claim_due`] already accepts, followed all the way to the
+    /// column an operator actually reads. The claim commits — that is what
+    /// moves the schedule and it is deliberate — and the worker is then killed
+    /// before [`record_outcome`]. This test is that kill: a claim that commits
+    /// and no record after it, which is byte-for-byte what a `SIGKILL` between
+    /// the two transactions leaves behind.
+    ///
+    /// # Why the first beat is recorded, and why that is the load-bearing line
+    ///
+    /// Without a *recorded* first beat there is nothing for the second one to
+    /// inherit, `last_outcome` is NULL because it was always NULL, and the
+    /// assertion below would pass against a table that never cleared anything.
+    /// So each round writes an outcome, **asserts it arrived**, and only then
+    /// kills the next beat. The fixture has to cross the threshold it is about.
+    ///
+    /// # `assert_eq!(…, None)` and not `assert_ne!(…, Some("turn"))`
+    ///
+    /// The second is satisfied by every stale value except one, including the
+    /// `clarify` round below — it would go green on exactly the bug. What has
+    /// to hold is that the row says *nothing*, so it is spelled as an equality
+    /// to `None`.
+    ///
+    /// # The witness, asserted rather than asserted about
+    ///
+    /// `updated_at` cannot tell the two cases apart, and the two equalities
+    /// below are what say so: it equals `last_claimed_at` after a beat that
+    /// recorded **and** after a beat that died, because the claim writes it too
+    /// and `loops::initiative::tick` hands one `now` to both statements. They
+    /// hold whichever way this module is written; they are here because "the
+    /// stale value is undetectable" is the reason the claim has to clear it,
+    /// and an unproved premise is how the previous shape survived review.
+    #[tokio::test]
+    async fn a_beat_killed_before_recording_does_not_report_the_beat_before_it() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db, "stale-outcome").await;
+        let id = seed_due(&db, tenant, "unlucky", Lifecycle::Active).await;
+
+        // `Schedule` does not carry `updated_at` — nothing in the product reads
+        // it — so the witness is read here rather than widened into the type.
+        async fn updated_at(db: &Db, id: EmployeeId) -> DateTime<Utc> {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            let got = sqlx::query_scalar(
+                "SELECT updated_at FROM employee_initiative WHERE employee_id = $1",
+            )
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("updated_at");
+            tx.rollback().await.expect("rollback");
+            got
+        }
+
+        let mut now = at(T0);
+        // Two rounds: the outcome that costs the most to be wrong about — an
+        // employee whose every beat dies reading `turn`, "working perfectly" —
+        // and one carrying a `last_detail`, so the sentence is proved to go
+        // with the code rather than survive it. A NULL outcome beside a stale
+        // question is the same lie one column over.
+        for (outcome, detail) in [("turn", None), ("clarify", Some("how many units?"))] {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            let beat = claim_due(&mut tx, 10, now).await.expect("claim");
+            tx.commit().await.expect("commit the claim");
+            assert_eq!(beat.len(), 1, "the beat at {now} was not taken up");
+
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            record_outcome(&mut tx, id, outcome, detail, now)
+                .await
+                .expect("record");
+            tx.commit().await.expect("commit the record");
+
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let recorded = get(&mut tx, id).await.expect("get");
+            tx.rollback().await.expect("rollback");
+            let recorded_updated = updated_at(&db, id).await;
+
+            // The premise, and the line the rest of this test is worthless
+            // without: a `None` below proves the claim cleared something only
+            // if there was something there to clear.
+            assert_eq!(
+                recorded.last_outcome.as_deref(),
+                Some(outcome),
+                "the beat that ran did not record, so the NULL asserted below \
+                 would be a column that was never written rather than one the \
+                 claim emptied"
+            );
+            assert_eq!(
+                recorded.last_detail.as_deref(),
+                detail,
+                "the sentence behind the code did not arrive either"
+            );
+            assert_eq!(
+                Some(recorded_updated),
+                recorded.last_claimed_at,
+                "a beat that recorded leaves `updated_at` on the claim's instant"
+            );
+
+            // The next beat is claimed, and the process dies here. Nothing
+            // records; that is the whole of the reproduction.
+            now = beat[0].next_at;
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            let died = claim_due(&mut tx, 10, now).await.expect("claim");
+            tx.commit().await.expect("commit the claim");
+            assert_eq!(died.len(), 1, "the beat at {now} was not taken up");
+
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let after = get(&mut tx, id).await.expect("get");
+            tx.rollback().await.expect("rollback");
+            let after_updated = updated_at(&db, id).await;
+
+            assert_eq!(
+                after.claims,
+                recorded.claims + 1,
+                "the beat really was taken up, so the row is describing it"
+            );
+            assert_eq!(
+                after.last_outcome, None,
+                "the beat that has just been taken up produced nothing, and the \
+                 row reports `{outcome}` from the beat before it. An operator \
+                 asking whether this cadence works is told about a turn that is \
+                 gone — which on `turn` reads as an employee working perfectly \
+                 while every one of its beats dies, the one failure nobody looks at"
+            );
+            assert_eq!(
+                after.last_detail, None,
+                "the code was cleared and the sentence behind it was not, so the \
+                 row now pairs `NULL` with a question from a beat that no longer \
+                 exists"
+            );
+            assert_eq!(
+                Some(after_updated),
+                after.last_claimed_at,
+                "the claim writes `updated_at` too, so a beat that died leaves it \
+                 exactly where a beat that recorded leaves it: there is no witness \
+                 in this row that could have caught the stale value, which is why \
+                 the claim has to clear it rather than a reader having to notice"
+            );
+
+            now = died[0].next_at;
+        }
 
         drop_tenant(&db, tenant).await;
     }
