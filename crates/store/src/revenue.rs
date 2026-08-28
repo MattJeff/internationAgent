@@ -1251,6 +1251,16 @@ pub struct Queueable {
 ///   this, here is how to see it again"* that has gone stale is the one mistake
 ///   in this job that cannot be walked back, so the export applies the same bar
 ///   `vertical::follow_up` applies to a kept `Approach`.
+/// * **`touch_count < max_touches`** — the ceiling [`mark_contacted`] carries in
+///   its own `WHERE`, handed to this end of the pair as well. Without it the
+///   selection offers somebody who has had the whole sequence, `record_queued`
+///   marks them, and the write refuses the row — and the `?` on that call takes
+///   the **whole export** down, not just the one row: `routes::queue::refused`
+///   drops the transaction, so nobody is marked and no file is produced. The
+///   remedy that route names — "run it again and they are simply gone from the
+///   queue" — is true of an opt-out, which clears two of the predicates above,
+///   and false of a row at the ceiling, which clears none of them. The number is
+///   the caller's for the reason [`contacts_due_for_follow_up`] gives.
 ///
 /// Newest finding per account, and one row per contact: an account with three
 /// mailboxes yields three rows carrying the same opener, which is
@@ -1279,6 +1289,7 @@ pub async fn queueable(
     as_of: DateTime<Utc>,
     fresh_since: DateTime<Utc>,
     limit: i64,
+    max_touches: i32,
 ) -> Result<Vec<Queueable>, RevenueError> {
     type Row = (
         Uuid,
@@ -1312,6 +1323,7 @@ pub async fn queueable(
             AND c.email IS NOT NULL \
             AND c.next_follow_up_at IS NOT NULL \
             AND c.next_follow_up_at <= $1 \
+            AND c.touch_count < $4 \
           ORDER BY c.next_follow_up_at, c.id \
           LIMIT $3 \
             FOR UPDATE OF c SKIP LOCKED",
@@ -1319,6 +1331,7 @@ pub async fn queueable(
     .bind(as_of)
     .bind(fresh_since)
     .bind(limit)
+    .bind(max_touches)
     .fetch_all(&mut ***tx)
     .await?;
 

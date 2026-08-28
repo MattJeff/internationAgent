@@ -1376,7 +1376,11 @@ async fn set_mission(
     let now = Utc::now();
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let team = load_team(&mut tx, team_id).await?;
-    org::set_mission(&mut tx, team.id, &mission).await?;
+    // `from_mission` comes back out of the write and not out of `team`: the
+    // load above is an unlocked read several statements back, and reporting it
+    // makes the trail name a mission another writer had already replaced. See
+    // `org::set_mission`.
+    let from_mission = org::set_mission(&mut tx, team.id, &mission).await?;
     record(
         &mut tx,
         &principal.actor,
@@ -1384,7 +1388,7 @@ async fn set_mission(
         json!({
             "event": "team.mission_set",
             "team_id": team.id.to_string(),
-            "from_mission": team.mission,
+            "from_mission": from_mission,
             "mission": mission.as_str(),
         }),
         now,
@@ -3498,6 +3502,119 @@ mod tests {
                 .unwrap_or_default()
                 .contains("section_id"),
             "{problem}"
+        );
+
+        h.teardown().await;
+    }
+
+    /// **The trail has to name the mission that was really replaced.**
+    ///
+    /// [`set_mission`] read the row with [`load_team`] — an ordinary `SELECT`,
+    /// no lock — and then wrote `from_mission` out of *that* read, while
+    /// `org::set_mission` threw its `PgQueryResult` away. Anything another
+    /// writer commits in between is invisible to both: the trail records
+    /// `A → C` for a write that in fact replaced `B`, and the `A → B`
+    /// transition is nowhere in it. Two concurrent `PUT`s therefore leave two
+    /// rows both claiming to start from `A`, and an audit row is quoted — one
+    /// naming a value that was already gone is worse than no row at all.
+    ///
+    /// **Arranged, not raced.** A side transaction writes `B` and holds the row
+    /// lock; the request reads `A`, blocks on the write, and only then is the
+    /// side transaction committed. The interleaving is the lock's, so this does
+    /// not depend on a sleep landing in the right place — and the wait itself is
+    /// what is polled for, not a duration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mission_write_names_the_mission_it_actually_replaced() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let team = h.team(SECRET_A, "growth").await;
+        let uri = format!("/v1/teams/{team}/mission");
+        let team_id = Uuid::parse_str(&team).expect("team id");
+
+        let (status, first) = h
+            .send(
+                "PUT",
+                &uri,
+                Some(SECRET_A),
+                Some(json!({"mission": "Acquisition"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // `Contenu`, uncommitted. The row lock is what makes the interleaving
+        // certain rather than likely.
+        let mut holder = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        sqlx::query("UPDATE teams SET mission = 'Contenu' WHERE id = $1")
+            .bind(team_id)
+            .execute(&mut **holder)
+            .await
+            .expect("hold the row");
+        // Whose lock the request has to be waiting on, asked of the backend
+        // that holds it. "Somebody in this database is waiting on a lock" would
+        // also be a signal and would not be evidence: this package's tests run
+        // in parallel against one database, and releasing on a stranger's wait
+        // would let the request read `Contenu` from the start — a green run
+        // that proves nothing, which is the one outcome this arrangement must
+        // not be able to produce.
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **holder)
+            .await
+            .expect("the holding backend");
+
+        let put = h.send("PUT", &uri, Some(SECRET_A), Some(json!({"mission": "SEO"})));
+        let release = async {
+            // Wait for the request to be *waiting* — it has read `Acquisition`
+            // and is now blocked on the row `Contenu` holds. Polling the wait
+            // rather than sleeping is what stops this test from passing for the
+            // wrong reason on a slow machine.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let mut probe = h.db.admin_tx_bypassing_rls().await.expect("probe tx");
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity \
+                      WHERE $1 = ANY(pg_blocking_pids(pid))",
+                )
+                .bind(blocker)
+                .fetch_one(&mut *probe)
+                .await
+                .expect("pg_blocking_pids");
+                probe.rollback().await.expect("rollback the probe");
+                if waiting > 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the request never blocked on the row this transaction holds, so \
+                     the interleaving this test is about never happened"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            holder.commit().await.expect("commit Contenu");
+        };
+        let ((status, second), ()) = tokio::join!(put, release);
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["mission"], "SEO");
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let froms: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT payload ->> 'from_mission' FROM audit_log \
+              WHERE payload ->> 'event' = 'team.mission_set' \
+                AND payload ->> 'team_id' = $1 \
+              ORDER BY occurred_at, id",
+        )
+        .bind(&team)
+        .fetch_all(&mut **tx)
+        .await
+        .expect("the audited writes");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            froms,
+            vec![None, Some("Contenu".to_owned())],
+            "the trail says a mission was replaced that had already been replaced: \
+             'Contenu' was the value this write really overwrote, and no row in the \
+             trail admits it ever existed"
         );
 
         h.teardown().await;
