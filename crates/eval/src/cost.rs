@@ -660,8 +660,8 @@ pub fn headline() -> String {
 /// **The figure to carry to a subscription**, where tokens are not what runs
 /// out. Metered pricing and a subscription bound the same system with different
 /// resources, and the arithmetic above answers only the first — so an operator
-/// who reads `$303–$560` and concludes the CLI backend is free has not
-/// converted the constraint, they have dropped it.
+/// who reads [`headline`]'s dollars and concludes the CLI backend is free has
+/// not converted the constraint, they have dropped it.
 ///
 /// The spread is the point. Calls per turn varied 2× across the recorded runs,
 /// so this is a range and not a rate, and the wide end is what a plan has to

@@ -1,7 +1,7 @@
 //! Le carnet: the port an employee's work board is reached through, and the
 //! one adapter behind it today.
 //!
-//! # Why this is a port and not four functions on `agentos_store::backlog`
+//! # Why this is a port and not free functions on `agentos_store::backlog`
 //!
 //! Because of what the customer is being sold. A company that already runs on
 //! Jira must be able to point its employees at *its* board, and a company that

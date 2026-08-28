@@ -259,10 +259,10 @@ impl RolePack {
             // list, "a buyer reads catalogues and does not fill in forms" is
             // enforced here and nowhere else.
             //
-            // `InternalSend` is the one entry here that does not leave the
-            // company, and leaving it out was a real bug rather than a
-            // judgement: the internal channel, the org chart and the briefing
-            // shipped complete and tested, and no buyer could reach any of them
+            // `InternalSend` does not leave the company, and leaving it out
+            // was a real bug rather than a judgement: the internal channel, the
+            // org chart and the briefing shipped complete and tested, and no
+            // buyer could reach any of them
             // — the role layer intersected `Channel::Internal` away, so the
             // gate refused every message with `ChannelNotAllowed`. A buyer that
             // cannot tell its head a supplier has gone silent is not cheaper,

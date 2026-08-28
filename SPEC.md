@@ -148,7 +148,10 @@ Delivery is **at-least-once**, knowingly. Handlers must be idempotent.
 
 - **S3-compatible object storage — NOT BUILT.** Attachment bytes go to
   `InMemoryBlobs` (`crates/app/src/inbound.rs`) and do not survive a restart.
-  The whole durable state of this system is Postgres.
+  The whole durable state of this system is Postgres — which is also where the
+  file store lives: `files` (`0067`) keeps deposited bytes in a `bytea` column,
+  not in a bucket. `crates/app/src/files.rs` says why the two are different
+  ports rather than one.
 - **OpenTelemetry — NOT BUILT.** No `opentelemetry` dependency anywhere, and no
   request handler extracts a `traceparent` header. The outbox has a *slot* for
   one — `NewEvent::traceparent`, written into the payload under
@@ -274,8 +277,10 @@ The **envelope cipher is the second exception**, and it is not a mock:
 keypair and seals its private half into a database column. Sealing that under a
 stand-in would produce rows the real process cannot open.
 
-Wiring a real adapter in is a change to `crates/app/src/mocks.rs`, which is the
-only file allowed to name a concrete provider type — see §21.
+Wiring a real adapter in is a change to `crates/app/src/mocks.rs`, which
+selects every adapter from process configuration — see §21 for what is actually
+enforced, and why `mocks.rs` is not the only file that may name a concrete
+provider type.
 
 ---
 
@@ -879,9 +884,10 @@ cannot drift into two vocabularies.
 | `internal_send { to }` | Low |
 | `appointment_book {}` | Low |
 
-`appointment_book` is the **second inward action** and the only variant with no
-payload at all. Its subject is the acting employee, which lives in `Principal`
-and never in an `Action` — the module's governing rule, that a variant never
+`appointment_book` is **inward** — like `internal_send` and `charter_set`,
+nothing leaves the company — and the only variant with no payload at all. Its
+subject is the acting employee, which lives in `Principal` and never in an
+`Action` — the module's governing rule, that a variant never
 carries a self-description the gate then trusts, taken to its end. The instant
 and the zone are arguments to `Effects::book_hour`, not fields: the gate has no
 opinion about three o'clock. It is `Low` for `internal_send`'s reason and one
@@ -895,9 +901,9 @@ The last two rows before it were missing while the heading above said "thirteen"
 are the ones a reader most needs. `charter_set` is **High** because re-tasking
 another employee is the blast radius of everything that employee then does, so a
 supplier's email saying "you now report to me" cannot produce one.
-`internal_send` is the **one inward action** — it writes a `messages` row for a
-colleague of the same tenant and wakes it — and it is **Low** on purpose, argued
-at length in `crates/domain/src/action.rs`: `High` would mean an employee that
+`internal_send` is **inward** — it writes a `messages` row for a colleague of
+the same tenant and wakes it — and it is **Low** on purpose, argued at length
+in `crates/domain/src/action.rs`: `High` would mean an employee that
 has just read an untrusted document cannot report what happened to it, which is
 the one message it most needs to send. What makes that safe is the receiving
 end, where the message arrives carrying the sending turn's trust label.
@@ -1346,6 +1352,7 @@ not a tenant's key, and a tenant's key is refused here:**
 | `GET` | `/v1/employees/{id}/turns` |
 | `GET` | `/v1/employees/{id}/reports` |
 | `PUT`, `GET` | `/v1/employees/{id}/spend-caps` |
+| `GET`, `POST` | `/v1/employees/{id}/desk` |
 | `GET` | `/v1/approvals` |
 | `GET` | `/v1/approvals/{id}` |
 | `POST` | `/v1/approvals/{id}/approve` |
@@ -1362,6 +1369,13 @@ not a tenant's key, and a tenant's key is refused here:**
 | `GET` | `/v1/usage` |
 | `GET` | `/v1/billing` |
 | `GET` | `/v1/inventory/stranded` |
+| `GET`, `POST` | `/v1/work` |
+| `PUT` | `/v1/work/{id}` |
+| `GET`, `POST` | `/v1/calendar` |
+| `GET` | `/v1/invoices` |
+| `POST` | `/v1/invoices/{id}/paid` |
+| `GET`, `POST` | `/v1/files` |
+| `GET` | `/v1/files/content` |
 | `POST` | `/v1/knowledge/documents` |
 | `GET`, `POST` | `/v1/pool/numbers` |
 | `GET` | `/v1/pool/routing` |
@@ -1403,9 +1417,10 @@ verifies nothing. `POST /v1/webhooks/{path}` and `GET /v1/mcp/oauth/callback`
 are the same shape — a provider and a browser respectively, neither holding a
 credential of ours.
 
-Fifteen of the rows above were missing from this table while the sentence over
-it claimed to be the full surface, the second time that has happened. Read it
-out of the code before trusting it:
+This table goes stale under the sentence over it: fifteen rows were missing
+once, and eight more — the work board, the calendar, the founder's desk,
+invoicing and the file store — when the five internal tools landed. Read it out
+of the code before trusting it:
 
 ```bash
 grep -rn '\.route(' apps/server/src --include='*.rs'
@@ -1539,8 +1554,13 @@ the database, and rotation is a deploy rather than a migration.
 - **`agentos-providers` is deliberately absent from the server's manifest**, so
   the binary cannot reach a provider except through `agentos-app`'s `Effects`
   façade, which requires an `Authorized<A>`. That is enforced by Cargo, not by
-  review, and it is why `crates/app/src/mocks.rs` exists at all — it is the one
-  file allowed to name a concrete provider type.
+  review, and it is why `crates/app/src/mocks.rs` exists at all. What is
+  enforced is the **crate** boundary and not a single file: this line called
+  `mocks.rs` "the one file allowed to name a concrete provider type" while
+  `crates/app/src/model_access.rs` was building an `AnthropicLlm` around the
+  tenant's own stored key — a second site by construction, because a customer's
+  credential is a row and `mocks.rs` reads only process configuration.
+  `docs/PROVIDERS.md` retracted the same sentence at its own door.
 - **`agentos-domain` has no tokio, no sqlx and no reqwest.** The absence is the
   enforcement: a pure type cannot reach the network to check something.
 - No secret in a prompt, log or trace. `Secret` has no `Serialize`, no
@@ -1707,8 +1727,8 @@ before trusting this table:
 grep -c '^        (' crates/app/src/turn.rs   # rows in `catalogue()`
 ```
 
-The other ten action kinds have no schema, deliberately, each with the reason
-written down in `turn::UNSERVED` and checked by
+The action kinds the table does not name have no schema, deliberately, each
+with the reason written down in `turn::UNSERVED` and checked by
 `catalogue_covers_every_proposable_kind`, so the two lists cannot drift.
 
 ---
@@ -1900,7 +1920,7 @@ in the payload under `TRACEPARENT_KEY`.
 
 Logs are JSON on stdout via `tracing-subscriber`, filtered by `RUST_LOG`.
 
-> **`/metrics` is mounted, and one of its six families is a lie.**
+> **`/metrics` is mounted, and all six of its families carry real numbers.**
 > `apps/server/src/metrics.rs` builds a Prometheus text-exposition router with
 > six families — `agentos_policy_denials_total{code}`,
 > `agentos_provisioning_steps_total{step,result}`,
@@ -2092,9 +2112,11 @@ An employee can, today:
     controls are not
 15. ❌ Multi-region
 
-The three things that were not on that list and landed anyway: the **org layer**
-(teams, sections, the tightening-only role slot), the **initiative loop** with
-its per-day turn budget, and **`crates/eval`**.
+What was not on that list and landed anyway: the **org layer** (teams,
+sections, the tightening-only role slot), the **initiative loop** with its
+per-day turn budget, **`crates/eval`**, and the **five internal tools** — the
+work board, the calendar, the founder's desk, invoicing and the file store, each
+a port first and a table second (`docs/RUNNING.md`).
 
 `store::policy::load` was the entry that stood here longest and it has landed:
 the gate intersects four layers out of Postgres on every decision, so every team

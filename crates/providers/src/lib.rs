@@ -1,4 +1,14 @@
-//! The only crate allowed to hold reqwest / aws-sdk / rmcp clients.
+//! The outbound provider clients: email, telephony, browser, LLM, embeddings,
+//! the lead sink and the secret stores.
+//!
+//! **Not the only crate allowed to hold a reqwest client**, which is what this
+//! line said until somebody grepped it: `agentos-app` builds its own in
+//! `oauth.rs` (the MCP token exchange) and in `peer_keys.rs` (an A2A peer's
+//! JWKS), both because the SSRF check and the connect have to sit inside one
+//! function — split across a crate boundary, the check is one refactor away
+//! from being skipped. What *is* enforced, and by Cargo rather than by review:
+//! this crate is absent from `apps/server`'s manifest, so the binary cannot
+//! reach a provider except through `agentos-app`'s `Effects` façade.
 //!
 //! Every adapter ships with a mock beside it and a shared contract suite. The
 //! contract every adapter must satisfy: `ensure` reconciles before it creates,

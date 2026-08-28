@@ -1,6 +1,14 @@
-//! The only crate that speaks SQL. Every connection is handed out through
-//! `Db::tenant_tx`, which sets `app.tenant_id` so row-level security applies;
-//! the raw pool is never exported.
+//! The schema, the migrations, and `TenantTx` — through which every connection
+//! is handed out, setting `app.tenant_id` so row-level security applies before
+//! the caller gets it. The raw pool is never exported, and the two ways past it
+//! are named to be greppable: `Db::admin_tx_bypassing_rls`, and
+//! `agentos-server`'s `doctor`, which needs a pool before there is a `Db`.
+//!
+//! **Not the only crate that speaks SQL**, which is what this header claimed
+//! for a long time. `agentos-app` and `agentos-server` both run `sqlx::query*`
+//! in production, in around thirty files between them — nearly all of it
+//! against a `TenantTx` this crate opened. `README.md` retracted the sentence
+//! and this header went on making it.
 
 pub mod a2a; // U28
 pub mod api_keys; // wave J: a keyring that outlives the deployment that made it

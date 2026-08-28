@@ -695,7 +695,7 @@ pub enum Action {
         subordinate: EmployeeId,
     },
 
-    /// Say something to a colleague: the one **inward** action.
+    /// Say something to a colleague: an **inward** action.
     ///
     /// Every other variant above leaves the company, `CharterSet` excepted.
     /// This one does not leave
@@ -719,7 +719,7 @@ pub enum Action {
         to: Slug,
     },
 
-    /// Undertake one moment of **your own** time: the second inward action.
+    /// Undertake one moment of **your own** time: another inward action.
     ///
     /// **Payload-free, and the emptiness is the argument.** Every other variant
     /// carries the parsed subject of its effect; this one's subject is the

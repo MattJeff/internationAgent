@@ -283,7 +283,7 @@ pub fn adapters_for(
     }
 }
 
-/// The five ports [`Effects`](crate::effects::Effects) and the inbound loop
+/// Every port [`Effects`](crate::effects::Effects) and the inbound loop
 /// need, all fake.
 ///
 /// The email port is shared with nothing: a mock provider's inbox lives in its

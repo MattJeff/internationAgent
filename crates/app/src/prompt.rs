@@ -1456,8 +1456,8 @@ Kind regards, Accounts Payable";
         // It read "post to none of it … yours does not carry this one", which
         // is a claim about `allowed_domains` — and the seller's layer carries
         // two hosts (docs/orizn-roles/sales-development.json). The true claim
-        // is about the *catalogue*: none of the seven tools types, so no model
-        // can write to a page whatever its policy says. That is a fact about
+        // is about the *catalogue*: no tool in it types, so no model can
+        // write to a page whatever its policy says. That is a fact about
         // this file's own neighbour and it is asserted as one, below.
         assert!(
             rendered.contains("you do not type into them"),
