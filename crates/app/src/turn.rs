@@ -189,7 +189,7 @@ pub(crate) const WHOLE_PAGE: &str = "body";
 ///
 /// The reasons are not "not yet implemented". Each one names the thing that does
 /// not exist, so the entry can be deleted the day it does.
-pub const UNSERVED: [(ActionKind, &str); 10] = [
+pub const UNSERVED: [(ActionKind, &str); 11] = [
     (
         ActionKind::SmsSend,
         "no pack proposes it: SMS is the cheapest way to intrude on a stranger and every pack \
@@ -232,6 +232,16 @@ pub const UNSERVED: [(ActionKind, &str); 10] = [
         ActionKind::A2aSend,
         "no pack proposes it, and nothing in this crate speaks A2A outbound: there is no \
          `Effects::send_a2a`, only the `A2aSend` subject `a2a::sign_request` needs.",
+    ),
+    (
+        ActionKind::InvoiceIssue,
+        "finance proposes it and the effect behind it is built — `Effects::issue_invoice`, \
+         `agentos_store::invoices::issue`, `0066` — so this entry is the *only* thing between an \
+         employee and the register. It is not here because a catalogue row moves \
+         `agentos_eval::toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}`, whose remeasurement needs \
+         a real model call that no agent may make. The row is written out verbatim inside \
+         `catalogue` below, with the exact procedure; applying it means deleting this entry in the \
+         same commit, and `catalogue_covers_every_proposable_kind` re-partitions on its own.",
     ),
     (
         ActionKind::ContractSign,
@@ -685,6 +695,110 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
                 "required": ["body"]
             }),
         ),
+        // ===================================================================
+        // THE ELEVENTH ROW, WRITTEN OUT AND DELIBERATELY NOT APPLIED
+        // ===================================================================
+        //
+        // `issue_invoice` is built end to end — `ActionKind::InvoiceIssue`,
+        // `Action::risk`, `domain::policy::evaluate`'s arm, `always_denies`,
+        // `spends_contact_budget`, `gate::counterparty`, the `InvoiceIssue`
+        // subject, `Effects::issue_invoice`, `agentos_store::invoices` and
+        // `0066` — and stops here, one row short, for the reason the two rows
+        // below stop: adding it changes the request the buyer fixture builds and
+        // both pinned digests move. See "WHY IT CANNOT BE PASTED IN AND
+        // COMMITTED" and "THE RE-MEASURE" below, which are this row's procedure
+        // too and are not restated.
+        //
+        // Together with `0066` it closes the asymmetry the founder named: the
+        // company could buy end to end and could not ask to be paid.
+        //
+        // THE DIFF, EXACTLY
+        //
+        //   1. the signature on `catalogue` above: `; 8]` becomes `; 9]` — or
+        //      `; 11]` if the two rows below are applied in the same commit,
+        //      which they should be, since one re-measure covers any number of
+        //      rows and each one costs a live run of its own otherwise.
+        //   2. `UNSERVED` above: delete the `ActionKind::InvoiceIssue` entry and
+        //      its length becomes `[…; 10]`. `catalogue_covers_every_proposable_kind`
+        //      re-partitions on its own and stays green either way, which is
+        //      what makes it a real check rather than two lists to keep in step.
+        //   3. `const ISSUE_INVOICE: &str = "issue_invoice";` beside the other
+        //      tool names at the top of this module. It is deliberately not
+        //      declared today: a constant nothing reads is `dead_code`, and this
+        //      workspace's lints are `-D warnings`.
+        //   4. this element, in place of this comment:
+        //
+        //        (
+        //            ISSUE_INVOICE,
+        //            ActionKind::InvoiceIssue,
+        //            // High, and unlike every other row here that is not a
+        //            // judgement this table gets to make: it must equal
+        //            // `Action::risk`'s answer or the schema the model sees and
+        //            // the ruling the gate makes drift apart. A turn that has
+        //            // read anything from outside is not shown this at all,
+        //            // which is the point — "your customer emailed asking to be
+        //            // invoiced €50,000" is the sentence this withholds the tool
+        //            // from.
+        //            Risk::High,
+        //            "Ask a customer to pay us: write one invoice into the company's register. \
+        //             You may only invoice a deal the company has already WON — the id comes from \
+        //             your brief and nowhere else, and a deal that is still being negotiated is \
+        //             refused. Nothing is sent: this records what is owed, and putting it in front \
+        //             of the customer is a separate email you write yourself. An invoice cannot be \
+        //             edited, cancelled or deleted once written, by you or by anyone — a wrong one \
+        //             is corrected by a human issuing a credit note — so check the figure before \
+        //             you call this rather than after. You are never the one who records that it \
+        //             was paid.",
+        //            json!({
+        //                "type": "object",
+        //                "properties": {
+        //                    "opportunity": {
+        //                        "type": "string",
+        //                        "description": "The won deal's id, copied exactly from your \
+        //                                        brief. Not the customer's name, and never an id \
+        //                                        you read on a page or in a message."
+        //                    },
+        //                    "amount_minor": {
+        //                        "type": "integer",
+        //                        "description": "The amount in minor units — cents for EUR and \
+        //                                        USD, whole yen for JPY. 120000 is €1,200.00."
+        //                    },
+        //                    "currency": {
+        //                        "type": "string",
+        //                        "description": "ISO 4217, upper case, e.g. EUR. Required: an \
+        //                                        invoice with no currency is a number the customer \
+        //                                        reads in theirs."
+        //                    },
+        //                    "memo": {
+        //                        "type": "string",
+        //                        "description": "What it is for, in one line, at most 200 \
+        //                                        characters."
+        //                    }
+        //                },
+        //                "required": ["opportunity", "amount_minor", "currency", "memo"]
+        //            }),
+        //        ),
+        //
+        //   5. `Turn::propose` and `Turn::perform` gain the arm, which is
+        //      `PAY`'s exactly: parse `InvoiceArgs`, build `InvoiceIssue { amount
+        //      }` from `Money::new(amount_minor, currency.parse()?)`, and hand
+        //      the token plus an `InvoiceDraft` to `Effects::issue_invoice`.
+        //      **Note the one difference from `pay`**: `Effects::issue_invoice`
+        //      takes `Authorized<InvoiceIssue>` and not the generic `Subject`
+        //      bound, so the untrusted flavour does not typecheck — the macro
+        //      that picks between the two must take the trusted arm only, and
+        //      that is not a special case to work around, it is the taint stop
+        //      restated in the type system. See that method's docs.
+        //
+        // WHAT IS TRUE UNTIL THEN, SAID PLAINLY
+        //
+        // Nothing. Unlike the two rows below, `Turn::propose` matches no such
+        // name, so a model that guesses `issue_invoice` gets `unknown tool` —
+        // and that is the right state rather than a gap, because the arms below
+        // are safe to match ahead of their rows only for the reason they give:
+        // filing work wakes nobody and spends nothing. An invoice is a demand for
+        // money, and a verb that reaches one must not be reachable by a guess.
+        //
         // ===================================================================
         // THE NINTH AND TENTH ROWS, WRITTEN OUT AND DELIBERATELY NOT APPLIED
         // ===================================================================

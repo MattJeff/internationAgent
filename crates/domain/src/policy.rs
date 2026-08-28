@@ -1022,6 +1022,13 @@ pub const fn spends_contact_budget(action: &Action) -> bool {
         | Action::FileUpload { .. }
         | Action::McpCall { .. }
         | Action::PaymentCreate { .. }
+        // An invoice goes to a customer this company has already won a deal
+        // with — `migrations/0066_invoices.sql` makes that structural — so
+        // there is no stranger here to charge for, and charging one would make
+        // billing an existing customer eat into the day's allowance of new
+        // ones. It asks `channel_open` rather than `channel_rules` for exactly
+        // this reason, the same split `BrowserRead` made.
+        | Action::InvoiceIssue { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }
@@ -1152,6 +1159,22 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         // are still a spend policy, and the amount decides — that is
         // `PerTransactionLimit`'s job and it is per action.
         ActionKind::PaymentCreate => spend.is_none(),
+        // ChannelNotAllowed / NoRule, and it deliberately reads the *same*
+        // channel `EmailSend` does rather than a field of its own.
+        //
+        // A demand for money is only a demand once it reaches the customer, and
+        // the one way this company reaches a customer is mail. So a layer that
+        // takes `Channel::Email` away from a seat takes billing with it, which
+        // is the correct reading: a seat that may not write to a customer may
+        // not bill one either. It narrows like every other allowlist here.
+        //
+        // What this arm is **not** is a spend cap. `spend` bounds what leaves
+        // the company and an invoice is a claim on somebody else, so reading it
+        // here would make raising a purchasing budget raise what may be billed
+        // — a widening, in the one direction this file refuses everywhere.
+        // `0066_invoices.sql` carries that argument and the founder's open
+        // question about an amount ceiling.
+        ActionKind::InvoiceIssue => closed(Channel::Email),
         // Never denied by policy: signing escalates to a human under every
         // policy this system can express, empty included, so there is no
         // `DenyReason` to predict and withholding the tool would withhold the
@@ -1411,6 +1434,31 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             Decision::Allow
         }
 
+        // **Asking to be paid, and the one arm here that rules on the outbound
+        // channel without charging the outreach budget.**
+        //
+        // `channel_open` and not `channel_rules`, for `BrowserRead`'s reason
+        // read the other way: `channel_rules` also charges
+        // `max_new_contacts_per_day`, and the party being invoiced is by
+        // construction one this company has already won a deal with — see
+        // `migrations/0066_invoices.sql`, where `opportunity_id` is NOT NULL and
+        // the store inserts only against a `closed_won` row. Billing a customer
+        // is not approaching a stranger, and spending a stranger's slot on it
+        // would mean a month's invoicing run silently ate the day's prospecting.
+        //
+        // The amount is **not** read. That is the deliberate half: there is no
+        // ceiling on what may be invoiced, no number in this file that could be
+        // one, and inventing a threshold would read as a decision somebody took.
+        // `0066_invoices.sql` writes the founder's question and the exact field
+        // that answers it — `invoice_approval_above: Option<Money>` beside
+        // `spend`, intersected with `min_money`, read here to answer
+        // `RequireApproval`. `amount` is bound rather than discarded so that the
+        // day it is added, this is the arm that stops compiling.
+        Action::InvoiceIssue { amount: _ } => match channel_open(Channel::Email) {
+            Some(reason) => Decision::deny(reason),
+            None => Decision::Allow,
+        },
+
         // Unconditional. There is no policy field to widen, no flag to flip and
         // no `if` to get wrong: signing binds the tenant, so a human signs off.
         Action::ContractSign { title } => Decision::RequireApproval {
@@ -1626,6 +1674,7 @@ mod tests {
                 peer: domain("partner.example.com"),
             },
             Action::PaymentCreate { amount: usd(100) },
+            Action::InvoiceIssue { amount: usd(100) },
             Action::ContractSign {
                 title: "supply agreement".into(),
             },

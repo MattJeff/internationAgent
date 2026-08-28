@@ -720,10 +720,29 @@ impl RolePack {
             model: ModelId::Opus5,
             briefing: FINANCE_BRIEFING,
 
-            // Reconcile, ask, prepare a payment, escalate.
+            // Reconcile, ask, prepare a payment, bill, escalate.
             //
             // `PaymentCreate` is here for the reason argued above, and the
             // approval threshold below is what makes it safe to be here.
+            //
+            // **`InvoiceIssue` is here and in no other pack in the workspace**,
+            // and the asymmetry with `PaymentCreate` is the whole reason it is
+            // an `ActionKind` at all. Asking to be paid is the other half of
+            // this function's job — a finance seat that can settle the company's
+            // obligations and cannot state anybody else's is half a ledger — and
+            // the two are not the same permission: money leaving is bounded by
+            // `spend` below, money owed is not bounded by anything numeric here
+            // and `migrations/0066_invoices.sql` says so out loud. The seller
+            // does **not** get it: `sales_development` stops one step before
+            // commercial terms exist, and a seat that could both agree a price
+            // and bill it would be the whole deal in one model's hands.
+            //
+            // What makes it safe to be here is not a threshold. It is that the
+            // party is not the seat's to choose: an invoice may only name a
+            // `closed_won` opportunity, and 0011's
+            // `opportunities_won_needs_approval` refuses that stage without a
+            // human's approval id. So every invoice this seat can issue sits
+            // behind terms somebody already signed off.
             //
             // `ContractSign` is *not*, and that asymmetry is the interesting
             // one: the function that pays an invoice feels like the function
@@ -759,6 +778,7 @@ impl RolePack {
                 ActionKind::BrowserRead,
                 ActionKind::McpCall,
                 ActionKind::PaymentCreate,
+                ActionKind::InvoiceIssue,
                 ActionKind::InternalSend,
             ]
             .into_iter()
@@ -1838,6 +1858,7 @@ mod tests {
                     ActionKind::BrowserRead,
                     ActionKind::McpCall,
                     ActionKind::PaymentCreate,
+                    ActionKind::InvoiceIssue,
                     ActionKind::InternalSend,
                 ],
             ),
@@ -1880,6 +1901,12 @@ mod tests {
 
     /// The exclusions, named rather than left to a set difference — because
     /// each of these is a statement about the role and not an omission.
+    ///
+    /// `InvoiceIssue` is deliberately **not** in this list: finance proposes it
+    /// and the other three do not, so it belongs in the table above where a set
+    /// is compared, not here where every pack is asserted to lack the same
+    /// thing. Its own exclusion is argued on `customer_success`, `growth` and
+    /// `entry_requirements` in the same place their other absences are.
     #[test]
     fn none_of_them_may_sign_delete_rotate_or_upload() {
         for pack in RolePack::all() {
@@ -1931,6 +1958,10 @@ mod tests {
             [
                 ActionKind::FileUpload,
                 ActionKind::PaymentCreate,
+                // High for the direction of the money rather than its size: a
+                // stranger's text must not be able to produce a demand for money
+                // in this company's name. See `Action::risk`.
+                ActionKind::InvoiceIssue,
                 ActionKind::ContractSign,
                 ActionKind::CredentialChange,
                 ActionKind::DataDelete,
@@ -1950,7 +1981,10 @@ mod tests {
         //  * growth's spend is an ad budget, which a per-transaction cap does
         //    not bound,
         //  * finance is the one function whose work ends in a payment, and it
-        //    still may not sign the contract behind it,
+        //    still may not sign the contract behind it; it is also the only seat
+        //    in the workspace that may ask to be paid, and what bounds *that* is
+        //    not a cap but a foreign key — an invoice may name only a deal
+        //    somebody already won and a human already approved,
         //  * and the entry-requirements seat proposes none of them.
         let table: &[(&str, BTreeSet<ActionKind>)] = &[
             (
@@ -1962,7 +1996,12 @@ mod tests {
             ("sales-development", BTreeSet::new()),
             ("customer-success", BTreeSet::new()),
             ("growth", BTreeSet::new()),
-            ("finance", [ActionKind::PaymentCreate].into_iter().collect()),
+            (
+                "finance",
+                [ActionKind::PaymentCreate, ActionKind::InvoiceIssue]
+                    .into_iter()
+                    .collect(),
+            ),
             //  * entry requirements changes nothing at all: `DataDelete` is the
             //    one it would reach for on its own, having decided that no
             //    answer beats a wrong one, and that decision is wrong.
@@ -2013,6 +2052,7 @@ mod tests {
             },
             ActionKind::A2aSend => Action::A2aSend { peer: domain() },
             ActionKind::PaymentCreate => Action::PaymentCreate { amount: usd(1) },
+            ActionKind::InvoiceIssue => Action::InvoiceIssue { amount: usd(1) },
             ActionKind::ContractSign => Action::ContractSign {
                 title: "an agreement".to_owned(),
             },

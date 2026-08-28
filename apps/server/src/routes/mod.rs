@@ -17,6 +17,10 @@ pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod initiative;
 pub mod interview; // the guided conversation that finishes a company
 pub mod inventory;
+// la facturation: the founder reads what the company is owed and says when it
+// arrived. The employee's half is `agentos_app::effects::issue_invoice` — and
+// there is deliberately no operator way to *issue* one; see the module docs.
+pub mod invoices;
 pub mod knowledge;
 pub mod mcp;
 pub mod model; // wave H: the tenant connects the model their employees think with

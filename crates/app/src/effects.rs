@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::{DecisionId, IdempotencyKey, Slug, WorkItemId};
+use agentos_domain::ids::{DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId};
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
@@ -57,12 +57,14 @@ use agentos_providers::telephony::{OpenWindow, OutboundSms, OutboundWhatsapp, Te
 use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
+use agentos_store::invoices;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use url::Url;
+use uuid::Uuid;
 
 use crate::backlog::{Backlog, BacklogError, PgBacklog, WorkAction};
 use crate::gate::{Authorizable, Authorized, Principal};
@@ -153,6 +155,21 @@ pub const NO_PROSPECT: &str = "no_such_prospect";
 /// because the two are separated by a gate call and a crate boundary, and the
 /// audit row should say which of them moved.
 pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
+
+/// What [`Effects::issue_invoice`] answers when the deal it was handed is not
+/// this company's, or is not one anybody won.
+///
+/// **One code for both, deliberately**, and it is [`NO_PROSPECT`]'s reasoning
+/// with a sharper edge: `agentos_store::invoices::issue` refuses with
+/// [`StoreError::NotFound`] either way, and separating them here would turn a
+/// failed invoice into an existence oracle for another company's opportunity
+/// ids — ask about a uuid, learn from the error whether it is a real deal.
+///
+/// It is a refusal rather than an [`EffectError::Unavailable`] because nothing
+/// is broken: the caller named a deal it may not bill, which is the ceiling
+/// working. `migrations/0066_invoices.sql` argues why that ceiling is the
+/// structural one.
+pub const NO_WON_DEAL: &str = "no_won_deal";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -270,6 +287,17 @@ subject!(
 subject!(
     /// Move money.
     PaymentCreate { amount: Money } => PaymentCreate
+);
+subject!(
+    /// Ask a customer for money: the same axis as [`PaymentCreate`], pointed the
+    /// other way.
+    ///
+    /// The subject is the amount and nothing else, exactly as it is for a
+    /// payment — which deal is billed rides on [`InvoiceDraft`] the way a payee
+    /// rides on a [`PaymentInstruction`]. `Money` and not an integer, because a
+    /// figure whose currency was implied is a figure the customer reads in
+    /// theirs.
+    InvoiceIssue { amount: Money } => InvoiceIssue
 );
 subject!(
     /// Say something to one peer's agent.
@@ -398,6 +426,23 @@ pub struct PaymentInstruction {
     /// The payee, in whatever form the payment provider identifies one.
     pub payee: String,
     /// What the payment is for; ends up on the statement and in the audit row.
+    pub memo: String,
+}
+
+/// Which won deal is being billed and what for. The amount is on the token.
+///
+/// [`PaymentInstruction`]'s shape, one direction along, and the difference
+/// between the two fields is the difference between the two acts. A payee is a
+/// **string** because it is whatever the payment provider calls an account and
+/// nothing here can check it; this names a row in **our own** `opportunities`,
+/// so it is a uuid the store looks up — and refuses if it is not this company's
+/// or is not `closed_won`. That refusal is the whole ceiling; see
+/// `migrations/0066_invoices.sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceDraft {
+    /// The won deal this bills.
+    pub opportunity_id: Uuid,
+    /// What it is for, in one line; ends up on the invoice and in the audit row.
     pub memo: String,
 }
 
@@ -1512,6 +1557,125 @@ impl Effects {
         self.record(&ok, detail, paid).await
     }
 
+    /// Ask for the money the token authorises: write one row of the register.
+    ///
+    /// # The one effect here with no provider, and why that is not a shortcut
+    ///
+    /// Every other method on this struct hands something to a port and records
+    /// what came back. There is no `InvoiceProvider` and there must not be one
+    /// today: this workspace may not call a PSP, so a port would be an interface
+    /// with no implementation and one caller — and what an invoice *is* at this
+    /// stage is a row saying somebody owes us. `Effects::send_internal` already
+    /// makes the same move for the same reason ("the provider here is our own
+    /// database") and this is that argument with the network removed entirely.
+    ///
+    /// **Nothing is sent.** Putting the demand in front of the customer is an
+    /// [`Effects::send_email`], gated and audited as one, deliberately not
+    /// folded in here: an invoice recorded and not sent is a mistake somebody
+    /// can see, and one sent and not recorded is not.
+    ///
+    /// # Why the bound is `Authorized<InvoiceIssue>` and not `A: Subject<Of = …>`
+    ///
+    /// Every sibling takes the generic bound so that one method serves both
+    /// `Authorized<S>` and `Authorized<Untrusted<S>>`. This one takes the
+    /// trusted newtype **only**, so a token minted from a tainted turn does not
+    /// typecheck here at all.
+    ///
+    /// It is belt to the domain's braces rather than the only stop. `Action::
+    /// InvoiceIssue` is [`Risk::High`](agentos_domain::action::Risk) and the
+    /// evaluator's arm answers `Allow`, so `evaluate`'s taint wire already
+    /// refuses an untrusted one with `DenyReason::UntrustedInput` — no token is
+    /// minted and, unlike `ContractSign`, no approval request is filed for a
+    /// human to be shown a stranger's demand.
+    ///
+    /// The bound is here because that property depends on the arm continuing to
+    /// answer `Allow`, and the day somebody adds the amount threshold
+    /// `0066_invoices.sql` leaves open it will not: the wire is written
+    /// `decision.is_allow()`, so an untrusted invoice over the threshold would
+    /// come back `RequireApproval` and slip past it, exactly as a signature does
+    /// today. **What this signature saves then is the effect, not the filing** —
+    /// no token of the untrusted flavour can reach this method, so nothing is
+    /// written; but the approval request would be on somebody's queue, authored
+    /// by a stranger. `crate::revenue`'s module docs name that hole and the one
+    /// expression in `domain::policy::evaluate` that closes it for every
+    /// high-risk action at once, and that expression is the fix to make on the
+    /// same day, not this bound.
+    ///
+    /// # What the audit row carries, and what it does not
+    ///
+    /// The amount, its currency, the memo, the deal and the invoice id. Not the
+    /// customer's name: it is not in the subject, it is a join away, and the
+    /// deal id is what a reader follows. `Effects::pay` learned the same lesson
+    /// from the other side — its `memo` reached the audit row only after
+    /// somebody asked "what was that payment for" and found nothing.
+    pub async fn issue_invoice(
+        &self,
+        ok: Authorized<InvoiceIssue>,
+        draft: &InvoiceDraft,
+    ) -> Result<InvoiceId, EffectError> {
+        let amount = ok.action().subject().amount;
+        let id = InvoiceId::new_v7(Utc::now());
+
+        let issued = self
+            .write_invoice(id, amount, draft)
+            .await
+            .map(|()| id)
+            .map_err(|err| match err {
+                // The store's silence for "not this company's deal, or nobody
+                // won it". A closed code rather than the store error, because it
+                // is handed back to a caller as a failure and it must not become
+                // an existence oracle for another company's opportunity ids.
+                StoreError::NotFound => EffectError::Refused(NO_WON_DEAL),
+                other => EffectError::Unavailable(other),
+            });
+
+        let detail = Some(json!({
+            "opportunity_id": draft.opportunity_id.to_string(),
+            "memo": draft.memo,
+            "minor": amount.minor(),
+            "currency": amount.currency().code(),
+            "invoice_id": issued.as_ref().ok().map(|id: &InvoiceId| id.to_string()),
+        }));
+        self.record(&ok, detail, issued).await
+    }
+
+    /// The write, in its own transaction, so [`Effects::issue_invoice`] reads
+    /// like its siblings: do the thing, then record it.
+    ///
+    /// Two transactions and not one, exactly as `send_internal` uses two — the
+    /// audit row records that the attempt happened, which is true whether or not
+    /// the row landed, and folding them together would make an unrecordable
+    /// audit row roll back an invoice the customer has already been told about.
+    async fn write_invoice(
+        &self,
+        id: InvoiceId,
+        amount: Money,
+        draft: &InvoiceDraft,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
+        let written = invoices::issue(
+            &mut tx,
+            id,
+            draft.opportunity_id,
+            self.principal.employee_id,
+            amount,
+            &draft.memo,
+        )
+        .await;
+        match written {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(err) => {
+                // Rolled back rather than dropped: nothing was written and a
+                // pooled connection goes back deliberately.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
     /// Say something to the colleague named on the token, and wake them.
     ///
     /// # Where the message's trust label comes from
@@ -2018,7 +2182,7 @@ mod tests {
     use agentos_domain::action::{ActionKind, Channel};
     use agentos_domain::ids::{EmployeeId, TenantId};
     use agentos_domain::money::Currency;
-    use agentos_domain::policy::{PolicyLimits, SpendLimits};
+    use agentos_domain::policy::{DenyReason, PolicyLimits, SpendLimits};
     use agentos_providers::browser::MockBrowser;
     use agentos_providers::email::MockEmailProvider;
     use agentos_providers::leads::MockLeadSink;
@@ -2029,7 +2193,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::gate::PolicyGate;
+    use crate::gate::{Denied, PolicyGate};
 
     // -- test doubles for the two ports that have no adapter ---------------
 
@@ -2387,6 +2551,63 @@ mod tests {
         }
     }
 
+    fn billed(minor: u64) -> InvoiceIssue {
+        InvoiceIssue {
+            amount: Money::new(minor, Currency::Eur).expect("nonzero"),
+        }
+    }
+
+    fn draft(opportunity_id: Uuid) -> InvoiceDraft {
+        InvoiceDraft {
+            opportunity_id,
+            memo: "March".to_owned(),
+        }
+    }
+
+    /// An account and one opportunity at `stage`, for this principal's company.
+    ///
+    /// Inserted directly rather than through `agentos_store::revenue`, because
+    /// what the invoice tests turn on is the *stage* and a helper that could
+    /// only build won deals would make the refusal untestable.
+    async fn deal(db: &Db, principal: &Principal, stage: &str) -> Uuid {
+        let account = Uuid::now_v7();
+        let opportunity = Uuid::now_v7();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Buyer plc', $3, 'airline', 'FR')",
+        )
+        .bind(account)
+        .bind(principal.tenant_id.as_uuid())
+        .bind(format!("buyer-{}.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("insert account");
+        sqlx::query(
+            "INSERT INTO opportunities \
+                 (id, tenant_id, account_id, stage, currency, value_minor, approval_id, closed_at) \
+             VALUES ($1, $2, $3, $4, 'EUR', 120000, $5, now())",
+        )
+        .bind(opportunity)
+        .bind(principal.tenant_id.as_uuid())
+        .bind(account)
+        .bind(stage)
+        .bind(Uuid::now_v7())
+        .execute(&mut **tx)
+        .await
+        .expect("insert opportunity");
+        tx.commit().await.expect("commit the deal");
+        opportunity
+    }
+
+    async fn won_deal(db: &Db, principal: &Principal) -> Uuid {
+        deal(db, principal, "closed_won").await
+    }
+
+    async fn open_deal(db: &Db, principal: &Principal) -> Uuid {
+        deal(db, principal, "negotiation").await
+    }
+
     /// Every `provider_call_attempted` row: `(decision_id, payload)`.
     async fn effect_rows(db: &Db, principal: &Principal) -> Vec<(Option<Uuid>, Value)> {
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
@@ -2667,6 +2888,153 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1["outcome"], json!("error"));
         assert_eq!(rows[0].1["effect"], json!("payment_create"));
+    }
+
+    /// **The selling side reaches the register**, and the row it writes is
+    /// linked to the ruling that permitted it.
+    ///
+    /// The three facts this pins, none of which the store's own tests can see
+    /// because they hold no token: an invoice is `Allow`ed rather than escalated
+    /// (a `RequireApproval` would come back `Denied::PendingApproval` and there
+    /// would be no token to spend), the audit row names `invoice_issue` and
+    /// carries the deal and the memo, and the amount reaches the register in the
+    /// currency it was ruled on.
+    #[tokio::test]
+    async fn an_invoice_is_ruled_on_recorded_and_written_to_the_register() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = won_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, billed(120_000))
+            .await
+            .expect("the seeded policy opens Channel::Email");
+        let decision_id = token.decision_id();
+        assert!(
+            token.reservation().is_none(),
+            "an invoice draws down no spend headroom: the money comes the other way"
+        );
+
+        let id = effects
+            .issue_invoice(token, &draft(opportunity))
+            .await
+            .expect("a won deal is invoiceable");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let register = agentos_store::invoices::register(&mut tx)
+            .await
+            .expect("read the register");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(register.len(), 1);
+        assert_eq!(register[0].id, id);
+        assert_eq!(
+            register[0].amount,
+            Money::new(120_000, Currency::Eur).unwrap()
+        );
+        assert_eq!(register[0].issued_by, principal.employee_id);
+        assert_eq!(register[0].paid_at, None);
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0,
+            Some(decision_id.as_uuid()),
+            "linked to the ruling"
+        );
+        assert_eq!(rows[0].1["effect"], json!("invoice_issue"));
+        assert_eq!(rows[0].1["outcome"], json!("ok"));
+        assert_eq!(rows[0].1["detail"]["currency"], json!("EUR"));
+        assert_eq!(rows[0].1["detail"]["minor"], json!(120_000));
+        assert_eq!(rows[0].1["detail"]["memo"], json!("March"));
+        assert_eq!(
+            rows[0].1["detail"]["opportunity_id"],
+            json!(opportunity.to_string())
+        );
+    }
+
+    /// **The ceiling, from the side that holds a token.**
+    ///
+    /// The gate says yes — this employee may bill — and the write still refuses,
+    /// because the party is not the seat's to choose: an invoice may only name a
+    /// deal somebody won, and winning one needs a human's approval id
+    /// (`opportunities_won_needs_approval`, 0011). That is the whole of what
+    /// stops a hundred invoices to strangers, so the assertion is on the
+    /// refusal — and on the audit row, because a refused demand for money is
+    /// exactly the thing an operator has to be able to see afterwards.
+    #[tokio::test]
+    async fn an_authorised_seat_still_cannot_invoice_a_deal_nobody_won() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = open_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, billed(120_000))
+            .await
+            .expect("the gate permits the verb");
+        let err = effects
+            .issue_invoice(token, &draft(opportunity))
+            .await
+            .expect_err("a deal in negotiation is not billable");
+        assert_eq!(err.code(), NO_WON_DEAL);
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let register = agentos_store::invoices::register(&mut tx)
+            .await
+            .expect("read the register");
+        tx.rollback().await.expect("rollback");
+        assert!(register.is_empty(), "nothing was written");
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "the refusal is on the record");
+        assert_eq!(rows[0].1["effect"], json!("invoice_issue"));
+        assert_eq!(rows[0].1["outcome"], json!("error"));
+        assert_eq!(rows[0].1["error"], json!(NO_WON_DEAL));
+    }
+
+    /// **A stranger's text cannot produce a demand for money, and it does not
+    /// produce an approval request either.**
+    ///
+    /// `Action::InvoiceIssue` is `Risk::High` and its arm answers `Allow`, so
+    /// `evaluate`'s taint wire fires and the gate denies outright with
+    /// `UntrustedInput`. The second assertion is the one that matters and is why
+    /// this is not modelled on `ContractSign`: an escalation here would file a
+    /// stranger's invoice in front of a human to approve.
+    #[tokio::test]
+    async fn a_tainted_turn_cannot_invoice_anybody() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+
+        let denied = gate(&db)
+            .authorize(&principal, Untrusted::new(billed(120_000)))
+            .await
+            .expect_err("a tainted invoice is refused");
+        assert!(
+            matches!(denied, Denied::Policy(DenyReason::UntrustedInput)),
+            "expected the taint stop, got {denied:?}"
+        );
+        assert!(
+            !matches!(denied, Denied::PendingApproval(_)),
+            "an untrusted invoice must not become a question a human is asked"
+        );
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM approvals WHERE state = 'pending'")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count approvals");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(pending, 0, "no approval was filed by a stranger");
     }
 
     /// **A read ruling cannot buy a keystroke on somebody's page.**

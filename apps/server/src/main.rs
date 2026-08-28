@@ -577,6 +577,11 @@ fn app(
             // answer — *when*. Before it, nothing in this product could name an
             // hour.
             .merge(routes::calendar::router(db.clone()))
+            // And beside those three, closing the asymmetry the founder named:
+            // the company could buy end to end and could not ask to be paid.
+            // Read-and-settle only — issuing goes through the gate, from a seat,
+            // and there is deliberately no operator route for it.
+            .merge(routes::invoices::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
