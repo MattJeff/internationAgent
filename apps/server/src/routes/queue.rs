@@ -75,7 +75,11 @@
 //!   `0` nor an employee layer a team has since tightened. Today's spend
 //!   through [`contacted_since`](agentos_store::revenue::contacted_since) from
 //!   UTC midnight, which is the column `record_queued` writes and the same day
-//!   boundary the turn ledger keys on.
+//!   boundary the turn ledger keys on. **That count is read with no lock**, and
+//!   the selection under it takes `FOR UPDATE OF c SKIP LOCKED` — so two pulls
+//!   at once get disjoint prospects, neither blocks, and both used to take the
+//!   whole day. [`agentos_store::outreach::reserve`] is the row lock that closes
+//!   it, taken in the transaction below, before anybody is marked.
 //! * **`may_propose(EmailSend)` and `Channel::Email`** — the sales role pack's,
 //!   carrying those loaded limits.
 //!
@@ -142,6 +146,7 @@ use agentos_app::queue;
 use agentos_app::rolepack_sales::RolePack;
 use agentos_domain::ids::EmployeeId;
 use agentos_store::db::{Db, StoreError};
+use agentos_store::outreach::{self, ContactBudgetError};
 use agentos_store::policy;
 use agentos_store::revenue as revenue_store;
 use axum::Json;
@@ -201,6 +206,12 @@ struct Export {
     /// empty file is an operator who has not raised the limit, which is the
     /// ordinary reason a new deployment exports nothing; it reads very
     /// differently from a budget that was there and found nobody.
+    ///
+    /// Measured against [`contacted_since`](agentos_store::revenue::contacted_since)
+    /// alone, which is the number the file path spends. In a deployment that has
+    /// also been *sending* today the `outreach_buckets` ledger may be further
+    /// along, so this can over-report headroom the reservation below then
+    /// refuses; `queued` is always the truth about the file.
     budget: u32,
     /// How many the tenant had already written to today, before this call.
     spent_today: u32,
@@ -365,7 +376,48 @@ async fn export(
     )
     .unwrap_or(u32::MAX);
 
-    let leads = queue::plan(ready, &pack, &suppression, spent_today);
+    let mut leads = queue::plan(ready, &pack, &suppression, spent_today);
+
+    // **The day's strangers, reserved under a row lock, before anybody is
+    // marked.** `spent_today` above is a `count(*)` read with no lock at all,
+    // and the selection under it takes `FOR UPDATE OF c SKIP LOCKED` — which is
+    // right, and is exactly what defeats the budget: two concurrent pulls get
+    // *disjoint* prospects, so neither ever blocks, both read "nobody contacted
+    // yet", and both take the whole day's allowance. Two files, twice the
+    // ceiling, and the number that was doubled is the one an operator answers
+    // for in front of a supervisory authority.
+    //
+    // `agentos_store::outreach` is the ledger that closes it, and it is the same
+    // shape `turns` and `spend` have had all along. It cannot widen anything:
+    // `plan` has already truncated to `max_new_contacts_per_day - spent_today`,
+    // and this only ever truncates further.
+    //
+    // **Only on the file path.** On the send path `queue::push` authorises every
+    // lead through `PolicyGate`, which charges this same bucket one stranger at
+    // a time — so reserving here as well would charge every prospect twice and
+    // halve the founder's day.
+    if !sending {
+        let granted = match outreach::reserve(
+            &mut tx,
+            employee_id,
+            now.date_naive(),
+            &policy,
+            u32::try_from(leads.len()).unwrap_or(u32::MAX),
+        )
+        .await
+        {
+            Ok(granted) => granted as usize,
+            Err(ContactBudgetError::Store(err)) => {
+                tx.rollback().await?;
+                return Err(ApiError::from(err));
+            }
+            // The day is spent. An empty file is a 200 here for the same reason
+            // it is when `plan` truncates to nothing — see the module docs.
+            Err(_) => 0,
+        };
+        leads.truncate(granted);
+    }
+
     // Before the bytes, in the same transaction as the bytes. The order is the
     // module's and the argument is in this one's docs.
     queue::record_queued(&mut tx, &leads, now)
@@ -870,8 +922,84 @@ mod tests {
         // And the first run is visible as spend, so a second run cannot be
         // handed the whole day's budget again.
         assert_eq!(second["spent_today"], 1);
+        // It is visible in the *reserved* ledger too, which is the half a
+        // concurrent pull can see. Delete the reservation from `export` and this
+        // is the line that goes red.
+        assert_eq!(taken_today(&h).await, 1);
 
         h.teardown().await;
+    }
+
+    /// **The budget is a reserved row now, not a count somebody read.**
+    ///
+    /// The pull's own counter — [`contacted_since`](revenue_store::contacted_since),
+    /// over `contacts.last_contacted_at` — is read with no lock, and the
+    /// selection under it takes `FOR UPDATE OF c SKIP LOCKED`, so two pulls at
+    /// once get *disjoint* prospects and neither ever blocks. Both read "nobody
+    /// written to today", both take the whole day, and the ceiling an operator
+    /// answers to a supervisory authority for is doubled.
+    ///
+    /// Arranged rather than raced, for the reason
+    /// `gate::a_policy_change_cannot_land_between_the_ruling_and_the_reservation`
+    /// gives: a slot taken out of `outreach_buckets` behind this route's back is
+    /// precisely what a concurrent pull leaves there, and it leaves `contacts`
+    /// untouched — so `contacted_since` still reports zero, `budget` still
+    /// reports the whole day, and the only thing left that can empty the file is
+    /// the reservation.
+    #[tokio::test]
+    async fn a_pull_spends_a_reserved_ledger_and_not_a_count_it_read() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        contact_budget(&h.db, h.a, 2).await;
+        let id = employee(&h.db, h.a, "seller").await;
+        for row in REAL.lines().skip(1).take(2) {
+            seed_row(&h.db, h.a, row, "s", "b", Utc::now()).await;
+        }
+
+        // A concurrent pull got there first and took both of today's strangers.
+        let employee_id = EmployeeId::from_uuid(id);
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let policy = policy::load(&mut tx, employee_id).await.expect("policy");
+        assert_eq!(
+            outreach::reserve(&mut tx, employee_id, Utc::now().date_naive(), &policy, 2)
+                .await
+                .expect("the whole day"),
+            2
+        );
+        tx.commit().await.expect("commit");
+
+        let (status, body) = h.export(id, SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["spent_today"], 0,
+            "nobody has been written to, which is the whole trap"
+        );
+        assert_eq!(
+            body["budget"], 2,
+            "and the unlocked count still says the day is untouched"
+        );
+        assert_eq!(
+            body["queued"], 0,
+            "the reserved ledger is what actually decides"
+        );
+        assert_eq!(csv_of(&body), header());
+
+        h.teardown().await;
+    }
+
+    /// What `outreach_buckets` says tenant A's seller has been cleared to reach
+    /// today. One employee per test, so the tenant is enough to find it.
+    async fn taken_today(h: &Harness) -> u32 {
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let taken: Option<i32> =
+            sqlx::query_scalar("SELECT contacts_taken FROM outreach_buckets WHERE day = $1")
+                .bind(Utc::now().date_naive())
+                .fetch_optional(&mut **tx)
+                .await
+                .expect("read the bucket");
+        tx.rollback().await.expect("rollback");
+        u32::try_from(taken.unwrap_or(0)).unwrap_or(0)
     }
 
     /// A file the founder uploads *is* a send, with the safety checks a day

@@ -101,6 +101,7 @@ use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::halt;
 use agentos_store::org::{self, TeamSpendRefused};
+use agentos_store::outreach::{self, ContactBudgetError};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
 use agentos_store::spend::{CapExceeded, Reservation};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -682,7 +683,13 @@ impl PolicyGate {
                 // 5. A permitted payment consumes the headroom it was measured
                 //    against, here, before the caller can be told yes.
                 Action::PaymentCreate { amount } => self.reserve(tx, principal, *amount, now).await,
-                _ => Ok(Outcome::Allow { reservation: None }),
+                // 5b. …and a permitted approach to a stranger consumes the
+                //     day's cold-outreach headroom, for exactly the same reason
+                //     and in the same transaction.
+                _ => {
+                    self.take_contact(tx, principal, action, ctx.contact, &policy, now)
+                        .await
+                }
             },
             Decision::Deny { reason } => Ok(Outcome::Deny(reason)),
             decision @ Decision::RequireApproval { .. } => {
@@ -773,6 +780,87 @@ impl PolicyGate {
             ContactStanding::New
         };
         Ok((u32::try_from(new_today).unwrap_or(u32::MAX), standing))
+    }
+
+    /// Consume one of the day's strangers, for an action the rule has just
+    /// allowed. **The counted half of [`Self::contacts`], made race-free.**
+    ///
+    /// [`Self::contacts`] derives `new_contacts_today` from an unlocked
+    /// aggregate over `audit_log`, and the write that follows it is
+    /// `audit::append` — an INSERT into an append-only log with no counter row
+    /// and no unique index. Two decisions read `1 of 2`, both are allowed, both
+    /// append, and the day ends at three strangers on a ceiling of two. That is
+    /// reproducible with no threads at all, and it is the last of this
+    /// workspace's three daily budgets to have been merely counted:
+    /// [`agentos_store::turns`] and [`agentos_store::spend`] both reserve under
+    /// a row lock, and this now does too.
+    ///
+    /// # Which decisions are charged, and it is exactly the old set
+    ///
+    /// One slot when — and only when — this audit row is about to add a
+    /// counterparty the trail has never carried: [`counterparty`] answers
+    /// `Some` (so the row will land under [`COUNTERPARTY_KEY`] at all) and the
+    /// standing read a moment ago said [`ContactStanding::New`] (so it is not
+    /// already in the aggregate). Those are the two conditions under which the
+    /// aggregate's `count(*)` would go up by one, so the bucket goes up by one
+    /// in the same cases and in no others. `agentos_store::outreach`'s
+    /// `the_bucket_and_the_audit_aggregate_count_the_same_set` walks a sequence
+    /// past both and compares them at every step.
+    ///
+    /// A payment is not an approach and never charges: [`counterparty`] is
+    /// `None` for it, and — this is the arm that would have been wrong —
+    /// [`Self::contacts`] reports `New` for an action with no counterparty at
+    /// all, because `bool_or(counterparty = NULL)` is NULL. Reserving on the
+    /// standing alone would have made every payment, every browse and every
+    /// message to a colleague spend one of the day's strangers.
+    ///
+    /// # The aggregate is still what the rule reads
+    ///
+    /// Both counters run. Not caution — the deployment day: a bucket created at
+    /// noon starts at zero while the trail already holds this morning's
+    /// strangers, so a bucket that *replaced* the aggregate would hand every
+    /// tenant a fresh allowance the afternoon `0055` lands. That is a ceiling
+    /// widening, which is the one thing a ceiling may never do. Side by side,
+    /// the refusal is the stricter of the two.
+    ///
+    /// # No savepoint, unlike [`Self::reserve`]
+    ///
+    /// That one needs one because a team refusal arrives *after* the employee's
+    /// own money is already reserved in this transaction. Nothing here is
+    /// half-done on the way to a refusal: `outreach::reserve` returns before any
+    /// write when the policy grants nothing, and its locking upsert assigns the
+    /// row's own value back to itself — so a refused reservation leaves the
+    /// bucket at exactly the number it already held, and committing it with the
+    /// deny audit row changes nothing.
+    ///
+    /// # The approval path deliberately does not do this
+    ///
+    /// [`Self::redeem`] re-takes the spend headroom and not this, because there
+    /// is nothing to take: `evaluate` answers `RequireApproval` only for
+    /// payments, contract signatures, credential changes, bulk erasure and
+    /// charters, and [`counterparty`] is `None` for every one of them. A
+    /// redeemed approval cannot write a row this budget counts.
+    async fn take_contact(
+        &self,
+        tx: &mut TenantTx<'_>,
+        principal: &Principal,
+        action: &Action,
+        standing: ContactStanding,
+        policy: &agentos_domain::policy::EffectivePolicy,
+        now: DateTime<Utc>,
+    ) -> Result<Outcome, Denied> {
+        if standing != ContactStanding::New || counterparty(action).is_none() {
+            return Ok(Outcome::Allow { reservation: None });
+        }
+        match outreach::reserve(tx, principal.employee_id, now.date_naive(), policy, 1).await {
+            Ok(_) => Ok(Outcome::Allow { reservation: None }),
+            Err(ContactBudgetError::Store(err)) => Err(Denied::Unavailable(err)),
+            // Both refusals share a reason because they share a remedy — an
+            // operator raising `max_new_contacts_per_day`. `NoBudget` is
+            // unreachable from here anyway: a ceiling of zero is `0 >= 0`, and
+            // `evaluate` refused above.
+            Err(_) => Ok(Outcome::Deny(DenyReason::ContactBudgetExhausted)),
+        }
     }
 
     /// What this employee has already reserved today in `currency`.
@@ -1709,6 +1797,123 @@ mod tests {
         gate.authorize(&principal, email("a@example.com"))
             .await
             .expect("a known counterparty costs nothing");
+    }
+
+    /// **The same budget, reserved rather than counted.**
+    ///
+    /// [`PolicyGate::contacts`] derives the day's number from an unlocked
+    /// aggregate over `audit_log`, and the write that follows it is an INSERT
+    /// into an append-only log: no counter row, no unique index, nothing to
+    /// block on. Two decisions read `1 of 2`, both are allowed, both append, and
+    /// the day ends at three strangers on a ceiling of two — reproduced in SQL,
+    /// with no threads and no timing, before `outreach_buckets` existed.
+    ///
+    /// Arranged rather than raced, for the same reason
+    /// [`a_policy_change_cannot_land_between_the_ruling_and_the_reservation`]
+    /// arranges: a slot taken out of the bucket behind the gate's back is
+    /// exactly what a concurrent twin leaves there, and it leaves `audit_log`
+    /// untouched — so the aggregate still reports the day as free, and the only
+    /// thing that can refuse below is the reservation.
+    #[tokio::test]
+    async fn an_allowed_approach_reserves_the_stranger_it_was_measured_against() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let day = Utc::now().date_naive();
+        // Five strangers and money, plus the internal channel — which is what
+        // makes the assertion below possible at all.
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Internal]),
+                ..limits()
+            },
+        )
+        .await;
+        give_caps(&db, &principal, 100_000, 50_000).await;
+
+        // **The arm that would have been wrong, and it is not the payment.** A
+        // payment is matched one line earlier in `decide` and never reaches the
+        // reservation; a message to a colleague does. `contacts` reports `New`
+        // for it — `bool_or(counterparty = NULL)` is NULL, and `InternalSend`
+        // has no counterparty on purpose — so reserving on the standing alone
+        // would make the first message to each colleague spend one of the day's
+        // strangers, which is exactly the failure `counterparty` was written to
+        // avoid. Same for a browse, an MCP call and a file upload.
+        gate.authorize(
+            &principal,
+            Action::InternalSend {
+                to: Slug::parse("bruno").expect("slug"),
+            },
+        )
+        .await
+        .expect("a colleague is not a stranger");
+        assert_eq!(strangers_today(&db, &principal, day).await, 0);
+
+        gate.authorize(&principal, payment(1_000))
+            .await
+            .expect("inside every cap");
+        assert_eq!(strangers_today(&db, &principal, day).await, 0);
+
+        gate.authorize(&principal, email("a@example.com"))
+            .await
+            .expect("the first stranger");
+        assert_eq!(strangers_today(&db, &principal, day).await, 1);
+
+        // A repeat is free on the ledger for the same reason it is free in the
+        // aggregate: the standing is `Known`, so nothing is charged.
+        gate.authorize(&principal, email("a@example.com"))
+            .await
+            .expect("a known counterparty costs nothing");
+        assert_eq!(strangers_today(&db, &principal, day).await, 1);
+
+        // The concurrent twin takes the rest of the day, without writing a
+        // single audit row — so the aggregate the rule reads still says `1 of 5`.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let policy = policy_store::load(&mut tx, principal.employee_id)
+            .await
+            .expect("policy");
+        assert_eq!(
+            outreach::reserve(&mut tx, principal.employee_id, day, &policy, 4)
+                .await
+                .expect("the rest of the day"),
+            4
+        );
+        tx.commit().await.expect("commit");
+
+        let before = audit_rows(&db, &principal).await.len();
+        let err = gate
+            .authorize(&principal, email("b@example.com"))
+            .await
+            .expect_err("the ledger is what decides, not the trail");
+        assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
+        assert_eq!(
+            strangers_today(&db, &principal, day).await,
+            5,
+            "a refusal does not advance the ledger"
+        );
+
+        // Refused, and audited like every other outcome — with the reason the
+        // rule would have used, so an operator reads one code for one remedy.
+        let rows = audit_rows(&db, &principal).await;
+        assert_eq!(rows.len(), before + 1);
+        assert_eq!(rows[before].0.as_deref(), Some("deny"));
+        assert_eq!(
+            rows[before].1.as_deref(),
+            Some(DenyReason::ContactBudgetExhausted.code())
+        );
+        assert_eq!(rows[before].2[COUNTERPARTY_KEY], json!("b@example.com"));
+    }
+
+    /// What `outreach_buckets` says this employee has been cleared to reach.
+    async fn strangers_today(db: &Db, principal: &Principal, day: chrono::NaiveDate) -> u32 {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let taken = outreach::taken_today(&mut tx, principal.employee_id, day)
+            .await
+            .expect("read the bucket");
+        tx.rollback().await.expect("rollback");
+        taken
     }
 
     #[tokio::test]
