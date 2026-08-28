@@ -61,6 +61,25 @@
 //! `max_new_contacts_per_day: 0`, and partway through the day on the three that
 //! ship `5`, `5` and `20`.
 //!
+//! # The warming schedule, which is a second narrowing and never a ramp
+//!
+//! `0070_outreach_warmup` added the other half of the ceiling: the number an
+//! operator wrote is where a seat *lands*, and [`warmup_release`] is how much of
+//! it today releases, given the sending domain's age and what the trail says
+//! about how our mail is received.
+//!
+//! **It cannot widen anything and the shape is why.** `effective = min(written,
+//! released)`, computed here, off an `EffectivePolicy` that
+//! `agentos_domain::policy::warmup_allowance` has already taken the same `min`
+//! against. A seat written down as five takes five however old and however clean
+//! the domain is. What moves is the floor coming up towards that number, never
+//! the number.
+//!
+//! **A tenant with no `outreach_warmup` row is untouched by all of it.** That is
+//! this module's own deployment-day argument, applied to itself: a narrowing
+//! that switched on for everybody the afternoon it landed would cut a running
+//! business to one stranger a day with nobody having asked.
+//!
 //! # Which day
 //!
 //! UTC, `now.date_naive()`, the same day the other two ledgers key on. The
@@ -81,16 +100,20 @@
 //! written-to-twice is what a sending domain does not recover from.
 
 use agentos_domain::ids::EmployeeId;
-use agentos_domain::policy::EffectivePolicy;
-use chrono::NaiveDate;
+use agentos_domain::policy::{Deliverability, EffectivePolicy, warmup_allowance};
+use chrono::{NaiveDate, TimeDelta};
 use thiserror::Error;
 
 use crate::db::{StoreError, TenantTx};
 
 /// Why an approach was refused.
 ///
-/// Two refusals rather than one, for [`crate::turns`]'s reason: [`Self::NoBudget`]
-/// is a policy nobody wrote, and [`Self::Exhausted`] is a policy doing its job.
+/// Three refusals rather than one, and each is a different remedy.
+/// [`Self::NoBudget`] is a policy nobody wrote and [`Self::Exhausted`] is a
+/// policy doing its job — [`crate::turns`]'s distinction, unchanged.
+/// [`Self::Warming`] is neither: the policy is right and the sending domain is
+/// not ready, so the only thing an operator could widen is the one number that
+/// would not help.
 #[derive(Debug, Error)]
 pub enum ContactBudgetError {
     /// The intersected policy allows this employee no cold outreach at all.
@@ -114,6 +137,32 @@ pub enum ContactBudgetError {
         taken: u32,
     },
 
+    /// The operator's ceiling was not what refused. This tenant is enrolled in
+    /// the warming schedule (`migrations/0070_outreach_warmup.sql`) and today
+    /// releases only part of the number they wrote — either because the sending
+    /// domain is young, or because its deliverability cannot be read at all.
+    ///
+    /// **A third refusal rather than a second `Exhausted`, and the reason is the
+    /// remedy.** The two above share one: an operator raising
+    /// `max_new_contacts_per_day`. This one is refused *under* that number —
+    /// `warmup_allowance` returns the `min` of the schedule and it — so raising
+    /// it does nothing, and reporting this as `Exhausted` would send somebody to
+    /// widen a limit on a domain the trail has just called unhealthy. It maps to
+    /// its own [`DenyReason`](agentos_domain::policy::DenyReason), which is not
+    /// grantable for the same reason.
+    #[error(
+        "the sending domain is warming: {allowed} of this seat's {written} new contacts a day \
+         are released today ({taken} taken)"
+    )]
+    Warming {
+        /// What the schedule and the measurement released today.
+        allowed: u32,
+        /// What the operator wrote. Always `>= allowed`.
+        written: u32,
+        /// What the bucket held.
+        taken: u32,
+    },
+
     /// The database said no.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -131,6 +180,7 @@ impl ContactBudgetError {
         match self {
             ContactBudgetError::NoBudget => "no_contact_budget",
             ContactBudgetError::Exhausted { .. } => "contact_budget_exhausted",
+            ContactBudgetError::Warming { .. } => "sending_domain_warming",
             ContactBudgetError::Store(_) => "unavailable",
         }
     }
@@ -205,8 +255,48 @@ pub async fn reserve(
     // -- everything from here to COMMIT runs under that row lock --
 
     let taken = u32::try_from(taken).unwrap_or(u32::MAX);
-    let granted = want.min(limit.saturating_sub(taken));
+
+    // The second narrowing, and it is only ever a narrowing. `None` is a tenant
+    // with no `outreach_warmup` row — the ramp is not installed for them and
+    // their day is exactly what it was before `0070` existed.
+    //
+    // `.min(limit)` is redundant: `warmup_allowance` already returns the `min`
+    // of the schedule and this same number, off the same `EffectivePolicy`.
+    // Kept because the two are independently tested — `agentos_domain`'s
+    // `the_warmup_never_returns_more_than_the_operator_wrote` sweeps the pure
+    // function, and this line means a caller that got handed a larger number by
+    // any route still cannot spend it. One lock at each end of the same claim.
+    let allowed = match warmup_release(tx, day, policy).await? {
+        None => limit,
+        Some(release) => release.min(limit),
+    };
+
+    let granted = want.min(allowed.saturating_sub(taken));
     if granted == 0 {
+        // Which of the two refused. `<` and not `<=`, and that is the whole of
+        // it: when the schedule released everything the operator wrote, the
+        // operator's number is genuinely the wall and raising it genuinely
+        // helps, so this must stay `Exhausted`. `<=` here swallows the ordinary
+        // refusal whole — including for tenants that are not enrolled, where
+        // `allowed` is `limit` by construction — and
+        // `a_tenant_with_no_warmup_row_has_exactly_the_day_it_had_before` is the
+        // line that catches it.
+        if allowed < limit {
+            // Counts only, no addresses: this is the line that answers "why is
+            // the seller sending one a day", and the usual answer is that
+            // nothing has ever proved a bounce would reach us.
+            tracing::info!(
+                allowed,
+                written = limit,
+                taken,
+                "the sending domain is warming; today releases part of this seat's ceiling"
+            );
+            return Err(ContactBudgetError::Warming {
+                allowed,
+                written: limit,
+                taken,
+            });
+        }
         return Err(ContactBudgetError::Exhausted { limit, taken });
     }
 
@@ -222,6 +312,129 @@ pub async fn reserve(
     .await?;
 
     Ok(granted)
+}
+
+/// What the warming schedule releases for this tenant on `day`, or `None` when
+/// the tenant is not enrolled in one.
+///
+/// **The measured half of the cold-contact ceiling.** `docs/ORIZN.md` asks for a
+/// number that moves as the sending domain ages, and says in the same breath
+/// that there is no measurement of deliverability to move it against. This is
+/// that measurement, assembled out of rows that already exist, plus the one
+/// fact no row could hold — see `migrations/0070_outreach_warmup.sql`.
+///
+/// # What is actually being measured, and by whom it is written
+///
+/// Two counts, both tenant-scoped by row-level security rather than by a
+/// predicate, over the same window ([`Deliverability::WINDOW_DAYS`]):
+///
+/// * **the denominator** is `sum(outreach_buckets.contacts_taken)` — strangers
+///   this tenant was cleared to approach. Written by `reserve` above, from its
+///   two production callers: `app::gate::PolicyGate::take_contact` on the
+///   sending path and `routes::queue::export` on the file path;
+/// * **the numerator** is `audit_log` rows of kind `mail_refused` whose payload
+///   says `permanent`. Written by `app::inbound::record_refusal`, reached from
+///   `main::on_webhook` when a verified provider delivery parses as
+///   [`Refusal`](agentos_providers::email::Refusal) — a spam complaint, which is
+///   always permanent, or a bounce the provider itself called permanent. Soft
+///   bounces are counted as evidence that the channel works and not as evidence
+///   against the domain: a full mailbox is not a reputation event.
+///
+/// `suppressions` was the other candidate for the numerator and was not taken.
+/// It holds the same complaints, but it also holds `opt_out` rows from the STOP
+/// reply path and rows an operator may add by hand, its writes are conditional
+/// on the address parsing, and its rows are keyed by address rather than by
+/// event — the same person refusing twice is one row. The trail counts events,
+/// which is what a rate needs.
+///
+/// # The count that is not a rate: has a refusal ever arrived at all
+///
+/// The third read is `count(*)` over every `mail_refused` row this tenant has,
+/// with no window and no `permanent` filter, and it exists because of the
+/// question `app::inbound::record_refusal` leaves open: nothing in this process
+/// can see whether the provider endpoint is subscribed to `email.bounced` and
+/// `email.complained`. If it is not, the numerator above is permanently zero and
+/// a two-valued measure would read a broken webhook as a spotless domain.
+///
+/// So one refusal, ever, of any severity, is what proves the channel exists —
+/// and the operator's `refusal_events_confirmed_at` is the other way to prove
+/// it, for a tenant whose list is genuinely clean enough never to have bounced.
+/// Neither, and the reading is [`Deliverability::Unknown`], which releases the
+/// floor and nothing more.
+///
+/// # The measurement is the domain's and the enforcement is the seat's
+///
+/// ponytail: what this returns is compared against **one employee's** bucket, so
+/// a tenant with three outbound seats can put three times the schedule on one
+/// sending domain. That is a real gap and it is named rather than closed: it is
+/// strictly narrower than the day those seats have without this function at all,
+/// so it cannot make anything worse, and the alternative was worse in a way this
+/// schema argues against elsewhere. A tenant-wide allowance needs a tenant-keyed
+/// counter, and `outreach_buckets` is keyed `(tenant, employee, day)` on
+/// purpose — `0055` says a ledger coarser than its limit "refuses an employee for
+/// what a colleague did", which is what a shared allowance over per-seat ceilings
+/// produces. The upgrade path, the day a tenant really does run several cold
+/// seats: a tenant-keyed row plus `pg_advisory_xact_lock` before the bucket
+/// upsert, in `reserve`, taken in that order.
+///
+/// The measurement above stays tenant-wide either way and that is not the same
+/// compromise — a reputation belongs to the domain, so both counts must span
+/// every seat that sends from it. Three seats that between them over-send show up
+/// in the rate and put all three back on the floor. Late, but not never.
+async fn warmup_release(
+    tx: &mut TenantTx<'_>,
+    day: NaiveDate,
+    policy: &EffectivePolicy,
+) -> Result<Option<u32>, StoreError> {
+    // One row per tenant and RLS picks it. No enrolment, no narrowing: the
+    // tenant's day is what it was before this existed, which is `0055`'s
+    // deployment-day argument and not an opinion about their deliverability.
+    let Some((started_on, confirmed)): Option<(NaiveDate, bool)> = sqlx::query_as(
+        "SELECT warming_started_on, refusal_events_confirmed_at IS NOT NULL FROM outreach_warmup",
+    )
+    .fetch_optional(&mut ***tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let since = day - TimeDelta::days(Deliverability::WINDOW_DAYS);
+    // Both windows start at the same midnight, so the two counts are over the
+    // same days and the rate between them means something.
+    let since_start = since.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc();
+
+    let approaches: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(contacts_taken), 0)::bigint FROM outreach_buckets WHERE day >= $1",
+    )
+    .bind(since)
+    .fetch_one(&mut ***tx)
+    .await?;
+
+    // One statement for both counts: they read the same rows and a second query
+    // is a second chance for them to disagree about which rows those are.
+    let (refusals, ever): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE occurred_at >= $1 AND payload->>'permanent' = 'true'), \
+                count(*) \
+           FROM audit_log WHERE action_kind = 'mail_refused'",
+    )
+    .bind(since_start)
+    .fetch_one(&mut ***tx)
+    .await?;
+
+    let measured = Deliverability::measure(
+        u64::try_from(approaches).unwrap_or(0),
+        u64::try_from(refusals).unwrap_or(u64::MAX),
+        confirmed || ever > 0,
+    );
+    // A count that will not fit is read in the direction that narrows: no
+    // approaches at all is `Unknown`, and unreadably many refusals is
+    // `Unhealthy`. Both release the floor.
+
+    Ok(Some(warmup_allowance(
+        policy,
+        (day - started_on).num_days(),
+        measured,
+    )))
 }
 
 /// How many strangers this employee has been cleared to reach on `day`. The
@@ -623,6 +836,295 @@ mod tests {
 
         drop_tenant(&db, tenant_a).await;
         drop_tenant(&db, tenant_b).await;
+    }
+
+    // -- the warming schedule ------------------------------------------------
+
+    /// Enrol a tenant. `admin_tx_bypassing_rls` because `app_role` holds no
+    /// INSERT on this table — see `0070` and
+    /// [`the_application_may_read_the_warmup_row_and_never_write_it`].
+    async fn enrol(db: &Db, tenant: TenantId, started_on: NaiveDate, confirmed: bool) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outreach_warmup (tenant_id, warming_started_on, \
+                                          refusal_events_confirmed_at) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id) DO UPDATE SET \
+               warming_started_on = excluded.warming_started_on, \
+               refusal_events_confirmed_at = excluded.refusal_events_confirmed_at",
+        )
+        .bind(tenant.as_uuid())
+        .bind(started_on)
+        .bind(confirmed.then(Utc::now))
+        .execute(&mut *tx)
+        .await
+        .expect("enrol");
+        tx.commit().await.expect("commit enrolment");
+    }
+
+    /// A day's worth of approaches already on the books, so the window has a
+    /// denominator without this test having to reserve them through the very
+    /// function it is measuring.
+    async fn seed_bucket(db: &Db, tenant: TenantId, employee: EmployeeId, day: NaiveDate, n: i32) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outreach_buckets (tenant_id, employee_id, day, contacts_taken) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(employee.as_uuid())
+        .bind(day)
+        .bind(n)
+        .execute(&mut *tx)
+        .await
+        .expect("seed bucket");
+        tx.commit().await.expect("commit bucket");
+    }
+
+    /// One refusal on the trail, through `crate::audit` and with
+    /// [`AuditKind::MailRefused`] rather than the string — so the spelling
+    /// `warmup_release` filters on is the one production writes, not a copy of
+    /// it that can drift.
+    ///
+    /// The payload key is the seam this cannot cover on its own: it is written
+    /// in `crates/app/src/inbound.rs` and read here, in another crate, with no
+    /// shared constant between them. `agentos_app::inbound`'s
+    /// `a_recorded_complaint_is_what_the_warming_schedule_reads` drives the real
+    /// writer end to end for exactly that reason.
+    async fn append_refusal(db: &Db, tenant: TenantId, permanent: bool, at: DateTime<Utc>) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        crate::audit::append(
+            &mut tx,
+            &crate::audit::AuditEvent {
+                payload: serde_json::json!({
+                    "reason": if permanent { "complaint" } else { "bounce" },
+                    "permanent": permanent,
+                    "channel": "email",
+                }),
+                ..crate::audit::AuditEvent::new(
+                    crate::audit::AuditActor::System,
+                    crate::audit::AuditKind::MailRefused,
+                    at,
+                )
+            },
+        )
+        .await
+        .expect("append refusal");
+        tx.commit().await.expect("commit refusal");
+    }
+
+    /// **The mutation the founder asked for by name.** A seat written down as
+    /// five takes five and never six, whatever the schedule and the measurement
+    /// would like — the domain here is four hundred days old with a spotless
+    /// window, which is every input that could push the release upward.
+    ///
+    /// Delete the `min` at the end of `domain::policy::warmup_allowance` and
+    /// this reserves fifty. Delete the `.min(limit)` in `reserve` and the domain
+    /// still holds the line; delete both and the ceiling is gone.
+    ///
+    /// The second half matters as much: the refusal that arrives when the day
+    /// is spent is `Exhausted` and **not** `Warming`, because the operator's
+    /// number is genuinely what refused and raising it genuinely would help.
+    #[tokio::test]
+    async fn a_tenant_capped_at_five_stays_at_five_however_warm_the_domain_is() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "capfive").await;
+
+        seed_bucket(&db, tenant, employee, DAY - TimeDelta::days(1), 100).await;
+        enrol(&db, tenant, DAY - TimeDelta::days(400), true).await;
+
+        assert_eq!(
+            reserve_committed(&db, tenant, employee, DAY, &policy(5), 50)
+                .await
+                .expect("a warm domain releases the whole written ceiling"),
+            5,
+            "the warming schedule wanted 401 and the operator wrote 5"
+        );
+
+        let err = reserve_committed(&db, tenant, employee, DAY, &policy(5), 1)
+            .await
+            .expect_err("the day is spent");
+        assert!(
+            matches!(err, ContactBudgetError::Exhausted { limit: 5, taken: 5 }),
+            "{err}"
+        );
+        assert_eq!(err.code(), "contact_budget_exhausted");
+        assert_eq!(counted(&db, tenant, employee, DAY).await, 5);
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **Not knowing is not the same as being fine**, and one complaint puts a
+    /// warm domain back on the floor.
+    ///
+    /// Four properties in one sequence, because they are one story:
+    ///
+    /// 1. enrolled, four hundred days old, nothing has ever demonstrated that a
+    ///    refusal would reach us — the release is the floor, not the ceiling,
+    ///    and the refusal names the warming schedule rather than the operator;
+    /// 2. a **transient** bounce arrives. It proves the channel exists, which is
+    ///    the fact `refusal_events_confirmed_at` otherwise has to assert by
+    ///    hand, and the domain is measurable and clean;
+    /// 3. so the release is the whole written ceiling;
+    /// 4. a **permanent** refusal lands. One in a hundred is 1%, over the 0.3%
+    ///    the bulk-sender requirements name, and the release is the floor again.
+    ///
+    /// Step 3 is what makes step 4 mean something, and it is also the assertion
+    /// that fails if the `permanent` filter is dropped: a transient bounce would
+    /// then count against the domain and the release would never have risen.
+    #[tokio::test]
+    async fn an_unmeasurable_domain_sits_on_the_floor_and_a_complaint_puts_it_back() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "unmeasured").await;
+        let noon = DAY.and_hms_opt(12, 0, 0).expect("valid").and_utc();
+
+        seed_bucket(&db, tenant, employee, DAY - TimeDelta::days(1), 100).await;
+        // Enrolled, old, and *not* confirmed: the founder's checkbox unticked.
+        enrol(&db, tenant, DAY - TimeDelta::days(400), false).await;
+
+        assert_eq!(
+            reserve_committed(&db, tenant, employee, DAY, &policy(5), 5)
+                .await
+                .expect("the floor is not zero, or nothing could ever be measured"),
+            1,
+            "a domain nobody can measure gets the floor and not the ceiling"
+        );
+        let err = reserve_committed(&db, tenant, employee, DAY, &policy(5), 1)
+            .await
+            .expect_err("the floor is spent");
+        assert!(
+            matches!(
+                err,
+                ContactBudgetError::Warming {
+                    allowed: 1,
+                    written: 5,
+                    taken: 1
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(err.code(), "sending_domain_warming");
+
+        // A soft bounce: evidence the channel works, and not evidence against
+        // the domain. Observation beats the operator's attestation.
+        append_refusal(&db, tenant, false, noon).await;
+        assert_eq!(
+            reserve_committed(&db, tenant, employee, DAY, &policy(5), 10)
+                .await
+                .expect("a measurable, clean domain releases the ceiling"),
+            4,
+            "one already taken, four left of the written five"
+        );
+
+        // And a real one. 1 in 105 is 0.95%, over the threshold. A fresh day,
+        // so this is the schedule refusing rather than yesterday's bucket.
+        append_refusal(&db, tenant, true, noon).await;
+        assert_eq!(
+            reserve_committed(&db, tenant, employee, NEXT_DAY, &policy(5), 5)
+                .await
+                .expect("the floor is still the floor"),
+            1,
+            "a complained-about domain is back on the floor"
+        );
+        let err = reserve_committed(&db, tenant, employee, NEXT_DAY, &policy(5), 1)
+            .await
+            .expect_err("and there is no second one");
+        assert!(
+            matches!(
+                err,
+                ContactBudgetError::Warming {
+                    allowed: 1,
+                    written: 5,
+                    taken: 1
+                }
+            ),
+            "{err}"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The deployment day.** A tenant with no `outreach_warmup` row keeps
+    /// exactly the day it had before `0070` existed — even with a trail that
+    /// would have condemned it, because nothing measured it and nothing asked.
+    ///
+    /// This is `0055`'s argument made once more. A narrowing that switched
+    /// itself on for every tenant the afternoon it was applied would cut a
+    /// running business from five strangers a day to one with nobody having
+    /// asked and no line saying why.
+    #[tokio::test]
+    async fn a_tenant_with_no_warmup_row_has_exactly_the_day_it_had_before() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "unenrolled").await;
+        let noon = DAY.and_hms_opt(12, 0, 0).expect("valid").and_utc();
+
+        seed_bucket(&db, tenant, employee, DAY - TimeDelta::days(1), 100).await;
+        append_refusal(&db, tenant, true, noon).await;
+
+        assert_eq!(
+            reserve_committed(&db, tenant, employee, DAY, &policy(5), 50)
+                .await
+                .expect("not enrolled, so nothing narrows"),
+            5
+        );
+        let err = reserve_committed(&db, tenant, employee, DAY, &policy(5), 1)
+            .await
+            .expect_err("the day is spent");
+        assert!(
+            matches!(err, ContactBudgetError::Exhausted { limit: 5, taken: 5 }),
+            "an unenrolled tenant can never be refused for warming: {err}"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// The grant in `0070`, proved rather than asserted in a comment.
+    ///
+    /// These two columns are the only writable thing in this workspace that
+    /// could *release* something, so the application reads them and an operator
+    /// writes them. The read has to work through RLS and the write has to fail.
+    #[tokio::test]
+    async fn the_application_may_read_the_warmup_row_and_never_write_it() {
+        let Some(db) = db().await else { return };
+        let (tenant, _employee) = seed(&db, "readonly").await;
+        enrol(&db, tenant, DAY, false).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let seen: Option<NaiveDate> =
+            sqlx::query_scalar("SELECT warming_started_on FROM outreach_warmup")
+                .fetch_optional(&mut **tx)
+                .await
+                .expect("the application reads its own row");
+        assert_eq!(seen, Some(DAY));
+
+        // Every one of these names its own tenant's row. The privilege check
+        // fires before the predicate is ever evaluated, so scoping them changes
+        // nothing about what is being proved — and `crates/app/tests/
+        // scoped_deletes.rs` is right that an unscoped `DELETE` in a source file
+        // is a hazard whatever the author meant by it.
+        for statement in [
+            "UPDATE outreach_warmup SET refusal_events_confirmed_at = now() \
+              WHERE tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid",
+            "DELETE FROM outreach_warmup \
+              WHERE tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid",
+            "INSERT INTO outreach_warmup (tenant_id, warming_started_on) \
+             VALUES (nullif(current_setting('app.tenant_id', true), '')::uuid, current_date)",
+        ] {
+            let refused = sqlx::query(statement).execute(&mut **tx).await;
+            assert!(
+                refused.is_err(),
+                "app_role performed `{statement}`; the warming row is read-only to it"
+            );
+            // Postgres aborts the transaction on the first refusal, so each
+            // statement needs its own. Reopened rather than batched: a test that
+            // stops after the first denial would pass with the other two
+            // granted.
+            tx.rollback().await.expect("rollback");
+            tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        }
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
     }
 
     // -- the gate's own SQL, borrowed ---------------------------------------

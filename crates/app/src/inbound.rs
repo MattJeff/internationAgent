@@ -767,6 +767,20 @@ pub async fn record_raw_email_delivery(
 /// should assume it. If those boxes are unticked, this path is correct and
 /// never runs, and the first thing to fix is the dashboard rather than any of
 /// this code.
+///
+/// **That question now has a consequence rather than only a comment.** The row
+/// this function writes is the sole production evidence in this workspace that
+/// a delivery report can reach us at all, and
+/// `agentos_store::outreach::warmup_release` reads it as exactly that: a tenant
+/// enrolled in the cold-contact warming schedule of
+/// `migrations/0070_outreach_warmup.sql` whose trail holds no `mail_refused` row
+/// — and whose operator has not ticked
+/// `outreach_warmup.refusal_events_confirmed_at` by hand — is measured as
+/// `Deliverability::Unknown` and held at one stranger a day, forever, however
+/// old the domain is and however large a ceiling an operator writes.
+///
+/// So an unticked box is no longer invisible. It is a seller that never gets
+/// past one cold email a day, and the place to look is the dashboard.
 async fn record_refusal(
     tx: &mut TenantTx<'_>,
     refusal: &Refusal,
@@ -3762,6 +3776,123 @@ mod tests {
         );
         // It is still on the trail — recorded, just not acted on.
         assert_eq!(refusals(&db, transient_tenant).await.len(), 1);
+    }
+
+    /// **The seam between the writer of a refusal and the reader of one**, and
+    /// it crosses two crates with no shared constant between them.
+    ///
+    /// [`record_refusal`] puts `"permanent": <bool>` into an `audit_log`
+    /// payload. `agentos_store::outreach::warmup_release` filters on
+    /// `payload->>'permanent' = 'true'` to decide whether a sending domain is
+    /// still fit to be shown to strangers — the measurement `docs/ORIZN.md` says
+    /// the cold-contact ceiling has nothing to move against. Neither function
+    /// knows the other exists. The only thing binding them is that string, in
+    /// two files, in two crates, and a rename on either side is a measurement
+    /// that silently reads zero forever while every unit test stays green.
+    ///
+    /// `store::outreach`'s own suite writes that payload by hand, which proves
+    /// the reader and not the pair. This one drives the real writer — a verified
+    /// Resend complaint, through [`record_raw_email_delivery`] — and then asks
+    /// the real ledger for a stranger.
+    ///
+    /// No `created_at` in the body on purpose: `Delivery::parse` then leaves
+    /// `at` as `None`, `record_refusal` falls back to the caller's `now`, and
+    /// the refusal lands inside the measurement window whatever day this runs.
+    #[tokio::test]
+    async fn a_recorded_complaint_is_what_the_warming_schedule_reads() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let now = Utc::now();
+        let today = now.date_naive();
+        let tomorrow = today + Duration::days(1);
+
+        // A tenant enrolled in the warming schedule, on a domain old enough for
+        // the schedule to have released everything, with a window that has mail
+        // in it and no refusals.
+        {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            sqlx::query(
+                "INSERT INTO outreach_buckets (tenant_id, employee_id, day, contacts_taken) \
+                 VALUES ($1, $2, $3, 100)",
+            )
+            .bind(tenant.as_uuid())
+            .bind(employee.as_uuid())
+            .bind(today - Duration::days(1))
+            .execute(&mut *tx)
+            .await
+            .expect("seed a window with mail in it");
+            sqlx::query(
+                "INSERT INTO outreach_warmup (tenant_id, warming_started_on, \
+                                              refusal_events_confirmed_at) \
+                 VALUES ($1, $2, now())",
+            )
+            .bind(tenant.as_uuid())
+            .bind(today - Duration::days(400))
+            .execute(&mut *tx)
+            .await
+            .expect("enrol");
+            tx.commit().await.expect("commit fixture");
+        }
+
+        let limits = agentos_domain::policy::PolicyLimits {
+            max_new_contacts_per_day: 5,
+            ..Default::default()
+        };
+        let policy =
+            agentos_domain::policy::EffectivePolicy::try_new(&limits, &limits, &limits, &limits)
+                .expect("coherent");
+
+        /// One reservation in its own committed transaction, as a caller runs it.
+        async fn take(
+            db: &Db,
+            tenant: TenantId,
+            employee: EmployeeId,
+            day: chrono::NaiveDate,
+            policy: &agentos_domain::policy::EffectivePolicy,
+            want: u32,
+        ) -> Result<u32, agentos_store::outreach::ContactBudgetError> {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let out = agentos_store::outreach::reserve(&mut tx, employee, day, policy, want).await;
+            match out.is_ok() {
+                true => tx.commit().await.expect("commit"),
+                false => tx.rollback().await.expect("rollback"),
+            }
+            out
+        }
+
+        assert_eq!(
+            take(&db, tenant, employee, today, &policy, 5)
+                .await
+                .expect("a measured, clean domain releases the written ceiling"),
+            5
+        );
+
+        // The real writer, on the real door.
+        let complaint = r#"{"type":"email.complained",
+             "data":{"email_id":"email_out_70","from":"lena@agents.example.com",
+                     "to":["angry@prospect.example"]}}"#;
+        read_delivery(&db, tenant, complaint, now)
+            .await
+            .expect("a complaint is never a handler error");
+
+        // One in a hundred and five is 0.95%, over the 0.3% the bulk-sender
+        // requirements name. A fresh day, so this is the schedule refusing and
+        // not yesterday's bucket.
+        assert_eq!(
+            take(&db, tenant, employee, tomorrow, &policy, 5)
+                .await
+                .expect("the floor is still released"),
+            1,
+            "the complaint the writer just recorded is the one the ledger reads"
+        );
+        let err = take(&db, tenant, employee, tomorrow, &policy, 1)
+            .await
+            .expect_err("and nothing beyond the floor");
+        assert_eq!(
+            err.code(),
+            "sending_domain_warming",
+            "raising `max_new_contacts_per_day` is not the remedy for this one: {err}"
+        );
     }
 
     /// **The two doors do not spell an address the same way, and one of them

@@ -58,11 +58,48 @@ that seat by definition. If one of the two is mis-set it is the second.
 jumps to volume is classified as spam, and `agents.example.com` is new. Five is
 a warming schedule, not a mistake.
 
-**What is missing is that nothing ramps.** The ceiling is a static number in a
-policy layer; there is no path that raises it as the domain ages, and no
-measurement of deliverability to raise it against. So the number is right for
-week one and wrong for month six, and the only thing that can change it is an
-operator editing a document. That is the gap worth closing before the number is.
+**What was missing is that nothing ramped.** The ceiling was a static number in
+a policy layer; there was no path that raised it as the domain aged, and no
+measurement of deliverability to raise it against. So the number was right for
+week one and wrong for month six, and the only thing that could change it was an
+operator editing a document.
+
+#### What was built, and it is not a ramp on the ceiling
+
+`migrations/0070_outreach_warmup.sql`, `agentos_domain::policy::warmup_allowance`
+and `agentos_store::outreach::reserve`. Read the migration for the argument; the
+two sentences that matter here are these.
+
+**Nothing raises the ceiling, because nothing in this workspace may.** Allowlists
+intersect, denylists union, a lower layer only narrows. So the warming schedule
+is a *second narrowing applied under the first* — `effective = min(what the
+operator wrote, what the schedule and the measurement release today)` — and a
+seat written down as five takes five whatever happens. What changes is what the
+operator's number **means** for an enrolled tenant: it stops being "what this
+seat sends today" and becomes "what this seat sends once the domain can carry
+it". The founder writes the destination once and the ramp walks there.
+
+**The measurement came first, because a ramp without one is a number that climbs
+on its own.** It is built out of rows that already exist: permanent
+`mail_refused` audit rows over `outreach_buckets.contacts_taken`, both
+tenant-wide, over thirty days, against the 0.3% complaint rate the Google/Yahoo
+bulk-sender requirements name. And it is **three**-valued, which is the whole
+point — *no evidence is not a clean bill of health*. A tenant that has never
+recorded a refusal, and whose operator has not confirmed the endpoint is
+subscribed, reads `Unknown` and is held at one a day.
+
+That last part answers the open question in
+`crates/app/src/inbound.rs::record_refusal` — *is the Resend endpoint actually
+subscribed to `email.bounced` and `email.complained`?* — in the only way this
+binary can. It still cannot read the checkbox. It now makes the unticked box
+visible: enrol a tenant and watch the seller sit at one cold email a day.
+
+**Two things are the founder's, not the code's.** The shape of the climb is
+`+1 stranger per day of age`, deliberately slower than every published warm-up
+plan and left open in `warmup_allowance`'s docs for a real schedule to replace.
+And **Orizn is not enrolled**: no `outreach_warmup` row means nothing changes,
+which is how this landed without cutting a running business from five a day to
+one. Enrolling is one INSERT and it is a decision, not a default.
 
 
 | Function | Team slug | Head | Role pack | Turns/day |
