@@ -49,6 +49,7 @@ use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::outbox::{self, NewEvent};
+use agentos_store::provisioning::{self, UnsettledCall};
 use agentos_store::{backlog, calendar};
 use agentos_store::{employee as employee_store, employee::StoredEmployee};
 use axum::Json;
@@ -133,6 +134,35 @@ struct ResourceView<'a> {
     updated_at: DateTime<Utc>,
 }
 
+/// One provider request that left and never came back with an answer.
+///
+/// Rendered rather than counted, because the fields are what a person needs to
+/// go and settle it: what was being attempted, which port it went out through,
+/// when, and the key — which spells out the Policy Gate `decision_id`, so the
+/// `audit_log` row naming the recipient is one query away.
+///
+/// The recipient itself is deliberately not here. It is already written once,
+/// under the tenant's own RLS, and copying it into a second table is the copy
+/// somebody forgets to redact.
+#[derive(Debug, Serialize)]
+struct UnsettledCallView {
+    intent_kind: String,
+    provider: String,
+    idempotency_key: String,
+    started_at: DateTime<Utc>,
+}
+
+impl From<UnsettledCall> for UnsettledCallView {
+    fn from(call: UnsettledCall) -> Self {
+        Self {
+            intent_kind: call.intent_kind,
+            provider: call.provider,
+            idempotency_key: call.idempotency_key,
+            started_at: call.started_at,
+        }
+    }
+}
+
 /// An employee as the API renders it.
 #[derive(Debug, Serialize)]
 struct EmployeeView<'a> {
@@ -150,11 +180,24 @@ struct EmployeeView<'a> {
     /// Steps whose `expected_by` has passed. Empty is the normal case; a
     /// non-empty list is somebody's morning.
     overdue: Vec<Step>,
+    /// Provider requests this seat sent more than [`SETTLING`] ago and never
+    /// learned the outcome of. Empty is the normal case; a non-empty list is
+    /// also somebody's morning, and a louder one — each entry is a message that
+    /// may or may not have reached a person, and **no API on any of these paths
+    /// can be asked which**. Somebody has to look in the provider's console.
+    ///
+    /// This is the reader half of `agentos_app::effects::SEND_UNSETTLED`. It is
+    /// here rather than on a route of its own because this endpoint is already
+    /// the one that "says what is actually true" about a seat, and a surface
+    /// nobody visits would leave `provider_intents` exactly as unread as it was
+    /// before anything started writing to it.
+    unsettled_calls: Vec<UnsettledCallView>,
 }
 
 impl<'a> EmployeeView<'a> {
-    fn of(employee: &'a Employee, now: DateTime<Utc>) -> Self {
+    fn of(employee: &'a Employee, now: DateTime<Utc>, unsettled: Vec<UnsettledCall>) -> Self {
         Self {
+            unsettled_calls: unsettled.into_iter().map(UnsettledCallView::from).collect(),
             id: employee.id().as_uuid(),
             slug: employee.slug().as_str(),
             domain: employee.domain().as_str(),
@@ -294,7 +337,15 @@ async fn create(
         "employee accepted; provisioning is the loop's problem now"
     );
 
-    Ok((StatusCode::ACCEPTED, Json(EmployeeView::of(&employee, now))).into_response())
+    // Empty, and not because nobody looked: this employee was minted in the
+    // transaction that just committed, so no provider request has ever been made
+    // under it. `create` calls nothing external — that is the whole point of the
+    // 202 above.
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EmployeeView::of(&employee, now, Vec::new())),
+    )
+        .into_response())
 }
 
 /// `GET /v1/employees/{id}` — lifecycle, derived health, and all eleven steps.
@@ -303,10 +354,11 @@ async fn get(
     principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let employee = load(&db, &principal, EmployeeId::from_uuid(id))
-        .await?
-        .employee;
-    Ok(Json(EmployeeView::of(&employee, Utc::now())).into_response())
+    let id = EmployeeId::from_uuid(id);
+    let now = Utc::now();
+    let employee = load(&db, &principal, id).await?.employee;
+    let unsettled = unsettled(&db, &principal, id, now).await?;
+    Ok(Json(EmployeeView::of(&employee, now, unsettled)).into_response())
 }
 
 /// `GET /v1/employees` — this tenant's employees, oldest first.
@@ -404,6 +456,37 @@ async fn load(db: &Db, principal: &Principal, id: EmployeeId) -> Result<StoredEm
     let stored = employee_store::load(&mut tx, id).await;
     tx.rollback().await?;
     Ok(stored?)
+}
+
+/// How long a provider request may be outstanding before "no answer yet" stops
+/// being a plausible reading of it.
+///
+/// Every adapter in `agentos-providers` builds its HTTP client with a 60-second
+/// `REQUEST_TIMEOUT`, and nothing on the effect path retries inside one call, so
+/// a request older than five minutes has already had its answer or is never
+/// getting one. The margin is generous on purpose: a false alarm here spends the
+/// one currency this endpoint is denominated in, which is somebody's attention.
+///
+/// ponytail: a constant and not a query parameter. Nobody has asked to tune it,
+/// and a knob on a diagnostic is a second thing to get wrong.
+const SETTLING: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// The provider requests for `id` that never came back — see
+/// [`EmployeeView::unsettled_calls`].
+///
+/// Its own transaction rather than [`load`]'s, and its own round trip: `load` is
+/// on every lifecycle write in this module and this read is only owed to the two
+/// handlers that render a whole employee.
+async fn unsettled(
+    db: &Db,
+    principal: &Principal,
+    id: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<Vec<UnsettledCall>, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let calls = provisioning::unsettled_calls(&mut tx, id, now - SETTLING).await;
+    tx.rollback().await?;
+    Ok(calls?)
 }
 
 /// Move the lifecycle, record the move, and answer with the new state.
@@ -517,7 +600,11 @@ async fn set_lifecycle(
     tx.commit().await?;
 
     tracing::info!(%id, %from, %to, "lifecycle changed");
-    Ok(Json(EmployeeView::of(&employee, now)).into_response())
+    // Read, not assumed empty. Suspending a seat does not answer the requests it
+    // already sent, and a terminated seat with an unsettled text is exactly the
+    // one somebody stops looking at.
+    let unsettled = unsettled(db, principal, id, now).await?;
+    Ok(Json(EmployeeView::of(&employee, now, unsettled)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +1560,107 @@ mod tests {
             .send("GET", "/v1/employees/not-a-uuid", SECRET_A, None, None)
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        h.teardown().await;
+    }
+
+    /// The wiring of [`EmployeeView::unsettled_calls`], against the deployed
+    /// [`SETTLING`] rather than a number this test picked.
+    ///
+    /// Two rows, one on each side of the constant: the old one is what a person
+    /// is owed, the fresh one is a request that is simply still in the air. A
+    /// handler that passed `now + SETTLING`, or no bound at all, would render
+    /// both — and the endpoint would start reporting every message this seat
+    /// sends in its first five minutes as an incident.
+    #[tokio::test]
+    async fn a_send_that_never_came_back_shows_up_on_the_employee_once_the_grace_has_passed() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key("unsettled")),
+                Some(body("mona")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let id = EmployeeId::from_uuid(
+            created["id"]
+                .as_str()
+                .expect("an id")
+                .parse()
+                .expect("a uuid"),
+        );
+        assert_eq!(
+            created["unsettled_calls"],
+            json!([]),
+            "a seat that has called nobody owes nobody a look"
+        );
+
+        // One write-ahead row on each side of the constant the handler uses, so
+        // the assertion turns on `SETTLING` itself and not on a literal.
+        let now = Utc::now();
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        for (key, at) in [
+            (
+                "effect:overdue",
+                now - SETTLING - chrono::TimeDelta::seconds(1),
+            ),
+            ("effect:in-the-air", now),
+        ] {
+            provisioning::begin_send_intent(
+                &mut tx,
+                id,
+                "telephony",
+                "sms_send",
+                &agentos_domain::ids::IdempotencyKey::for_step(id, key),
+                at,
+            )
+            .await
+            .expect("write-ahead row");
+        }
+        tx.commit().await.expect("commit");
+
+        let (status, seat) = h
+            .send(
+                "GET",
+                &format!("/v1/employees/{}", id.as_uuid()),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let calls = seat["unsettled_calls"]
+            .as_array()
+            .expect("the field is always an array");
+        assert_eq!(calls.len(), 1, "only the overdue one: {calls:?}");
+        assert_eq!(calls[0]["intent_kind"], json!("sms_send"));
+        assert_eq!(calls[0]["provider"], json!("telephony"));
+        assert!(
+            calls[0]["idempotency_key"]
+                .as_str()
+                .expect("a key")
+                .ends_with("effect:overdue"),
+            "the older row is the one owed a person: {calls:?}"
+        );
+
+        // Another tenant's credential sees an employee that does not exist, so
+        // there is no window onto this list from outside.
+        let (status, _) = h
+            .send(
+                "GET",
+                &format!("/v1/employees/{}", id.as_uuid()),
+                SECRET_B,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         h.teardown().await;
     }

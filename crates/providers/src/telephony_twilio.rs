@@ -135,32 +135,26 @@ pub struct TwilioTelephony {
     /// retried, because a 2xx means Twilio accepted the message. That is the
     /// asymmetry `find_number` argues — strict on lookup, lenient on create.
     ///
-    /// # Why the store's table is not the small fix the backlog assumed
+    /// # The store's side of this is now built, and it is smaller than it sounds
     ///
-    /// The idempotency table already exists: `provider_intents`, unique on
-    /// `(tenant_id, provider, idempotency_key)`, with `state` defaulting to
-    /// `in_flight` — a write-ahead record, committed *before* the network call.
-    /// So the missing piece is not a migration. It is three other things:
+    /// `store::provisioning::begin_send_intent` writes a `provider_intents` row
+    /// and `agentos_app::effects::Effects::begin_send` **commits it before the
+    /// POST**; `record_sent` closes it in the same transaction as the audit row
+    /// once an answer arrives. A send that got no answer is left `in_flight` on
+    /// purpose, and `GET /v1/employees/{id}` renders those as `unsettled_calls`
+    /// for a person to reconcile in the Twilio console.
     ///
-    /// * `store::provisioning::begin_intent` takes a `Claim` — a leased
-    ///   `employee_resources` row and a `Step` — and hardcodes
-    ///   `intent_kind = 'provisioning_step'`. A send has none of that. It needs
-    ///   a sibling keyed on employee plus key alone.
-    /// * The write has to **commit** before the POST and a second one after it,
-    ///   and `Effects::send_sms` holds ports, not a transaction: today it calls
-    ///   the provider and then writes one audit row. That is the real work.
-    /// * Even then the guarantee is bounded. Twilio's Messages API has no
-    ///   idempotency header and no "did key K land" query, so a resumed
-    ///   `in_flight` row cannot recover the `sid`. The table turns a silent
-    ///   duplicate into a recorded ambiguity a human can settle — which is
-    ///   worth having, and is not the same sentence as "cannot double-send".
+    /// **What that fixes is the record, not the duplicate.** It does not close
+    /// the window described above and nothing in this crate could: the Messages
+    /// API has no idempotency header and no "did key K land" query, so an
+    /// `in_flight` row can never recover its `sid` by asking, and the retry that
+    /// follows a crashed turn arrives under a fresh Policy Gate ruling — a fresh
+    /// key — and is simply a second send. What changed is that it is now a
+    /// second send with two rows behind it instead of a silence.
     ///
-    /// It is not built here because **nothing in this build can reach it**:
-    /// `send_sms`, `send_whatsapp` and `place_call` have no non-test caller,
-    /// and `SmsSend`, `WhatsappSend` and `CallPlace` are all in
-    /// `agentos_app::turn::UNSERVED`. Build it with the first pack that
-    /// proposes one of them, not before — half an idempotency table reads like
-    /// a guarantee and is not one.
+    /// So this map still earns its place, and still only covers the successful
+    /// half. A caller who wants the expensive half closed needs an idempotent
+    /// send API, which Twilio does not offer.
     sent: Mutex<BTreeMap<String, ProviderMessageId>>,
 }
 
