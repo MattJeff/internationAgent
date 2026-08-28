@@ -220,6 +220,39 @@ impl BrowserStep<'_> {
             Self::Click(_) | Self::Type { .. } | Self::Fill { .. } => false,
         }
     }
+
+    /// Which step this is, as a word for an audit row.
+    ///
+    /// **The name and never the argument, and the asymmetry is the whole
+    /// reason this is a method rather than a `format!("{step:?}")` at the call
+    /// site.** Every variant here carries something that must not reach a
+    /// column: [`BrowserStep::Fill`] holds a [`Secret`], which is the one thing
+    /// this workspace says may never appear in an audit line at all;
+    /// [`BrowserStep::Type`] holds text a customer dictated; `Goto` holds a URL
+    /// whose query is somebody's session. A `Debug` rendering would put the
+    /// first two in the trail the day somebody reached for the easy spelling,
+    /// and `Secret`'s own `Debug` is the only thing standing in the way.
+    ///
+    /// So the return type is `&'static str` on purpose: there is no argument
+    /// that can be threaded through it, and a caller that wants one has to go
+    /// and write the leak itself.
+    ///
+    /// No `_` arm, for [`Self::is_a_read`]'s reason one level down: a new
+    /// variant must be *named* before an audit row can be written about it,
+    /// rather than silently reading as whatever the fallback said.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Goto(_) => "goto",
+            Self::Click(_) => "click",
+            Self::Type { .. } => "type",
+            Self::Fill { .. } => "fill",
+            Self::Text(_) => "text",
+            Self::Markup(_) => "markup",
+            Self::Screenshot => "screenshot",
+            Self::Location => "location",
+        }
+    }
 }
 
 /// What a [`BrowserStep`] produced.
