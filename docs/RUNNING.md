@@ -332,6 +332,40 @@ inherits an hour. So it is cancelled in the only vocabulary 0063 gave —
 stamping `now` on an hour already past would manufacture a record saying
 somebody kept it.
 
+## The gap the preflight names and this map did not: memory does not work
+
+`agentos-server doctor` reports the embedder as `[OK]` and it is telling the
+truth about the *credential* — there is nothing to set. What it says beside it is
+the part that matters:
+
+> `MOCK — a SHA-256 hash (mock-sha256-1536), not semantics: retrieval returns
+> something and it is not the right thing. This build ships no real embedder, so
+> no credential changes it.`
+
+Checked rather than taken on trust: `agentos_providers::embedder::Embedder` has
+**one variant**, `Mock`, and it is the default. There is no second one to switch
+to.
+
+So `knowledge` — what an employee recalls before it answers — ingests, chunks,
+stores and retrieves, and the ranking it retrieves by is a hash of the text
+rather than its meaning. Everything around it is real: the tenant isolation, the
+chunking, the `source_id`, the storage. The one thing that makes retrieval
+*retrieval* is not.
+
+**Why it belongs on this map rather than in a backlog.** It is the only piece of
+the running company that is wired, green, exercised by tests, and wrong at the
+same time — every other gap here is either absent (nothing to mistake for
+working) or off behind a switch. A reader who sees `knowledge` in the node table
+and the doctor's `[OK]` will conclude an employee has memory. It has recall that
+returns something.
+
+**It is not a credential and not a wave.** A real embedder is a provider
+integration with a per-call cost, which makes it the same decision as every other
+model spend: whose key, and priced how. On the CLI path Orizn now runs, there is
+no embeddings endpoint at all — the subscription does not expose one — so this is
+the first place where "the customer brings their own model" and "we run on the
+CLI" give different answers.
+
 ## What the sweep found, and it is worth reading before trusting the gate
 
 **The taint wire was forgotten in exactly the branch its own comment swore it
