@@ -193,25 +193,66 @@ pub enum MissionError {
     Corrupt(OrgError),
 }
 
-/// Write what this team is for. Replaces whatever was there.
+/// Write what this team is for. Replaces whatever was there, and says what it
+/// replaced.
 ///
 /// Takes a parsed [`Mission`], not a `&str`, so there is no way to reach this
 /// column without going through [`Mission::parse`] — which is the whole reason
 /// the type exists.
+///
+/// # It returns the previous mission because the audit row cannot read one
+///
+/// `routes::teams::set_mission` writes `from_mission` into the trail, and it
+/// used to take that value from its own earlier `load_team` — an ordinary
+/// `SELECT`, no lock, several statements back. Anything another writer commits
+/// in between is invisible to it, so two concurrent `PUT`s leave two audit rows
+/// both claiming to start from `A`: the trail records `A → C` for a write that
+/// really replaced `B`, and the `A → B` transition is nowhere in it. An audit
+/// row is quoted. One naming a value that was already gone is worse than none,
+/// and `routes::teams::a_mission_write_names_the_mission_it_actually_replaced`
+/// is what fails if this comes back.
+///
+/// So the read moves inside the write, and `FOR UPDATE` is what makes it a read
+/// of the *committed* row rather than of the statement's snapshot: the second
+/// writer blocks in the CTE, and `READ COMMITTED`'s recheck walks it to the
+/// version the first writer just committed. Without the lock the CTE would
+/// still be evaluated against the snapshot taken before the wait and report the
+/// stale value again — the same shape `crate::outbox::claim_of` documents at
+/// length, here for a value that is reported rather than filtered on.
+///
+/// `NotFound` on nothing updated, which is the other half of the dropped
+/// `PgQueryResult`: this used to answer `Ok(())` for a team that does not
+/// exist. Unreachable today only because nothing in this workspace deletes a
+/// `teams` row and every caller has already loaded one — a dependency nothing
+/// stated until this line.
+///
+/// **The two siblings next door have the same shape and are not fixed here.**
+/// `routes::teams::set_policy_role` reports `from_policy_role` out of the same
+/// unlocked `load_team`, and `set_budget` reads `org::budget` in a separate
+/// statement before writing. Neither has been reproduced; both are one audit
+/// row away from this one.
 pub async fn set_mission(
     tx: &mut TenantTx<'_>,
     team_id: Uuid,
     mission: &Mission,
-) -> Result<(), StoreError> {
-    sqlx::query(
-        "UPDATE teams SET mission = $3, updated_at = now() WHERE tenant_id = $1 AND id = $2",
+) -> Result<Option<String>, StoreError> {
+    let previous: Option<Option<String>> = sqlx::query_scalar(
+        "WITH prev AS ( \
+             SELECT id, mission FROM teams \
+              WHERE tenant_id = $1 AND id = $2 \
+                FOR UPDATE \
+         ) \
+         UPDATE teams SET mission = $3, updated_at = now() \
+           FROM prev WHERE teams.id = prev.id \
+         RETURNING prev.mission",
     )
     .bind(tx.tenant_id().as_uuid())
     .bind(team_id)
     .bind(mission.as_str())
-    .execute(&mut ***tx)
+    .fetch_optional(&mut ***tx)
     .await?;
-    Ok(())
+
+    previous.ok_or(StoreError::NotFound)
 }
 
 /// What this team is for, re-parsed on the way out.

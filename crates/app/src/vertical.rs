@@ -2809,6 +2809,22 @@ async fn flow_for(
 ///   off the column that survives a restart. `Sequence` cannot do it here: it
 ///   holds its touches in memory and a fresh one says "due" about somebody
 ///   written to an hour ago.
+/// * `touch_count` — [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES), the ceiling
+///   [`mark_contacted`](agentos_store::revenue::mark_contacted) now carries in
+///   its own `WHERE`. **This end of the pair is what makes the other end
+///   harmless.** Without it the spacing was the only thing between a spent
+///   sequence and a fresh approach, and 72 hours after the third touch this
+///   offered the same person again — for a `selling_turn` that sends *before*
+///   it marks. The write then refuses the row, its rollback takes
+///   `last_contacted_at` with it, the spacing never advances, and the same
+///   person is written to on every cadence from then on. That is the sentence
+///   `mark_contacted`'s docs make about the chase — "it is the *same* number
+///   both ends of the pair are handed, which is what makes 'selected, therefore
+///   writable' true again" — owed to this path too.
+///
+///   Not a parameter, unlike [`contacts_due_for_follow_up`](agentos_store::revenue::contacts_due_for_follow_up)'s
+///   range: that one crosses into `agentos-store`, which cannot see
+///   `agentos_app::revenue`. This query is in the crate the constant lives in.
 async fn contactable(
     tx: &mut TenantTx<'_>,
     account_id: Uuid,
@@ -2820,12 +2836,14 @@ async fn contactable(
             AND c.active \
             AND c.email IS NOT NULL \
             AND (c.last_contacted_at IS NULL OR c.last_contacted_at <= $2) \
+            AND c.touch_count < $3 \
             AND revenue_suppression_of(c.email, null::text) IS NULL \
           ORDER BY c.is_primary DESC, c.id \
           LIMIT 1",
     )
     .bind(account_id)
     .bind(now - crate::revenue::FOLLOW_UP_AFTER)
+    .bind(crate::revenue::MAX_TOUCHES as i32)
     .fetch_optional(&mut ***tx)
     .await
     .map_err(StoreError::from)?;
@@ -6958,6 +6976,98 @@ mod tests {
         }
         .note();
         assert!(note.contains("last touch"), "{note}");
+    }
+
+    /// **Somebody who has already had the whole sequence is not a fresh
+    /// prospect.**
+    ///
+    /// [`contactable`] filters on `active`, on the suppression list and on the
+    /// 72-hour spacing, and on nothing else — `touch_count` is not one of its
+    /// predicates. So a contact who has spent all three touches is offered to
+    /// [`selling_turn`] as a *first approach* the moment the spacing elapses.
+    /// The counter is one column and both paths write it: the chase spends it,
+    /// and so does `app::queue::record_queued` on the export a human uploads,
+    /// which is how the live list spends it today.
+    ///
+    /// **The write's new ceiling made this worse rather than better, which is
+    /// why it is a test and not a note.** [`selling_turn`] sends *before* it
+    /// marks. With the cap in the `UPDATE`, the mark on a row already at three
+    /// matches nothing, `mark_contacted` answers `NotFound`, and the rollback
+    /// takes with it the only write that moves `last_contacted_at` — so the
+    /// spacing never advances and this person is written to again on the next
+    /// cadence, and the one after that. Before the cap they got one extra email
+    /// per 72 hours and a counter reading four; now they get one per tick,
+    /// unbounded, and the counter still reads three.
+    ///
+    /// Fixed at the selection, because that is the end that can refuse without
+    /// an email having gone: `contactable` is handed the same `MAX_TOUCHES` the
+    /// write carries, which is what makes "selected, therefore writable" true on
+    /// this path as
+    /// [`mark_contacted`](agentos_store::revenue::mark_contacted) claims it is
+    /// on the chase's.
+    #[tokio::test]
+    async fn a_prospect_who_has_had_the_whole_sequence_is_not_approached_again() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        let (_, contact) = seed_described_prospect(&db, &desk.principal, PROSPECT_EMAIL).await;
+
+        // The whole sequence, spent through the one statement that counts it,
+        // and long enough ago that the spacing has elapsed. No evidence is
+        // filed, which is the ordinary state of an account worked through the
+        // export rather than through the prober.
+        let long_ago = now - TimeDelta::days(30);
+        let mut tx = db.tenant_tx(desk.principal.tenant_id).await.expect("tx");
+        for _ in 0..crate::revenue::MAX_TOUCHES {
+            revenue_store::mark_contacted(
+                &mut tx,
+                contact,
+                long_ago,
+                None,
+                crate::revenue::MAX_TOUCHES as i32,
+            )
+            .await
+            .expect("the sequence this person has already had");
+        }
+        tx.commit().await.expect("commit the sequence");
+        assert_eq!(
+            touch_state(&db, &desk.principal, contact).await.0,
+            crate::revenue::MAX_TOUCHES as i32,
+            "the fixture did not spend the sequence, so this proves nothing"
+        );
+
+        if let Some(prospect) = next_prospect(&db, &desk.principal, now).await {
+            let _ = selling_turn(
+                &db,
+                &desk.prober,
+                &desk.seller,
+                &orizn(),
+                &desk.principal,
+                &sales_pack(permissive()),
+                &sales_objective_value(),
+                &prospect,
+                now,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            desk.email.sent_count(),
+            0,
+            "a fourth email went to somebody who has already had three, as a first \
+             approach — and the mark that would have recorded it was refused by the \
+             ceiling, so the spacing did not move and the next cadence sends a fifth"
+        );
+        assert_eq!(
+            touch_state(&db, &desk.principal, contact).await.0,
+            crate::revenue::MAX_TOUCHES as i32
+        );
     }
 
     /// **Two workers that read the same chase must not both send it.**

@@ -395,9 +395,16 @@ pub async fn due(
     now: DateTime<Utc>,
     limit: i64,
 ) -> Result<Vec<Ready>, RevenueError> {
-    let rows =
-        revenue_store::queueable(tx, now, now - crate::proof_of_need::MAX_FINDING_AGE, limit)
-            .await?;
+    let rows = revenue_store::queueable(
+        tx,
+        now,
+        now - crate::proof_of_need::MAX_FINDING_AGE,
+        limit,
+        // The ceiling [`record_queued`]'s own write carries, handed to the
+        // selection that feeds it. Both ends or neither: see `queueable`.
+        crate::revenue::MAX_TOUCHES as i32,
+    )
+    .await?;
 
     Ok(rows
         .into_iter()
@@ -1277,6 +1284,102 @@ mod tests {
             "an opt-out deactivates the contact, so the queue never sees it"
         );
         tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **One contact at the ceiling must not take the founder's whole export
+    /// with it.**
+    ///
+    /// [`due`]'s selection is
+    /// [`queueable`](agentos_store::revenue::queueable), and its predicates were
+    /// due-and-active, a stored opener and a fresh finding — `touch_count` was
+    /// not among them. [`record_queued`] marks through a `mark_contacted` whose
+    /// `WHERE` now carries `MAX_TOUCHES`, so a person who has already had all
+    /// three touches is still selected, then refused by the write, and the `?`
+    /// in `record_queued` is what the batch dies on. `routes::queue::refused`
+    /// drops the transaction: nobody is marked and no file is produced, for
+    /// everyone in the run.
+    ///
+    /// That route's own remedy — "run it again and they are simply gone from the
+    /// queue" — is exactly what stops being true. It holds for the refusal it
+    /// was written about: an opt-out sets `active = false` **and**
+    /// `next_follow_up_at = NULL` in one statement, which is two of the
+    /// selection's own predicates. A row at the ceiling trips none of them, so
+    /// the next run selects it again and fails identically, forever.
+    ///
+    /// The fix is at the selection, because that is the end that can refuse
+    /// before anything is written — the same pairing
+    /// `vertical::contactable` needs and
+    /// [`contacts_due_for_follow_up`](agentos_store::revenue::contacts_due_for_follow_up)
+    /// already had.
+    #[tokio::test]
+    async fn a_contact_at_the_ceiling_does_not_take_the_whole_export_down_with_it() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db).await;
+        let now = Utc::now();
+        let email = format!("t{}@example.com", Uuid::now_v7().simple());
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let contact = seed_due(&mut tx, &email, now).await;
+        let account: Uuid = sqlx::query_scalar("SELECT account_id FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the seeded account");
+
+        // A finding with a stored opener: `queueable` joins to one, so without
+        // it this contact would be absent for the wrong reason.
+        revenue_store::insert_evidence(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue_store::NewEvidence {
+                account_id: account,
+                employee_id: None,
+                kind: "missing_visa_info",
+                passport_country: "FR",
+                destination_country: "VN",
+                travel_date: None,
+                source_url: "https://example.com/booking",
+                reproduction: "Book CDG->SGN, nationality France; step 3 states no requirement.",
+                artifact_ref: None,
+                observed_claim: "No visa required for this destination.",
+                correct_claim: "French passport holders need an e-visa for Vietnam.",
+                authority_url: None,
+                checked_at: now,
+                opener_subject: Some("Your entry-requirements step, on the 12th"),
+                opener_body: Some("We ran your booking flow and step 3 stated no requirement."),
+            },
+        )
+        .await
+        .expect("evidence");
+
+        // The whole sequence, spent through the one statement that counts a
+        // touch — and still due, which is the state this is about.
+        for _ in 0..crate::revenue::MAX_TOUCHES {
+            revenue_store::mark_contacted(
+                &mut tx,
+                contact,
+                now,
+                Some(now),
+                crate::revenue::MAX_TOUCHES as i32,
+            )
+            .await
+            .expect("the sequence this person has already had");
+        }
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let ready = due(&mut tx, now, 100).await.expect("the export queue");
+        assert!(
+            !ready.iter().any(|row| row.who.contact_id == contact),
+            "the export offered somebody who has already had all three touches"
+        );
+        let leads = plan(ready, &pack(10), &Suppression::new(), 0);
+        record_queued(&mut tx, &leads, now)
+            .await
+            .expect("one contact at the ceiling took the whole export down with it");
+        tx.commit().await.expect("commit");
 
         drop_tenant(&db, tenant).await;
     }
