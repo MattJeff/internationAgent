@@ -1001,7 +1001,12 @@ async fn vertical(
 /// instead of as a silent zero.
 fn classify(result: &str) -> &'static str {
     if result.ends_with(": no such tool") {
-        "invented a tool that does not exist"
+        // Two cases under one heading, because the sentence is deliberately one
+        // sentence: `Turn::propose` answers a name outside this turn's offer
+        // exactly as it answers a name nobody has ever heard of, so that a
+        // refusal cannot be read as "that exists, but not for you". A counter
+        // here that split them would be an existence oracle with a report.
+        "asked for a tool it was not offered"
     } else if result.contains(": arguments are not ") {
         "tool call with the wrong argument shape"
     } else if result.contains(" is not an address") {

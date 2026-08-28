@@ -960,9 +960,13 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
 
     // (a) through the agent loop. The turn's context contains the supplier's
     //     email, so the turn is untrusted and the payment tool is not in the
-    //     schemas at all. A model that names it anyway reaches the gate as
-    //     `Untrusted<PaymentCreate>` and is refused there — defence in depth,
-    //     and this asserts both halves.
+    //     schemas at all. A model that names it anyway is refused by
+    //     `Turn::propose`, which since 2026-08-28 will not build a proposal out
+    //     of a name this turn was not offered — so the gate is never asked and
+    //     there is no ruling to find. The layer underneath, which turns
+    //     `Untrusted<PaymentCreate>` into a refusal, is exercised by (b) below
+    //     against the same amount from the same email: defence in depth, and
+    //     the two halves are now asserted one apiece rather than twice over.
     //
     //     Asked with a buyer's floor, because that is what this employee is:
     //     `tools_for` narrows by trust and then by the role pack's `proposable`
@@ -1086,20 +1090,21 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
     );
     assert_eq!(
         rulings(new_rows),
-        vec![
-            (
-                "payment_create",
-                "deny",
-                Some(DenyReason::UntrustedInput.code())
-            ),
-            (
-                "payment_create",
-                "deny",
-                Some(DenyReason::UntrustedInput.code())
-            ),
-        ],
-        "two proposals, two audited refusals, and nothing else: {new_rows:#?}"
+        vec![(
+            "payment_create",
+            "deny",
+            Some(DenyReason::UntrustedInput.code())
+        )],
+        "one proposal, one audited refusal, and nothing else: {new_rows:#?}"
     );
+    // **One row and not two, and the missing one is not a gap in the trail.**
+    // The model's guess at `pay` is refused by `Turn::propose` before a
+    // `PaymentCreate` exists, so there is no decision for the gate to have
+    // made and none is written — a gate that logged a ruling it never made
+    // would be the worse of the two. What the attempt costs instead is a
+    // failed tool result and a tick of `Finished::malformed_calls`, which is
+    // what the agent loops log. `(b)` below is what keeps the audited
+    // refusal in this test.
     // Nothing anywhere in this employee's history was ever allowed to pay.
     assert!(
         !after
@@ -1451,7 +1456,8 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
                 "deny",
                 Some(DenyReason::ContactBudgetExhausted.code())
             ),
-            untrusted,
+            // One, and it is (b)'s. The turn's own guess at `pay` never became
+            // a proposal — see step 5 — so it left no ruling to write down.
             untrusted,
             contract,
             contract,

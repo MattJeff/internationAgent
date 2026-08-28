@@ -2610,8 +2610,11 @@ mod tests {
         assert!(!pack.may_propose(ActionKind::EmailSend));
         assert!(!pack.may_propose(ActionKind::PaymentCreate));
 
-        // Each of those is refused by the layer too, so guessing a tool name
-        // that was never offered still ends in a denial.
+        // Each of those is refused by the layer too. Not because a guess gets
+        // that far any more — `Turn::propose` refuses a name outside this turn's
+        // offer before there is a proposal — but because the layer still has to
+        // be right on its own. Deleting these because something upstream now
+        // catches it first is how a second layer quietly becomes one.
         assert!(pack.limits().spend.is_none());
         assert_eq!(
             evaluate(&policy, &specimen(ActionKind::PaymentCreate), &ctx()),
