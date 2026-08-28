@@ -226,11 +226,22 @@ pub const UNSERVED: [(ActionKind, &str); 11] = [
     ),
     (
         ActionKind::WhatsappSend,
-        "the buyer proposes it and cannot be given it: free-form WhatsApp needs an `OpenWindow`, \
-         which is proof that the counterparty wrote to us within 24 hours, and a turn has no \
-         conversation clock to derive one from. Outside the window the only legal message is a \
-         pre-approved template, and this workspace has no template registry to name one from. \
-         Two missing things, both real, neither of them this catalogue's to invent.",
+        "the buyer proposes it, and **one of the two missing things has stopped being missing**. \
+         This reason used to name a conversation clock and a template registry. The clock exists: \
+         `0069` wired the telephony ingest, an inbound WhatsApp message is a dated `messages` row \
+         on a thread, and `Effects::whatsapp_window` reads it and mints the `OpenWindow` that \
+         `RenderedWhatsapp::FreeForm` needs — which until then could be obtained nowhere outside \
+         a test. So the ordinary case, answering somebody who wrote to us in the last 24 hours, \
+         is built end to end and this entry is the only thing between an employee and it. What is \
+         left is the *closed*-window case: outside 24 hours the only legal message is a \
+         pre-approved template, and this workspace has no template registry to name one from — \
+         nor could it invent one, since a template is an object in a console nobody here has \
+         opened. The row is therefore written out inside `catalogue` below as a free-form-only \
+         tool, with the exact procedure, and is not applied: a catalogue row moves \
+         `agentos_eval::toolchoice::{TRUSTED_PROMPT, UNTRUSTED_PROMPT}` and `cost::DIGEST`, whose \
+         remeasurement needs a real model call that no agent may make. Applying it means deleting \
+         this entry in the same commit; `catalogue_covers_every_proposable_kind` re-partitions on \
+         its own.",
     ),
     (
         ActionKind::CallPlace,
@@ -375,11 +386,14 @@ pub(crate) const BROWSE_RISK: Risk = Risk::Low;
 /// its binding to `employee_resources`, and pairing that binding with the
 /// principal's employee id rebuilds the session the provisioner made, which is
 /// what [`Effects::read_page`](crate::effects::Effects::read_page) does. The
-/// other two claims in that sentence *do* still hold and are now written down
-/// where they can be deleted: see [`UNSERVED`] for WhatsApp's missing window
-/// proof and template registry, and for the fact that the phone's real problem
-/// is not a sender identity at all — no adapter in this workspace can place a
-/// call.
+/// other two claims in that sentence were also written down where they can be
+/// deleted, and both have since been half deleted. WhatsApp's window proof is
+/// derivable now — [`crate::effects::Effects::whatsapp_window`], on the clock
+/// `0069`'s ingest writes — so [`UNSERVED`] names only the template registry;
+/// and the phone's problem was never a sender identity, but an adapter *can*
+/// place a call today, so what [`UNSERVED`] names there is the turn-taking loop.
+/// Read that array for both, and the two blocks at the end of this function for
+/// what each would cost to ship.
 ///
 /// The cost of being wrong about that was not one absent tool. Every one of the
 /// six role packs lists [`ActionKind::BrowserRead`], every one of their
@@ -1146,6 +1160,133 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
         //     deliberate decision and not a step in this list.
         //   * the same re-measure the block above spells out, which NOBODY IN
         //     AN AGENT WAVE MAY RUN.
+        //
+        // ===================================================================
+        // WHERE `send_whatsapp` WOULD GO, WRITTEN OUT AND NOT APPLIED
+        // ===================================================================
+        //
+        // This one is `issue_invoice`'s case and not `place_call`'s: the
+        // machine exists and only the measurement is unbought. `0069` gave a
+        // conversation a clock — an inbound WhatsApp message is a dated
+        // `messages` row on a thread with an `external_ref` — and
+        // `Effects::whatsapp_window` reads it and mints the `OpenWindow` that
+        // `RenderedWhatsapp::FreeForm` has always demanded and that nothing
+        // outside a test could previously obtain. With that, replying inside
+        // the 24-hour window is built end to end: the subject
+        // (`effects::WhatsappSend`), the policy arms (`domain::policy`'s
+        // `Channel::Whatsapp` plus a calling-code prefix, `always_denies` and
+        // `evaluate` asking both), `Effects::send_whatsapp`, the adapters, the
+        // audit row.
+        //
+        // **The schema below offers free text and nothing else, and that is the
+        // decision rather than an omission.** Outside the window the only legal
+        // message is a template pre-approved in the provider's console, and this
+        // workspace has no registry to name one from — see `UNSERVED`. A
+        // `template` argument written today would have to guess whose namespace
+        // the name lives in (`telephony_twilio` sends a Twilio **Content SID**;
+        // Meta's own API takes a template name plus a language), who writes the
+        // rows and when, and what a positional variable means. That is
+        // `place_call`'s mistake one channel over: a schema for a payload that
+        // does not exist yet. The honest tool is the one that can only reply,
+        // and it says so.
+        //
+        //   1. the signature on `catalogue` above: `; 11]` becomes `; 12]`.
+        //   2. `UNSERVED` above: delete the `ActionKind::WhatsappSend` entry;
+        //      its length becomes `[…; 10]`.
+        //   3. `const SEND_WHATSAPP: &str = "send_whatsapp";` beside the other
+        //      tool names at the top of this module — not declared today,
+        //      because a constant nothing reads is `dead_code` and this
+        //      workspace's lints are `-D warnings`.
+        //   4. this element, in place of this comment:
+        //
+        //        (
+        //            SEND_WHATSAPP,
+        //            ActionKind::WhatsappSend,
+        //            // `Low`, matching `Action::risk`, and matching it is not
+        //            // a copy: `High` would withhold the verb from every turn
+        //            // that has read anything from outside, and a turn that
+        //            // has just read somebody's WhatsApp message is the only
+        //            // turn this tool is for. What is dangerous about a reply
+        //            // is who it reaches, and that is `domain::policy`'s
+        //            // ruling — a channel grant plus a calling-code prefix —
+        //            // not this table's.
+        //            Risk::Low,
+        //            "Reply on WhatsApp to somebody who has written to you there in the last 24 \
+        //             hours. You cannot start a WhatsApp conversation and you cannot revive an \
+        //             old one: WhatsApp only allows free text while their own last message to \
+        //             you is under 24 hours old, and outside that the only legal message is a \
+        //             pre-approved template, which this company does not have. So a number you \
+        //             have not heard from today is refused, and the refusal says so — send an \
+        //             email instead, or ask a colleague. Nothing is retried on your behalf.",
+        //            json!({
+        //                "type": "object",
+        //                "properties": {
+        //                    "to": {
+        //                        "type": "string",
+        //                        "description": "Their number in E.164, e.g. +33612345678. The \
+        //                                        number that wrote to you, copied from your \
+        //                                        brief."
+        //                    },
+        //                    "body": {
+        //                        "type": "string",
+        //                        "description": "What to say, in plain text."
+        //                    }
+        //                },
+        //                "required": ["to", "body"]
+        //            }),
+        //        ),
+        //
+        //   5. `Turn::propose` gains the arm, which is the `SmsSend` shape:
+        //      parse `to` as an `E164`, build `WhatsappSend { to }`. `perform`
+        //      is the one that differs, and the difference is the whole tool —
+        //      it must ask `Effects::whatsapp_window(&to)` **before** the gate,
+        //      and hand back a `Reply::Error` when it is `None`:
+        //
+        //        let Some(window) = self.effects.whatsapp_window(&to).await? else {
+        //            return Ok(Reply::Error(
+        //                "they have not written to you on WhatsApp in the last 24 hours, so \
+        //                 WhatsApp will not carry free text to them; use another channel"
+        //                    .to_owned(),
+        //            ));
+        //        };
+        //
+        //      Before the gate, and that ordering is deliberate: a closed window
+        //      is not a denial, it is a fact about the counterparty, and filing
+        //      an approval for a message the platform will refuse would ask a
+        //      human to authorise something that cannot happen. It is the same
+        //      call `Effects::opted_out` makes one seam over.
+        //
+        //      Then `gated!` on `WhatsappSend { to }` and
+        //      `Effects::send_whatsapp(ok, RenderedWhatsapp::FreeForm { from,
+        //      body, window })`, with `from` the employee's own sender exactly
+        //      as `place_call` takes its `from` from the caller and its `to`
+        //      off the token.
+        //
+        //      **The window is read twice on purpose and this is not the
+        //      double-read the repo otherwise refuses.** The mint above proves
+        //      it was open when the model asked; both adapters re-check
+        //      `expires_at() <= now` at the wire and answer `Terminal {
+        //      code: "window_closed" }`, because a turn can run for
+        //      `TURN_DEADLINE` in between. The first read produces a sentence a
+        //      model can act on, the second produces a refusal nothing can
+        //      route around. Neither is redundant with the other.
+        //
+        //   6. `EngineConfig` provisions `Step::Whatsapp` already; no flag
+        //      moves. `store::policy::default_ceiling` grants no
+        //      `Channel::Whatsapp` and no calling code, and layers only narrow,
+        //      so the tool reaches nobody until an operator's ceiling says
+        //      otherwise — a separate decision, not a step in this list.
+        //
+        //   7. the same re-measure the `issue_invoice` block spells out, which
+        //      NOBODY IN AN AGENT WAVE MAY RUN. One live run covers any number
+        //      of rows, so if this and `issue_invoice` are both wanted they
+        //      belong in one commit.
+        //
+        // WHAT IS TRUE UNTIL THEN: nothing is reachable. `Turn::propose` matches
+        // no `send_whatsapp` and refuses any name absent from this turn's
+        // request, so the verb is unreachable rather than merely unlisted.
+        // `Effects::send_whatsapp` and `Effects::whatsapp_window` have no caller
+        // outside this crate's tests.
     ]
 }
 

@@ -2268,6 +2268,125 @@ async fn preceded_by_our_message(
         .map(|(_, sent_at)| sent_at))
 }
 
+/// When this counterparty last wrote to this employee **on WhatsApp**.
+///
+/// This is the conversation clock [`crate::turn::UNSERVED`] said a turn did not
+/// have, and the only input
+/// [`OpenWindow::since_last_inbound`](agentos_providers::telephony::OpenWindow::since_last_inbound)
+/// takes. It is read here rather than in [`crate::effects`] because the writer
+/// of the key it joins on is twenty lines up: [`conversation_for`] files a
+/// thread under `(employee_id, channel, external_ref)`, `external_ref` is
+/// `TelephonyRoute::read`'s E.164-parsed counterparty, and a reader that
+/// spelled that join differently would be a window derived from a thread the
+/// ingest never wrote.
+///
+/// # Which clock this is, and why there is no second candidate
+///
+/// `messages.received_at`. On this path it is **ours, at landing**: a Twilio
+/// messaging webhook carries `MessageSid`, `From`, `To`, `Body` and the media
+/// fields and **no timestamp at all** — see
+/// `telephony::normalize_twilio_form`, which reads every field there is and
+/// takes the instant from [`InboundCtx`](agentos_providers::telephony::InboundCtx)
+/// because the payload has none. So the question "the provider's word or ours"
+/// has one answer here by construction, and it is not a preference: there is
+/// nothing the provider asserted to prefer. (Mail is the other way round —
+/// `email::RawInbound::received_at` is the provider's envelope instant, and
+/// `record_refusal` deliberately takes a complaint's timestamp from the payload
+/// because it is part of a legal record. That reasoning does not reach here,
+/// because there is no payload instant to take.)
+///
+/// **A replay cannot move it, and this is enforced twice.** The route's dedupe
+/// id is a hash of the exact bytes, so `outbox::enqueue` hands a replayed
+/// callback the original row; and if a second row is somehow drained, [`land`]
+/// inserts `ON CONFLICT (tenant_id, idempotency_key) DO NOTHING` on a key
+/// derived from `MessageSid`, so the stored `received_at` is the first
+/// landing's and no `UPDATE` anywhere in this module rewrites it. A captured
+/// Twilio callback stays signature-valid until the auth token rotates — see
+/// `routes::webhooks`, which says so — and that is survivable *because* of
+/// this: a replay lands nothing, so it cannot extend a legal window.
+///
+/// # What it is late by, which is not free and is not ours to fix here
+///
+/// Meta's window starts when **Meta** received the customer's message. This
+/// timestamp is when **our outbox poller** landed the delivery, which is later
+/// by the provider's own hop plus however long the row waited to be claimed. So
+/// a window derived from it closes *after* the real one, which is the unsafe
+/// direction — the last seconds of a derived window are seconds Meta may
+/// already consider outside it.
+///
+/// Nothing here shortens it, and no number is invented to. See
+/// [`crate::effects::Effects::whatsapp_window`], which is where the margin
+/// would be subtracted and where the founder's question is written down.
+///
+/// # Three narrowings, each of them the refusing direction
+///
+/// * **WhatsApp only**, and *not* the [`telephony_scope`] affinity that treats
+///   `sms` and `voice` as one relationship. That affinity exists so a supplier
+///   who texts and then calls still reaches the same employee; reusing it here
+///   would let an SMS open a WhatsApp window, which is a policy violation
+///   manufactured out of an unrelated channel.
+///
+///   **The thread's channel is asked and the message's is not**, which looks
+///   like the weaker of the two and is the one that can be tested. Three
+///   writers put rows in `messages`, and each of them derives the thread from
+///   [`conversation_for`] *with the channel it is about to write on the row*:
+///   [`land_inbound_text`] and [`ingest_email`], the only two non-test callers
+///   of [`land`], and the internal channel, whose own INSERT pairs
+///   `Channel::Internal` with `'internal'`. So `c.channel` and `m.channel`
+///   cannot disagree, and asking both would be a conjunct no fixture this
+///   workspace can write would ever exercise — two conjuncts, neither provable,
+///   which is the shape of a green test that is blind to the branch it
+///   protects. Asking one makes it load-bearing: delete `c.channel` and
+///   `a_whatsapp_window_is_derived_from_the_last_inbound_on_that_channel` goes
+///   red on the SMS, because the SMS thread carries the same `external_ref`.
+/// * **Inbound only.** Our own messages do not reopen the window — that is the
+///   whole of the rule. `conversations.last_message_at` is therefore not the
+///   column to read: [`land`] writes it for outbound rows too.
+/// * **This employee only.** Meta keys the window on the business number, and a
+///   pooled WhatsApp sender can carry several employees (`Step::Whatsapp`'s
+///   `{address}/{employee}` binding). So a colleague on the same sender may
+///   have a window this returns `None` for. That is narrower than Meta and
+///   deliberately so: the relationship, the trust links and the thread belong
+///   to the employee who holds them, and widening it would let one seat spend
+///   another seat's window.
+///
+/// # The candidate that was rejected
+///
+/// [`crate::psyche`] already keeps `Standing::last_heard_from_at`, "the last
+/// time they said anything at all", per employee and counterparty — one call
+/// instead of this query. It must not be used. It is keyed on
+/// `psyche::key(counterparty)` with **no channel**, so an email or an SMS from
+/// the same person would open a WhatsApp window; and its own module says
+/// "advisory, all of it — it decides nothing about what is allowed". Deriving a
+/// legal permission from the advisory ledger inverts that contract in the one
+/// direction that costs.
+pub async fn last_inbound_whatsapp_at(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+    counterparty: &E164,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    // `max` and not `ORDER BY … LIMIT 1`: an empty set is one NULL row rather
+    // than no row, so "they never wrote" arrives as `None` on the happy path
+    // instead of as a `fetch_optional` that a later edit could turn into a
+    // `fetch_one` and a runtime error.
+    sqlx::query_scalar(
+        "SELECT max(m.received_at) \
+           FROM messages m \
+           JOIN conversations c ON c.id = m.conversation_id \
+          WHERE c.employee_id = $1 \
+            AND c.channel = $2 \
+            AND c.external_ref = $3 \
+            AND m.direction = $4",
+    )
+    .bind(employee_id.as_uuid())
+    .bind(Channel::Whatsapp.as_str())
+    .bind(counterparty.as_str())
+    .bind(direction_str(Direction::Inbound))
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)
+}
+
 /// The message this key already landed as, if it did — with its turn re-read
 /// from the outbox rather than re-queued, since the dedupe key makes
 /// [`outbox::enqueue`] hand back the original id.
@@ -3742,8 +3861,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use agentos_providers::email::{MockEmailProvider, RawAttachment, RawInbound};
-    use agentos_providers::telephony::MockTelephony;
-    use chrono::Duration;
+    use agentos_providers::telephony::{MockTelephony, OpenWindow};
+    use chrono::{Duration, SubsecRound};
 
     use super::*;
 
@@ -3820,6 +3939,22 @@ mod tests {
         pooled: bool,
         since: DateTime<Utc>,
     ) {
+        allocate_on(db, tenant, employee, Step::Phone, number, pooled, since).await;
+    }
+
+    /// The same, on whichever step owns the address —
+    /// [`telephony_scope`] routes `Channel::Whatsapp` to [`Step::Whatsapp`] and
+    /// SMS and voice to [`Step::Phone`], so a WhatsApp fixture that allocated a
+    /// phone would be routed nowhere.
+    async fn allocate_on(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+        step: Step,
+        number: &E164,
+        pooled: bool,
+        since: DateTime<Utc>,
+    ) {
         let external_id = match pooled {
             true => format!("{}/{}", number.as_str(), employee.as_uuid()),
             false => number.as_str().to_owned(),
@@ -3828,9 +3963,10 @@ mod tests {
         sqlx::query(
             "INSERT INTO employee_resources \
                  (employee_id, step, tenant_id, state, provider, external_id, created_at) \
-             VALUES ($1, 'phone', $2, 'ready', 'twilio', $3, $4)",
+             VALUES ($1, $2, $3, 'ready', 'twilio', $4, $5)",
         )
         .bind(employee.as_uuid())
+        .bind(step.as_str())
         .bind(tenant.as_uuid())
         .bind(&external_id)
         .bind(since)
@@ -3857,6 +3993,22 @@ mod tests {
             .append_pair("MessageSid", sid)
             .append_pair("From", from)
             .append_pair("To", to.as_str())
+            .append_pair("Body", body)
+            .finish()
+            .into_bytes()
+    }
+
+    /// The same body on the WhatsApp side of the one Twilio endpoint. The
+    /// `whatsapp:` prefix on both numbers is the *only* thing in the payload
+    /// that tells the two channels apart — `TelephonyRoute::read` and
+    /// `normalize_twilio_form` each say so — so a fixture without it is an SMS
+    /// fixture wearing a WhatsApp name, and every assertion below would be
+    /// about the wrong channel.
+    fn wa_form(sid: &str, from: &str, to: &E164, body: &str) -> Vec<u8> {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("MessageSid", sid)
+            .append_pair("From", &format!("whatsapp:{from}"))
+            .append_pair("To", &format!("whatsapp:{}", to.as_str()))
             .append_pair("Body", body)
             .finish()
             .into_bytes()
@@ -5688,6 +5840,233 @@ mod tests {
             row.conversation_id.is_some(),
             "the row names the thread it landed in"
         );
+    }
+
+    // -- the 24-hour window -------------------------------------------------
+
+    /// **The clock `turn::UNSERVED` said a turn did not have.**
+    ///
+    /// Every timestamp here arrives the way production writes one: a signed
+    /// Twilio form through `land_inbound_text`, with the landing instant as the
+    /// clock. Nothing inserts a `messages` row by hand, because the shape of
+    /// that row — which channel, which `external_ref`, which direction — *is*
+    /// what is under test.
+    ///
+    /// Four seams, each of which would widen a legal window if it were wrong,
+    /// and each of which a narrower assertion would admit:
+    ///
+    /// 1. **The boundary.** 23h59 open, exactly 24h shut, 24h01 shut. Asserted
+    ///    on the expiry and not only on `is_some`, because `is_some()` alone
+    ///    admits a window derived from the wrong message.
+    /// 2. **The channel.** An SMS from the same number on the same day opens no
+    ///    WhatsApp window, even though `telephony_scope` deliberately treats a
+    ///    text and a call as one relationship.
+    /// 3. **The direction.** Our own reply does not reopen it.
+    /// 4. **The replay.** A redelivered callback does not move it forward.
+    #[tokio::test]
+    async fn a_whatsapp_window_is_derived_from_the_last_inbound_on_that_channel() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let alex = hire(&db, tenant, "alex").await;
+        // Microsecond-truncated: `timestamptz` keeps six digits and the
+        // assertions below compare a round trip against the value we sent.
+        let now = Utc::now().trunc_subsecs(6);
+
+        let sender = number(20);
+        let phone = number(21);
+        allocate_on(
+            &db,
+            tenant,
+            lena,
+            Step::Whatsapp,
+            &sender,
+            true,
+            now - Duration::days(9),
+        )
+        .await;
+        allocate_on(
+            &db,
+            tenant,
+            alex,
+            Step::Whatsapp,
+            &sender,
+            true,
+            now - Duration::days(8),
+        )
+        .await;
+        allocate_on(
+            &db,
+            tenant,
+            lena,
+            Step::Phone,
+            &phone,
+            false,
+            now - Duration::days(9),
+        )
+        .await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        let customer = "+33612345678";
+        let them = E164::parse(customer).expect("E.164");
+        let stranger = E164::parse("+33698765432").expect("E.164");
+
+        let window_for = |employee, at: DateTime<Utc>, who: &E164| {
+            let db = db.clone();
+            let who = who.clone();
+            async move {
+                let mut tx = db.tenant_tx(tenant).await.expect("tx");
+                let last = last_inbound_whatsapp_at(&mut tx, employee, &who)
+                    .await
+                    .expect("read the clock");
+                tx.commit().await.expect("commit read");
+                (last, OpenWindow::since_last_inbound(last, at))
+            }
+        };
+
+        // Nobody has written. Closed, and closed is the absence of a window
+        // rather than a window of length zero — `FreeForm` needs the value, so
+        // `None` is what makes the send unspellable.
+        let (last, window) = window_for(lena, now, &them).await;
+        assert_eq!(last, None, "no message, no clock");
+        assert!(window.is_none());
+
+        // (2) An SMS from the same person, an hour ago, through the real
+        // ingest. `telephony_scope` calls a text and a call one relationship;
+        // it must not call a text and a WhatsApp one.
+        text(
+            &db,
+            tenant,
+            &telephony,
+            &form("SM_win", customer, &phone, "je vous appelle"),
+            now - Duration::hours(1),
+        )
+        .await
+        .expect("the sms lands");
+        let (last, window) = window_for(lena, now, &them).await;
+        assert_eq!(
+            last, None,
+            "an SMS opened a WhatsApp window: free text would go out on a channel they never \
+             wrote to us on"
+        );
+        assert!(window.is_none());
+
+        // The message the window is actually made of.
+        let wrote_at = now - Duration::hours(23) - Duration::minutes(59);
+        let landed = text(
+            &db,
+            tenant,
+            &telephony,
+            &wa_form("WA_win", customer, &sender, "bonjour, la commande?"),
+            wrote_at,
+        )
+        .await
+        .expect("the whatsapp message lands");
+        assert_eq!(
+            owner_of(&db, tenant, landed.message_id).await,
+            lena,
+            "the front desk on this sender is Lena; the rest of this test is about her window"
+        );
+
+        // (1) The boundary. The expiry is asserted, not merely `is_some`: a
+        // window derived from the SMS above would also be `Some` here.
+        let (last, window) = window_for(lena, now, &them).await;
+        assert_eq!(
+            last,
+            Some(wrote_at),
+            "the clock is the instant we landed the delivery"
+        );
+        let open = window.expect("23h59 is inside the window");
+        assert_eq!(open.expires_at(), wrote_at + OpenWindow::DURATION);
+        // The fixture really does straddle the threshold — a constant that
+        // never crossed it would make the two assertions below agree for the
+        // wrong reason.
+        assert!(wrote_at + OpenWindow::DURATION > now);
+        assert!(wrote_at + OpenWindow::DURATION <= wrote_at + Duration::hours(24));
+
+        // Exactly 24 hours is shut. `since_last_inbound` tests `>` and not
+        // `>=`, and the difference is one legal message.
+        assert!(
+            OpenWindow::since_last_inbound(last, wrote_at + Duration::hours(24)).is_none(),
+            "the boundary instant itself was treated as open"
+        );
+        assert!(
+            OpenWindow::since_last_inbound(
+                last,
+                wrote_at + Duration::hours(24) + Duration::minutes(1)
+            )
+            .is_none()
+        );
+
+        // (4) The replay. Identical bytes, a second delivery, a later clock:
+        // `land` inserts ON CONFLICT DO NOTHING on a key derived from
+        // `MessageSid`, so the stored instant is the first landing's.
+        let replay = text(
+            &db,
+            tenant,
+            &telephony,
+            &wa_form("WA_win", customer, &sender, "bonjour, la commande?"),
+            now,
+        )
+        .await
+        .expect("the replay is a no-op, not an error");
+        assert!(replay.duplicate);
+        assert_eq!(replay.message_id, landed.message_id);
+        let (last, _) = window_for(lena, now, &them).await;
+        assert_eq!(
+            last,
+            Some(wrote_at),
+            "a replayed callback moved the window forward; a captured Twilio callback stays \
+             signature-valid until the auth token rotates"
+        );
+
+        // (3) Our own reply does not reopen it. Written straight into
+        // `messages` because there is no outbound WhatsApp caller to write it
+        // — which is the point: the column, not the sender, is what the query
+        // filters on.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
+                  provider_message_id, body, trust_label, idempotency_key, received_at, \
+                  created_at) \
+             VALUES ($1, $2, $3, $4, 'whatsapp', 'outbound', 'us', 'MM_out', 'bien reçu', \
+                     'trusted', $5, $6, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(landed.conversation_id.as_uuid())
+        .bind(lena.as_uuid())
+        .bind(format!("wa-out-{}", Uuid::now_v7()))
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .expect("insert our reply");
+        tx.commit().await.expect("commit our reply");
+        let (last, _) = window_for(lena, now, &them).await;
+        assert_eq!(
+            last,
+            Some(wrote_at),
+            "our own message reopened the window; the rule is that theirs does"
+        );
+
+        // A colleague on the same pooled sender has no window of his own.
+        // Narrower than Meta, which keys on the business number — argued on
+        // `last_inbound_whatsapp_at`.
+        let (last, window) = window_for(alex, now, &them).await;
+        assert_eq!(
+            last, None,
+            "a colleague sharing the pooled sender inherited Lena's window"
+        );
+        assert!(window.is_none());
+
+        // And a number that never wrote gets nothing, on the employee who does
+        // have a window with somebody else.
+        let (last, window) = window_for(lena, now, &stranger).await;
+        assert_eq!(
+            last, None,
+            "one counterparty's message opened a window for another"
+        );
+        assert!(window.is_none());
     }
 
     // -- the internal channel ----------------------------------------------

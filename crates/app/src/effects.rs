@@ -963,6 +963,90 @@ impl Effects {
         self.record(&ok, message_detail(&sent), sent).await
     }
 
+    /// Whether this employee may write free text to this number on WhatsApp
+    /// right now, and the proof if it may.
+    ///
+    /// **The half of [`crate::turn::UNSERVED`]'s WhatsApp entry that has stopped
+    /// being missing.** [`OpenWindow`] has existed since the adapter was
+    /// written and could be obtained nowhere outside a test, because nothing in
+    /// this workspace could say when a counterparty last wrote to us on that
+    /// channel. The telephony ingest (`0069`,
+    /// [`inbound::land_inbound_text`](crate::inbound::land_inbound_text)) makes
+    /// that a row, and this is the read of it. The remaining half — a registry
+    /// of pre-approved templates, which is what a *closed* window allows — is
+    /// still missing and is still named in that entry.
+    ///
+    /// `None` is a refusal and covers three things on purpose: they have never
+    /// written to us here, they wrote more than 24 hours ago, or they wrote
+    /// exactly 24 hours ago to the microsecond.
+    /// [`OpenWindow::since_last_inbound`] tests `expires_at > now`, strictly, so
+    /// the boundary instant itself is shut — the safe direction, since a
+    /// free-form send outside the window is a policy violation with Meta rather
+    /// than a 4xx to shrug at.
+    ///
+    /// # No token, for [`Effects::opted_out`]'s reason, one direction along
+    ///
+    /// This performs no effect: it reads two of our own tables and the only
+    /// thing its answer can do is *withhold* a message. Requiring an
+    /// [`Authorized`] would mean the caller had to be granted the send before it
+    /// could find out whether the send is legal, which is backwards, and a
+    /// policy denial could not make an illegal send legal — it can only stop a
+    /// legal one from happening, which the gate does anyway at the actual send.
+    ///
+    /// # The window this returns is already stale, and both halves are named
+    ///
+    /// **The clock is late.** `messages.received_at` on this path is when our
+    /// outbox poller landed the delivery, and Meta's 24 hours run from when
+    /// *Meta* received the customer's message — earlier by a provider hop plus
+    /// however long the row waited to be claimed. So the expiry here is later
+    /// than the real one by that lag, and the last seconds of it are seconds
+    /// Meta may already count as outside.
+    ///
+    /// **And it decays.** The proof is a value, not a lease: it says the window
+    /// was open at the instant this was called. A turn can run for
+    /// `TURN_DEADLINE` afterwards, so a window with thirty seconds left when the
+    /// model asked can be shut when the message reaches the wire. That one is
+    /// **already closed, at the wire, by both adapters** —
+    /// `MockTelephony::send_whatsapp` and `TwilioTelephony::send_whatsapp` each
+    /// refuse `FreeForm` with `Terminal { code: "window_closed" }` when
+    /// `expires_at() <= now`. It is deliberately not re-checked here as well: a
+    /// third copy of the rule would be a third place for it to drift, and the
+    /// one that matters is the one nearest the send.
+    ///
+    /// # FOUNDER'S QUESTION, LEFT OPEN: what is the safety margin?
+    ///
+    /// The lag above is real and it is unobservable from here — nothing in a
+    /// Twilio messaging callback says when Meta got the message. The honest fix
+    /// is to subtract a margin from the derived expiry, and **the margin is a
+    /// number this repository cannot source**: it is a judgement about how much
+    /// of a 24-hour window to give back in exchange for never sending one second
+    /// late. No number is invented here, exactly as `0063` invents no cutoff for
+    /// how late is too late to keep an appointment.
+    ///
+    /// The place for the answer is one subtraction on the `now` below —
+    /// `Utc::now() + MARGIN` closes the window early by `MARGIN` and changes
+    /// nothing else, because [`OpenWindow`] is derived from `now` and never
+    /// stored. What bounds the damage until then: free-form WhatsApp is
+    /// unreachable by a model (no catalogue row), the boundary is strict rather
+    /// than inclusive, and a late send is refused by the adapter rather than
+    /// sent as free text.
+    ///
+    /// The other unsourced number is the 24 itself — see [`OpenWindow::DURATION`].
+    pub async fn whatsapp_window(&self, to: &E164) -> Result<Option<OpenWindow>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let last =
+            crate::inbound::last_inbound_whatsapp_at(&mut tx, self.principal.employee_id, to)
+                .await
+                .map_err(EffectError::Unavailable)?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+
+        Ok(OpenWindow::since_last_inbound(last, Utc::now()))
+    }
+
     /// Send the rendered WhatsApp message to the number on the token.
     pub async fn send_whatsapp<A: Subject<Of = WhatsappSend>>(
         &self,
@@ -3153,6 +3237,136 @@ mod tests {
             "a calling code nobody granted must not be dialable: {elsewhere:?}"
         );
         assert_eq!(phone.dialled().len(), 1, "the refused number rang anyway");
+    }
+
+    /// **The seat the window belongs to.**
+    ///
+    /// `last_inbound_whatsapp_at`'s own boundary and channel seams are proved
+    /// in `inbound`, against the ingest that writes the rows. What is only
+    /// provable here is the plumbing: that this method asks about *this*
+    /// principal's employee, in *this* principal's tenant. A wrong id there
+    /// returns `None` forever and nothing complains — the window is simply
+    /// never open, and the symptom is an employee that can never reply.
+    ///
+    /// So the two halves are both asserted, and the second is the one that
+    /// catches it: `None` before the message, `Some` after. `None` alone is the
+    /// answer a completely disconnected method would also give.
+    #[tokio::test]
+    async fn the_window_this_employee_holds_is_read_for_this_employee() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        // A sender no other run has used: `(provider, external_id)` is unique
+        // across the whole table and these rows are left behind.
+        let sender = E164::parse(&format!(
+            "+33{:012}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+                .unsigned_abs()
+                % 1_000_000_000_000
+        ))
+        .expect("e164");
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+                 (employee_id, step, tenant_id, state, provider, external_id) \
+             VALUES ($1, 'whatsapp', $2, 'ready', 'twilio', $3)",
+        )
+        .bind(principal.employee_id.as_uuid())
+        .bind(principal.tenant_id.as_uuid())
+        .bind(sender.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("allocate the whatsapp sender");
+        tx.commit().await.expect("commit allocation");
+
+        let them = E164::parse("+33612345678").expect("e164");
+        assert!(
+            effects
+                .whatsapp_window(&them)
+                .await
+                .expect("the read succeeds")
+                .is_none(),
+            "a number that has never written to us has no window"
+        );
+
+        // One inbound message, through the ingest that writes the row rather
+        // than by hand — the shape of that row is what the query reads.
+        let telephony = MockTelephony::new(Utc::now(), "token");
+        let landed_at = Utc::now();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("MessageSid", "WA_effects")
+            .append_pair("From", &format!("whatsapp:{}", them.as_str()))
+            .append_pair("To", &format!("whatsapp:{}", sender.as_str()))
+            .append_pair("Body", "bonjour")
+            .finish()
+            .into_bytes();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        crate::inbound::land_inbound_text(&mut tx, &telephony, &form, landed_at)
+            .await
+            .expect("the message lands on this employee");
+        tx.commit().await.expect("commit the landing");
+
+        let window = effects
+            .whatsapp_window(&them)
+            .await
+            .expect("the read succeeds")
+            .expect("they wrote to us a moment ago");
+        assert_eq!(
+            window.expires_at(),
+            landed_at + OpenWindow::DURATION,
+            "the expiry is 24h from their message, not from now"
+        );
+
+        // And it is theirs alone: another number on the same sender has none.
+        assert!(
+            effects
+                .whatsapp_window(&E164::parse("+33698675309").expect("e164"))
+                .await
+                .expect("the read succeeds")
+                .is_none(),
+            "one counterparty's message opened a window for another"
+        );
+
+        // **The clock is the wall clock, and this is the only assertion that
+        // says so.** This method takes no `now` — it reads `Utc::now()` — so a
+        // version that compared the message against *itself* would report every
+        // window open forever, and every assertion above would still pass:
+        // they all turn on whether a message exists at all. Somebody who wrote
+        // 25 hours ago is the case that tells the two apart.
+        let stale = E164::parse("+33755500001").expect("e164");
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("MessageSid", "WA_effects_stale")
+            .append_pair("From", &format!("whatsapp:{}", stale.as_str()))
+            .append_pair("To", &format!("whatsapp:{}", sender.as_str()))
+            .append_pair("Body", "hier")
+            .finish()
+            .into_bytes();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        crate::inbound::land_inbound_text(
+            &mut tx,
+            &telephony,
+            &form,
+            landed_at - OpenWindow::DURATION - chrono::TimeDelta::hours(1),
+        )
+        .await
+        .expect("the old message lands");
+        tx.commit().await.expect("commit the old landing");
+
+        assert!(
+            effects
+                .whatsapp_window(&stale)
+                .await
+                .expect("the read succeeds")
+                .is_none(),
+            "a message from 25 hours ago left the window open"
+        );
     }
 
     #[test]
