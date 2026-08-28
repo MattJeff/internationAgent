@@ -1737,9 +1737,11 @@ async fn chasing_step(
 /// constant, and [`Shown::cut`] for why the sentence is outside the frame.
 ///
 /// The truncation is only defensible because the read is already ordered:
-/// `store::backlog`'s `ORDER` is the founder's own ranking, so what falls off
-/// the end is what he ranked last. A cut into an unordered list would be a
-/// random twenty.
+/// `store::backlog`'s `ORDER` is `ordinal ASC NULLS LAST, created_at ASC`, so
+/// what falls off the end is what the founder ranked last, or — for the items
+/// he ranked not at all, which 0061 made the default on purpose — what arrived
+/// most recently. Either way it is an order somebody can predict. A cut into an
+/// unordered list would be a random twenty.
 async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Shown> {
     let board = PgBacklog::new(db.clone(), tenant);
     let warn = |err: &BacklogError| {
@@ -1765,9 +1767,15 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Show
     let lines = |heading: &str, kind: &str, items: Vec<Held>, cut: &mut Vec<String>| {
         let heading = heading.to_owned();
         // Both board lists come back in `store::backlog`'s `ORDER`, which is
-        // the founder's own ranking; see this function's docs for why the
-        // diary next door says something else.
-        if let Some(note) = cut_note(kind, "in the order somebody ranked them", items.len()) {
+        // `ordinal ASC NULLS LAST, created_at ASC` — **ranked first, then
+        // oldest first**, and the second half is most of it: 0061 made
+        // `ordinal` nullable with no default precisely so nothing invents a
+        // rank, so an item nobody ranked is ordered by when it arrived and by
+        // nothing else. Saying "in the order somebody ranked them" was a false
+        // sentence in a model's context, which is the one place in this
+        // repository where prose is input rather than documentation. See
+        // `cut_note` for why the diary next door says something else again.
+        if let Some(note) = cut_note(kind, "ranked first, then oldest first", items.len()) {
             cut.push(note);
         }
         items
@@ -1888,9 +1896,12 @@ struct Shown {
 ///
 /// **`order` is a parameter because the three lists are not sorted alike, and
 /// this sentence is said to a model.** It used to read "in the order somebody
-/// ranked them" for all three, which is true of the two board lists —
-/// `store::backlog`'s `ORDER` is the founder's own ranking — and false of the
-/// diary, which `store::calendar::upcoming` returns `ORDER BY at ASC, id ASC`.
+/// ranked them" for all three, and it was false of all three. `store::backlog`'s
+/// `ORDER` is `ordinal ASC NULLS LAST, created_at ASC`: ranked items first,
+/// then everything nobody ranked in arrival order — and since 0061 leaves
+/// `ordinal` null by default so that nothing invents a rank, that second group
+/// is the ordinary case rather than the exception. The diary is worse still:
+/// `store::calendar::upcoming` returns `ORDER BY at ASC, id ASC`.
 /// Nobody ranks an hour; it simply comes round. Telling a turn that a
 /// chronological list was ranked invites it to read the top of the list as
 /// somebody's priority and the tail as the part that was judged to matter

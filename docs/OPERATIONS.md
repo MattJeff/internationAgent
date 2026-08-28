@@ -1140,9 +1140,14 @@ diff unnoticed. This paragraph used to read "three legitimate callers:
 migrations, the outbox poller and the provisioning loop's claims", and it was
 wrong twice. There are **many more outside tests** — and *migrations was never
 one of them*: `Db::migrate` runs sqlx's migrator against the pool and opens no
-transaction at all. The count that replaced the list is gone too, for the reason
-the end of this section gives: three readers counting on three different days
-got three different numbers, which is what a number in a document does.
+transaction at all.
+
+The list was replaced by a measured count — 26 production calls against 273 in
+tests, a split that needed hand-checking because four files carry a
+`#[cfg(test)]` that does not open a test module — and then the number was
+dropped too. Not because anybody miscounted, but because the count was correct
+on the day it was taken and is a hostage to the next commit. The shape below is
+what does not go stale.
 
 What is legitimate is a **shape**, not a list, which is why the list kept going
 stale while the shape never did:
