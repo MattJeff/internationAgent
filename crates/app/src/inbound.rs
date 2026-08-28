@@ -359,8 +359,7 @@
 //! no row and no counter behind, only its bucket locked until this transaction
 //! ends, which is the same lock a delivered message takes.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::HashSet;
 
 use agentos_domain::action::{E164, EmailAddress};
 use agentos_domain::employee::Step;
@@ -379,11 +378,11 @@ use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
 use agentos_store::revenue as revenue_store;
 use agentos_store::turns;
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::files::{Files, FilesError, PgFiles};
 use crate::prompt::Relation;
 use crate::psyche;
 use crate::turn::Context;
@@ -520,73 +519,55 @@ impl InboundError {
 }
 
 // ---------------------------------------------------------------------------
-// Blobs
+// Attachments
 // ---------------------------------------------------------------------------
 
-/// Where attachment bytes go, since they may not stay at the provider.
+// THE TRAIT THAT USED TO BE HERE, AND WHY IT IS NOT.
+//
+// `BlobStore` was a trait with one method (`put`), one implementation
+// (`InMemoryBlobs`, a `HashMap` behind a `Mutex`), and one call site. Its doc
+// said a reader "can add `get` then, against a real object store". Nobody did,
+// and `apps/server/src/main.rs` built the `HashMap` for the running server. So
+// the store was **write-only through the trait** — a supplier's invoice went
+// into a map that nothing could read, and the map died with the process. The
+// restart was the second defect; the first was that no reader existed at all.
+//
+// `crate::files::Files` is that store, already built: durable, tenant-isolated
+// by RLS rather than by a formatted key, `Untrusted` on everything it hands
+// back, and a `get` that **verifies the digest** instead of asserting it. It
+// already has an operator surface (`GET /v1/files/content`). Adding `get` to
+// `BlobStore` would have been a second, weaker spelling of a port that exists,
+// so the trait is deleted and this path deposits through that one.
+//
+// The two ports are one port because the distinction that justified two does
+// not survive contact: "an ingestion path with no tenant transaction" is not
+// this function, which already opens two of them (`resume`, and the landing
+// transaction below) with `job.tenant_id` in hand.
+
+/// The name one attachment is filed under in [`crate::files`].
 ///
-/// One method, because one method is all the inbound path needs: it writes.
-/// Whoever reads them later can add `get` then, against a real object store.
-#[async_trait]
-pub trait BlobStore: Send + Sync {
-    /// Store `bytes` under `key`. Must be idempotent — a retried ingest fetches
-    /// and puts the same attachment again.
-    async fn put(&self, key: &str, content_type: &str, bytes: Vec<u8>)
-    -> Result<(), ProviderError>;
-}
-
-/// A [`BlobStore`] in a `HashMap`, for tests and for `cargo run` without S3.
-#[derive(Debug, Default)]
-pub struct InMemoryBlobs(Mutex<HashMap<String, Vec<u8>>>);
-
-impl InMemoryBlobs {
-    /// An empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The bytes stored under `key`, if any.
-    pub fn bytes(&self, key: &str) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .expect("blob store poisoned")
-            .get(key)
-            .cloned()
-    }
-
-    /// How many distinct blobs are held.
-    pub fn len(&self) -> usize {
-        self.0.lock().expect("blob store poisoned").len()
-    }
-
-    /// Whether anything has been stored.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl BlobStore for InMemoryBlobs {
-    async fn put(
-        &self,
-        key: &str,
-        _content_type: &str,
-        bytes: Vec<u8>,
-    ) -> Result<(), ProviderError> {
-        self.0
-            .lock()
-            .expect("blob store poisoned")
-            .insert(key.to_owned(), bytes);
-        Ok(())
-    }
-}
-
-/// Where one attachment's bytes live.
+/// Derived, not stored: the same message always yields the same name, so a
+/// retried ingest addresses the same file — and `files` is first-write-wins, so
+/// the retry's conflict *is* the idempotence, enforced by a primary key rather
+/// than promised by a doc comment.
 ///
-/// Derived, not stored: the same message always yields the same key, so a
-/// retried ingest overwrites rather than accumulating. Built from the
-/// provider's own ids and **never** from the sender's filename — that string is
-/// attacker-chosen and this one becomes a path.
+/// **Still never the sender's filename**, though the original reason changed.
+/// It was excluded because this string became a path; under `bytea` a name is
+/// never parsed and never becomes a path, so that reason is gone. The reason
+/// that replaced it is stronger: `files` is one flat per-company namespace and
+/// first write wins, so a sender-chosen name would let a counterparty **squat**
+/// it — email a company `contract.pdf` and their own signed contract can never
+/// be filed under that name again, and whoever opens it gets the stranger's
+/// bytes. The `inbound/` prefix and the provider's own ids keep every deposit a
+/// counterparty causes inside a namespace no human files into. The filename
+/// stays where it already is: `messages.attachments[].filename`, wrapped.
+///
+/// ponytail: unbounded, because `ProviderRef` and the attachment id are
+/// unbounded provider strings while `files_name_shape` caps a name at 200
+/// characters. Real ids are ~40, so this is ~90; a provider with long ids would
+/// trip the CHECK and every attachment would be warned and skipped by
+/// `ingest_email` rather than lost silently. The upgrade path is to hash the
+/// two provider parts into a fixed-width suffix, which stays deterministic.
 pub fn blob_key(
     tenant_id: TenantId,
     provider_message_id: &ProviderRef,
@@ -1329,13 +1310,15 @@ pub struct Landed {
 /// 2. **Fetch the body.** Not present yet is [`InboundError::NotReady`], which
 ///    is retryable, because the webhook routinely arrives first.
 /// 3. **Fetch the bytes, now.** The `download_url` is an hour old at most and
-///    every second between the fetch and here is spent for nothing.
+///    every second between the fetch and here is spent for nothing. They are
+///    filed into [`crate::files`] as they arrive, and **no failure to file one
+///    can fail the message** — see the comment on the deposit for why that is
+///    classified here rather than in [`InboundError::is_retryable`].
 /// 4. **One transaction** for the conversation, the message and the turn — no
 ///    network calls inside it, so it is short and cannot half-commit.
 pub async fn ingest_email(
     db: &Db,
     email: &dyn EmailProvider,
-    blobs: &dyn BlobStore,
     job: &InboundJob,
     now: DateTime<Utc>,
 ) -> Result<Landed, InboundError> {
@@ -1357,24 +1340,79 @@ pub async fn ingest_email(
             other => InboundError::Provider(other),
         })?;
 
+    // The classeur, this company's. Built here rather than passed in because
+    // `Files` is per-tenant and the caller (`loops::inbound`) is not: it drains
+    // every tenant's notices through one loop, so a port handed down from
+    // `main` could only have been bound to the wrong company or to none.
+    let classeur = PgFiles::new(db.clone(), job.tenant_id);
     for attachment in &raw.attachments {
         let key = blob_key(job.tenant_id, &job.provider_message_id, &attachment.id);
         if attachment.url_expires_at <= now {
-            // ponytail: land the message anyway, with a blob key that resolves
-            // to nothing. A lost invoice is bad; losing the email that carried
-            // it is worse. The warn is the signal — give attachments their own
+            // ponytail: land the message anyway, with a name that resolves to
+            // nothing. A lost invoice is bad; losing the email that carried it
+            // is worse. The warn is the signal — give attachments their own
             // state column when someone needs to query for the gaps.
             tracing::warn!(blob = %key, "attachment download url expired before we fetched it");
             continue;
         }
-        match email
+        let bytes = match email
             .fetch_attachment(&job.provider_message_id, &attachment.id)
             .await
         {
-            Ok(bytes) => blobs.put(&key, &attachment.content_type, bytes).await?,
+            Ok(bytes) => bytes,
             Err(err) if err.is_retryable() => return Err(InboundError::Provider(err)),
             Err(err) => {
                 tracing::warn!(blob = %key, code = err.code(), "attachment bytes unreachable");
+                continue;
+            }
+        };
+
+        // **THE DEPOSIT IS CLASSIFIED, NEVER PROPAGATED, AND THIS IS THE WHOLE
+        // OF IT.** A `?` here would be the defect this change exists to avoid:
+        // an attachment over `files_content_size`, or a provider id over
+        // `files_name_shape`, fails a CHECK; a CHECK violation has no SQLSTATE
+        // arm in `StoreError::from`, so it arrives as `StoreError::Database`;
+        // and `InboundError::is_retryable` reports `Database` as retryable —
+        // correctly, since that variant is mostly pool timeouts. The result
+        // would be a message that can never land and a job that retries until
+        // it dead-letters, which loses the customer's mail to save its
+        // attachment. That is exactly backwards, and it is why `is_retryable`
+        // is **not** touched by this change: the bucket is not made finer, the
+        // failure is simply never turned into an `InboundError` at all.
+        //
+        // What it costs, stated rather than hidden: a database failure that
+        // heals within milliseconds loses this attachment permanently, because
+        // the message lands and the next delivery takes the `resume` branch. A
+        // database failure that does *not* heal costs nothing, because the
+        // landing transaction a few lines below fails too and the whole job
+        // retries. So the exposure is one narrow race, weighed against a
+        // guaranteed loss of mail — the founder's rule, applied to the arm it
+        // was written for.
+        //
+        // ponytail: the race closes by depositing inside the landing
+        // transaction behind a SAVEPOINT per attachment, so a CHECK failure
+        // rolls back one file instead of the message. That is nested-transaction
+        // machinery `TenantTx` does not expose today; add it when an operator
+        // reports a gap this warn does not explain.
+        match classeur.put(&key, &attachment.content_type, &bytes).await {
+            Ok(_) => {}
+            // A retry finding its own bytes already filed: first-write-wins
+            // means the row that refused us is the row we were trying to
+            // write, so this is success.
+            //
+            // **This arm changes a log line and not a behaviour, and that is
+            // measured rather than assumed** — deleting it lets the conflict
+            // fall into the warn below, which also continues, and every test
+            // here stays green. It earns its two lines anyway: the message
+            // below says "could not be filed" about a file that *is* filed,
+            // which sends whoever reads it hunting for bytes that are already
+            // there. Do not delete it as a no-op branch; it is a no-op branch
+            // on purpose, guarding a false alarm on the most ordinary path
+            // there is. What *is* load-bearing is the `continue`-shaped arm
+            // below — see the deposit comment.
+            Err(FilesError::Unavailable(StoreError::Conflict(_))) => {}
+            Err(err) => {
+                tracing::warn!(blob = %key, error = %err, "attachment bytes could not be filed");
             }
         }
     }
@@ -3717,7 +3755,6 @@ mod tests {
     async fn deliver(
         db: &Db,
         email: &MockEmailProvider,
-        blobs: &InMemoryBlobs,
         tenant: TenantId,
         notice: &InboundNotice,
         now: DateTime<Utc>,
@@ -3731,7 +3768,20 @@ mod tests {
             employee_id,
             provider_message_id: notice.provider_message_id.clone(),
         };
-        ingest_email(db, email, blobs, &job, now).await
+        ingest_email(db, email, &job, now).await
+    }
+
+    /// What this company holds in its classeur, by name.
+    ///
+    /// Read through `agentos_store::files` rather than through
+    /// [`crate::files::PgFiles`] so that the *store* is what the pipeline tests
+    /// assert on, leaving `PgFiles::get`'s digest verification to the port's own
+    /// tests instead of asserting it twice.
+    async fn filed(db: &Db, tenant: TenantId) -> Vec<agentos_store::files::Filed> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let all = agentos_store::files::index(&mut tx).await.expect("index");
+        tx.rollback().await.expect("rollback");
+        all
     }
 
     async fn count(db: &Db, tenant: TenantId, sql: &'static str) -> i64 {
@@ -4279,19 +4329,18 @@ mod tests {
         let (tenant, _) = seed(&db).await;
         let now = Utc::now();
         let email = MockEmailProvider::new();
-        let blobs = InMemoryBlobs::new();
         email.seed_inbound(
             raw("email_1", now, Duration::hours(1)),
             [("att_1".to_owned(), b"PDF".to_vec())],
         );
 
-        let first = deliver(&db, &email, &blobs, tenant, &notice("email_1", now), now)
+        let first = deliver(&db, &email, tenant, &notice("email_1", now), now)
             .await
             .expect("first delivery lands");
         assert!(!first.duplicate);
 
         for attempt in 2..=3 {
-            let again = deliver(&db, &email, &blobs, tenant, &notice("email_1", now), now)
+            let again = deliver(&db, &email, tenant, &notice("email_1", now), now)
                 .await
                 .unwrap_or_else(|e| panic!("delivery {attempt}: {e}"));
             assert!(again.duplicate, "delivery {attempt} must be a duplicate");
@@ -4328,10 +4377,9 @@ mod tests {
         let (tenant, _) = seed(&db).await;
         let now = Utc::now();
         let email = MockEmailProvider::new();
-        let blobs = InMemoryBlobs::new();
 
         // Nothing seeded: the provider does not have it yet.
-        let err = deliver(&db, &email, &blobs, tenant, &notice("email_2", now), now)
+        let err = deliver(&db, &email, tenant, &notice("email_2", now), now)
             .await
             .expect_err("the body is not there yet");
         assert!(matches!(err, InboundError::NotReady));
@@ -4345,7 +4393,7 @@ mod tests {
             raw("email_2", now, Duration::hours(1)),
             [("att_1".to_owned(), b"PDF".to_vec())],
         );
-        let landed = deliver(&db, &email, &blobs, tenant, &notice("email_2", now), now)
+        let landed = deliver(&db, &email, tenant, &notice("email_2", now), now)
             .await
             .expect("the retry lands it");
         assert!(!landed.duplicate);
@@ -4354,30 +4402,56 @@ mod tests {
     }
 
     /// The attachment window: the bytes are fetched during the ingest that
-    /// follows the webhook, and a URL that already died does not take the
-    /// message down with it.
+    /// follows the webhook, land in a **table**, come back out **through the
+    /// port**, and a URL that already died does not take the message down.
+    ///
+    /// The read is the half that could not be written before this change: the
+    /// bytes used to go into a `HashMap` behind a trait with no `get`, so
+    /// nothing in the workspace could hand a supplier's invoice back. Fetching
+    /// through [`crate::files::Files::get`] — in a transaction of its own,
+    /// after the ingest committed — is what makes this test say "readable and
+    /// durable" rather than "was passed to a writer".
     #[tokio::test]
-    async fn attachment_bytes_land_inside_the_window_and_a_dead_url_does_not_lose_the_message() {
+    async fn an_attachment_is_filed_durably_and_can_be_read_back_through_the_port() {
         let Some(db) = db().await else { return };
         let (tenant, _) = seed(&db).await;
         let now = Utc::now();
         let email = MockEmailProvider::new();
-        let blobs = InMemoryBlobs::new();
         email.seed_inbound(
             raw("email_3", now, Duration::hours(1)),
             [("att_1".to_owned(), b"PDF".to_vec())],
         );
 
-        deliver(&db, &email, &blobs, tenant, &notice("email_3", now), now)
+        deliver(&db, &email, tenant, &notice("email_3", now), now)
             .await
             .expect("lands");
 
         let key = blob_key(tenant, &ProviderRef::new("email_3"), "att_1");
-        assert_eq!(blobs.bytes(&key).as_deref(), Some(b"PDF".as_slice()));
-        assert_eq!(blobs.len(), 1);
 
-        // The stored row points at the blob, and names the attachment by the
-        // provider's id rather than the expiring URL.
+        // **Read back through the port**, which verifies the digest rather than
+        // asserting it, and hands the bytes over wrapped.
+        let classeur = crate::files::PgFiles::new(db.clone(), tenant);
+        let kept = classeur.get(&key).await.expect("the invoice is readable");
+        assert_eq!(
+            kept.digest,
+            <sha2::Sha256 as sha2::Digest>::digest(b"PDF").as_slice()
+        );
+        assert_eq!(
+            kept.bytes.into_inner_for_rendering(),
+            b"PDF".to_vec(),
+            "these bytes, unchanged, out of a table: the whole change"
+        );
+        // A counterparty's bytes stay hostile input all the way out.
+        assert!(kept.content_type.taint().is_untrusted());
+
+        let held = filed(&db, tenant).await;
+        assert_eq!(held.len(), 1, "one attachment, one row");
+        assert_eq!(held[0].name, key);
+        assert_eq!(held[0].size, 3);
+
+        // The stored row points at the file by the name it was filed under, and
+        // names the attachment by the provider's id rather than the expiring
+        // URL. This is the join: `messages.attachments[].blob` -> `files.name`.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         let stored: Value = sqlx::query_scalar(
             "SELECT attachments FROM messages WHERE provider_message_id = 'email_3'",
@@ -4389,18 +4463,157 @@ mod tests {
         assert_eq!(stored[0]["blob"], json!(key));
         assert_eq!(stored[0]["provider_ref"], json!("att_1"));
 
+        // A plain redelivery never reaches the deposit at all — `resume` finds
+        // the message and returns before the attachment loop — so it is *not*
+        // what exercises the conflict. See the test below for the retry that
+        // does.
+        let again = deliver(&db, &email, tenant, &notice("email_3", now), now)
+            .await
+            .expect("a redelivery lands as a duplicate");
+        assert!(again.duplicate);
+        assert_eq!(filed(&db, tenant).await.len(), 1, "still one row, not two");
+
         // An hour later, a different message whose URL is already dead.
         let dead = MockEmailProvider::new();
         dead.seed_inbound(
             raw("email_4", now, Duration::hours(-1)),
             [("att_1".to_owned(), b"PDF".to_vec())],
         );
-        let landed = deliver(&db, &dead, &blobs, tenant, &notice("email_4", now), now)
+        let landed = deliver(&db, &dead, tenant, &notice("email_4", now), now)
             .await
             .expect("the message lands even though its attachment did not");
         assert!(!landed.duplicate);
-        assert_eq!(blobs.len(), 1, "no second blob was fetched");
+        assert_eq!(
+            filed(&db, tenant).await.len(),
+            1,
+            "no second file was fetched"
+        );
         assert_eq!(messages(&db, tenant).await, 2);
+    }
+
+    /// **A retry that finds its own bytes already filed is success, not a
+    /// failure**, and the message must land on top of them.
+    ///
+    /// This is the arm a plain redelivery cannot reach: `resume` short-circuits
+    /// before the attachment loop, so the only way the deposit meets its own
+    /// earlier work is an ingest that filed the bytes and then failed before
+    /// landing the message — a `normalize` refusal, a conversation upsert that
+    /// lost a race. Staged directly by filing under the derived name first,
+    /// which is exactly the state such an attempt leaves behind.
+    ///
+    /// What this covers, stated exactly, because the obvious claim is wrong in
+    /// two directions and both were measured rather than assumed:
+    ///
+    /// * Deleting the `Conflict` arm leaves this **green** — the conflict falls
+    ///   into the generic arm, which also continues. That arm is log
+    ///   correctness, not behaviour.
+    /// * Making the generic arm propagate also leaves this **green** — the
+    ///   `Conflict` arm catches it first.
+    ///
+    /// So what this test actually guards is the *disjunction*: **a conflict is
+    /// never fatal**, by whichever arm. Break both and it goes red with
+    /// `files_pkey` as the reason, which is the shape the defect would really
+    /// have — `StoreError::Conflict` is what `is_retryable` calls false, so the
+    /// message dead-letters on its first retry citing its own earlier success.
+    #[tokio::test]
+    async fn a_retry_that_meets_its_own_earlier_deposit_still_lands_the_message() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        email.seed_inbound(
+            raw("email_retry", now, Duration::hours(1)),
+            [("att_1".to_owned(), b"PDF".to_vec())],
+        );
+
+        // The state a crashed first attempt leaves: the bytes are filed, the
+        // message is not.
+        let key = blob_key(tenant, &ProviderRef::new("email_retry"), "att_1");
+        crate::files::PgFiles::new(db.clone(), tenant)
+            .put(&key, "application/pdf", b"PDF")
+            .await
+            .expect("stage the earlier deposit");
+        assert_eq!(messages(&db, tenant).await, 0, "…and no message yet");
+
+        let landed = deliver(&db, &email, tenant, &notice("email_retry", now), now)
+            .await
+            .expect("the retry must not fail on its own earlier deposit");
+        assert!(!landed.duplicate, "the message itself is new");
+        assert_eq!(messages(&db, tenant).await, 1);
+        assert_eq!(turns(&db, tenant).await, 1);
+
+        // One row, and it still holds the *first* bytes: first write wins, so a
+        // deposit that swallowed the conflict must not have overwritten
+        // anything either.
+        let held = filed(&db, tenant).await;
+        assert_eq!(held.len(), 1, "the retry filed no second copy");
+        assert_eq!(held[0].name, key);
+        assert_eq!(
+            crate::files::PgFiles::new(db.clone(), tenant)
+                .get(&key)
+                .await
+                .expect("readable")
+                .bytes
+                .into_inner_for_rendering(),
+            b"PDF".to_vec()
+        );
+    }
+
+    /// **The trap, asserted: an attachment the `files` CHECKs refuse must lose
+    /// itself and never the message.**
+    ///
+    /// This is the arm the whole classification exists for. An attachment over
+    /// `files_content_size` fails a CHECK, a CHECK violation has no SQLSTATE arm
+    /// in `StoreError::from` so it arrives as `StoreError::Database`, and
+    /// `InboundError::is_retryable` reports `Database` as retryable. Propagating
+    /// it would therefore produce a message that can never land and a job that
+    /// retries until it dead-letters — losing the customer's mail in order to
+    /// save its attachment, which is exactly backwards.
+    ///
+    /// Asserted on the real ceiling against a real database, because the defect
+    /// is precisely that the constraint is in Postgres and the retry decision is
+    /// in Rust: a mocked store could not fail the way this has to fail.
+    #[tokio::test]
+    async fn an_attachment_too_big_for_the_classeur_loses_itself_and_not_the_email() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        // One byte over `files_content_size`, which is `MAX_BODY_BYTES`. The
+        // provider hands us bytes; no HTTP body limit stands between a supplier
+        // and this path, which is why the ceiling can be tripped at all.
+        let huge = vec![0x41_u8; 1024 * 1024 + 1];
+        email.seed_inbound(
+            raw("email_big", now, Duration::hours(1)),
+            [("att_1".to_owned(), huge)],
+        );
+
+        let landed = deliver(&db, &email, tenant, &notice("email_big", now), now)
+            .await
+            .expect("a lost invoice is bad; losing the email that carried it is worse");
+        assert!(!landed.duplicate);
+        assert_eq!(
+            messages(&db, tenant).await,
+            1,
+            "the message landed despite the attachment it could not keep"
+        );
+        assert_eq!(turns(&db, tenant).await, 1, "and the agent was woken");
+        assert!(
+            filed(&db, tenant).await.is_empty(),
+            "nothing was filed: the CHECK refused it and the warn is the record"
+        );
+
+        // And the message is not left half-landed: a redelivery is a duplicate,
+        // not a second attempt, so the oversized attachment is not re-fetched
+        // for ever.
+        let again = deliver(&db, &email, tenant, &notice("email_big", now), now)
+            .await
+            .expect("redelivery");
+        assert!(
+            again.duplicate,
+            "the notice is settled, not retried for ever"
+        );
+        assert_eq!(again.message_id, landed.message_id);
     }
 
     /// The trust boundary, on the object the agent loop actually receives.
@@ -4489,7 +4702,6 @@ mod tests {
         let (tenant, _) = seed(&db).await;
         let now = Utc::now();
         let email = MockEmailProvider::new();
-        let blobs = InMemoryBlobs::new();
 
         for (id, from) in [
             ("email_6", "Accounts <AP@Supplier.example>"),
@@ -4504,7 +4716,7 @@ mod tests {
                 },
                 [("att_1".to_owned(), b"PDF".to_vec())],
             );
-            deliver(&db, &email, &blobs, tenant, &notice(id, now), now)
+            deliver(&db, &email, tenant, &notice(id, now), now)
                 .await
                 .unwrap_or_else(|e| panic!("{id}: {e}"));
         }
@@ -5048,12 +5260,11 @@ mod tests {
         let (tenant, lena) = seed(&db).await;
         let now = Utc::now();
         let email = MockEmailProvider::new();
-        let blobs = InMemoryBlobs::new();
         let notice = notice("msg_audit", now);
         email.seed_inbound(raw("msg_audit", now, Duration::hours(1)), []);
 
         for attempt in 1..=3 {
-            deliver(&db, &email, &blobs, tenant, &notice, now)
+            deliver(&db, &email, tenant, &notice, now)
                 .await
                 .unwrap_or_else(|e| panic!("delivery {attempt}: {e}"));
         }

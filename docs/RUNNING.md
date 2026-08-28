@@ -199,29 +199,54 @@ gap at all: the decided target is people who *already have a SaaS*, and they
 arrive with a stack, a server and a problem rather than a blank page. Left
 unbuilt on purpose until somebody who is not the founder asks for it.
 
-## The gap nobody has closed: attachments are write-only
+## Closed: attachments were write-only, and now they are rows
 
-**Verified by hand on 2026-08-28, not reported second-hand.** A customer's email
-attachment goes into a `HashMap` in process memory that nothing can read back,
-and that empties on every restart.
+**The gap, as it stood on 2026-08-28.** A customer's email attachment went into a
+`HashMap` in process memory that nothing could read back, and that emptied on
+every restart. Three facts, each of which was one grep:
 
-Three facts, each checkable in one grep:
+* `apps/server/src/main.rs` built `InMemoryBlobs` for the running server.
+* `impl BlobStore for` appeared **once** in the whole workspace. There was no
+  durable adapter to switch to.
+* The trait had exactly one method, `put`. **There was no `get`.**
+  `InMemoryBlobs` had a `bytes()` accessor, but it was on the concrete type and
+  production held an `Arc<dyn BlobStore>` — so through the trait the store was
+  write-only. The doc on `put` said whoever reads them later can add `get`;
+  nobody did.
 
-* `apps/server/src/main.rs:327` builds `InMemoryBlobs` for the running server.
-* `impl BlobStore for` appears **once** in the whole workspace, and that is it.
-  There is no durable adapter to switch to.
-* The trait has exactly one method, `put`. **There is no `get`.** `InMemoryBlobs`
-  has a `bytes()` accessor, but it is on the concrete type, and production holds
-  an `Arc<dyn BlobStore>` — so through the trait the store is write-only. The
-  doc on `put` says whoever reads them later can add `get`; nobody did.
+So the restart was the second-worst part. The worst was that nothing could read
+an attachment back even without one.
 
-So the restart is the second-worst part. The worst is that nothing could read an
-attachment back even without one.
+**What was done.** `BlobStore` and `InMemoryBlobs` are deleted, not extended.
+`ingest_email` deposits attachments into `files` (0067) through
+`agentos_app::files::Files` — durable, tenant-isolated by RLS rather than by a
+formatted key, and carrying `digest = sha256(content)` as a CHECK. The port
+already had a `get` that **verifies** that digest rather than asserting it, and
+an operator surface: `GET /v1/files/content?name=…` returns the bytes. No new
+trait method and no new route were needed; the write path was simply pointed at
+the store that already had a reader.
 
-**The destination now exists.** `files` (0067) is durable, tenant-isolated, RLS
-forced, and carries `digest = sha256(content)` as a CHECK — which is exactly
-what a stored attachment wants, because a counterparty's bytes are the one thing
-in this system you most want to prove unchanged.
+Adding `get` to `BlobStore` instead would have been a second, weaker spelling of
+a port that already existed — one with no tenant argument, so no adapter could
+have had row-level security.
+
+**Nothing was migrated, because there was nothing to migrate.** Every attachment
+held in memory at the moment of deploy was already unreachable: no reader
+existed, and the map dies with the process. They are lost, and they were lost
+before the deploy. Mail that arrives after it lands in a table.
+
+**What is still not covered**, named rather than implied:
+
+* An attachment the `files` CHECKs refuse — over 1 MiB, or a provider id long
+  enough to bust the 200-character name — is **warned and skipped**, and the
+  message still lands. That is deliberate: a lost invoice is bad, losing the
+  email that carried it is worse. The `tracing::warn!` carrying `blob = <name>`
+  is the only record, because attachments have no state column.
+* A database failure during the deposit that heals within milliseconds loses
+  that one attachment permanently. One that does not heal costs nothing, because
+  the landing transaction fails too and the whole job retries.
+* An **employee** still cannot read an attachment. There is no `ActionKind` for
+  it, deliberately — see `crates/app/src/files.rs`. Only an operator key can.
 
 **And the rewiring has a trap that has to be handled in the same change**, named
 by the agent that built `files` and repeated here because it is the kind of fix

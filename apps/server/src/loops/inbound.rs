@@ -61,9 +61,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentos_app::effects::Ports;
-use agentos_app::inbound::{
-    BlobStore, InboundError, InboundJob, Landed, NOTICE_AGGREGATE, ingest_email,
-};
+use agentos_app::inbound::{InboundError, InboundJob, Landed, NOTICE_AGGREGATE, ingest_email};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::outbox::{self, Aggregates, OutboxEvent};
 use chrono::{DateTime, Utc};
@@ -86,15 +84,21 @@ const IDLE: Duration = Duration::from_millis(250);
 ///
 /// Spawn one per replica; two on the same database is a supported configuration
 /// and the reason the claim is `SKIP LOCKED`.
-pub async fn run(db: Db, ports: Arc<Ports>, blobs: Arc<dyn BlobStore>, cancel: CancellationToken) {
+pub async fn run(db: Db, ports: Arc<Ports>, cancel: CancellationToken) {
     let pump = db.clone();
     drain(
         &pump,
         &move |job: InboundJob| {
-            let (db, ports, blobs) = (db.clone(), ports.clone(), blobs.clone());
+            let (db, ports) = (db.clone(), ports.clone());
+            // No blob store is threaded through here any more. Attachments are
+            // filed into `agentos_app::files`, whose adapter is per-tenant —
+            // and this loop is not: it drains every company's notices, so the
+            // only place that can bind the classeur to a company is
+            // `ingest_email`, which holds `job.tenant_id`.
+            //
             // The provider is reached through `agentos_app`, never named here:
             // this crate does not depend on `agentos-providers` on purpose.
-            async move { ingest_email(&db, &*ports.email, &*blobs, &job, Utc::now()).await }
+            async move { ingest_email(&db, &*ports.email, &job, Utc::now()).await }
         },
         cancel,
     )

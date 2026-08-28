@@ -1,8 +1,11 @@
 //! `/v1/files`: le classeur — file a document, see what is filed, get one back.
 //!
 //! `migrations/0067_files.sql` argues for the table and [`agentos_app::files`]
-//! for the port. This is the only surface that reaches either today, and the
-//! only one that ever writes.
+//! for the port. This is the only *HTTP* surface that reaches either, and the
+//! only one a person writes through. It is no longer the only writer:
+//! `agentos_app::inbound::ingest_email` deposits every email attachment it
+//! fetches, under the derived name `blob_key` returns, which is what made
+//! attachments durable and readable at all.
 //!
 //! # Why the bytes travel as base64 inside JSON
 //!
@@ -59,10 +62,19 @@
 //! **No `PUT`.** There is no UPDATE grant either. A second deposit under a name
 //! this company has used is a 409, which is the whole of "first write wins".
 //!
-//! **No `deposited_by` and no audit row.** `routes::calendar`'s reason,
-//! unchanged: every writer here holds an operator API key, so the answer would
-//! be the same string on every row, and `AuditKind` is a closed vocabulary whose
-//! widening belongs in the change that gives somebody *else* a way to file.
+//! **No `deposited_by` and no audit row.** `routes::calendar`'s reason, and it
+//! has to be restated because the premise moved: it used to be "every writer
+//! holds an operator API key, so the column would be the same string on every
+//! row", and there are now two kinds of writer — this route, and the inbound
+//! loop. The conclusion survives because **the name already answers it**.
+//! Anything under `inbound/` was deposited by `ingest_email` and nothing else
+//! can write that prefix; anything else came through here. A column would be a
+//! second answer to a question the primary key already answers, which is the
+//! shape `0067` refuses for a uuid beside the name. The inbound half is
+//! attributable further than a column would reach anyway:
+//! `messages.attachments[].blob` joins the file to the message, which carries
+//! the sender, the thread and the time, and *that* row already has its audit
+//! trail. `AuditKind` stays closed.
 
 use agentos_app::files::{Files, FilesError, PgFiles};
 use agentos_store::db::{Db, StoreError};

@@ -49,9 +49,7 @@ use std::time::{Duration, Instant};
 
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
-use agentos_app::inbound::{
-    self, BlobStore, Errand, InMemoryBlobs, Recorded, Secret, Thread, record_raw_email_delivery,
-};
+use agentos_app::inbound::{self, Errand, Recorded, Secret, Thread, record_raw_email_delivery};
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::model_access::NoModel;
@@ -324,7 +322,13 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // connection, and the employees of that tenant then burned a whole day's
     // turn budget on a key that was not there.
     let secrets = agentos_app::mocks::secret_store();
-    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobs::new());
+    // No blob store is built here any more, and the deletion is the fix. This
+    // line used to construct a `HashMap` behind a trait whose only method was
+    // `put`: a customer's attachments were unreadable through the trait and
+    // gone on the next deploy — the same process-local defect the comment above
+    // records `0050_tenant_model_key` fixing for the model credential, in the
+    // same function, one variable apart. Attachments now go to `files`, which
+    // is a table.
     let engine = ProvisioningEngine::new(
         db.clone(),
         agentos_app::mocks::adapters_for(&config.master_key, &config.credentials, secrets.clone()),
@@ -405,7 +409,6 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             tokio::spawn(loops::inbound::run(
                 db.clone(),
                 ports.clone(),
-                blobs,
                 cancel.clone(),
             )),
         ),

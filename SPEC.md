@@ -146,12 +146,15 @@ Two schema features the outbox does without, deliberately:
 
 Delivery is **at-least-once**, knowingly. Handlers must be idempotent.
 
-- **S3-compatible object storage — NOT BUILT.** Attachment bytes go to
-  `InMemoryBlobs` (`crates/app/src/inbound.rs`) and do not survive a restart.
-  The whole durable state of this system is Postgres — which is also where the
+- **S3-compatible object storage — NOT BUILT, and not needed for durability.**
+  The whole durable state of this system is Postgres, which is also where the
   file store lives: `files` (`0067`) keeps deposited bytes in a `bytea` column,
-  not in a bucket. `crates/app/src/files.rs` says why the two are different
-  ports rather than one.
+  not in a bucket. Attachment bytes used to go to an in-process `HashMap` behind
+  a write-only `BlobStore` trait; that trait is deleted and `ingest_email` now
+  deposits through `agentos_app::files::Files`, so there is **one** port for
+  "keep a company's bytes" rather than two. The day a customer wants their own
+  bucket it is a second adapter behind that port — `crates/app/src/files.rs` has
+  the path — not a second trait.
 - **OpenTelemetry — NOT BUILT.** No `opentelemetry` dependency anywhere, and no
   request handler extracts a `traceparent` header. The outbox has a *slot* for
   one — `NewEvent::traceparent`, written into the payload under
@@ -208,7 +211,7 @@ Every external capability is behind a trait. This is the real list — six in
 | `McpCaller` | `app/src/effects.rs` | `Fleet` (`app/src/mcp.rs`), `NotConfigured` |
 | `PaymentProvider` | `app/src/effects.rs` | `NotConfigured` only |
 | `AgentRuntime` | `app/src/a2a.rs` | test-only |
-| `BlobStore` | `app/src/inbound.rs` | `InMemoryBlobs` |
+| `Files` | `app/src/files.rs` | `PgFiles` |
 
 Names the older spec used that do **not** exist, and what replaced them:
 
