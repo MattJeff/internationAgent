@@ -578,8 +578,13 @@ pub enum McpError {
     /// [`crate::hosted::BridgeError`].
     ///
     /// The codes: `hosting_unavailable` (this deployment runs no bridge
-    /// runtime), `bridge_endpoint_refused` (the address it answered with is not
-    /// one we may dial), `bridge_endpoint_not_an_address` (it answered with a
+    /// runtime), `hosted_cap_reached` (this tenant is already holding
+    /// [`crate::hosted::Bridges::per_tenant`] bridges, so this one was never
+    /// asked for), `bridge_secret_not_transportable` (the stored credential
+    /// cannot be one environment variable — see
+    /// [`crate::hosted`]'s `transportable`), `bridge_endpoint_refused` (the
+    /// address it answered with is not one we may dial),
+    /// `bridge_endpoint_not_an_address` (it answered with a
     /// name), or whatever code the runtime itself returned. A row naming a
     /// connector this build does not host is not in here on purpose: it is not
     /// a hosted binding at all, so it is skipped by [`provisioned`] like any
@@ -1543,6 +1548,11 @@ impl Fleet {
     /// `hosting_unavailable` and their tenant has no tools on them, which is the
     /// same fail-closed shape as a server that is down. See [`crate::hosted`]
     /// for what has to be deployed to change that.
+    ///
+    /// **This is also where a tenant's hosted bindings are counted**, against
+    /// [`crate::hosted::Bridges::per_tenant`], because this is the only caller
+    /// of the only function that reaches a runtime. Past the cap a binding is a
+    /// recorded `hosted_cap_reached` failure and nothing is started.
     pub async fn bind(
         tx: &mut TenantTx<'_>,
         credentials: &Credentials,
@@ -1581,6 +1591,26 @@ impl Fleet {
 
         let mut servers = BTreeMap::new();
         let mut failures = BTreeMap::new();
+        // **How many containers this tenant has made us ask for on this pass.**
+        //
+        // Counted here rather than queried, because the rows are already in
+        // hand: `configured` is this tenant's whole configuration, so the count
+        // is exact and there is no window between reading it and acting on it —
+        // no advisory lock, no second statement, nothing to race. That is the
+        // reason the ceiling on *starts* lives at the bind even though the
+        // refusal a customer should read belongs at the write.
+        //
+        // Incremented **before** the await and not after it. A hosted row whose
+        // container fails to come up has still cost a start attempt, and it will
+        // cost another on the next refresh tick, forever: counting only the
+        // successes would bound how many bridges a tenant *has* while leaving
+        // unbounded how many a tenant can make us try to run, which is the same
+        // machine and the same bill.
+        //
+        // `BTreeMap` order means the survivors are the alphabetically first
+        // handles, every tick. Arbitrary, but stable — a cap that picked a
+        // different subset each pass would start and reap containers forever.
+        let mut bridges_started = 0usize;
         for (name, binding) in configured {
             let sealed = binding.sealed_token.as_deref();
             let bound = match &binding.how {
@@ -1605,7 +1635,17 @@ impl Fleet {
                     None => Err(McpError::Hosting {
                         code: "hosting_unavailable",
                     }),
+                    // **Past the cap, the runtime is never asked.** A refusal
+                    // that started a container and then apologised would be the
+                    // opposite of a cap. See `hosted::BRIDGES_PER_TENANT` for
+                    // the number and for whose question it is.
+                    Some(bridges) if bridges_started >= bridges.per_tenant() => {
+                        Err(McpError::Hosting {
+                            code: "hosted_cap_reached",
+                        })
+                    }
                     Some(bridges) => {
+                        bridges_started += 1;
                         credentials
                             .bind_hosted(
                                 tenant_id,
@@ -3318,6 +3358,7 @@ mod tests {
         let bridges = Bridges::new(
             Arc::clone(&runtime) as Arc<dyn crate::hosted::BridgeRuntime>,
             BridgeNetwork::parse("127.0.0.0/8").expect("a valid network"),
+            1,
         );
         let hosted = bind(Some(&bridges)).await;
         assert_eq!(
@@ -3358,6 +3399,7 @@ mod tests {
         let elsewhere = Bridges::new(
             Arc::new(FakeRuntime::answering(bridge.url())),
             BridgeNetwork::parse("10.42.0.0/16").expect("a valid network"),
+            1,
         );
         let refused = bind(Some(&elsewhere)).await;
         assert!(
@@ -3379,6 +3421,207 @@ mod tests {
             !failure.detail.contains("127.0.0.1"),
             "a refusal named our own infrastructure's address: {failure:?}"
         );
+    }
+
+    /// **A tenant gets the number of containers the cap says and not one more.**
+    ///
+    /// The subject is `hosted::BRIDGES_PER_TENANT`, and the thing under test is
+    /// arithmetic rather than a boolean, so the cap is swept over 0, 1 and 2
+    /// against a tenant holding two hosted bindings. One value would not have
+    /// been enough: at 0 the first comparison refuses and nothing below it ever
+    /// runs, so a cap that was secretly `count > limit` — off by one, admitting
+    /// one container per tenant on a deployment that said none — would pass a
+    /// zero-only test and fail every customer.
+    ///
+    /// **What is asserted is `seen`, not `inventory`.** A binding that produced
+    /// no tools proves nothing about whether a container was started: the whole
+    /// hazard is a process running on our machine, and the only witness to that
+    /// is the runtime being asked. `FakeRuntime` records every `start`, so the
+    /// question "how many processes did this tenant cost us" has a literal
+    /// answer here.
+    ///
+    /// The two hosted rows differ only in their handle, which is the point:
+    /// `server` is a slug the tenant chooses, so "how many can they have" is
+    /// "how many names can they think of" until something counts. The third row
+    /// is dialled and sorts before both, so this tenant is the shape a real one
+    /// has rather than the shape that makes the arithmetic easy — see the
+    /// comment on it.
+    #[tokio::test]
+    async fn a_tenant_gets_the_number_of_bridges_the_cap_allows() {
+        use crate::hosted::{BridgeNetwork, Bridges, tests::FakeRuntime};
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; mcp binding tests need a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let bridge = crate::mocks::FakeMcpServer::start(&["lookup"]).await;
+        let tenant = TenantId::new_v7(Utc::now());
+        let label = format!("mcp-cap-{}", tenant.as_uuid().simple());
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([9u8; 32])));
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        // Two hosted rows, two handles, one connector. Sealed per handle,
+        // because the AAD names the handle — a shortcut that sealed once and
+        // wrote the blob twice would fail to open on the second row and the
+        // test would go green on `Credential` failures instead of on the cap.
+        for handle in ["alpha", "bravo"] {
+            let server = Slug::parse(handle).expect("a slug");
+            let sealed = credentials
+                .seal(tenant, &server, Some(format!("sk-live-{handle}")))
+                .expect("seals")
+                .expect("a credential was given");
+            sqlx::query(
+                "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector, sealed_token) \
+                 VALUES ($1, $2, NULL, 'public', 'orizn-visa', $3)",
+            )
+            .bind(tenant.as_uuid())
+            .bind(handle)
+            .bind(&sealed)
+            .execute(&mut *tx)
+            .await
+            .expect("insert hosted binding");
+        }
+        // **And one dialled binding beside them, sorting first.**
+        //
+        // Because that is the shape a real tenant has, and because the two
+        // shapes disagree about what the counter counts. A cap written as "how
+        // many bindings have I bound" instead of "how many containers have I
+        // asked for" passes every assertion below on an all-hosted fixture and
+        // then, in production, spends this customer's whole quota on a server
+        // somebody else is running. `aaa` sorts before both hosted handles, so
+        // it is the first thing the loop sees and the counter's first chance to
+        // be wrong.
+        let dialled = Slug::parse("aaa").expect("a slug");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector) \
+             VALUES ($1, 'aaa', $2, 'private', 'custom')",
+        )
+        .bind(tenant.as_uuid())
+        .bind(bridge.url())
+        .execute(&mut *tx)
+        .await
+        .expect("insert dialled binding");
+        tx.commit().await.expect("commit configuration");
+
+        for (cap, expected_starts) in [(0usize, 0usize), (1, 1), (2, 2)] {
+            let runtime = Arc::new(FakeRuntime::answering(bridge.url()));
+            let bridges = Bridges::new(
+                Arc::clone(&runtime) as Arc<dyn crate::hosted::BridgeRuntime>,
+                BridgeNetwork::parse("127.0.0.0/8").expect("a valid network"),
+                cap,
+            );
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let fleet = Fleet::bind(
+                &mut tx,
+                &credentials,
+                Some(&bridges),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the configuration is readable");
+            tx.commit().await.expect("commit read");
+
+            let started = runtime.seen.lock().expect("not poisoned").len();
+            assert_eq!(
+                started, expected_starts,
+                "a cap of {cap} let this tenant ask for {started} containers"
+            );
+            // The dialled binding is bound at every cap, including zero. It
+            // costs nobody a process — it is an address we connect to on demand
+            // — so a cap on containers that touched it would be a cap on the
+            // wrong noun.
+            assert!(
+                fleet.is_bound(&dialled),
+                "a cap of {cap} took away a binding that starts nothing: {:?}",
+                fleet.failures()
+            );
+            // The refusals are recorded, not silent: a binding nobody may start
+            // has to be visible to the operator who configured it, exactly as
+            // `hosting_unavailable` is.
+            let refused: Vec<&Slug> = fleet
+                .failures()
+                .iter()
+                .filter(|(_, failure)| failure.code == "hosted_cap_reached")
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(
+                refused.len(),
+                2 - expected_starts,
+                "a cap of {cap} produced {:?}",
+                fleet.failures()
+            );
+            // Alphabetical, and the same alphabetical every pass. A cap that
+            // picked a different subset each tick would reap and restart
+            // containers forever, which is the failure mode a stable order buys
+            // off. At cap 1 the survivor is `alpha`, so the refusal is `bravo`.
+            if cap == 1 {
+                assert_eq!(
+                    refused,
+                    vec![&Slug::parse("bravo").expect("a slug")],
+                    "the cap admitted an unstable subset"
+                );
+            }
+        }
+
+        // **A start that failed still spent the tenant's slot**, and this is the
+        // half a runtime that always answers cannot show. Every assertion above
+        // holds identically whether the counter is incremented before the call
+        // or after a successful one, because the fake always succeeds — so
+        // without this block the sentence "it bounds starts asked for, not
+        // starts that succeeded" would be a comment no test reads.
+        //
+        // The failure mode it names is the expensive one: a tenant whose
+        // containers cannot come up is a tenant whose bindings *never* fill the
+        // quota, so a cap counting successes would let them ask the runtime to
+        // start every one of their rows, on every refresh tick, forever.
+        let failing = Arc::new(FakeRuntime::failing("bridge_image_missing"));
+        let bridges = Bridges::new(
+            Arc::clone(&failing) as Arc<dyn crate::hosted::BridgeRuntime>,
+            BridgeNetwork::parse("127.0.0.0/8").expect("a valid network"),
+            1,
+        );
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let fleet = Fleet::bind(
+            &mut tx,
+            &credentials,
+            Some(&bridges),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the configuration is readable");
+        tx.commit().await.expect("commit read");
+        assert_eq!(
+            failing.seen.lock().expect("not poisoned").len(),
+            1,
+            "a container that failed to start was not counted, so this tenant \
+             asked for one per row per tick"
+        );
+        // And the two rows fail for the two different reasons, in order: the
+        // first spent the slot and the runtime said no, the second never got
+        // one. A single code for both would hide which of the two happened.
+        assert_eq!(
+            fleet
+                .failures()
+                .iter()
+                .map(|(name, failure)| (name.as_str(), failure.code))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", "bridge_image_missing"),
+                ("bravo", "hosted_cap_reached")
+            ],
+            "{:?}",
+            fleet.failures()
+        );
+        assert!(fleet.is_bound(&dialled), "{:?}", fleet.failures());
     }
 
     /// **The pin outranks the gate.** A tool whose digest no longer matches is
