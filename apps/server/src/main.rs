@@ -577,6 +577,13 @@ fn app(
             // answer — *when*. Before it, nothing in this product could name an
             // hour.
             .merge(routes::calendar::router(db.clone()))
+            // The fourth of that set, and the one the other three were
+            // workarounds for: *say something*. `work` and `calendar` put a
+            // sentence in front of an employee and neither can be replied to;
+            // `approvals` below is a button. This is a thread — the same
+            // `messages` rows an employee already writes to a colleague, with a
+            // person at one end.
+            .merge(routes::desk::router(db.clone()))
             .merge(routes::approvals::router(db.clone(), gate.clone()))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A

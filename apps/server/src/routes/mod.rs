@@ -8,6 +8,10 @@ pub mod billing;
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
+// le fil: the person reads what landed on a seat's desk and writes back from it.
+// No table and no port — `0028`'s internal channel already is the thread; see
+// `agentos_app::inbound`'s desk section and `migrations/0065`.
+pub mod desk;
 pub mod employees; // U31
 // wave K: the founder picks a window and gets a quote — effort and money, never
 // a chance of success. Beside `usage` and `turns` in spirit: those two report
