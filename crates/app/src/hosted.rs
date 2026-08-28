@@ -196,7 +196,7 @@
 //!   keeps alive indefinitely — the lease is renewed exactly as fast as it
 //!   expires.
 //!
-//!   So the cap is here, on the value that reaches the runtime:
+//!   So a cap is here, on the value that reaches the runtime:
 //!   [`BRIDGES_PER_TENANT`] is the number, [`Bridges`] carries it, and
 //!   [`crate::mcp::Fleet::bind`] refuses a tenant's hosted bindings past it
 //!   **before** calling [`BridgeRuntime::start`]. It bounds starts *asked for*
@@ -205,11 +205,25 @@
 //!   many processes can one customer make us try to run" is the question worth
 //!   answering.
 //!
-//!   What it does not bound is the number of *rows*: all but the first
-//!   [`Bridges::per_tenant`] of a tenant's hosted bindings are recorded
-//!   failures that bind nothing, which is inert but is a customer told
-//!   "connected" about a binding that is not. Refusing the (cap+1)th **write**
-//!   is the other half and is deployment requirement 4 below.
+//!   **Read what it counts, though, because it is one pass and not one
+//!   deployment.** The counter is a local that starts at zero on every bind,
+//!   and the bindings it admits are the first `n` in slug order — a slug the
+//!   tenant chose. A bridge, meanwhile, is leased: it runs for the idle TTL
+//!   after the *last* pass that asked for it. So a tenant who adds a handle
+//!   sorting before the current winners starts a container and displaces one
+//!   without stopping it, and holds `n` × (TTL ÷ interval between passes) at
+//!   once — 3 × `n` on the refresh tick alone, more through the nudge every
+//!   mutation sends. [`BRIDGES_PER_TENANT`] carries that arithmetic. It is not
+//!   a hole this crate can close: the lease is the runtime's and a caller
+//!   cannot count what its earlier calls are still running.
+//!
+//!   What it does not bound is the number of *rows*, and that is where the real
+//!   ceiling has to come from. All but the first [`Bridges::per_tenant`] of a
+//!   tenant's hosted bindings are recorded failures that bind nothing, which is
+//!   inert but is a customer told "connected" about a binding that is not.
+//!   Refusing the (cap+1)th **write** is the other half, it is what makes the
+//!   *set* of handles finite instead of the *rate* bounded, and it is
+//!   deployment requirement 4 below.
 //! * **The child this deployment already has.** "This process spawns nothing"
 //!   is true of the MCP path and is *not* true of the binary:
 //!   `crates/providers/src/llm_cli.rs` runs `claude` as a child when
@@ -274,14 +288,38 @@
 //!    mTLS on the same private network — because the request carrying
 //!    [`BridgeSpec`] carries a tenant's credential.
 //! 4. **A refusal at the write, in the same change as the route that creates a
-//!    hosted row** — and note what this requirement no longer says. The
-//!    *process* cap is not deployment work and did not wait for the route: it
-//!    is [`BRIDGES_PER_TENANT`], it is carried by [`Bridges`], and
-//!    [`crate::mcp::Fleet::bind`] applies it before anything is started, so a
-//!    tenant-chosen slug cannot become an unbounded number of containers
-//!    whatever door writes the row. That door had to be second, because a cap
-//!    that ships after the branch it bounds leaves a window in which a customer
-//!    can start as many processes on our machine as they can think of names.
+//!    hosted row, and it is the requirement that carries the real number.**
+//!    [`BRIDGES_PER_TENANT`] did not wait for the route and is applied by
+//!    [`crate::mcp::Fleet::bind`] before anything is started, so a
+//!    tenant-chosen slug cannot become an unbounded number of containers *on
+//!    one pass*. One pass is all it bounds. The population a machine has to
+//!    survive is `BRIDGES_PER_TENANT` × (idle TTL ÷ interval between passes),
+//!    because a displaced binding stops being asked for and goes on running for
+//!    its lease — so the write is the door where the *set* of handles becomes
+//!    finite, and this requirement is what decides how big a deployment is.
+//!    Three consequences, none of them optional:
+//!
+//!    * **Size the row cap at the container cap, not at a comfortable number.**
+//!      Every hosted row a tenant holds is a container that will be alive as
+//!      soon as it sorts into the admitted window. A row cap of twenty with
+//!      `BRIDGES_PER_TENANT` at two is a machine sized for two and reachable at
+//!      twenty.
+//!    * **A delete must not refund the slot before the TTL has run.**
+//!      `DELETE /v1/mcp/servers/{server}` exists, so a cap that counts rows
+//!      *held* is a cap a tenant cycles: delete a hosted row, write a
+//!      lower-sorting one, and the container behind the deleted handle keeps
+//!      its lease while the new one starts. Either the count includes hosted
+//!      handles retired within the TTL, or the number above is fiction.
+//!    * **The runtime holds the ceiling that is actually about concurrency.**
+//!      The bullet above says how many bridges a tenant gets is not the
+//!      runtime's to decide, and that is right about *which* bridges: it cannot
+//!      tell a legitimate second binding from a hostile one. It is wrong as a
+//!      reason to leave it out of this list, because a per-tenant count is not
+//!      a per-key judgement, [`BridgeSpec`] hands it the tenant, and it is the
+//!      only party that knows what is still running. A runtime that refuses to
+//!      hold more than `BRIDGES_PER_TENANT` live bridges for one tenant — by
+//!      reaping its own oldest, not by failing the start — is the backstop the
+//!      other two bullets are relying on being unnecessary.
 //!
 //!    What is still owed is the customer-facing half. `POST /v1/mcp/connect`
 //!    answers `503 hosting_unavailable` for a
@@ -557,7 +595,52 @@ fn host_bits_set(ip: IpAddr, bits: u8) -> bool {
         .any(|&byte| byte != 0)
 }
 
-/// How many bridges one tenant may have running at once.
+/// How many bridges one tenant may make us **ask for on one bind pass**.
+///
+/// # It is not "how many a tenant may have running at once", and the gap is the
+/// lease
+///
+/// That is what this constant used to say, and it was the wrong noun in a way
+/// that would have sized every other number in this file. The counter it feeds
+/// lives in [`crate::mcp::Fleet::bind`], it is a local that starts at zero on
+/// every pass, and what it admits is the first `n` **hosted** bindings in
+/// `BTreeMap<Slug, _>` order — that is, in byte order of a handle the *tenant*
+/// typed at `POST /v1/mcp/connect`. So the value bounded is starts per pass.
+/// The population is bounded by something else entirely: a bridge is not
+/// stopped, it is **leased**, and it lives for the runtime's idle TTL after the
+/// last pass that asked for it (see the module docs — the TTL is required to
+/// exceed `REFRESH`, and fifteen minutes is the floor argued for there).
+///
+/// Those two are related by how often a tenant's fleet is rebound, and the
+/// arithmetic is the whole finding:
+///
+/// > containers alive for one tenant ≤ `n` × (idle TTL ÷ interval between
+/// > passes)
+///
+/// A tenant reaches that bound by choosing handles, which costs nothing: add a
+/// hosted binding whose slug sorts before the current winners and it takes an
+/// admitted slot, while the binding it displaced simply stops being asked for
+/// — and *stops being asked for* is not *stops running*, it is the first tick
+/// of a TTL. Slugs are `[a-z0-9-]{2,32}`, so a descending sequence is
+/// inexhaustible in any sense that matters; `aab` beats `alpha` beats `bravo`,
+/// and there are 36^32 more where those came from.
+///
+/// At the tick alone — `REFRESH` is 300 s, the floor TTL is 900 s — that is
+/// **3 × `n`** containers for a tenant who adds one lower slug per five
+/// minutes. It is worse than that in this deployment, because the binder loop
+/// also wakes on a **nudge sent by every mutation** in `routes::mcp`: the
+/// interval between passes is one write plus one rebind, not five minutes, so
+/// the multiplier is the TTL divided by that. The 3× is the floor of the
+/// mechanism, not its ceiling.
+///
+/// **Nothing in this process can close that**, and the shape of the reason is
+/// worth stating rather than patching around: concurrency is a property of the
+/// lease, the lease is held by the runtime, and a process that only ever says
+/// "start this" cannot count what its previous sentences are still running.
+/// The two places that can are deployment requirement 4 (refuse the write, so
+/// the tenant never names the handles) and the runtime itself (which is the
+/// only party that knows what is alive). Both are in the requirement list
+/// below with this number attached.
 ///
 /// # The number is not this crate's to choose, and the placeholder is zero
 ///
@@ -583,12 +666,49 @@ fn host_bits_set(ip: IpAddr, bits: u8) -> bool {
 /// > deployment?**
 ///
 /// It is answered with an operator's arithmetic and not a programmer's:
-/// `(box memory ÷ resident size of one runner) ÷ tenants per box`, with margin,
-/// and then sanity-checked against what a customer plausibly connects — the
+/// `(box memory ÷ resident size of one runner) ÷ tenants per box`, with margin
+/// — **and then divided by the multiplier above**, because that arithmetic
+/// computes containers the box can hold and this constant buys `n` × TTL ÷
+/// pass-interval of them. An operator who writes the first number here has
+/// sized the machine for one pass and bought several passes' worth. It is then
+/// sanity-checked against what a customer plausibly connects — the
 /// catalogue has one hosted entry, so "more than a handful" is a number nobody
 /// has a use for yet. Raising it is a one-line deploy, which is the same price
 /// this module already charges for adding a [`Package`], and for the same
 /// reason: it is a decision somebody should have to make on purpose.
+///
+/// # Why no test pins this to zero
+///
+/// The proposal was `assert_eq!(BRIDGES_PER_TENANT, 0)`, so that turning
+/// hosting on costs a deleted test rather than an ignored comment. The premise
+/// is right — this is a safety switch and not a setting, and a switch that
+/// moves without breaking anything eventually moves. The test still does not
+/// earn its line, for a reason specific to this constant rather than the usual
+/// grumble about pinning a value to itself:
+///
+/// **It has no caller.** A pin would assert about a number nothing reads, so it
+/// cannot fail on the way hosting actually gets turned on by accident — a
+/// wiring change that writes `Bridges::new(runtime, network, 5)` with a literal
+/// passes it, hosts five containers per tenant, and the pin is still green.
+/// What holds hosting off today is three other things: `bridges` is `None` at
+/// the single production call site, no [`BridgeRuntime`] is implemented in this
+/// workspace, and `POST /v1/mcp/connect` answers 503 for a hosted connector.
+/// A test on this constant would read as the switch and be none of them.
+///
+/// **And the behaviour it wants is already covered.**
+/// `mcp::tests::the_cap_admits_a_number_of_starts_per_pass_and_not_a_number_of_containers`
+/// sweeps the cap over 0, 1 and 2 and asserts that at zero the runtime is asked
+/// for nothing and both bindings are recorded refusals. That is the assertion
+/// that fails when the *branch* stops failing closed, which is the failure that
+/// can happen by accident. A pin fails only when somebody edits this line on
+/// purpose — and somebody editing this line on purpose deletes the assert in
+/// the same keystroke, having read neither.
+///
+/// **What would earn it** is the day [`Bridges::new`] has a production call
+/// site: a test that drives *that* wiring and asserts no bridge starts. It
+/// fails on a hand-typed number as well as on an edited constant, which is the
+/// half a pin cannot see. Until then the honest guard is the sentence above it,
+/// and the sentence is doing the work.
 pub const BRIDGES_PER_TENANT: usize = 0;
 
 /// A runtime, the network its answers must land in, and how many of its bridges
@@ -648,10 +768,19 @@ impl Bridges {
         }
     }
 
-    /// How many bridges this deployment will start for one tenant.
+    /// How many bridges this deployment will start for one tenant **on one
+    /// bind pass**. See [`BRIDGES_PER_TENANT`] for why that is not the same
+    /// number as how many it will be holding.
     ///
-    /// Read by [`crate::mcp::Fleet::bind`], which is the only thing that calls
-    /// [`Self::endpoint`] and therefore the only place the count can be kept.
+    /// Read by [`crate::mcp::Fleet::bind`], and the reason the count is kept
+    /// there is not that it reaches the runtime — it does not. The chain is
+    /// `Fleet::bind` → [`crate::mcp::Credentials::bind_hosted`] →
+    /// [`Self::endpoint`] → [`BridgeRuntime::start`], and the middle link is
+    /// the only caller of `endpoint`. What `bind_hosted` cannot do is count:
+    /// it is handed one binding and knows nothing of the tenant's others.
+    /// `Fleet::bind` is the one frame in that chain that holds a tenant's whole
+    /// configuration at once, which is what makes it the only place upstream of
+    /// the runtime where a per-tenant number means anything.
     pub(crate) const fn per_tenant(&self) -> usize {
         self.per_tenant
     }
@@ -681,8 +810,17 @@ impl Bridges {
     }
 }
 
-/// Whether this secret can be *one* environment variable's value, whatever the
-/// runtime encodes it into.
+/// Whether this secret is free of the three bytes a line-oriented encoding
+/// splits on.
+///
+/// **Not "whatever the runtime encodes it into".** That is a stronger sentence
+/// than three bytes can carry and it is held somewhere else: deployment
+/// requirement 1 is what requires the environment to be built as a list of
+/// pairs rather than interpolated into text, and an encoding this function has
+/// not heard of — one that splits on `;`, one that reads `%` — walks straight
+/// past it. What is checked here is what is checkable from here, and the
+/// guarantee that covers the rest lives in the requirement, not in this
+/// signature.
 ///
 /// # The gap this closes, which is the one gap the module's own table has
 ///

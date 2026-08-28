@@ -1550,9 +1550,15 @@ impl Fleet {
     /// for what has to be deployed to change that.
     ///
     /// **This is also where a tenant's hosted bindings are counted**, against
-    /// [`crate::hosted::Bridges::per_tenant`], because this is the only caller
-    /// of the only function that reaches a runtime. Past the cap a binding is a
+    /// [`crate::hosted::Bridges::per_tenant`], because this is the only frame
+    /// that holds a tenant's whole configuration at once — the function that
+    /// actually reaches a runtime is [`Credentials::bind_hosted`], one binding
+    /// at a time, with nothing to count against. Past the cap a binding is a
     /// recorded `hosted_cap_reached` failure and nothing is started.
+    ///
+    /// The count is **per pass**, and one pass is not one deployment: see
+    /// [`crate::hosted::BRIDGES_PER_TENANT`] for why a leased container outlives
+    /// the pass that asked for it, and what that costs.
     pub async fn bind(
         tx: &mut TenantTx<'_>,
         credentials: &Credentials,
@@ -1593,12 +1599,21 @@ impl Fleet {
         let mut failures = BTreeMap::new();
         // **How many containers this tenant has made us ask for on this pass.**
         //
+        // That sentence is the whole of what this counts, and it is narrower
+        // than a reader wants it to be. It is a local: it starts at zero on
+        // every call, so it bounds a *rate* — `per_tenant` starts per pass —
+        // and not a population. A bridge is not stopped when we stop asking for
+        // it, it is leased, and it runs on for the runtime's idle TTL. So the
+        // containers alive for one tenant are `per_tenant` × (TTL ÷ interval
+        // between passes), which the tick alone makes 3× and the nudge in
+        // `routes::mcp` makes worse. `hosted::BRIDGES_PER_TENANT` carries the
+        // arithmetic and deployment requirement 4 carries the fix; nothing in
+        // this frame can do better, because the lease is somebody else's.
+        //
         // Counted here rather than queried, because the rows are already in
         // hand: `configured` is this tenant's whole configuration, so the count
-        // is exact and there is no window between reading it and acting on it —
-        // no advisory lock, no second statement, nothing to race. That is the
-        // reason the ceiling on *starts* lives at the bind even though the
-        // refusal a customer should read belongs at the write.
+        // is exact for the pass and there is no window between reading it and
+        // acting on it — no advisory lock, no second statement, nothing to race.
         //
         // Incremented **before** the await and not after it. A hosted row whose
         // container fails to come up has still cost a start attempt, and it will
@@ -1607,9 +1622,19 @@ impl Fleet {
         // unbounded how many a tenant can make us try to run, which is the same
         // machine and the same bill.
         //
-        // `BTreeMap` order means the survivors are the alphabetically first
-        // handles, every tick. Arbitrary, but stable — a cap that picked a
-        // different subset each pass would start and reap containers forever.
+        // **`BTreeMap` order means the admitted set is the alphabetically first
+        // handles, and the alphabet is the tenant's.** Stable across passes for
+        // a fixed configuration, which is what stops a cap from reaping and
+        // restarting containers forever — but `server` is a slug the customer
+        // types, so adding one that sorts lower is how they choose which of
+        // their bindings holds a container, and the one it displaced keeps
+        // running until its lease ends. Ordering by anything the tenant does not
+        // control — age, say — would blunt that and not close it, since a delete
+        // frees a slot either way; it is not worth a column until requirement 4
+        // exists to be measured against.
+        //
+        // ponytail: no ordering change, no reconciliation. The write refusal is
+        // the fix and it is one door away.
         let mut bridges_started = 0usize;
         for (name, binding) in configured {
             let sealed = binding.sealed_token.as_deref();
@@ -3423,7 +3448,15 @@ mod tests {
         );
     }
 
-    /// **A tenant gets the number of containers the cap says and not one more.**
+    /// **A tenant gets the number of container *starts* the cap says, per pass,
+    /// and more containers than that.**
+    ///
+    /// The name used to be "gets the number of bridges the cap allows", which is
+    /// what the cap looked like until the last block of this test was written.
+    /// It counts starts admitted on one bind; a container outlives the bind that
+    /// asked for it by the runtime's idle TTL. The first three blocks below
+    /// prove the per-pass arithmetic and the fourth proves it is per-pass — see
+    /// `hosted::BRIDGES_PER_TENANT` for what that costs and where it is fixed.
     ///
     /// The subject is `hosted::BRIDGES_PER_TENANT`, and the thing under test is
     /// arithmetic rather than a boolean, so the cap is swept over 0, 1 and 2
@@ -3447,7 +3480,7 @@ mod tests {
     /// has rather than the shape that makes the arithmetic easy — see the
     /// comment on it.
     #[tokio::test]
-    async fn a_tenant_gets_the_number_of_bridges_the_cap_allows() {
+    async fn the_cap_admits_a_number_of_starts_per_pass_and_not_a_number_of_containers() {
         use crate::hosted::{BridgeNetwork, Bridges, tests::FakeRuntime};
 
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -3622,6 +3655,112 @@ mod tests {
             fleet.failures()
         );
         assert!(fleet.is_bound(&dialled), "{:?}", fleet.failures());
+
+        // **Two passes at a cap of two ask for three different containers.**
+        //
+        // Every assertion above holds and the cap is never once exceeded — this
+        // is the branch they are all blind to, because each of them looks at one
+        // pass and a container does not live in a pass. `bridges_started` is a
+        // local that resets; a bridge is *leased*, and runs until its idle TTL
+        // expires after the last pass that asked for it. So "asked for on this
+        // pass" and "running on this machine" are different sets, and the second
+        // is the union of the first over a TTL's worth of passes.
+        //
+        // One INSERT is what moves it, and its only special property is a handle
+        // that sorts low: `aab` < `alpha` < `bravo`. The admitted set is the
+        // first two hosted handles in that order, so the second pass starts
+        // `aab` and stops *asking for* `bravo` — which is not stopping `bravo`.
+        // Nothing in this process can. Slugs are `[a-z0-9-]{2,32}` and the
+        // customer types them, so the sequence does not run out.
+        //
+        // One runtime across both passes, because a runtime is a deployment and
+        // not a call: `seen` accumulating is the only shape in which "how many
+        // containers exist" is a question this test can ask at all.
+        let runtime = Arc::new(FakeRuntime::answering(bridge.url()));
+        let bridges = Bridges::new(
+            Arc::clone(&runtime) as Arc<dyn crate::hosted::BridgeRuntime>,
+            BridgeNetwork::parse("127.0.0.0/8").expect("a valid network"),
+            2,
+        );
+        let asked = |runtime: &FakeRuntime| -> Vec<String> {
+            runtime
+                .seen
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .map(|(_, server, _, _)| server.clone())
+                .collect()
+        };
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        Fleet::bind(
+            &mut tx,
+            &credentials,
+            Some(&bridges),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the configuration is readable");
+        tx.commit().await.expect("commit read");
+        assert_eq!(asked(&runtime), vec!["alpha", "bravo"], "the first pass");
+
+        // The whole exploit: one row, one low handle, no privilege.
+        let displacer = Slug::parse("aab").expect("a slug");
+        let sealed = credentials
+            .seal(tenant, &displacer, Some("sk-live-aab".to_owned()))
+            .expect("seals")
+            .expect("a credential was given");
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector, sealed_token) \
+             VALUES ($1, 'aab', NULL, 'public', 'orizn-visa', $2)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(&sealed)
+        .execute(&mut *tx)
+        .await
+        .expect("insert the lower-sorting hosted binding");
+        tx.commit().await.expect("commit the new row");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let second = Fleet::bind(
+            &mut tx,
+            &credentials,
+            Some(&bridges),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the configuration is readable");
+        tx.commit().await.expect("commit read");
+
+        // The second pass is within its cap, honestly: two starts asked for.
+        let all = asked(&runtime);
+        assert_eq!(
+            all.len() - 2,
+            2,
+            "the second pass exceeded the cap: {all:?}"
+        );
+        // And `bravo` was *refused*, not stopped — the only verb this process
+        // has. Its container is the runtime's until the lease runs out.
+        assert_eq!(
+            second
+                .failures()
+                .get(&Slug::parse("bravo").expect("a slug"))
+                .map(|failure| failure.code),
+            Some("hosted_cap_reached"),
+            "{:?}",
+            second.failures()
+        );
+        // The finding: three distinct containers under a cap of two.
+        let distinct: std::collections::BTreeSet<&String> = all.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "a cap of 2 was asked for {} distinct containers across two passes; \
+             if this is 2, the admitted set stopped being the tenant's to choose \
+             and `hosted::BRIDGES_PER_TENANT` should stop saying it is: {all:?}",
+            distinct.len()
+        );
     }
 
     /// **The pin outranks the gate.** A tool whose digest no longer matches is
