@@ -79,7 +79,13 @@
 //! 2. **It is inside a range the operator wrote down.** [`BridgeNetwork`] is
 //!    deployment configuration — the subnet the runtime puts bridges on. It
 //!    intersects with `placement`, it never widens it, and an unset value is an
-//!    empty set, which refuses every endpoint and turns hosting off.
+//!    empty set, which refuses every endpoint and turns hosting off. Read what
+//!    it actually says, though: not "this is a bridge" but "this address is in
+//!    the range you named", so the strength of the whole point is the strength
+//!    of the range. A subnet that also holds a cache or an admin surface admits
+//!    those too. That is deployment requirement 2 below, and it is a
+//!    requirement rather than a check because nothing in this process can see
+//!    what else lives on an operator's network.
 //! 3. **It is an address, not a hostname.** A name is resolved twice — once
 //!    when it is checked and once when it is dialled — and DNS is free to
 //!    answer differently the second time. `crate::mcp`'s own docs flag that
@@ -130,11 +136,34 @@
 //! no owner. So the contract is a **lease**: [`BridgeRuntime::start`] is
 //! idempotent per (tenant, server, package), the binder loop in
 //! `apps/server/src/routes/mcp.rs` calls it on every refresh tick, and a
-//! runtime reaps a bridge nobody has
-//! asked for in `IDLE_TTL`. Deleting a binding then stops the asking, and the
+//! runtime reaps a bridge nobody has asked for since its idle TTL expired.
+//! Deleting a binding then stops the asking, and the
 //! bridge goes away on its own, whether or not this process was there to see
 //! it. One method, no reconciliation loop, and the failure mode of our crashing
 //! is a container that expires rather than one that leaks.
+//!
+//! **The lease has a renewal period and it is a number in another crate.** That
+//! sentence used to name an `IDLE_TTL` that exists nowhere in this workspace,
+//! which made the whole argument above rest on a free variable. The renewal is
+//! `REFRESH` in `apps/server/src/routes/mcp.rs` — **300 seconds** — because that
+//! is the only thing that calls `start` on a schedule, and the requirement is an
+//! inequality:
+//!
+//! > A runtime's idle TTL must be **strictly greater than `REFRESH`, with margin
+//! > for missed ticks.** Fifteen minutes is the smallest defensible value: it
+//! > survives two consecutive ticks lost to a slow bind, a restart or a
+//! > rescheduled replica.
+//!
+//! Both directions of getting it wrong are real and neither is loud. A TTL
+//! **below** 300 s reaps every bridge between ticks, so hosting flaps: each
+//! refresh is a cold container start, the tenant's tools appear and disappear,
+//! and the symptom at the top is an intermittent `hosting_unavailable` that
+//! reproduces nowhere. A TTL far **above** it is the leak this design accepted
+//! on purpose — a deleted binding's container holds that tenant's credential
+//! until the TTL runs out — so the margin buys reliability and is paid for in
+//! how long a revoked credential stays resident. Fifteen minutes is where those
+//! two meet; a deployment that shortens `REFRESH` must shorten the TTL with it,
+//! and the two numbers only make sense read together.
 //!
 //! # What this does NOT cover, said plainly
 //!
@@ -153,8 +182,23 @@
 //!   operator infrastructure with an operator's blast radius, and [`accept`]
 //!   re-checks its answer for exactly that reason — a runtime that is wrong
 //!   about an address still cannot point us at one.
-//! * **Resource exhaustion.** CPU, memory and process limits are the runtime's;
-//!   nothing here can bound them.
+//! * **What one bridge consumes.** CPU, memory and process limits are the
+//!   runtime's; nothing here can bound them.
+//! * **How many bridges a tenant gets, which is NOT the runtime's** and is the
+//!   correction to the sentence that used to stand here. The runtime is
+//!   *required* to start a second container for a second `(tenant, server)` —
+//!   that is the isolation unit and refusing would break a legitimate second
+//!   binding — so it has no basis on which to say no. The count is decided
+//!   upstream, by how many rows a tenant has in `mcp_servers` on a hosted
+//!   connector, and `server` is a slug the tenant chooses: **`0013_mcp.sql`
+//!   caps nothing and no route counts.** For a dialled binding that is
+//!   harmless, because a row is an address we connect to on demand. For a
+//!   hosted one, every row is a container that the binder loop's refresh tick
+//!   keeps alive indefinitely — the lease is renewed exactly as fast as it
+//!   expires. Nothing today can create such a row (see the deployment section),
+//!   which is the only reason this is a note and not a hole; a per-tenant cap
+//!   on hosted bindings has to ship in the same change as the route that
+//!   creates them, and is listed there.
 //! * **The child this deployment already has.** "This process spawns nothing"
 //!   is true of the MCP path and is *not* true of the binary:
 //!   `crates/providers/src/llm_cli.rs` runs `claude` as a child when
@@ -170,10 +214,17 @@
 //! # What has to be deployed before any of this runs
 //!
 //! Nothing in this module starts anything, and no implementation of
-//! [`BridgeRuntime`] ships in this workspace. Until one does, a hosted binding
-//! fails to bind with `hosting_unavailable` and its tenant simply has no tools
-//! on it — the same fail-closed path as a server that is down. What a
-//! deployment has to add:
+//! [`BridgeRuntime`] ships in this workspace. **Nor is there any wiring that
+//! could hand one in**, and that is worth saying separately because the two
+//! read alike and are not: `Fleet::bind`'s `bridges` argument is the literal
+//! `None` at `apps/server/src/routes/mcp.rs`, which is its one production call
+//! site; [`Bridges`] is constructed nowhere outside tests; and no environment
+//! variable in this workspace feeds [`BridgeNetwork::parse`]. So [`accept`],
+//! [`BridgeNetwork`] and [`Bridges`] are today reached only from tests —
+//! everything they refuse, they refuse in a test. Until a runtime *and* its
+//! wiring land, a hosted binding fails to bind with `hosting_unavailable` and
+//! its tenant simply has no tools on it — the same fail-closed path as a server
+//! that is down. What a deployment has to add:
 //!
 //! 1. **A bridge runtime**, reachable from this process, that starts a
 //!    container per (tenant, server) from a pinned runner image, wraps the
@@ -181,13 +232,39 @@
 //!    one, and is what `tests/orizn.rs` already runs), and answers with the
 //!    address it assigned. Its container contract: read-only root, no bind
 //!    mounts, an environment containing only [`BridgeSpec`]'s variables, a
-//!    network with no route to Postgres or to this server's admin surface, and
-//!    an idle TTL.
-//! 2. **`BridgeNetwork`**, as the subnet that runtime allocates from. Unset
-//!    means hosting is off.
+//!    network with no route to Postgres or to this server's admin surface, an
+//!    idle TTL satisfying the inequality above — and **a log stream that is
+//!    dropped rather than shipped**. That last row is the one a container
+//!    contract usually forgets: the package's own stdout and stderr are
+//!    somebody else's code writing whatever it likes, a stdio MCP server prints
+//!    diagnostics there by convention, and a package that echoes its
+//!    environment on startup puts a *tenant's* credential into the operator's
+//!    log aggregator — where it is durable, indexed, and outside every
+//!    mechanism the table above names. "Do not persist the secret" was written
+//!    for the runtime's own manifests and does not reach the child's file
+//!    descriptors.
+//! 2. **`BridgeNetwork`**, as the subnet that runtime allocates from, and the
+//!    requirement is sharper than "where bridges live": **it must contain
+//!    nothing but bridges.** [`accept`]'s guarantee is only ever as good as
+//!    that, because what it authorises is not "this is a bridge" but "this
+//!    address is inside the range you wrote down" — so a bridge subnet carved
+//!    out of a shared VPC range, which is the ordinary way to deploy, hands a
+//!    compromised runtime every neighbour in it: a cache, a broker, an internal
+//!    admin surface. `placement` narrows that to private space and no further.
+//!    A dedicated range is the mechanism; unset means hosting is off.
 //! 3. **A transport to it that is not the public internet** — a unix socket or
 //!    mTLS on the same private network — because the request carrying
 //!    [`BridgeSpec`] carries a tenant's credential.
+//! 4. **A per-tenant cap on hosted bindings, in the same change as the route
+//!    that creates them.** `POST /v1/mcp/connect` answers `503
+//!    hosting_unavailable` for a [`crate::catalog::Provision::Host`] connector
+//!    today, so no tenant can create a hosted row at all — which is what makes
+//!    the uncapped count above a note rather than a hole. Opening that branch
+//!    without a cap turns a tenant-chosen slug into a container: `mcp_servers`
+//!    is keyed `(tenant_id, server)`, nothing counts the rows, and the refresh
+//!    tick renews every lease as fast as it expires. The cap belongs on the
+//!    write, not on the bind — a refusal at bind time is a container already
+//!    started.
 
 use std::net::IpAddr;
 
@@ -338,6 +415,12 @@ impl BridgeNetwork {
     /// Parse `10.42.0.0/16,fd00:bridge::/64` — comma separated, whitespace
     /// tolerated, empty entries skipped.
     ///
+    /// **Each entry must be the network address of its own prefix.**
+    /// `10.42.0.7/16` is an error, not sixty-five thousand addresses, and the
+    /// argument is at the check: the only way a typo here can hurt is by
+    /// naming more than it spells, so the one reading that is never taken is
+    /// the generous one.
+    ///
     /// ponytail: hand-rolled prefix matching rather than the `ipnet` crate. Two
     /// comparisons over the octets of an address is less code than the
     /// dependency's own feature flags, and this is the only place in the
@@ -353,6 +436,19 @@ impl BridgeNetwork {
             let width = if addr.is_ipv4() { 32 } else { 128 };
             if bits > width {
                 return Err("prefix longer than the address family allows");
+            }
+            // **`10.42.0.7/16` is refused, not silently read as `10.42.0.0/16`.**
+            //
+            // Masking it would be the convenient reading and it is the one that
+            // widens: the operator who typed that address meant one host, and
+            // the value that would take effect covers sixty-five thousand of
+            // them — every one of which `accept` would then agree to dial. It is
+            // the same class of mistake as `/33` and gets the same treatment
+            // this type already argues for: a typo in a network is a boot-time
+            // error, because "empty means refuse" cannot save a list that
+            // parsed into something bigger than what was written.
+            if host_bits_set(addr, bits) {
+                return Err("prefix has bits set below its length; write the network address");
             }
             nets.push((addr, bits));
         }
@@ -375,12 +471,6 @@ impl BridgeNetwork {
 /// every IPv4-in-IPv6 spelling through `placement`, and a bridge network is
 /// written in whichever family the operator's subnet actually is.
 fn prefix_eq(a: IpAddr, b: IpAddr, bits: u8) -> bool {
-    fn octets(ip: IpAddr) -> Vec<u8> {
-        match ip {
-            IpAddr::V4(v4) => v4.octets().to_vec(),
-            IpAddr::V6(v6) => v6.octets().to_vec(),
-        }
-    }
     let (a, b) = (octets(a), octets(b));
     if a.len() != b.len() {
         return false;
@@ -397,6 +487,39 @@ fn prefix_eq(a: IpAddr, b: IpAddr, bits: u8) -> bool {
     // and `rest` is 1..=7 here so the shift cannot be 8.
     let mask = 0xffu8 << (8 - rest);
     a[whole] & mask == b[whole] & mask
+}
+
+/// The octets of an address, four or sixteen of them.
+///
+/// One function for both families, so every bit-level rule in this module reads
+/// the same address the same way — the alternative is two spellings of the same
+/// arithmetic that agree until one of them is edited.
+fn octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    }
+}
+
+/// Whether any bit at or below position `bits` is set — i.e. whether this
+/// address is something other than the network address of its own prefix.
+///
+/// `bits` is `<= width` by the time this is called, so `whole` is in range when
+/// `rest` is non-zero and is exactly `octets.len()` when `rest` is zero and the
+/// prefix is the whole address, where the tail slice is empty and the answer is
+/// `false`.
+fn host_bits_set(ip: IpAddr, bits: u8) -> bool {
+    let octets = octets(ip);
+    let whole = usize::from(bits / 8);
+    let rest = bits % 8;
+    // The low `8 - rest` bits of the straddled octet, when there is one...
+    if rest != 0 && octets[whole] & (0xffu8 >> rest) != 0 {
+        return true;
+    }
+    // ...and every octet after it, which is all of them when `rest` is zero.
+    octets[whole + usize::from(rest != 0)..]
+        .iter()
+        .any(|&byte| byte != 0)
 }
 
 /// A runtime, and the network its answers must land in.
@@ -659,6 +782,45 @@ pub(crate) mod tests {
         for raw in ["10.42.0.0", "10.42.0.0/33", "not-an-ip/8", "10.42.0.0/x"] {
             assert!(BridgeNetwork::parse(raw).is_err(), "{raw:?} parsed");
         }
+        // **A prefix with host bits set is refused rather than masked**, and
+        // this is the half that is about widening rather than about typos: each
+        // of these, read as its network address, covers strictly more than what
+        // was written, and `accept` would agree to dial every extra address.
+        // The first two are the realistic mistake — a host address with the
+        // subnet's prefix length on it, which is how an operator writes down
+        // what `ip addr` printed.
+        for raw in [
+            "10.42.0.7/16",
+            "10.42.128.9/17",
+            // The one whose only set host bit is *inside* the straddled octet:
+            // `192 & 0x7f` is `0x40`, and every octet after it is zero. Nothing
+            // but the partial-octet half of `host_bits_set` catches this, which
+            // is why it is written down separately from its neighbours.
+            "10.42.192.0/17",
+            "fd00:b::5/48",
+            "10.0.0.1/0",
+            "fd00::1/8",
+        ] {
+            assert!(
+                BridgeNetwork::parse(raw).is_err(),
+                "{raw:?} parsed, and it names more addresses than it spells"
+            );
+        }
+        // The network address of each of those is accepted, so the refusals
+        // above are about the host bits and not about the prefix length.
+        for raw in [
+            "10.42.0.0/16",
+            "10.42.128.0/17",
+            "fd00:b::/48",
+            "0.0.0.0/0",
+            "fd00::/8",
+        ] {
+            assert!(BridgeNetwork::parse(raw).is_ok(), "{raw:?} did not parse");
+        }
+        // A full-width prefix is the whole address and has no host bits, in
+        // either family — the boundary `host_bits_set` indexes closest to.
+        assert!(BridgeNetwork::parse("10.42.0.7/32").is_ok());
+        assert!(BridgeNetwork::parse("fd00:b::5/128").is_ok());
         // Whitespace and empty entries are tolerated, because a comma-separated
         // environment variable is typed by a human.
         assert_eq!(
