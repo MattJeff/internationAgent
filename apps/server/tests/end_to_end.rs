@@ -79,7 +79,19 @@ const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 /// re-run without reading, and the day it means something nobody believes it.
 /// Since this bound is never reached when the loop is healthy, making it
 /// generous costs a green run nothing and costs a wedged one only patience.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(120);
+///
+/// **And the first half of that sentence was falsified on 2026-08-29, which is
+/// why the number moved.** The loop was healthy — the same test converged in
+/// **3.8 seconds** run on its own, immediately afterwards — and it still ran out
+/// of 120 seconds with `mcp` in `provisioning`, on a machine carrying parallel
+/// agent builds. So the bound is a function of how much CPU the loop is getting,
+/// not of whether it is stuck, and a CI runner is a loaded machine too.
+///
+/// 300 rather than a bigger round number because it is the one this workspace
+/// already uses for the same kind of judgement (`MAX_OUTBOX_LAG_SECS`), and
+/// because the argument above still holds where it is true: a wedged loop fails
+/// either way, just later.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Harness
