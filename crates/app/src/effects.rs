@@ -60,6 +60,7 @@ use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::invoices;
+use agentos_store::org;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
@@ -2360,9 +2361,33 @@ impl Effects {
         // keep holding the day's headroom.
         if let Some(reservation) = ok.reservation() {
             let settled = if outcome.is_ok() {
+                // No team arm, and it is not a symmetry that got missed:
+                // settling is bookkeeping and deliberately leaves *both*
+                // buckets charged — money that moved stays spent against the
+                // employee's day and against the team's. `spend::settle` flips
+                // the reservation row and touches no bucket at all.
                 spend::settle(&mut tx, reservation).await
             } else {
-                spend::release(&mut tx, reservation).await
+                // `org::release` and not `spend::release`, because the gate
+                // reserved through `org::reserve` and that charged **two**
+                // buckets: the employee's `spend_buckets` row and the team's
+                // `team_spend_buckets` row. `Authorized::reservation`'s
+                // contract has said `org::release` since it was written and
+                // this line said `spend::release`, so a payment the provider
+                // refused gave the seat its headroom back and left the charge
+                // on the team until midnight.
+                //
+                // That is the half that costs, because the team row is shared:
+                // one seat's provider outage refuses *every* seat on the team
+                // with `team_daily_limit`, for a day, with no money moved.
+                // `a_failed_payment_gives_the_team_its_headroom_back_too` is
+                // the test, and the one beside it could not see this because
+                // its fixture seats nobody on a team.
+                //
+                // `org::release` calls `spend::release` first, so the employee
+                // half is byte-for-byte what it was; an employee on no team is
+                // exactly the old behaviour.
+                org::release(&mut tx, reservation).await
             };
             settled.map_err(EffectError::Unavailable)?;
         }
@@ -2469,6 +2494,7 @@ mod tests {
     use agentos_providers::leads::MockLeadSink;
     use agentos_providers::telephony::MockTelephony;
     use agentos_providers::{FaultMode, ProviderBinding};
+    use agentos_store::org;
     use agentos_store::spend::SpendCaps;
     use url::Url;
     use uuid::Uuid;
@@ -3309,6 +3335,98 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1["outcome"], json!("error"));
         assert_eq!(rows[0].1["effect"], json!("payment_create"));
+    }
+
+    /// **The team's headroom comes back too**, which the test above cannot see
+    /// and never could.
+    ///
+    /// `seed` puts its employee on **no team**, so `org::reserve` takes the
+    /// employee's bucket and stops — the team half of the ledger is never
+    /// touched, and a release that forgets it looks exactly like one that does
+    /// not. Every seat the founder actually runs is on a team with a budget
+    /// (`routes::teams` is the surface for writing one), so the shape this
+    /// fixture had was not the shape production has.
+    ///
+    /// What the miss costs is not one payment: `team_spend_buckets` is keyed
+    /// `(tenant, team, day, currency)` and shared by every seat on the team, so
+    /// a provider outage that refuses four payments of the budget's quarter
+    /// leaves the whole purchasing team refused with `team_daily_limit` until
+    /// midnight — with no money moved and nothing in the trail saying why.
+    ///
+    /// It asserts the employee's side as well, so a "fix" that swapped one
+    /// release for the other rather than adding the team half goes red here.
+    #[tokio::test]
+    async fn a_failed_payment_gives_the_team_its_headroom_back_too() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let team = org::create_team(
+            &mut tx,
+            &Slug::parse("purchasing").expect("slug"),
+            "Purchasing",
+        )
+        .await
+        .expect("team");
+        org::set_member(&mut tx, principal.employee_id, team, None)
+            .await
+            .expect("seat");
+        org::set_budget(
+            &mut tx,
+            team,
+            Money::new(60_000, Currency::Eur).expect("nonzero"),
+        )
+        .await
+        .expect("budget");
+        tx.commit().await.expect("commit team");
+
+        let effects = Effects::new(
+            db.clone(),
+            ports(
+                MockEmailProvider::new(),
+                MockPayments::broken(ProviderError::from_status(400, None)),
+            ),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, euros(15_000))
+            .await
+            .expect("under every cap, the team's included");
+
+        // The charge landed on both ledgers, or the assertion below is vacuous.
+        let day = Utc::now().date_naive();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        assert_eq!(
+            org::spent(&mut tx, team, day, Currency::Eur)
+                .await
+                .expect("team bucket"),
+            15_000,
+            "the gate reserves through org::reserve, which charges the team too"
+        );
+        tx.rollback().await.expect("rollback");
+
+        effects
+            .pay(token, MEMO)
+            .await
+            .expect_err("the payment provider refused");
+
+        assert_eq!(
+            reservation_states(&db, &principal).await,
+            vec!["released".to_owned()],
+            "the employee's own reservation is released"
+        );
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        assert_eq!(
+            org::spent(&mut tx, team, day, Currency::Eur)
+                .await
+                .expect("team bucket"),
+            0,
+            "money that did not move must not hold the *team's* day either: \
+             `Authorized::reservation`'s contract says org::release, and a \
+             spend::release leaves this charge on the team until midnight"
+        );
+        tx.rollback().await.expect("rollback");
     }
 
     /// **The selling side reaches the register**, and the row it writes is
