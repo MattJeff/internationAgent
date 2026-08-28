@@ -507,6 +507,15 @@ the logs like a bug and is a missing row.
 
 ## What this costs per month
 
+> **Unit warning, and it is not a footnote.** Every figure below is metered-API
+> pricing. Orizn runs on the CLI path (step 7), where there is **no per-token
+> invoice at all** — the currency is a monthly seat and the binding constraint is
+> throughput. These numbers are the right reading for a deployment that pays per
+> token and the wrong unit for this one. They are kept, measured and re-measured
+> because they are what a *customer* on `api_key` will be billed, which is the
+> question the forecast endpoint answers.
+
+
 **This section holds no arithmetic of its own, and that is the point.**
 
 It used to. It published **≈ $76 a month**, derived here in prose from three
@@ -968,7 +977,54 @@ columns in their role layer, which the loader reads as `spend: None` — "this
 layer permits no spending at all" — and their packs do not list `PaymentCreate`
 as proposable. Refused twice, in two independent places.
 
-### 7. Verify, then watch the first turn
+### 7. Connect the model — and for Orizn that is the CLI, not a key
+
+**This step was missing, and without it nothing thinks.** Steps 1–6 stand the
+company up and none of them gives it a model. A seat with no connection answers
+`NoModel::NotConnected` on its first turn, which is terminal and parks the
+message — deliberately, since no amount of retrying connects a model.
+
+Orizn runs on **this host's `claude` CLI**, on a subscription, not on a metered
+key:
+
+```sh
+# at boot, in step 1's environment
+export AGENTOS_LLM=cli
+
+# once the tenant exists, per tenant
+curl -sS -X POST $API/v1/model \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"path":"cli"}'
+```
+
+`api_key` is the other path and it is the one **customers** use: they bring
+their own credential, we never supply the model, and that is the whole of "priced
+on infrastructure only". `path` is `api_key` or `cli`; the `api_key` field is
+required on the first and ignored on the second.
+
+**It worked:** `GET /v1/model` reports the `cli` path.
+
+**Most likely failure, and it is a refusal rather than a bug.** Connecting a
+tenant to `cli` is refused when the host itself runs `AGENTOS_LLM=anthropic`,
+because the host's model is then a credential *we* pay for and that tenant's
+whole fleet would run on our bill — the one arrangement this product says never
+happens. The fix is the host's own `AGENTOS_LLM`, never the request.
+
+**What this changes about the money, and it changes the unit rather than the
+number.** Every figure in "What this costs per month" above is metered-API
+pricing. On the CLI there is **no per-token invoice at all**: the currency is a
+monthly seat and the binding constraint is throughput. So `$87–$105/month` is
+the right reading for a deployment that pays per token and **the wrong unit
+entirely for this one** — `cost.rs` says so in as many words beside the figures.
+
+Two consequences worth holding on to. The ~1.4k input tokens a catalogue row
+costs on every call stops being money and becomes **throughput and latency**, so
+"is this verb worth its rent" is a different question with possibly a different
+answer. And the real ceiling is no longer the bill: it is whether a subscription
+permits an unattended fleet, which is a question about its terms and not about
+tokens. Nothing here can answer that one.
+
+### 8. Verify, then watch the first turn
 
 ```sh
 curl -sS $API/readyz            # {"ready":true,…}
@@ -999,7 +1055,7 @@ select occurred_at, actor, payload ->> 'event' as event
 `decision_id` is null on all of them, and that is honest: no Policy Gate ruling
 authorised these. They are an operator's key acting directly.
 
-### 8. Load the prospect lists
+### 9. Load the prospect lists
 
 Everything above stands up a company with an empty pipeline. `accounts` and
 `contacts` had no writer outside tests, so `contacts_due_for_follow_up` returned
@@ -1051,7 +1107,7 @@ An address on the suppression list is skipped, is not created, and is not
 re-activated if it opted out between two imports. That is enforced inside the
 INSERT *and* by a trigger under it.
 
-### 9. Get the booking flows written — the employee proposes, you confirm
+### 10. Get the booking flows written — the employee proposes, you confirm
 
 Step 8 gives the seller people to write to. It does not give it the thing the
 cold email is *about*: the proof of need — the contradiction `proof_of_need`
@@ -1175,7 +1231,7 @@ field is a denial and the installer refuses a document that has one.
 
 **What is still SQL, and correctly so:**
 
-* the read-back in step 5 and the audit query in step 7. Both *read*. A read
+* the read-back in step 5 and the audit query in step 8. Both *read*. A read
   cannot silently deny an employee the web, which is the failure this exercise
   was about.
 * nothing else. There is no write left in this runbook that is not a command.
@@ -1229,7 +1285,7 @@ answer that is not in any document. There is no third document in it, and that i
 the important part.
 
 **How long the agents run is required, and there is no default.** `window_ends_at`
-is step 8 of the entry journey — *choose how long the agents run: 2 days, one
+is step 9 of the entry journey — *choose how long the agents run: 2 days, one
 week, one month* — as the instant that answer works out to, and it is the one
 field here that belongs to a company rather than to a file: "one month" has no
 meaning without the moment it is counted from. Omit it and the call is a `400`
