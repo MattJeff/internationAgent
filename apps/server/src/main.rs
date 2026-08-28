@@ -4113,8 +4113,19 @@ mod tests {
     }
 
     /// The claim the whole pipeline exists for. The model is steered by text in
-    /// the email and proposes the wire anyway; the gate refuses, the refusal is
+    /// the email and asks for the wire anyway; it is refused, the refusal is
     /// fed back, no provider is called, and the employee still answers.
+    ///
+    /// **What refuses it moved down a layer on 2026-08-28**, and this test says
+    /// so rather than papering over it. `pay` is not in an untrusted turn's
+    /// request, and `Turn::propose` no longer builds a proposal out of a name
+    /// this turn may not propose — so the gate is never asked and there is no
+    /// `deny` row to count. That is the whole point of the change: the layer
+    /// that stopped it does not depend on `policy::evaluate` being right, which
+    /// that morning it was not. The gate's own refusal of the same subject is
+    /// asserted where the gate is: `turn::an_injected_wire_over_the_approval_threshold_files_no_approval`
+    /// and `gate::an_untrusted_payment_never_reaches_the_ledger`, over
+    /// `domain::policy::untrusted_input_never_reaches_a_high_risk_side_effect`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_injected_instruction_is_denied_and_no_effect_runs() {
         let Some(landed) = land_a_message(INJECTION).await else {
@@ -4148,13 +4159,16 @@ mod tests {
             0,
             "an effect ran for an injected instruction"
         );
-        // The gate ruled, and it ruled no.
-        assert!(
+        // Nothing was ruled on at all — the guess never became a subject. This
+        // is the assertion that goes red if `Turn::propose` stops checking the
+        // name against what the turn may propose: the guess becomes a
+        // `PaymentCreate`, the gate refuses it, and a row appears here.
+        assert_eq!(
             landed
-                .count("SELECT count(*) FROM audit_log WHERE decision = 'deny'")
-                .await
-                > 0,
-            "the payment was not refused by the gate; what stopped it?"
+                .count("SELECT count(*) FROM audit_log WHERE decision IS NOT NULL")
+                .await,
+            0,
+            "a tool this turn was never offered reached the gate"
         );
 
         // The taint wire, one level up from `turn.rs`'s own test: the schema was

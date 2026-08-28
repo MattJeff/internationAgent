@@ -843,8 +843,12 @@ mod tests {
             );
         }
 
-        // And the policy layer refuses the same things independently, so
-        // guessing a tool name that was never offered still ends in a denial.
+        // And the policy layer refuses the same things independently — which
+        // since 2026-08-28 is the *second* refusal rather than the only one:
+        // `Turn::propose` will not build a proposal out of a name this turn was
+        // not offered, so a guess is answered `no such tool` and never reaches
+        // the layer. What is asserted below is that the layer would still say
+        // no if it did, which is the half this file owns.
         //
         // `BrowserWrite` is the one exception and it is deliberate:
         // `PolicyLimits` has a single `allowed_domains` list shared by read and

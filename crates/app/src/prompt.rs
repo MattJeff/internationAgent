@@ -426,6 +426,21 @@ impl SystemPrompt {
         self
     }
 
+    /// The floor itself, for the one caller that has to ask [`tools_for`] a
+    /// second question about the same turn.
+    ///
+    /// [`Turn::propose`](crate::turn::Turn::propose) refuses a tool name this
+    /// turn may not propose, and "may not propose" is trust plus this floor —
+    /// deliberately *not* the policy, which the gate re-reads per action and
+    /// refuses on the record. Handing the set out rather than answering the
+    /// question here keeps one implementation of the predicate: the caller
+    /// calls the same `tools_for` the request went through, with `None` where
+    /// the policy would go.
+    #[must_use]
+    pub const fn floor(&self) -> &BTreeSet<ActionKind> {
+        &self.floor
+    }
+
     /// Tell the model that one MCP tool exists — and only the ones this
     /// employee may actually call. **This is also where the prompt is told the
     /// employee's policy**, which scopes the action schemas too: see the
