@@ -1208,6 +1208,17 @@ fn counterparty(action: &Action) -> Option<String> {
         | Action::FileUpload { .. }
         | Action::McpCall { .. }
         | Action::PaymentCreate { .. }
+        // `None`, and it is the entry here with the most plausible-looking wrong
+        // answer after `InternalSend`. An invoice *does* address somebody, so
+        // writing the customer under this key would read as honest bookkeeping —
+        // and it would make the first invoice to each customer consume one of
+        // the day's cold contacts, so a company that billed twenty customers on
+        // the first of the month could not approach a prospect until the second.
+        // The party is by construction one this company already won a deal with
+        // (`migrations/0066_invoices.sql`), so it is not a *new* counterparty in
+        // any sense the ceiling means, and the domain's
+        // `spends_contact_budget` says so from the other side.
+        | Action::InvoiceIssue { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }

@@ -16,6 +16,7 @@ pub mod files; // le classeur: the bytes somebody gave us, kept as they are
 pub mod halt; // wave J: the switch that stops a whole company
 pub mod idempotency; // U10
 pub mod initiative;
+pub mod invoices; // la facturation: what the company is owed, and what arrived
 pub mod knowledge; // U14
 pub mod model_access; // wave H: whose model this tenant thinks with
 pub mod model_usage; // le grand livre des jetons

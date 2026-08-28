@@ -880,10 +880,11 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means a
-    /// sixteenth action cannot be added without someone deciding here whether
-    /// a sales employee may propose it. There are fifteen today
-    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 15]`); this said
-    /// "fourteenth" after both `charter_set` and `internal_send` had landed.
+    /// seventeenth action cannot be added without someone deciding here whether
+    /// a sales employee may propose it. There are sixteen today
+    /// (`Action::ALL_DISCRIMINANTS` is `[ActionKind; 16]`); this said
+    /// "fourteenth" after both `charter_set` and `internal_send` had landed, and
+    /// "fifteenth" until `invoice_issue` did.
     #[test]
     fn the_sales_role_cannot_propose_an_action_outside_its_allowlist() {
         let sales = sales();
@@ -907,6 +908,12 @@ mod tests {
         for forbidden in [
             ActionKind::PaymentCreate,
             ActionKind::ContractSign,
+            // And it cannot bill, which is the same refusal as `ContractSign`
+            // one step later in time: this pack stops before commercial terms
+            // exist, and a seat that could agree a price *and* issue the demand
+            // for it would hold the whole deal. Billing is `finance`'s, behind a
+            // won opportunity and the human approval that stage requires.
+            ActionKind::InvoiceIssue,
             ActionKind::SmsSend,
             ActionKind::WhatsappSend,
             ActionKind::BrowserWrite,

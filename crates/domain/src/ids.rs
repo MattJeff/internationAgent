@@ -98,6 +98,16 @@ uuid_newtype!(
     /// See `migrations/0063_appointments.sql`.
     AppointmentId
 );
+uuid_newtype!(
+    /// One demand for money the company has made, in its own register.
+    /// See `migrations/0066_invoices.sql`.
+    ///
+    /// **Not an invoice number.** A uuid is unique and unguessable and it is not
+    /// what a tax authority means by "sequential" — see that migration's section
+    /// on what this is not. This is the handle the API and the store use; a
+    /// legal number, if one is ever needed, is a second column beside it.
+    InvoiceId
+);
 
 // ---------------------------------------------------------------------------
 // Slug

@@ -545,6 +545,7 @@ pub enum ActionKind {
     McpCall,
     A2aSend,
     PaymentCreate,
+    InvoiceIssue,
     ContractSign,
     CredentialChange,
     DataDelete,
@@ -554,7 +555,7 @@ pub enum ActionKind {
 
 impl ActionKind {
     /// Every discriminant. Iterate this to prove a rule covers the whole space.
-    pub const ALL: [ActionKind; 15] = [
+    pub const ALL: [ActionKind; 16] = [
         ActionKind::EmailSend,
         ActionKind::SmsSend,
         ActionKind::WhatsappSend,
@@ -565,6 +566,7 @@ impl ActionKind {
         ActionKind::McpCall,
         ActionKind::A2aSend,
         ActionKind::PaymentCreate,
+        ActionKind::InvoiceIssue,
         ActionKind::ContractSign,
         ActionKind::CredentialChange,
         ActionKind::DataDelete,
@@ -585,6 +587,7 @@ impl ActionKind {
             ActionKind::McpCall => "mcp_call",
             ActionKind::A2aSend => "a2a_send",
             ActionKind::PaymentCreate => "payment_create",
+            ActionKind::InvoiceIssue => "invoice_issue",
             ActionKind::ContractSign => "contract_sign",
             ActionKind::CredentialChange => "credential_change",
             ActionKind::DataDelete => "data_delete",
@@ -638,6 +641,27 @@ pub enum Action {
         peer: Domain,
     },
     PaymentCreate {
+        amount: Money,
+    },
+    /// Ask a customer to pay us. Money in the other direction, and the one
+    /// outbound act this enum was missing.
+    ///
+    /// The subject is the **amount**, and nothing else, for the module rule
+    /// above: a variant carries the parsed subject of its effect and no
+    /// self-description the gate then trusts. Which deal it bills lives on the
+    /// body (`app::effects::InvoiceDraft`), exactly as a payee lives on a
+    /// `PaymentInstruction` rather than on [`Action::PaymentCreate`] — and the
+    /// gate has no opinion about which of a company's own won deals is being
+    /// invoiced, only about whether this seat may bill at all.
+    ///
+    /// `Money` and not a bare integer, so a currency cannot be omitted: an
+    /// invoice whose currency was implied is a figure the customer reads in
+    /// theirs.
+    ///
+    /// See `migrations/0066_invoices.sql` for why this is a discriminant at all
+    /// rather than a table an employee writes to — the short version is that a
+    /// verb outside this enum is a verb no role pack can decline.
+    InvoiceIssue {
         amount: Money,
     },
     /// `title` is display-only — see [`Action::risk`] and the evaluator: the
@@ -696,7 +720,7 @@ pub enum Action {
 impl Action {
     /// Alias for [`ActionKind::ALL`], so `Action::ALL_DISCRIMINANTS` reads at
     /// the call site.
-    pub const ALL_DISCRIMINANTS: [ActionKind; 15] = ActionKind::ALL;
+    pub const ALL_DISCRIMINANTS: [ActionKind; 16] = ActionKind::ALL;
 
     /// Which discriminant this is. Exhaustive by construction — no `_` arm.
     pub const fn kind(&self) -> ActionKind {
@@ -711,6 +735,7 @@ impl Action {
             Action::McpCall { .. } => ActionKind::McpCall,
             Action::A2aSend { .. } => ActionKind::A2aSend,
             Action::PaymentCreate { .. } => ActionKind::PaymentCreate,
+            Action::InvoiceIssue { .. } => ActionKind::InvoiceIssue,
             Action::ContractSign { .. } => ActionKind::ContractSign,
             Action::CredentialChange { .. } => ActionKind::CredentialChange,
             Action::DataDelete { .. } => ActionKind::DataDelete,
@@ -753,6 +778,17 @@ impl Action {
 
             Action::FileUpload { .. }
             | Action::PaymentCreate { .. }
+            // High, and the reason is the direction of the money rather than
+            // its size. A stranger's text saying "please invoice us €50,000"
+            // must not produce a demand for money in this company's name — and
+            // unlike `ContractSign`, which escalates and therefore slips past
+            // the taint wire (`evaluate` applies it only to an `Allow`), this
+            // arm's ruling *is* an `Allow`, so an untrusted turn is refused
+            // outright with `DenyReason::UntrustedInput` and no approval is
+            // filed for a human to look at. See `app::revenue`'s module docs
+            // for why an approval queue a stranger can write into is the thing
+            // being avoided.
+            | Action::InvoiceIssue { .. }
             | Action::ContractSign { .. }
             | Action::CredentialChange { .. }
             | Action::DataDelete { .. }
@@ -1021,10 +1057,10 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ActionKind::ALL.len(), "duplicate discriminant");
-        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 15);
+        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 16);
     }
 
-    /// Thirteen of the fifteen actions leave the company. The two that do not
+    /// Fourteen of the sixteen actions leave the company. The two that do not
     /// are `CharterSet` and this one, the internal channel, and it is
     /// deliberately `Low`: see the paragraph on
     /// [`Action::risk`].

@@ -774,11 +774,12 @@ mod tests {
     // -- the allowlist -----------------------------------------------------
 
     /// The whole action space, partitioned. Iterating `ActionKind::ALL` means
-    /// a sixteenth action cannot be added without someone deciding here
-    /// whether a buyer may propose it. (There are fifteen —
-    /// `Action::ALL_DISCRIMINANTS` is `[ActionKind; 15]`. This said "fourteenth"
-    /// while `charter_set` and `internal_send` had both already landed, which is
-    /// an ordinal that dates itself; the property it names does not.)
+    /// a seventeenth action cannot be added without someone deciding here
+    /// whether a buyer may propose it. (There are sixteen —
+    /// `Action::ALL_DISCRIMINANTS` is `[ActionKind; 16]`. This said "fourteenth"
+    /// while `charter_set` and `internal_send` had both already landed, and
+    /// "sixteenth" until `invoice_issue` did; the property it names does not
+    /// date, which is why the count is read off the constant beside it.)
     #[test]
     fn the_buyer_cannot_propose_an_action_outside_its_allowlist() {
         let buyer = buyer();
@@ -811,6 +812,13 @@ mod tests {
             ActionKind::A2aSend,
             ActionKind::CredentialChange,
             ActionKind::DataDelete,
+            // A buyer bills nobody. It is the seat that *receives* invoices —
+            // its whole `PaymentCreate` grant exists so it can settle one — and
+            // a function that could both approve a supplier's invoice and issue
+            // the company's own is the segregation of duties that bookkeeping
+            // was invented to prevent, which is the argument `finance`'s own
+            // pack makes one field along.
+            ActionKind::InvoiceIssue,
             // Re-tasking a colleague is not buying anything. A pack is a job,
             // and no job in this workspace includes "decide what somebody else
             // works on" — that authority comes from the org chart, one
