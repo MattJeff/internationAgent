@@ -217,10 +217,18 @@ pub async fn open_for(
 /// to a brief, for the reason `agentos_app::backlog` gives: the wrapper is
 /// unconditional so that nobody ever has to decide it is safe to drop.
 ///
-/// ponytail: unbounded and unpaginated, like [`board`]. The number this needs is
-/// a `LIMIT` on what one brief may be shown, and it belongs beside the one
-/// `loops::initiative::waiting` already has an open question about — one answer
-/// for both lists, not two.
+/// ponytail: still unbounded here, and the one answer this asked for now exists
+/// one layer up. `loops::initiative::MAX_LINES` is the number, it covers this
+/// list and [`open_for`] and the diary alike — one answer for all three, as this
+/// comment asked — and it lives at the reader rather than in the SQL because the
+/// bound is a fact about what a *prompt* may cost, not about what a board holds:
+/// at `agentos_eval::scoping::tokens` a line of this list is 16–39 tokens, of
+/// which 15 are the bullet and the uuid before the founder has typed a word.
+/// `GET /v1/work` reads the same rows onto a screen and must not be cut.
+///
+/// Keeping the read whole is also what pays for the notice. A `LIMIT` returns
+/// twenty rows and no way to say there are two hundred, and a list that is
+/// silently short is the thing being fixed.
 pub async fn unclaimed(tx: &mut TenantTx<'_>) -> Result<Vec<Item>, StoreError> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM work_items \

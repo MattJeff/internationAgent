@@ -386,7 +386,18 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// Stable, low-cardinality label for `employee_initiative.last_outcome`.
+    /// Stable, low-cardinality label for `employee_initiative.last_outcome` —
+    /// and, since `0072`, for `appointments.outcome` too.
+    ///
+    /// **Adding a variant is not enough.** This `match` is exhaustive, so a new
+    /// variant is a compile error here and whoever adds one must invent a code.
+    /// `appointments_outcome_is_a_code` is a CHECK over these same nine strings
+    /// (these eight plus `agentos_store::calendar::CANCELLED`) and Postgres
+    /// cannot be told about a Rust enum, so **a new code needs a migration in
+    /// the same commit** or `record` starts swallowing a `23514` and the diary
+    /// silently keeps reading `NULL`.
+    /// `every_outcome_this_loop_can_reach_is_a_word_the_diary_knows` is what
+    /// makes that a failing test rather than a production surprise.
     const fn code(&self) -> &'static str {
         match self {
             Outcome::NoCharter => "no_charter",
@@ -1002,27 +1013,34 @@ async fn sales_work_for(
 /// lost outcome costs an operator one stale line on a status page — where
 /// stopping the loop over bookkeeping would cost every employee its next turn.
 ///
-/// # Nothing is written for a turn an appointment started
+/// # Two tables, because the two claims consumed two different things
 ///
 /// `employee_initiative.last_outcome` is the **cadence's** column: one row per
 /// employee, describing what happened the last time its rhythm came round. An
 /// employee that keeps a promise need not have that row at all — 0020 says
-/// chartered-and-unscheduled is the ordinary state — so `record_outcome` would
-/// return `NotFound` and log an error about a row that is correctly absent.
+/// chartered-and-unscheduled is the ordinary state — so writing a promise's
+/// outcome there would return `NotFound` on the seats appointments exist for,
+/// and would be worse than silence on the rest: the operator reading
+/// `GET /v1/employees/{id}/initiative` is asking "is its cadence working", and a
+/// promise overwriting that answer would make a healthy schedule read as
+/// whatever the last appointment did.
 ///
-/// Writing it anyway would be worse than silence rather than merely noisy: the
-/// operator reading `GET /v1/employees/{id}/initiative` is asking "is its
-/// cadence working", and an appointment's outcome overwriting that answer would
-/// make a healthy schedule read as whatever the last promise did.
+/// That argument is unchanged and is why the branch below is a branch and not a
+/// second write. **What was wrong is that the appointment arm did not exist.**
+/// This function returned at its first line on `claims.is_none()`, so a promise
+/// was consumed — `rang_at` written and committed by the claim, before any
+/// charter had been read — and *nothing* recorded what became of it. Every
+/// deterministic refusal downstream (`NoCharter`, `NoModel`, `Clarify`,
+/// `NoWork`, `OverBudget`) therefore left a row reading `rang_at > at`, which in
+/// `0063`'s own vocabulary means **kept, late**. The founder could not tell a
+/// promise nobody could act on from one kept four days behind.
 ///
-/// **So an appointment's outcome is logged and stored nowhere**, which is a real
-/// gap and is named as one: `appointments` has no outcome column, and the day
-/// somebody wants "did the moment I promised actually produce anything" the
-/// place for it is beside `rang_at`.
+/// `0072` is the column and carries the argument for its shape; the two things
+/// this function has to get right are that success is written *explicitly*, so
+/// a process killed here can never be mistaken for one, and that a failure to
+/// record stays swallowed — the promise is already consumed either way, and
+/// stopping the loop over bookkeeping would cost every other employee its turn.
 async fn record(db: &Db, due: &Woken, outcome: &Outcome, now: DateTime<Utc>) {
-    if due.claims.is_none() {
-        return;
-    }
     let mut tx = match db.admin_tx_bypassing_rls().await {
         Ok(tx) => tx,
         Err(err) => {
@@ -1030,14 +1048,27 @@ async fn record(db: &Db, due: &Woken, outcome: &Outcome, now: DateTime<Utc>) {
             return;
         }
     };
-    let written = initiative::record_outcome(
-        &mut tx,
-        due.employee_id,
-        outcome.code(),
-        outcome.detail(),
-        now,
-    )
-    .await;
+    // On `kept` and not on `claims`, and the two are exhaustive by construction:
+    // the `From<Due>` impl sets `claims` and no `kept`, the `From<Kept>` impl
+    // sets `kept` and no `claims`. Asking about `kept` is asking which row was
+    // consumed, which is the question that decides which table records it.
+    //
+    // No detail on this side. `0072` has no `last_detail` twin: the code is what
+    // the founder's diary reads, and the sentence is in the log line `handle`
+    // has already emitted by the time this runs.
+    let written = match &due.kept {
+        Some(kept) => calendar::record_outcome(&mut tx, kept.id, outcome.code()).await,
+        None => {
+            initiative::record_outcome(
+                &mut tx,
+                due.employee_id,
+                outcome.code(),
+                outcome.detail(),
+                now,
+            )
+            .await
+        }
+    };
     if let Err(err) = written.and(tx.commit().await.map_err(StoreError::from)) {
         tracing::error!(error = %err, "initiative outcome was not recorded");
     }
@@ -1208,8 +1239,14 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     //
     // After the plan and after the vertical's note, deliberately: the ranking is
     // the founder's and it belongs last, where it is nearest the model's answer.
+    //
+    // The truncation notice, when there is one, goes on the **brief** and not on
+    // the list. See [`Shown::cut`]: it is a claim about our own cut, and inside
+    // the fence it would be a claim somebody else's work item title could forge.
     if let Some(items) = waiting(&agent.db, due.tenant_id, due.employee_id).await {
-        context = context.with_task(BOARD_BRIEF).with_untrusted(&items, BOARD);
+        context = context
+            .with_task(brief_with(BOARD_BRIEF, items.cut.as_deref()))
+            .with_untrusted(&items.lines, BOARD);
     }
 
     // And what it has already promised, which is the board's argument applied to
@@ -1221,8 +1258,8 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // employee to keep it again.
     if let Some(promised) = diary(&agent.db, due.tenant_id, due.employee_id).await {
         context = context
-            .with_task(DIARY_BRIEF)
-            .with_untrusted(&promised, DIARY);
+            .with_task(brief_with(DIARY_BRIEF, promised.cut.as_deref()))
+            .with_untrusted(&promised.lines, DIARY);
     }
 
     let cancel = agent.cancel.child_token();
@@ -1693,13 +1730,17 @@ async fn chasing_step(
 /// against this tenant's board and against this employee's own row, so the worst
 /// it buys is a refusal.
 ///
-/// ponytail: unbounded, both halves. `inbound::unanswered` caps its list at 20
-/// with an argument about prompts, and the number is not borrowable — that one
-/// is "questions I asked", which grows on its own, and these are lists a human
-/// types. FOUNDER'S QUESTION, LEFT OPEN: how many items may one turn be shown
-/// before the board is costing more in tokens than it saves in rediscovery? One
-/// answer for both lists, in the `LIMIT` neither read has.
-async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untrusted<String>> {
+/// # Bounded, and it says what it cut
+///
+/// [`MAX_LINES`] per half, and a sentence in our own voice when either half is
+/// longer. The number and the sentence are both load-bearing — see that
+/// constant, and [`Shown::cut`] for why the sentence is outside the frame.
+///
+/// The truncation is only defensible because the read is already ordered:
+/// `store::backlog`'s `ORDER` is the founder's own ranking, so what falls off
+/// the end is what he ranked last. A cut into an unordered list would be a
+/// random twenty.
+async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Shown> {
     let board = PgBacklog::new(db.clone(), tenant);
     let warn = |err: &BacklogError| {
         tracing::warn!(
@@ -1716,24 +1757,140 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untr
     let mine = board.open_for(employee).await.inspect_err(warn).ok();
     let pool = board.unclaimed().await.inspect_err(warn).ok();
 
-    let lines = |heading: &str, items: Vec<Held>| {
+    // Counted before the truncation and carried out separately: `items.len()`
+    // after a `take` is `MAX_LINES` and says nothing. This is the whole reason
+    // the `LIMIT` is here and not in the two `SELECT`s — twenty rows cannot tell
+    // an employee that there are two hundred.
+    let mut cut = Vec::new();
+    let lines = |heading: &str, kind: &str, items: Vec<Held>, cut: &mut Vec<String>| {
         let heading = heading.to_owned();
+        if let Some(note) = cut_note(kind, items.len()) {
+            cut.push(note);
+        }
         items
             .into_iter()
+            .take(MAX_LINES)
             .map(|item| item.title.map(|title| format!("- [{}] {title}", item.id)))
             .reduce(|all, next| all.zip_with(next, |all, next| format!("{all}\n{next}")))
             .map(|list| list.map(|list| format!("{heading}\n{list}")))
     };
 
-    match (
-        lines("What is yours:", mine.unwrap_or_default()),
-        lines("Nobody has taken these yet:", pool.unwrap_or_default()),
-    ) {
+    let mine = lines(
+        "What is yours:",
+        "items on your own board",
+        mine.unwrap_or_default(),
+        &mut cut,
+    );
+    let pool = lines(
+        "Nobody has taken these yet:",
+        "unclaimed items",
+        pool.unwrap_or_default(),
+        &mut cut,
+    );
+
+    let lines = match (mine, pool) {
         (Some(mine), Some(pool)) => {
             Some(mine.zip_with(pool, |mine, pool| format!("{mine}\n\n{pool}")))
         }
         (only, None) | (None, only) => only,
-    }
+    }?;
+    Some(Shown {
+        lines,
+        cut: (!cut.is_empty()).then(|| cut.join(" ")),
+    })
+}
+
+/// How many lines of any one list a turn is shown.
+///
+/// # The measurement, because the number had to come out of one
+///
+/// Three separate reads reached a turn with no bound at all, and each carried
+/// its own FOUNDER'S QUESTION asking for this number — three agents in a row
+/// declining to invent it, which was right of them. What changed is that there
+/// is now a price. On 2026-08-28 three catalogue rows moved input tokens per
+/// model call from ~4.6k to ~6.0k and Orizn's bill from \$70–84 to \$87–105 a
+/// month: **≈1.4k tokens is what one new capability costs, and it is the unit
+/// this deployment has already priced and accepted.**
+///
+/// Measured with `agentos_eval::scoping::tokens`, the estimator the rest of the
+/// repo weighs prompts with (±20%, and the comparison below is between two
+/// numbers from the same function, where a systematic factor cancels):
+///
+/// | line | tokens |
+/// |---|---|
+/// | board / pool, `- [{uuid}] {title}` | 16–39, mean 27 |
+/// | …of which the bullet and the uuid, before a word is typed | 15 |
+/// | diary, `- {local} {zone} — {subject}` | 16–36, mean 25 |
+/// | …of which the instant and the zone | 16 |
+///
+/// So one item in each of the three lists is ≈79 tokens, and 1.4k tokens buys
+/// **≈18 rounds**. Twenty is that figure at the resolution the number deserves,
+/// and it is not a coincidence that it is also
+/// `agentos_app::inbound::MAX_OUTSTANDING`, which bounds the only comparable
+/// list this repo already had — *"a bound rather than a page: this text goes
+/// into a prompt, and an employee with two hundred open questions has a problem
+/// no reminder is going to fix"*. That constant is private to its module and is
+/// deliberately not made public to be shared: it answers a different question
+/// about a different list, and two lists agreeing on twenty is worth less than
+/// either of them being able to move alone.
+///
+/// What twenty costs and what it replaced, at the measured means:
+///
+/// | items per list | three lists | share of a 6.0k prompt |
+/// |---|---|---|
+/// | 20 (this) | ≈1.6k | ≈26% |
+/// | 100 | ≈7.9k | more than the whole prompt |
+/// | 200 | ≈15.8k | ≈2.6× the whole prompt |
+///
+/// The 200 row is not hypothetical: it is one founder giving one employee two
+/// hundred tasks, which `POST /v1/work` permits and nothing throttles. That turn
+/// used to cost roughly four times what a turn costs, silently, and the founder's
+/// bill would have moved with no feature having been added.
+///
+/// **This is still the founder's number to overrule**, and it is now overrulable
+/// with the arithmetic in hand rather than in the dark: one item per list per
+/// turn is ≈79 tokens, and the exchange rate is that ≈1.4k of them is a new
+/// capability.
+const MAX_LINES: usize = 20;
+
+/// A list as a turn is shown it: the lines that fit, and what was left out.
+///
+/// A named pair and not a tuple, for
+/// [`SalesWork`]'s reason one type over — the two halves have different
+/// provenance and must not be swapped by position — and here the provenance
+/// difference is the security property, not an ergonomic one.
+struct Shown {
+    /// The lines, wrapper intact. Somebody else's words, and they stay inside
+    /// [`Untrusted`] until `prompt::render_fenced`.
+    lines: Untrusted<String>,
+    /// Our own sentence naming what is missing, when anything is; `None` is a
+    /// list shown whole.
+    ///
+    /// **Outside the frame, which is the point of it being a separate field.**
+    /// It is appended to the brief — our voice, unfenced — rather than to the
+    /// list, because "you are seeing 20 of 213" is a claim about our own
+    /// truncation, and a claim an attacker can forge is worth nothing. Anybody
+    /// on the internet can type a work item title through a customer's booking
+    /// page's sibling paths, and a line inside the fence saying *and that is all
+    /// of them* would be the exact thing this field exists to prevent.
+    cut: Option<String>,
+}
+
+/// What is said when a list did not fit, or nothing when it did.
+///
+/// The count is exact rather than "and more", and that is the whole difference
+/// between this and a `LIMIT`: an employee shown twenty of twenty-two and one
+/// shown twenty of two hundred are in different situations, and only the second
+/// one should stop trusting the list to be the work.
+fn cut_note(kind: &str, total: usize) -> Option<String> {
+    (total > MAX_LINES).then(|| {
+        format!(
+            "You are being shown the first {MAX_LINES} of {total} {kind}, in the order somebody \
+             ranked them; the other {} are real and you are not seeing them. Do not treat this \
+             list as everything there is, and do not conclude from it that anything is finished.",
+            total - MAX_LINES,
+        )
+    })
 }
 
 /// This seat's outstanding promises, as one frame's worth of text, or `None`
@@ -1742,8 +1899,13 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untr
 /// [`waiting`] next door, for the diary, and everything that function's docs
 /// argue holds here unchanged: the wrapper never comes off — `map` and
 /// `zip_with` keep it on, and the only exit is inside `prompt::render_fenced` —
-/// a diary that cannot be read is a turn that runs without it, and there is no
-/// `LIMIT`.
+/// a diary that cannot be read is a turn that runs without it, and the same
+/// [`MAX_LINES`] bounds it with the same notice when it bites.
+///
+/// The ordering that makes truncating honest is `store::calendar::upcoming`'s
+/// `ORDER BY at ASC`: what falls off the end of a diary is the far future, and
+/// an employee will be woken for each of those hours when it comes round anyway.
+/// A cut here loses the least of the three lists.
 ///
 /// One thing is this function's alone. The board's taint argument is about *our
 /// own* board becoming a laundering path the day an employee can post to it;
@@ -1752,7 +1914,7 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untr
 /// [`Calendar`](agentos_app::calendar::Calendar) is a customer's booking page
 /// and anybody on the internet may type into one. See
 /// [`agentos_app::calendar`]'s module docs.
-async fn diary(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untrusted<String>> {
+async fn diary(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Shown> {
     let promised = match PgCalendar::new(db.clone(), tenant, employee)
         .upcoming()
         .await
@@ -1768,9 +1930,12 @@ async fn diary(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Untrus
             return None;
         }
     };
-    promised
+    let cut = cut_note("hours you have promised", promised.len());
+    let lines = promised
         .into_iter()
-        .reduce(|all, next| all.zip_with(next, |all, next| format!("{all}\n{next}")))
+        .take(MAX_LINES)
+        .reduce(|all, next| all.zip_with(next, |all, next| format!("{all}\n{next}")))?;
+    Some(Shown { lines, cut })
 }
 
 /// What is said in **our** voice when a promised moment has come round.
@@ -1799,6 +1964,17 @@ fn kept_brief(kept: &Kept, now: DateTime<Utc>) -> String {
         kept.zone,
         now.format("%Y-%m-%d %H:%M"),
     )
+}
+
+/// A brief, plus the truncation notice when its list was cut.
+///
+/// One line, in one place, so the board and the diary cannot end up saying it
+/// two different ways. Both briefs already end in a full stop.
+fn brief_with(brief: &str, cut: Option<&str>) -> String {
+    match cut {
+        Some(cut) => format!("{brief} {cut}"),
+        None => brief.to_owned(),
+    }
 }
 
 /// The `source_id` the frame of a moment that has just come round carries.
@@ -2225,7 +2401,7 @@ pub(crate) mod tests {
             Context::new()
                 .with_task(TURN_BRIEF)
                 .with_task(BOARD_BRIEF)
-                .with_untrusted(&items, BOARD)
+                .with_untrusted(&items.lines, BOARD)
                 .trust(),
             TrustLabel::Untrusted,
             "a turn shown its board is untrusted; `turn::visible` then withholds \
@@ -2442,7 +2618,7 @@ pub(crate) mod tests {
         assert_eq!(
             Context::new()
                 .with_task(DIARY_BRIEF)
-                .with_untrusted(&promised, DIARY)
+                .with_untrusted(&promised.lines, DIARY)
                 .trust(),
             TrustLabel::Untrusted,
             "a turn shown its diary is untrusted; `turn::visible` then withholds \
@@ -2624,9 +2800,217 @@ pub(crate) mod tests {
              beside them"
         );
 
+        // **And the defect `0072` closes, in the fixture that already produced
+        // it.** None of these five seats is chartered, so every one of these
+        // four turns ended at `Outcome::NoCharter` — the claim had already
+        // written `rang_at` and committed, and `record` returned at its first
+        // line. Four promises were consumed, nothing was done, and each row read
+        // `rang_at > at`, which `0063`'s vocabulary calls *kept, late*. The count
+        // below is over `outcome IS NULL`, because NULL is exactly the state that
+        // used to be indistinguishable from success.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let silent: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointments \
+              WHERE rang_at IS NOT NULL AND outcome IS NULL AND tenant_id IN \
+              (SELECT id FROM tenants WHERE slug LIKE 'loop-initiative-%')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count the silent");
+        let unchartered: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointments \
+              WHERE outcome = 'no_charter' AND tenant_id IN \
+              (SELECT id FROM tenants WHERE slug LIKE 'loop-initiative-%')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count the recorded");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            silent, 0,
+            "a promise was consumed and nothing said what became of it; the row \
+             now reads as a promise kept late and it is not one"
+        );
+        assert_eq!(
+            unchartered, 4,
+            "each rung promise must name the deterministic reason its turn never \
+             happened, and `no_charter` is something the founder can go and fix"
+        );
+
         for tenant in tenants {
             drop_tenant(&db, tenant).await;
         }
+    }
+
+    /// **Every code this loop can produce is a word the diary's CHECK knows.**
+    ///
+    /// The one thing no compiler can check about `0072`. Adding an [`Outcome`]
+    /// variant is a compile error in [`Outcome::code`] — the `match` is
+    /// exhaustive — but Postgres cannot be told about a Rust enum, so a code
+    /// missing from `appointments_outcome_is_a_code` would surface as a `23514`
+    /// inside [`record`], which logs and swallows, leaving the column NULL and
+    /// the founder back where `0072` found him. This is the test that makes that
+    /// loud.
+    ///
+    /// ponytail: the array is written out and a tenth variant that nobody adds
+    /// here is still missed. The upgrade path is a `create type … as enum` fed
+    /// from one list, which costs an `alter type` per value and buys nothing else
+    /// — this is the cheap 90%.
+    #[tokio::test]
+    async fn every_outcome_this_loop_can_reach_is_a_word_the_diary_knows() {
+        use agentos_domain::ids::AppointmentId;
+        use agentos_store::calendar as diary_store;
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_diaries(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let ada = seed_due(&db, tenant, "vocabulary", None).await;
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let promise = diary_store::book(
+            &mut tx,
+            AppointmentId::new_v7(now),
+            ada,
+            now - chrono::TimeDelta::minutes(5),
+            "Europe/Paris",
+            "an hour to write nine different endings onto",
+        )
+        .await
+        .expect("book");
+        tx.commit().await.expect("commit");
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        diary_store::claim_due(&mut admin, 8, now)
+            .await
+            .expect("claim");
+        admin.commit().await.expect("commit");
+
+        // One of each variant. The `String`s are irrelevant — `code()` never
+        // reads them — and the point of listing every variant is that this is
+        // where somebody adding a tenth is made to think about the migration.
+        let every = [
+            Outcome::NoCharter,
+            Outcome::Unreadable(String::new()),
+            Outcome::NoModel(String::new()),
+            Outcome::Clarify(String::new()),
+            Outcome::NoWork(String::new()),
+            Outcome::Turn,
+            Outcome::Failed(String::new()),
+            Outcome::OverBudget(String::new()),
+        ];
+        for outcome in &every {
+            let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            diary_store::record_outcome(&mut admin, promise.id, outcome.code())
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "`{}` is a code this loop writes and `appointments_outcome_is_a_code` \
+                         does not accept it — add it there in this same commit: {err}",
+                        outcome.code()
+                    )
+                });
+            admin.commit().await.expect("commit");
+        }
+
+        // And the CHECK is a vocabulary rather than decoration: a word this loop
+        // never produces is refused, which is what makes the loop above a proof
+        // of anything.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        assert!(
+            diary_store::record_outcome(&mut admin, promise.id, "went_well")
+                .await
+                .is_err(),
+            "the column accepted a word nothing writes, which is `0020`'s free \
+             `text` and the thing `0072` refuses to be"
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **No silent ceiling: a list that was cut says so, in our own voice and
+    /// outside the fence.**
+    ///
+    /// [`MAX_LINES`] is the measured bound and this is the half of it that is a
+    /// behaviour rather than a number. An employee shown twenty of two hundred
+    /// and told nothing believes it has seen the work, and the mistake it then
+    /// makes — concluding a board is finished, promising an hour it has already
+    /// promised — is silent and unrecoverable.
+    ///
+    /// Two properties, and the second is the one worth the test:
+    ///
+    /// 1. Exactly [`MAX_LINES`] lines reach the frame, out of a longer list.
+    /// 2. **The count is exact and the sentence is a `task`, not part of the
+    ///    fenced list.** A notice inside the frame is a notice a hostile work
+    ///    item title can imitate, and "you are seeing all of them" is precisely
+    ///    the sentence an attacker would want to write.
+    #[tokio::test]
+    async fn a_list_that_did_not_fit_says_how_much_of_it_the_turn_is_not_seeing() {
+        use agentos_store::backlog;
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        let tenant = seed_tenant(&db).await;
+        let ada = seed_due(&db, tenant, "capped", None).await;
+
+        let over = MAX_LINES + 3;
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        for n in 0..over {
+            backlog::post(
+                &mut tx,
+                agentos_domain::ids::WorkItemId::new_v7(
+                    now + chrono::TimeDelta::milliseconds(n as i64),
+                ),
+                &format!("task number {n}"),
+                Some(ada),
+                None,
+            )
+            .await
+            .expect("post");
+        }
+        tx.commit().await.expect("commit");
+
+        let shown = waiting(&db, tenant, ada).await.expect("a board this long");
+        let rendered = format!("{:?}", shown.lines);
+        assert_eq!(
+            rendered.matches("- [").count(),
+            MAX_LINES,
+            "the turn was shown {} lines and the cap is {MAX_LINES}",
+            rendered.matches("- [").count()
+        );
+        let cut = shown
+            .cut
+            .clone()
+            .expect("a list this long was cut and must say so");
+        assert!(
+            cut.contains(&format!("first {MAX_LINES} of {over}")),
+            "the notice has to carry the real total — twenty of twenty-three and \
+             twenty of two hundred are different situations: {cut}"
+        );
+
+        // The notice is in our voice, outside the fence, and it is `with_task`
+        // that puts it there. Asserted through the rendered context rather than
+        // by reading the field, because "outside the fence" is a property of the
+        // bytes the model receives and not of a struct.
+        let context = Context::new()
+            .with_task(brief_with(BOARD_BRIEF, shown.cut.as_deref()))
+            .with_untrusted(&shown.lines, BOARD);
+        let sent = format!("{:?}", context.messages());
+        let notice = sent
+            .find("first 20 of 23")
+            .expect("the notice reached the model");
+        let fence = sent
+            .find("BEGIN source=work-board")
+            .expect("the list is fenced");
+        assert!(
+            notice < fence,
+            "the truncation notice is inside the frame, where a work item title \
+             somebody else typed could forge one saying the opposite: {sent}"
+        );
+
+        drop_tenant(&db, tenant).await;
     }
 
     async fn outcome_of(

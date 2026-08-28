@@ -76,9 +76,25 @@ pub struct Appointment {
     /// What the moment is about, in one line.
     pub subject: String,
     /// When the moment stopped being a promise. `None` is still ahead; a value
-    /// earlier than [`Appointment::at`] is a cancellation, and one later is a
-    /// promise kept — see `0063`.
+    /// earlier than [`Appointment::at`] is a cancellation, and one later is the
+    /// hour having come round — see `0063`.
+    ///
+    /// **It does not say the promise was kept.** That used to be the reading and
+    /// `0072` is why it is not: the claim writes this before anything has looked
+    /// for a charter, so a promise nobody could act on carries the same
+    /// `rang_at > at` a promise kept four days late does. [`Appointment::outcome`]
+    /// is what tells the two apart.
     pub rang_at: Option<DateTime<Utc>>,
+    /// What became of the moment once it stopped being a promise, in `0072`'s
+    /// closed vocabulary.
+    ///
+    /// `None` on a row whose [`Appointment::rang_at`] is `None` is a promise
+    /// still ahead. `None` on a row that *has* rung is the one state worth
+    /// naming: **it rang and nothing ever came back** — the process died between
+    /// the claim's commit and the turn, or the row predates `0072`. Never
+    /// success: `"turn"` is written explicitly, so no failure to write can be
+    /// mistaken for one.
+    pub outcome: Option<String>,
     /// When it was written down.
     pub created_at: DateTime<Utc>,
 }
@@ -121,7 +137,7 @@ pub struct Kept {
 /// input for an injection to arrive on.
 const COLUMNS: &str = "id, employee_id, at, at_zone, \
                        to_char(at AT TIME ZONE at_zone, 'YYYY-MM-DD HH24:MI') AS local_time, \
-                       subject, rang_at, created_at";
+                       subject, rang_at, outcome, created_at";
 
 /// One row, decoded. By reference so both reads can name it in a `map`.
 fn row_of(row: &PgRow) -> Appointment {
@@ -133,9 +149,23 @@ fn row_of(row: &PgRow) -> Appointment {
         local_time: row.get("local_time"),
         subject: row.get("subject"),
         rang_at: row.get("rang_at"),
+        outcome: row.get("outcome"),
         created_at: row.get("created_at"),
     }
 }
+
+/// The word `0068`'s settlement writes into [`Appointment::outcome`].
+///
+/// A constant rather than a literal in [`cancel_outstanding`]'s SQL, for the
+/// reason [`claim_due`] binds `Lifecycle::Active` rather than spelling it: the
+/// string is also in `0072`'s CHECK and in `routes::calendar`'s view, and a
+/// rename that misses one of them should be a compile error somewhere rather
+/// than a `23514` at the moment somebody leaves the company.
+///
+/// It is deliberately **not** one of `loops::initiative::Outcome`'s codes: no
+/// turn produces it, and a settlement is the one thing in this vocabulary that
+/// happens without anybody being woken.
+pub const CANCELLED: &str = "cancelled";
 
 /// Does this server's tzdata know this name?
 ///
@@ -211,11 +241,19 @@ pub async fn book(
 /// showed it back to the employee that kept it would be telling it to keep it
 /// again.
 ///
-/// ponytail: no `LIMIT`. A diary is a thing a human types into by hand, and the
-/// same FOUNDER'S QUESTION `loops::initiative::waiting` leaves open applies
-/// here — how much of it may one turn be shown before it costs more in tokens
-/// than it saves in rediscovery? The place for the answer is the `LIMIT` this
-/// read does not have.
+/// ponytail: still no `LIMIT`, and that is now an answer rather than an open
+/// question. The bound this read was missing was measured and applied, and it
+/// was applied **at the reader**: `loops::initiative::MAX_LINES` shows a turn
+/// the soonest twenty and says how many it is not showing. The number is a fact
+/// about how much a *prompt* may cost — at `agentos_eval::scoping::tokens` a
+/// diary line is 16–36 tokens, so an unbounded list is an unbounded bill — and a
+/// port that a customer's Google Calendar may one day sit behind has no business
+/// knowing it. A `LIMIT` here would also have destroyed the count the notice is
+/// made of: twenty rows cannot say that there are two hundred.
+///
+/// What is left unbounded is the row read, and that is the cheap half: these are
+/// one seat's outstanding hours, in a table `0063` describes as holding a handful
+/// a day.
 pub async fn upcoming(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
@@ -238,7 +276,13 @@ pub async fn upcoming(
 /// week is what is coming *and* what was kept, and a diary that hid the second
 /// half would make the first look like nothing had happened.
 ///
-/// ponytail: no pagination and no window. Same argument as [`upcoming`].
+/// ponytail: no pagination and no window, and **not** for [`upcoming`]'s reason
+/// any more — the two reads have different readers and the bound followed the
+/// reader. That one feeds a prompt, so it is capped where the prompt is built.
+/// This one feeds a screen a person scrolls, exactly as
+/// `agentos_app::inbound::MAX_ON_DESK` says of its own list, and the day a
+/// company has enough promises for the answer not to fit on one is the day this
+/// gets a window.
 pub async fn diary(tx: &mut TenantTx<'_>) -> Result<Vec<Appointment>, StoreError> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM appointments ORDER BY at ASC, id ASC"
@@ -382,21 +426,75 @@ pub async fn claim_due(
 /// [`crate::backlog::unassign_all`]'s reason. A suspension is reversible, and a
 /// seat that comes back keeps the hours it promised — late, and told so by
 /// `kept_brief`.
+///
+/// # Why it also writes the word, since `0072`
+///
+/// [`CANCELLED`] goes in beside the timestamp, and it is not decoration. Before
+/// [`Appointment::outcome`] existed, `rang_at < at` was the *only* spelling of a
+/// cancellation and it was unambiguous. With an outcome column present and this
+/// statement silent, `outcome IS NULL` would have meant "cancelled" **or** "rang
+/// and nothing came back", told apart by comparing two timestamps — which is
+/// exactly the one-comparison-carrying-two-facts defect `0072` exists to remove,
+/// reintroduced one column over. `appointments_outcome_agrees_with_the_clock` is
+/// what makes the two spellings inseparable rather than merely consistent.
 pub async fn cancel_outstanding(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
     now: DateTime<Utc>,
 ) -> Result<u64, StoreError> {
     let settled = sqlx::query(
-        "UPDATE appointments SET rang_at = $2 \
+        "UPDATE appointments SET rang_at = $2, outcome = $3 \
           WHERE employee_id = $1 AND rang_at IS NULL AND at > $2",
     )
     .bind(employee.as_uuid())
     .bind(now)
+    .bind(CANCELLED)
     .execute(&mut ***tx)
     .await?
     .rows_affected();
     Ok(settled)
+}
+
+/// Write down what became of a promise that has already rung.
+///
+/// # Why this is a second transaction, and why that is survivable here
+///
+/// It has to be: [`claim_due`] commits before the turn starts — `0063`'s
+/// deliberate trade — so by the time anything knows what became of the moment,
+/// the transaction that consumed it is long gone. A process killed between the
+/// two writes nothing, which is why `0072` makes `NULL` mean *it rang and
+/// nothing came back* and makes success the value that has to be written. This
+/// function can therefore fail, be skipped, or never be reached, and the row is
+/// still not a lie.
+///
+/// `rang_at IS NOT NULL` in the WHERE rather than a bare `id = $1`: an outcome on
+/// a promise still ahead is a row `appointments_outcome_agrees_with_the_clock`
+/// would refuse anyway, and [`StoreError::NotFound`] is a better answer than a
+/// `23514` out of the driver.
+///
+/// A bare `PgConnection`, like [`claim_due`] and
+/// [`crate::initiative::record_outcome`], because its one caller is the
+/// cross-tenant loop and it is bookkeeping for a claim that was itself
+/// cross-tenant.
+pub async fn record_outcome(
+    conn: &mut PgConnection,
+    id: AppointmentId,
+    outcome: &str,
+) -> Result<(), StoreError> {
+    let written = sqlx::query(
+        "UPDATE appointments SET outcome = $2 \
+          WHERE id = $1 AND rang_at IS NOT NULL",
+    )
+    .bind(id.as_uuid())
+    .bind(outcome)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
+    if written == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -715,6 +813,162 @@ mod tests {
              kept late is visible at all"
         );
         tx.rollback().await.expect("rollback");
+    }
+
+    /// **The defect `0072` exists for, and the constraint that keeps its fix
+    /// from rotting.**
+    ///
+    /// Before this column, a promise the claim consumed and nobody could act on
+    /// was byte-for-byte a promise kept four days late: `rang_at > at` and
+    /// nothing else. The four assertions here are the four states that have to
+    /// stay distinguishable — still a promise, rang and recorded, rang and lost,
+    /// settled early — plus the three writes that would put two of them back
+    /// together and are refused by
+    /// `appointments_outcome_agrees_with_the_clock`.
+    ///
+    /// The forgeries are attempted as the table's **owner**, bypassing RLS and
+    /// bypassing every Rust function above, which is the writer a CHECK exists
+    /// for — the same reader `a_diary_is_one_company_s_and_the_catalogue_says_so`
+    /// aims its zone assertion at. Each is its own transaction because a failed
+    /// statement aborts the one it is in.
+    #[tokio::test]
+    async fn a_rung_promise_says_what_became_of_it_and_a_cancelled_one_cannot_be_dressed_as_kept() {
+        let Some((db, tenant, _)) = fixture().await else {
+            return;
+        };
+        let now = Utc::now().trunc_subsecs(6);
+        let ada = seed_employee(&db, tenant, "ada-outcome").await;
+        let due_at = now - TimeDelta::hours(1);
+        let ahead_at = now + TimeDelta::hours(1);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let due = book(
+            &mut tx,
+            AppointmentId::new_v7(now),
+            ada,
+            due_at,
+            "Europe/Paris",
+            "the hour that came round",
+        )
+        .await
+        .expect("book the due one");
+        let ahead = book(
+            &mut tx,
+            AppointmentId::new_v7(now + TimeDelta::milliseconds(1)),
+            ada,
+            ahead_at,
+            "Europe/Paris",
+            "the hour this seat will not be here for",
+        )
+        .await
+        .expect("book the one still ahead");
+        tx.commit().await.expect("commit");
+        assert_eq!(due.outcome, None, "a promise is written with no outcome");
+
+        // A promise still ahead has nothing to say about itself, and saying so
+        // is `NotFound` rather than a constraint violation out of the driver.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        assert!(
+            matches!(
+                record_outcome(&mut admin, ahead.id, "turn").await,
+                Err(StoreError::NotFound)
+            ),
+            "nothing became of an hour that has not come round yet"
+        );
+        admin.commit().await.expect("commit");
+
+        // Rung — and this is the moment the promise is spent, before anything
+        // has looked for a charter. What used to happen next is nothing at all.
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        let rung = claim_due(&mut admin, 8, now).await.expect("claim");
+        admin.commit().await.expect("commit");
+        assert!(
+            rung.iter().any(|k| k.id == due.id),
+            "the due promise was not rung: {:?}",
+            rung.iter().map(|k| k.id).collect::<Vec<_>>()
+        );
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        record_outcome(&mut admin, due.id, "no_charter")
+            .await
+            .expect("record what became of it");
+        admin.commit().await.expect("commit");
+
+        // Settled, in 0068's spelling, and now with 0072's word beside it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert_eq!(
+            cancel_outstanding(&mut tx, ada, now).await.expect("settle"),
+            1,
+            "the hour still ahead is the only one left to settle"
+        );
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let read = |id: AppointmentId, diary: &[Appointment]| {
+            diary
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap_or_else(|| panic!("{id} left the diary"))
+                .clone()
+        };
+        let all = diary(&mut tx).await.expect("diary");
+        tx.rollback().await.expect("rollback");
+
+        let kept = read(due.id, &all);
+        assert!(
+            kept.rang_at.expect("rang") >= kept.at,
+            "the clock alone still reads as *kept, late* — which is the whole \
+             reason the word beside it has to exist"
+        );
+        assert_eq!(
+            kept.outcome.as_deref(),
+            Some("no_charter"),
+            "an hour that came round and produced nothing must say so; NULL here \
+             is the state the founder cannot tell from four days late"
+        );
+
+        let settled = read(ahead.id, &all);
+        assert!(
+            settled.rang_at.expect("settled") < settled.at,
+            "0068's spelling is untouched: a cancellation is settled before the \
+             hour it named"
+        );
+        assert_eq!(
+            settled.outcome.as_deref(),
+            Some(CANCELLED),
+            "…and it now says so in a word, so NULL is left meaning one thing"
+        );
+
+        // The three rows that would put the states back together. Owner-written,
+        // so nothing but the CHECK is between them and the table.
+        for (id, word, why) in [
+            (
+                ahead.id,
+                "turn",
+                "a cancellation dressed as a turn credits a seat that had left \
+                 with an hour that never came round",
+            ),
+            (
+                due.id,
+                CANCELLED,
+                "an hour that really rang, relabelled a cancellation, erases the \
+                 only record that it happened",
+            ),
+            (
+                due.id,
+                "kept",
+                "a word outside the vocabulary is the `text` column 0020 has and \
+                 0072 refuses to be",
+            ),
+        ] {
+            let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+            let refused = sqlx::query("UPDATE appointments SET outcome = $2 WHERE id = $1")
+                .bind(id.as_uuid())
+                .bind(word)
+                .execute(&mut *admin)
+                .await;
+            assert!(refused.is_err(), "{why}");
+        }
     }
 
     /// One company's diary is invisible to another, the isolation is asserted
