@@ -966,6 +966,51 @@ pub fn evaluate_browser_read(policy: &EffectivePolicy, domain: &Domain) -> Decis
     }
 }
 
+/// Does [`evaluate`] rule this action against
+/// [`PolicyLimits::max_new_contacts_per_day`]?
+///
+/// **The set the cold-outreach ceiling refuses on**, which is narrower than the
+/// set that carries a counterparty into the audit trail — and the gap between
+/// those two is a real refusal somebody invents by using the wrong one.
+/// `evaluate_rules`' `channel_rules` is the only reader of that ceiling, and
+/// these four arms are the only ones that call it.
+///
+/// [`Action::A2aSend`] is the arm this exists for. A peer **is** a counterparty
+/// and `app::gate::counterparty` says so, because the trail has to record who
+/// called — but the A2A arm asks `allowed_a2a_peers` and nothing else, so the
+/// ceiling has never had an opinion about a peer. A ledger charging on "has a
+/// counterparty" therefore refuses A2A on any policy whose outreach budget is
+/// spent, and on the shipped default of `0` it refuses every one: every role
+/// pack in `docs/` ships `max_new_contacts_per_day: 0`, and
+/// `app::a2a::GateInterceptor` authorises every **inbound** call as an
+/// `Action::A2aSend`.
+///
+/// [`Action::InternalSend`] is the same pairing read the other way. It has no
+/// counterparty and does not come through `channel_rules`, for the reason that
+/// arm gives at length: a colleague is not a stranger.
+///
+/// Exhaustive, with no `_` arm, for [`always_denies`]' reason — a new [`Action`]
+/// has to be considered here rather than defaulted into or out of a budget.
+pub const fn spends_contact_budget(action: &Action) -> bool {
+    match action {
+        Action::EmailSend { .. }
+        | Action::SmsSend { .. }
+        | Action::WhatsappSend { .. }
+        | Action::CallPlace { .. } => true,
+        Action::A2aSend { .. }
+        | Action::BrowserRead { .. }
+        | Action::BrowserWrite { .. }
+        | Action::FileUpload { .. }
+        | Action::McpCall { .. }
+        | Action::PaymentCreate { .. }
+        | Action::ContractSign { .. }
+        | Action::CredentialChange { .. }
+        | Action::DataDelete { .. }
+        | Action::CharterSet { .. }
+        | Action::InternalSend { .. } => false,
+    }
+}
+
 /// Does this policy deny **every** action of this kind, whatever its payload
 /// and whatever context it is ruled in?
 ///
@@ -2930,6 +2975,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// **`spends_contact_budget` is a claim about [`evaluate`], so it is checked
+    /// against [`evaluate`] rather than re-read.**
+    ///
+    /// The list in that function is written out by hand — it has to be, it is a
+    /// `const fn` over `Action` — and a hand-written list of which arms consult a
+    /// ceiling is exactly the copy that drifts when an arm is rewired. So: run
+    /// every specimen twice through the real evaluator, changing **nothing but**
+    /// `new_contacts_today`, and the predicate must agree with whether that moved
+    /// the answer. No reasoning about which refusal fires first is needed,
+    /// because both runs meet the same ones.
+    #[test]
+    fn the_contact_budget_charges_exactly_the_arms_the_ceiling_rules_on() {
+        let limits = permissive();
+        let policy = effective(&limits);
+        let free = ActionCtx {
+            trust: TrustLabel::Trusted,
+            contact: ContactStanding::New,
+            new_contacts_today: 0,
+            ..ActionCtx::new(actor(), at(1_700_000_000))
+        };
+        let spent = ActionCtx {
+            new_contacts_today: u32::MAX,
+            ..free.clone()
+        };
+
+        for action in every_action_and_then_some() {
+            let moved = evaluate(&policy, &action, &free) != evaluate(&policy, &action, &spent);
+            assert_eq!(
+                spends_contact_budget(&action),
+                moved,
+                "spends_contact_budget disagrees with the evaluator about {action:?}"
+            );
         }
     }
 

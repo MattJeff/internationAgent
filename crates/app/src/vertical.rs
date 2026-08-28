@@ -2866,11 +2866,6 @@ pub struct DueChase {
     pub contact_id: Uuid,
     /// Where the chase goes.
     pub to: EmailAddress,
-    /// `contacts.last_contacted_at` — when the note this chases went out.
-    ///
-    /// **The only fact the second email states**, and it is ours: it comes off
-    /// our own outbox column, not off their page. See [`chase_message`].
-    pub wrote_at: DateTime<Utc>,
     /// How many touches have already gone out. One or two, never three: the
     /// selection filters at [`MAX_TOUCHES`](crate::revenue::MAX_TOUCHES).
     pub touches: i32,
@@ -2929,8 +2924,7 @@ pub async fn due_chase(
         // `mark_contacted` moves either column — so this is the unwrap and not a
         // second predicate. The address can genuinely be absent: a contact is
         // reachable by phone or by email, and this vertical sends email.
-        let (Some(raw), Some(wrote_at)) = (contact.email.as_deref(), contact.last_contacted_at)
-        else {
+        let (Some(raw), Some(_)) = (contact.email.as_deref(), contact.last_contacted_at) else {
             continue;
         };
         let Ok(to) = EmailAddress::parse(raw) else {
@@ -2956,7 +2950,6 @@ pub async fn due_chase(
         return Ok(Some(DueChase {
             contact_id: contact.id,
             to,
-            wrote_at,
             touches: contact.touch_count,
         }));
     }
@@ -2975,11 +2968,27 @@ pub async fn due_chase(
 /// claim fresh across a restart" — it is **what may a message with no evidence
 /// behind it say**, and the answer is: what we did, not what their page shows.
 ///
-/// So the body is one fact and two questions. The fact is that we wrote on a
-/// date, which is [`DueChase::wrote_at`] — our own `last_contacted_at` column,
-/// not their page. Everything is past tense and about the note. There is no
-/// claim, no requirement, no reproduction steps and no invitation to re-run
-/// them, and the opt-out every approach carries.
+/// So the body is one fact and two questions. The fact is that we wrote and
+/// heard nothing — ours entirely, off `contacts.touch_count`, not off their
+/// page. Everything is past tense and about the note. There is no claim, no
+/// requirement, no reproduction steps and no invitation to re-run them, and the
+/// opt-out every approach carries.
+///
+/// # It does not name the day, and it used to
+///
+/// The date came off `contacts.last_contacted_at`, which was an outbox column
+/// until [`chasing_turn`] started **claiming before sending**. `mark_contacted`
+/// now writes it when the touch is claimed, and the send after it can be
+/// refused by the provider — the touch is spent either way, deliberately, but
+/// the column then holds a day on which nothing left the building. Quoting it
+/// made the second email state a false fact about *us*, twice, in the subject
+/// and in the first clause.
+///
+/// A truthful date needs a record of what actually went out, which is a column
+/// this schema does not have. Between inventing one and dropping a sentence
+/// nobody asked for, the sentence goes: "earlier" is true under every outcome
+/// the claim-before-send trade can produce, and a chase whose subject is *"you
+/// did not answer"* never needed a date to say so.
 ///
 /// # The other two shapes, and why not
 ///
@@ -3016,15 +3025,14 @@ pub async fn due_chase(
 /// Not one byte of the prospect's page is in it, which is also what keeps the
 /// initiative loop's claim that its turn starts trusted by construction true on
 /// this path.
-fn chase_message(chase: &DueChase, opt_out: &str) -> crate::revenue::Outreach {
-    let when = chase.wrote_at.date_naive();
+fn chase_message(opt_out: &str) -> crate::revenue::Outreach {
     crate::revenue::Outreach {
-        subject: format!("Following up on my note of {when}"),
+        subject: "Following up on my earlier note".to_owned(),
         // Past tense throughout, and about the note rather than about the page.
         // "what your entry-requirements step showed when we ran it" stays true
         // after they deploy a fix; "what it shows" would not.
         body: format!(
-            "I wrote to you on {when} about what your entry-requirements step showed when we ran \
+            "I wrote to you earlier about what your entry-requirements step showed when we ran \
              it, and I have not heard back.\n\nIf that step is not yours, tell me who owns it and \
              I will write to them instead. If it is and this is not worth your time, say so and I \
              will leave it there.\n\n{opt_out}"
@@ -3188,7 +3196,7 @@ pub async fn chasing_turn(
     let outcome = seller
         .touch(
             &mut sequence,
-            &chase_message(chase, OPT_OUT),
+            &chase_message(OPT_OUT),
             TrustLabel::Untrusted,
             now,
         )
@@ -3476,7 +3484,7 @@ mod tests {
     use agentos_domain::untrusted::Untrusted;
     use agentos_providers::browser::{BrowserSession, MockBrowser};
     use agentos_providers::email::MockEmailProvider;
-    use agentos_providers::{ProviderBinding, ProviderError};
+    use agentos_providers::{FaultMode, ProviderBinding, ProviderError};
     use agentos_store::db::Db;
     use async_trait::async_trait;
     use chrono::{NaiveDate, TimeDelta};
@@ -6846,29 +6854,143 @@ mod tests {
         (account, contact, first)
     }
 
+    /// **The one fact the chase asserts must be one that happened.**
+    ///
+    /// `chase_message` quotes [`DueChase::wrote_at`] as the day we wrote, and
+    /// that column stopped being an outbox the moment [`chasing_turn`] started
+    /// claiming before sending: `mark_contacted` writes `last_contacted_at` at
+    /// the claim, and the send after it can fail. The touch is spent either way
+    /// — deliberately, that is what claiming buys — but the *date* is then a day
+    /// nothing left the building on, and the next chase states it to the
+    /// prospect as a fact about us.
+    ///
+    /// Reproduced through the real path, with one provider fault and no timing:
+    /// touch one goes out on day zero, touch two is claimed on day three and
+    /// refused by the provider, and on day six the queue offers the same person
+    /// with `wrote_at` pointing at day three.
+    #[tokio::test]
+    async fn a_chase_never_names_a_day_nothing_was_sent_on() {
+        let Some(db) = db().await else { return };
+        let now = Utc::now();
+        let desk = sales_desk(
+            &db,
+            &[&conflating_panel()],
+            StubOrizn::answering("visa_required", &verified_on(now)),
+            permissive(),
+        )
+        .await;
+        // Day zero: the first approach really goes out.
+        let (_, contact, _) = approached(&db, &desk, now).await;
+        assert_eq!(desk.email.sent_count(), 1);
+
+        // Day three: the same employee, behind a provider that is throttling.
+        // Only the mailer differs — same gate, same principal, same tenant.
+        let throttled = Arc::new(MockEmailProvider::with_fault(FaultMode::FailBefore(
+            ProviderError::from_status(429, None),
+        )));
+        let seller = Seller::new(
+            desk.gate.clone(),
+            Effects::new(
+                db.clone(),
+                Arc::new(Ports {
+                    email: throttled.clone(),
+                    ..crate::mocks::ports()
+                }),
+                desk.principal.clone(),
+            ),
+            desk.principal.clone(),
+            SENDER,
+            Suppression::new(),
+        );
+
+        let day_three = now + crate::revenue::FOLLOW_UP_AFTER;
+        let chase = next_chase(&db, &desk.principal, day_three)
+            .await
+            .expect("touch two is due");
+        let chased = chasing_turn(&db, &seller, &desk.principal, &chase, day_three)
+            .await
+            .expect("the chase reached an outcome");
+        assert!(
+            !chased.outcome.is_sent(),
+            "the provider was supposed to refuse it: {:?}",
+            chased.outcome
+        );
+        assert_eq!(
+            throttled.sent_count(),
+            0,
+            "nothing left the building on day three"
+        );
+        // The touch is spent all the same, which is the claim-before-send trade
+        // and is not what this test objects to.
+        assert_eq!(touch_state(&db, &desk.principal, contact).await.0, 2);
+
+        // **The hazard, on the row.** `last_contacted_at` now points at day
+        // three, and nothing was sent on day three. Any message that quotes this
+        // column as a send date states a false fact about us.
+        let claimed = last_contacted(&db, &desk.principal, contact).await;
+        assert_eq!(
+            claimed.date_naive(),
+            day_three.date_naive(),
+            "the claim did not move the column, so this proves nothing"
+        );
+
+        // Day six. The queue offers the same person, and the message it builds
+        // names no day at all — the only shape that stays true, because there is
+        // no column here that can vouch for one.
+        let day_six = day_three + crate::revenue::FOLLOW_UP_AFTER;
+        let next = next_chase(&db, &desk.principal, day_six)
+            .await
+            .expect("touch three is due");
+        assert_eq!(next.contact_id, contact);
+        let message = chase_message(OPT_OUT);
+        for half in [&message.subject, &message.body] {
+            assert!(
+                !half.chars().any(|c| c.is_ascii_digit()),
+                "the chase names a day, and the only day available to it is one \
+                 nothing was sent on ({}): {message:?}",
+                claimed.date_naive()
+            );
+        }
+    }
+
+    /// The column the chase used to quote: when this contact was last *claimed*,
+    /// which since `chasing_turn` claims before sending is not when anything was
+    /// last sent.
+    async fn last_contacted(db: &Db, principal: &Principal, contact: Uuid) -> DateTime<Utc> {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT last_contacted_at FROM contacts WHERE id = $1")
+                .bind(contact)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("read the contact");
+        tx.rollback().await.expect("rollback");
+        at
+    }
+
     /// **What the second email is allowed to say**, on its own and with no
     /// database in it.
     ///
-    /// The type already carries half the argument: a [`DueChase`] holds a
-    /// contact id, an address, a date off our own outbox column and an integer.
-    /// There is no [`Evidence`], no [`Probe`] and no page in it, so there is
-    /// nothing about the prospect's product available to say. This asserts the
-    /// other half — that what *is* available is used, and nothing that reads
-    /// like a claim is invented around it.
+    /// The signature carries half the argument: [`chase_message`] takes the
+    /// opt-out and nothing else, so there is no [`Evidence`], no [`Probe`], no
+    /// page and no row it *could* quote. This asserts the other half — that
+    /// nothing reading like a claim is invented anyway.
+    ///
+    /// It used to name the day we wrote, and that clause is gone: the column it
+    /// came from is written at the claim rather than at the send, so it could
+    /// name a day nothing went out. See [`chase_message`], and
+    /// [`a_chase_never_names_a_day_nothing_was_sent_on`] for the reproduction.
     #[test]
     fn the_second_email_states_one_fact_and_it_is_ours() {
-        let chase = DueChase {
-            contact_id: Uuid::nil(),
-            to: address(PROSPECT_EMAIL),
-            wrote_at: at(2026, 8, 12),
-            touches: 1,
-        };
-        let message = chase_message(&chase, OPT_OUT);
+        let message = chase_message(OPT_OUT);
 
-        // The one fact, in both halves: the day we wrote, off
-        // `contacts.last_contacted_at`.
-        assert!(message.subject.contains("2026-08-12"), "{message:?}");
-        assert!(message.body.contains("2026-08-12"), "{message:?}");
+        // The one fact, and it is ours: we wrote and heard nothing. No date —
+        // there is no column that can vouch for one.
+        assert!(
+            message.body.contains("I wrote to you earlier"),
+            "{message:?}"
+        );
+        assert!(message.body.contains("not heard back"), "{message:?}");
         // And the way out that every approach carries.
         assert!(message.body.contains("reply with STOP"), "{message:?}");
 
@@ -6982,7 +7104,7 @@ mod tests {
         );
 
         // The claim is in the first message and in nothing else.
-        let second = chase_message(&chase, OPT_OUT);
+        let second = chase_message(OPT_OUT);
         assert!(first.body.contains("How to see it again"));
         assert!(
             !second.body.contains("How to see it again"),
@@ -7002,19 +7124,14 @@ mod tests {
         }
 
         // And the clock the first message answers to, which this one does not.
+        // A fortnight on, `Approach::still_true` refuses the finding — and the
+        // chase is unmoved, because there is nothing in it for a clock to
+        // expire. That is now a property of its *signature*: the message is a
+        // function of the opt-out and nothing else, so no row, no date and no
+        // page can reach it.
         let approach = Approach::filed(first, now);
         assert!(!approach.still_true(now + TimeDelta::days(14)));
-        let fortnight = chase_message(
-            &DueChase {
-                wrote_at: now,
-                ..chase.clone()
-            },
-            OPT_OUT,
-        );
-        assert_eq!(
-            fortnight.body, second.body,
-            "the chase's words depend on something other than the day we wrote"
-        );
+        assert_eq!(chase_message(OPT_OUT).body, second.body);
     }
 
     /// **The touch limit bites, and it bites in the selection.**
