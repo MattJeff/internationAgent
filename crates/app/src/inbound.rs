@@ -1591,26 +1591,24 @@ const BARE_REFUSAL_WORDS: usize = 8;
 /// So this errs toward suppressing — with one exception that matters more than
 /// the rule. A polite refusal in prose ("merci, mais non", "not for us right
 /// now") is **not** matched here, and that is deliberate rather than a gap in
-/// the vocabulary list. On **email**, any inbound message already ends the
-/// follow-up sequence one line up in [`land`], via
+/// the vocabulary list. Any inbound message already ends the follow-up sequence
+/// one line up in [`land`], via
 /// [`stop_follow_up`](agentos_store::revenue::stop_follow_up) — so the person
 /// who says "thanks but no" is not chased again either way. What a suppression
 /// adds on top is *permanent, cross-campaign, cannot-be-re-imported*, and
-/// reading that out of "not right now" claims more than they said.
-///
-/// **That half of the argument does not hold on a phone channel, and saying so
-/// is the point of this paragraph.** `stop_follow_up` is
-/// `WHERE email = $1`; a number matches no row, so an inbound SMS or WhatsApp
-/// ends nothing. On those channels a missed STOP costs the chase as well as the
-/// message, which makes the false negative dearer than the email case this
-/// argument was written for — and it is still the cheaper of the two errors,
-/// because the other one is for ever. The fix is a `stop_follow_up` keyed on
-/// the channel's own address rather than on `email`, and it belongs in the
-/// change that gives `contacts.phone` a follow-up column, not here. It is the
+/// reading that out of "not right now" claims more than they said. It is the
 /// same argument [`crate::queue::reconcile_opt_outs`] makes for recording a
 /// platform unsubscribe as [`Scope::Tenant`](agentos_store::revenue::Scope)
 /// rather than `Global`: record the claim they made, not the larger one we
 /// could infer.
+///
+/// **That half of the argument held on email only, and this paragraph used to
+/// say so.** `stop_follow_up` was `WHERE email = $1`; a number matched no row,
+/// so an inbound SMS or WhatsApp ended nothing and a missed STOP by text cost
+/// the chase as well as the message. It is now keyed on `(channel, address)`
+/// and matches `contacts.phone` on a phone channel, which is what makes the
+/// sentence above true on the very channels this narrowing is about. The
+/// asymmetry it rests on is restored, not assumed.
 ///
 /// # Why the channel is an argument
 ///
@@ -1646,22 +1644,20 @@ const BARE_REFUSAL_WORDS: usize = 8;
 ///
 /// The direction is chosen by the asymmetry and not by taste. A **missed** STOP
 /// sends one more message to somebody who does not want it — unpleasant,
-/// repairable, and the next STOP catches it. On **email** it does not even
-/// leave the chase running: `stop_follow_up` fires in [`land`] on any inbound
-/// message, before this classifier is consulted, so the sequence is over either
-/// way and what a missed refusal loses is only the permanent, cross-campaign
-/// half.
-///
-/// **On the very channels this narrowing is about, that consolation is false.**
-/// `stop_follow_up` is `WHERE email = $1`, so a phone number matches no row and
-/// an inbound text ends no sequence. A missed STOP by text costs the chase as
-/// well. It is still the cheaper error — the other one is for ever — but the
-/// margin is thinner here than the email case this argument grew up in, and
-/// pretending otherwise would be arguing from the wrong population twice over.
-/// An
+/// repairable, and the next STOP catches it. It does not even leave the chase
+/// running: `stop_follow_up` fires in [`land`] on any inbound message, before
+/// this classifier is consulted, so the sequence is over either way and what a
+/// missed refusal loses is only the permanent, cross-campaign half. An
 /// **invented** STOP makes a customer unreachable forever, on every channel at
 /// once, through a row nobody can delete. Those two do not cost the same, so
 /// they must not be traded at the same rate.
+///
+/// That consolation was false on the very channels this narrowing is about for
+/// as long as `stop_follow_up` was `WHERE email = $1` — a number matched no row
+/// and an inbound text ended no sequence, so a missed STOP by text cost the
+/// chase as well. The key is `(channel, address)` now and a text lands on
+/// `contacts.phone`, so the two errors are weighed at the rate this paragraph
+/// always claimed. The claim and the mechanism are the same sentence again.
 ///
 /// # Open, and it is the founder's call rather than this function's
 ///
@@ -1794,6 +1790,14 @@ fn quotes_the_original(line: &str) -> bool {
 
 /// How `suppressions` spells this counterparty, or `None` when it cannot hold
 /// them at all.
+///
+/// `0011_revenue.sql` writes it once and both tables believe it: the address on
+/// a suppression is normalised *"the same way `contacts.email` /
+/// `contacts.phone` are, because the check between them is an equality test"*.
+/// So this answers for `contacts` too, and [`land`] reads it twice — once to
+/// stop the chase on the channel a reply arrived on, once to record a refusal on
+/// it. One spelling, two readers; two spellings would be the seam where a
+/// stopped chase and a recorded opt-out disagree about who just wrote in.
 ///
 /// # The question [`land`] used to ask, and why it was the wrong one
 ///
@@ -2029,6 +2033,11 @@ pub async fn land(
     // authorises anything. See `crate::psyche`.
     if message.direction == Direction::Inbound {
         let from = contact_of(&message.from);
+        // How the revenue schema spells this counterparty, computed once and
+        // read twice below: the chase that stops and the refusal that may
+        // follow it are the same person on the same channel, and two spellings
+        // of that would be two answers to it.
+        let addressed = suppressible(message.channel, &from);
         let ours = preceded_by_our_message(tx, message.conversation_id, message_id).await?;
         psyche::observe_reply(
             tx,
@@ -2057,27 +2066,41 @@ pub async fn land(
         // prospect who replies and is chased four minutes later by a cadence
         // that had already selected them.
         //
-        // `contact_of` lower-cases and drops the display name, which is exactly
-        // the spelling `contacts_email_lower` guarantees on the column — so this
-        // is an equality test on one spelling rather than a guess at three.
+        // **And "or SMS" is true here for the first time.** The claim above was
+        // written when `land` had one channel and stayed in place after
+        // `0069_a_number_is_an_endpoint_too` gave it a second: `stop_follow_up`
+        // was `WHERE email = $1`, a number matched no row, and a prospect who
+        // answered a cold email by text went on being chased for three more
+        // days. `suppressible` names the channel and spells the address the way
+        // that channel's column spells it — lower-case for `contacts.email`,
+        // E.164 for `contacts.phone` — so this is an equality test on one
+        // spelling rather than a guess at three, on both.
+        //
+        // `None` is the counterparty `contacts` cannot hold at all: a short
+        // code, an A2A peer id, an internal slug. Nobody is chasing an address
+        // no row can carry, so there is nothing to stop and nothing to say —
+        // unlike the refusal below, where `None` means a person's opt-out was
+        // heard and could not be recorded.
         //
         // Not a suppression: they replied, they did not opt out. STOP is
         // `revenue_store::suppress`, and it deactivates the row.
-        match revenue_store::stop_follow_up(tx, &from).await {
-            Ok(0) => {}
-            Ok(stopped) => tracing::info!(
-                contacts = stopped,
-                "this person answered; their follow-up sequence is over"
-            ),
-            // Swallowed, and it is the one write here that is. The message has
-            // landed and the turn is enqueued; failing the whole ingest because
-            // a sales column would not update would dead-letter a human's reply
-            // over bookkeeping. Loud, because the cost of losing it is one
-            // unwanted chase in three days.
-            Err(err) => tracing::error!(
-                error = %err,
-                "a reply did not stop the follow-up sequence; this person may be chased again"
-            ),
+        if let Some((channel, address)) = addressed.as_ref() {
+            match revenue_store::stop_follow_up(tx, *channel, address).await {
+                Ok(0) => {}
+                Ok(stopped) => tracing::info!(
+                    contacts = stopped,
+                    "this person answered; their follow-up sequence is over"
+                ),
+                // Swallowed, and it is the one write here that is. The message
+                // has landed and the turn is enqueued; failing the whole ingest
+                // because a sales column would not update would dead-letter a
+                // human's reply over bookkeeping. Loud, because the cost of
+                // losing it is one unwanted chase in three days.
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "a reply did not stop the follow-up sequence; this person may be chased again"
+                ),
+            }
         }
 
         // **And where a refusal becomes final.** The line above ends one
@@ -2127,7 +2150,7 @@ pub async fn land(
         // own — whether a human confirms before a `phone` row is written — is
         // written out in full on that function and is deliberately open.
         if refuses_contact(message.channel, &message.body_text) {
-            match suppressible(message.channel, &from) {
+            match addressed {
                 Some((channel, address)) => {
                     revenue_store::suppress(
                         tx,
@@ -5319,6 +5342,166 @@ mod tests {
         // different shape from the contact it should match never fires.
         assert_eq!(address, refuser.as_str());
         assert_eq!(reason, "opt_out");
+    }
+
+    /// A prospect this tenant is mid-cadence with, reachable at both addresses
+    /// and due for their next chase at `due`.
+    async fn prospect(
+        db: &Db,
+        tenant: TenantId,
+        phone: &E164,
+        email: &str,
+        due: DateTime<Utc>,
+    ) -> Uuid {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let account = Uuid::now_v7();
+        revenue_store::insert_account(
+            &mut tx,
+            account,
+            &revenue_store::NewAccount {
+                legal_name: "Deutsche Lufthansa AG",
+                // Unique per tenant, and two prospects here mean two accounts.
+                domain: &format!("{}.test", phone.digits()),
+                segment: "airline",
+                country: "DE",
+                employee_id: None,
+                location: None,
+                website: None,
+            },
+        )
+        .await
+        .expect("account");
+
+        let contact = Uuid::now_v7();
+        revenue_store::insert_contact(
+            &mut tx,
+            contact,
+            &revenue_store::NewContact {
+                account_id: account,
+                full_name: "Anke Vogel",
+                email: Some(email),
+                phone: Some(phone.as_str()),
+                role: None,
+                language: None,
+                is_primary: false,
+                lawful_basis: "legitimate_interest",
+                next_follow_up_at: Some(due),
+            },
+        )
+        .await
+        .expect("contact");
+        tx.commit().await.expect("commit prospect");
+        contact
+    }
+
+    /// Who the seller's cadence would chase next — `vertical::due_chase`'s own
+    /// query, not the column behind it.
+    async fn chased(db: &Db, tenant: TenantId, as_of: DateTime<Utc>) -> BTreeSet<Uuid> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let due = revenue_store::contacts_due_for_follow_up(&mut tx, as_of, 10, 0..3)
+            .await
+            .expect("due");
+        tx.commit().await.expect("commit read");
+        due.into_iter().map(|c| c.id).collect()
+    }
+
+    /// **A text is an answer, and until this landed the cadence never heard
+    /// it.**
+    ///
+    /// `land` calls `stop_follow_up` on every inbound message, and that call was
+    /// `WHERE email = $1`. A phone number matches no `contacts` row by email, so
+    /// a prospect who answered a cold email **by text** stayed on the three-day
+    /// cadence and was written to again — through the same door
+    /// `0069_a_number_is_an_endpoint_too` had just opened. It also made
+    /// `refuses_contact` argue from a premise that was false on the very
+    /// channels it had been narrowed for: *their sequence is over either way*.
+    ///
+    /// Four claims, and the last two are the ones that make a green run mean
+    /// something:
+    ///
+    /// 1. both prospects are chaseable before the text — a queue that was
+    ///    already empty would satisfy claim 2 without the fix;
+    /// 2. the one who texted is off the queue;
+    /// 3. **the one who did not text is still on it.** An `UPDATE` that dropped
+    ///    the address predicate stops every chase in the tenant and passes
+    ///    claims 1 and 2 exactly as the real fix does;
+    /// 4. the texter is still `active` and holds no suppression row. Answering
+    ///    is not opting out, and the neighbouring wrong fix — treat any inbound
+    ///    text as a STOP — also empties the queue, permanently, on a table with
+    ///    no DELETE.
+    #[tokio::test]
+    async fn a_prospect_who_answers_by_text_stops_being_chased() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let pool = number(20);
+        allocate(&db, tenant, lena, &pool, true, now - Duration::days(1)).await;
+        let telephony = MockTelephony::new(now, "tok");
+
+        // Both were written to three days ago and are due now. `now` and not a
+        // date in the future: `chased` is asked at `now`, so a fixture that
+        // failed to cross the threshold shows up as claim 1 and not as a
+        // silently empty queue underneath claims 2 and 3.
+        let texter_number = number(21);
+        let texter = prospect(&db, tenant, &texter_number, "anke@lh.test", now).await;
+        // The address `raw`/`notice` write into `From`, so this one is
+        // reachable by the email ingest below without a second fixture.
+        let silent = prospect(&db, tenant, &number(22), "ap@supplier.example", now).await;
+        assert_eq!(
+            chased(&db, tenant, now).await,
+            BTreeSet::from([texter, silent]),
+            "the fixture is not on the chase queue; nothing below would mean anything"
+        );
+
+        // One of them replies, on the channel nothing keyed on.
+        text(
+            &db,
+            tenant,
+            &telephony,
+            &form(
+                "SM_reply",
+                texter_number.as_str(),
+                &pool,
+                "Bonjour, oui — envoyez-moi les détails la semaine prochaine.",
+            ),
+            now,
+        )
+        .await
+        .expect("the reply lands");
+
+        assert_eq!(
+            chased(&db, tenant, now).await,
+            BTreeSet::from([silent]),
+            "either the person who answered by text is still being chased, or answering emptied \
+             the whole tenant's queue"
+        );
+
+        // And the other one answers the ordinary way, through the ordinary
+        // door. The channel is read from the message on both paths, so a fix
+        // that hard-coded either one passes exactly half of this test.
+        let email = MockEmailProvider::new();
+        email.seed_inbound(raw("email_reply", now, Duration::hours(1)), []);
+        deliver(&db, &email, tenant, &notice("email_reply", now), now)
+            .await
+            .expect("the email reply lands");
+        assert!(
+            chased(&db, tenant, now).await.is_empty(),
+            "a reply by email no longer stops the sequence it always stopped"
+        );
+
+        // They answered; they did not opt out.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let active: bool = sqlx::query_scalar("SELECT active FROM contacts WHERE id = $1")
+            .bind(texter)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read contact");
+        tx.commit().await.expect("commit read");
+        assert!(active, "a reply deactivated the person who sent it");
+        assert!(
+            suppressions_of(&db, tenant).await.is_empty(),
+            "a reply was recorded as a permanent opt-out"
+        );
     }
 
     /// A number `suppressions` cannot hold is loud and loses nothing.

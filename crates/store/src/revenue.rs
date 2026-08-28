@@ -975,22 +975,55 @@ pub async fn contacts_due_for_follow_up(
 /// turn, so the reason has nowhere to live and nothing to tell.
 ///
 /// Keyed on the **address** rather than on a contact id because the caller is
-/// `app::inbound::land`, and what an inbound email carries is an address. RLS
-/// scopes it to the tenant, and `contacts_email_key` is unique per tenant, so
-/// this touches at most one row.
+/// `app::inbound::land`, and what an inbound message carries is an address.
+/// RLS scopes it to the tenant.
+///
+/// # The channel is the other half of the key, and it used to be missing
+///
+/// This was `WHERE email = $1` for as long as email was the only channel that
+/// reached `land`. It stopped being true the day `land_inbound_text` acquired a
+/// caller (`0069_a_number_is_an_endpoint_too`), and the failure was silent: a
+/// number matches no `contacts` row by `email`, so a prospect who answered a
+/// cold email **by text** went on being chased on the three-day cadence, and
+/// `refuses_contact`'s whole reason for tolerating a polite "merci, mais non"
+/// — *their sequence is over either way* — was false on exactly the channels it
+/// had just been narrowed for.
+///
+/// The pair `(channel, address)` is the same key `suppressions` has carried
+/// since `0011_revenue.sql`, matched the same way `revenue_suppression_of`
+/// matches it: an `email` row against `contacts.email`, a `phone` row against
+/// `contacts.phone`. The precedent is followed rather than re-argued, down to
+/// the `case` form of `suppressions_address_normalised` — a channel this
+/// function has never heard of yields `NULL`, which equals nothing, so an
+/// unknown channel stops **no** sequence rather than every one of them.
+///
+/// The address must arrive spelled the way the column spells it — lower-case
+/// for `email`, E.164 for `phone` — which is what `contacts_email_lower` and
+/// `contacts_phone_e164` guarantee on one side and `app::inbound::suppressible`
+/// produces on the other. That is an equality test on one spelling rather than
+/// a guess at three.
 ///
 /// Returns how many rows it stopped, so a caller can log the interesting case
-/// and stay silent about the ordinary one — most inbound mail is from somebody
-/// nobody is chasing.
+/// and stay silent about the ordinary one — most inbound traffic is from
+/// somebody nobody is chasing. At most one row on `email`, which
+/// `contacts_email_key` makes unique per tenant; **possibly several** on
+/// `phone`, which has no unique index, and stopping every one of them is the
+/// same reading `suppressions_deactivate_contacts` takes of the same address.
 ///
 /// Not a suppression: they replied, they did not opt out. An opt-out is
 /// [`suppress`], which deactivates the row by trigger.
-pub async fn stop_follow_up(tx: &mut TenantTx<'_>, email: &str) -> Result<u64, RevenueError> {
+pub async fn stop_follow_up(
+    tx: &mut TenantTx<'_>,
+    channel: Channel,
+    address: &str,
+) -> Result<u64, RevenueError> {
     Ok(sqlx::query(
         "UPDATE contacts SET next_follow_up_at = NULL, updated_at = now() \
-          WHERE email = $1 AND active AND next_follow_up_at IS NOT NULL",
+          WHERE active AND next_follow_up_at IS NOT NULL \
+            AND (CASE $1::text WHEN 'email' THEN email WHEN 'phone' THEN phone END) = $2::text",
     )
-    .bind(email)
+    .bind(channel.as_str())
+    .bind(address)
     .execute(&mut ***tx)
     .await?
     .rows_affected())
@@ -2783,6 +2816,128 @@ mod tests {
 
         drop_tenant(&db, a).await;
         drop_tenant(&db, b).await;
+    }
+
+    /// **The chase stops on the channel they answered on, and on no other.**
+    ///
+    /// `stop_follow_up` was `WHERE email = $1`, so a phone number matched no row
+    /// and an inbound text left the three-day cadence running. The seeded
+    /// contact carries both addresses, which is what lets the four arms below be
+    /// told apart at all.
+    ///
+    /// Each assertion is written for what it **admits**, not for what it
+    /// rejects, because the obvious wrong fix here passes a looser one: keying
+    /// on the address alone (`email = $2 OR phone = $2`) stops the right chase
+    /// for the right reason and also stops it when an *email* opt-out names a
+    /// number, which is how a contact reachable at both addresses gets dropped
+    /// off the queue by a message that was never theirs. So the two zero-row
+    /// arms come first and they are `== 0`, not `is_ok()`.
+    ///
+    /// The date arithmetic is checked rather than assumed: `seed_graph` writes
+    /// `now + 3 days` and the queue is asked at `now + 4 days`, so the first
+    /// assertion fails loudly if the fixture ever stops crossing the threshold
+    /// the rest of the test reads through.
+    #[tokio::test]
+    async fn a_reply_stops_the_chase_only_on_the_channel_it_arrived_on() {
+        let Some(db) = db().await else { return };
+        let now = at(1_800_000_100);
+        let tenant = seed_tenant(&db, "revenue-stop-follow-up").await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+
+        let email = "anke.stop@lufthansa.test";
+        let phone = "+4915112345678";
+        let graph = seed_graph(&mut tx, now, email).await;
+
+        // One spelling of "who is due", read six times below. `now + 4 days` is
+        // one day past what `seed_graph` writes.
+        macro_rules! due {
+            () => {
+                contacts_due_for_follow_up(&mut tx, now + TimeDelta::days(4), 10, 0..3)
+                    .await
+                    .expect("due")
+            };
+        }
+
+        assert_eq!(
+            due!().len(),
+            1,
+            "the fixture must be due before anything stops it, or the rest of this test reads a \
+             queue that was already empty"
+        );
+
+        // The number, offered on the email channel. Nobody wrote to this person
+        // at that address — there is no such address — so nothing may stop.
+        assert_eq!(
+            stop_follow_up(&mut tx, Channel::Email, phone)
+                .await
+                .expect("email/number"),
+            0,
+            "a number matched an email key; the channel is not part of the key"
+        );
+        // And the mirror: their address, offered on the phone channel.
+        assert_eq!(
+            stop_follow_up(&mut tx, Channel::Phone, email)
+                .await
+                .expect("phone/address"),
+            0,
+            "an address matched a phone key; the channel is not part of the key"
+        );
+        assert_eq!(
+            due!().len(),
+            1,
+            "a message on a channel this contact was never reached on ended their sequence"
+        );
+
+        // They text back. This is the arm that did not exist.
+        assert_eq!(
+            stop_follow_up(&mut tx, Channel::Phone, phone)
+                .await
+                .expect("phone/number"),
+            1,
+            "a text from a number `contacts.phone` holds stopped nothing"
+        );
+        assert!(
+            due!().is_empty(),
+            "they answered by text and the cadence kept them"
+        );
+
+        // Put them back on the queue and prove the email arm still carries what
+        // it always carried: a fix that only ever reads `phone` passes every
+        // assertion above.
+        mark_contacted(
+            &mut tx,
+            graph.contact,
+            now,
+            Some(now + TimeDelta::days(3)),
+            3,
+        )
+        .await
+        .expect("chase");
+        assert_eq!(due!().len(), 1, "back on the queue");
+        assert_eq!(
+            stop_follow_up(&mut tx, Channel::Email, email)
+                .await
+                .expect("email/address"),
+            1,
+            "the email arm stopped working"
+        );
+        assert!(due!().is_empty());
+
+        // Nothing here is a suppression: they replied, they did not opt out.
+        // The adjacent wrong fix — treating any inbound message as an opt-out —
+        // would leave the contact inactive and a row in the append-only table.
+        let (active, suppressions): (bool, i64) = sqlx::query_as(
+            "SELECT c.active, (SELECT count(*) FROM suppressions) FROM contacts c WHERE c.id = $1",
+        )
+        .bind(graph.contact)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read back");
+        assert!(active, "answering deactivated the person who answered");
+        assert_eq!(suppressions, 0, "a reply was recorded as an opt-out");
+
+        tx.commit().await.expect("commit");
+        drop_tenant(&db, tenant).await;
     }
 
     // -- suppression --------------------------------------------------------
