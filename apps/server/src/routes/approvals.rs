@@ -69,6 +69,26 @@
 //! seam an executor plugs into, and inventing an outbox event that no handler
 //! reads would be scaffolding, not a feature.
 //!
+//! # Why there is no "where did this come from" on the queue
+//!
+//! The obvious missing field on [`ApprovalView`] is provenance: *this request
+//! was built from a page your employee read*. It is missing because it has one
+//! possible value. Every arm of `policy::evaluate` that answers
+//! `RequireApproval` is `Risk::High`, and the taint wire refuses a high-risk
+//! action from untrusted input before an approval is filed — so a tainted row
+//! cannot exist. The four call sites that file approvals outside the gate —
+//! `agentos_app::provisioning` and the three in `crate::loops::provisioning` —
+//! compose their text from step names and employee ids, never from a document.
+//! `agentos_app::gate`'s `an_untrusted_turn_puts_no_line_in_the_approval_queue`
+//! is that claim against the real table.
+//!
+//! A column reading `trusted` on every row is the shape this repository has
+//! deleted twice — a `traceparent` NULL everywhere, a memory table nothing
+//! wrote. The one thing that would make it worth writing is an arm answering
+//! `RequireApproval` for a `Risk::Low` action, which the wire does not catch;
+//! that gate test names it as the edge it does not cover, and nothing else in
+//! the workspace watches for it either. Revisit then, and not before.
+//!
 //! Denying is the mirror: one guarded `UPDATE` off `pending`, one audit row, in
 //! one transaction. After it the nonce can never be spent — the gate's own
 //! redemption predicate requires `state = 'pending'` — which is what "the
