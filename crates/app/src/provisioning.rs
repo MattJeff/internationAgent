@@ -1595,8 +1595,8 @@ mod tests {
     use agentos_providers::email::MockEmailProvider;
     use agentos_providers::secrets::MemorySecretStore;
     use agentos_providers::telephony::{
-        InboundCtx, MockTelephony, OutboundSms, OutboundWhatsapp, ParseError, ProviderMessageId,
-        SigError, WebhookBody,
+        InboundCtx, MockTelephony, OutboundCall, OutboundSms, OutboundWhatsapp, ParseError,
+        ProviderMessageId, SigError, WebhookBody,
     };
     use async_trait::async_trait;
     use tokio::sync::Notify;
@@ -1955,6 +1955,14 @@ mod tests {
             unimplemented!("provisioning never sends")
         }
 
+        async fn place_call(
+            &self,
+            _key: &IdempotencyKey,
+            _call: &OutboundCall,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("provisioning never dials")
+        }
+
         fn verify_webhook(
             &self,
             _url: &str,
@@ -2041,6 +2049,14 @@ mod tests {
             _message: &OutboundWhatsapp,
         ) -> Result<ProviderMessageId, ProviderError> {
             unimplemented!("provisioning never sends")
+        }
+
+        async fn place_call(
+            &self,
+            _key: &IdempotencyKey,
+            _call: &OutboundCall,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("provisioning never dials")
         }
 
         fn verify_webhook(

@@ -53,7 +53,9 @@ use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
 use agentos_providers::email::{EmailProvider, OutboundEmail, ProviderMessageId};
 use agentos_providers::leads::{self as leads, LeadSink};
-use agentos_providers::telephony::{OpenWindow, OutboundSms, OutboundWhatsapp, TelephonyProvider};
+use agentos_providers::telephony::{
+    OpenWindow, OutboundCall, OutboundSms, OutboundWhatsapp, TelephonyProvider,
+};
 use agentos_providers::{ProviderBinding, ProviderError};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
@@ -275,6 +277,22 @@ subject!(
 subject!(
     /// Send a WhatsApp message to one number.
     WhatsappSend { to: E164 } => WhatsappSend
+);
+subject!(
+    /// Ring one number.
+    ///
+    /// The strictest of the four outbound subjects to obtain, and not because
+    /// anything here says so — `domain::policy` does, twice over. A call has to
+    /// clear `Channel::Voice` **and** match a prefix in `allowed_calling_codes`
+    /// (`always_denies` asks both, `evaluate`'s arm asks both in that order),
+    /// where an email clears a channel and a denylist. On top of that
+    /// `spends_contact_budget` charges it, so the first call to a stranger eats
+    /// one of the day's cold contacts exactly as a first email does.
+    ///
+    /// That is the answer to "is a call worse than an SMS": the packs refuse
+    /// SMS by *omitting* it, and voice is refused by a rule instead — which is
+    /// the stronger of the two, because a rule survives a pack being rewritten.
+    CallPlace { to: E164 } => CallPlace
 );
 subject!(
     /// Look at what a page on a domain already says.
@@ -725,7 +743,8 @@ pub struct Ports {
     /// billed differently, and only one of them can be told somebody
     /// unsubscribed. See [`agentos_providers::leads`].
     pub leads: Arc<dyn LeadSink>,
-    /// SMS and WhatsApp.
+    /// SMS, WhatsApp, and the dial. Not what a call says — see
+    /// [`Effects::place_call`].
     pub telephony: Arc<dyn TelephonyProvider>,
     /// The employee's browser.
     pub browser: Arc<dyn BrowserProvider>,
@@ -917,6 +936,67 @@ impl Effects {
             .await
             .map_err(EffectError::Provider);
         self.record(&ok, message_detail(&sent), sent).await
+    }
+
+    /// Ring the number on the token, from this employee's own number.
+    ///
+    /// # There is no body, and that is the shape of the honest half
+    ///
+    /// Every other message-shaped method here takes a rendered thing beside its
+    /// token — a [`RenderedEmail`], a [`RenderedSms`]. This one takes an
+    /// [`E164`] and nothing else, because there is nothing else to take: the
+    /// call is silent. What a call *says* is speech synthesis, recognition and
+    /// a turn-taking loop over a media stream, none of which exists anywhere in
+    /// this workspace, and a `body: String` parameter here would be an argument
+    /// every adapter throws away. See
+    /// [`OutboundCall`](agentos_providers::telephony::OutboundCall), which has
+    /// no field for it for the same reason, and
+    /// `telephony_twilio::SILENT_TWIML`, which is the whole of what the callee
+    /// hears.
+    ///
+    /// So this is the *dialling* half of a phone call, built and testable, and
+    /// it is deliberately not reachable by a model: `ActionKind::CallPlace` is
+    /// still in [`crate::turn::UNSERVED`], with the reason rewritten to name
+    /// what is now missing rather than what used to be.
+    ///
+    /// # `Ok` means the carrier took the request, not that anybody answered
+    ///
+    /// Restated here and not merely on the port, because this is the layer that
+    /// writes the audit row and the row is what an operator reads afterwards.
+    /// `provider_call_attempted` with `effect: "call_place"` and an `ok`
+    /// outcome says *we asked a carrier to ring this number and it agreed to*.
+    /// Busy, no answer, an answering machine and a decline all happen after
+    /// this returns, they arrive on a status callback no route in this build
+    /// accepts, and none of them can make this row say anything different.
+    ///
+    /// The `from` number comes from the caller and the `to` number comes off
+    /// the token — never the other way round, and never both from one place.
+    /// They are the same type, so a swap compiles and returns `Ok`; what
+    /// catches it is `the_number_dialled_is_the_number_the_gate_ruled_on`
+    /// below, reading the double's own log.
+    pub async fn place_call<A: Subject<Of = CallPlace>>(
+        &self,
+        ok: Authorized<A>,
+        from: E164,
+    ) -> Result<ProviderMessageId, EffectError> {
+        let call = OutboundCall {
+            from,
+            // The number that was ruled on, exactly as `send_email` takes its
+            // recipient off the token rather than out of a rendered header.
+            to: ok.action().subject().to.clone(),
+        };
+
+        let placed = self
+            .ports
+            .telephony
+            .place_call(&self.key_for(&ok), &call)
+            .await
+            .map_err(EffectError::Provider);
+        // `message_detail`'s `provider_message_id`, reused rather than spelled
+        // a second way: it is the id the provider handed back, which is what
+        // the key means, and the row's own `effect` field already says a call
+        // is what it was handed back for.
+        self.record(&ok, message_detail(&placed), placed).await
     }
 
     /// Run one browser step in an existing session.
@@ -2315,7 +2395,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::Mutex;
 
-    use agentos_domain::action::{ActionKind, Channel};
+    use agentos_domain::action::{ActionKind, CallingCode, Channel};
     use agentos_domain::ids::{EmployeeId, TenantId};
     use agentos_domain::money::Currency;
     use agentos_domain::policy::{DenyReason, PolicyLimits, SpendLimits};
@@ -2477,7 +2557,24 @@ mod tests {
                 // policy that grants a host without granting the channel grants
                 // nothing — which is what the browser tests below discovered
                 // one `ChannelNotAllowed` at a time.
-                allowed_channels: BTreeSet::from([Channel::Email, Channel::Web]),
+                // `Channel::Voice` and the calling code below because this
+                // fixture now dials, and a policy that grants one without the
+                // other grants nothing: `evaluate`'s `CallPlace` arm asks the
+                // channel *and* the prefix, which is the whole of what makes
+                // voice the strictest outbound channel in this file.
+                //
+                // Widening a shared fixture is normally how a test starts
+                // passing for the wrong reason, and here it cannot: no other
+                // test in this module authorises a phone-shaped action, so
+                // `Voice` and `+1` are read by exactly one of them. What it is
+                // **not** is a claim about a real deployment —
+                // `store::policy::default_ceiling` grants neither, layers only
+                // narrow, and this database has no platform layer at all. See
+                // `turn::UNSERVED`'s `CallPlace` entry.
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Web, Channel::Voice]),
+                allowed_calling_codes: BTreeSet::from([
+                    CallingCode::new(1).expect("+1 is a calling code")
+                ]),
                 // Still here, and still doing work: reading no longer consults
                 // it, but `BrowserWrite` and `FileUpload` do, and the browser
                 // tests below authorise writes against exactly this entry.
@@ -2621,6 +2718,20 @@ mod tests {
             email: Arc::new(MockEmailProvider::new()),
             telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
             browser,
+            mcp: Arc::new(StubMcp),
+            payments: MockPayments::healthy(),
+            leads: Arc::new(MockLeadSink::new()),
+        })
+    }
+
+    /// The same ports with the telephony double kept in hand, for the call
+    /// test: what it asserts is which number actually got dialled, and an
+    /// `Arc<dyn TelephonyProvider>` cannot be asked.
+    fn ports_dialling(telephony: Arc<MockTelephony>) -> Arc<Ports> {
+        Arc::new(Ports {
+            email: Arc::new(MockEmailProvider::new()),
+            telephony,
+            browser: Arc::new(MockBrowser::new()),
             mcp: Arc::new(StubMcp),
             payments: MockPayments::healthy(),
             leads: Arc::new(MockLeadSink::new()),
@@ -2861,6 +2972,81 @@ mod tests {
             ["buyer@example.com"],
             "and nobody new reached the platform"
         );
+    }
+
+    /// The seam, and the two things that can only go wrong at it.
+    ///
+    /// `OutboundCall` has two `E164` fields, and this method is the only place
+    /// in the workspace where they are filled in from two different sources —
+    /// one off the token, one off the argument. A swap type-checks, returns
+    /// `Ok`, writes a perfectly ordinary audit row, and rings the employee's
+    /// own desk from the stranger's number. Nothing but this assertion is
+    /// between that and production.
+    ///
+    /// The second half is the number the gate refuses. `+33…` is outside the
+    /// fixture's `allowed_calling_codes`, so it is denied for a reason no other
+    /// channel has — and the assertion that matters is not the `Denied`, it is
+    /// that the double's dial log did not grow.
+    #[tokio::test]
+    async fn the_number_dialled_is_the_number_the_gate_ruled_on() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let gate = gate(&db);
+        let phone = Arc::new(MockTelephony::new(Utc::now(), "token"));
+        let effects = Effects::new(db.clone(), ports_dialling(phone.clone()), principal.clone());
+
+        let mine = E164::parse("+15005550006").expect("e164");
+        let theirs = E164::parse("+14158675309").expect("e164");
+        let ok = gate
+            .authorize(&principal, CallPlace { to: theirs.clone() })
+            .await
+            .expect("voice and +1 are both granted by the fixture policy");
+        let placed = effects
+            .place_call(ok, mine.clone())
+            .await
+            .expect("the carrier took it");
+
+        // The assembly, read off the provider rather than off our own hopes.
+        assert_eq!(
+            phone.dialled(),
+            [OutboundCall {
+                from: mine.clone(),
+                to: theirs
+            }],
+            "the numbers are the token's `to` and the caller's `from`, in that order"
+        );
+
+        // And the row an operator reads afterwards. `ok` here means the carrier
+        // agreed to dial and nothing more — no field of this row can say
+        // whether anybody picked up, which is `place_call`'s whole caveat.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["effect"], json!("call_place"));
+        assert_eq!(rows[0].1["outcome"], json!("ok"));
+        assert_eq!(
+            rows[0].1["detail"]["provider_message_id"],
+            json!(placed.as_str())
+        );
+
+        // A number outside the granted calling codes: refused before any
+        // adapter is troubled, which is the half a `Denied` alone would not
+        // prove.
+        let elsewhere = gate
+            .authorize(
+                &principal,
+                CallPlace {
+                    to: E164::parse("+33123456789").expect("e164"),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                elsewhere,
+                Err(Denied::Policy(DenyReason::CallingCodeNotAllowed))
+            ),
+            "a calling code nobody granted must not be dialable: {elsewhere:?}"
+        );
+        assert_eq!(phone.dialled().len(), 1, "the refused number rang anyway");
     }
 
     #[test]
