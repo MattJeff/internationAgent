@@ -22,6 +22,37 @@
 //! * **There is no update and no delete.** Not "there is no function for it" —
 //!   `app_role` lacks the privilege and a trigger rejects the statement even
 //!   for a superuser (see `0001_core.sql`). The tests below prove both.
+//!
+//! # FOUNDER'S QUESTION, LEFT OPEN: how long may a row name a counterparty?
+//!
+//! The three shapes above are about correctness and they are settled. This one
+//! is not, and it is the bill they run up: a row here names people who are not
+//! customers of ours — `agentos_app::gate`'s `counterparty` writes a prospect's
+//! address or number on every ruling, `app::inbound` writes an inbound sender's
+//! under `from`, `app::effects` writes both sides of a refused WhatsApp send —
+//! and **no statement in this system can ever remove one**. Not a tenant
+//! deletion: the missing foreign key is deliberate, so a tenant that leaves
+//! takes nothing with it. Not a correction: the trigger binds superusers.
+//!
+//! That is the right answer for *what happened* and it has no answer at all for
+//! *for how long*. A person who asks to be forgotten is answered today by a
+//! `suppressions` row, which stops us writing to them and adds one more record
+//! of who they are.
+//!
+//! The question is the founder's for `0063`'s reason — it is a judgement about
+//! what this company owes somebody who never asked to be in a database, traded
+//! against an audit trail whose whole value is that nobody can edit it, and no
+//! number in this repository sources it. It is **not** a defect to fix in
+//! passing, and it must not be answered by quietly leaving fields off refusal
+//! rows: a trail that cannot say who a refused send was for is a trail that
+//! cannot be audited, which is the cost of the other direction and it is real.
+//!
+//! Whatever the answer is, this module is where it lands: a retention job here
+//! needs a privilege `app_role` must not hold and an exemption from the trigger
+//! that `0001_core.sql` wrote to bind superusers, so answering it is a
+//! migration and a decision, in that order. Until then every writer keeps
+//! naming the counterparty, and this paragraph is why that is a choice rather
+//! than an oversight.
 
 use agentos_domain::action::ActionKind;
 use agentos_domain::ids::{ConversationId, DecisionId, EmployeeId, TenantId};

@@ -159,6 +159,13 @@ pub const NO_PROSPECT: &str = "no_such_prospect";
 /// read the same `Recipient`. It is a named refusal rather than an assertion
 /// because the two are separated by a gate call and a crate boundary, and the
 /// audit row should say which of them moved.
+///
+/// **That last clause was a promise the code did not keep**, for the same
+/// reason [`WHATSAPP_WINDOW_NOT_THEIRS`] did not: the refusal was recorded
+/// through `message_detail`, which maps only the success case, so the row said
+/// `detail: None` and named neither address. It now carries `ruled` and
+/// `row_address` — the two spellings, side by side, with `row_address: null`
+/// when the row had no `email` column at all.
 pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 
 /// [`LEAD_NOT_THE_RULED_ADDRESS`] one channel over: the WhatsApp window handed
@@ -177,14 +184,19 @@ pub const LEAD_NOT_THE_RULED_ADDRESS: &str = "lead_address_mismatch";
 /// separated by a gate call, so a refusal is a fact worth recording rather than
 /// a bug worth panicking on.
 ///
-/// **What the row does not say, and the sentence here used to promise it did.**
-/// `message_detail` maps only the success case, so a refused send writes
-/// `detail: None` and **neither number reaches it**. Reading the row tells an
-/// operator that a window did not match, never which window or whose. Making it
-/// say so is a `detail` on the refusal branch carrying both — and that is a
-/// deliberate choice about putting a counterparty's phone number in an audit
-/// row, not an oversight to fix on the way past. The same gap sits on
-/// [`LEAD_NOT_THE_RULED_ADDRESS`], which predates this.
+/// **What the row would not say, and the sentence here used to promise it did.**
+/// `message_detail` maps only the success case, so a refused send wrote
+/// `detail: None` and **neither number reached it**. Reading the row told an
+/// operator that a window did not match, never which window or whose.
+///
+/// The row now carries `ruled` and `window_with`. Both, and the choice is
+/// argued at the branch that writes them: a disagreement needs two terms, the
+/// ruled number is already in the trail on the gate's row for the same
+/// `decision_id` so it is no new class of data, and `audit_log` has no index on
+/// `decision_id` to fetch the other half through. What it costs — a
+/// counterparty's phone number in a table with no `DELETE` — is a retention
+/// question, and it is left open where it belongs, in
+/// [`agentos_store::audit`].
 pub const WHATSAPP_WINDOW_NOT_THEIRS: &str = "whatsapp_window_mismatch";
 
 /// What [`Effects::issue_invoice`] answers when the deal it was handed is not
@@ -532,13 +544,23 @@ pub enum RenderedWhatsapp {
 impl RenderedWhatsapp {
     /// Address it to the number on the token, or refuse.
     ///
-    /// **`None` is the seam this returns a `Result`-shaped answer for**, and it
-    /// is the only place two independent facts about one message meet: the
-    /// gate ruled on a recipient, and the window was derived for a
-    /// counterparty. Both are honest apart; a message where they disagree is
-    /// one person's consent spent on another, and the send it would produce is
-    /// free text to somebody who never wrote to us — legal-looking on the wire
-    /// and a policy violation on Meta's platform.
+    /// **`Err` is the seam this returns a `Result` for**, and it is the only
+    /// place two independent facts about one message meet: the gate ruled on a
+    /// recipient, and the window was derived for a counterparty. Both are
+    /// honest apart; a message where they disagree is one person's consent
+    /// spent on another, and the send it would produce is free text to somebody
+    /// who never wrote to us — legal-looking on the wire and a policy violation
+    /// on Meta's platform.
+    ///
+    /// **The `Err` carries the window's own number, and it did not use to.**
+    /// This answered `Option`, so the caller knew only *that* something
+    /// mismatched and had nothing to write down; the audit row it produced
+    /// named neither side. Carrying the peer out of the comparison that made it
+    /// means the evidence and the check cannot drift — a second read of
+    /// `body`'s window at the call site would be a second place to get the
+    /// variant wrong, and it would answer `None` for a future variant that
+    /// refuses here for some other reason, which is the row silently going
+    /// quiet again.
     ///
     /// It cannot be a comparison further down. `OutboundWhatsapp::FreeForm`
     /// carries no recipient beside the window's, so the port is never handed
@@ -550,11 +572,11 @@ impl RenderedWhatsapp {
     ///
     /// A template needs no window and may open a conversation, so it is simply
     /// addressed to the ruled number.
-    fn addressed_to(self, to: E164) -> Option<OutboundWhatsapp> {
-        Some(match self {
+    fn addressed_to(self, to: E164) -> Result<OutboundWhatsapp, E164> {
+        Ok(match self {
             Self::FreeForm { from, body, window } => {
                 if *window.peer() != to {
-                    return None;
+                    return Err(window.peer().clone());
                 }
                 OutboundWhatsapp::FreeForm { from, body, window }
             }
@@ -972,17 +994,35 @@ impl Effects {
             .iter()
             .find(|(name, _)| *name == leads::EMAIL_COLUMN)
             .map(|(_, value)| *value);
-        let staged = if addressed == Some(ruled.as_str()) {
-            self.ports
+        let (staged, detail) = if addressed == Some(ruled.as_str()) {
+            let staged = self
+                .ports
                 .leads
                 .stage(&self.key_for(&ok), row)
                 .await
-                .map_err(EffectError::Provider)
+                .map_err(EffectError::Provider);
+            let detail = message_detail(&staged);
+            (staged, detail)
         } else {
-            Err(EffectError::Refused(LEAD_NOT_THE_RULED_ADDRESS))
+            // The two spellings that disagreed, which is the whole of what this
+            // refusal is about and neither of which reached the row before.
+            // `message_detail` maps only the `Ok`, so this arm wrote
+            // `detail: None` and an operator learned that an address mismatched
+            // and never which addresses — see [`LEAD_NOT_THE_RULED_ADDRESS`],
+            // whose own sentence promised "the audit row should say which of
+            // them moved" while the code said nothing.
+            //
+            // `null` and not an omission when the row has no `email` column at
+            // all: "the row named somebody else" and "the row named nobody" are
+            // different bugs in different crates, and a missing key reads as
+            // both.
+            (
+                Err(EffectError::Refused(LEAD_NOT_THE_RULED_ADDRESS)),
+                Some(json!({ "ruled": ruled, "row_address": addressed })),
+            )
         };
 
-        self.record(&ok, message_detail(&staged), staged).await
+        self.record(&ok, detail, staged).await
     }
 
     /// Everyone the sending platform has been told to stop mailing.
@@ -1166,9 +1206,34 @@ impl Effects {
         ok: Authorized<A>,
         body: RenderedWhatsapp,
     ) -> Result<ProviderMessageId, EffectError> {
-        let Some(message) = body.addressed_to(ok.action().subject().to.clone()) else {
-            let refused = Err(EffectError::Refused(WHATSAPP_WINDOW_NOT_THEIRS));
-            return self.record(&ok, message_detail(&refused), refused).await;
+        let ruled = ok.action().subject().to.clone();
+        let message = match body.addressed_to(ruled.clone()) {
+            Ok(message) => message,
+            // Both numbers, because the fact being recorded is a *disagreement*
+            // and one term of it is not a comparison: a row naming only the
+            // window's peer cannot be told apart from a row where the ruling was
+            // the wrong half. `message_detail` maps only the `Ok`, so this arm
+            // used to write `detail: None` and the row said a window did not
+            // match without saying which window or whose.
+            //
+            // `ruled` is on the gate's own row for this `decision_id` too
+            // ([`crate::gate`]'s `counterparty`), so repeating it here adds no
+            // class of data the trail did not already hold — and `audit_log`
+            // carries no index on `decision_id`, so "fetch the other half" is a
+            // scan of the tenant's whole history rather than a lookup. The
+            // window's peer is on no row anywhere.
+            //
+            // What it costs is named where it lands: see
+            // [`agentos_store::audit`]'s open question about how long a
+            // counterparty's number may sit in a table with no DELETE.
+            Err(window_with) => {
+                let refused = Err(EffectError::Refused(WHATSAPP_WINDOW_NOT_THEIRS));
+                let detail = json!({
+                    "ruled": ruled.as_str(),
+                    "window_with": window_with.as_str(),
+                });
+                return self.record(&ok, Some(detail), refused).await;
+            }
         };
 
         self.begin_send(&ok, TELEPHONY_PORT).await?;
@@ -1334,6 +1399,10 @@ impl Effects {
         step: BrowserStep<'_>,
     ) -> Result<BrowserOutcome, EffectError> {
         let allowed = ok.action().subject().domain.clone();
+        // Taken before `step` is moved into `drive`. `&'static str`, so there
+        // is nothing here to keep alive and nothing of the step's *argument*
+        // to leak — see [`BrowserStep::name`].
+        let step_name = step.name();
         // **What the gate actually ruled on**, not what the bound admits. Both
         // subjects reach here — see [`READ_TOKEN`] — and only the action says
         // which permission was bought. Written as "a read ruling may drive a
@@ -1353,7 +1422,23 @@ impl Effects {
                 .await
         };
 
-        let detail = browse_detail(&allowed, elsewhere.as_ref());
+        let mut detail = browse_detail(&allowed, elsewhere.as_ref());
+        // **What the row could not say.** `book_effect` writes the *kind* off
+        // the token — `browser_write`, or `browser_read` when a reading token
+        // drove this — and `browse_detail` writes the hosts. Neither says what
+        // was actually done, so a click, a screenshot and a credential typed
+        // into a stranger's form all left the same row, and a
+        // [`READ_TOKEN`] refusal said only that a read ruling drove *something*
+        // that writes. That is the difference between "the model clicked a
+        // search button it should not have" and "we were one check away from
+        // putting a vault credential on a page nobody ruled on for writing",
+        // and an operator had no way to tell them apart.
+        //
+        // On every row and not only on the refusal: the question "what did this
+        // browser_write actually do" is asked of the successes too, and a field
+        // that appears only when something failed is a field nobody trusts to
+        // be absent for the right reason.
+        detail.insert("step".to_owned(), json!(step_name));
         self.record(&ok, Some(Value::Object(detail)), outcome).await
     }
 
@@ -2826,6 +2911,21 @@ fn sel(selector: &crate::flow_proposal::Selector) -> &str {
 }
 
 /// The payload detail every message-shaped effect shares.
+///
+/// **It maps only the `Ok`, and that is now the whole of what it claims.** The
+/// id a provider hands back does not exist when the provider said no, so a
+/// failed send has nothing for this to write and `None` is honest — the reason
+/// and the retryability are on the row already, put there by
+/// [`Effects::book_effect`] from the error itself.
+///
+/// What it must not be asked to do is carry a **refusal we made ourselves**,
+/// which is what [`Effects::stage_lead`] and [`Effects::send_whatsapp`] used it
+/// for: those two arms know something a provider never told them — the two
+/// values that disagreed — and routing them through here wrote `detail: None`
+/// and threw both away. Each builds its own detail now. If a third refusal of
+/// that shape appears, it belongs beside them and not inside this function:
+/// there is no detail common to "the row named somebody else" and "the window
+/// is somebody else's" beyond the code, and the code has a column.
 fn message_detail(sent: &Result<ProviderMessageId, EffectError>) -> Option<Value> {
     sent.as_ref()
         .ok()
@@ -2853,7 +2953,7 @@ mod tests {
     use agentos_providers::telephony::{
         InboundCtx, MockTelephony, ParseError, Region, SigError, WebhookBody,
     };
-    use agentos_providers::{EnsureCtx, FaultMode, ProviderBinding, Provisioned};
+    use agentos_providers::{EnsureCtx, FaultMode, ProviderBinding, Provisioned, Secret};
     use agentos_store::org;
     use agentos_store::spend::SpendCaps;
     use chrono::{SubsecRound, TimeDelta};
@@ -3526,6 +3626,50 @@ mod tests {
             ["buyer@example.com"],
             "and nobody new reached the platform"
         );
+
+        // **And the refusal is legible.** Everything above passes against a row
+        // that carries no detail at all — the assertions are about the error and
+        // the platform, not about what an operator can read afterwards. The row
+        // has to name the two spellings that disagreed, or the trail says an
+        // address mismatched and leaves whoever is holding the incident with no
+        // way to tell "the queue built the wrong row" from "the gate ruled on
+        // the wrong person".
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 2, "the refusal is a row too: {rows:?}");
+        let refusal = &rows[1].1;
+        assert_eq!(refusal["error"], json!(LEAD_NOT_THE_RULED_ADDRESS));
+        assert_eq!(
+            refusal["detail"]["ruled"],
+            json!("buyer@example.com"),
+            "the row cannot say who the gate ruled on, so nobody can tell a bad \
+             row from a bad ruling"
+        );
+        assert_eq!(
+            refusal["detail"]["row_address"],
+            json!("someone.else@example.com"),
+            "the row cannot say who the platform would have mailed, which is the \
+             only fact this refusal exists to record"
+        );
+
+        // A row with no `email` column at all is a different bug in a different
+        // crate, and `null` is what keeps the two apart. A row that simply
+        // omitted the key would read as "we did not look".
+        let ok = gate
+            .authorize(&principal, to("buyer@example.com"))
+            .await
+            .expect("email is allowed");
+        effects
+            .stage_lead(ok, &[("objet_email", "s")])
+            .await
+            .expect_err("a row with no address at all is not the ruled address");
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[2].1["detail"],
+            json!({ "ruled": "buyer@example.com", "row_address": Value::Null }),
+            "a row that named nobody must not read like a row that named somebody \
+             else, and an absent key reads like neither"
+        );
     }
 
     /// The seam, and the two things that can only go wrong at it.
@@ -3821,6 +3965,29 @@ mod tests {
         assert_eq!(rows.len(), 1, "a refusal is recorded too: {rows:?}");
         assert_eq!(rows[0].1["outcome"], json!("error"));
         assert_eq!(rows[0].1["error"], json!(WHATSAPP_WINDOW_NOT_THEIRS));
+        // **And the row is legible on its own.** The three assertions above pass
+        // against `detail: None`, which is what this branch used to write. The
+        // two numbers are what makes the row a *comparison*: with only one of
+        // them an operator cannot tell whether the window was minted for the
+        // wrong person or the ruling was, and `audit_log` has no index on
+        // `decision_id` to go and fetch the other half through.
+        assert_eq!(
+            rows[0].1["detail"]["ruled"],
+            json!(stranger.as_str()),
+            "the row cannot say who the gate ruled on, so a refused send names \
+             no recipient anywhere in the trail"
+        );
+        assert_eq!(
+            rows[0].1["detail"]["window_with"],
+            json!(wrote_to_us.as_str()),
+            "the row cannot say whose window was about to be spent on somebody \
+             else, and no other row in this system holds that number"
+        );
+        assert_ne!(
+            rows[0].1["detail"]["ruled"], rows[0].1["detail"]["window_with"],
+            "both keys read the same number, so the row records an agreement \
+             where the code found a disagreement"
+        );
 
         // The same window, the same body, addressed to the person it is
         // actually with.
@@ -4683,6 +4850,25 @@ mod tests {
         assert_eq!(rows[0].1["error"], json!(READ_TOKEN));
         assert_eq!(rows[0].1["effect"], json!("browser_read"));
 
+        // **And the two rows are not the same row.** Every assertion above is
+        // satisfied by two byte-identical payloads, which is what this loop used
+        // to leave behind: `effect`, `outcome` and `error` are equal for a
+        // keystroke and for a click, so the trail recorded "a read ruling drove
+        // something that writes" twice and never what. That difference is the
+        // one an incident turns on — a `type` put a customer's text on a page
+        // nobody ruled on for writing, a `fill` would have put a vault
+        // credential there, and a `click` pressed a button.
+        assert_eq!(
+            [&rows[0].1["detail"]["step"], &rows[1].1["detail"]["step"]],
+            [&json!("type"), &json!("click")],
+            "the trail cannot say what the refused steps were, so a keystroke \
+             and a click are one row read twice"
+        );
+
+        // The domain the token named is still there beside it: `step` is an
+        // addition to `browse_detail`, not a replacement for what it said.
+        assert_eq!(rows[0].1["detail"]["domain"], json!("portal.example.com"));
+
         // And the steps a read *is* for still run, or the prober's every
         // navigation would have died with this fix.
         // `Text` is a read too and is deliberately not exercised here: this
@@ -4729,6 +4915,105 @@ mod tests {
             )
             .await
             .expect("a write ruling may type");
+
+        // The steps that succeeded say what they were too, so "which of these
+        // five rows is the one that typed" is a `payload -> 'detail' ->> 'step'`
+        // and not a reconstruction from the order somebody hopes they ran in.
+        let rows = effect_rows(&db, &principal).await;
+        let steps: Vec<Value> = rows
+            .iter()
+            .map(|(_, payload)| payload["detail"]["step"].clone())
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                json!("type"),
+                json!("click"),
+                json!("goto"),
+                json!("location"),
+                json!("type"),
+            ],
+            "an allowed browser row cannot say what it did, so only the refusals \
+             are readable and the successes are five identical lines"
+        );
+    }
+
+    /// **The step's name, and never one byte of its argument.**
+    ///
+    /// `BrowserStep::Fill` exists so a credential can be typed into a page
+    /// without ever being printable, and this is the row it produces. The trail
+    /// has to say a credential was typed — that is a security fact, and the
+    /// selector alone would not carry it — and it must not say *which*
+    /// credential or what it was worth. A `format!("{step:?}")` at the call site
+    /// would satisfy the first half and fail the second the day `Secret`'s
+    /// `Debug` was relaxed, so the check is on the rendered row: the plaintext
+    /// is nowhere in it, under any spelling.
+    #[tokio::test]
+    async fn a_typed_credential_is_named_as_a_step_and_never_written_down() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let session = BrowserSession {
+            employee_id: principal.employee_id,
+            binding: ProviderBinding {
+                provider: "mock-browser".to_owned(),
+                external_id: "ctx-1".to_owned(),
+            },
+            user_data_dir: None,
+        };
+        const PLAINTEXT: &str = "hunter2-correct-horse";
+        let secret = Secret::new(PLAINTEXT.to_owned());
+        let subject = BrowserWrite {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+
+        // A fresh context is on `about:blank`, which is inside nobody's domain,
+        // so the scope guard refuses every non-navigating step until something
+        // has loaded a page. Land on the ruled host first — one ruling per step,
+        // as everywhere else here.
+        let landing = Url::parse("https://portal.example.com/login").expect("url");
+        let token = gate(&db)
+            .authorize(&principal, subject.clone())
+            .await
+            .expect("portal.example.com is on the write list");
+        effects
+            .browse_write(token, &session, BrowserStep::Goto(&landing))
+            .await
+            .expect("the ruled host is reachable");
+
+        let token = gate(&db)
+            .authorize(&principal, subject)
+            .await
+            .expect("portal.example.com is on the write list");
+        effects
+            .browse_write(
+                token,
+                &session,
+                BrowserStep::Fill {
+                    sel: "#password",
+                    secret: &secret,
+                },
+            )
+            .await
+            .expect("a write ruling may fill");
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].1["detail"]["step"],
+            json!("fill"),
+            "the trail cannot say a credential was typed into somebody's page, \
+             which is the one browser step that is a security event on its own"
+        );
+        let rendered = rows[1].1.to_string();
+        assert!(
+            !rendered.contains(PLAINTEXT),
+            "the credential is in the audit row: {rendered}"
+        );
     }
 
     #[tokio::test]
