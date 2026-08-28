@@ -862,7 +862,8 @@ impl Effects {
     ///
     /// Fenced by [`Self::begin_send`] and [`Self::record_sent`] — a row committed
     /// before the request leaves and closed after it is answered. Read
-    /// [`SEND_UNSETTLED`] for exactly how much that is worth.
+    /// [`Self::send_sms`] for exactly how much that is worth; the fence is the
+    /// same and so is the bounded promise.
     pub async fn send_email<A: Subject<Of = EmailSend>>(
         &self,
         ok: Authorized<A>,
@@ -2566,10 +2567,30 @@ impl Effects {
     /// * [`ProviderError::Terminal`] and [`ProviderError::RateLimited`] are
     ///   **answers**. The provider read the request and declined; nothing was
     ///   sent, and the row is settled `failed` so it stops asking for attention.
-    /// * [`ProviderError::Retryable`] is a timeout or a 5xx, which is exactly
-    ///   the case `telephony_twilio` documents as *"the request may even have
-    ///   landed"*. Nothing is written. The row stays `in_flight`, which is the
-    ///   only true statement about it.
+    /// * [`ProviderError::Retryable`] is the arm worth reading twice, because
+    ///   the obvious sentence about it is the wrong way round. It is **not**
+    ///   mostly "the request may even have landed". Every adapter in
+    ///   `agentos-providers` funnels its entire transport failure set through
+    ///   [`ProviderError::timeout`] in one `map_err(|_| …)` around
+    ///   `reqwest::send` — `email_resend::call` and `telephony_twilio`'s
+    ///   `ApiError::transport` both — so a refused connection, a DNS failure
+    ///   and a TLS handshake that never finished all arrive here, and
+    ///   [`ProviderError::from_status`] adds 408, 425 and every 5xx on top. In
+    ///   every one of those the request either never left this process or was
+    ///   turned away without being acted on. The genuinely ambiguous member —
+    ///   a read timeout *after* the bytes went out, which is what
+    ///   `telephony_twilio` means by *"the request may even have landed"* — is
+    ///   one case in that class and not the usual one.
+    ///
+    ///   Nothing is written and the row stays `in_flight` anyway. That is a
+    ///   **pessimistic** answer by construction and not a neutral one: from the
+    ///   near side of the socket there is nothing to branch on, so it
+    ///   over-reports on purpose. Most rows this leaves behind will be sends
+    ///   that never happened, and the reader has to be told that or it will
+    ///   read a list of near-misses as a list of double-sends — see
+    ///   [`Self::send_sms`], `routes::employees`'s `unsettled_calls`, and
+    ///   `docs/OPERATIONS.md` §6. Settling them `failed` instead would be
+    ///   pleasant to read and wrong on precisely the row that mattered.
     /// * [`ProviderError::PendingExternal`] is filed with the timeout and not
     ///   with the refusals, deliberately: it means somebody outside must act
     ///   before the resource is usable, it carries no message id, and a send
@@ -2755,13 +2776,16 @@ mod tests {
 
     use agentos_domain::action::{ActionKind, CallingCode, Channel};
     use agentos_domain::ids::{EmployeeId, TenantId};
+    use agentos_domain::message::CanonicalMessage;
     use agentos_domain::money::Currency;
     use agentos_domain::policy::{DenyReason, PolicyLimits, SpendLimits};
     use agentos_providers::browser::MockBrowser;
     use agentos_providers::email::MockEmailProvider;
     use agentos_providers::leads::MockLeadSink;
-    use agentos_providers::telephony::MockTelephony;
-    use agentos_providers::{FaultMode, ProviderBinding};
+    use agentos_providers::telephony::{
+        InboundCtx, MockTelephony, ParseError, Region, SigError, WebhookBody,
+    };
+    use agentos_providers::{EnsureCtx, FaultMode, ProviderBinding, Provisioned};
     use agentos_store::org;
     use agentos_store::spend::SpendCaps;
     use chrono::{SubsecRound, TimeDelta};
@@ -2944,15 +2968,25 @@ mod tests {
                 // `store::policy::default_ceiling` grants neither, layers only
                 // narrow, and this database has no platform layer at all. See
                 // `turn::UNSERVED`'s `CallPlace` entry.
-                // `Channel::Sms` joins them for the write-ahead tests below, and
-                // it is the same argument `Voice` makes one paragraph up, checked
-                // the same way rather than assumed: `SmsSend` appears in exactly
-                // two places in this crate — the `subject!` macro and
-                // `Effects::send_sms` — and no other test in this module
-                // authorises an SMS-shaped action, so this entry is read by the
-                // two that do and can make nothing else pass. `evaluate`'s
-                // `SmsSend` arm asks the channel *and* the calling code, so the
-                // `+1` below is load-bearing for it too.
+                // `Channel::Sms` joins them for the write-ahead tests below, on
+                // the same argument `Voice` makes one paragraph up — but not on
+                // the sentence that used to be written here, which claimed
+                // `SmsSend` "appears in exactly two places in this crate" and is
+                // false. The token is in `gate`, `turn`, `provisioning` and
+                // three rolepacks as `Action::SmsSend` / `ActionKind::SmsSend`,
+                // and the subject type of that name is in this module's own docs
+                // and in the tests below on top of the two it named.
+                //
+                // The claim that does hold is narrower and is the one the
+                // widening actually rests on: `Channel::Sms` is read in exactly
+                // two places in `domain::policy` — `always_denies`'
+                // `ActionKind::SmsSend` arm and `evaluate`'s `Action::SmsSend`
+                // arm — and nowhere else, so this entry cannot loosen a ruling
+                // on any other verb, whatever else spells the name. Within this
+                // test module the only SMS-shaped actions are the ones the
+                // write-ahead tests authorise. `evaluate`'s arm asks the channel
+                // *and* the calling code, so the `+1` below is load-bearing for
+                // it too.
                 allowed_channels: BTreeSet::from([
                     Channel::Email,
                     Channel::Web,
@@ -3111,10 +3145,15 @@ mod tests {
         })
     }
 
-    /// The same ports with the telephony double kept in hand, for the call
-    /// test: what it asserts is which number actually got dialled, and an
-    /// `Arc<dyn TelephonyProvider>` cannot be asked.
-    fn ports_dialling(telephony: Arc<MockTelephony>) -> Arc<Ports> {
+    /// The same ports, with the telephony double left in the **caller's** hand:
+    /// the dial test asks it which number actually got rung and
+    /// [`ReadsTheLogMidFlight`] is asked what it saw, neither of which the
+    /// `Ports` field can answer once the double is behind a `dyn`.
+    ///
+    /// The parameter is the trait object rather than [`MockTelephony`] because
+    /// there are two doubles now; each caller keeps its own concrete `Arc` and
+    /// hands a coerced clone in here.
+    fn ports_dialling(telephony: Arc<dyn TelephonyProvider>) -> Arc<Ports> {
         Arc::new(Ports {
             email: Arc::new(MockEmailProvider::new()),
             telephony,
@@ -3620,7 +3659,7 @@ mod tests {
         );
     }
 
-    /// A number the fixture policy grants, for the two write-ahead tests.
+    /// A number the fixture policy grants, for the three write-ahead tests.
     fn a_number() -> E164 {
         E164::parse("+14158675309").expect("e164")
     }
@@ -3630,6 +3669,171 @@ mod tests {
             from: E164::parse("+15005550006").expect("e164"),
             body: body.to_owned(),
         }
+    }
+
+    /// A telephony port that answers a send only after looking at
+    /// `provider_intents` **from a second connection**.
+    ///
+    /// The second connection is the whole mechanism. An `INSERT` that has not
+    /// committed is invisible outside its own transaction, so every row this
+    /// records is a row that was already durable at the instant the provider was
+    /// called — which is the one question the other two write-ahead tests cannot
+    /// ask, because by the time they read, both writes have happened.
+    ///
+    /// ponytail: this rather than a port that blocks with a
+    /// `tokio::time::timeout` wrapped round the send. That buys the same
+    /// assertion with a wall clock — a duration to pick, and a loaded CI box to
+    /// be wrong on. Nothing here waits for anything.
+    ///
+    /// Every other method is `unimplemented!` on purpose: this is not a second
+    /// [`MockTelephony`] and nothing should grow into using it as one.
+    struct ReadsTheLogMidFlight {
+        db: Db,
+        tenant: TenantId,
+        /// `(state, external_id)` of every send row visible from outside, as of
+        /// the moment the provider held the request.
+        seen: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl TelephonyProvider for ReadsTheLogMidFlight {
+        async fn send_sms(
+            &self,
+            _key: &IdempotencyKey,
+            _sms: &OutboundSms,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            let mut tx = self
+                .db
+                .tenant_tx(self.tenant)
+                .await
+                .expect("a second connection while the send is in flight");
+            let rows = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT state, external_id FROM provider_intents \
+                  WHERE step IS NULL ORDER BY created_at",
+            )
+            .fetch_all(&mut **tx)
+            .await
+            .expect("read provider_intents from outside the send");
+            tx.rollback().await.expect("rollback the read");
+            *self.seen.lock().expect("seen mutex poisoned") = rows;
+            Ok(ProviderMessageId::new("SM-observed"))
+        }
+
+        async fn ensure_number(
+            &self,
+            _ctx: &EnsureCtx,
+            _region: &Region,
+        ) -> Result<Provisioned, ProviderError> {
+            unimplemented!("this double only sends texts")
+        }
+
+        async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
+            unimplemented!("this double only sends texts")
+        }
+
+        async fn send_whatsapp(
+            &self,
+            _key: &IdempotencyKey,
+            _message: &OutboundWhatsapp,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("this double only sends texts")
+        }
+
+        async fn place_call(
+            &self,
+            _key: &IdempotencyKey,
+            _call: &OutboundCall,
+        ) -> Result<ProviderMessageId, ProviderError> {
+            unimplemented!("this double only sends texts")
+        }
+
+        fn verify_webhook(
+            &self,
+            _url: &str,
+            _body: WebhookBody<'_>,
+            _headers: &[(String, String)],
+        ) -> Result<(), SigError> {
+            unimplemented!("this double only sends texts")
+        }
+
+        fn normalize(
+            &self,
+            _ctx: &InboundCtx,
+            _raw: &[u8],
+        ) -> Result<CanonicalMessage, ParseError> {
+            unimplemented!("this double only sends texts")
+        }
+    }
+
+    /// **The order of the two commits, observed while the request is in
+    /// flight.** This is the property the whole fence *is*, and the one the two
+    /// tests below do not pin.
+    ///
+    /// They read `provider_intents` after `send_sms` has returned. From there a
+    /// row written before the provider call and a row written after it look
+    /// identical — so a refactor that folded [`Effects::begin_send`] and
+    /// [`Effects::record_sent`] into one transaction wrapped around the call
+    /// would keep every one of their assertions green and delete the entire
+    /// guarantee. There is nothing left of this feature except the order: a
+    /// process that dies with the request on the wire leaves something behind
+    /// **only** if the row committed first.
+    ///
+    /// So the observation happens from inside the provider call, on a second
+    /// connection, where an uncommitted insert cannot be seen.
+    ///
+    /// # What it asserts, and the two ways of being wrong it separates
+    ///
+    /// Not just "a row exists". `in_flight` *and* no `external_id`: a fence
+    /// that committed the row early and already claimed an id it had not been
+    /// given would be the other way of lying, and one assertion on presence
+    /// alone would admit it. The settled row is then checked after the call
+    /// returns, so what was seen mid-flight is established as a **window** and
+    /// not as a state the row never leaves — a build that never settled
+    /// anything would pass the first half and turn the operator's reader into a
+    /// log of every message ever sent.
+    #[tokio::test]
+    async fn the_write_ahead_row_is_committed_before_the_request_leaves() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let phone = Arc::new(ReadsTheLogMidFlight {
+            db: db.clone(),
+            tenant: principal.tenant_id,
+            seen: Mutex::new(Vec::new()),
+        });
+        let effects = Effects::new(db.clone(), ports_dialling(phone.clone()), principal.clone());
+
+        let ok = gate(&db)
+            .authorize(&principal, SmsSend { to: a_number() })
+            .await
+            .expect("sms and +1 are both granted by the fixture policy");
+        let sent = effects
+            .send_sms(ok, a_text("your delivery is late"))
+            .await
+            .expect("the port answered");
+
+        let mid_flight = phone.seen.lock().expect("seen mutex poisoned").clone();
+        assert_eq!(
+            mid_flight.len(),
+            1,
+            "nothing was visible from a second connection while the provider held \
+             the request: the write-ahead row did not commit before the send"
+        );
+        assert_eq!(
+            mid_flight[0].0, "in_flight",
+            "the row was committed early and already settled, which is a claim \
+             about an answer nobody had yet"
+        );
+        assert_eq!(
+            mid_flight[0].1, None,
+            "an external id the provider had not handed back yet"
+        );
+
+        // And the same row is closed by the time the call returns, so what was
+        // observed above is a window and not where the row lives.
+        let rows = intent_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "one request, one row: {rows:?}");
+        assert_eq!(rows[0].3, "succeeded");
+        assert_eq!(rows[0].4.as_deref(), Some(sent.as_str()));
     }
 
     /// **The crash window, fabricated.** The request reaches the provider and
