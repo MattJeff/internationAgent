@@ -2630,6 +2630,7 @@ pub(crate) mod tests {
             gate: agentos_app::gate::PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
             fleets: crate::routes::mcp::Fleets::new().0,
+            embedder: agentos_app::knowledge::Embedder::default(),
             cancel: CancellationToken::new(),
         };
         let principal = ActingAs::employee(tenant, boss);
