@@ -236,6 +236,50 @@ struct ApprovalView {
 /// Tenant scoping is [`Db::tenant_tx`] and nothing else: there is no
 /// `WHERE tenant_id = …` to forget, because row-level security is applied to
 /// the transaction rather than to the statement.
+///
+/// # FOUNDER'S QUESTION: nothing ever takes a row off this queue by itself
+///
+/// `state` has three values and **none of them is "expired"**.
+/// `app::gate::APPROVAL_TTL` is 24 hours, `approvals::redeem` requires
+/// `expires_at > now()`, and no writer anywhere moves a lapsed request out of
+/// `pending`. So an escalation nobody answered inside a day stays on this list
+/// for as long as the tenant exists, and the gate files a *fresh* row every time
+/// the employee proposes the action again — `request_approval` has no dedupe on
+/// `action_hash`. A fortnight nobody was watching therefore ends with a queue
+/// whose head — this is `ORDER BY requested_at` — is the oldest and most
+/// certainly dead work, and whose one still-redeemable row is at the bottom.
+///
+/// **Two readers of the word "pending", and only one of them has the predicate.**
+/// `crate::metrics`'s gauge is
+///
+/// ```sql
+/// WHERE state = 'pending' AND (expires_at IS NULL OR expires_at > now())
+/// ```
+///
+/// with its own reason written beside it — "an expired approval is not queue
+/// depth: nobody can act on it, so counting it would give a graph that climbs
+/// and never comes back". That sentence is true of this list word for word, and
+/// this list does not have the clause. Measured on a seventeen-day fixture at
+/// the deployed cadence: 85 rows, 80 of them past `expires_at`, while
+/// `agentos_approvals_pending` reads 5. At a year, 1 870 and 1 865. It is not a
+/// speed problem — 0.9 ms at 1 870 rows — it is the operator being shown a
+/// backlog the graph says does not exist.
+///
+/// **Not decided here, and deliberately.** Three answers are available and each
+/// is the founder's, not this handler's:
+///
+/// * *hide them* — copy the gauge's clause. One line, and it loses the only
+///   list of what the company asked for and never got. `GET /v1/approvals/{id}`
+///   still answers, but nothing enumerates.
+/// * *order them last* — nothing disappears and the queue stops burying the one
+///   actionable row, but it still grows without bound.
+/// * *close them* — a fourth `state`, or a sweep. That is a retention decision
+///   on a row that is evidence (the agent asked; nobody answered), and
+///   `0061`/`0067` are this schema's argument for why such a row is not deleted
+///   on an engineer's say-so.
+///
+/// Note that they are not quite dead: [`deny`] takes any `pending` row without
+/// checking `expires_at`, so an operator *can* clear them — one HTTP call each.
 async fn list(
     State(state): State<Approvals>,
     principal: Principal,
