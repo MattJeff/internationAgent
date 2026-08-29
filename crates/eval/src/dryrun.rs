@@ -131,7 +131,6 @@ use agentos_app::{inbound, mocks};
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Lifecycle};
 use agentos_domain::ids::{EmployeeId, Slug, TenantId};
-use agentos_domain::money::{Currency, Money};
 use agentos_providers::ProviderError;
 use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, Message, Usage};
 use agentos_providers::llm_cli::CliLlm;
@@ -483,17 +482,42 @@ async fn stand_up(db: Db, passes: usize) -> Company {
         .iter()
         .find(|(slug, ..)| *slug == "books")
         .expect("the finance seat");
-    let usd_minor = |minor| Money::new(minor, Currency::Usd).expect("usd");
+
+    // **Both amounts read off `docs/orizn-roles/finance.json`, not typed here.**
+    //
+    // They used to be `usd_minor(100_000)` and `usd_minor(50_000)` — a second
+    // copy of the finance layer's own `max_per_day` and `max_per_transaction`,
+    // typed out fifteen lines under the loop that installs that very layer from
+    // the file. No assertion could sensibly have been put on that copy: this module
+    // is behind `--features live-orizn`, so `scripts/test.sh` compiles neither
+    // `cargo test -p agentos-eval` nor `cargo clippy --all-targets` with it, and
+    // a test written in here would be a test that never runs. A number the
+    // suite cannot see is not made safe by an assertion the suite cannot see
+    // either; it is made safe by not existing twice.
+    //
+    // Read from the document, the numbers are covered by what already guards
+    // that document: `cost::digest` hashes every byte of every file in
+    // `docs/orizn-roles/`, and `eval::tests::every_correctness_check_passes`
+    // fails when the hash leaves `cost::DIGEST` behind — in the default build.
+    // And the dry run now measures the company `docs/ORIZN.md` describes even
+    // when somebody edits that document, which is the point of reading it.
+    let caps = limits("orizn-roles/finance.json")
+        .spend
+        .expect("finance is the only one of the five role layers that carries a spend row");
     let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-    org::set_budget(&mut tx, finance.2, usd_minor(100_000))
+    org::set_budget(&mut tx, finance.2, caps.max_per_day())
         .await
         .expect("team budget");
     spend::set_caps(
         &mut tx,
         finance.1,
         spend::SpendCaps::new(
-            usd_minor(100_000),
-            usd_minor(50_000),
+            caps.max_per_day(),
+            caps.max_per_transaction(),
+            // The third number is *not* derived, and `docs/ORIZN.md` says why in
+            // as many words: "`daily_transactions: 2` is not a redundant copy of
+            // the money caps". It is the count that keeps binding on a day of
+            // three $10 payments, which the money caps never notice.
             std::num::NonZeroU32::new(2).expect("two"),
         )
         .expect("caps"),

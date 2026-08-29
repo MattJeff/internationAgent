@@ -680,6 +680,33 @@ async fn a_providers_signing_secret_is_usable_and_findable_nowhere() {
         status, 400,
         "a provider with no ingest is the caller's mistake: {refused}"
     );
+    // **And the status on its own was the whole assertion, which is not enough
+    // for either reader.** This route answers 400 for three different things —
+    // a body that is not JSON, a blank `secret`, and this — and until now all
+    // three carried `ApiError::bad_request`'s generic `bad_request`. A signup
+    // script cannot act on that: two of the three are fixed by correcting the
+    // request and the third only by deploying a build that reads the provider,
+    // so a client retrying on 400 retries forever. The refusal now has a code of
+    // its own, and this is what stops it quietly collapsing back into the
+    // generic one — which is a change no status assertion can see.
+    assert_eq!(
+        refused["code"], "provider_not_wired",
+        "the 400 has to say *which* 400 it is: {refused:#}"
+    );
+    // The other direction, and the reason a second code was worth adding: an
+    // ordinary bad request on the same route keeps the generic code. Without
+    // this, `provider_not_wired` could be what every refusal here says, which
+    // would leave the caller exactly where it started.
+    let (status, blank) = server.post(
+        "/v1/platform/webhooks",
+        Some(PLATFORM_SECRET),
+        &format!(r#"{{"tenant_id":"{}","secret":"  "}}"#, tenants[0].0),
+    );
+    assert_eq!(status, 400, "a blank secret is refused: {blank}");
+    assert_eq!(
+        blank["code"], "bad_request",
+        "a malformed request is not a provider this build cannot read: {blank:#}"
+    );
 
     // A delivery each, with the same provider event id — the shape a shared
     // provider account produces. Signed with the shared secret, so the signature

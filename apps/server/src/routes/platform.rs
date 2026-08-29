@@ -576,8 +576,25 @@ fn registration_refused(err: agentos_app::webhooks::EndpointError, tenant_id: Uu
                 .as_deref()
                 == Some(SQLSTATE_CHECK_VIOLATION) =>
         {
-            ApiError::bad_request(
-                "provider: no ingest reads this provider's deliveries on this build",
+            // Its own `code`, not `ApiError::bad_request`'s generic
+            // `bad_request`. Three refusals on this one route are 400s — a body
+            // that is not JSON, a blank `secret`, and this — and under one code
+            // a caller registering endpoints in a loop cannot tell "you sent
+            // rubbish" from "this build has no ingest for that provider". The
+            // first is fixed by correcting the request, the second only by
+            // deploying a build that reads it, and a signup script that retries
+            // the second is a script that never stops. Low cardinality and a
+            // literal, like the rest of the vocabulary: `error.rs`, rule 2.
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "provider_not_wired",
+                "no ingest reads this provider's deliveries",
+            )
+            .with_detail(
+                "provider: no ingest reads this provider's deliveries on this build. \
+                 `email` and `twilio` are wired; a third needs a reader registered in \
+                 `apps/server/src/main.rs` and the `webhook_endpoints_provider_is_wired` \
+                 CHECK widened to match.",
             )
         }
         EndpointError::Store(err) => err.into(),
