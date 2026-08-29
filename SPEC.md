@@ -986,6 +986,17 @@ Also true and not yet fixed: an MCP server that answers 402 is classified
 built against reqwest 0.13 and this workspace against 0.12, so `mcp.rs` cannot
 downcast far enough to read the status. See `mcp::refused_the_credential`.
 
+The seven links that do exist run end to end against a loopback double in
+`crates/app/tests/x402_chain.rs` — a real 402 on the wire, priced, ruled on,
+refused as untrusted, re-proposed by a human, hashed into an approval line and
+reserved — and it stops where the eighth link is missing. **The eighth link is
+where "a human approved" would become "the money moved", and it is a decision
+rather than a gap**: `routes::approvals::approve` mints an `Authorized<Action>`,
+which satisfies no `Effects` bound, and drops it. What that costs today (a
+payment reservation nobody settles or releases) and what crossing it would take,
+in order, is argued in one place — `x402.rs`, "The bridge from a human approved
+to the money moved".
+
 The wallet design this is aimed at, kept as a decision: customer-controlled
 funding source, employee wallet or delegated/session signer, small balance and
 strict spend ceiling, non-exportable signing key, on-chain guardrails where

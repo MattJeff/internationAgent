@@ -456,6 +456,15 @@ async fn approve(
         )
         .await?;
 
+    // **This is where the chain stops, and it stops on purpose.** `authorized`
+    // is an `Authorized<Action>`, which satisfies no `Effects` bound — every
+    // method there is `A: Subject<Of = …>` and there is no `impl Subject for
+    // Action` — so a human's click becomes a decision id and a redeemed row,
+    // never an effect. What that costs (a payment reservation nobody settles or
+    // releases) and what crossing it would take, in order, is argued in one
+    // place: `agentos_app::x402`, "The bridge from a human approved to the money
+    // moved". `crate::sourcing::place_order` reaches the same wall from the
+    // other side, and `crates/app/tests/x402_chain.rs` walks up to it.
     Ok(Json(json!({
         "id": id.to_string(),
         "state": "redeemed",

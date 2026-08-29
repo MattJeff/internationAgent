@@ -33,6 +33,17 @@ fn main() {
     let _ = Effects::brief::<Untrusted<Action>>;
     let _ = Effects::book_hour::<Untrusted<Action>>;
     let _ = agentos_app::a2a::sign_request::<Untrusted<Action>>;
+
+    // The **trusted** flavour of the same type, which is not a symmetry for
+    // tidiness: `Authorized<Action>` is exactly what
+    // `routes::approvals::approve` holds after a human clicks, and what
+    // `sourcing::place_order` declines to return. A bare `Action` has no
+    // `Subject` impl at all — the `subject!` macro writes one per newtype — so
+    // this is `E0277` where the lines above are `E0271`, and that difference is
+    // the whole reason the approval route ends in a `Json` instead of an
+    // effect. `x402.rs`, "The bridge from a human approved to the money moved",
+    // is what this line pins.
+    let _ = Effects::pay::<Action>;
 }
 
 /// `issue_invoice` is the one effect with no `Of =` to widen: it takes the

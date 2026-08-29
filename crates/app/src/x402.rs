@@ -162,6 +162,84 @@
 //! writing them now would be scaffolding whose first real use is the day
 //! somebody has to re-read assumptions nobody wrote down. What is here is the
 //! half that has to be right before any of that is safe: **the amount**.
+//!
+//! # The bridge from *a human approved* to *the money moved*
+//!
+//! The intended chain is *MCP call → 402 → read → `PaymentCreate` → gate →
+//! budget → human approval → wallet → payment → replay → receipt*. Seven of
+//! those exist and `crates/app/tests/x402_chain.rs` runs them in one hand
+//! against a loopback double, from a real 402 on the wire to the approval line
+//! and its hash. **This section is the eighth link, and it is written here
+//! because the answer used to be spread across four files.**
+//!
+//! ## Where it stops, to the line
+//!
+//! `apps/server/src/routes/approvals.rs::approve` calls
+//! [`PolicyGate::redeem_approval`](crate::gate::PolicyGate::redeem_approval),
+//! gets an `Authorized<Action>` back, returns its `decision_id`, and **drops
+//! it**. Nothing further happens, and nothing further *can*: every method on
+//! [`Effects`](crate::effects::Effects) is bound `A: Subject<Of = …>`, the
+//! `subject!` macro implements [`Subject`](crate::effects::Subject) for one
+//! newtype per effect, and **there is no `impl Subject for Action`**. So the
+//! token that route mints is a receipt for a ruling, not a capability to do
+//! anything with it. `crates/app/tests/ui/effects_untrusted_action.rs` is the
+//! compiler holding that shut.
+//!
+//! ## It is a decision, and this is the second time it is being taken
+//!
+//! `crate::sourcing::place_order` reached the same wall from the other
+//! direction and wrote it down: it returns an `ApprovalId` because *"the only
+//! thing this function could have returned instead is an `Authorized<Action>`,
+//! which no `Effects` method accepts. Money moves later, elsewhere, through a
+//! payment the gate rules on separately."*
+//!
+//! The reason it is a decision rather than an omission: turning the stored
+//! `Action` back into a typed subject is a `match` over every variant of
+//! [`Action`], from a jsonb column to a newtype, kept in step with the enum by
+//! nothing — and the arm somebody got wrong would be the arm that spends a
+//! human's click on a different effect from the one they read. That match is
+//! worth writing when something is waiting on the far side of it. Today nothing
+//! is: `PaymentProvider` is `NotConfigured` (see `crate::mocks`), so it would be
+//! a whole-enum match feeding a port whose contract is to refuse.
+//!
+//! ## What the dead end costs today, named rather than left to be discovered
+//!
+//! A redeemed payment approval reserves. `Authorized::reservation` says the
+//! executor owes it a `spend::settle` or an `org::release` — and the only code
+//! that pays that debt is `Effects::book_effect`, reached from no path that
+//! starts at this route. **So an approved payment holds the day's headroom
+//! until the bucket's day rolls over.** That is the conservative direction —
+//! headroom stays spent and is never handed back for money that did not move —
+//! but it is a real consequence and it is the *first* thing a bridge has to
+//! fix, not the last.
+//!
+//! ## What crossing it would take, smallest first
+//!
+//! 1. **A typed redemption for one kind.** `redeem_approval` is already generic
+//!    over `A: Authorizable`; the route passes a bare `Action` only because
+//!    that is what the request body deserialises to. The bridge is a route that
+//!    reads the body into [`effects::PaymentCreate`](crate::effects::PaymentCreate)
+//!    when `approvals.action_kind` says `payment_create`, redeems *that*, and
+//!    hands the token to [`Effects::pay`](crate::effects::Effects::pay) with
+//!    the memo. No new type, no new trait, no `turn::catalogue` row — and
+//!    routing through `Effects::pay` is also what settles or releases the
+//!    reservation above. That is the whole of link eight.
+//! 2. **A `PaymentProvider` that is not `NotConfigured`.** Everything in (1) is
+//!    reachable and testable before this exists; it just answers
+//!    `Terminal { code: "not_configured" }` in the audit trail.
+//! 3. **The two decisions above** — [`PRICED_ASSETS`] and whether [`Money`]
+//!    grows a sub-minor representation. Those are what make any of it reachable
+//!    from a *402* rather than from a human typing an amount into a form.
+//! 4. **Then, and only then, the x402-specific half**: `X-PAYMENT`, proof
+//!    encoding, the facilitator, the receipt — and the replay, which is the one
+//!    link nothing in this workspace has a shape for. The original `tools/call`
+//!    lived inside `Effects::call_tool`, which returned long before a human
+//!    looked at the queue, so "replay the request" is a **new**
+//!    `Action::McpCall` ruled on again, not a resumption of the old one. Nobody
+//!    has decided whether that second call is free because the payment bought
+//!    it, or is its own spend against `turn::Budgets::max_tool_calls`. Written
+//!    here because that is a founder's question and this is the first place it
+//!    is visible.
 
 use agentos_domain::action::Action;
 use agentos_domain::money::{Currency, Money, MoneyError};
