@@ -665,7 +665,13 @@ fn app(
             // Read-and-settle only — issuing goes through the gate, from a seat,
             // and there is deliberately no operator route for it.
             .merge(routes::invoices::router(db.clone()))
-            .merge(routes::approvals::router(db.clone(), gate.clone()))
+            // `ports` and not a second copy: approving a payment performs it,
+            // through the same adapter a turn would. See `approvals::approve`.
+            .merge(routes::approvals::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
             // route nobody merged is a route nobody can call, and the

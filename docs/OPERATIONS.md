@@ -1163,10 +1163,30 @@ key's label is the role.* A key labelled `approver` can decide approvals that
 require `approver`; the loops file theirs requiring `operator`, so you need a
 key labelled `operator` to clear a reaper or sweeper escalation.
 
-Approving does **not** perform the effect. It mints the capability token, spends
-the nonce and reports a decision id. `agentos-providers` is deliberately not a
-dependency of this binary, so no route here can reach an executor. That seam is
-open by design and is honest about it.
+**Approving performs the effect for `payment_create`, and for nothing else.**
+Every other kind mints the capability token, spends the nonce, reports a decision
+id and stops — `Authorized<Action>` satisfies no `Effects` bound, so there is
+nothing to hand it to. A payment is redeemed into a typed subject and passed to
+`Effects::pay`.
+
+What you will see today is **`502 payment_not_performed`** with
+`payment_error: "not_configured"`, because this build has no payment rail
+(SPEC §13). That is the system working. The body still carries
+`state: "redeemed"` and the `decision_id`: **the approval is spent either way**,
+so a 502 here is not something to retry. Confirm with
+`GET /v1/approvals/{id}`, which reads `redeemed`.
+
+The reason it is routed through the façade at all is the ledger, not the money:
+redeeming a payment approval *reserves* against the day's bucket, and only
+`Effects::pay` settles or releases it. Before this route reached it, an approved
+payment held the seat's headroom — and its team's — until UTC midnight for money
+that had not moved. Now a refusal releases both. If you see a payment approval
+that ends in neither (the request never returned, say), look for an `in_flight`
+row on `GET /v1/employees/{id}`'s `unsettled_calls` and see §6.
+
+**Approving the same payment twice pays once.** The approval leaves `pending` in
+the transaction the gate commits before the payment is attempted, so a retried
+`approve` is `approval_already_decided` and the rail is never approached again.
 
 Approvals expire: 24 hours for gate-filed ones, 7 days for loop escalations.
 
@@ -1437,6 +1457,10 @@ it is durable because it lives in a table rather than in the store.
 **MCP and payments refuse rather than pretend.** Both ports return
 `Terminal { code: "not_configured" }` and log it. That is deliberate: a fake
 that returns a plausible payment id is a fake that will one day be believed.
+The payment port is now genuinely *reached* — from a turn's `pay` tool and from
+`POST /v1/approvals/{id}/approve` — so that refusal is what an operator sees as
+a `502`, and every attempt leaves a settled `provider_intents` row. Nothing is
+missing but the rail, and which rail is SPEC §13's open decision.
 
 **WhatsApp never provisions.** `Step::Whatsapp` needs
 `EngineConfig::whatsapp_sender`, `EngineConfig::default()` sets it to `None`, and

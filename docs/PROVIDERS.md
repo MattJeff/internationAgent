@@ -650,6 +650,17 @@ id is a fake that will one day be believed; `not_configured` is the honest answe
 and shows up in the audit trail as one. If you are testing a payment flow and
 seeing `not_configured`, the system is working.
 
+**The payment port is now reached from a human's click**, not only from a turn:
+`POST /v1/approvals/{id}/approve` on a `payment_create` redeems the approval into
+a typed subject and calls `Effects::pay`, which answers `502
+payment_not_performed` with `payment_error: not_configured`. Writing an adapter
+for this port therefore has a live call site waiting for it — and two obligations
+beyond the trait, both in this file's next section: **reconcile before you
+create** (the `IdempotencyKey` the port is handed is derived from the Policy Gate
+ruling and is stable for that ruling, so look the payment up by it before making
+one), and never hold a signing key an LLM can reach. Which rail goes behind it is
+SPEC §13's open wallet decision, not an adapter author's.
+
 ---
 
 ## The two contracts every adapter must satisfy

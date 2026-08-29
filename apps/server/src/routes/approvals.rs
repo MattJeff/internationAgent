@@ -103,15 +103,38 @@
 //! `approver` may decide approvals that require `approver`, and nothing else.
 //! When identities grow roles, [`held_role`] is the one function that changes.
 //!
-//! # What approving does not do
+//! # What approving does, and the one kind it does it for
 //!
-//! It does not perform the effect. `agentos-providers` is deliberately not a
-//! dependency of this binary, so no route here can reach an
-//! [`Effects`](agentos_app::effects::Effects) façade — approving mints the
-//! [`Authorized`](agentos_app::gate::Authorized) token, spends the nonce, and
-//! reports the decision id. The token is dropped here on purpose: it is the
-//! seam an executor plugs into, and inventing an outbox event that no handler
-//! reads would be scaffolding, not a feature.
+//! For every action kind but one it still performs nothing: approving mints the
+//! [`Authorized`](agentos_app::gate::Authorized) token, spends the nonce,
+//! reports the decision id and **drops the token**. That is not shyness,
+//! it is the type system — `Authorized<Action>` satisfies no
+//! [`Effects`](agentos_app::effects::Effects) bound, because every method there
+//! takes `A: Subject<Of = …>` and there is no `impl Subject for Action`.
+//!
+//! For **`payment_create` it performs the payment**, and that one arm is link
+//! eight of the chain `agentos_app::x402` argues end to end. The body is already
+//! a parsed [`Action`]; the payment variant is destructured into
+//! [`PaymentCreate`](agentos_app::effects::PaymentCreate) — the newtype whose
+//! `to_action()` rebuilds the identical variant, so the approval hash is
+//! untouched — redeemed as *that*, and handed to
+//! [`Effects::pay`](agentos_app::effects::Effects::pay).
+//!
+//! The old sentence here — *"`agentos-providers` is deliberately not a
+//! dependency of this binary, so no route here can reach an `Effects` façade"* —
+//! was reasoning from the wrong crate. `Effects`, `Ports` and `PaymentProvider`
+//! all live in `agentos-app`, which this binary depends on and whose
+//! `mocks::ports_for` exists precisely so the composition root can assemble a
+//! [`Ports`](agentos_app::effects::Ports) without naming a provider crate.
+//! `main` already builds one for every turn; this route is handed the same
+//! `Arc`.
+//!
+//! **No money moves.** `Ports::payments` is `NotConfigured` — SPEC §13 — so a
+//! redeemed payment answers `Terminal { code: "not_configured" }` and this route
+//! answers `502`. What routing through the façade buys today is the *other* debt
+//! the dropped token left: the reservation the redemption took is settled or
+//! released by `Effects::book_effect`, which nothing on this path reached. See
+//! [`approve`].
 //!
 //! # Why there is no "where did this come from" on the queue
 //!
@@ -138,6 +161,9 @@
 //! redemption predicate requires `state = 'pending'` — which is what "the
 //! action never executes" means at this layer.
 
+use std::sync::Arc;
+
+use agentos_app::effects::{Effects, PaymentCreate, Ports};
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_domain::action::{Action, ActionKind};
 use agentos_domain::ids::{ApprovalId, EmployeeId};
@@ -184,15 +210,24 @@ macro_rules! view_sql {
     };
 }
 
-/// The routes' shared state: a database for the queue, a gate for the verdict.
+/// The routes' shared state: a database for the queue, a gate for the verdict,
+/// and — for the one action kind that has an executor — the ports the effect
+/// goes out through.
+///
+/// `ports` is the process-wide [`Ports`] `main` built, the same one every turn
+/// acts through, so a payment released by a human reaches the identical adapter
+/// a payment proposed by an employee would. A second `Ports` here would be a
+/// second answer to "which payment provider is installed", which is the shape of
+/// bug this workspace refuses one seam over in `mocks::ports_for`.
 #[derive(Clone)]
 pub struct Approvals {
     db: Db,
     gate: PolicyGate,
+    ports: Arc<Ports>,
 }
 
 /// Mount the approval routes.
-pub fn router(db: Db, gate: PolicyGate) -> Router {
+pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>) -> Router {
     Router::new()
         .route("/v1/approvals", get(list))
         .route("/v1/approvals/{id}", get(one))
@@ -200,7 +235,7 @@ pub fn router(db: Db, gate: PolicyGate) -> Router {
         .route("/v1/approvals/{id}/deny", post(deny))
         .route("/v1/capability-requests", get(capability_requests))
         .route("/v1/capability-requests/decide", post(decide_capability))
-        .with_state(Approvals { db, gate })
+        .with_state(Approvals { db, gate, ports })
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +383,19 @@ struct Decidable {
     /// undecidable rather than decidable by anyone.
     required_role: String,
     nonce: String,
+    /// The gate's own one-line rendering of the action — `reason` in the
+    /// schema, `summary` on the queue — and **the exact sentence the approver
+    /// was shown**.
+    ///
+    /// Read here because [`approve`] hands it to
+    /// [`Effects::pay`](agentos_app::effects::Effects::pay) as the memo, and a
+    /// payment's memo is the answer to "what was that for". Deriving it from the
+    /// stored line rather than taking it from the request body is deliberate:
+    /// the memo is the one field of a payment no hash is taken over, so a body
+    /// field would be a free-text string an approver could set to anything after
+    /// the fact. This one is `policy::evaluate`'s own words about the action that
+    /// *was* hashed.
+    summary: String,
 }
 
 /// Load the decision-relevant half of an approval. No `state` filter: whether
@@ -359,7 +407,8 @@ async fn decidable(tx: &mut TenantTx<'_>, id: Uuid) -> Result<Option<Decidable>,
         "SELECT employee_id, \
                 coalesce(action->>'requested_by', '')  AS requested_by, \
                 coalesce(action->>'required_role', '') AS required_role, \
-                coalesce(action->>'nonce', '')         AS nonce \
+                coalesce(action->>'nonce', '')         AS nonce, \
+                coalesce(reason, '')                  AS summary \
            FROM approvals WHERE id = $1",
     )
     .bind(id)
@@ -413,7 +462,64 @@ struct Approve {
     action: Action,
 }
 
+/// What a redeemed payment reports when the port would not move the money.
+///
+/// One literal, because [`ApiError`]'s vocabulary is closed and the provider's
+/// own code is open across adapters. The provider's word goes in an extension
+/// member instead, where a dashboard keyed on `code` cannot be broken by an
+/// adapter inventing a new one — and where an operator can still read
+/// `not_configured` without going to the audit trail.
+const PAYMENT_NOT_PERFORMED: &str = "payment_not_performed";
+
 /// Spend the approval on the action in the body.
+///
+/// # Link eight, and the one arm it is
+///
+/// `agentos_app::x402`'s *"The bridge from a human approved to the money moved"*
+/// lists what crossing it takes, smallest first, and item one is **a typed
+/// redemption for one kind**: read the body into
+/// [`PaymentCreate`](agentos_app::effects::PaymentCreate) when that is what the
+/// body is, redeem *that*, and hand the token to
+/// [`Effects::pay`](agentos_app::effects::Effects::pay). That is what the match
+/// below does, and it is deliberately **one arm and not a `match` over the
+/// enum**: the thing that argument warns against is a whole-enum translation
+/// from a jsonb column, "kept in step with the enum by nothing", where the arm
+/// somebody got wrong is the arm that spends a human's click on a different
+/// effect. There is no translation here. `body.action` is already a parsed
+/// [`Action`], one variant is destructured into the newtype that rebuilds *the
+/// identical variant* through [`PaymentCreate::to_action`], and every other
+/// variant takes the path it has always taken — minted, reported, dropped.
+///
+/// The hash ceremony is therefore untouched: `redeem_approval` re-hashes
+/// `to_action()`, which is `Action::PaymentCreate { amount, payee }` field for
+/// field, so a swapped payee is still `approval_action_mismatch`.
+///
+/// # It is redeemed exactly once, whichever arm runs
+///
+/// The match is **before** the redemption and not after it. Both arms call
+/// `redeem_approval` once, with the same id and the same nonce, and neither can
+/// reach the other's.
+///
+/// # Why a failed payment is a 502 and not a 200
+///
+/// Two facts come out of this handler and they can disagree: the approval was
+/// redeemed (irreversibly — `approvals.state` left `pending` in the transaction
+/// the gate committed), and the money did not move. A 200 would state the first
+/// and bury the second, which is the failure `agentos_app::mocks` is arranged
+/// against one layer down: *"a fake that returns a plausible payment id is a
+/// fake that will one day be believed"*. An error that carries `state:
+/// "redeemed"` and the `decision_id` as extension members states both, and the
+/// audit row is the same either way.
+///
+/// **Today it is always the 502**, because [`Ports::payments`] is
+/// `NotConfigured` and answers `Terminal { code: "not_configured" }` — see SPEC
+/// §13. That is the system working, and the point of routing through
+/// [`Effects::pay`](agentos_app::effects::Effects::pay) anyway is the half that
+/// is not about the money: the token carries a spend reservation that somebody
+/// owes the ledger a `settle` or a `release`, and `Effects::book_effect` is the
+/// only code that pays that debt. Dropping the token — which is what this route
+/// did — left an approved payment holding the day's headroom, and the team's,
+/// until the bucket rolled over at midnight.
 async fn approve(
     State(state): State<Approvals>,
     principal: Principal,
@@ -446,30 +552,63 @@ async fn approve(
         employee_id: EmployeeId::from_uuid(employee_id),
         actor: principal.actor.clone(),
     };
+    let approval_id = ApprovalId::from_uuid(id);
+
+    // The one arm with an executor. Everything else is minted, reported and
+    // dropped, exactly as it always was — there is nothing on the far side of
+    // those tokens to hand them to.
+    let Action::PaymentCreate { amount, payee } = body.action else {
+        let authorized = state
+            .gate
+            .redeem_approval(&gate_principal, approval_id, &row.nonce, body.action)
+            .await?;
+        return Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": authorized.decision_id().as_uuid().to_string(),
+        })));
+    };
+
     let authorized = state
         .gate
         .redeem_approval(
             &gate_principal,
-            ApprovalId::from_uuid(id),
+            approval_id,
             &row.nonce,
-            body.action,
+            PaymentCreate { amount, payee },
         )
         .await?;
+    let decision_id = authorized.decision_id().as_uuid().to_string();
 
-    // **This is where the chain stops, and it stops on purpose.** `authorized`
-    // is an `Authorized<Action>`, which satisfies no `Effects` bound — every
-    // method there is `A: Subject<Of = …>` and there is no `impl Subject for
-    // Action` — so a human's click becomes a decision id and a redeemed row,
-    // never an effect. What that costs (a payment reservation nobody settles or
-    // releases) and what crossing it would take, in order, is argued in one
-    // place: `agentos_app::x402`, "The bridge from a human approved to the money
-    // moved". `crate::sourcing::place_order` reaches the same wall from the
-    // other side, and `crates/app/tests/x402_chain.rs` walks up to it.
-    Ok(Json(json!({
-        "id": id.to_string(),
-        "state": "redeemed",
-        "decision_id": authorized.decision_id().as_uuid().to_string(),
-    })))
+    // The effect is attributed to the **employee** the approval names, not to
+    // the human who pressed the button: the audit row a payment writes is the
+    // seat's, the reservation on the token is the seat's, and the approver is
+    // already on the gate's own row for this `decision_id` as the actor that
+    // redeemed it.
+    let effects = Effects::new(state.db.clone(), state.ports.clone(), gate_principal);
+    // The memo is the queue line the approver read, and is the only field of
+    // this payment no hash is taken over — see [`Decidable::summary`].
+    match effects.pay(authorized, &row.summary).await {
+        Ok(paid) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": decision_id,
+            "payment": { "provider_message_id": paid.as_str() },
+        }))),
+        Err(err) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            PAYMENT_NOT_PERFORMED,
+            "the approval was redeemed and the payment provider did not move the money",
+        )
+        // Both facts, because they disagree and both are true. The approval is
+        // spent whatever this says.
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id))
+        // The port's own word. `EffectError::code` is `&'static str` and is the
+        // same vocabulary the audit row carries, so an operator reading a 502
+        // and an operator reading the trail read one string.
+        .with_extension("payment_error", json!(err.code()))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,7 +1069,17 @@ mod tests {
     }
 
     fn mount(db: &Db, gate: &PolicyGate, keys: ApiKeys) -> Router {
-        router(db.clone(), gate.clone()).layer(from_fn_with_state(
+        // `mocks::ports()` binds `NotConfigured` behind `payments`, which is
+        // what a deployment binds too — see SPEC §13. A test that wanted a
+        // payment to *succeed* would have to install a fake that returns a
+        // plausible payment id, which is the one thing `agentos_app::mocks`
+        // refuses to ship.
+        router(
+            db.clone(),
+            gate.clone(),
+            Arc::new(agentos_app::mocks::ports()),
+        )
+        .layer(from_fn_with_state(
             crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
             require_api_key,
         ))
@@ -969,6 +1118,45 @@ mod tests {
     /// The keyring for one tenant, with `label` as the caller's role.
     fn keys(tenant: TenantId, label: &str, secret: &str) -> ApiKeys {
         ApiKeys::parse(&format!("{label}:{}:{secret}", tenant.as_uuid())).expect("keyring")
+    }
+
+    /// `(state, last_error)` of every payment this seat approached the rail
+    /// with, oldest first.
+    ///
+    /// A row exists because `Effects::pay` commits one *before* the port is
+    /// entered, so this counts approaches and not successes — which is the only
+    /// countable thing when the port refuses.
+    async fn payment_intents(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+    ) -> Vec<(String, Option<String>)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows = sqlx::query_as(
+            "SELECT state, last_error FROM provider_intents \
+              WHERE employee_id = $1 AND intent_kind = 'payment_create' \
+              ORDER BY created_at, id",
+        )
+        .bind(employee.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read provider_intents");
+        tx.commit().await.expect("commit");
+        rows
+    }
+
+    /// Every spend reservation this seat holds, oldest first.
+    async fn reservation_states(db: &Db, tenant: TenantId, employee: EmployeeId) -> Vec<String> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows = sqlx::query_scalar(
+            "SELECT state FROM spend_reservations WHERE employee_id = $1 ORDER BY created_at, id",
+        )
+        .bind(employee.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read spend_reservations");
+        tx.commit().await.expect("commit");
+        rows
     }
 
     async fn state_of(db: &Db, tenant: TenantId, id: ApprovalId) -> String {
@@ -1151,9 +1339,88 @@ mod tests {
 
         // And what the human did approve still goes through, so the refusal
         // above is the payee and not the fixture being unredeemable.
+        //
+        // "Goes through" is now a 502 and not a 200, and that is the bridge
+        // rather than a regression: the token is handed to `Effects::pay`, and
+        // `Ports::payments` is `NotConfigured`. The approval is redeemed either
+        // way — which is the line that proves the earlier refusal was the payee
+        // — and the body says which of the two facts is which.
         let (status, body) = call(&app, &uri, SECRET, Some(json!({ "action": approved }))).await;
-        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["code"], json!("payment_not_performed"));
+        assert_eq!(body["state"], json!("redeemed"));
+        assert_eq!(body["payment_error"], json!("not_configured"));
         assert_eq!(state_of(&db, tenant, id).await, "redeemed");
+    }
+
+    /// **A redeemed payment is attempted exactly once, and a replay does not
+    /// attempt a second.**
+    ///
+    /// The claim the whole payment bridge stands on. `Effects::pay` commits a
+    /// `provider_intents` row *before* the port is entered, so the number of
+    /// those rows is the number of times this system was about to move money —
+    /// countable after the fact, unlike the port call itself, and countable even
+    /// against a port that refuses.
+    ///
+    /// The replay is the crash it stands in for. A process that dies between
+    /// the rail's answer and its own commit leaves a caller who will retry the
+    /// same `POST .../approve`; what stops that retry paying again is not this
+    /// route and not the fence, it is `approvals::redeem` — the row left
+    /// `pending` in the transaction `redeem_approval` commits before
+    /// `Effects::pay` is reached, so the second attempt is `AlreadyDecided` and
+    /// the port is never entered. This test is that sentence against a real
+    /// database.
+    ///
+    /// It also pins the half the dead end used to cost: the reservation the
+    /// redemption took is **released**, because the money did not move. Before
+    /// the bridge the token was dropped, nothing settled it, and an approved
+    /// payment held the seat's headroom — and its team's — until midnight.
+    #[tokio::test]
+    async fn a_replayed_approval_does_not_pay_twice() {
+        let Some(db) = db().await else { return };
+        let gate = PolicyGate::new(db.clone());
+        let (tenant, employee) = seed(&db).await;
+        may_spend_up_to_500(&db, tenant, employee).await;
+
+        let approved = pay(50_000, "Cabinet Dubois");
+        let id = file(&gate, &GatePrincipal::employee(tenant, employee), &approved).await;
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+        let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
+        let body = json!({ "action": approved });
+
+        let (status, answer) = call(&app, &uri, SECRET, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer:?}");
+        assert_eq!(answer["payment_error"], json!("not_configured"));
+
+        // One approach to the money, and the port's own vocabulary in the
+        // column an operator reads.
+        assert_eq!(
+            payment_intents(&db, tenant, employee).await,
+            vec![("failed".to_owned(), Some("not_configured".to_owned()))],
+            "the write-ahead row says the rail answered, and what it said"
+        );
+        assert_eq!(
+            reservation_states(&db, tenant, employee).await,
+            vec!["released".to_owned()],
+            "money that did not move must not hold the day's headroom"
+        );
+
+        // The replay. Same id, same nonce, same body — the retry a crashed
+        // caller makes.
+        let (status, answer) = call(&app, &uri, SECRET, Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(answer["code"], json!("approval_already_decided"));
+
+        assert_eq!(
+            payment_intents(&db, tenant, employee).await.len(),
+            1,
+            "a replayed approval must not approach the rail a second time"
+        );
+        assert_eq!(
+            reservation_states(&db, tenant, employee).await.len(),
+            1,
+            "and must not reserve a second time either"
+        );
     }
 
     #[tokio::test]
