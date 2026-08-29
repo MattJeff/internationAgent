@@ -400,12 +400,28 @@ pub fn verify_request(
     // `created` is required; `expires` is not, and its absence means our own
     // LIFETIME rather than "forever" — a signature with no stated end is not a
     // signature we keep believing.
+    //
+    // Neither is `expires` when it is *stated*: it is a number in a header a
+    // stranger wrote, so believed as given it is the signer — or whoever
+    // captured one of its requests — who decides how long a replay stays good
+    // for. `created + LIFETIME` is the ceiling on both branches, which is what
+    // makes this module's "the window is LIFETIME" true of what we *accept* and
+    // not only of what we emit. It only ever narrows: a peer signing our own
+    // five minutes, or less, is unaffected.
+    //
+    // `saturating_add` because `created` is that same stranger's number, and
+    // `i64::MAX + 300` is a panic in any build with overflow checks — reachable
+    // from one header on the request path.
     let created: i64 = param(params, "created")
         .and_then(|raw| raw.parse().ok())
         .ok_or(VerifyError::Malformed)?;
+    let ceiling = created.saturating_add(LIFETIME.num_seconds());
     let expires: i64 = match param(params, "expires") {
-        Some(raw) => raw.parse().map_err(|_| VerifyError::Malformed)?,
-        None => created + LIFETIME.num_seconds(),
+        Some(raw) => raw
+            .parse::<i64>()
+            .map_err(|_| VerifyError::Malformed)?
+            .min(ceiling),
+        None => ceiling,
     };
     let now = now.timestamp();
     let skew = SKEW.num_seconds();
@@ -811,6 +827,106 @@ mod tests {
             verify_request(&request, &headers(&signed), &[], now),
             Err(VerifyError::UnknownKey)
         );
+    }
+
+    /// **The window is ours, not the peer's.**
+    ///
+    /// `expires` is a number in a header a stranger wrote, and taken as given it
+    /// is the peer — or whoever captured one of its requests — who decides how
+    /// long a signature stays replayable. Nothing about the signature is forged
+    /// here: the params in the header are the params in the base, so the curve
+    /// has no objection and only the clock can refuse it.
+    #[test]
+    fn a_peer_cannot_widen_the_window_by_naming_its_own_expiry() {
+        let now = Utc::now();
+        let request = request();
+        let key = SigningKey::generate();
+        let key_id = key.public_key().key_id();
+
+        let decade = TimeDelta::days(3650);
+        let params = signature_params(
+            &COVERED,
+            &key_id,
+            now.timestamp(),
+            (now + decade).timestamp(),
+        );
+        let digest = content_digest(request.body);
+        let signature = key.sign(base(&request, &COVERED, &digest, &params).as_bytes());
+        let input = format!("{LABEL}={params}");
+        let signature = format!("{LABEL}=:{}:", signature.to_base64());
+        let headers = SignatureHeaders {
+            signature_input: Some(&input),
+            signature: Some(&signature),
+            content_digest: Some(&digest),
+        };
+        let keys = [key.public_key()];
+
+        // Inside our own lifetime it is a good signature...
+        assert_eq!(
+            verify_request(&request, &headers, &keys, now),
+            Ok(Verdict::Verified(key.public_key().key_id()))
+        );
+        // ...and a day later it is not, whatever the header asked for.
+        assert_eq!(
+            verify_request(&request, &headers, &keys, now + TimeDelta::days(1)),
+            Err(VerifyError::Stale),
+            "a captured request stays replayable for as long as its signer said so"
+        );
+
+        // The other half: a ceiling narrows and does not *replace*. A peer that
+        // asks for one minute gets one minute, not ours.
+        let minute = TimeDelta::minutes(1);
+        let params = signature_params(
+            &COVERED,
+            &key_id,
+            now.timestamp(),
+            (now + minute).timestamp(),
+        );
+        let signature = key.sign(base(&request, &COVERED, &digest, &params).as_bytes());
+        let input = format!("{LABEL}={params}");
+        let signature = format!("{LABEL}=:{}:", signature.to_base64());
+        let headers = SignatureHeaders {
+            signature_input: Some(&input),
+            signature: Some(&signature),
+            content_digest: Some(&digest),
+        };
+        assert_eq!(
+            verify_request(
+                &request,
+                &headers,
+                &keys,
+                now + minute + SKEW + TimeDelta::seconds(1)
+            ),
+            Err(VerifyError::Stale),
+            "a peer that asked for a minute was believed for our five"
+        );
+    }
+
+    /// `created` is a number a stranger writes, and the default `expires` is
+    /// computed from it before anything has looked at how large it is.
+    #[test]
+    fn a_created_at_the_edge_of_the_integer_range_is_stale_and_not_an_overflow() {
+        let request = request();
+        let digest = content_digest(request.body);
+
+        for created in [i64::MAX, i64::MIN] {
+            let input =
+                format!("{LABEL}=(\"content-digest\");created={created};keyid=\"k\";alg=\"{ALG}\"");
+            assert_eq!(
+                verify_request(
+                    &request,
+                    &SignatureHeaders {
+                        signature_input: Some(&input),
+                        signature: Some("sig1=::"),
+                        content_digest: Some(&digest),
+                    },
+                    &[],
+                    Utc::now(),
+                ),
+                Err(VerifyError::Stale),
+                "created={created}"
+            );
+        }
     }
 
     /// A peer signing a narrower profile than ours still verifies, as long as

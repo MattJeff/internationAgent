@@ -94,13 +94,27 @@ pub struct Principal {
 }
 
 /// One configured credential.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ApiKey {
     /// Human name for the key, e.g. `ops-console`. Becomes the audit actor —
     /// so the trail says which key acted, never what the secret was.
     label: String,
     tenant_id: TenantId,
     secret: String,
+}
+
+// Hand-written, like every other type in this workspace that holds one: a
+// derived `Debug` prints `secret` verbatim, and a keyring is exactly the sort of
+// thing somebody renders while working out why a request 401'd. The label and
+// the tenant are the half that answers that question; the secret never was.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("label", &self.label)
+            .field("tenant_id", &self.tenant_id)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The keyring, parsed once at boot and shared by every request.
@@ -216,10 +230,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Holds the environment keyring, the pool, and the deployment's key-hashing
 /// key. Cheap to clone: an `Arc<Vec<_>>`, a pooled handle and 32 bytes.
 ///
-/// No `Debug`, and not because the fields are secret — [`ApiKeys`] has one that
-/// prints entries. Because this is the type an axum layer holds, so it is the
-/// type that appears in a `Service` type name in a panic, and the fewer ways
-/// there are to render a keyring the better.
+/// No `Debug`. Not because a rendering would leak — [`ApiKeys`] redacts, and so
+/// does [`agentos_app::api_keys::Hasher`] by having none. Because this is the
+/// type an axum layer holds, so it is the type that appears in a `Service` type
+/// name in a panic, and the fewer ways there are to render a keyring the better.
 #[derive(Clone)]
 pub struct Keyring {
     /// `AGENTOS_API_KEYS`. Consulted first — see the module docs.
@@ -367,10 +381,21 @@ pub struct PlatformPrincipal {
 }
 
 /// One configured platform credential.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PlatformKey {
     label: String,
     secret: String,
+}
+
+// Hand-written, for the reason [`ApiKey`]'s is — and this one guards the single
+// credential that can mint another tenant's keys.
+impl std::fmt::Debug for PlatformKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformKey")
+            .field("label", &self.label)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The platform keyring, parsed once at boot.
@@ -816,6 +841,31 @@ mod tests {
             AuditActor::Operator(who) => assert_eq!(who, "ops-console"),
             other => panic!("expected an operator, got {other:?}"),
         }
+    }
+
+    /// **A keyring must not print what it holds.**
+    ///
+    /// [`Keyring`] has no `Debug` at all, which is what keeps these off the one
+    /// surface that renders types by accident — but these two are `pub`, they
+    /// are what `Config` holds, and one `tracing::debug!(?keys)` anywhere is a
+    /// log line carrying every operator credential in the deployment. The
+    /// labels are the half worth printing and the half that is already the
+    /// audit actor; the secrets are the half that is never worth printing.
+    #[test]
+    fn a_keyring_renders_its_labels_and_never_its_secrets() {
+        let tenant = Uuid::from_u128(1);
+        let env = ApiKeys::parse(&format!("ops-console:{tenant}:{SECRET}")).expect("valid");
+        let rendered = format!("{env:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("ops-console") && rendered.contains(&tenant.to_string()),
+            "the half worth printing is missing: {rendered}"
+        );
+
+        let platform = PlatformKeys::parse(&format!("signup:{OTHER}")).expect("valid");
+        let rendered = format!("{platform:?}");
+        assert!(!rendered.contains(OTHER), "{rendered}");
+        assert!(rendered.contains("signup"), "{rendered}");
     }
 
     #[test]
