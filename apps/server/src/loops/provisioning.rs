@@ -750,10 +750,67 @@ async fn reap(
     Ok(escalated)
 }
 
-/// Has a human already been asked this exact question and not yet answered it?
+/// Has a human already been asked this exact question, and **can they still
+/// answer it**?
 ///
 /// The hash is computed by Postgres over the same canonical bytes
 /// `approvals::create` hashes, so the two can only ever agree.
+///
+/// # `expires_at > now()` is the second half of the question
+///
+/// `approvals.state` has three values and none of them is "expired": nothing in
+/// this workspace moves a lapsed request out of `pending` — the only
+/// `UPDATE approvals SET state` there is is `approvals::redeem`, which a human
+/// has to reach. So a row nobody clicked inside [`LoopConfig::approval_ttl`]
+/// stays `pending` for the life of the tenant, and without this clause it went
+/// on answering "already asked" forever.
+///
+/// That made the suppression **permanent**, which is a different failure from
+/// the one this guard exists to prevent. [`reap`] files nothing and flips the
+/// step to `failed` anyway; the row is retried until `attempt_count` reaches
+/// [`LoopConfig::max_attempts`] and then [`CLAIM_SQL`] never looks at it again.
+/// A failed step on an *active* employee is on no operator list —
+/// `GET /v1/inventory/stranded` is `lifecycle = 'terminated'` only — so after
+/// one unanswered escalation the step was never raised to a human again, by
+/// anything, ever.
+///
+/// The predicate is `approvals::redeem`'s, word for word and on purpose: this
+/// asks "could a human still say yes to the row I found", and `redeem` is what
+/// decides that. A NULL `expires_at` therefore does **not** suppress —
+/// `NULL > now()` is NULL, `redeem` matches nothing, and a question nobody can
+/// answer must not silence the next one. `NewApproval::expires_at` is
+/// non-optional so no writer in this workspace can produce that row; the clause
+/// is what makes it a property of the query rather than of the callers.
+///
+/// `crate::metrics`'s gauge spells the same idea as
+/// `(expires_at IS NULL OR expires_at > now())` and is right to: it counts what
+/// an operator could act on, and `routes::approvals::deny` clears a lapsed row
+/// without checking the deadline. Two questions, two clauses, neither is the
+/// other's. `routes::approvals::list` has no clause at all, also deliberately,
+/// and carries its own founder's question about it.
+///
+/// # FOUNDER'S QUESTION: nobody has chosen a reminder cadence
+///
+/// Once a lapsed row stops suppressing, the step escalates again — and what
+/// bounds that is not a reminder policy, because there is no reminder policy.
+/// It is two numbers chosen for other reasons:
+///
+/// * **how many times**: [`LoopConfig::max_attempts`], whose docstring is about
+///   provider calls ("give up retrying a step after this many claims"). The
+///   `failed` arm of [`CLAIM_SQL`] is capped by it, so one step buys at most
+///   `max_attempts` more trips through `pending_external` and therefore at most
+///   that many more escalations, then goes quiet for good.
+/// * **how far apart**: the provider's own `expected_by`. Twilio decides how
+///   long a regulatory bundle sits in review, so it decides the gap between one
+///   reminder and the next.
+///
+/// The founder's queue therefore gets up to `max_attempts` rows for one step
+/// over its life, each naming a *different* `poll_ref` — a different
+/// re-submission that also failed. That is a log rather than a repetition, which
+/// is why nothing here dedupes across it. But "five reminders, spaced by
+/// Twilio" is an accident of two unrelated knobs, and if the answer should be
+/// "one a week until somebody clicks" that is an interval this file will not
+/// invent. The knob it would go on is [`LoopConfig`].
 async fn already_asked(
     tx: &mut agentos_store::db::TenantTx<'_>,
     employee: EmployeeId,
@@ -764,6 +821,7 @@ async fn already_asked(
         "SELECT id FROM approvals \
           WHERE employee_id = $1 \
             AND state = 'pending' \
+            AND expires_at > now() \
             AND action->>'action_hash' = encode(sha256(convert_to($2::text, 'UTF8')), 'hex') \
           LIMIT 1",
     )
@@ -2001,6 +2059,148 @@ mod tests {
         )
         .await;
         assert_eq!(pending, 1, "one bundle, one question");
+    }
+
+    /// An escalation nobody answered must stop silencing its step.
+    ///
+    /// The mutation this test exists for is one clause: take
+    /// `AND expires_at > now()` back out of [`already_asked`] and the third
+    /// `reap` below files nothing. What that costs is not "a row is missing" —
+    /// nothing in this workspace moves a lapsed approval out of `pending`, so
+    /// the guard would answer "already asked" for the life of the tenant, and
+    /// **this step would never be raised to a human again**. `reap` goes on
+    /// flipping it to `failed` in silence, [`CLAIM_SQL`] stops claiming it at
+    /// [`LoopConfig::max_attempts`], and a failed step on an *active* employee
+    /// is on no operator screen: `GET /v1/inventory/stranded` is terminated
+    /// employees only.
+    ///
+    /// [`an_overdue_pending_external_step_is_escalated_once`] is the other half
+    /// and is blind to this one — both of its reaps land inside the approval's
+    /// seven days, which is precisely the window where suppressing is right. A
+    /// test can only see the deadline it crosses.
+    #[tokio::test]
+    async fn an_escalation_nobody_answered_stops_silencing_its_step() {
+        let Some((db, _guard)) = db().await else {
+            return;
+        };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db, "grace").await;
+        let cfg = LoopConfig::default();
+
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources SET state = 'ready' WHERE employee_id = $1",
+        )
+        .await;
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources \
+                SET state = 'pending_external', poll_ref = 'BU:FR:first', \
+                    expected_by = now() - interval '1 hour' \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .await;
+
+        let claimed = claim(&db, &cfg, Utc::now()).await.expect("claim");
+        assert_eq!(claimed.len(), 1, "an overdue wait is work");
+        assert_eq!(
+            reap(&db, &cfg, &claimed[0], Utc::now())
+                .await
+                .expect("reap"),
+            vec![Step::Phone],
+        );
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1",
+            )
+            .await,
+            1,
+            "the first overdue wait asks",
+        );
+
+        // Still inside its seven days: the operator has the question open, and
+        // asking again would be the 18,000-a-day failure. This half must keep
+        // working, which is why it is in the same test as the half that must
+        // start working.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources \
+                SET state = 'pending_external', poll_ref = 'BU:FR:first', \
+                    expected_by = now() - interval '1 hour' \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .await;
+        reap(&db, &cfg, &claimed[0], Utc::now())
+            .await
+            .expect("reap while the question is live");
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1",
+            )
+            .await,
+            1,
+            "a live question is not asked twice",
+        );
+
+        // Seven days pass and nobody clicks. `state` is still 'pending' — there
+        // is no writer that would make it anything else — so only `expires_at`
+        // knows the question is dead.
+        exec(
+            &db,
+            &employee,
+            "UPDATE approvals SET expires_at = now() - interval '1 second' \
+              WHERE employee_id = $1",
+        )
+        .await;
+        assert_eq!(
+            scalar::<i64>(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE employee_id = $1 AND state = 'pending'",
+            )
+            .await,
+            1,
+            "a lapsed approval is still 'pending', which is the whole trap",
+        );
+
+        // The bundle was re-submitted under a new reference and ran out of
+        // patience again.
+        exec(
+            &db,
+            &employee,
+            "UPDATE employee_resources \
+                SET state = 'pending_external', poll_ref = 'BU:FR:second', \
+                    expected_by = now() - interval '1 hour' \
+              WHERE employee_id = $1 AND step = 'phone'",
+        )
+        .await;
+        reap(&db, &cfg, &claimed[0], Utc::now())
+            .await
+            .expect("reap after the question died");
+
+        let reasons: String = scalar(
+            &db,
+            &employee,
+            "SELECT string_agg(reason, ' || ' ORDER BY requested_at) \
+               FROM approvals WHERE employee_id = $1",
+        )
+        .await;
+        assert!(
+            reasons.contains("BU:FR:second"),
+            "nobody was ever going to be told about this step again: {reasons}",
+        );
+        assert!(
+            reasons.contains("BU:FR:first"),
+            "the dead question is evidence and is not overwritten: {reasons}",
+        );
     }
 
     #[tokio::test]
