@@ -803,6 +803,74 @@ mod tests {
         assert!(slow.chase_line(now).contains("Leave them alone"));
     }
 
+    /// **The two constants in the allowance, each on data that crosses it.**
+    ///
+    /// [`Standing::overdue_by`] is `(expected + 2·σ).max(scale)` and until this
+    /// test neither term was measured: in
+    /// [`the_allowance_is_the_counterpartys_own_habit`] the fast archetype is
+    /// chased at 24h whether the allowance is 2.8h, 4h or 10h, and the slow one
+    /// is spared at 24h whether it is 70h or 73h. Both mutants —
+    /// `2.0 * spread` -> `0.0 * spread`, and dropping `.max(OBSERVED.scale())`
+    /// — kept every assertion in this file green. Each half below is chosen so
+    /// that one of them flips a verdict.
+    ///
+    /// The σ half is the interesting one, and it is not "the slower supplier
+    /// gets more rope": the erratic contact here has the *shorter* average of
+    /// the two and is spared anyway, because half its replies land at 18h and
+    /// chasing at 20h would be chasing its ordinary behaviour.
+    #[test]
+    fn both_terms_of_the_allowance_decide_something() {
+        let waiting = |series: &[(f64, i64)]| Standing {
+            counterparty: "ap@supplier.example".to_owned(),
+            latency: fold(&log(series), at(0)).0,
+            stance: Stance::Neutral,
+            awaiting_reply_since: Some(at(0)),
+            last_heard_from_at: None,
+        };
+
+        // σ: same silence, two contacts, and the spread is the whole difference.
+        // Steady answers at 10h every time (σ = 0, allowance 10h); erratic
+        // alternates 2h and 18h (expected 7.6h, σ = 8h, allowance 23.6h).
+        let steady = waiting(&[(10.0, 0), (10.0, 1), (10.0, 2), (10.0, 3), (10.0, 4)]);
+        let erratic = waiting(&[
+            (2.0, 0),
+            (18.0, 1),
+            (2.0, 2),
+            (18.0, 3),
+            (2.0, 4),
+            (18.0, 5),
+        ]);
+        assert!(
+            erratic.latency.expected() < steady.latency.expected(),
+            "the erratic contact must be the one with the shorter average, or \
+             this test is measuring the mean and not the spread"
+        );
+        let twenty = at(20 * 3_600);
+        assert!(
+            steady.overdue_by(twenty).is_some(),
+            "twice a metronome's own habit is late"
+        );
+        assert!(
+            erratic.overdue_by(twenty).is_none(),
+            "18h is an ordinary Tuesday for this contact; without the 2σ term \
+             it would be chased inside its own scatter"
+        );
+
+        // The floor: a contact that answers in an hour has an allowance of
+        // `OBSERVED.scale()`, not of an hour, so three hours of silence is not
+        // a reason to write to somebody.
+        let metronome = waiting(&[(1.0, 0), (1.0, 1), (1.0, 2), (1.0, 3), (1.0, 4)]);
+        assert_eq!(metronome.latency.std_dev(), Some(0.0));
+        assert!(
+            metronome.overdue_by(at(3 * 3_600)).is_none(),
+            "chased two hours over, because the allowance collapsed onto the habit"
+        );
+        assert!(
+            metronome.overdue_by(at(5 * 3_600)).is_some(),
+            "the floor is a floor, not a mute"
+        );
+    }
+
     /// Forgetting runs on the log, and the log alone. Same rows, same `now`:
     /// the identical ledger. A later `now`: a faded one.
     #[test]
@@ -1307,6 +1375,133 @@ mod tests {
         assert_eq!(
             landed, 2,
             "a header the psyche cannot name cost us a message"
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The clamp on `surprise` is what keeps a very late reply from
+    /// dead-lettering itself**, and it had no test that could tell.
+    ///
+    /// `psyche_episodes_surprise_range` is `[-2, 2]`, ours is in hours divided
+    /// by a four-hour scale, and the INSERT runs inside `land`'s transaction —
+    /// so a surprise the column refuses does not lose an observation, it loses
+    /// the customer's email. The threshold is only eight hours of surprise, so
+    /// "a supplier who took a fortnight this time" reaches it on any ordinary
+    /// relationship.
+    ///
+    /// The assertion `a_real_reply_moves_the_expectation_through_the_real_path`
+    /// makes about this is `(-2.0..=2.0).contains(&stored)` over a series of
+    /// 6/7/6/5 hours: every surprise there is under two hours, so the range
+    /// admits the unclamped value too and deleting `.clamp(-2.0, 2.0)` leaves
+    /// it green. Here the raw value is ~98 and the stored one is asserted
+    /// **equal** to the boundary, so both the clamp and its sign have to be
+    /// right.
+    #[tokio::test]
+    async fn a_reply_a_fortnight_late_is_still_delivered() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+
+        // A six-hour habit, learned the ordinary way.
+        for (day, hours) in [(0, 6.0), (1, 7.0), (2, 6.0), (3, 5.0)] {
+            exchange(&db, tenant, lena, SUPPLIER, at(day * 86_400), hours).await;
+        }
+        // ...and then they vanish for four hundred hours. `expect("land")`
+        // below is the assertion that matters: without the clamp the CHECK
+        // rejects the episode, `land` returns the error, and this message is
+        // dead-lettered.
+        exchange(&db, tenant, lena, SUPPLIER, at(10 * 86_400), 400.0).await;
+
+        // The mirror, on its own relationship: a contact whose habit is a
+        // fortnight and who suddenly answers the same morning. `.min(2.0)` is
+        // the lazy half-fix that would pass the first half of this test and
+        // dead-letter this message, so the floor is asserted as well as the
+        // ceiling.
+        let eager = "sales@fortnightly.example";
+        for round in 0..4 {
+            exchange(&db, tenant, lena, eager, at(round * 20 * 86_400), 400.0).await;
+        }
+        exchange(&db, tenant, lena, eager, at(90 * 86_400), 6.0).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let episodes = psyche_store::episodes_about(&mut tx, lena, SUPPLIER, HISTORY)
+            .await
+            .expect("episodes");
+        assert_eq!(episodes.len(), 5, "the late reply was not recorded");
+        // Newest first, so this is the late one. Raw surprise is ~394h over a
+        // 4h scale — a hundred times what the column holds.
+        let stored = episodes[0].surprise.expect("a surprise was measured");
+        assert_eq!(
+            stored, 2.0,
+            "the stored surprise is not the column's ceiling"
+        );
+        let hours = episodes[0]
+            .detail
+            .get("observed_hours")
+            .and_then(Value::as_f64)
+            .expect("the exact hours survive in the detail");
+        assert_eq!(hours, 400.0, "the clamp reached the number the fold reads");
+
+        let early = psyche_store::episodes_about(&mut tx, lena, eager, HISTORY)
+            .await
+            .expect("episodes");
+        assert_eq!(early.len(), 5, "the early reply was not recorded");
+        assert_eq!(
+            early[0].surprise.expect("a surprise was measured"),
+            -2.0,
+            "the stored surprise is not the column's floor"
+        );
+        tx.rollback().await.expect("rollback");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **A second RFQ to somebody already silent does not restart the clock.**
+    ///
+    /// `vertical::open_the_round` calls [`awaiting_reply`] for every recipient
+    /// of every round, so a supplier that is shortlisted quarter after quarter
+    /// and never answers is written here again and again. With `=` instead of
+    /// `or` the wait would be reset by our own letter each time, `waited` would
+    /// never exceed the allowance, and the one counterparty the chase list
+    /// exists for — the one that never replies — would be the one it can never
+    /// name.
+    ///
+    /// No test in this file sent a second RFQ, so that mutation was green.
+    #[tokio::test]
+    async fn a_second_rfq_does_not_reset_how_long_they_have_been_silent() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+
+        // A supplier that answers in seventy hours, four times: allowance 70h.
+        for day in 0..4 {
+            exchange(&db, tenant, lena, SUPPLIER, at(day * 10 * 86_400), 70.0).await;
+        }
+
+        let first = at(40 * 86_400);
+        let second = first + TimeDelta::hours(72);
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        for sent in [first, second] {
+            awaiting_reply(&mut tx, lena, SUPPLIER, sent)
+                .await
+                .expect("awaiting");
+        }
+        tx.commit().await.expect("commit");
+
+        let now = first + TimeDelta::hours(96);
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let after = standing(&mut tx, lena, SUPPLIER, now)
+            .await
+            .expect("standing");
+        assert_eq!(
+            after.awaiting_reply_since,
+            Some(first),
+            "the second letter overwrote how long they have been silent"
+        );
+        assert!(
+            after.overdue_by(now).is_some(),
+            "ninety-six hours of silence from a seventy-hour supplier, and the \
+             chase list cannot see it"
         );
         tx.rollback().await.expect("rollback");
 
