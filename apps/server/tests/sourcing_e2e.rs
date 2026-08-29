@@ -82,7 +82,7 @@ use agentos_domain::policy::{DenyReason, PolicyLimits};
 use agentos_domain::psyche::links::{Polarity, TrustEvent, TrustLedger};
 use agentos_domain::sourcing as buying;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
-use agentos_store::db::Db;
+use agentos_store::db::{Db, StoreError};
 use agentos_store::psyche as psyche_store;
 use agentos_store::sourcing as sourcing_store;
 use chrono::{DateTime, Utc};
@@ -833,9 +833,19 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
 
     // A currency with no rate stops the whole comparison rather than quietly
     // dropping the supplier nobody could convert.
-    assert!(
-        rank(&live, &lane(), &Fx::new(Usd).with(Eur, 108, 100)).is_err(),
-        "an unconvertible quote must not be silently left out of the shortlist"
+    //
+    // By the variant and by the currency, not `is_err()`. The claim is that the
+    // *Chinese* quote — the one this table cannot convert — stops the ranking.
+    // A bare `is_err` is equally happy with `NoRate(Eur)`, which would mean the
+    // rate that was supplied is not being read at all, and with `LaneCurrency`,
+    // `NoQuantity` or `Overflow`, none of which is about a missing rate. It was
+    // measured: pointing the table at CNY instead of EUR gives `NoRate(Eur)`,
+    // and the old assertion was green on it.
+    assert_eq!(
+        rank(&live, &lane(), &Fx::new(Usd).with(Eur, 108, 100)).unwrap_err(),
+        agentos_app::sourcing::QuoteError::NoRate(Cny),
+        "an unconvertible quote must not be silently left out of the shortlist, \
+         and the refusal has to name the currency nobody could convert"
     );
 
     // -- the same round, in the store --------------------------------------
@@ -934,9 +944,36 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         },
     )
     .await;
-    assert!(
-        refused.is_err(),
-        "the schema accepted a CNY quote against a EUR RFQ; the currency pin is gone"
+    // **Which constraint refused it, not merely that something did.** Every
+    // other way this insert can fail is also an `Err`: `23514` on
+    // `quotes_incoterm` or `quotes_currency_iso`, `quotes_tenant_id_key` on a
+    // uuid collision, a serialization abort, a dropped connection. A bare
+    // `is_err()` passes on all of them, so a fixture that drifted into being
+    // refused for a reason with nothing to do with money read as proof of a
+    // currency pin that could by then have been deleted. `quotes_rfq_fk` is the
+    // composite `(tenant_id, rfq_id, currency)` key, and naming it is the
+    // difference between "the write failed" and "the currency is pinned to the
+    // RFQ".
+    //
+    // What this does *not* separate, checked rather than assumed: deleting the
+    // Shenzhen supplier row makes the same insert break `quotes_supplier_fk`
+    // too, and Postgres still reports `quotes_rfq_fk` — the referential triggers
+    // fire in constraint order and the currency pin is declared first. Both are
+    // true of that row, so there is nothing here to prefer; the CHECKs above are
+    // the ones this assertion can and does tell apart, because a CHECK is
+    // evaluated before any FK trigger runs.
+    let err = refused
+        .expect_err("the schema accepted a CNY quote against a EUR RFQ; the currency pin is gone");
+    let db_err = match &err {
+        sourcing_store::SourcingError::Store(StoreError::Database(db_err)) => db_err,
+        other => panic!("a foreign key violation is a database error, not {other:?}"),
+    };
+    assert_eq!(
+        db_err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("quotes_rfq_fk"),
+        "something other than the RFQ's currency pin refused this row: {err:?}"
     );
     let _ = tx.rollback().await;
 
@@ -1142,10 +1179,24 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         .await
         .expect("an order is always a question for a human");
     assert!(!approval.as_uuid().is_nil());
-    assert!(
-        order.commitment().contains(&list[1].to_string()) && order.commitment().contains("USD"),
-        "the approval is hashed to a line naming the payee and the money: {}",
-        order.commitment()
+    // **The whole line, not two substrings of it.** This is the text the
+    // approval is hashed against, so what a human reads and what a redemption
+    // is checked against are the same string. `contains(payee) &&
+    // contains("USD")` stayed true of a commitment that had lost the quantity,
+    // lost the reference, or carried `USD 1.00` — the amount is the one field a
+    // swap would be worth making, and "contains the three letters USD" does not
+    // look at it. Spelled out of the `Order`'s own fields rather than as a
+    // second copy of the expected text, so editing the fixture above cannot
+    // make this red for a reason that is not a defect; `order.total` is
+    // `ranked[0].total`, asserted to be `$16,848.00` further up, so the money
+    // in this line is the landed cost and not a number typed twice.
+    assert_eq!(
+        order.commitment(),
+        format!(
+            "purchase order {}: {} × {} from {} for {}",
+            order.reference, order.quantity, order.description, order.supplier, order.total
+        ),
+        "the approval is hashed to a line naming the payee, the goods and the money"
     );
 
     // A small one, for the carve-out that does not exist.
@@ -1343,9 +1394,16 @@ async fn a_purchasing_round_runs_end_to_end_and_never_moves_money_on_its_own() {
         &founding,
     )
     .await;
+    // `NotFound` by name. The genealogy check is a `count(DISTINCT id)` that
+    // runs *before* the insert, precisely so a caller citing episodes that are
+    // not theirs is refused without half-writing the transaction — so the
+    // variant is the whole claim. `is_err()` on its own also accepts
+    // `Conflict` (the belief's unique key), `Serialization`, and any driver
+    // error from a transaction that is already poisoned, and the last of those
+    // would make the four reads below fail for a reason this line had hidden.
     assert!(
-        borrowed.is_err(),
-        "a belief about one supplier was founded on another supplier's episodes"
+        matches!(borrowed, Err(StoreError::NotFound)),
+        "a belief about one supplier was founded on another supplier's episodes: {borrowed:?}"
     );
 
     // Why the agent holds what it holds: the belief, and the three episodes it
@@ -1713,9 +1771,15 @@ fn the_domain_refuses_to_compare_two_prices_that_are_not_the_same_price() {
         )
         .expect("a quote lands");
     assert_eq!(negotiation.state(), buying::NegotiationState::Quoted);
+    // Expired, and by the variant: `live_at` refuses three different ways, and
+    // the other two — a window that never opened, a window that ends before it
+    // starts — would mean this fixture's quote was malformed all along rather
+    // than that a deadline was enforced. Same shape as the `QuoteExpired`
+    // assertion further up this file, which is the one this should have matched.
+    let too_late = ddp.live_at(at(T0 + 60 * DAY));
     assert!(
-        ddp.live_at(at(T0 + 60 * DAY)).is_err(),
-        "there is no LiveQuote to accept, so there is no acceptance"
+        matches!(too_late, Err(buying::SourcingError::QuoteExpired { .. })),
+        "there is no LiveQuote to accept, so there is no acceptance: {too_late:?}"
     );
 
     // A deadline is a deadline.

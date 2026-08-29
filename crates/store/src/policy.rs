@@ -2423,6 +2423,58 @@ pub(crate) mod tests {
 
     // -- the operator's ceiling -------------------------------------------
 
+    /// **The three shipped amounts, in the other unit, next to the value.**
+    ///
+    /// [`default_ceiling`]'s doc states $500, $100 and $2 000; its body writes
+    /// `50_000`, `10_000` and `200_000` through one `usd_minor` closure. Until
+    /// this test, those three numbers had exactly one assertion in the whole
+    /// workspace and it lived in `apps/server/src/main.rs` — four crates away,
+    /// behind a `DATABASE_URL` that makes it return early when there is none,
+    /// and covering only the approval threshold. It catches a scaling of
+    /// `usd_minor` at all *only* because it pays `4_500` and `15_000` as bare
+    /// literals: it straddles the threshold by accident of being written in
+    /// minor units this function did not build.
+    ///
+    /// The other two caps had nothing, and that is measured rather than argued.
+    /// Raising `max_per_day` alone to `2_000_000` — the shipped structuring
+    /// guard silently becoming $20 000 — leaves `agentos-app` (616 tests) and
+    /// `agentos-server` (411, including the `readyz` test above) entirely green,
+    /// and fails this one.
+    ///
+    /// So this is written the way that accident works, on purpose: the value is
+    /// constructed in minor units and asserted in **major** ones, through
+    /// [`Money::from_major_str`], which multiplies by the currency's exponent
+    /// rather than dividing. An assertion spelled `50_000` beside a body
+    /// spelling `50_000` would be a literal compared to itself and would survive
+    /// any scaling of the closure that builds it.
+    ///
+    /// No database, deliberately: every other test in this module needs one, and
+    /// a shipped default that only gets checked where Postgres is reachable is a
+    /// default nothing checks on the machine that changed it.
+    #[test]
+    fn the_shipped_ceiling_is_the_three_dollar_amounts_its_doc_states() {
+        let spend = default_ceiling()
+            .spend
+            .expect("the shipped ceiling carries a spend policy");
+        let usd = |major| Money::from_major_str(major, Usd).expect("a dollar amount");
+
+        assert_eq!(
+            spend.max_per_transaction(),
+            usd("500.00"),
+            "the largest unattended payment moved"
+        );
+        assert_eq!(
+            spend.max_per_day(),
+            usd("2000.00"),
+            "the structuring guard moved"
+        );
+        assert_eq!(
+            spend.approval_above(),
+            usd("100.00"),
+            "the line above which a human presses the button moved"
+        );
+    }
+
     /// Wipe every platform version and hold the lock, so a ceiling test starts
     /// from the state a fresh install is in: nothing.
     async fn no_ceiling(db: &Db) -> MutexGuard<'static, ()> {
