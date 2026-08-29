@@ -28,11 +28,29 @@
 //! The three shapes above are about correctness and they are settled. This one
 //! is not, and it is the bill they run up: a row here names people who are not
 //! customers of ours — `agentos_app::gate`'s `counterparty` writes a prospect's
-//! address or number on every ruling, `app::inbound` writes an inbound sender's
-//! under `from`, `app::effects` writes both sides of a refused WhatsApp send —
-//! and **no statement in this system can ever remove one**. Not a tenant
-//! deletion: the missing foreign key is deliberate, so a tenant that leaves
-//! takes nothing with it. Not a correction: the trigger binds superusers.
+//! address or number on every ruling it makes on an `EmailSend`, `SmsSend`,
+//! `WhatsappSend`, `CallPlace` or `A2aSend`, and `app::inbound` writes an
+//! inbound sender's under `from` — and **no statement in this system can ever
+//! remove one**. Not a tenant deletion: the missing foreign key is deliberate,
+//! so a tenant that leaves takes nothing with it. Not a correction: the trigger
+//! binds superusers.
+//!
+//! This list used to carry a third entry — "`app::effects` writes both sides of
+//! a refused WhatsApp send" — and it is corrected rather than dropped, because
+//! the correction is the interesting part. That row is real code and it is
+//! **not reachable in production**: `Effects::send_whatsapp` has no caller
+//! outside `effects.rs`'s own test module, `ActionKind::WhatsappSend` is in
+//! `turn::UNSERVED` so no model can propose one, and the procedure written out
+//! in `turn::catalogue` for the day it is served derives the window from the
+//! same `to` it then gates on — which is what would make the two numbers
+//! disagree, so the caller that would write the row is the caller that makes it
+//! impossible. `WHATSAPP_WINDOW_NOT_THEIRS`'s own doc says as much one crate
+//! over; this file was citing it as a bill already run up.
+//!
+//! It stays named here because it is the *shape* the answer has to survive, not
+//! because a deployment is carrying it: the day a WhatsApp arm is written, a
+//! refusal writes a stranger's number into a table with no `DELETE`, and that
+//! is a question to have answered before the arm, not after.
 //!
 //! That is the right answer for *what happened* and it has no answer at all for
 //! *for how long*. A person who asks to be forgotten is answered today by a

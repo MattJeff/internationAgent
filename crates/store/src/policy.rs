@@ -2427,19 +2427,43 @@ pub(crate) mod tests {
     ///
     /// [`default_ceiling`]'s doc states $500, $100 and $2 000; its body writes
     /// `50_000`, `10_000` and `200_000` through one `usd_minor` closure. Until
-    /// this test, those three numbers had exactly one assertion in the whole
-    /// workspace and it lived in `apps/server/src/main.rs` — four crates away,
-    /// behind a `DATABASE_URL` that makes it return early when there is none,
-    /// and covering only the approval threshold. It catches a scaling of
-    /// `usd_minor` at all *only* because it pays `4_500` and `15_000` as bare
-    /// literals: it straddles the threshold by accident of being written in
-    /// minor units this function did not build.
+    /// this test, those three numbers had **two** assertions in the whole
+    /// workspace, both of them four crates away in `apps/server` and both of
+    /// them covering only the approval threshold — which is the count, and the
+    /// first version of this sentence said "exactly one".
     ///
-    /// The other two caps had nothing, and that is measured rather than argued.
+    /// * `apps/server/src/main.rs`'s readyz test, behind a `DATABASE_URL` that
+    ///   makes it return early when there is none. It catches a scaling of
+    ///   `usd_minor` at all *only* because it pays `4_500` and `15_000` as bare
+    ///   literals: it straddles the threshold by accident of being written in
+    ///   minor units this function did not build.
+    /// * `apps/server/src/policy.rs`'s
+    ///   `the_printed_ceiling_is_a_file_this_command_accepts`, which needs no
+    ///   database at all. It builds its negative case with
+    ///   `json.replace("\"minor\": 10000", "\"minor\": 900000")`, so moving the
+    ///   approval threshold makes the replacement match nothing, the unmodified
+    ///   document parses, and `is_err()` fails: paying `usd_minor(20_000)` here
+    ///   turns it red, measured.
+    ///
+    /// **And it is blind to precisely the mutation this test exists for**, which
+    /// is worth writing down because it is a good demonstration of the class.
+    /// Multiplying the `usd_minor` closure by a hundred leaves it **green**:
+    /// `serde_json` then prints `"minor": 1000000`, which still *contains*
+    /// `"minor": 10000`, so the replacement still fires, still produces an
+    /// approval threshold above the per-transaction cap, and the document is
+    /// still refused for the reason the assertion asks about. A substring match
+    /// against a number is a match against its prefix. That is the same shape as
+    /// this test's own last paragraph — a literal compared to something the
+    /// scaled closure built — arriving by a different road.
+    ///
+    /// So: two assertions, both on one of three caps, and neither of them on the
+    /// scale of the unit. The other two caps had nothing, and that is measured
+    /// rather than argued.
     /// Raising `max_per_day` alone to `2_000_000` — the shipped structuring
-    /// guard silently becoming $20 000 — leaves `agentos-app` (616 tests) and
-    /// `agentos-server` (411, including the `readyz` test above) entirely green,
-    /// and fails this one.
+    /// guard silently becoming $20 000 — leaves `agentos-app` (618 tests) and
+    /// `agentos-server` (412, including the `readyz` test above) entirely green,
+    /// and fails this one. Re-measured on 2026-08-29, which is why those two
+    /// counts moved by 2 and by 1: they are the run, not a memory of one.
     ///
     /// So this is written the way that accident works, on purpose: the value is
     /// constructed in minor units and asserted in **major** ones, through
