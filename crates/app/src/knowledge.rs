@@ -506,7 +506,12 @@ const MAX_QUERY_CHARS: usize = 512;
 /// nothing on this" and answers from itself. It matches words — see the
 /// retrieval section of the module docs — and an employee that knows that asks
 /// instead of guessing.
-const RECALLED_BRIEF: &str = "\
+///
+/// `pub` for one reader outside this module: `agentos_eval::toolchoice` hashes
+/// it, so that rewording the paragraph a recalling turn reads turns the recorded
+/// tool-choice scores red. It was private and it was reworded once with that pin
+/// green. See `crate::brief` for where that line is drawn.
+pub const RECALLED_BRIEF: &str = "\
 The framed blocks below are passages from your company's document store, \
 selected because their words appear in the message you are answering. That \
 search matches words and not meaning, so a document that answers in different \
@@ -522,7 +527,9 @@ each one carries.";
 /// It exists because the alternative is an employee that answers as if it had
 /// checked. "I don't know" and "I couldn't look" are different answers and only
 /// one of them is honest.
-const UNAVAILABLE_BRIEF: &str = "\
+///
+/// `pub` for the same one reader as [`RECALLED_BRIEF`].
+pub const UNAVAILABLE_BRIEF: &str = "\
 Your company's document store could not be reached while preparing this \
 message, so you are answering without it. Do not present anything as coming \
 from a company document, and if the answer turns on one, say plainly that you \
@@ -1697,13 +1704,25 @@ mod tests {
     ///   one chunk — which anybody reading the thread can see. The message in
     ///   the loop below is an ordinary customer email and returned exactly the
     ///   chunk its last three words name.
-    /// * **`-` suppresses, and adding words never can.** Extra words only
-    ///   narrow. `invoice` returned five passages with the warehouse rule
-    ///   first; `invoice -warehouse` returned five with the rule gone and four
-    ///   more notes in its place — a full, plausible top-k with the one
-    ///   document that constrains the sender deleted from it. [`RECALLED_BRIEF`]
-    ///   tells the model these were "selected because their words appear in the
-    ///   message", so the hole reads as "the company has nothing else on file".
+    /// * **`-` suppresses one document and leaves the answer looking full.**
+    ///   Not "only negation removes": a conjunction removes far more, because
+    ///   every extra word drops every passage that does not contain it — the
+    ///   attacker just cannot aim it. Adding `-warehouse`'s worth of narrowing
+    ///   by adding words takes the rest of the top-k down with the target and
+    ///   returns a short, visibly thin result. `invoice` returned five passages
+    ///   with the warehouse rule first; `invoice -warehouse` returned five
+    ///   again, the rule gone and four more notes in its place — a full,
+    ///   plausible top-k with the one document that constrains the sender
+    ///   deleted from it, and nothing about its length to say so.
+    ///
+    ///   [`RECALLED_BRIEF`] does not paper over that hole and does not deepen
+    ///   it either: it tells the model in as many words that "what is missing
+    ///   here is not evidence the company has nothing on file". What it cannot
+    ///   tell the model is *which* absence this is. A passage missing because
+    ///   the store says it in other words and a passage missing because the
+    ///   sender struck it out read identically from inside the turn, and no
+    ///   sentence in a brief can separate them — which is why the fix is in the
+    ///   parser and not in the prose.
     ///
     /// What this does **not** fix is selection itself, and nothing here can: a
     /// sender who writes "crushed skids" still gets the crushed-skids chunk,

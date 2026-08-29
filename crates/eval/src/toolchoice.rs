@@ -26,16 +26,20 @@
 //! exactly when it is most wrong.
 //!
 //! What replaces replay is one line: CI pins [`TRUSTED_PROMPT`] and
-//! [`UNTRUSTED_PROMPT`], digests of the request `--live` sends — prefix and
-//! tool schemas both, since a tool description is prompt. Editing either turns
-//! this suite red with *"the recorded live scores are stale"*, which is a true
-//! statement, and the fix is to re-run the live set and update the constants.
-//! That is the whole mechanism: the deterministic half's job is to
+//! [`UNTRUSTED_PROMPT`], digests of the prompt a scored turn carries — the
+//! rendered prefix, the tool schemas (a tool description is prompt), and the
+//! operator paragraphs a real turn prepends ([`PREPENDED_BRIEFS`]). Editing any
+//! of it turns this suite red with *"the recorded live scores are stale"*, which
+//! is a true statement, and the fix is to re-run the live set and update the
+//! constants. That is the whole mechanism: the deterministic half's job is to
 //! **invalidate** the model numbers, not to fabricate them.
 //!
-//! "The request `--live` sends" and "the request a turn sends" are not the same
-//! request, and the difference is [`BEYOND_THE_PIN`]. Read it before quoting a
-//! score at anyone.
+//! The pin is deliberately *wider* than the bytes `--live` sends: `run_live`
+//! sends a case's task and none of the briefs, while an employee reads the
+//! briefs on every turn. Pinning only what the fixture builds is the version of
+//! this that goes green forever while production moves underneath it. What is
+//! still narrower than a production turn is [`BEYOND_THE_PIN`], item by item.
+//! Read it before quoting a score at anyone.
 //!
 //! The live runner prints the digest beside its scores for the same reason —
 //! a score without the prompt it was measured against is a number with no
@@ -227,55 +231,111 @@ pub const TRUSTED_PROMPT: &str = "2119fd017a1a8464";
 /// [`TRUSTED_PROMPT`] by construction.
 pub const UNTRUSTED_PROMPT: &str = "1fc3e84ea1abaf88";
 
+/// The operator-written paragraphs a real turn prepends, in roughly the order a
+/// turn prepends them: the two openings, the two lists, the two recall briefs.
+///
+/// **These are `messages`, and `messages` were outside the pin.** The reasoning
+/// for leaving them out was that messages vary per case — true of a case's own
+/// task, and false of every string below, which is fixed prose the model reads
+/// before it picks a tool. `BOARD_BRIEF` was rewritten in waveG-g1 and
+/// `RECALLED_BRIEF` in waveS-s2, both with this row green, so the tool-choice
+/// scores this repo publishes were certified against a prompt that had moved
+/// twice.
+///
+/// Four of them were private consts in `apps/server`, a binary crate with no
+/// library target, so this crate could not name them at all. They are
+/// [`agentos_app::brief`]'s now — moved, not copied and not paraphrased. The
+/// third option, hashing what *this fixture* builds instead of what a turn
+/// builds, is the one that had to be refused: it would pin the fixture, go
+/// green forever, and leave production free to move underneath it, which is the
+/// exact failure being fixed.
+///
+/// What is deliberately **not** in here is in [`BEYOND_THE_PIN`], with the
+/// argument for each.
+const PREPENDED_BRIEFS: &[&str] = &[
+    agentos_app::brief::INBOUND_BRIEF,
+    agentos_app::brief::TURN_BRIEF,
+    agentos_app::brief::BOARD_BRIEF,
+    agentos_app::brief::DIARY_BRIEF,
+    agentos_app::knowledge::RECALLED_BRIEF,
+    agentos_app::knowledge::UNAVAILABLE_BRIEF,
+];
+
 /// **Where the two pins stop, said in the report rather than in a doc
 /// comment.**
 ///
 /// The pins cover the model id, `SystemPrompt::render`'s output for *this*
-/// fixture, and every offered tool's name, description and schema. Two kinds of
-/// prompt sit outside that and neither is exotic — both are on a production
-/// turn every day:
+/// fixture, every offered tool's name, description and schema, and — since this
+/// note's first version was written — [`PREPENDED_BRIEFS`], the operator
+/// constants a real turn puts in front of the task.
 ///
-/// 1. **The trusted paragraphs, because they are `messages` and not `system`.**
-///    `Context::with_task` appends a `Message`, and `digest_of` skips
-///    `messages` on the grounds that they vary per case. True of a case's task;
-///    false of the operator-written constants a real turn always prepends —
-///    `main.rs::TURN_BRIEF`, `loops::initiative::{BOARD_BRIEF, DIARY_BRIEF}`,
-///    `routes::interview::INTERVIEW_BRIEF`,
-///    `app::knowledge::{RECALLED_BRIEF, UNAVAILABLE_BRIEF}`. Those are fixed
-///    prose the model reads before it picks a tool, and **two of them have
-///    moved since these constants were last derived**: `BOARD_BRIEF` in
-///    waveG-g1 and `RECALLED_BRIEF` in waveS-s2, both with the pin green.
+/// **That first version got the enumeration wrong in three ways, and they are
+/// corrected here rather than deleted, because a boundary note nobody can check
+/// is how the boundary moved unnoticed the first time.**
 ///
-///    It is not that the recorded 4/5 went stale — `run_live` never sent those
-///    paragraphs either, so the score is still a fact about the request it was
-///    measured against. It is that the request it was measured against is not
-///    the one an employee receives, and a green pin reads as though it were.
+/// * It said *"three of the six are private to a binary crate"*. **Four** of
+///   the six were, all in `apps/server`: `main.rs::TURN_BRIEF`,
+///   `loops::initiative::BOARD_BRIEF`, `loops::initiative::DIARY_BRIEF` and
+///   `routes::interview::INTERVIEW_BRIEF`. The two `app::knowledge` ones were
+///   private to a *library* crate, which is a different and far cheaper problem
+///   — one keyword, not a move. Undercounting the expensive kind by one is how
+///   a plan that says "reach the constants first" reads as smaller than it is.
+/// * It wrote *"TURN_BRIEF"* once where there are two, with different bytes:
+///   `main.rs`'s says a message has arrived, the initiative loop's says none
+///   has. Six names, seven constants, **five** of them in the binary crate.
+///   They are [`agentos_app::brief`]'s `INBOUND_BRIEF` and `TURN_BRIEF` now, so
+///   the collision cannot recur under one name.
+/// * It missed two trusted paragraphs entirely — items 1 and 2 below, which are
+///   the ones the pin still does not cover.
 ///
-/// 2. **Two sections of the prefix the fixture never renders.** `render` emits
+/// # What is still outside, and why each one is
+///
+/// 1. **`Charter::brief`, which is `pub` and always was.** Every turn taken by
+///    an employee with a charter prepends it, and it is *not* a constant: its
+///    own documentation says it lands as a message rather than as prefix
+///    precisely because it varies per objective. It is the question, not the
+///    prompt, and hashing it would mean inventing an objective for this fixture
+///    and pinning that — the fixture again, not production.
+/// 2. **`loops::initiative::kept_brief`.** Same shape, worse: it interpolates
+///    the promised hour, its zone and the current clock. Its template is a
+///    constant inside a `format!` and could be lifted out; it has not been,
+///    because a turn woken by an appointment is not a turn any of [`CASES`]
+///    measures, and lifting a string to hash it is how a pin starts covering
+///    things nobody scores.
+/// 3. **`routes::interview::INTERVIEW_BRIEF`.** A constant, still private to
+///    the binary crate, still deliberately unhashed. It opens the one-off
+///    onboarding extraction turn — "reply with one JSON object and nothing
+///    else" — which no employee takes while doing its job, and none of the five
+///    cases resembles. Hashing it would turn a buyer's tool-choice score red
+///    because onboarding prose was reworded, which is the same over-invalidation
+///    this file already refused for `rolepack_sales`. The day somebody writes an
+///    interview case, it moves and gets hashed with it.
+/// 4. **A section of the prefix the fixture never renders.** `render` emits
 ///    "# Credentials you hold" only when `with_credential` has been called, and
 ///    [`prompt`] never calls it — so that paragraph, which every employee
 ///    holding an SMTP password reads, is inside `render` and outside both pins.
 ///    (The roster is *not* an instance of this: an empty roster still renders
 ///    its "Nobody" branch, and that branch is hashed.)
 ///
-/// **What closing this costs, and why no wave agent may do it quietly.**
-/// Hashing the briefs means hashing a canonical request built with them, which
-/// moves `TRUSTED_PROMPT` and `UNTRUSTED_PROMPT` — and a moved pin with no
-/// `--live` run behind it is precisely the laundering the mechanism exists to
-/// stop. The order is: reach the constants first (three of the six are private
-/// to a binary crate, so they move to `agentos_app` or the eval grows a
-/// canonical-turn fixture), then re-derive, then run `--live` in the same
-/// change, then re-pin with the new score. Not before, and not in pieces.
+/// **The scores above are not stale, and the pin below is now red.** `run_live`
+/// never sent the briefs either, so 4/5 remains a true fact about the request it
+/// was measured against — the point is that the request it was measured against
+/// is not the one an employee receives, and a green pin read as though it were.
+/// Widening the hash moves both constants, which is the mechanism working:
+/// **only a `--live` run may re-pin them**, and copying the printed values into
+/// the source without one is the laundering this whole file exists to stop.
 const BEYOND_THE_PIN: &str = "\
-the trusted paragraphs a real turn prepends — TURN_BRIEF, BOARD_BRIEF, \
-DIARY_BRIEF, INTERVIEW_BRIEF, knowledge::RECALLED_BRIEF and \
-UNAVAILABLE_BRIEF. They are `messages`, not `system`, so neither pin hashes \
-them, and BOARD_BRIEF and RECALLED_BRIEF have both been rewritten since these \
-digests were derived, with this row green throughout. The scores above are not \
-stale — `--live` never sent those paragraphs either — but the request they \
-were measured against is not the one an employee receives. Same gap, second \
-form: `render`'s \"# Credentials you hold\" section, which this fixture never \
-builds and every employee holding a credential reads";
+two trusted paragraphs a real turn prepends that are still not hashed, both \
+because they are not constants: `Charter::brief`, which varies per objective by \
+its own design, and `loops::initiative::kept_brief`, which interpolates a \
+promised hour and the clock. Plus one that is a constant and is excluded on \
+purpose — `routes::interview::INTERVIEW_BRIEF`, which opens the onboarding \
+extraction turn no employee takes while working, and which no case here \
+resembles. The six that a working turn prepends ARE hashed now, after four of \
+them moved out of a binary crate; before that, BOARD_BRIEF and RECALLED_BRIEF \
+were both rewritten with this row green. Same gap, second form: `render`'s \
+\"# Credentials you hold\" section, which this fixture never builds and every \
+employee holding a credential reads";
 
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.
@@ -403,20 +463,45 @@ fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
 /// `input_schema` goes through `Value`'s own `Display`, whose object keys are
 /// ordered, so the bytes do not depend on the order the fields were inserted.
 ///
-/// The `messages` and `max_tokens` of that request are deliberately *not*
-/// hashed. They vary per case by design — each of [`CASES`] carries its own —
-/// and a pin that moved per case would be a pin on nothing.
+/// # Why the operator's briefs are in here now
 ///
-/// That reasoning is right about a case's own task and wrong about everything
-/// else in `messages`, which is [`BEYOND_THE_PIN`]'s subject.
+/// The `messages` and `max_tokens` of that request are still *not* hashed, and
+/// the reason has not changed: each of [`CASES`] carries its own task, and a pin
+/// that moved per case would be a pin on nothing.
+///
+/// But "messages vary per case" was only ever true of the *task*. Everything a
+/// real turn puts in front of that task is an operator-written constant, and
+/// there are [`PREPENDED_BRIEFS`]'s six of them. Two were rewritten with this
+/// row green, which is the same failure the tool descriptions produced one
+/// paragraph up, arriving through the other half of the request.
+///
+/// So the line is drawn at what the bytes *are* rather than at which field they
+/// travel in: **an operator constant is prompt and is hashed; a case's task is
+/// the question and is not.** Hashing the question would move the pin on every
+/// case; not hashing the prompt makes the pin false, which is what it was.
+///
+/// The digest therefore no longer equals "the bytes `--live` sends" — `run_live`
+/// sends a case's task and none of the briefs. That is deliberate and it is the
+/// stronger claim: the pin's subject is the prompt an employee reads, and a
+/// score is only quotable while that has not moved. What remains outside is
+/// [`BEYOND_THE_PIN`], with a reason per item.
 pub fn digest(trust: TrustLabel) -> String {
-    digest_of(&prompt().request(default_model().as_str(), MAX_TOKENS, trust, Vec::new()))
+    digest_of(
+        &prompt().request(default_model().as_str(), MAX_TOKENS, trust, Vec::new()),
+        PREPENDED_BRIEFS,
+    )
 }
 
-/// [`digest`]'s body, over a request handed in rather than built — so a test
-/// can hand it two requests differing by one tool description and hold the
-/// pin to the claim its doc comment makes.
-fn digest_of(request: &LlmRequest) -> String {
+/// [`digest`]'s body, over a request and a brief list handed in rather than
+/// built — so a test can hand it two that differ by one tool description, or by
+/// one brief, and hold the pin to the claim its doc comment makes.
+///
+/// The briefs are a parameter for the second of those and not for style. A
+/// `digest_of` that quietly stopped hashing them would produce a digest that is
+/// merely *different*, not obviously wrong, and the next agent along would
+/// re-derive the constant and move on — which is exactly how this gap lasted.
+/// `the_pin_sees_a_brief_change` is the assertion that fails instead.
+fn digest_of(request: &LlmRequest, briefs: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.model.as_bytes());
     hasher.update(request.system.as_bytes());
@@ -424,6 +509,9 @@ fn digest_of(request: &LlmRequest) -> String {
         hasher.update(tool.name.as_bytes());
         hasher.update(tool.description.as_bytes());
         hasher.update(tool.input_schema.to_string().as_bytes());
+    }
+    for brief in briefs {
+        hasher.update(brief.as_bytes());
     }
     hasher
         .finalize()
@@ -895,8 +983,8 @@ mod tests {
         let mut after = before.clone();
         after.tools[0].description.push_str(" (and one more word)");
         assert_ne!(
-            digest_of(&before),
-            digest_of(&after),
+            digest_of(&before, PREPENDED_BRIEFS),
+            digest_of(&after, PREPENDED_BRIEFS),
             "a reworded tool description left the pin where it was — which is \
              the exact failure this covers"
         );
@@ -906,10 +994,49 @@ mod tests {
         let mut narrowed = before.clone();
         narrowed.tools[0].input_schema = serde_json::json!({"type": "object", "properties": {}});
         assert_ne!(
-            digest_of(&before),
-            digest_of(&narrowed),
+            digest_of(&before, PREPENDED_BRIEFS),
+            digest_of(&narrowed, PREPENDED_BRIEFS),
             "a rewritten input schema left the pin where it was"
         );
+    }
+
+    /// **The same failure, arriving through `messages` instead.** `BOARD_BRIEF`
+    /// and `RECALLED_BRIEF` were each rewritten while this row stayed green,
+    /// because `digest_of` hashed the system block and the schemas and skipped
+    /// every operator paragraph a real turn prepends.
+    ///
+    /// This is the assertion that would have been red on those two days. It
+    /// rewords one brief and touches nothing else — and it checks every brief
+    /// separately rather than the list as a whole, because a hash that dropped
+    /// the last three entries would still pass a whole-list check.
+    #[test]
+    fn the_pin_sees_a_brief_change() {
+        let request = prompt().request(
+            default_model().as_str(),
+            MAX_TOKENS,
+            TrustLabel::Trusted,
+            Vec::new(),
+        );
+        let pinned = digest_of(&request, PREPENDED_BRIEFS);
+
+        for index in 0..PREPENDED_BRIEFS.len() {
+            let mut reworded: Vec<&str> = PREPENDED_BRIEFS.to_vec();
+            // Not "" — an emptied brief could be caught by a length check that a
+            // reworded one would sail past, and rewording is what actually
+            // happens to these.
+            reworded[index] = "an operator rewrote this paragraph and nothing else";
+            assert_ne!(
+                pinned,
+                digest_of(&request, &reworded),
+                "brief {index} is not in the digest, so rewriting it would leave \
+                 the recorded live scores certified against a prompt that moved"
+            );
+        }
+
+        // And the briefs are load-bearing rather than decorative: dropping all
+        // six is not the same digest either, which is what would happen if a
+        // later `digest_of` narrowed back to the request alone.
+        assert_ne!(pinned, digest_of(&request, &[]));
     }
 
     use super::*;

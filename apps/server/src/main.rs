@@ -47,6 +47,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentos_app::brief::INBOUND_BRIEF;
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
 use agentos_app::inbound::{self, Errand, Recorded, Secret, Thread, record_raw_email_delivery};
@@ -1401,15 +1402,6 @@ struct Agent {
     cancel: CancellationToken,
 }
 
-/// What one message's turn is, in the model's terms.
-///
-/// Ours, operator-written, and the same bytes every turn — it is part of the
-/// cached prefix. Nothing a counterparty wrote may be interpolated in here:
-/// that text goes through `Context::with_untrusted` and comes out framed.
-const TURN_BRIEF: &str = "A new message has arrived on one of your channels. Read it, decide \
-                          what it needs, and use your tools to do it. Finish by writing the \
-                          reply you want sent — that text is recorded on the conversation.";
-
 impl Agent {
     /// `agent.turn.requested`: the employee actually answers.
     ///
@@ -1763,7 +1755,7 @@ impl Agent {
             // argues that trade at length, and its argument is the one that
             // survives: even documents provably ours are *selected* by a query
             // the counterparty wrote.
-            let mut context = Context::new().with_task(TURN_BRIEF);
+            let mut context = Context::new().with_task(INBOUND_BRIEF);
             if let Some(charter) = &charter {
                 context = context.with_task(charter.brief());
             }

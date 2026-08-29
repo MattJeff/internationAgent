@@ -578,9 +578,12 @@ regards,\nAnja Vogt";
 /// The order and the pieces are that handler's, not this file's invention:
 /// standing brief, then the plan from the charter, then the message fenced,
 /// then whatever the store returned fenced by the same `render_fenced`. What is
-/// deliberately missing is the server's own `TURN_BRIEF`, a private const in
-/// the binary crate — a constant, and a constant cannot slope, which is why its
-/// absence changes nothing this suite claims. It is in `unmeasured` anyway.
+/// deliberately missing is the server's own inbound brief — now reachable as
+/// `agentos_app::brief::INBOUND_BRIEF`, so this is a choice rather than the wall
+/// it used to be. It stays missing because it is a constant, a constant cannot
+/// slope, and this suite measures a slope; adding it would move every recorded
+/// figure below by the same fixed offset and change nothing they claim. It is in
+/// `unmeasured` anyway.
 ///
 /// The retrieval is the one step not run against the real query: there is no
 /// database in a deterministic suite. What stands in for it is the bound that
@@ -969,10 +972,12 @@ pub fn evaluate() -> Surface {
         unmeasured: vec![
             "the tokenizer. There is none in this workspace and no network — every absolute \
              figure above is `scoping::tokens`, ±20%, unverified against a real one",
-            "three trusted paragraphs the real path adds and this one cannot reach: the server's \
-             TURN_BRIEF, the initiative loop's, and `knowledge::RECALLED_BRIEF` — two private \
-             consts in a binary crate and one private to `app`. The floor above is short by \
-             them, and all three are constants, which cannot slope",
+            "three trusted paragraphs the real path adds and this one leaves out: \
+             `brief::INBOUND_BRIEF`, `brief::TURN_BRIEF` and `knowledge::RECALLED_BRIEF`. They \
+             are all reachable now — they were two private consts in a binary crate and one \
+             private to `app` until `toolchoice`'s pin needed them — so this is a choice, not a \
+             wall. The floor above is short by them, and all three are constants, which cannot \
+             slope",
             "whether a real tenant's allowlist is team-shaped. The fixture grants one team's \
              server in the role layer, which is the shape `domain::org::Team` produces and \
              caps; an operator who writes one tenant-wide layer instead gets the row above \

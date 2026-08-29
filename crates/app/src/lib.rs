@@ -9,6 +9,7 @@
 pub mod a2a; // U28
 pub mod api_keys; // wave J: step zero — a key a customer can be given and can lose
 pub mod backlog; // le carnet: the port a work board is reached through, ours or the customer's
+pub mod brief; // the operator's own words that open a turn — reachable, so a pin can hash them
 pub mod calendar; // le calendrier: the port a seat's diary is reached through, ours or the customer's
 pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
 pub mod effects; // U21

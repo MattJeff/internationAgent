@@ -861,8 +861,12 @@ async fn take_turn(
 
 /// `loops::initiative::vertical_step`, for the charter that has one.
 ///
-/// A copy and not a call, for the same reason `TURN_BRIEF` is a copy: it lives
-/// in a binary crate with no library target. What is *not* copied is any part of
+/// A copy and not a call, for the reason `TURN_BRIEF` *used* to be a copy: it
+/// lives in a binary crate with no library target. `TURN_BRIEF` stopped being
+/// one — it moved to `agentos_app::brief` when `toolchoice`'s pin needed to hash
+/// it — and this could follow it the day something needs to. Nothing does: a
+/// digest of prose is a thing the eval wants, a digest of a scheduling branch is
+/// not. What is *not* copied is any part of
 /// the decision — [`vertical::due_chase`] and [`vertical::due_prospect`] are the
 /// same two queries `sales_work_for` asks in the same order, and
 /// [`vertical::selling_turn`] and [`vertical::chasing_turn`] are the same two

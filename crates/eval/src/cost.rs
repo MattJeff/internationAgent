@@ -333,20 +333,18 @@ pub fn turns_per_day() -> u32 {
 
 /// What a self-started turn is, in the model's terms.
 ///
-/// A verbatim copy of `apps/server/src/loops/initiative.rs`'s `TURN_BRIEF`, a
-/// private const in a binary crate with no library target. Copied rather than
-/// paraphrased: a dry run that sends different bytes from the running system is
-/// measuring a company nobody deployed. If the original moves, this moves — and
-/// [`DIGEST`] is what says the recorded numbers moved with it.
-pub const TURN_BRIEF: &str = "Nobody has written to you. Your working rhythm has come round, so \
-                              this turn is yours to spend on your own objective. You have been \
-                              here before and the plan below does not know it: start by finding \
-                              out where you actually got to — read your own conversations, notes \
-                              and records — then advance the earliest stage that is not finished. \
-                              One turn is not the whole plan. Do the next real piece of work, \
-                              finish it, and write down what you did. If a stage is blocked on \
-                              somebody else, say so and move to what is not blocked rather than \
-                              waiting inside this turn.";
+/// **This was a verbatim copy**, with a doc comment asking a human to keep two
+/// files in sync — the only thing available while the original was a private
+/// const in a binary crate with no library target. It is the original now:
+/// `agentos_app::brief::TURN_BRIEF`, moved there so that the pin in
+/// `toolchoice` can hash the paragraphs a real turn prepends. A copy that
+/// drifted would have measured a company nobody deployed, and nothing but
+/// attention was stopping it. Re-exported rather than imported at each use so
+/// the call sites here did not have to move with it.
+///
+/// The bytes are unchanged, so [`DIGEST`] does not move on this edit; if the
+/// original moves from here on, [`DIGEST`] moves with it, which is the point.
+pub use agentos_app::brief::TURN_BRIEF;
 
 /// The charters these seats are given, in the operator's words.
 ///
