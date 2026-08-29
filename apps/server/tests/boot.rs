@@ -36,6 +36,11 @@ fn complete_env() -> HashMap<&'static str, String> {
         ("EMAIL_API_KEY", "re_not_a_real_key"),
         ("TELEPHONY_API_KEY", "ACtest:not-a-real-token"),
         ("BROWSER_API_KEY", "proj_test:bb_not_a_real_key"),
+        // Never spent: the process builds a client from it at boot and this
+        // test never ingests anything, so no request is made against any
+        // account. That is the property, not an accident of this fixture — see
+        // `agentos_providers::embedder_openai`.
+        ("EMBEDDER_API_KEY", "sk-not-a-real-key"),
     ] {
         env.insert(var, value.to_owned());
     }
@@ -152,9 +157,12 @@ fn a_partly_real_deployment_says_so_in_one_line_at_boot() {
         "and so does the one that is not: {logged}"
     );
     assert!(logged.contains("browser=browserbase"), "{logged}");
-    // The ports no credential can make real are on the same line, so a line
-    // with no MOCK in it cannot be produced by leaving something out.
-    assert!(logged.contains("embedder=MOCK"), "{logged}");
+    // Including the one whose credential used to be able to quiet the guard
+    // while selecting nothing. It selects something now, and the line says so.
+    assert!(logged.contains("embedder=openai"), "{logged}");
+    // The port no credential can make real is on the same line, so a line with
+    // no MOCK in it cannot be produced by leaving something out.
+    assert!(logged.contains("secrets=MOCK"), "{logged}");
 }
 
 #[test]

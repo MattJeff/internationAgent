@@ -1,0 +1,54 @@
+-- 0076_knowledge_index_real_embedder: the second model gets the second index.
+--
+-- `agentos_providers::embedder::Embedder` has a real variant now. Setting
+-- `EMBEDDER_API_KEY` selects `OpenAiEmbedder`, and every chunk it embeds is
+-- stamped `text-embedding-3-small` by `app::knowledge::model_name` rather than
+-- `mock-sha256-1536`. Without this index those chunks are searchable and slow:
+-- 0026 measured the same situation at 889 ms against 2.8 ms over 20 000 chunks,
+-- with no error anywhere to say why.
+--
+-- This is the migration 0026 said a second model would be, arriving on the terms
+-- it set:
+--
+--   "What that costs when a second model appears: one more migration, adding one
+--    more partial index [...] That cost is the point. The migration is the moment
+--    somebody has to say out loud whether the new vectors belong in the old
+--    space."
+--
+-- Said out loud: **they do not.** A 1536-float vector from SHA-256 and a
+-- 1536-float vector from a trained model are the same Postgres type and share no
+-- geometry at all. So this is a second index and not a widened predicate, the
+-- two sets stay disjoint at the storage layer, and a search binds exactly one of
+-- them — `search_vector` has carried `WHERE model = $n` since 0004 and still
+-- does.
+--
+-- WHY THIS PREDICATE IS NOT 0004'S MISTAKE REPEATED
+--
+-- 0004 created this index partial on `text-embedding-3-small` and 0026 dropped
+-- it, because nothing in the system had ever written that string: the predicate
+-- named a model that could not exist, so the index was never applicable and the
+-- test that EXPLAINed the vector leg passed on the store's own fixtures. The
+-- string is the same and the situation is the opposite. There is now a code path
+-- that writes it — `OpenAiEmbedder::MODEL`, selected by a credential, on the
+-- ingest of every document in a deployment that has one — and there are two
+-- checks that the three spellings have not drifted:
+--
+--   * `agentos_app::knowledge` asserts at COMPILE TIME that
+--     `store::knowledge::OPENAI_EMBEDDING_MODEL` and
+--     `providers::embedder_openai::OpenAiEmbedder::MODEL` are the same bytes.
+--     Those live in two crates that cannot see each other, which is exactly the
+--     shape 0026's drift had.
+--   * `the_real_embedders_index_names_the_model_it_writes` reads this
+--     predicate back out of `pg_indexes` and compares it with the constant, so
+--     an edit to this file that the Rust side does not follow fails a test
+--     instead of costing every retrieval a sequential scan.
+--
+-- The dimension is unchanged and is not a coincidence: `text-embedding-3-small`
+-- is natively `vector(1536)`, which is the column, and the adapter asks for that
+-- width explicitly and refuses any other rather than reshaping one to fit. A
+-- model of a different width is the *next* migration, and it is a column, not an
+-- index.
+
+create index if not exists knowledge_chunks_embedding_hnsw_openai
+  on knowledge_chunks using hnsw (embedding vector_cosine_ops)
+  where model = 'text-embedding-3-small';

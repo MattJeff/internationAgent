@@ -331,14 +331,15 @@ explicitly, so nothing reaches production on a fake.
 `mocks::ports_for(&config.credentials)`: `EMAIL_API_KEY` builds a real
 `ResendEmailProvider`, `TELEPHONY_API_KEY=ACxxxx:auth_token` a real
 `TwilioTelephony`, `BROWSER_API_KEY=project-id:api-key` a real
-`BrowserbaseBrowser` with a live CDP driver. Unset means the mock beside it, and
+`BrowserbaseBrowser` with a live CDP driver, `EMBEDDER_API_KEY=sk-…` a real
+`OpenAiEmbedder`. Unset means the mock beside it, and
 the boot guard refuses a mock nobody accepted, naming which one. A deployment
 with a Resend key and no Twilio account is the normal case, not an error — and
 every boot logs one line saying which is which:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 `/readyz` publishes the same inventory as `mock_adapters`, because "the mail
@@ -349,10 +350,12 @@ Half a compound credential is a **named boot failure**, never a silent mock:
 an adapter holding half of what it needs is the deployment that believes it is
 sending mail and is not.
 
-`EMBEDDER_API_KEY` is **no longer read**. It used to satisfy the boot guard
-while selecting nothing — `Embedder` has one variant and it is a SHA-256 hash —
-and a credential that cannot change what runs must not be able to quiet an
-alarm.
+`EMBEDDER_API_KEY` is **read again**, and the argument that deleted it is
+answered rather than dropped. It used to satisfy the boot guard while *selecting
+nothing* — `Embedder` had one variant and it was a SHA-256 hash — and a
+credential that cannot change what runs must not be able to quiet an alarm. It
+changes what runs now. One value and not a pair: the customer brings the key,
+the model name is a constant of the adapter, and we never supply the model.
 
 Real regardless of any credential:
 
@@ -364,17 +367,17 @@ Real regardless of any credential:
   invents a phone number costs nothing; a mock cipher costs an identity.
 
 Still fake regardless of any credential, and named as such on every boot: the
-**embedder** and the **employee secret vault** (an in-process plaintext map that
-forgets on restart — not the envelope cipher above, which is real).
+**employee secret vault** (an in-process plaintext map that forgets on restart —
+not the envelope cipher above, which is real).
 
-The embedder is the one that reads like a feature and is not: `Embedder` has a
-single variant, a SHA-256 hash, so knowledge ingests, chunks, stores and
-retrieves — and ranks by a hash of the text rather than its meaning. It is the
-only part of a running company that is wired, green, tested and wrong at once;
-every other gap here is absent, and an absence cannot be mistaken for working.
-**`docs/RUNNING.md` carries the whole argument**, including why a real embedder
-is a decision rather than a task: on the CLI path a deployment may be running,
-the subscription exposes no embeddings endpoint at all.
+The embedder used to be on that list and is not any more. It was the one that
+read like a feature and was not: on the default `Mock` variant knowledge still
+ingests, chunks, stores and retrieves, but ranks by a hash of the text rather
+than its meaning — wired, green, tested and wrong at once, where every other gap
+here is an absence and an absence cannot be mistaken for working. That is still
+exactly what a deployment without `EMBEDDER_API_KEY` gets, which is why the boot
+guard now names it like any other mock. **`docs/RUNNING.md` carries the whole
+argument.**
 
 **The Policy Gate reads the four layers out of Postgres on every decision.**
 `main.rs` builds it as `PolicyGate::new(db)` and `gate.rs` calls

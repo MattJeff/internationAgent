@@ -484,19 +484,30 @@ The email adapter also needs the `whsec_…` signing secret and takes it from th
 `email` entry of `AGENTOS_WEBHOOK_SECRETS`, and its sending domain from
 `AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
 
-There is deliberately **no `EMBEDDER_API_KEY`**. It used to be a row here and
-was the guard's own version of the failure the guard exists to prevent:
-exporting any string turned the alarm off while `Embedder` still had one variant
-and it was still a SHA-256 hash. The embedder and the employee secret vault are
-named as permanent mocks in the boot line instead.
+`EMBEDDER_API_KEY` is a row here again, and the reason it was deleted is worth
+knowing before you set it. It used to be the guard's own version of the failure
+the guard exists to prevent: exporting any string turned the alarm off while
+`Embedder` still had one variant and it was still a SHA-256 hash. It selects a
+real client now — `OpenAiEmbedder`, on the customer's own key,
+`text-embedding-3-small` — so the alarm it quiets is an alarm about something
+that became real. One value, not a pair: the model name is a constant of the
+adapter, because the HNSW index is partial on it. The employee secret vault is
+the only permanent mock left in the boot line.
+
+**Setting it does not re-embed what is already stored.** Every chunk records the
+model it was embedded under and every search binds one model, so a corpus
+ingested on the hash keeps `mock-sha256-1536` and stops being findable until it
+is ingested again. That is deliberate — the alternative is comparing a SHA-256
+digest with a sentence embedding and reporting a score — but it is a migration
+of the customer's documents, not a restart.
 
 ### What a boot says about its adapters
 
 Every boot, real or not, logs one line:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 `/readyz` publishes the same thing as `mock_adapters`, so the question survives
@@ -513,7 +524,7 @@ agentos-server: refusing to start: email, browser would run as mocks and do
 nothing real, and nobody said that was acceptable (set EMAIL_API_KEY,
 BROWSER_API_KEY for the real thing, or AGENTOS_ALLOW_MOCKS=1 to accept exactly
 these). Adapters would be: email=MOCK telephony=twilio browser=MOCK
-llm=anthropic embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+embedder=openai llm=anthropic secrets=MOCK(in-memory)
 ```
 
 The inventory is in the refusal as well as in a successful boot, because the
@@ -1363,10 +1374,13 @@ when it is not — per adapter, decided in `config.rs` and built in
 deployment still does *not* do is listed below; see `docs/PROVIDERS.md` for the
 per-vendor detail.
 
-**The embedder is a SHA-256 hash and no credential changes that.** Retrieval
-runs, returns results, and the results are not semantically related to the
-query: "cat" and "kitten" are as unrelated as "cat" and "diesel". Use it to
-test plumbing.
+**The embedder is a SHA-256 hash unless `EMBEDDER_API_KEY` is set.** Without it,
+retrieval runs on word matching alone — the vector leg is not consulted at all,
+because a hash has no opinion about meaning and five confident unrelated
+passages are worse than none. "cat" and "kitten" are as unrelated as "cat" and
+"diesel". With it, `OpenAiEmbedder` embeds against the customer's key and
+retrieval is hybrid again; documents ingested before the switch keep their old
+model and have to be ingested again.
 
 **The employee secret vault is an in-process plaintext map** that forgets on
 restart. The envelope cipher that seals employee signing keys is real and is a
@@ -1526,10 +1540,11 @@ documents, and fixing any one of them alone would have read like a correction
 while two copies went on lying. The complementary operational reads remain
 `/readyz`, `/v1/inventory/stranded` and SQL.
 
-**Company knowledge is plaintext and Markdown only, on a hash embedder.** No URL
-fetching, no PDF parsing, no file upload, no malware or content-type validation.
-The embedder is a SHA-256 hash with no semantics, so retrieval quality is not a
-thing this build has yet.
+**Company knowledge is plaintext and Markdown only.** No URL fetching, no PDF
+parsing, no file upload, no malware or content-type validation. Retrieval
+quality now depends on whether `EMBEDDER_API_KEY` is set: without it the
+embedder is a SHA-256 hash with no semantics and retrieval is word matching,
+which on an inbound email almost never matches.
 
 **No payments, no WhatsApp adapter, and a voice half.** The payment port
 refuses with `not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on

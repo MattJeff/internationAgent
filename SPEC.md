@@ -223,9 +223,10 @@ Names the older spec used that do **not** exist, and what replaced them:
 - `McpConnector` → `McpCaller`, plus the concrete `McpServer` / `Fleet`.
 - `A2aGateway` → the concrete `A2aExecutor` + `PgTaskStore`; the trait is
   `AgentRuntime` and only tests implement it.
-- `KnowledgeEmbedder` → `Embedder`, an **enum** with one variant (`Mock`), not a
-  trait. A trait with one implementation is an interface nobody is choosing
-  between.
+- `KnowledgeEmbedder` → `Embedder`, an **enum** with two variants (`Mock`,
+  `OpenAi`), not a trait. It was one variant for a long time, and the enum was
+  the honest shape then too: a trait with one implementation is an interface
+  nobody is choosing between.
 - `SecretProvider` → `SecretStore`.
 
 Provider identifiers are stored in `employee_resources`; secrets are not.
@@ -244,6 +245,7 @@ and a fake phone, which is the normal state of an integration, not an error.
 | `EMAIL_API_KEY` | `re_…` | `ResendEmailProvider` |
 | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` | `TwilioTelephony` |
 | `BROWSER_API_KEY` | `project-id:api-key` | `BrowserbaseBrowser` + `CdpWebsocket` |
+| `EMBEDDER_API_KEY` | `sk-…` | `OpenAiEmbedder` |
 
 Two of them are compound because the adapter behind them takes two values, and
 they are one variable each for the same reason the keyring is: half a
@@ -255,19 +257,27 @@ The email adapter also needs the `whsec_…` signing secret, and takes it from t
 `email` entry of `AGENTOS_WEBHOOK_SECRETS` — where an operator has already
 pasted it — rather than from a fourth variable holding the same string.
 
-`EMBEDDER_API_KEY` **is no longer read at all.** It used to gate the boot guard
-while selecting nothing, because `Embedder` has one variant and it is a SHA-256
-hash; a credential that cannot change what runs must not be able to quiet an
-alarm. The embedder and the secret vault are named as permanent mocks in the
-boot summary instead.
+`EMBEDDER_API_KEY` **is read again, and the argument that removed it is
+answered.** It used to gate the boot guard while *selecting nothing*, because
+`Embedder` had one variant and it was a SHA-256 hash; a credential that cannot
+change what runs must not be able to quiet an alarm. It selects something now —
+`OpenAiEmbedder`, on the customer's key — and three observable things move with
+it: `Embedder::is_semantic()` becomes `true`, so `knowledge::retrieve` runs the
+vector leg; chunks are stamped `text-embedding-3-small` rather than
+`mock-sha256-1536`; and `0076_knowledge_index_real_embedder.sql` gives that
+model a partial HNSW index of its own. It is one value and not a pair because
+the customer brings the key and the **model name is a constant of the adapter** —
+a partial index predicate is a SQL literal and cannot name an environment
+variable, so a configurable model would be a model with no index. The secret
+vault is the only permanent mock left in the boot summary.
 
 Every boot logs one line naming what is behind every port, and `/readyz`
 publishes the same inventory as `mock_adapters` for as long as the replica is
 up:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 The **model is the exception**: `mocks::llm` selects `AnthropicLlm`, `CliLlm` or
@@ -683,15 +693,29 @@ Pipeline as built: `text -> normalise -> chunk -> embed -> index -> employee ACL
 AV and no extension check; the only content control is normalisation and a
 refusal of the empty document. The global 1 MiB body cap is the only size limit.
 
-**The embedder is a hash.** `Embedder::Mock` derives a unit-length
-1536-dimension vector from SHA-256: same string in, byte-identical vector out,
-on any machine, forever, with no network and no key. It makes no attempt at
-semantics — "cat" and "kitten" are as unrelated as "cat" and "diesel". Use it to
-test plumbing; use a real embedder to test whether retrieval finds the right
-document. Every chunk records its model as `mock-sha256-1536`, deliberately not
-a real model name, because a `vector(1536)` from one embedder and a
-`vector(1536)` from another are the same Postgres type and are not the same
-space — mixing them returns nonsense rather than an error.
+**The embedder is a hash unless `EMBEDDER_API_KEY` is set.** `Embedder::Mock`
+derives a unit-length 1536-dimension vector from SHA-256: same string in,
+byte-identical vector out, on any machine, forever, with no network and no key.
+It makes no attempt at semantics — "cat" and "kitten" are as unrelated as "cat"
+and "diesel" — and `is_semantic()` is `false`, which is what makes `retrieve`
+drop the vector leg rather than fuse in five passages ranked by a digest.
+`Embedder::OpenAi` (`embedder_openai.rs`) is the real one, on the customer's
+key, `text-embedding-3-small`, `is_semantic()` `true`. Every chunk records its
+model — `mock-sha256-1536` or `text-embedding-3-small` — because a
+`vector(1536)` from one embedder and a `vector(1536)` from another are the same
+Postgres type and are not the same space; mixing them returns nonsense rather
+than an error. The mock's name is deliberately not a vendor model name, and
+switching the credential on does **not** re-embed what is already stored: those
+rows keep their model and stop being findable until they are ingested again.
+
+**The dimension is fixed at 1536 and the real adapter refuses anything else.**
+`vector(1536)` is the column; `text-embedding-3-small` is natively that wide,
+which is why it is the model rather than a preference. The request sends
+`dimensions: 1536` explicitly and the response is measured, so a vendor changing
+a default is `Terminal { code: "embedding_dim_mismatch" }` at the adapter and
+never a Postgres error mid-ingest. Nothing is projected or truncated to fit — a
+transform of ours between the customer's model and the customer's answers would
+be invisible from the outside and would make `model` on the row a lie.
 
 Retrieval is **hybrid**: a cosine leg and a `plainto_tsquery('english')`
 full-text leg, fused in Rust by reciprocal rank fusion (`RRF_K = 60.0`) with
@@ -740,15 +764,22 @@ tools — see §14.
 
 A retrieved document is untrusted data, never executable instruction.
 
-The HNSW index is **partial on the model**, and `0026_knowledge_index_model.sql`
-is the migration that made the predicate name the model this system writes
-(`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing ever
-wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on 20 000
-chunks). There is now one constant for it,
-`store::knowledge::DEFAULT_EMBEDDING_MODEL`, and `app::knowledge::model_name`
-returns *that* rather than a second spelling. A second embedding model is a
-second partial index and therefore a migration, deliberately: that migration is
-where somebody has to say whether the new vectors belong in the old space.
+The HNSW index is **partial on the model**, and there are two of them.
+`0026_knowledge_index_model.sql` made the predicate name the model this system
+writes (`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing
+ever wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on
+20 000 chunks). `0076_knowledge_index_real_embedder.sql` is the second model
+arriving on the terms 0026 set, and it answers 0026's question out loud: the two
+spaces are **not** one space, so it is a second index and not a widened
+predicate. There is one constant per model —
+`store::knowledge::DEFAULT_EMBEDDING_MODEL` and
+`store::knowledge::OPENAI_EMBEDDING_MODEL` — and `app::knowledge::model_name`
+returns *those* rather than second spellings. The same drift is now closed in
+both directions it can open: a `const` block in `app::knowledge` proves the
+store's constant and `providers::embedder_openai::OpenAiEmbedder::MODEL` are the
+same bytes at compile time (two crates that cannot see each other), and
+`the_real_embedders_index_names_the_model_it_writes` reads the predicate back
+out of `pg_indexes` and compares it with the constant.
 
 ---
 
@@ -2275,7 +2306,9 @@ An employee can, today:
   Browserbase client with a live CDP driver
 - ✅ store and retrieve secrets without LLM exposure, envelope-encrypted, with
   every read audited
-- ⚠️ answer from company knowledge — real hybrid retrieval, on a hash embedder
+- ⚠️ answer from company knowledge — real hybrid retrieval, and whether it ranks
+  by meaning is `EMBEDDER_API_KEY`: set, `OpenAiEmbedder` and both legs; unset,
+  the hash and the full-text leg alone
 - ✅ connect to MCP servers, with operator-pinned tool digests
 - ✅ expose an A2A agent card and three task methods
 - ❌ make a payment — **NOT BUILT**; the gate, the approval and the reservation
@@ -2299,7 +2332,7 @@ An employee can, today:
 2. ✅ Provisioning engine
 3. ✅ Policy Gate + approvals *(loader wired — §14)*
 4. ✅ Email *(Resend, selected by `EMAIL_API_KEY`)*
-5. ⚠️ Knowledge *(text only, hash embedder)*
+5. ⚠️ Knowledge *(text only; hash embedder unless `EMBEDDER_API_KEY` is set)*
 6. ✅ MCP
 7. ✅ A2A
 8. ✅ Browser *(Browserbase + CDP, selected by `BROWSER_API_KEY`)*
