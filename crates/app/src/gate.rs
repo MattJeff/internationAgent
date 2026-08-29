@@ -556,6 +556,19 @@ impl PolicyGate {
         // burning it is deliberate — a halt that quietly destroyed every
         // pending approval would make the release the expensive half of the
         // switch.
+        //
+        // **"The moment the halt is lifted" is true for a stop shorter than
+        // `APPROVAL_TTL` and false for every longer one, and the second kind is
+        // the ordinary kind.** Nothing here pauses `approvals.expires_at` and
+        // nothing may — a 24-hour authorisation that survived a fortnight would
+        // be the "standing authorisation nobody remembers granting" that
+        // `NewApproval::expires_at` exists to refuse. So the deadline runs
+        // through the stop, and `0054`'s operating window is a stop *designed*
+        // to last days: step 8 of the entry journey sells 2 days, 1 week or 1
+        // month, and an expired window reports itself here as a halt. A company
+        // that ran out on Tuesday and is extended on the seventeenth comes back
+        // with every pending approval dead of old age, still reading `pending`,
+        // and with nothing anywhere counting them.
         let outcome = match halt::halted(&mut tx).await.map_err(Denied::Unavailable)? {
             Some(halt) => Outcome::Halted(halt.reason),
             None => match self.lifecycle(&mut tx, principal).await? {
