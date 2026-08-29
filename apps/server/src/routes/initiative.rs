@@ -48,7 +48,7 @@ use agentos_app::rolepack_sales::{self, Segment};
 use agentos_app::rolepack_service;
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::Lifecycle;
-use agentos_domain::ids::EmployeeId;
+use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_domain::initiative::{Cadence, MAX_INTERVAL, MIN_INTERVAL};
 use agentos_domain::money::{Currency, Money};
 use agentos_store::db::Db;
@@ -203,6 +203,23 @@ pub(crate) enum ObjectiveBody {
         #[serde(default)]
         reviewer: Option<String>,
     },
+    #[serde(rename = "managing")]
+    Managing {
+        /// What the team exists to get done. Empty here and a `Gap` there, like
+        /// every other role's headline field.
+        #[serde(default)]
+        mission: String,
+        /// Which role each direct report is meant to hold, by slug. Empty is
+        /// the default and a legitimate answer — see `rolepack_service::Seats`
+        /// for why this is the one headline field that is *not* a gap.
+        ///
+        /// A plain `BTreeMap<String, String>` on the wire and parsed through
+        /// `Slug` and `Charter::vacant` below, which is this enum's own rule:
+        /// every value here is a string until `into_charter` turns it into the
+        /// type that validates it.
+        #[serde(default)]
+        seats: std::collections::BTreeMap<String, String>,
+    },
 }
 
 /// Minor units and an ISO-4217 code — the shape `Money` serialises as, so what
@@ -313,6 +330,31 @@ impl ObjectiveBody {
                     reviewer,
                 },
             }),
+            ObjectiveBody::Managing { mission, seats } => {
+                let mut table = std::collections::BTreeMap::new();
+                for (report, role) in seats {
+                    let slug = Slug::parse(&report).map_err(|err| {
+                        ApiError::bad_request(format!("seats: {report:?} is not a slug ({err})"))
+                    })?;
+                    // The same refusal `vertical::seats_objective` makes when
+                    // the row is read back, here so an operator learns it while
+                    // they are watching rather than from a manager's turn that
+                    // quietly skipped a seat. Purchasing and sales are the two
+                    // that cannot be created empty — `Charter::vacant` says why.
+                    if Charter::vacant(&role).is_none() {
+                        return Err(ApiError::bad_request(format!(
+                            "seats: {role:?} is not a role a manager can create an empty seat                              for; charter that employee directly"
+                        )));
+                    }
+                    table.insert(slug, role);
+                }
+                Ok(Charter::Managing {
+                    objective: rolepack_service::Seats {
+                        mission,
+                        seats: table,
+                    },
+                })
+            }
         }
     }
 }

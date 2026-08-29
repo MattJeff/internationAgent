@@ -30,6 +30,7 @@
 //! misconfigured.
 
 mod auth; // U30
+mod bridge; // the container runtime `agentos_app::hosted` describes and does not contain
 mod config; // U30
 mod doctor;
 mod error; // U30
@@ -355,6 +356,45 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // does not depend on `agentos-providers` — see `Cargo.toml`.
     let credentials = agentos_app::mcp::Credentials::from_master_key(&config.master_key);
 
+    // The bridge runtime, or nothing at all.
+    //
+    // `None` here is the state this deployment has been in since `hosted` was
+    // written, and it is still the default: without `MCP_BRIDGE_BIND` every
+    // hosted binding refuses with `hosting_unavailable` and no container is
+    // started for anybody. What changed is that the branch now exists — the
+    // cap, the address and the image are an operator's three decisions, and
+    // `config::Hosting` is where they are made or not made.
+    //
+    // Built here rather than in `routes::mcp` because the *same* handle goes to
+    // the binder loop and to `POST /v1/mcp/connect`: the route starts a bridge
+    // to prove the connection works and the loop renews its lease five minutes
+    // later, and two runtimes would be two lease maps over one set of
+    // containers, each reaping what the other believed it was holding.
+    let bridges = match &config.hosting {
+        None => None,
+        Some(hosting) => {
+            let containers = std::sync::Arc::new(bridge::Containers::new(
+                hosting.image.clone(),
+                hosting.bind,
+                bridge::IDLE,
+            ));
+            // Before anything binds: a restart inherits the containers its
+            // predecessor leased and no map that covers them.
+            containers.sweep().await;
+            tracing::info!(
+                bind = %hosting.bind,
+                per_tenant = hosting.per_tenant,
+                image = hosting.image,
+                "hosted mcp is on"
+            );
+            Some(std::sync::Arc::new(agentos_app::hosted::Bridges::new(
+                containers,
+                hosting.network(),
+                hosting.per_tenant,
+            )))
+        }
+    };
+
     // The agent runtime, wired once and shared by every turn the outbox
     // dispatches. It hangs off the same token, so SIGTERM ends an in-flight
     // turn between effects instead of mid-payment.
@@ -386,6 +426,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 // registration and renewed by the loop with another is a binding
                 // that connects once and dies at its first expiry.
                 config.oauth_clients.clone(),
+                bridges.clone(),
                 rebinds,
                 cancel.clone(),
             )),
@@ -434,6 +475,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             gate,
             fleets,
             credentials,
+            bridges,
             ports.clone(),
             ModelWiring { llm },
         ),
@@ -533,12 +575,18 @@ struct ModelWiring {
     llm: Arc<dyn Llm>,
 }
 
+// Eight, and the eighth is `bridges`. The same `#[allow]` `app::mcp`'s
+// `bind_hosted` carries and for the same reason: every one of these is a
+// distinct wiring decision made once at boot, and a struct that existed only to
+// carry them past a lint would be a type nobody reads with a name nobody chose.
+#[allow(clippy::too_many_arguments)]
 fn app(
     db: Db,
     config: &Config,
     gate: PolicyGate,
     fleets: Fleets,
     credentials: agentos_app::mcp::Credentials,
+    bridges: Option<Arc<agentos_app::hosted::Bridges>>,
     ports: Arc<Ports>,
     model: ModelWiring,
 ) -> Router {
@@ -562,6 +610,7 @@ fn app(
         fleets,
         credentials.clone(),
         config.oauth_clients.clone(),
+        bridges,
         &config.public_host,
     );
     let api = with_api_stack(
@@ -5028,6 +5077,9 @@ mod tests {
             // with anyway.
             credentials: agentos_app::mocks::Credentials::default(),
             oauth_clients: std::sync::Arc::default(),
+            // Hosting off, which is what a deployment that has not set
+            // `MCP_BRIDGE_BIND` has and what every test here wants.
+            hosting: None,
             // No provider callbacks registered, so no webhook handlers. The
             // termination entry does not depend on any of it.
             webhooks: Vec::new(),
@@ -5590,6 +5642,8 @@ mod tests {
             // registered an application has. `refresh_due` finds nothing, so
             // the binder does exactly what it did before `waveI-i1`.
             std::sync::Arc::new(agentos_app::oauth::OauthClients::default()),
+            // And no bridge runtime: both companies dial a URL.
+            None,
             rebinds,
             cancel.clone(),
         ));

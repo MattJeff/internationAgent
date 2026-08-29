@@ -164,6 +164,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentos_app::catalog::{self, Connector, Credential};
+use agentos_app::hosted::Bridges;
 use agentos_app::mcp::{BindFailure, Credentials, Declaration, Fleet, McpServer, Reach, RiskClass};
 use agentos_app::oauth::{self, Claimed, OauthClients};
 use agentos_domain::ids::{Slug, TenantId};
@@ -304,6 +305,15 @@ pub struct McpState {
     /// wiring: nothing reachable from a request can name it, and every handler
     /// reads it the same way in every build.
     catalog: &'static [Connector],
+    /// The bridge runtime this deployment runs, or `None` for one that runs
+    /// none.
+    ///
+    /// The same handle the binder loop holds, for the reason
+    /// [`McpState::credentials`] gives about the cipher and one more that is
+    /// specific to this field: a bridge is *leased*, and two runtimes over one
+    /// Docker daemon would be two lease maps each reaping what the other
+    /// believed it was holding. `main` builds one and clones the `Arc`.
+    bridges: Option<Arc<Bridges>>,
 }
 
 impl McpState {
@@ -318,6 +328,7 @@ impl McpState {
         fleets: Fleets,
         credentials: Credentials,
         clients: Arc<OauthClients>,
+        bridges: Option<Arc<Bridges>>,
         public_host: &str,
     ) -> Self {
         Self {
@@ -330,6 +341,7 @@ impl McpState {
                 public_host.trim_end_matches('/')
             )),
             catalog: catalog::CATALOG,
+            bridges,
         }
     }
 
@@ -1015,7 +1027,7 @@ async fn connect(
     // from the request only for `custom`. This is most of what the catalogue is
     // worth: a customer who cannot mistype GitHub's host cannot be walked into
     // binding one that looks like it.
-    let (url, reach) = match connector.provision {
+    let (url, reach, package) = match connector.provision {
         catalog::Provision::Dial(url) => {
             if body.url.is_some() || body.reach.is_some() {
                 return Err(ApiError::bad_request(format!(
@@ -1023,25 +1035,17 @@ async fn connect(
                     connector.key
                 )));
             }
-            (url.to_owned(), connector.reach)
+            (Some(url.to_owned()), connector.reach, None)
         }
-        // **The one branch that is not built, and it is refused rather than
-        // half-built.** A hosted connector has no endpoint until a bridge
-        // runtime starts one, and `agentos_app::hosted` deliberately ships no
-        // runtime — so there is nothing for this route's own rule to be true
-        // of: *a connection is validated only if it was tried*. Writing the row
-        // anyway would be storing what the customer typed and calling it
-        // connected, which is the meaning this route exists to refuse.
+        // **A hosted connector has no endpoint until a bridge runtime starts
+        // one**, so this branch's whole job is to make this route's own rule
+        // true of it: *a connection is validated only if it was tried*. It
+        // starts the bridge, lists its tools, and writes a row with a NULL URL
+        // — there is no address to store, and `0043_mcp_hosted.sql` is that
+        // column becoming nullable. The runtime mints an address per start and
+        // the next bind pass gets a different one.
         //
-        // A 503, not a 404 and not a 400: the connector is real, the request is
-        // well formed, and what is missing is on our side and is temporary in
-        // the only sense that matters — it is a deployment away. See
-        // `agentos_app::hosted` for what that deployment is. The row shape
-        // itself works and is exercised by
-        // `mcp::tests::a_hosted_binding_starts_a_bridge_and_never_names_its_address`.
-        //
-        // **What is left to write here, when the branch opens, and in what
-        // order.** `hosted::BRIDGES_PER_TENANT` did not wait for this route:
+        // `hosted::BRIDGES_PER_TENANT` did not wait for this route:
         // `app::mcp::Fleet::bind` applies it before any runtime is asked, so
         // opening this branch cannot hand a tenant an unbounded number of
         // containers *on one bind pass*.
@@ -1058,30 +1062,56 @@ async fn connect(
         //
         // So the refusal owed here is not only the one a customer can read, it
         // is the one that makes the ceiling true: count this tenant's rows on
-        // hosted connectors and answer 409 past the cap, in the same change
-        // that first lets one be written, with the cap **equal to**
-        // `BRIDGES_PER_TENANT` rather than a roomier number — and count hosted
-        // handles this tenant has retired inside the idle TTL as well, or
-        // `DELETE /v1/mcp/servers/{server}` refunds the slot while the
-        // container behind it is still alive and the cap counts rows the
-        // machine is not running. Without any of it a customer is also told
-        // "verified" about a row that will bind as `hosted_cap_reached`
-        // forever — a lie on top of the load.
+        // hosted connectors and answer 409 past the cap, with the cap **equal
+        // to** `BRIDGES_PER_TENANT` rather than a roomier number. That is what
+        // the count below does, and it reads the number off `Bridges` rather
+        // than off this deployment's configuration so that the two cannot
+        // disagree — see `hosted::Bridges::per_tenant`.
         //
-        // The count belongs in the same transaction as the INSERT below, and it
-        // needs `pg_advisory_xact_lock(hashtextextended($tenant::text, 0))` in
-        // front of it — the pattern `0027_positions.sql` already uses for a
-        // per-tenant invariant — or two concurrent requests each count N and
-        // each write. The catalogue cannot be a SQL predicate (`0043`'s
-        // decision 2 says why), so the hosted connector keys go down as a
-        // parameter read out of `catalog::CATALOG` at the call, never as a
-        // stored copy.
-        catalog::Provision::Host(_) => {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "hosting_unavailable",
-                "this deployment runs no bridge runtime, so it cannot host this connector's server",
-            ));
+        // **What is still owed, and what it costs.** Retired handles are not
+        // counted. `DELETE /v1/mcp/servers/{server}` refunds the slot at once
+        // while the container behind it stays alive until the runtime's idle
+        // TTL, so a tenant who cycles handles holds more containers than rows.
+        // That is not a hole this change opened: `BRIDGES_PER_TENANT`'s own
+        // arithmetic already tells an operator to divide by `TTL ÷ pass
+        // interval` for exactly this reason, and counting retirements narrows
+        // the multiplier rather than creating the bound. Doing it needs a
+        // record of *when* a hosted row was deleted, which is a column no
+        // migration has written.
+        //
+        // ponytail: containers held per tenant ≈ cap × (bridge::IDLE ÷
+        // routes::mcp::REFRESH). Tighten by recording a `retired_at` on delete
+        // and counting rows retired within the TTL, when a customer is cycling
+        // handles fast enough to matter.
+        catalog::Provision::Host(package) => {
+            // No runtime, and therefore no connection to make: this deployment
+            // has not set `MCP_BRIDGE_BIND`. A 503 rather than a 404 or a 400,
+            // for the reason above — the connector is real and what is missing
+            // is on our side.
+            let Some(bridges) = state.bridges.as_deref() else {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "hosting_unavailable",
+                    "this deployment runs no bridge runtime, so it cannot host this connector's server",
+                ));
+            };
+            if body.url.is_some() || body.reach.is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "url and reach are not yours to set for the {:?} connector",
+                    connector.key
+                )));
+            }
+            // **The cap, once here and once under the lock below.** This read
+            // races and is kept anyway, because what it protects is not the
+            // invariant — the recount is — but the machine: without it, a
+            // tenant already at the cap gets a container started for every
+            // request they send, each one leased for the idle TTL, and every
+            // one of them is refused after the fact. The write is safe with
+            // only the recount; the box is not.
+            if hosted_rows(&state, principal.tenant_id, &server).await? >= bridges.per_tenant() {
+                return Err(hosted_cap(bridges.per_tenant()));
+            }
+            (None, connector.reach, Some(package))
         }
         catalog::Provision::Customer => {
             let url = body
@@ -1109,7 +1139,7 @@ async fn connect(
                     "reach: this connector may not reach private address space",
                 ));
             }
-            (url, reach)
+            (Some(url), reach, None)
         }
     };
 
@@ -1158,19 +1188,49 @@ async fn connect(
     //
     // Before the write, deliberately. Everything below this point is either a
     // failure with nothing stored or a binding that was observed working.
-    let bound = state
-        .credentials
-        .bind(
-            principal.tenant_id,
-            server.clone(),
-            &url,
-            &std::collections::BTreeMap::new(),
-            reach,
-            sealed.as_deref(),
-            CancellationToken::new(),
-        )
-        .await
-        .map_err(bind_failed(&server))?;
+    //
+    // Two calls and not one, because a hosted binding has no URL to dial: it
+    // starts a container and binds to whatever address the runtime answered
+    // with. `bind_hosted` is the only path from a package to a live endpoint
+    // and it is the same one the binder loop takes five minutes later, which is
+    // what makes this round trip evidence about the thing that will actually
+    // run rather than about a URL somebody typed.
+    let bound = match package {
+        Some(package) => {
+            let bridges = state
+                .bridges
+                .as_deref()
+                .expect("the hosted arm above returned 503 without a runtime");
+            state
+                .credentials
+                .bind_hosted(
+                    principal.tenant_id,
+                    server.clone(),
+                    &package,
+                    &std::collections::BTreeMap::new(),
+                    sealed.as_deref(),
+                    bridges,
+                    CancellationToken::new(),
+                )
+                .await
+        }
+        None => {
+            let url = url.as_deref().expect("every dialled arm produced a url");
+            state
+                .credentials
+                .bind(
+                    principal.tenant_id,
+                    server.clone(),
+                    url,
+                    &std::collections::BTreeMap::new(),
+                    reach,
+                    sealed.as_deref(),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    }
+    .map_err(bind_failed(&server))?;
     let tools = discovered(&bound, connector);
     let addresses: Vec<String> = bound
         .pinned_addresses()
@@ -1195,6 +1255,35 @@ async fn connect(
 
     let now = Utc::now();
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+
+    // **The count that makes the cap true, under a lock that makes it a count.**
+    //
+    // The pre-check above races by construction — it reads in one transaction
+    // and writes in another — so without this, `n` concurrent requests each see
+    // `cap - 1` rows and each write one. The advisory lock is per tenant and
+    // transaction-scoped, the pattern `0027_positions.sql` already uses for a
+    // per-tenant invariant, and it is taken *before* the count so the count is
+    // the last word.
+    //
+    // Only for a hosted connector: a dialled binding starts nothing on our
+    // machine, so serialising every `connect` behind one lock per tenant would
+    // buy nothing and cost a queue.
+    if package.is_some() {
+        let cap = state
+            .bridges
+            .as_deref()
+            .expect("the hosted arm above returned 503 without a runtime")
+            .per_tenant();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(principal.tenant_id.as_uuid().to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(StoreError::from)?;
+        if count_hosted(&mut tx, principal.tenant_id, &server).await? >= cap {
+            return Err(hosted_cap(cap));
+        }
+    }
+
     sqlx::query(
         "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector, sealed_token) \
          VALUES ($1, $2, $3, $4, $5, $6) \
@@ -1261,6 +1350,68 @@ async fn connect(
         })),
     )
         .into_response())
+}
+
+/// The 409 a tenant at the ceiling gets, and the only place its wording lives.
+///
+/// A 409 and not a 429: nothing here is rate limiting, and retrying does not
+/// help. What is in the way is a row this tenant already owns, and the fix is to
+/// delete one — which the message says, because a cap with no stated remedy is
+/// indistinguishable from a bug.
+fn hosted_cap(cap: usize) -> ApiError {
+    ApiError::conflict(
+        "hosted_cap_reached",
+        "this deployment's per-tenant limit on hosted servers is already reached",
+    )
+    .with_detail(format!(
+        "at most {cap} hosted server(s) per tenant; disconnect one before connecting another"
+    ))
+}
+
+/// How many hosted bindings this tenant holds, not counting `server` itself.
+///
+/// **Not counting `server`** because `connect` is `ON CONFLICT DO UPDATE`:
+/// reconnecting a handle that already exists — the only way to rotate a
+/// credential — writes no new row, and a count that included it would make the
+/// last slot un-rotatable.
+///
+/// The hosted connector keys go down as a parameter read out of the catalogue at
+/// the call and never as a stored copy, because the catalogue is a `const` in
+/// this binary and SQL cannot see it — `0043_mcp_hosted.sql`'s decision 2 is the
+/// same argument pointed at a `CHECK` constraint. A connector this build does
+/// not recognise is therefore not hosted and does not count, which is the
+/// fail-open direction for this one number and the fail-closed direction for
+/// everything else: `catalog::find_in` also refuses to bind it.
+async fn count_hosted(
+    tx: &mut agentos_store::db::TenantTx<'_>,
+    tenant: TenantId,
+    server: &Slug,
+) -> Result<usize, ApiError> {
+    let hosted: Vec<&str> = catalog::CATALOG
+        .iter()
+        .filter(|entry| matches!(entry.provision, catalog::Provision::Host(_)))
+        .map(|entry| entry.key)
+        .collect();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mcp_servers \
+         WHERE tenant_id = $1 AND connector = ANY($2) AND server <> $3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&hosted)
+    .bind(server.as_str())
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+/// The same count, in its own transaction, for the pre-check before a container
+/// is started. See the `Provision::Host` arm for why both exist.
+async fn hosted_rows(state: &McpState, tenant: TenantId, server: &Slug) -> Result<usize, ApiError> {
+    let mut tx = state.db.tenant_tx(tenant).await?;
+    let count = count_hosted(&mut tx, tenant, server).await;
+    let _ = tx.rollback().await;
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -2063,12 +2214,14 @@ pub async fn run(
     fleets: Fleets,
     credentials: Credentials,
     clients: Arc<OauthClients>,
+    bridges: Option<Arc<Bridges>>,
     mut rebinds: mpsc::Receiver<TenantId>,
     ct: CancellationToken,
 ) {
+    let bridges = bridges.as_deref();
     // Startup: every tenant that has configured anything. Not gated on the
     // listener, so a slow MCP server delays tool availability and nothing else.
-    rebind_all(&db, &fleets, &credentials, &clients, &ct).await;
+    rebind_all(&db, &fleets, &credentials, &clients, bridges, &ct).await;
 
     let mut refresh = tokio::time::interval(REFRESH);
     refresh.tick().await; // The first tick is immediate; we just did it.
@@ -2076,9 +2229,9 @@ pub async fn run(
     loop {
         tokio::select! {
             () = ct.cancelled() => break,
-            _ = refresh.tick() => rebind_all(&db, &fleets, &credentials, &clients, &ct).await,
+            _ = refresh.tick() => rebind_all(&db, &fleets, &credentials, &clients, bridges, &ct).await,
             received = rebinds.recv() => match received {
-                Some(tenant) => rebind(&db, &fleets, &credentials, &clients, tenant, &ct).await,
+                Some(tenant) => rebind(&db, &fleets, &credentials, &clients, bridges, tenant, &ct).await,
                 // Every sender is gone, which means the router that holds the
                 // other half is gone, which means the process is on its way
                 // down. Nothing left to keep current.
@@ -2099,6 +2252,7 @@ async fn rebind(
     fleets: &Fleets,
     credentials: &Credentials,
     clients: &OauthClients,
+    bridges: Option<&Bridges>,
     tenant: TenantId,
     ct: &CancellationToken,
 ) {
@@ -2125,22 +2279,14 @@ async fn rebind(
             return;
         }
     };
-    // `None`: this deployment runs no bridge runtime, because none exists to
-    // run — `agentos_app::hosted` is the contract for one and deliberately
-    // ships no implementation. Every hosted binding therefore fails to bind
-    // with `hosting_unavailable`, which `list_servers` renders, and no tenant
-    // gets tools from a container nobody started. The day a runtime is
-    // deployed, this is the line that hands it in, and nothing else here
-    // changes.
-    //
-    // It cannot be handed in without a number: `Bridges::new` takes the
-    // per-tenant cap, and the value it is required to be passed here is
-    // `hosted::BRIDGES_PER_TENANT`, which is zero until somebody answers the
-    // question written on it. So the wiring change is a `Some(...)` that still
-    // starts nothing, and turning hosting on is a second, deliberate edit to a
-    // constant — which is the order that stops "wire it up" from also meaning
-    // "and let a customer run as many processes as they like on our box".
-    let fleet = Fleet::bind(&mut tx, credentials, None, ct).await;
+    // This is the line the paragraph that used to be here said would hand a
+    // runtime in, and `crate::bridge` is the runtime. `None` is still what a
+    // deployment without `MCP_BRIDGE_BIND` passes, and it still means every
+    // hosted binding fails with `hosting_unavailable` — see `config::Hosting`
+    // for why an unset address rather than a compiled-in constant is what holds
+    // hosting off now, and why the cap that arrives with it defaults to the
+    // same zero it always did.
+    let fleet = Fleet::bind(&mut tx, credentials, bridges, ct).await;
     // A read-only transaction either way; rolling back is the cheaper unwind.
     let _ = tx.rollback().await;
 
@@ -2180,6 +2326,7 @@ async fn rebind_all(
     fleets: &Fleets,
     credentials: &Credentials,
     clients: &OauthClients,
+    bridges: Option<&Bridges>,
     ct: &CancellationToken,
 ) {
     let tenants: Vec<TenantId> = match db.admin_tx_bypassing_rls().await {
@@ -2219,7 +2366,7 @@ async fn rebind_all(
         if ct.is_cancelled() {
             return;
         }
-        rebind(db, fleets, credentials, clients, tenant, ct).await;
+        rebind(db, fleets, credentials, clients, bridges, tenant, ct).await;
     }
 }
 
@@ -2655,10 +2802,11 @@ mod tests {
                 fleets.clone(),
                 credentials.clone(),
                 clients.clone(),
+                None,
                 "https://agentos.test",
             );
             Some(Self {
-                // `state` is built above with the five-argument `McpState::new`
+                // `state` is built above with the six-argument `McpState::new`
                 // that `waveI-i1` introduced; the `Keyring` is `waveJ-j1`'s,
                 // which made the environment keyring one half of a resolver
                 // whose other half is the `api_keys` table. Both are needed and
@@ -2766,6 +2914,7 @@ mod tests {
                 self.fleets.clone(),
                 self.credentials.clone(),
                 self.clients.clone(),
+                None,
                 "https://agentos.test",
             )
             .over(catalog);
@@ -3077,6 +3226,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -3141,6 +3294,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -3391,6 +3548,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -3407,6 +3568,7 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            None,
             &CancellationToken::new(),
         )
         .await;
@@ -3617,6 +3779,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -3732,6 +3898,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -3823,6 +3993,10 @@ mod tests {
             &h.fleets,
             &h.credentials,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -4284,6 +4458,10 @@ mod tests {
             &h.fleets,
             &rotated,
             &h.clients,
+            // No runtime in the tests that exercise the loop: every binding
+            // here dials a URL. `hosted`'s own suite is where a bridge is
+            // started, against `FakeRuntime`.
+            None,
             h.a,
             &CancellationToken::new(),
         )
@@ -4561,6 +4739,7 @@ mod tests {
             h.fleets.clone(),
             h.credentials.clone(),
             h.clients.clone(),
+            None,
             "https://agentos.test",
         );
         let server = Slug::parse("gh-oauth").expect("slug");

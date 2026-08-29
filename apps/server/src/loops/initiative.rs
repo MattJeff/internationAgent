@@ -470,6 +470,7 @@ pub(crate) fn plan_of(charter: &Charter) -> Result<Vec<(&'static str, String)>, 
         Charter::Finance { objective } => service_plan(objective.plan()),
         Charter::EntryRequirements { objective } => service_plan(objective.plan()),
         Charter::Engineering { objective } => service_plan(objective.plan()),
+        Charter::Managing { objective } => service_plan(objective.plan()),
     }
 }
 
@@ -1514,6 +1515,13 @@ async fn vertical_step(
         // named — so there is nothing here for a hard-coded vertical to call,
         // and one that guessed a tool name would be this binary claiming to
         // know a vendor's surface.
+        // The manager's own step. It is in this `match` and not beside it for
+        // the reason every other arm is: whatever a role does before its model
+        // call is that role's business, and a second dispatch on the charter
+        // would be a second place to forget one.
+        Charter::Managing { objective } => {
+            managing_step(agent, principal, objective, Utc::now()).await
+        }
         Charter::Support { .. }
         | Charter::Growth { .. }
         | Charter::Finance { .. }
@@ -1825,6 +1833,231 @@ async fn waiting(db: &Db, tenant: TenantId, employee: EmployeeId) -> Option<Show
         lines,
         cut: (!cut.is_empty()).then(|| cut.join(" ")),
     })
+}
+
+/// One report, as the single query in [`managing_step`] reads it.
+///
+/// A named struct and not the six-tuple this was, because `clippy` is right
+/// about that one: the two `Option<String>`s are a role and an outcome and
+/// nothing at the call site would have caught them being swapped.
+///
+/// Every field but `id` and `slug` is nullable, and each `None` is a state a
+/// manager exists for: no charter row, or a seat that has never been woken.
+#[derive(sqlx::FromRow)]
+struct Seat {
+    id: uuid::Uuid,
+    slug: String,
+    role: Option<String>,
+    #[sqlx(rename = "objective")]
+    stored: Option<serde_json::Value>,
+    last_claimed_at: Option<DateTime<Utc>>,
+    last_outcome: Option<String>,
+}
+
+/// A manager's turn: fill the seats its objective names, then show it the
+/// state of its reports.
+///
+/// # The two halves, and why only one of them can act
+///
+/// **Filling a seat is code, not a model call.** `vertical::delegate` documents
+/// why: no role pack lists `ActionKind::CharterSet` as proposable and nothing
+/// turns model output into an `Action::CharterSet`, so re-tasking a colleague
+/// is a head's own code proposing to the gate, which rules on it and writes the
+/// audit row. What that code is allowed to decide is therefore kept as small as
+/// it can be: for a report with **no charter at all**, and only when the
+/// manager's own objective names a role for that report's slug, it writes the
+/// *vacant* charter for that role — `Charter::vacant`, an objective that is all
+/// gaps. Nothing here invents what a seat is for. The report's next turn reads
+/// the charter, finds `Stage::Clarify`, and asks the question itself.
+///
+/// A report that already has a charter is never touched, whatever the objective
+/// says. Re-pointing somebody who is mid-job is a decision with a reason behind
+/// it, and "the table disagrees with the row" is not that reason — an operator
+/// who wants it re-tasked writes the charter, and the table catching up on its
+/// own would silently undo them.
+///
+/// **The other half is material and nothing else.** The table below is a record
+/// this system wrote about its own seats — our slugs, our role names, our own
+/// `Gap::question()` constants — so it goes on the brief rather than through
+/// `Untrusted`. There is no counterparty in it. The one field that could carry
+/// somebody else's words is `last_detail`, and every value it takes comes from
+/// `Outcome`'s closed vocabulary.
+///
+/// A read that fails costs the manager its table and not its turn: a seat that
+/// cannot see its team can still answer its own manager.
+async fn managing_step(
+    agent: &Agent,
+    principal: &ActingAs,
+    objective: &rolepack_service::Seats,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let warn = |err: &dyn std::fmt::Display| {
+        tracing::warn!(
+            tenant_id = %principal.tenant_id.as_uuid(),
+            employee_id = %principal.employee_id.as_uuid(),
+            error = %err,
+            "could not read this manager's reports; the turn runs without them"
+        );
+    };
+
+    let mut tx = agent
+        .db
+        .tenant_tx(principal.tenant_id)
+        .await
+        .inspect_err(|err| warn(err))
+        .ok()?;
+    let reports = agentos_store::org::reports(&mut tx, principal.employee_id)
+        .await
+        .inspect_err(|err| warn(err))
+        .ok()?;
+    let ids: Vec<uuid::Uuid> = reports.iter().map(EmployeeId::as_uuid).collect();
+    // One query for the whole team rather than three per report. `LEFT JOIN` on
+    // both sides, because the two rows this is looking for are the ones that do
+    // not exist: a report with no charter and a report that has never been
+    // woken are exactly the seats a manager is for.
+    let rows: Vec<Seat> = sqlx::query_as(
+        "SELECT e.id, e.slug, c.role, c.objective, i.last_claimed_at, i.last_outcome \
+               FROM employees e \
+               LEFT JOIN employee_charters c ON c.employee_id = e.id \
+               LEFT JOIN employee_initiative i ON i.employee_id = e.id \
+              WHERE e.id = ANY($1) AND e.lifecycle = 'active' \
+              ORDER BY e.slug",
+    )
+    .bind(&ids)
+    .fetch_all(&mut **tx)
+    .await
+    .inspect_err(|err| warn(err))
+    .ok()?;
+    // Read-only, and the delegation below opens its own: `delegate` takes a
+    // `&Db` because the gate rules in a transaction of its own, against the
+    // chart as it stands at the moment of the ruling rather than as it stood
+    // when this read started.
+    let _ = tx.rollback().await;
+
+    if rows.is_empty() {
+        return Some(
+            "You have no active reports. Nobody's work is yours to unblock this turn; if that is \
+             wrong, it is a question for whoever draws the org chart."
+                .to_owned(),
+        );
+    }
+
+    let mut lines = Vec::new();
+    for Seat {
+        id,
+        slug,
+        role,
+        stored,
+        last_claimed_at,
+        last_outcome,
+    } in rows
+    {
+        let employee = EmployeeId::from_uuid(id);
+        let charter = match (role.as_deref(), stored.as_ref()) {
+            (Some(role), Some(stored)) => Charter::of(role, stored).ok(),
+            // A `role` with no `objective` or the other way round cannot happen
+            // — they are two columns of one row — and a charter that will not
+            // parse is `None` here for the same reason it is `unreadable_charter`
+            // in `assignment_for`: the seat is not working, and that is the fact
+            // the manager needs.
+            _ => None,
+        };
+
+        let Some(charter) = charter else {
+            // The one place this function writes anything. `Slug::parse` cannot
+            // fail on a column that went through it on the way in, but a manager
+            // is not the place to turn that into a stopped turn.
+            let seat = Slug::parse(&slug)
+                .ok()
+                .and_then(|slug| objective.seats.get(&slug).cloned());
+            let filled = match seat {
+                None => None,
+                Some(role) => match Charter::vacant(&role) {
+                    // Unreachable: `seats_objective` refuses a role with no
+                    // vacant charter when the objective is read. Kept because
+                    // it is the invariant rather than the branch — the day a
+                    // pack is added without one, this is what does not panic.
+                    None => None,
+                    Some(charter) => {
+                        match vertical::delegate(
+                            &agent.gate,
+                            &agent.db,
+                            principal,
+                            employee,
+                            &charter,
+                            now,
+                        )
+                        .await
+                        {
+                            Ok(decision) => {
+                                tracing::info!(
+                                    %decision,
+                                    report = slug,
+                                    role,
+                                    "a manager filled a vacant seat"
+                                );
+                                Some(role)
+                            }
+                            // A refusal is the gate's answer and it is the
+                            // manager's business to know about, not to retry:
+                            // a suspended head, a report that moved off the
+                            // line between the two reads, a policy that does
+                            // not carry the action.
+                            Err(err) => {
+                                warn(&err);
+                                None
+                            }
+                        }
+                    }
+                },
+            };
+            lines.push(match filled {
+                Some(role) => format!(
+                    "- {slug} — had no charter; you have just made it a {role} seat. It will ask \
+                     what the job is on its next turn."
+                ),
+                None => format!(
+                    "- {slug} — no charter, and your objective names no seat for it. Nobody has \
+                     said what this employee is for."
+                ),
+            });
+            continue;
+        };
+
+        let waiting: Vec<&str> = charter
+            .open_questions()
+            .into_iter()
+            .map(|question| question.ask)
+            .collect();
+        let acted = match last_claimed_at {
+            None => "has never been woken".to_owned(),
+            Some(at) => {
+                let hours = (now - at).num_hours();
+                let outcome = last_outcome.as_deref().unwrap_or("unrecorded");
+                format!("last acted {hours}h ago, outcome {outcome}")
+            }
+        };
+        lines.push(if waiting.is_empty() {
+            format!("- {slug} ({}) — {acted}", charter.role())
+        } else {
+            format!(
+                "- {slug} ({}) — {acted}; waiting on an answer: {}",
+                charter.role(),
+                waiting.join(" ")
+            )
+        });
+    }
+
+    // The same bound every other list a turn is shown carries, and the same
+    // reason: a count after a `take` is the take.
+    let total = lines.len();
+    let cut = cut_note("report", "by name", total);
+    lines.truncate(MAX_LINES);
+    Some(format!(
+        "Your reports, by name:\n{}{}",
+        lines.join("\n"),
+        cut.map(|note| format!("\n{note}")).unwrap_or_default()
+    ))
 }
 
 /// How many lines of any one list a turn is shown.
@@ -2287,6 +2520,178 @@ pub(crate) mod tests {
             .expect("set schedule");
         tx.commit().await.expect("commit");
         id
+    }
+
+    /// **The only production caller of `vertical::delegate`, end to end.**
+    ///
+    /// Everything under it was already tested in isolation — the gate rules on
+    /// `CharterSet` against `team_memberships.reports_to`, `Charter::vacant` is
+    /// all gaps, `seats_objective` refuses a role that cannot be left empty.
+    /// What had no test at all is the sentence that joins them: *a manager's
+    /// turn fills the seat its objective names, and touches nothing else.*
+    ///
+    /// Three reports, one of each case the step distinguishes:
+    ///
+    /// * `ada` has no charter and is named — it gets one, and it is vacant.
+    /// * `bob` has no charter and is **not** named — it gets nothing, because a
+    ///   manager does not invent what a seat is for.
+    /// * `cy` already has a charter and *is* named, with a different role — it
+    ///   is not touched, which is the assertion that matters most here. A step
+    ///   that re-pointed a working seat because a table disagreed with a row
+    ///   would silently undo whoever chartered it.
+    #[tokio::test]
+    async fn a_manager_fills_the_seat_its_objective_names_and_leaves_the_rest_alone() {
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(db) = db().await else {
+            return;
+        };
+        let tenant = seed_tenant(&db).await;
+
+        // The reports first: `seed_due` mints a slug with a random suffix, so
+        // the objective cannot be written until they exist.
+        let ada = seed_due(&db, tenant, "ada", None).await;
+        let bob = seed_due(&db, tenant, "bob", None).await;
+        let working = Charter::Engineering {
+            objective: agentos_app::rolepack_service::Changes {
+                repository: "the visa API".to_owned(),
+                checks: Some("cargo test".to_owned()),
+                reviewer: Some("the CTO".to_owned()),
+            },
+        };
+        let cy = seed_due(&db, tenant, "cy", Some(working.clone())).await;
+
+        let slug_of = async |who: EmployeeId| -> Slug {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let slug: String = sqlx::query_scalar("SELECT slug FROM employees WHERE id = $1")
+                .bind(who.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("slug");
+            let _ = tx.rollback().await;
+            Slug::parse(&slug).expect("slug")
+        };
+        let (ada_slug, cy_slug) = (slug_of(ada).await, slug_of(cy).await);
+
+        // The manager, and the chart that gives it authority. Without the
+        // `reports_to` link the gate answers `OutsideChainOfCommand` and this
+        // test would pass for the wrong reason — which is why the negative half
+        // is asserted on `bob`, who is on the same line, rather than on
+        // somebody who is not.
+        let boss = seed_due(
+            &db,
+            tenant,
+            "boss",
+            Some(Charter::Managing {
+                objective: agentos_app::rolepack_service::Seats {
+                    mission: "keep the visa data right".to_owned(),
+                    seats: [
+                        (
+                            ada_slug.clone(),
+                            agentos_app::rolepack_service::CUSTOMER_SUCCESS.to_owned(),
+                        ),
+                        // Named, already chartered, and named as something else.
+                        (cy_slug, agentos_app::rolepack_service::GROWTH.to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            }),
+        )
+        .await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let team = agentos_store::org::create_team(
+            &mut tx,
+            &Slug::parse("product").expect("slug"),
+            "Product",
+        )
+        .await
+        .expect("team");
+        for who in [boss, ada, bob, cy] {
+            agentos_store::org::set_member(&mut tx, who, team, None)
+                .await
+                .expect("member");
+        }
+        for who in [ada, bob, cy] {
+            assert!(
+                agentos_store::org::set_position(&mut tx, who, None, Some(boss))
+                    .await
+                    .expect("position"),
+                "the reporting line is what the gate rules on"
+            );
+        }
+        tx.commit().await.expect("commit the chart");
+
+        let agent = Agent {
+            db: db.clone(),
+            llm: Arc::new(agentos_app::mocks::ScriptedLlm::responses(Vec::new())),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+            gate: agentos_app::gate::PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            fleets: crate::routes::mcp::Fleets::new().0,
+            cancel: CancellationToken::new(),
+        };
+        let principal = ActingAs::employee(tenant, boss);
+        let Some(Charter::Managing { objective }) = ({
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let loaded = Charter::load(&mut tx, boss).await.expect("load");
+            let _ = tx.rollback().await;
+            loaded
+        }) else {
+            panic!("the manager's charter did not come back as a managing one");
+        };
+
+        let note = managing_step(&agent, &principal, &objective, Utc::now())
+            .await
+            .expect("a manager's turn always has a note");
+
+        let charter_of = async |who: EmployeeId| -> Option<Charter> {
+            let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+            let loaded = Charter::load(&mut tx, who).await.expect("load");
+            let _ = tx.rollback().await;
+            loaded
+        };
+
+        // Named and empty: filled, and filled *vacant* — the charter asks
+        // rather than starts. This is the invariant
+        // `vertical::tests::a_vacant_charter_asks_before_it_acts` pins, asserted
+        // here against the row that was actually written.
+        let filled = charter_of(ada).await.expect("ada was given a charter");
+        assert_eq!(
+            filled.role(),
+            agentos_app::rolepack_service::CUSTOMER_SUCCESS
+        );
+        assert!(
+            !filled.open_questions().is_empty(),
+            "a filled seat that has nothing to ask is a seat that started working"
+        );
+
+        // Not named: nothing. A manager does not invent an objective.
+        assert!(
+            charter_of(bob).await.is_none(),
+            "bob was not in the table and must not have been chartered"
+        );
+
+        // Named, already working: untouched, and still the *engineering*
+        // charter somebody wrote rather than the growth one the table names.
+        assert_eq!(
+            charter_of(cy).await.expect("cy kept its charter"),
+            working,
+            "a report with a charter is never re-pointed by the table"
+        );
+
+        // And the manager was told, by name and in its own words.
+        assert!(
+            note.contains(ada_slug.as_str()),
+            "the note does not mention {ada_slug}: {note}"
+        );
+        assert!(
+            note.contains("just made it a"),
+            "the note does not say what was filled: {note}"
+        );
+
+        clear_schedules(&db).await;
     }
 
     /// A model that answers once and keeps every request it was handed.

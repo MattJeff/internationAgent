@@ -40,9 +40,10 @@
 //! for a week and answers none of it.
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use agentos_app::hosted::{BRIDGES_PER_TENANT, BridgeNetwork};
 use agentos_app::mocks::{
     BrowserCredentials, Credentials, EmailCredentials, LlmBackend, TelephonyCredentials,
 };
@@ -268,6 +269,64 @@ pub struct Config {
     /// `agentos_app::catalog::CATALOG` for why there is no entry to register for
     /// yet.
     pub oauth_clients: Arc<OauthClients>,
+    /// `MCP_BRIDGE_BIND` — whether this deployment runs hosted MCP servers at
+    /// all, and where their ports are published.
+    ///
+    /// `None` is the default and it is the whole safety switch: no address, no
+    /// [`Bridges`](agentos_app::hosted::Bridges), and every hosted binding
+    /// refuses with `hosting_unavailable`. `agentos_app::hosted` spends a page
+    /// on why an unset value here has to start nothing rather than default to
+    /// something, and the short version is that the wrong default is not a
+    /// smaller version of the right one — it is one container per slug a tenant
+    /// can invent, on our machine.
+    pub hosting: Option<Hosting>,
+}
+
+/// What it takes to run somebody else's MCP server on this deployment.
+///
+/// One struct rather than three optional fields, because "an address but no
+/// cap" and "a cap but no address" are states that would have to be checked for
+/// at the call site, forever, by everyone. Here they cannot be spelled.
+#[derive(Debug, Clone)]
+pub struct Hosting {
+    /// `MCP_BRIDGE_BIND` — the address a bridge's port is published on, and the
+    /// **only** address [`accept`](agentos_app::hosted::accept) will take: see
+    /// [`Hosting::network`]. `127.0.0.1` for a development box, the host's
+    /// address on the operator's bridge subnet for a real one.
+    pub bind: IpAddr,
+    /// `MCP_BRIDGES_PER_TENANT` — how many bridges one tenant may have started
+    /// on one bind pass. Defaults to
+    /// [`BRIDGES_PER_TENANT`](agentos_app::hosted::BRIDGES_PER_TENANT), which is
+    /// **zero**.
+    ///
+    /// A variable rather than the constant it defaults to, because that
+    /// constant's own documentation says the number is "answered with an
+    /// operator's arithmetic and not a programmer's" — box memory over runner
+    /// size over tenants per box — and an operator cannot do arithmetic in a
+    /// binary somebody else compiled. Defaulting to the constant keeps the
+    /// fail-closed direction it was chosen for: a deployment that sets an
+    /// address and nothing else starts nothing and says `hosted_cap_reached`,
+    /// which names the remaining decision.
+    pub per_tenant: usize,
+    /// `MCP_BRIDGE_IMAGE` — the runner image. Defaults to
+    /// [`DEFAULT_IMAGE`](crate::bridge::DEFAULT_IMAGE).
+    pub image: String,
+}
+
+impl Hosting {
+    /// The addresses [`accept`](agentos_app::hosted::accept) admits: exactly
+    /// [`Hosting::bind`], as its own single-address prefix.
+    ///
+    /// Derived rather than configured, and that is the point. The network and
+    /// the publish address used to be two variables, and two settings that must
+    /// agree are one setting somebody eventually gets wrong — in the direction
+    /// where the network is wider than what the runtime can produce, which is
+    /// the direction that admits an address we did not mint.
+    pub fn network(&self) -> BridgeNetwork {
+        let bits = if self.bind.is_ipv4() { 32 } else { 128 };
+        BridgeNetwork::parse(&format!("{}/{bits}", self.bind))
+            .expect("a single address is the network address of its own longest prefix")
+    }
 }
 
 /// One provider callback endpoint.
@@ -323,6 +382,10 @@ impl fmt::Debug for Config {
             // the client id, which is not a secret, and certainly not the one
             // beside it.
             .field("oauth_clients", &self.oauth_clients)
+            // Nothing secret in it, and the whole of it is worth printing: this
+            // is the field that decides whether this deployment runs anybody
+            // else's code at all.
+            .field("hosting", &self.hosting)
             .finish()
     }
 }
@@ -481,6 +544,33 @@ impl Config {
             });
         }
 
+        // Hosting is off unless an address says otherwise, and the other two
+        // variables are read only inside that branch: a deployment that sets a
+        // cap and no address has configured nothing, and reading its number
+        // would give it something to look at that changes no behaviour.
+        let hosting = match get("MCP_BRIDGE_BIND") {
+            None => None,
+            Some(raw) => {
+                let bind = raw.parse::<IpAddr>().map_err(|err| ConfigError::Invalid {
+                    var: "MCP_BRIDGE_BIND",
+                    detail: format!("{raw:?} is not an IP address ({err})"),
+                })?;
+                let per_tenant = match get("MCP_BRIDGES_PER_TENANT") {
+                    None => BRIDGES_PER_TENANT,
+                    Some(raw) => raw.parse::<usize>().map_err(|err| ConfigError::Invalid {
+                        var: "MCP_BRIDGES_PER_TENANT",
+                        detail: format!("{raw:?} is not a count ({err})"),
+                    })?,
+                };
+                Some(Hosting {
+                    bind,
+                    per_tenant,
+                    image: get("MCP_BRIDGE_IMAGE")
+                        .unwrap_or_else(|| crate::bridge::DEFAULT_IMAGE.to_owned()),
+                })
+            }
+        };
+
         Ok(Self {
             bind,
             public_host,
@@ -497,6 +587,7 @@ impl Config {
             credentials,
             webhooks,
             oauth_clients,
+            hosting,
         })
     }
 
@@ -703,6 +794,74 @@ mod tests {
 
     fn parse(env: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
         Config::parse(|var| env.get(var).cloned())
+    }
+
+    /// Hosting is off unless an address turns it on, and on with a cap of zero
+    /// unless a second variable answers the question written on
+    /// `BRIDGES_PER_TENANT`. Both halves of the safety switch, in one test,
+    /// because the dangerous edit is the one that keeps half of it.
+    #[test]
+    fn hosting_is_off_until_an_address_and_a_cap_say_otherwise() {
+        let mut env = complete();
+        assert!(parse(&env).expect("parse").hosting.is_none());
+
+        env.insert("MCP_BRIDGE_BIND", "127.0.0.1".to_owned());
+        let hosting = parse(&env).expect("parse").hosting.expect("hosting");
+        assert_eq!(hosting.per_tenant, BRIDGES_PER_TENANT);
+        assert_eq!(hosting.per_tenant, 0, "the default still starts nothing");
+        assert_eq!(hosting.image, crate::bridge::DEFAULT_IMAGE);
+
+        env.insert("MCP_BRIDGES_PER_TENANT", "2".to_owned());
+        assert_eq!(
+            parse(&env)
+                .expect("parse")
+                .hosting
+                .expect("hosting")
+                .per_tenant,
+            2
+        );
+
+        env.insert("MCP_BRIDGE_BIND", "not-an-address".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::Invalid {
+                var: "MCP_BRIDGE_BIND",
+                ..
+            })
+        ));
+    }
+
+    /// The network `accept` is given admits the address the runtime publishes
+    /// on, and **nothing else** — the whole reason it is derived rather than
+    /// configured. A `/32` that came out one bit short would admit a
+    /// neighbour's container.
+    #[test]
+    fn the_admitted_network_is_exactly_the_bind_address() {
+        for (bind, neighbour) in [
+            ("127.0.0.1", "127.0.0.2"),
+            ("10.42.0.1", "10.42.0.2"),
+            ("fd00::1", "fd00::2"),
+        ] {
+            let bind: IpAddr = bind.parse().expect("addr");
+            let neighbour: IpAddr = neighbour.parse().expect("addr");
+            let hosting = Hosting {
+                bind,
+                per_tenant: 1,
+                image: String::new(),
+            };
+            let network = hosting.network();
+            // Built the way `crate::bridge` builds it, through `SocketAddr`, so
+            // an IPv6 literal is bracketed here exactly as it is there.
+            let url = |ip| format!("http://{}/mcp", std::net::SocketAddr::new(ip, 8000));
+            assert!(
+                agentos_app::hosted::accept(&url(bind), &network).is_ok(),
+                "{bind} is the address we publish on and must be admitted"
+            );
+            assert!(
+                agentos_app::hosted::accept(&url(neighbour), &network).is_err(),
+                "{neighbour} is not ours and must not be admitted"
+            );
+        }
     }
 
     #[test]

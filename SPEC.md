@@ -829,6 +829,46 @@ employee to fit the key would put a UUID naming nobody into an AAD forever.
 and `0043_mcp_hosted.sql` the hosted-package arm. **That is three MCP tables,
 not the two counted above**; the two above are what `0013` created.
 
+### Hosted servers — the runtime, and the one variable that turns it on
+
+`crates/app/src/hosted.rs` is the contract and says no implementation belongs in
+`crates/app`. `apps/server/src/bridge.rs` is the implementation: a
+`BridgeRuntime` over the `docker` command, one container per `(tenant, server)`,
+leased rather than stopped and reaped after `bridge::IDLE` (20 minutes). It
+publishes a port — `-p <bind>:0:8000` — rather than routing to a container
+address, because a container's own address is unreachable from the host on
+macOS; the isolation the module argues for is the container, not the route.
+
+Three variables, and hosting is **off** without the first:
+
+| Variable | Meaning |
+|---|---|
+| `MCP_BRIDGE_BIND` | the address bridges publish on. Unset means no `Bridges` at all and every hosted binding refuses with `hosting_unavailable` |
+| `MCP_BRIDGES_PER_TENANT` | the cap. Defaults to `hosted::BRIDGES_PER_TENANT`, which is **zero** |
+| `MCP_BRIDGE_IMAGE` | the runner image. Defaults to `node:22-alpine`, which runs `supergateway` over the pinned stdio package |
+
+The network `accept` admits is **derived** from the bind address as its own
+`/32` (or `/128`) rather than configured, so the set of endpoints admitted is
+exactly the set the runtime can produce. Two settings that must agree are one
+setting somebody eventually gets wrong.
+
+`POST /v1/mcp/connect` accepts a hosted connector: it starts the bridge, lists
+its tools and writes a row with a **NULL url**, under
+`pg_advisory_xact_lock(hashtextextended($tenant, 0))` with a recount against the
+cap, answering **409 `hosted_cap_reached`** past it. Reconnecting an existing
+handle does not count itself, so the last slot stays rotatable.
+
+**NOT BUILT: retirement is not counted against the cap.** `DELETE` refunds a
+slot at once while the container behind it lives until the idle TTL, so a tenant
+cycling handles holds up to `cap × (IDLE ÷ REFRESH)` containers — the multiplier
+`BRIDGES_PER_TENANT`'s own arithmetic already tells an operator to divide by.
+Narrowing it needs a `retired_at` no migration has written.
+
+**Untested against a real daemon in this workspace** — Docker was not running
+when it was written. The parsing and the address derivation have unit tests
+(`bridge::tests`, `config::tests`); the `docker` verbs and the runner command
+line have not been executed once.
+
 **NOT BUILT:** persisting resources and prompts — only tools are listed and
 stored, and there is no `list_resources` or `list_prompts` call anywhere in the
 workspace — and protocol negotiation beyond what the SDK does internally.
@@ -1970,6 +2010,43 @@ default — never acts on its own.
 
 `GET`/`PUT /v1/employees/{id}/initiative` reads and sets the cadence.
 
+### The manager's turn
+
+`managing` is the eighth role (`migrations/0074_charter_role_managing.sql`,
+`rolepack_service::RolePack::managing`) and the only one whose work is other
+employees'. It is the narrowest pack in the workspace: one `ActionKind`,
+`InternalSend`, which the tool catalogue offers as `message_colleague`,
+`brief_direct_reports`, `add_work_item` and `update_work_item`. No `EmailSend`,
+no `McpCall`, no browser — a manager's leverage is its reports.
+
+Its objective is `Seats`: a **mission**, which is a gap, and a table of
+`slug → role`, which deliberately is not — a manager that fills no seat
+automatically is a legitimate and safer answer.
+
+`loops::initiative::managing_step` runs before the model call and does two
+things:
+
+1. **Fills vacant seats.** For a report with *no charter at all* whose slug the
+   objective names, it calls `vertical::delegate` with `Charter::vacant(role)` —
+   an objective that is all gaps. Nothing invents what the seat is for: the
+   report's next turn reads the charter, finds `Stage::Clarify`, and asks. A
+   report that already has a charter is never touched, whatever the table says.
+2. **Shows the manager its team.** One row per active report: role, open
+   questions, when it last acted and with what outcome. It goes on the *brief*
+   and not through `Untrusted` — every field is something this system wrote
+   about its own seats.
+
+`Charter::vacant` covers six of the eight roles. Purchasing and sales are
+excluded because each has a field with no empty value — `what`/`quantity`
+describe a thing being bought, and a `Segment` is a closed enum with no unset
+variant, so a vacant one would have to pick a segment and `gaps()` would not
+report it. Those two seats are chartered by whoever knows what is being bought
+or sold.
+
+**This is the first and only production caller of `vertical::delegate`.** Before
+it, the function was written, gated and tested, and called by nothing outside
+its own tests.
+
 ---
 
 ## 25. The two verticals
@@ -2321,6 +2398,19 @@ sections, the tightening-only role slot), the **initiative loop** with its
 per-day turn budget, **`crates/eval`**, and the **five internal tools** — the
 work board, the calendar, the founder's desk, invoicing and the file store, each
 a port first and a table second (`docs/RUNNING.md`).
+
+Two things that were written and unreachable are now wired, which is a different
+kind of entry from either column above — no new capability, one call site each:
+
+- **Hosted MCP** (§11). `crates/app/src/hosted.rs` had the contract, the cap,
+  the SSRF check and the migration; what it had was `bridges: None` at the one
+  production call site and no runtime. `apps/server/src/bridge.rs` is the
+  runtime and `MCP_BRIDGE_BIND` is the switch. Never run against a live Docker
+  daemon — see §11.
+- **The manager's seat** (§24). `vertical::delegate` had the gate, the audit row
+  and the "one link, not a walk" argument; it had no caller outside its tests,
+  because every one of the seven roles was an individual contributor. The eighth
+  role is the caller.
 
 `store::policy::load` was the entry that stood here longest and it has landed:
 the gate intersects four layers out of Postgres on every decision, so every team
