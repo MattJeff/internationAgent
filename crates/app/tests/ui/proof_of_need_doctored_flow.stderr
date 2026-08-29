@@ -1,0 +1,11 @@
+error[E0616]: field `panel` of struct `Flow` is private
+  --> tests/ui/proof_of_need_doctored_flow.rs:18:13
+   |
+18 |     guessed.panel = "body".to_owned();
+   |             ^^^^^ private field
+
+error[E0616]: field `submit` of struct `Flow` is private
+  --> tests/ui/proof_of_need_doctored_flow.rs:19:13
+   |
+19 |     guessed.submit = Some("#book-now".to_owned());
+   |             ^^^^^^ private field

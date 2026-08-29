@@ -1,7 +1,39 @@
 error: cannot construct `agentos_app::proof_of_need::Evidence` with struct literal syntax due to private fields
-  --> tests/ui/vertical_forged_evidence.rs:16:20
+  --> tests/ui/vertical_forged_evidence.rs:17:20
    |
-16 |     let evidence = Evidence {
-   |                    ^^^^^^^^
+17 |       let evidence = Evidence {
+   |                      ^^^^^^^^
+18 |           prospect: "Airline Example".to_owned(),
+   |           -------------------------------------- private field
+19 |           domain: Domain::parse("book.airline.example").unwrap(),
+   |           ------------------------------------------------------ private field
+20 |           entry: Url::parse("https://book.airline.example/entry").unwrap(),
+   |           ---------------------------------------------------------------- private field
+21 | /         probe: Probe {
+22 | |             passport: CountryCode::parse("FR").unwrap(),
+23 | |             destination: CountryCode::parse("VN").unwrap(),
+24 | |             travel_date: NaiveDate::from_ymd_opt(2026, 8, 24).unwrap(),
+25 | |         },
+   | |_________- private field
+26 |           finding: Finding::SaysNothing,
+   |           ----------------------------- private field
+27 |           observed: Untrusted::new(String::new()),
+   |           --------------------------------------- private field
+28 | /         authority: Some(Answer {
+29 | |             requirement: Claim::VisaRequired,
+30 | |             stay_days: None,
+31 | |             source: "made up".to_owned(),
+32 | |             retrieved_at: Utc::now(),
+33 | |             effective_from: None,
+34 | |         }),
+   | |__________- private field
+35 |           rule_age: RuleAge::Unknown,
+   |           -------------------------- private field
+36 |           observed_at: Utc::now(),
+   |           ----------------------- private field
+37 |           steps: Vec::new(),
+   |           ----------------- private field
+38 |           screenshot: Vec::new(),
+   |           ---------------------- private field
    |
-   = note: ...and other private field `_observed` that was not provided
+   = note: ...and other private fields `fee` and `_observed` that were not provided

@@ -1176,6 +1176,9 @@ struct Material {
     /// The answers, each with the address that sent it. Owned, because
     /// [`Quote::live_at`] borrows the domain quote it proves live.
     quotes: Vec<(buying::Quote, EmailAddress)>,
+    /// The answers that are in no comparison, one entry each. See
+    /// [`Uncompared`]; [`Material::comparable`] adds the third kind.
+    uncompared: Vec<Uncompared>,
     /// Units the round is priced for.
     quantity: u64,
     /// The buyer's own costs on this lane.
@@ -1210,7 +1213,7 @@ impl Material {
     ) -> Result<Self, sourcing_store::SourcingError> {
         let open = sourcing_store::open_rfq(tx, employee_id).await?;
 
-        let (candidates, unreachable, quotes) = match &open {
+        let (candidates, unreachable, quotes, uncompared) = match &open {
             None => {
                 // `None` for the country: `find_suppliers` filters on the
                 // *supplier's* country and a buying objective states only where
@@ -1218,9 +1221,17 @@ impl Material {
                 // the delivery country would be a domestic buyer.
                 let found = sourcing_store::find_suppliers(tx, None, category(objective)).await?;
                 let reached = sourcing::recipients(tx, &found).await?;
-                (reached.candidates, reached.unreachable, Vec::new())
+                (
+                    reached.candidates,
+                    reached.unreachable,
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
-            Some(open) => (Vec::new(), Vec::new(), answers(tx, open, now).await?),
+            Some(open) => {
+                let (quotes, uncompared) = answers(tx, open, now).await?;
+                (Vec::new(), Vec::new(), quotes, uncompared)
+            }
         };
 
         Ok(Self {
@@ -1234,6 +1245,7 @@ impl Material {
             candidates,
             unreachable,
             quotes,
+            uncompared,
             lane: Lane::new(currency),
             fx: Fx::new(currency),
         })
@@ -1244,24 +1256,25 @@ impl Material {
     /// Borrows `self`, which is why it is not a field: `Quote<'a>` holds the
     /// domain quote rather than copying the price out of it, so the owned
     /// `Vec` and the borrowed one cannot live in the same struct.
-    fn comparable(&self, now: DateTime<Utc>) -> Vec<Quote<'_>> {
-        self.quotes
-            .iter()
-            .filter_map(|(quote, from)| {
-                match Quote::live_at(quote, from.clone(), self.quantity, now) {
-                    Ok(live) => Some(live),
-                    // `live_quotes` already applied the same window in SQL, so
-                    // the two checks disagreeing means the row is corrupt —
-                    // `received_at` after `valid_until`. Dropped and named
-                    // rather than ranked: a price nobody was standing behind is
-                    // not a quote.
-                    Err(err) => {
-                        tracing::warn!(error = %err, "a stored quote is not a live price");
-                        None
-                    }
+    fn comparable(&self, now: DateTime<Utc>) -> (Vec<Quote<'_>>, Vec<Uncompared>) {
+        let mut live = Vec::with_capacity(self.quotes.len());
+        let mut dropped = Vec::new();
+        for (quote, from) in &self.quotes {
+            match Quote::live_at(quote, from.clone(), self.quantity, now) {
+                Ok(standing) => live.push(standing),
+                // `live_quotes` already applied the same window in SQL, so the
+                // two checks disagreeing means the row is corrupt —
+                // `received_at` after `valid_until`. Dropped and named rather
+                // than ranked: a price nobody was standing behind is not a
+                // quote. Counted as well as logged, because the note is where
+                // the employee finds out the round is short.
+                Err(err) => {
+                    tracing::warn!(error = %err, "a stored quote is not a live price");
+                    dropped.push(Uncompared::NotLive);
                 }
-            })
-            .collect()
+            }
+        }
+        (live, dropped)
     }
 }
 
@@ -1286,14 +1299,15 @@ async fn answers(
     tx: &mut TenantTx<'_>,
     open: &OpenRfq,
     now: DateTime<Utc>,
-) -> Result<Vec<(buying::Quote, EmailAddress)>, sourcing_store::SourcingError> {
+) -> Result<(Vec<(buying::Quote, EmailAddress)>, Vec<Uncompared>), sourcing_store::SourcingError> {
     let live = sourcing_store::live_quotes(tx, open.id, now).await?;
     let ids: Vec<Uuid> = live.iter().map(|quote| quote.supplier_id).collect();
     let contacts = sourcing_store::supplier_contacts(tx, &ids).await?;
     // What the RFQ asked for. A supplier who named no term was answering on it.
     let dictated = open.incoterm.as_deref().and_then(incoterm);
 
-    Ok(live
+    let mut uncompared = Vec::new();
+    let comparable = live
         .into_iter()
         .filter_map(|quote| {
             // Ordered primary-first by the query. Suppression is not consulted:
@@ -1308,6 +1322,7 @@ async fn answers(
                     supplier_id = %quote.supplier_id,
                     "a quote came from a supplier with no readable contact and cannot be ranked"
                 );
+                uncompared.push(Uncompared::NoContact);
                 return None;
             };
             let Some(term) = quote.incoterm.as_deref().and_then(incoterm).or(dictated) else {
@@ -1316,6 +1331,7 @@ async fn answers(
                     "a quote names no Incoterm and its RFQ dictated none; there is no honest \
                      landed cost for it"
                 );
+                uncompared.push(Uncompared::NoIncoterm);
                 return None;
             };
 
@@ -1342,7 +1358,8 @@ async fn answers(
                 from,
             ))
         })
-        .collect())
+        .collect();
+    Ok((comparable, uncompared))
 }
 
 /// One of the eleven terms, or nothing. The column is CHECKed against this same
@@ -1376,6 +1393,48 @@ impl RoundError {
     }
 }
 
+/// Why a quote that is on the open round is in no comparison.
+///
+/// The quote side of [`Unreached`], and it exists for the same reason:
+/// [`crate::sourcing::rank`] refuses the whole comparison rather than lose a
+/// line to a missing exchange rate, because *a ranking missing a line looks
+/// exactly like a ranking*. Three rows never reach `rank` at all — they are
+/// dropped between the store and [`Quote::live_at`] — and until this type
+/// existed they left a `tracing::warn!` and nothing an employee or an operator
+/// could see.
+///
+/// The sharp case is not a short table. It is an **empty** one: `due` reads
+/// `Negotiate` from `!quotes.is_empty()`, so a round whose every answer was
+/// dropped here falls through to `Discover` and the employee is told to go
+/// looking for suppliers who have in fact already replied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uncompared {
+    /// The supplier that sent it has no active contact with a readable address.
+    /// Everything downstream is keyed by [`EmailAddress`], so there is nothing
+    /// to rank it under. A data gap, and the same one
+    /// [`Unreachable::NoContact`](crate::sourcing::Unreachable) names on the way
+    /// out.
+    NoContact,
+    /// It names no Incoterm and its RFQ dictated none, so there is no honest
+    /// landed cost for it — see [`crate::sourcing::landed_cost`].
+    NoIncoterm,
+    /// The stored row is not a price at `now`. The SQL window and
+    /// [`agentos_domain::sourcing::Quote::live_at`] disagree, which means
+    /// `received_at` is after `valid_until` and the row is corrupt.
+    NotLive,
+}
+
+impl Uncompared {
+    /// Stable, low-cardinality metric label.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Uncompared::NoContact => "no_contact",
+            Uncompared::NoIncoterm => "no_incoterm",
+            Uncompared::NotLive => "not_live",
+        }
+    }
+}
+
 /// One purchasing turn's vertical half: what the code did, and who it could not
 /// reach.
 #[derive(Debug)]
@@ -1389,6 +1448,12 @@ pub struct Ran {
     /// this is exactly what [`crate::sourcing::Recipients`] has two vectors to
     /// prevent.
     pub unreachable: Vec<Unreached>,
+    /// Quotes on the open round that are in no comparison, and why.
+    ///
+    /// Also not an error: the turn still runs on whatever is comparable. It is
+    /// on [`Ran`] and not on [`Bought::Compared`] because the case it exists for
+    /// is the one where there *is* no `Compared` — see [`Uncompared`].
+    pub uncompared: Vec<Uncompared>,
     /// The chase list, already rendered — one line per counterparty this
     /// employee is waiting on, and whether the wait is long **for them**.
     ///
@@ -1500,6 +1565,29 @@ impl Ran {
             ));
         }
 
+        // The other end of the same rule. Above it is suppliers who never got
+        // the letter; here it is answers to a letter that did go out, which are
+        // in no comparison. Said rather than dropped for the reason `rank`
+        // refuses a round it cannot convert: a comparison missing a line reads
+        // exactly like a comparison, and an *empty* one reads exactly like
+        // nobody having replied.
+        if !self.uncompared.is_empty() {
+            let counts: Vec<String> = self
+                .uncompared
+                .iter()
+                .map(|why| why.code().to_owned())
+                .collect();
+            note.push_str(&format!(
+                "\n\n{} quote(s) came back on this round and are in **none** of the comparison \
+                 above ({}). Whatever is ordered above is not the whole round, and if nothing is \
+                 ordered above then suppliers have answered even though this turn has no \
+                 comparison to show you — do not treat that as silence and do not write to them \
+                 again over it. That is an operator's job, not yours — report it.",
+                self.uncompared.len(),
+                counts.join(", "),
+            ));
+        }
+
         // The psyche, and the only thing it decides. Every other branch above
         // tells the employee not to chase anybody who has not had time to
         // answer; this is the part that knows how much time that is, per
@@ -1582,6 +1670,7 @@ pub async fn purchasing_turn(
         return Ok(Ran {
             bought: Bought::Clarify(clarification(&pack.plan(objective))),
             unreachable: Vec::new(),
+            uncompared: Vec::new(),
             waiting: Vec::new(),
         });
     };
@@ -1607,7 +1696,7 @@ pub async fn purchasing_turn(
     // Minted before the letter so the reference in a supplier's inbox is the
     // primary key of the row that will hold their answer.
     let reference = Uuid::now_v7();
-    let quotes = material.comparable(now);
+    let (quotes, not_live) = material.comparable(now);
     let round = Round {
         candidates: &material.candidates,
         quotes: &quotes,
@@ -1645,6 +1734,9 @@ pub async fn purchasing_turn(
     Ok(Ran {
         bought,
         unreachable: material.unreachable,
+        // Both ends of the drop: the rows `answers` could not key or price, and
+        // the ones whose own validity window refused them.
+        uncompared: material.uncompared.into_iter().chain(not_live).collect(),
         waiting,
     })
 }
@@ -1961,12 +2053,12 @@ impl Approach {
     /// `opt_out` is the plain way out that every approach carries — an
     /// operator's sentence, not a model's.
     pub fn new(evidence: &Evidence, opt_out: &str) -> Option<Self> {
-        if !evidence.finding.stands_on_their_page() {
+        if !evidence.finding().stands_on_their_page() {
             return None;
         }
 
         let steps: Vec<String> = evidence
-            .steps
+            .steps()
             .iter()
             .enumerate()
             .map(|(n, step)| format!("{}. {step}", n + 1))
@@ -1976,7 +2068,9 @@ impl Approach {
             message: crate::revenue::Outreach {
                 subject: format!(
                     "{}: what your entry-requirements step shows for {} → {}",
-                    evidence.prospect, evidence.probe.passport, evidence.probe.destination
+                    evidence.prospect(),
+                    evidence.probe().passport,
+                    evidence.probe().destination
                 ),
                 body: format!(
                     "{}\n\nHow to see it again:\n{}\n\n{opt_out}",
@@ -1984,7 +2078,7 @@ impl Approach {
                     steps.join("\n"),
                 ),
             },
-            known_good_at: evidence.observed_at,
+            known_good_at: evidence.observed_at(),
         })
     }
 
@@ -2260,7 +2354,7 @@ pub async fn sell(
     // database. Those go to a human.
     let Some(approach) = Approach::new(&evidence, opt_out) else {
         tracing::info!(
-            finding = evidence.finding.code(),
+            finding = evidence.finding().code(),
             "finding rests on our row rather than on their page; handing it to a human unsent"
         );
         return Ok(Sold::ForHuman(evidence));
@@ -2568,7 +2662,7 @@ impl Worked {
                  pair rather than on anything visible on their page, and a prospect rebuts that \
                  with a free source. No email was sent and none may be. {filed} Hand it to a human \
                  with the reproduction steps; that is the whole of what this finding is for.",
-                evidence.finding.code(),
+                evidence.finding().code(),
             ),
 
             Sold::Approached { evidence, outcome } => {
@@ -2592,7 +2686,7 @@ impl Worked {
                      built from the evidence rather than written, so a second version of it is a \
                      second claim about somebody else's product. What is yours is the conversation \
                      after this: the reply, the qualification, and the handoff.",
-                    evidence.finding.code(),
+                    evidence.finding().code(),
                 )
             }
         }
@@ -2664,7 +2758,7 @@ pub async fn selling_turn(
     prospect: &DueProspect,
     now: DateTime<Utc>,
 ) -> Result<Worked, SellError> {
-    let who = prospect.flow.prospect.clone();
+    let who = prospect.flow.prospect().to_owned();
 
     let Some(probe) = probe_for(objective, now) else {
         // Unreachable through the loop — an objective with no market is a plan
@@ -3352,11 +3446,11 @@ async fn file_finding(
     evidence: &Evidence,
 ) -> Option<Uuid> {
     let id = Uuid::now_v7();
-    let steps = evidence.steps.join("\n");
+    let steps = evidence.steps().join("\n");
     // `observed_claim` is NOT NULL and non-empty, and a `SaysNothing` finding is
     // frequently about a panel that really did contain nothing. Ours, in that
     // one case, and it says which it is.
-    let observed = evidence.observed.expose_for_parsing().trim();
+    let observed = evidence.observed().expose_for_parsing().trim();
     let observed = if observed.is_empty() {
         "(their panel displayed nothing for this pair)"
     } else {
@@ -3366,7 +3460,7 @@ async fn file_finding(
     // nowhere else for it: `authority_url` has a CHECK for `^https?://` and
     // `Answer::source` is a tool handle, not a page. It is
     // `crate::orizn::SOURCE`, which is ours by construction.
-    let correct = evidence.authority.as_ref().map_or_else(
+    let correct = evidence.authority().map_or_else(
         || {
             "not established, and not needed: this finding stands on the prospect's own page"
                 .to_owned()
@@ -3392,11 +3486,11 @@ async fn file_finding(
         &revenue_store::NewEvidence {
             account_id: prospect.account_id,
             employee_id: Some(principal.employee_id),
-            kind: evidence_kind(&evidence.finding),
-            passport_country: evidence.probe.passport.as_str(),
-            destination_country: evidence.probe.destination.as_str(),
-            travel_date: Some(evidence.probe.travel_date),
-            source_url: evidence.entry.as_str(),
+            kind: evidence_kind(evidence.finding()),
+            passport_country: evidence.probe().passport.as_str(),
+            destination_country: evidence.probe().destination.as_str(),
+            travel_date: Some(evidence.probe().travel_date),
+            source_url: evidence.entry().as_str(),
             reproduction: &steps,
             // ponytail: the screenshot is on the `Evidence` and there is no
             // object store to put it in, so the column stays null and the row
@@ -3406,7 +3500,7 @@ async fn file_finding(
             observed_claim: observed,
             correct_claim: &correct,
             authority_url: None,
-            checked_at: evidence.observed_at,
+            checked_at: evidence.observed_at(),
             opener_subject: opener.as_ref().map(|a| a.message().subject.as_str()),
             opener_body: opener.as_ref().map(|a| a.message().body.as_str()),
         },
@@ -3429,7 +3523,7 @@ async fn file_finding(
         Err(err) => {
             tracing::error!(
                 error = %err,
-                finding = evidence.finding.code(),
+                finding = evidence.finding().code(),
                 "the finding was not filed; it is in this turn's note and nowhere else"
             );
             None
@@ -5214,6 +5308,106 @@ mod tests {
         );
     }
 
+    /// The answer side of the same rule, and the one the store's own docs
+    /// already claimed: `supplier_contacts` says a supplier whose every contact
+    /// is deactivated "comes back with no rows at all, which the caller reports
+    /// rather than skips". Two callers read that query. `recipients` reported.
+    /// `answers` dropped the quote with a `tracing::warn!` and nothing else, so
+    /// the comparison the employee was shown was short by a supplier who had in
+    /// fact answered — and `sourcing::rank` refuses a whole round rather than
+    /// lose a line for exactly that reason.
+    ///
+    /// Both halves, because the second is the dangerous one: `due` reads
+    /// `Negotiate` off `!quotes.is_empty()`, so when the *last* comparable quote
+    /// goes the turn falls through to `Discover` and the employee is told to go
+    /// find suppliers who have already replied to it.
+    #[tokio::test]
+    async fn a_quote_that_cannot_be_ranked_is_counted_rather_than_dropped() {
+        let Some(db) = db().await else { return };
+        let pack = rolepack::RolePack::international_buyer();
+        let (principal, buyer, email) = buying_desk(&db, pack.limits().clone()).await;
+        let objective = buying_objective_value();
+        let seeded = seed_suppliers(&db, &principal, category(&objective)).await;
+        let now = Utc::now();
+
+        purchasing_turn(&db, &buyer, &principal, &pack, &objective, now)
+            .await
+            .expect("the round was readable");
+        let open = open_round(&db, &principal)
+            .await
+            .expect("the round is open");
+
+        // Both suppliers answer.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        for ((supplier, _), unit) in seeded.iter().zip([300u64, 450]) {
+            sourcing_store::insert_quote(
+                &mut tx,
+                Uuid::now_v7(),
+                &sourcing_store::NewQuote {
+                    rfq_id: open.id,
+                    supplier_id: *supplier,
+                    unit_price: Money::new(unit, Currency::Usd).expect("non-zero"),
+                    quantity: 5_000,
+                    freight: None,
+                    duties: None,
+                    other_fees: None,
+                    lead_time_days: Some(20),
+                    incoterm: Some("DDP"),
+                    valid_until: now + TimeDelta::days(30),
+                },
+            )
+            .await
+            .expect("quote");
+        }
+        tx.commit().await.expect("commit quotes");
+
+        /// Retire everybody at one supplier — the person left, the row is
+        /// stale. `supplier_contacts` filters on `active` in its `WHERE`.
+        async fn retire(db: &Db, principal: &Principal, supplier: Uuid) {
+            let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+            sqlx::query("UPDATE supplier_contacts SET active = false WHERE supplier_id = $1")
+                .bind(supplier)
+                .execute(&mut **tx)
+                .await
+                .expect("deactivate");
+            tx.commit().await.expect("commit");
+        }
+
+        let later = now + TimeDelta::days(3);
+        retire(&db, &principal, seeded[1].0).await;
+
+        let short = purchasing_turn(&db, &buyer, &principal, &pack, &objective, later)
+            .await
+            .expect("the round was readable");
+        let Bought::Compared { landed, .. } = &short.bought else {
+            panic!("one quote is still comparable: {short:?}");
+        };
+        assert_eq!(landed.len(), 1, "the ranking is short a supplier");
+        assert_eq!(short.uncompared, vec![Uncompared::NoContact]);
+        let note = short.note();
+        assert!(
+            note.contains("1 quote(s) came back on this round") && note.contains("no_contact"),
+            "a ranking missing a line was presented as the comparison: {note}"
+        );
+
+        // And the half that reads as silence. Nothing was written to anybody on
+        // either turn: comparing is not contacting.
+        retire(&db, &principal, seeded[0].0).await;
+        let silent = purchasing_turn(&db, &buyer, &principal, &pack, &objective, later)
+            .await
+            .expect("the round was readable");
+        assert!(
+            matches!(silent.bought, Bought::Model(rolepack::Stage::Discover)),
+            "{silent:?}"
+        );
+        let note = silent.note();
+        assert!(
+            note.contains("2 quote(s) came back on this round"),
+            "a round whose every answer was dropped read as nobody having replied: {note}"
+        );
+        assert_eq!(email.sent_count(), 2, "a comparison turn wrote to somebody");
+    }
+
     // -- closing a round ---------------------------------------------------
 
     /// `(quotes_returned, quotes_missed)` for one supplier, out of the view the
@@ -5553,7 +5747,7 @@ mod tests {
         let principal = seed(db).await;
         let email = Arc::new(MockEmailProvider::new());
         let browser = Arc::new(MockBrowser::new());
-        browser.set_text(&flow().panel, panel);
+        browser.set_text(flow().panel(), panel);
         let ports = Arc::new(Ports {
             email: email.clone(),
             browser,
@@ -5675,7 +5869,7 @@ mod tests {
         assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
         assert_eq!(desk.email.sent_count(), 1);
         assert_eq!(sequence.touches().len(), 1);
-        assert_eq!(evidence.finding, Finding::Conflates);
+        assert_eq!(*evidence.finding(), Finding::Conflates);
 
         // Each lookup happened once, in the alpha-3 spelling the real server
         // demands — `CountryCode` is alpha-2 and both tools reject it. Two
@@ -5691,8 +5885,8 @@ mod tests {
             vec![json!({ "passport": "FRA", "destination": "VNM" })],
             "the fee tool was not asked, or was asked in alpha-2"
         );
-        assert_eq!(evidence.fee, None, "an unpriced surface produced a fee");
-        let authority = evidence.authority.as_ref().expect("the lookup succeeded");
+        assert_eq!(evidence.fee(), None, "an unpriced surface produced a fee");
+        let authority = evidence.authority().expect("the lookup succeeded");
         assert_eq!(authority.requirement, Claim::VisaRequired);
         assert_eq!(authority.source, crate::orizn::SOURCE);
 
@@ -5720,7 +5914,7 @@ mod tests {
         // difference between the two visible at the type level — reading it
         // takes `expose_for_parsing`, which greps.
         assert!(
-            evidence.observed.expose_for_parsing().contains(INJECTION),
+            evidence.observed().expose_for_parsing().contains(INJECTION),
             "the panel text was not preserved as evidence"
         );
 
@@ -5804,14 +5998,11 @@ mod tests {
         };
         assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
         // Exactly one. One finding, one touch, one message.
-        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert_eq!(*evidence.finding(), Finding::UnattributedFee);
         assert_eq!(desk.email.sent_count(), 1);
         assert_eq!(sequence.touches().len(), 1);
 
-        let fee = evidence
-            .fee
-            .as_ref()
-            .expect("the schedule priced this pair");
+        let fee = evidence.fee().expect("the schedule priced this pair");
         assert_eq!(fee.amount(), 15_000);
         assert_eq!(fee.currency(), "JPY");
         assert_eq!(fee.as_of().to_string(), as_of);
@@ -5839,7 +6030,7 @@ mod tests {
             2,
             "a URL reached the mail: {body}"
         );
-        assert!(body.contains(flow().entry.as_str()), "{body}");
+        assert!(body.contains(flow().entry().as_str()), "{body}");
         assert!(!body.contains("mofa"), "{body}");
         assert!(!body.contains(INJECTION), "{body}");
         assert!(!body.contains("commercial"), "{body}");
@@ -5896,10 +6087,11 @@ mod tests {
         let Sold::Approached { evidence, .. } = sold else {
             panic!("the page finding was lost with the fee: {sold:?}");
         };
-        assert_eq!(evidence.finding, Finding::UnattributedFee);
+        assert_eq!(*evidence.finding(), Finding::UnattributedFee);
         assert_eq!(desk.email.sent_count(), 1, "the finding still goes out");
         assert_eq!(
-            evidence.fee, None,
+            evidence.fee(),
+            None,
             "an exempt traveller was billed the destination's consular fee"
         );
 
@@ -5966,15 +6158,15 @@ mod tests {
             panic!("a bare contradiction was not held back: {sold:?}");
         };
         assert_eq!(
-            evidence.finding,
+            *evidence.finding(),
             Finding::Contradicts {
                 shown: Claim::NoVisa,
                 correct: Claim::VisaRequired,
             }
         );
         // It is real evidence: reproduction steps, a screenshot, the source.
-        assert_eq!(evidence.steps.len(), 6);
-        assert!(!evidence.screenshot.is_empty());
+        assert_eq!(evidence.steps().len(), 6);
+        assert!(!evidence.screenshot().is_empty());
         assert!(evidence.claim_line().contains(crate::orizn::SOURCE));
 
         // And there is no way to turn it into a message.
@@ -6242,8 +6434,8 @@ mod tests {
         let Sold::Approached { evidence, outcome } = sold else {
             panic!("a page-only finding still needed our row: {sold:?}");
         };
-        assert_eq!(evidence.finding, Finding::Conflates);
-        assert_eq!(evidence.authority, None, "there was no row to carry");
+        assert_eq!(*evidence.finding(), Finding::Conflates);
+        assert_eq!(evidence.authority(), None, "there was no row to carry");
         assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
         assert_eq!(desk.email.sent_count(), 1);
     }
@@ -6454,6 +6646,7 @@ mod tests {
         let quiet = Ran {
             bought: Bought::Model(rolepack::Stage::Discover),
             unreachable: Vec::new(),
+            uncompared: Vec::new(),
             waiting: Vec::new(),
         };
         assert!(
@@ -6502,8 +6695,8 @@ mod tests {
             &mut tx,
             account,
             &revenue_store::NewAccount {
-                legal_name: &flow.prospect,
-                domain: flow.domain.as_str(),
+                legal_name: flow.prospect(),
+                domain: flow.domain().as_str(),
                 // `accounts.segment`'s own spelling for `Segment::Airline`; see
                 // `segment_column`.
                 segment: "airline",
@@ -6565,12 +6758,12 @@ mod tests {
         )
         .bind(principal.tenant_id.as_uuid())
         .bind(account)
-        .bind(flow.entry.as_str())
-        .bind(&flow.passport_field)
-        .bind(&flow.destination_field)
-        .bind(&flow.date_field)
-        .bind(&flow.submit)
-        .bind(&flow.panel)
+        .bind(flow.entry().as_str())
+        .bind(flow.passport_field())
+        .bind(flow.destination_field())
+        .bind(flow.date_field())
+        .bind(flow.submit())
+        .bind(flow.panel())
         .execute(&mut *tx)
         .await
         .expect("insert flow");
@@ -6676,13 +6869,13 @@ mod tests {
             panic!("a reproducible conflation should have been approached: {worked:?}");
         };
         assert!(matches!(outcome, Contacted::Sent { .. }), "{outcome:?}");
-        assert_eq!(evidence.finding, Finding::Conflates);
+        assert_eq!(*evidence.finding(), Finding::Conflates);
         assert_eq!(desk.email.sent_count(), 1);
 
         // The pair is the objective's market against `PROBE_DESTINATION`, and
         // it is on the evidence where a prospect can repeat it.
-        assert_eq!(evidence.probe.passport.as_str(), "FR");
-        assert_eq!(evidence.probe.destination.as_str(), PROBE_DESTINATION);
+        assert_eq!(evidence.probe().passport.as_str(), "FR");
+        assert_eq!(evidence.probe().destination.as_str(), PROBE_DESTINATION);
 
         // Filed, and the person is marked in the same turn.
         assert!(worked.filed.is_some(), "the finding was not filed");
@@ -6753,7 +6946,7 @@ mod tests {
             panic!("a bare contradiction was not held back: {worked:?}");
         };
         assert_eq!(
-            evidence.finding,
+            *evidence.finding(),
             Finding::Contradicts {
                 shown: Claim::NoVisa,
                 correct: Claim::VisaRequired,
