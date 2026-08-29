@@ -2831,6 +2831,7 @@ pub(crate) mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: crate::routes::mcp::Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -3047,6 +3048,7 @@ pub(crate) mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: crate::routes::mcp::Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -3890,6 +3892,7 @@ pub(crate) mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: crate::routes::mcp::Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4127,6 +4130,7 @@ pub(crate) mod tests {
             ports: Arc::new(agentos_app::mocks::ports()),
             // No binder loop here, so every tenant's fleet is empty and every
             // MCP call is refused by name.
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: crate::routes::mcp::Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4233,6 +4237,7 @@ pub(crate) mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: crate::routes::mcp::Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4490,6 +4495,7 @@ pub(crate) mod tests {
                 credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 gate: PolicyGate::new(db.clone()),
                 ports: Arc::new(ports),
+                embedder: agentos_app::knowledge::Embedder::default(),
                 // No binder loop, so the fleet is empty and the Orizn lookup is
                 // refused by name. See `PANEL`.
                 fleets: crate::routes::mcp::Fleets::new().0,

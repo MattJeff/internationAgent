@@ -119,21 +119,31 @@
 //! can steer within. It does not make anything in that set trusted, and there is
 //! still exactly one rendering path.
 //!
-//! # This build cannot rank by meaning, and what [`retrieve`] does about it
+//! # A deployment with no embedding credential cannot rank by meaning, and what
+//! [`retrieve`] does about it
 //!
 //! **Read this before believing an employee has memory.**
-//! [`agentos_providers::embedder::Embedder`] has one variant, `Mock`, it is the
-//! default, and it is a SHA-256 hash stretched to 1536 floats. Two vectors from
-//! it are as related as their digests, which is to say not at all: "damaged
-//! pallets" and "broken skids" are exactly as far apart as "damaged pallets" and
-//! "diesel". [`Embedder::is_semantic`] is that fact in the form a caller can
-//! branch on, and it is `false`.
+//! [`agentos_providers::embedder::Embedder`] defaults to `Mock`, which is a
+//! SHA-256 hash stretched to 1536 floats. Two vectors from it are as related as
+//! their digests, which is to say not at all: "damaged pallets" and "broken
+//! skids" are exactly as far apart as "damaged pallets" and "diesel".
+//! [`Embedder::is_semantic`] is that fact in the form a caller can branch on,
+//! and on that variant it is `false`.
 //!
-//! Everything else in this module is real and stays: the chunker, the scope
+//! Everything else in this module is real either way: the chunker, the scope
 //! predicate, the tenant isolation, the taint, the citation. The one thing that
-//! makes retrieval *retrieval* is not, and it will not be until somebody buys an
-//! embedder — a provider integration with a per-call cost, and on the CLI path
-//! this workspace now runs there is no embeddings endpoint at all.
+//! makes retrieval *retrieval* now has a second variant behind it —
+//! `EMBEDDER_API_KEY` selects `agentos_providers::embedder_openai`, on the
+//! customer's own key, and [`Embedder::is_semantic`] becomes `true` with it. The
+//! branch below is therefore not a permanent state of the world; it is what a
+//! deployment that has not bought an embedder gets, which is still every
+//! deployment in this repository's tests and every one on a laptop.
+//!
+//! **Turning it on does not re-embed what is already there.** A document
+//! ingested under the hash keeps `model = 'mock-sha256-1536'` and every search
+//! binds one model, so it simply stops being findable until it is ingested
+//! again. That is the deduplication rule in [`ingest`] working as written, and
+//! it is the alternative to silently comparing two incomparable vector spaces.
 //!
 //! So the question is what [`retrieve`] should return when it cannot rank by
 //! meaning, and there were four candidates:
@@ -247,6 +257,44 @@ pub const CHUNK_OVERLAP_CHARS: usize = 200;
 /// halfway through an ingest.
 const _: () = assert!(Embedder::DIM == EMBEDDING_DIM);
 
+/// **The model name the real adapter puts on the wire and the model name the
+/// partial index is built on are the same bytes.**
+///
+/// This is `migrations/0026_knowledge_index_model.sql`'s failure closed at
+/// compile time. That bug was two names for one thing in two places that could
+/// not see each other: the index predicate said `text-embedding-3-small`, every
+/// chunk said `mock-sha256-1536`, so the index served nothing in production and
+/// the test that EXPLAINed the vector leg passed on the only rows in the world
+/// that matched the predicate. The same gap is back by construction —
+/// `agentos-providers` (which sends the model to the vendor) and `agentos-store`
+/// (which owns the index) do not depend on each other, and this crate is the
+/// only one that sees both.
+///
+/// A `const` block rather than a test, for the same reason
+/// [`agentos_providers::RETRYABLE_CODES`] is one: a test that has to be run is a
+/// test somebody can skip, and the cost of the drift is invisible at run time.
+/// Byte by byte because `==` on `&str` is not const-stable; `as_bytes` and
+/// indexing are.
+const _: () = {
+    let wire = agentos_providers::embedder_openai::OpenAiEmbedder::MODEL.as_bytes();
+    let indexed = agentos_store::knowledge::OPENAI_EMBEDDING_MODEL.as_bytes();
+    assert!(
+        wire.len() == indexed.len(),
+        "the model the embedder sends and the model the HNSW index is partial on have \
+         different lengths — one of them is unindexed, which is 889 ms against 2.8 ms on \
+         every retrieval and nothing red anywhere"
+    );
+    let mut i = 0;
+    while i < wire.len() {
+        assert!(
+            wire[i] == indexed[i],
+            "the model the embedder sends and the model the HNSW index is partial on have \
+             drifted — see migrations/0026 for what that costs"
+        );
+        i += 1;
+    }
+};
+
 /// What the document is written in.
 ///
 /// `Deserialize` because an ingest route takes this from a request body, and a
@@ -338,16 +386,28 @@ pub enum KnowledgeError {
 /// Exhaustive on purpose: a new [`Embedder`] variant must not compile until
 /// someone decides whether its vectors live in the same space as an existing
 /// model's — and, since the arm has to name a model, whether that model has an
-/// index. There is exactly one today and it is
-/// [`DEFAULT_EMBEDDING_MODEL`](agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL),
-/// referenced rather than re-spelled: the store owns the partial HNSW index and
-/// therefore owns the name, and a second spelling here is precisely what let
-/// the index predicate and the stamped model drift apart until `0026`.
-pub const fn model_name(embedder: Embedder) -> &'static str {
+/// index. Both arms reference the store's constant rather than re-spelling it:
+/// the store owns the partial HNSW indexes and therefore owns the names, and a
+/// second spelling here is precisely what let the index predicate and the
+/// stamped model drift apart until `0026`.
+///
+/// The two names are two spaces and the difference is the point. A chunk
+/// embedded by the hash and a chunk embedded by the model are both
+/// `vector(1536)` rows in one table; only this column keeps a search from
+/// comparing them. Which is also why turning `EMBEDDER_API_KEY` on does not
+/// re-embed anything: the documents already on file keep the model they were
+/// ingested under and stop being found, until they are ingested again — see
+/// [`ingest`], where changing the embedder is deliberately not deduped.
+pub const fn model_name(embedder: &Embedder) -> &'static str {
     match embedder {
         // `mock-sha256-1536`, deliberately not a real vendor model name — see
         // the module docs.
         Embedder::Mock => agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL,
+        // `text-embedding-3-small`, which *is* a real vendor model name,
+        // because the vectors on those rows really are that model's. The
+        // `const` block above is what keeps this equal to the string the
+        // adapter sends.
+        Embedder::OpenAi(_) => agentos_store::knowledge::OPENAI_EMBEDDING_MODEL,
     }
 }
 
@@ -361,7 +421,7 @@ pub const fn model_name(embedder: Embedder) -> &'static str {
 /// the new one.
 pub async fn ingest(
     tx: &mut TenantTx<'_>,
-    embedder: Embedder,
+    embedder: &Embedder,
     doc: &Document<'_>,
 ) -> Result<Ingested, KnowledgeError> {
     let text = normalise(doc.text);
@@ -380,7 +440,7 @@ pub async fn ingest(
     }
 
     let texts = chunk(&text, doc.format);
-    let vectors = embedder.embed(&texts)?;
+    let vectors = embedder.embed(&texts).await?;
 
     let source_id = Uuid::now_v7();
     knowledge::insert_source(
@@ -438,12 +498,12 @@ pub async fn ingest(
 /// passes it.
 pub async fn retrieve(
     tx: &mut TenantTx<'_>,
-    embedder: Embedder,
+    embedder: &Embedder,
     question: &str,
     employee_id: Option<EmployeeId>,
     limit: i64,
 ) -> Result<Vec<Hit>, KnowledgeError> {
-    let Some(vector) = embedder.embed(&[question.to_owned()])?.pop() else {
+    let Some(vector) = embedder.embed(&[question.to_owned()]).await?.pop() else {
         return Ok(Vec::new());
     };
     let embedding = vector.into();
@@ -694,7 +754,7 @@ impl Recalled {
 ///    should still answer the customer.
 pub async fn recall(
     db: &Db,
-    embedder: Embedder,
+    embedder: &Embedder,
     tenant_id: TenantId,
     request: &Recall<'_>,
 ) -> Recalled {
@@ -1084,7 +1144,7 @@ mod tests {
     /// Ingest one document into a tenant and commit it.
     async fn stock(db: &Db, tenant: TenantId, text: &str) -> Ingested {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let ingested = ingest(&mut tx, Embedder::Mock, &document(text))
+        let ingested = ingest(&mut tx, &Embedder::Mock, &document(text))
             .await
             .expect("ingest");
         tx.commit().await.expect("commit");
@@ -1190,7 +1250,7 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let ingested = ingest(
             &mut tx,
-            Embedder::Mock,
+            &Embedder::Mock,
             &Document {
                 scope,
                 ..document(text)
@@ -1209,7 +1269,7 @@ mod tests {
     /// as "saw the wrong document" rather than "ranked it eleventh".
     async fn visible(db: &Db, tenant: TenantId, who: Option<EmployeeId>) -> Vec<String> {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", who, 100)
+        let hits = retrieve(&mut tx, &Embedder::Mock, "pallets", who, 100)
             .await
             .expect("retrieve");
         tx.rollback().await.expect("rollback");
@@ -1234,7 +1294,7 @@ mod tests {
     /// cost claim: bytes are what a turn pays for.
     async fn measure(db: &Db, tenant: TenantId, who: Option<EmployeeId>) -> (usize, usize, usize) {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", who, RECALL_LIMIT)
+        let hits = retrieve(&mut tx, &Embedder::Mock, "pallets", who, RECALL_LIMIT)
             .await
             .expect("retrieve");
         tx.rollback().await.expect("rollback");
@@ -1344,7 +1404,7 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
 
         let text = handbook();
-        let ingested = ingest(&mut tx, Embedder::Mock, &document(&text))
+        let ingested = ingest(&mut tx, &Embedder::Mock, &document(&text))
             .await
             .expect("ingest");
         assert!(ingested.chunks > 3, "fixture must need several chunks");
@@ -1354,7 +1414,7 @@ mod tests {
         // artefact: every chunk was eligible and one was returned.
         let hits = retrieve(
             &mut tx,
-            Embedder::Mock,
+            &Embedder::Mock,
             SKU,
             None,
             i64::try_from(ingested.chunks).expect("fits"),
@@ -1388,13 +1448,13 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
 
         let text = handbook();
-        let first = ingest(&mut tx, Embedder::Mock, &document(&text))
+        let first = ingest(&mut tx, &Embedder::Mock, &document(&text))
             .await
             .expect("first ingest");
 
         // Byte-identical but for the whitespace an exporter changes on a whim.
         let again = text.replace('\n', "\r\n") + "   \n\n";
-        let second = ingest(&mut tx, Embedder::Mock, &document(&again))
+        let second = ingest(&mut tx, &Embedder::Mock, &document(&again))
             .await
             .expect("second ingest");
         assert!(second.reused);
@@ -1410,7 +1470,7 @@ mod tests {
         // A *changed* document is not the same document, or dedupe would be
         // "never ingest anything twice", which is a different and useless rule.
         let edited = text.replace("fourteen day", "twenty one day");
-        let third = ingest(&mut tx, Embedder::Mock, &document(&edited))
+        let third = ingest(&mut tx, &Embedder::Mock, &document(&edited))
             .await
             .expect("third ingest");
         assert!(!third.reused);
@@ -1426,7 +1486,7 @@ mod tests {
         let tenant = create_tenant(&db).await;
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
 
-        let err = ingest(&mut tx, Embedder::Mock, &document("   \n\n\t\n"))
+        let err = ingest(&mut tx, &Embedder::Mock, &document("   \n\n\t\n"))
             .await
             .expect_err("nothing to ingest");
         assert!(matches!(err, KnowledgeError::Empty));
@@ -1446,16 +1506,50 @@ mod tests {
     /// first one passed, because the two names lived in two crates.
     #[test]
     fn the_mock_is_not_labelled_as_a_real_model_and_is_the_model_the_index_covers() {
-        assert_eq!(model_name(Embedder::Mock), "mock-sha256-1536");
+        assert_eq!(model_name(&Embedder::Mock), "mock-sha256-1536");
         for vendor in ["text-embedding-3-small", "text-embedding-3-large"] {
-            assert_ne!(model_name(Embedder::Mock), vendor);
+            assert_ne!(model_name(&Embedder::Mock), vendor);
         }
         assert_eq!(
-            model_name(Embedder::Mock),
+            model_name(&Embedder::Mock),
             agentos_store::knowledge::DEFAULT_EMBEDDING_MODEL,
             "the model chunks are stamped with and the model the index is \
              partial on must be one constant, not two that agree today"
         );
+    }
+
+    /// **The two embedders write two model names, and the real one writes the
+    /// name that is actually on the wire.**
+    ///
+    /// The first half is the whole of the `model` column's job: a hash vector
+    /// and a trained vector are both `vector(1536)` and share no geometry, so
+    /// one name for both would be the silent mixing 0004 wrote the column
+    /// against. The second half is 0026's drift, closed — the `const` block at
+    /// the top of this module proves the store's constant and the adapter's are
+    /// the same bytes, and this asserts that `model_name` actually returns it
+    /// rather than a third spelling.
+    #[test]
+    fn the_real_embedder_stamps_the_model_it_sends_and_it_is_not_the_mocks() {
+        use agentos_providers::embedder_openai::OpenAiEmbedder;
+
+        let real = Embedder::OpenAi(std::sync::Arc::new(OpenAiEmbedder::new(
+            agentos_providers::Secret::new("sk-not-a-real-key"),
+        )));
+
+        assert_eq!(model_name(&real), OpenAiEmbedder::MODEL);
+        assert_eq!(model_name(&real), "text-embedding-3-small");
+        assert_ne!(
+            model_name(&real),
+            model_name(&Embedder::Mock),
+            "two vector spaces sharing one model name is a search that compares \
+             a SHA-256 digest with a sentence embedding and reports a score"
+        );
+
+        // And the branch `retrieve` reads: only one of them claims to rank by
+        // meaning, which is what makes the credential a selection rather than a
+        // switch that quiets an alarm.
+        assert!(real.is_semantic());
+        assert!(!Embedder::Mock.is_semantic());
     }
 
     // -- recall ------------------------------------------------------------
@@ -1482,7 +1576,7 @@ mod tests {
         .await;
 
         let question = Untrusted::new(SKU.to_owned());
-        let recalled = recall(&db, Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+        let recalled = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
 
         assert!(!recalled.unavailable());
         assert!(!recalled.hits().is_empty(), "the fixture was not found");
@@ -1535,7 +1629,7 @@ mod tests {
         // into `unavailable` in one `match`.
         let recalled = recall(
             &db,
-            Embedder::Mock,
+            &Embedder::Mock,
             tenant,
             &Recall {
                 timeout: Duration::ZERO,
@@ -1565,7 +1659,7 @@ mod tests {
         let tenant = create_tenant(&db).await;
 
         let question = Untrusted::new(SKU.to_owned());
-        let recalled = recall(&db, Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+        let recalled = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
 
         assert!(!recalled.unavailable(), "an empty store is not a failure");
         assert!(recalled.hits().is_empty());
@@ -1626,7 +1720,7 @@ mod tests {
         //    below is a miss and not an empty tenant. One chunk out of forty-odd
         //    carries these words, and one is what comes back.
         let question = Untrusted::new("crushed skids".to_owned());
-        let found = recall(&db, Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+        let found = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
         assert!(!found.unavailable());
         assert_eq!(
             found.hits().len(),
@@ -1652,7 +1746,7 @@ mod tests {
         //    cannot see the connection, and the honest report of that is an
         //    empty hand.
         let question = Untrusted::new("what happens to damaged pallets".to_owned());
-        let missed = recall(&db, Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+        let missed = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
         assert!(
             missed.hits().is_empty(),
             "a question this build cannot rank came back with {} passages that answer \
@@ -1743,7 +1837,7 @@ mod tests {
         // Half 1 — the premise, which is the assertion of the test above: asked
         // in words the store does not use, recall comes back empty.
         let honest = Untrusted::new("what happens to damaged pallets".to_owned());
-        let missed = recall(&db, Embedder::Mock, tenant, &Recall::new(&honest, None)).await;
+        let missed = recall(&db, &Embedder::Mock, tenant, &Recall::new(&honest, None)).await;
         assert!(!missed.unavailable());
         assert!(missed.hits().is_empty(), "the premise moved");
 
@@ -1754,7 +1848,7 @@ mod tests {
              wanted to confirm the paperwork or crushed skids"
                 .to_owned(),
         );
-        let steered = recall(&db, Embedder::Mock, tenant, &Recall::new(&steered, None)).await;
+        let steered = recall(&db, &Embedder::Mock, tenant, &Recall::new(&steered, None)).await;
         assert!(
             !steered
                 .hits()
@@ -1770,7 +1864,7 @@ mod tests {
 
         // Half 2 — suppression. The word on its own retrieves the rule...
         let plain = Untrusted::new("invoice".to_owned());
-        let plain = recall(&db, Embedder::Mock, tenant, &Recall::new(&plain, None)).await;
+        let plain = recall(&db, &Embedder::Mock, tenant, &Recall::new(&plain, None)).await;
         assert!(
             plain
                 .hits()
@@ -1781,7 +1875,7 @@ mod tests {
 
         // ...and one hyphen must not be able to take it back out.
         let hidden = Untrusted::new("invoice -warehouse".to_owned());
-        let hidden = recall(&db, Embedder::Mock, tenant, &Recall::new(&hidden, None)).await;
+        let hidden = recall(&db, &Embedder::Mock, tenant, &Recall::new(&hidden, None)).await;
         assert!(
             hidden
                 .hits()
@@ -1820,7 +1914,8 @@ mod tests {
 
         for (tenant, mine, theirs) in [(alpha, "alpha", "beta"), (beta, "beta", "alpha")] {
             let question = Untrusted::new(SKU.to_owned());
-            let recalled = recall(&db, Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+            let recalled =
+                recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
 
             assert!(!recalled.unavailable());
             assert!(!recalled.hits().is_empty(), "{mine} recalled nothing");
@@ -1853,7 +1948,7 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let trusted = ingest(
             &mut tx,
-            Embedder::Mock,
+            &Embedder::Mock,
             &Document {
                 trust: TrustLabel::Trusted,
                 ..document(&text)
@@ -2016,7 +2111,7 @@ mod tests {
         // assertion: this stops compiling the day a scoped chunk comes back as
         // a bare String.
         let mut tx = db.tenant_tx(org.tenant).await.expect("tenant tx");
-        let hits = retrieve(&mut tx, Embedder::Mock, "pallets", Some(org.dev), 100)
+        let hits = retrieve(&mut tx, &Embedder::Mock, "pallets", Some(org.dev), 100)
             .await
             .expect("retrieve");
         tx.rollback().await.expect("rollback");

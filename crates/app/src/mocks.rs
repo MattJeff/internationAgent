@@ -52,6 +52,8 @@ use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
 use agentos_providers::email_resend::ResendEmailProvider;
+use agentos_providers::embedder::Embedder;
+use agentos_providers::embedder_openai::OpenAiEmbedder;
 use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
 use agentos_providers::secrets::MemorySecretStore;
@@ -135,6 +137,8 @@ pub struct Credentials {
     pub telephony: Option<TelephonyCredentials>,
     /// Browserbase. `None` is [`MockBrowser`].
     pub browser: Option<BrowserCredentials>,
+    /// The embedding model. `None` is [`Embedder::Mock`], the SHA-256 hash.
+    pub embedder: Option<EmbedderCredentials>,
 }
 
 /// What [`ResendEmailProvider::new`] takes.
@@ -168,6 +172,20 @@ pub struct BrowserCredentials {
     pub api_key: String,
 }
 
+/// What [`OpenAiEmbedder::new`] takes, and the whole of it.
+///
+/// **One field, and no model name beside it.** The customer brings the key and
+/// pays the bill — the same rule [`LlmBackend::pays_with_our_key`] enforces one
+/// port over — but the *model* is a constant of the adapter, because the HNSW
+/// index is partial on a model name and a partial index predicate is a SQL
+/// literal. A model an operator could type would be a model with no index and
+/// therefore a sequential scan on every retrieval. See
+/// `agentos_providers::embedder_openai` and `migrations/0026`.
+pub struct EmbedderCredentials {
+    /// The `sk-…` API key. Nothing else: see above.
+    pub api_key: String,
+}
+
 // A derived Debug would print three live credentials into whatever log line
 // someone dumps the configuration to. Same reason `Config` writes its own.
 impl fmt::Debug for Credentials {
@@ -176,6 +194,7 @@ impl fmt::Debug for Credentials {
             .field("email", &self.email.is_some())
             .field("telephony", &self.telephony.is_some())
             .field("browser", &self.browser.is_some())
+            .field("embedder", &self.embedder.is_some())
             .finish()
     }
 }
@@ -220,6 +239,30 @@ fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
                 .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
         ),
         None => Arc::new(MockBrowser::new()),
+    }
+}
+
+/// The embedder: the real client when there is a key, the SHA-256 hash when
+/// there is not.
+///
+/// **Not a field of [`Ports`] or [`Adapters`], and it does not want to be.**
+/// Nothing routes an embedding through the `Effects` façade — `knowledge::ingest`
+/// and `knowledge::recall` take one directly, because an embedding is not an
+/// action an employee proposes and there is nothing for the gate to decide about
+/// it. So it is selected here, like [`llm`], and handed to the two callers that
+/// need it.
+///
+/// The selection is what makes `EMBEDDER_API_KEY` a credential rather than a
+/// switch: with a key, `Embedder::is_semantic()` is `true` and
+/// `knowledge::retrieve` runs the vector leg it refuses to run on a hash. That
+/// is the argument `config.rs` used to make for *removing* the variable, and it
+/// is answered rather than dropped — there is now something for it to select.
+pub fn embedder(credentials: &Credentials) -> Embedder {
+    match &credentials.embedder {
+        Some(embedder) => Embedder::OpenAi(Arc::new(OpenAiEmbedder::new(Secret::new(
+            embedder.api_key.clone(),
+        )))),
+        None => Embedder::Mock,
     }
 }
 
@@ -781,6 +824,9 @@ mod tests {
                 project_id: "proj_test".to_owned(),
                 api_key: "bb_live_key".to_owned(),
             }),
+            embedder: Some(EmbedderCredentials {
+                api_key: "sk-live-key".to_owned(),
+            }),
         }
     }
 
@@ -928,6 +974,59 @@ mod tests {
         assert!(
             ports.email.verify_webhook(body, &headers).is_err(),
             "email had no credential and must still be the mock"
+        );
+    }
+
+    /// The embedder, which is the adapter whose credential used to select
+    /// nothing.
+    ///
+    /// Not folded into the test above because it takes no socket and no
+    /// signature to tell the two apart: `is_semantic` is the branch
+    /// `knowledge::retrieve` actually reads, and it is the difference between a
+    /// hybrid search and a word search. Asserting on it is asserting on the
+    /// thing the credential is supposed to change.
+    #[test]
+    fn the_embedding_credential_selects_a_backend_that_ranks_by_meaning() {
+        let real = embedder(&live());
+        assert!(
+            real.is_semantic(),
+            "EMBEDDER_API_KEY selected something whose vectors mean nothing, which is \
+             exactly the alarm-quieting the variable was deleted for"
+        );
+        // The other observable difference, and the one the store reads: two
+        // model names, so the two vector spaces never meet in one search.
+        assert_eq!(
+            crate::knowledge::model_name(&real),
+            "text-embedding-3-small"
+        );
+
+        let fake = embedder(&Credentials::default());
+        assert!(!fake.is_semantic());
+        assert_eq!(crate::knowledge::model_name(&fake), "mock-sha256-1536");
+
+        // Per adapter, like every other one: an embedding key on its own does
+        // not make the mailbox real.
+        let only_embeddings = ports_for(&Credentials {
+            embedder: live().embedder,
+            ..Credentials::default()
+        });
+        let body = br#"{"type":"email.received"}"#;
+        let timestamp = Utc::now().timestamp().to_string();
+        let headers = agentos_providers::email::WebhookHeaders {
+            signature: agentos_providers::email::sign_webhook(
+                &Secret::new(LIVE_WEBHOOK_SECRET),
+                "msg_1",
+                &timestamp,
+                body,
+            ),
+            id: "msg_1".to_owned(),
+            timestamp,
+        };
+        assert!(
+            only_embeddings
+                .email
+                .verify_webhook(body, &headers)
+                .is_err()
         );
     }
 

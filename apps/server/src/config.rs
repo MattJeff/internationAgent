@@ -45,7 +45,8 @@ use std::sync::Arc;
 
 use agentos_app::hosted::{BRIDGES_PER_TENANT, BridgeNetwork};
 use agentos_app::mocks::{
-    BrowserCredentials, Credentials, EmailCredentials, LlmBackend, TelephonyCredentials,
+    BrowserCredentials, Credentials, EmailCredentials, EmbedderCredentials, LlmBackend,
+    TelephonyCredentials,
 };
 use agentos_app::oauth::OauthClients;
 use agentos_domain::ids::TenantId;
@@ -72,24 +73,50 @@ const DEFAULT_RUST_LOG: &str = "info,agentos_server=debug";
 ///   rather than by whether a credential happens to be exported;
 ///   [`LlmBackend::mock_label`] answers "is this one real?". A second variable
 ///   meaning the same thing would be the two lists this module exists to avoid.
-/// * The **embedder** and the **secret vault**, which have no real
-///   implementation in this workspace at all. `EMBEDDER_API_KEY` used to sit
-///   here, and it was the guard's own version of the failure the guard exists
-///   to prevent: exporting it silenced a refusal and selected nothing, because
-///   `Embedder` has one variant and it is a SHA-256 hash. A credential that
-///   cannot change what runs must not be able to quiet an alarm. Both are named
-///   as permanent mocks by [`Config::adapter_summary`] instead, which is honest
-///   and does not make `AGENTOS_ALLOW_MOCKS` mandatory for every deployment
-///   forever — a flag everybody must set is a flag that means nothing.
-const PROVIDER_CREDENTIALS: [(&str, &str, &str); 3] = [
+/// * The **secret vault**, which has no real implementation in this workspace
+///   at all. It is named as a permanent mock by [`Config::adapter_summary`]
+///   instead, which is honest and does not make `AGENTOS_ALLOW_MOCKS` mandatory
+///   for every deployment forever — a flag everybody must set is a flag that
+///   means nothing.
+///
+/// # `EMBEDDER_API_KEY` is a row again, and the argument that removed it is
+/// answered rather than forgotten
+///
+/// It used to sit here, and it was deleted for a good reason: exporting any
+/// string silenced a refusal and **selected nothing**, because `Embedder` had
+/// one variant and it was a SHA-256 hash. A credential that cannot change what
+/// runs must not be able to quiet an alarm.
+///
+/// That test is met now, and it is worth being exact about how rather than
+/// asserting it. `agentos_providers::embedder::Embedder` has a second variant;
+/// [`Credentials::embedder`] being `Some` is what builds
+/// `OpenAiEmbedder` against the customer's key, and three observable things
+/// change with it: `Embedder::is_semantic()` becomes `true`, which is the branch
+/// `agentos_app::knowledge::retrieve` reads to run the vector leg it refuses to
+/// run on a hash; every chunk is stamped `text-embedding-3-small` instead of
+/// `mock-sha256-1536`, which is what keeps the two vector spaces apart in one
+/// table; and `migrations/0076` gives that model an index of its own. The alarm
+/// this credential quiets is an alarm about something that became real, which
+/// is the only condition under which quieting it was ever wrong.
+///
+/// What it still does **not** buy is a model of the operator's choosing — the
+/// key is the customer's, the model name is a constant, and
+/// `agentos_providers::embedder_openai` argues why a partial index predicate
+/// cannot name an environment variable.
+const PROVIDER_CREDENTIALS: [(&str, &str, &str); 4] = [
     ("email", "EMAIL_API_KEY", "resend"),
     ("telephony", "TELEPHONY_API_KEY", "twilio"),
     ("browser", "BROWSER_API_KEY", "browserbase"),
+    ("embedder", "EMBEDDER_API_KEY", "openai"),
 ];
 
 /// The adapters no credential can make real, named in every boot summary so a
 /// green line is not read as "all of this is live".
-const PERMANENT_MOCKS: &str = "embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)";
+///
+/// One left. The embedder was the other, and it moved into
+/// [`PROVIDER_CREDENTIALS`] when it stopped being unfixable — see that
+/// constant's docs, which carry the argument for both directions.
+const PERMANENT_MOCKS: &str = "secrets=MOCK(in-memory)";
 
 /// Why the process cannot start.
 #[derive(Debug, thiserror::Error)]
@@ -510,6 +537,12 @@ impl Config {
                 project_id,
                 api_key,
             }),
+            // One value and not a pair, unlike the two above: the customer
+            // brings the key and the model is a constant of the adapter,
+            // because the HNSW index is partial on a model name and a partial
+            // index predicate is a SQL literal. See
+            // `agentos_providers::embedder_openai`.
+            embedder: get("EMBEDDER_API_KEY").map(|api_key| EmbedderCredentials { api_key }),
         };
 
         // Fixed length, matching [`PROVIDER_CREDENTIALS`] row for row: adding a
@@ -519,6 +552,7 @@ impl Config {
             credentials.email.is_some(),
             credentials.telephony.is_some(),
             credentials.browser.is_some(),
+            credentials.embedder.is_some(),
         ];
         let mut mock_adapters = Vec::new();
         let mut mock_vars = Vec::new();
@@ -768,6 +802,7 @@ mod tests {
         ("EMAIL_API_KEY", "re_live_key"),
         ("TELEPHONY_API_KEY", "ACtest:live-auth-token"),
         ("BROWSER_API_KEY", "proj_test:bb_live_key"),
+        ("EMBEDDER_API_KEY", "sk-live-key"),
     ];
 
     /// Everything a real deployment sets. Tests remove from this, never add to
@@ -879,6 +914,7 @@ mod tests {
         assert!(config.credentials.email.is_some());
         assert!(config.credentials.telephony.is_some());
         assert!(config.credentials.browser.is_some());
+        assert!(config.credentials.embedder.is_some());
     }
 
     // -- credentials select adapters ---------------------------------------
@@ -900,6 +936,7 @@ mod tests {
                     ("EMAIL_API_KEY", c.credentials.email.is_some()),
                     ("TELEPHONY_API_KEY", c.credentials.telephony.is_some()),
                     ("BROWSER_API_KEY", c.credentials.browser.is_some()),
+                    ("EMBEDDER_API_KEY", c.credentials.embedder.is_some()),
                 ]
             };
             for (other, configured) in present(&config) {
@@ -977,7 +1014,8 @@ mod tests {
         assert_eq!(
             parse(&env).expect("valid").adapter_summary(),
             format!(
-                "email=resend telephony=twilio browser=browserbase llm=anthropic {PERMANENT_MOCKS}"
+                "email=resend telephony=twilio browser=browserbase embedder=openai \
+                 llm=anthropic {PERMANENT_MOCKS}"
             ),
         );
 
@@ -987,7 +1025,8 @@ mod tests {
         assert_eq!(
             config.adapter_summary(),
             format!(
-                "email=resend telephony=MOCK browser=browserbase llm=anthropic {PERMANENT_MOCKS}"
+                "email=resend telephony=MOCK browser=browserbase embedder=openai \
+                 llm=anthropic {PERMANENT_MOCKS}"
             ),
             "one real adapter missing must not read the same as all of them present"
         );
@@ -1012,20 +1051,62 @@ mod tests {
 
     /// The adapters no credential can fix are named every time, so a summary
     /// with no `MOCK` in it cannot be produced by leaving something out.
+    ///
+    /// One left. The embedder was the other and it is a credential now, which
+    /// is what [`the_embedder_credential_is_a_selection_and_not_a_silencer`]
+    /// below is about.
     #[test]
     fn the_permanent_mocks_are_named_even_on_a_fully_credentialed_deployment() {
-        let mut env = complete();
-        // The variable that used to silence the guard while selecting nothing.
-        env.insert("EMBEDDER_API_KEY", "definitely-not-real".to_owned());
-
-        let config = parse(&env).expect("valid");
+        let config = parse(&complete()).expect("valid");
         assert!(
             config.mock_adapters.is_empty(),
             "nothing selectable is fake"
         );
-        let summary = config.adapter_summary();
+        assert!(
+            config.adapter_summary().contains("secrets=MOCK"),
+            "{}",
+            config.adapter_summary()
+        );
+    }
+
+    /// **`EMBEDDER_API_KEY` is back, and it has to earn the alarm it quiets.**
+    ///
+    /// It was deleted because exporting any string turned a refusal green while
+    /// selecting nothing. The test for its return is not "does it parse" — it is
+    /// that removing it makes the boot *refuse* by name, the way every other
+    /// credential does, and that the summary tells an operator which of the two
+    /// embedders is behind the port. A variable that could be absent without the
+    /// guard noticing would be the old bug pointing the other way.
+    #[test]
+    fn the_embedder_credential_is_a_selection_and_not_a_silencer() {
+        let mut env = complete();
+        assert!(
+            parse(&env)
+                .expect("valid")
+                .adapter_summary()
+                .contains("embedder=openai"),
+            "a deployment that has bought an embedder must be able to see it"
+        );
+
+        env.remove("EMBEDDER_API_KEY");
+        let err = parse(&env).expect_err("a hash embedder must not start silently");
+        let ConfigError::MocksNotAllowed {
+            adapters,
+            vars,
+            summary,
+        } = &err
+        else {
+            panic!("expected MocksNotAllowed, got {err:?}");
+        };
+        assert_eq!(adapters, "embedder");
+        assert_eq!(vars, "EMBEDDER_API_KEY");
         assert!(summary.contains("embedder=MOCK"), "{summary}");
-        assert!(summary.contains("secrets=MOCK"), "{summary}");
+
+        // And an operator who says so out loud gets the hash, named as one.
+        env.insert("AGENTOS_ALLOW_MOCKS", "1".to_owned());
+        let config = parse(&env).expect("allowed");
+        assert!(config.credentials.embedder.is_none());
+        assert_eq!(config.mock_adapters, vec!["embedder"]);
     }
 
     // -- the model ---------------------------------------------------------

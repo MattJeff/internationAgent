@@ -316,6 +316,12 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // provisioner cannot buy a number from Twilio that the effects path then
     // texts from a mock.
     let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
+    // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
+    // the real client and its absence selects the SHA-256 hash. Not a field of
+    // `Ports` — nothing routes an embedding through the gate — so it is built
+    // here and handed to the two callers that need it: the turn's `recall`, and
+    // the ingest route.
+    let embedder = agentos_app::mocks::embedder(&config.credentials);
     // **One vault per deployment, built here**, and since
     // `0050_tenant_model_key` it has exactly one reader: the provisioner's
     // identity canary. The tenant's model credential used to live here too, and
@@ -405,6 +411,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         credentials: credentials.clone(),
         gate: gate.clone(),
         ports: ports.clone(),
+        embedder: embedder.clone(),
         fleets: fleets.clone(),
         cancel: cancel.clone(),
     };
@@ -590,6 +597,15 @@ fn app(
     ports: Arc<Ports>,
     model: ModelWiring,
 ) -> Router {
+    // Read off the same `Credentials` the turn path's was, rather than passed
+    // in as a ninth argument. A second instance and not a shared one, which is
+    // the trade `agentos_app::mocks::ports_for` already makes and argues: the
+    // HTTP client is stateless and the model name is a constant, so the two
+    // cannot disagree about anything an operator can observe. The thing that
+    // would matter — one deployment, one model on its chunks — is guaranteed by
+    // `model_name` being an exhaustive `match` and not by object identity.
+    let embedder = agentos_app::mocks::embedder(&config.credentials);
+
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -685,7 +701,7 @@ fn app(
                 gate.clone(),
                 ports.clone(),
             ))
-            .merge(routes::knowledge::router(db.clone()))
+            .merge(routes::knowledge::router(db.clone(), embedder.clone()))
             // Beside `knowledge`, deliberately, because the pair is the whole
             // distinction: that one indexes a document so a turn can find what
             // resembles a question, and this one keeps the bytes so a person can
@@ -1439,6 +1455,15 @@ struct Agent {
     credentials: agentos_app::mcp::Credentials,
     gate: PolicyGate,
     ports: Arc<Ports>,
+    /// The embedding backend this deployment's `EMBEDDER_API_KEY` selected.
+    ///
+    /// A field rather than `Embedder::default()` at the call site, and the
+    /// difference is whether a turn recalls anything at all: unset is the
+    /// SHA-256 hash, whose `is_semantic()` is `false`, which makes
+    /// `knowledge::retrieve` skip the vector leg and answer on word matching
+    /// alone. Reading the deployment's choice here is what lets a customer who
+    /// has bought an embedder get one.
+    embedder: Embedder,
     /// Every tenant's MCP bindings, kept current by the binder loop.
     ///
     /// Not folded into `ports`, and it cannot be: `Ports` is process-wide and
@@ -1850,7 +1875,7 @@ impl Agent {
                     // answer.
                     let recalled = knowledge::recall(
                         &self.db,
-                        Embedder::default(),
+                        &self.embedder,
                         event.tenant_id,
                         &knowledge::Recall::new(&inbound, Some(employee_id)),
                     )
@@ -3481,6 +3506,7 @@ mod tests {
                 ports: Arc::new(agentos_app::mocks::ports()),
                 // No binder loop in this test, so every tenant's fleet is
                 // empty and every MCP call is refused by name.
+                embedder: agentos_app::knowledge::Embedder::default(),
                 fleets: Fleets::new().0,
                 cancel: cancel.clone(),
             };
@@ -3611,6 +3637,7 @@ mod tests {
                 credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 gate: PolicyGate::new(self.db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
+                embedder: agentos_app::knowledge::Embedder::default(),
                 fleets: Fleets::new().0,
                 cancel,
             };
@@ -4337,6 +4364,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4717,6 +4745,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4890,6 +4919,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -5419,7 +5449,7 @@ mod tests {
         // rather than a tautology about an empty store.
         knowledge::ingest(
             &mut tx,
-            Embedder::default(),
+            &Embedder::default(),
             &knowledge::Document {
                 scope: knowledge::Scope::Company,
                 uri: Some("file://handbook.md"),
@@ -5680,6 +5710,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: fleets.clone(),
             cancel: cancel.clone(),
         };
@@ -5779,6 +5810,17 @@ mod tests {
             // query built from the message instead of quoting it — and that is
             // when somebody should be made to come back and assert the presence
             // again, with a corpus of more than one chunk behind it.
+            //
+            // Half of that day has arrived and this fixture is deliberately on
+            // the other half: `EMBEDDER_API_KEY` now selects a real embedder,
+            // and this `Agent` is built with `Embedder::default()` — the hash —
+            // because a test that reached a vendor would cost money per run.
+            // So what is pinned here is the *mock* deployment's behaviour, which
+            // is still every laptop and every CI run. A deployment with the
+            // credential set runs both legs and this assertion says nothing
+            // about it; asserting the presence needs a fake embeddings endpoint
+            // wired through `mocks::embedder`, which is the piece of work this
+            // comment is now asking for.
             assert!(
                 !whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
                 "{}'s turn recalled its own document, which this build cannot do — \

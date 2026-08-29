@@ -71,6 +71,7 @@ pub mod cdp;
 pub mod email; // U16
 pub mod email_resend; // real Resend client
 pub mod embedder; // U19
+pub mod embedder_openai; // real /v1/embeddings client
 pub mod leads; // the outbound sending platform's list
 pub mod llm; // U19
 pub mod llm_anthropic; // real /v1/messages client
