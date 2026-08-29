@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
-  --> tests/ui/effects_untrusted_action.rs:46:35
+  --> tests/ui/effects_untrusted_action.rs:57:35
    |
-46 |     let _ = effects.issue_invoice(ok, draft).await;
+57 |     let _ = effects.issue_invoice(ok, draft).await;
    |                     ------------- ^^ expected `Authorized<InvoiceIssue>`, found `Authorized<Untrusted<InvoiceIssue>>`
    |                     |
    |                     arguments to this method are incorrect
@@ -193,3 +193,25 @@ note: required by a bound in `sign_request`
    |
    | pub async fn sign_request<A: crate::effects::Subject<Of = crate::effects::A2aSend>>(
    |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `sign_request`
+
+error[E0277]: the trait bound `Action: agentos_app::effects::Subject` is not satisfied
+  --> tests/ui/effects_untrusted_action.rs:46:28
+   |
+46 |     let _ = Effects::pay::<Action>;
+   |                            ^^^^^^ the trait `agentos_app::effects::Subject` is not implemented for `Action`
+   |
+   = help: the following other types implement trait `agentos_app::effects::Subject`:
+             Browse
+             agentos_app::effects::A2aSend
+             agentos_app::effects::AppointmentBook
+             agentos_app::effects::BrowserRead
+             agentos_app::effects::BrowserWrite
+             agentos_app::effects::CallPlace
+             agentos_app::effects::EmailSend
+             agentos_app::effects::InternalSend
+           and $N others
+note: required by a bound in `Effects::pay`
+  --> src/effects.rs
+   |
+   |     pub async fn pay<A: Subject<Of = PaymentCreate>>(
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Effects::pay`
