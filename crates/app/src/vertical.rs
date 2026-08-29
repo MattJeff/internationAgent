@@ -4109,6 +4109,50 @@ mod tests {
              cannot be chartered at all. Widen or narrow the constraint in a NEW \
              migration — an applied one cannot be edited."
         );
+
+        // **And the half the name promises, which reading literals cannot give.**
+        // Everything above parses the constraint's *text*, so it catches a
+        // widening that adds a literal and nothing else: `or length(role) > 0`,
+        // a regex, an `is not null` all leave these two lists equal while an
+        // operator writes `'poet'`. A test called `admits_exactly` that checks
+        // syntax rather than admission is the shape this workspace has now been
+        // bitten by eight times — and this one was born in the change meant to
+        // close that class.
+        //
+        // So the real expression is *evaluated* rather than parsed, against a
+        // value, with no row to insert: the foreign keys on this table would
+        // otherwise force a whole fixture in to test one boolean, and the
+        // constraint would not be what was under test.
+        let expr = def
+            .trim()
+            .strip_prefix("CHECK (")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or(&def)
+            .to_owned();
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        for role in in_binary.iter().map(String::as_str).chain(["poet"]) {
+            let admits: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT ({expr}) FROM (SELECT $1::text AS role) AS t"
+            )))
+            .bind(role)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the constraint expression evaluates");
+            assert_eq!(
+                admits,
+                role != "poet",
+                "`{role}`: the CHECK admits it = {admits}, and this build {}. \
+                 A widening spelled any way at all — a regex, a length test, an \
+                 `is not null` OR-ed onto the array — keeps every literal above \
+                 and leaves those two lists equal, so only this assertion sees it",
+                if role == "poet" {
+                    "ships no pack by that name"
+                } else {
+                    "ships that pack"
+                }
+            );
+        }
+        tx.rollback().await.expect("rollback");
     }
 
     /// A stored objective is re-parsed, not deserialised. A country code the
