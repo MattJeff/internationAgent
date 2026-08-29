@@ -2302,8 +2302,11 @@ impl Effects {
                 Err(match err {
                     InternalError::Store(err) => EffectError::Unavailable(err),
                     // Unreachable colleague, unanswerable question, somebody
-                    // else's thread, a colleague out of turns. All four are the
-                    // world saying no to something the policy allows.
+                    // else's thread, not the owner, a colleague out of turns, a
+                    // recipient whose policy will not load. **Six**, not the
+                    // four this comment used to name — the arm catches every
+                    // `InternalError` but `Store`, and two were missing. All six
+                    // are the world saying no to something the policy allows.
                     refused => EffectError::Refused(refused.code()),
                 })
             }

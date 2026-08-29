@@ -511,7 +511,14 @@ fn digest_of(request: &LlmRequest, briefs: &[&str]) -> String {
         hasher.update(tool.input_schema.to_string().as_bytes());
     }
     for brief in briefs {
+        // The separator is load-bearing and its absence was a verified false
+        // negative: without it, concatenation makes a sentence moved from the
+        // end of one brief to the start of the next invisible to the digest —
+        // the same bytes in the same order, hashing the same. A byte that
+        // cannot appear inside a `&'static str` written as Rust source is the
+        // cheapest domain separator there is.
         hasher.update(brief.as_bytes());
+        hasher.update(b"\x00");
     }
     hasher
         .finalize()
