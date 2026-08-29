@@ -21,6 +21,18 @@
 //! means it is **absent** rather than present and quietly passing. Same shape,
 //! same reasoning, as `crates/app`'s `live-orizn` feature.
 //!
+//! **And guard 2 would not in fact have caught this crate**, which is worth
+//! saying rather than leaving as an argument that reads stronger than it is:
+//! the `SKIP:` grep lives inside `scripts/test.sh`'s per-package loop, and
+//! `agentos-eval` is run *after* that loop, on its own line, with neither
+//! `--nocapture` nor a `tee`. A runtime skip written here would print into a
+//! terminal nothing reads. That does not weaken the choice — a module needing
+//! ten minutes and a paid model must be absent from a default build whether or
+//! not anything would have noticed it passing quietly — it just means the
+//! guard doing the work is `crates/app`'s, where the same shape really is
+//! under the grep, and this crate is following it on the argument rather than
+//! on the enforcement.
+//!
 //! # What is real here and what is not
 //!
 //! Real: the tenant, the ceiling and the five role layers, read from
@@ -488,12 +500,20 @@ async fn stand_up(db: Db, passes: usize) -> Company {
     // They used to be `usd_minor(100_000)` and `usd_minor(50_000)` — a second
     // copy of the finance layer's own `max_per_day` and `max_per_transaction`,
     // typed out fifteen lines under the loop that installs that very layer from
-    // the file. No assertion could sensibly have been put on that copy: this module
-    // is behind `--features live-orizn`, so `scripts/test.sh` compiles neither
-    // `cargo test -p agentos-eval` nor `cargo clippy --all-targets` with it, and
-    // a test written in here would be a test that never runs. A number the
-    // suite cannot see is not made safe by an assertion the suite cannot see
-    // either; it is made safe by not existing twice.
+    // the file. No assertion could sensibly have been put on that copy: this
+    // module is behind `--features live-orizn`, so `scripts/test.sh` never
+    // *runs* a line of it, and a test written in here would be a test that
+    // never runs. A number the suite cannot see is not made safe by an
+    // assertion the suite cannot see either; it is made safe by not existing
+    // twice.
+    //
+    // The half of that sentence about *compiling* was true when it was written
+    // and is not any more, and closing it was the point: `scripts/test.sh` now
+    // ends with a second `cargo clippy --workspace --all-targets
+    // --all-features`, so this module is type-checked and linted on every run
+    // while still executing nothing. What that buys is a rename underneath it
+    // failing the build. What it still cannot buy is an assertion, because
+    // checking is not running — so the argument above stands unchanged.
     //
     // Read from the document, the numbers are covered by what already guards
     // that document: `cost::digest` hashes every byte of every file in

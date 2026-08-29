@@ -87,13 +87,29 @@ pub const NO_BROWSER: &str = "no_browser";
 
 /// A step that writes, driven by a token the gate ruled as a *read*.
 ///
-/// **This was reachable, and widening reads made it live.** `Browse`
-/// (`proof_of_need::Browse`) rules as `Action::BrowserRead` and declares
-/// `type Of = BrowserWrite`, so it satisfies [`Effects::browse_write`]'s bound
-/// and could drive a `Type` or a `Click`. `read_page`'s own documentation
-/// asserted the opposite — *"a token minted for reading cannot be spent on
-/// `Effects::browse_write`"* — which was a claim about a bound that both
-/// tokens satisfy.
+/// **The type system admits it and one caller's discipline is what keeps it
+/// from happening.** `Browse` (`proof_of_need::Browse`) rules as
+/// `Action::BrowserRead` and declares `type Of = BrowserWrite`, so it satisfies
+/// [`Effects::browse_write`]'s bound and *compiles* into a `Type` or a `Click`.
+/// `read_page`'s own documentation asserted the opposite — *"a token minted for
+/// reading cannot be spent on `Effects::browse_write`"* — which was a claim
+/// about a bound that both tokens satisfy.
+///
+/// **It is not on a live path today, and the earlier version of this paragraph
+/// said it was.** It read "this was reachable, and widening reads made it
+/// live". The only production holder of a `Browse` token is
+/// `proof_of_need::Prober`, and `Prober::step` takes `authorize_write` for
+/// `Plan::Type` and `Plan::Click` and `authorize_read` only for `Plan::Goto`,
+/// the panel `Text` and the `Screenshot` — all three of which
+/// `BrowserStep::is_a_read` accepts. So no call in this workspace outside
+/// `effects.rs`'s own tests can reach the refusal below.
+///
+/// Which is the argument for the check, not against it: what stands between a
+/// read ruling and a keystroke is currently three correct choices in one
+/// `match` arm, in a different crate, with nothing that fails when a fourth
+/// `Plan` variant is added and authorised the easy way. The refusal is what
+/// turns that from a silent widening into a coded failure and an audit row, and
+/// it costs one `matches!` per call.
 ///
 /// It mattered little while a read had to clear `allowed_domains`: the two
 /// rulings then permitted the same set of hosts, so the escalation bought
@@ -734,22 +750,47 @@ pub enum EffectError {
     /// The effect was authorised and could still not be performed, because
     /// something read at write time said no.
     ///
-    /// [`Effects::send_internal`] produces four, and they are all facts about
-    /// the *recipient*: there is no such colleague on this employee's team, the
-    /// thread being answered or handed over is not this employee's, or the
-    /// colleague has no turns left in its day. None of them is expressible as an
-    /// [`Action`] — an `Action` carries a parsed subject and no org chart and no
-    /// ledger — so the gate cannot rule on them, and pushing them into it would
-    /// mean a second transaction between the check and the write for a team
-    /// membership or a turn budget to change in.
+    /// **Two shapes, and the counts are counted rather than remembered.** The
+    /// enum above opens by naming what it deliberately does not have; this
+    /// inventory then left a method out without saying so. It read
+    /// "`send_internal` produces four" and "`read_page` produces two" and named
+    /// no third method, while [`Effects::post_work`] — a shipped tool,
+    /// `add_work_item` in `turn::catalogue` — has produced one all along.
     ///
-    /// [`Effects::read_page`] produces two, and they are facts about *this
-    /// deployment* rather than about the recipient — same reasoning, one seam
-    /// over. [`NO_BROWSER`] is an employee whose browser context is not
-    /// provisioned, which is a `employee_resources` row the gate has no business
-    /// reading; `not_text` is a browser adapter that answered a text read with
-    /// something that is not text, which is a bug in an adapter and not a
-    /// decision anybody made.
+    /// *Facts about the recipient.* [`Effects::send_internal`] maps every
+    /// [`InternalError`] but `Store`, which is **six** and not four: no such
+    /// colleague on this employee's team, an answer to a question nobody asked
+    /// it, somebody else's thread, a handover to a seat that owns nothing, a
+    /// recipient whose policy will not load, and a colleague with no turns left
+    /// in its day. [`Effects::post_work`] maps the same enum, from
+    /// `inbound::may_assign`, and can only ever reach `unreachable_colleague`
+    /// through it — `may_assign` calls two functions that fail with
+    /// `StoreError` and returns `Unreachable` itself, so that is its whole
+    /// non-`Store` surface. ([`Effects::brief`] maps the enum too and reaches
+    /// none of them — `inbound::brief` puts every per-recipient refusal in the
+    /// receipt instead of returning it — which is argued at the arm itself.)
+    /// None of these is expressible as an [`Action`] — an `Action` carries a
+    /// parsed subject and no org chart and no ledger — so the gate cannot rule
+    /// on them, and pushing them into it would mean a second transaction
+    /// between the check and the write for a team membership or a turn budget
+    /// to change in.
+    ///
+    /// *Facts about this deployment.* [`Effects::read_page`] produces **three**
+    /// and not two — same reasoning, one seam over. [`NO_BROWSER`] is an
+    /// employee whose browser context is not provisioned, which is an
+    /// `employee_resources` row the gate has no business reading.
+    /// [`NO_LOCATION`] and `not_text` are both a browser adapter answering a
+    /// step with an outcome that step cannot have — a `Goto` that came back
+    /// with no address, a text read that came back as something other than text
+    /// — which is a bug in an adapter and not a decision anybody made.
+    ///
+    /// The other refusals in this module are neither shape and are argued at
+    /// the constants that name them. This is **not** the inventory of every
+    /// [`Refused`](EffectError::Refused) code in the crate and should not become
+    /// one — `grep -n 'EffectError::Refused' crates/app/src/effects.rs` is that,
+    /// always current, where a prose list would rot. What this *is* is the
+    /// argument for why a refusal lives here rather than at the gate, and so the
+    /// methods it names have to be every method that argument covers.
     ///
     /// The payload is a closed code, because it is handed back to a model as a
     /// failed tool result and it is what teaches it to stop asking.
