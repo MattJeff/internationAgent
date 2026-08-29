@@ -968,6 +968,134 @@ mod tests {
         );
     }
 
+    // -- models ------------------------------------------------------------
+
+    /// **The clause `any_limits` cannot generate.**
+    ///
+    /// `allowed_models` is the one field the strategy below leaves empty, so in
+    /// both properties its clause in [`is_tighter_than`] reads `∅ ⊆ ∅` and is
+    /// true no matter which way it is spelled — reversing it to `is_superset`
+    /// leaves every other test in this module green. Everything about models
+    /// therefore has to be said here, by name, or it is not said at all.
+    ///
+    /// The direction is the one that matters commercially: a tenant on Haiku
+    /// must not acquire Opus by writing a team layer, because the tenant's key
+    /// pays for the tokens.
+    #[test]
+    fn a_team_may_not_be_given_a_model_its_tenant_forbids() {
+        let tenant_on_haiku = PolicyLimits {
+            allowed_models: [ModelId::Haiku45].into_iter().collect(),
+            ..tenant_layer()
+        };
+        let greedy_team = Team::try_new(
+            tenant(),
+            slug("growth"),
+            PolicyLimits {
+                allowed_models: ModelId::ALL.into_iter().collect(),
+                ..purchasing()
+            },
+            None,
+        )
+        .expect("a valid team");
+
+        // The team layer, on its own, does say Opus. That is not the question.
+        assert!(
+            greedy_team
+                .limits()
+                .allowed_models
+                .contains(&ModelId::Opus5)
+        );
+        assert!(!is_tighter_than(greedy_team.limits(), &tenant_on_haiku));
+
+        // Stacked, it says exactly what the tenant said and nothing more.
+        let stacked = EffectivePolicy::try_new(
+            &tenant_on_haiku,
+            &tenant_on_haiku,
+            greedy_team.limits(),
+            &tenant_on_haiku,
+        )
+        .expect("single currency")
+        .limits()
+        .clone();
+        assert_eq!(stacked.allowed_models, [ModelId::Haiku45].into());
+        assert!(is_tighter_than(&stacked, &tenant_on_haiku));
+        // And what a seat actually runs is the tenant's model, even asking for
+        // the one the team wrote down.
+        let policy = EffectivePolicy::try_new(
+            &tenant_on_haiku,
+            &tenant_on_haiku,
+            greedy_team.limits(),
+            &tenant_on_haiku,
+        )
+        .expect("single currency");
+        assert_eq!(
+            crate::policy::model_for(Some(&policy), ModelId::Opus5),
+            Some(ModelId::Haiku45)
+        );
+
+        // A section under that team cannot get one back either.
+        let sectioned = greedy_team
+            .with_section(
+                slug("emea"),
+                Some(&PolicyLimits {
+                    allowed_models: ModelId::ALL.into_iter().collect(),
+                    ..purchasing()
+                }),
+            )
+            .expect("single currency");
+        let section = sectioned.layer_for(Some(&slug("emea"))).unwrap();
+        let stacked_section = EffectivePolicy::try_new(
+            &tenant_on_haiku,
+            &tenant_on_haiku,
+            section,
+            &tenant_on_haiku,
+        )
+        .expect("single currency")
+        .limits()
+        .clone();
+        assert_eq!(stacked_section.allowed_models, [ModelId::Haiku45].into());
+
+        // The other direction is what an operator is allowed to do: a team may
+        // give up models its tenant holds. Cheaper is always within.
+        let frugal = Team::try_new(
+            tenant(),
+            slug("support"),
+            PolicyLimits {
+                allowed_models: [ModelId::Haiku45].into_iter().collect(),
+                ..purchasing()
+            },
+            None,
+        )
+        .expect("a valid team");
+        assert!(is_tighter_than(frugal.limits(), &tenant_layer()));
+
+        // Empty denies rather than inheriting: a team that names no model
+        // leaves its seats unable to think at all, which is the harsh direction
+        // and the safe one.
+        let mute = Team::try_new(
+            tenant(),
+            slug("mute"),
+            PolicyLimits {
+                allowed_models: BTreeSet::new(),
+                ..purchasing()
+            },
+            None,
+        )
+        .expect("a valid team");
+        let stacked_mute = EffectivePolicy::try_new(
+            &tenant_layer(),
+            &tenant_layer(),
+            mute.limits(),
+            &tenant_layer(),
+        )
+        .expect("single currency");
+        assert!(stacked_mute.limits().allowed_models.is_empty());
+        assert_eq!(
+            crate::policy::model_for(Some(&stacked_mute), ModelId::Haiku45),
+            None
+        );
+    }
+
     // -- the property: a team cannot widen its tenant ----------------------
 
     fn at(secs: i64) -> DateTime<Utc> {

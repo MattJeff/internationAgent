@@ -129,11 +129,18 @@ impl Cadence {
     /// `offset` spreads employees that would otherwise share a schedule; pass
     /// `Duration::ZERO` when that does not matter, which in a test is always.
     ///
-    /// Saturating: a clock far enough in the future to overflow a `DateTime`
-    /// should produce the latest representable instant, not a panic in a loop
-    /// that runs unattended.
+    /// Saturating at every step, because this runs in a loop nobody watches: a
+    /// clock far enough in the future to overflow a `DateTime`, or an `offset`
+    /// large enough to overflow the `Duration` sum, produces the latest
+    /// representable instant rather than a panic.
+    ///
+    /// `saturating_add` and not `+`: `Duration`'s `Add` panics on overflow — in
+    /// release as well as in debug, since it is an explicit `expect` inside
+    /// `core` and not an arithmetic overflow check — and `offset` is drawn by
+    /// the caller, so the bound is this function's to hold and not the caller's
+    /// to remember.
     pub fn advance(self, from: DateTime<Utc>, offset: Duration) -> DateTime<Utc> {
-        let step = chrono::Duration::from_std(self.interval + offset)
+        let step = chrono::Duration::from_std(self.interval.saturating_add(offset))
             .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1_000));
         from.checked_add_signed(step)
             .unwrap_or(DateTime::<Utc>::MAX_UTC)
@@ -309,6 +316,26 @@ mod tests {
         assert_eq!(
             cadence(3_600).advance(DateTime::<Utc>::MAX_UTC, Duration::ZERO),
             DateTime::<Utc>::MAX_UTC
+        );
+
+        // The other overflow, and the one that used to abort: the *offset*.
+        // `interval + offset` is `Duration::add`, which panics rather than
+        // saturating, so a jitter draw near the top of the range took the
+        // scheduler down before any of the `DateTime` arithmetic above ran.
+        // `offset` is drawn by the caller, which makes this a bound the callee
+        // has to hold — the promise on `advance` is unconditional.
+        assert_eq!(
+            cadence(3_600).advance(at(0), Duration::MAX),
+            DateTime::<Utc>::MAX_UTC
+        );
+        assert_eq!(
+            cadence(3_600).advance(at(0), Duration::from_secs(u64::MAX)),
+            DateTime::<Utc>::MAX_UTC
+        );
+        // And a plausible jitter still lands exactly where the arithmetic says.
+        assert_eq!(
+            cadence(3_600).advance(at(0), Duration::from_secs(17)),
+            at(3_617)
         );
     }
 

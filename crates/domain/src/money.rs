@@ -72,10 +72,25 @@ impl Currency {
     }
 
     /// Number of decimal places between the major and minor unit.
+    ///
+    /// Written out with no `_` arm, which is the whole point: ISO-4217 also has
+    /// three-decimal currencies (BHD, KWD, TND, JOD) and a wildcard defaulting
+    /// to `2` would price one of them at a hundredth of its value, silently, in
+    /// every direction at once — [`Money::from_major`], [`Money::from_major_str`]
+    /// and [`fmt::Display`] all read this one function, so nothing downstream
+    /// would disagree with anything else and no test could see it. A new variant
+    /// must stop the build here and be decided on.
     pub const fn exponent(self) -> u32 {
         match self {
             Currency::Jpy | Currency::Krw => 0,
-            _ => 2,
+            Currency::Usd
+            | Currency::Eur
+            | Currency::Gbp
+            | Currency::Cny
+            | Currency::Chf
+            | Currency::Cad
+            | Currency::Aud
+            | Currency::Inr => 2,
         }
     }
 
