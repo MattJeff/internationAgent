@@ -1,7 +1,24 @@
 error: cannot construct `Flow` with struct literal syntax due to private fields
-  --> tests/ui/proof_of_need_forged_flow.rs:18:5
+  --> tests/ui/proof_of_need_forged_flow.rs:20:5
    |
-18 |     Flow {
+20 |     Flow {
    |     ^^^^
+21 |         prospect: "Airline Example".to_owned(),
+   |         -------------------------------------- private field
+22 |         domain: Domain::parse("book.airline.example").unwrap(),
+   |         ------------------------------------------------------ private field
+23 |         entry: Url::parse("https://book.airline.example/entry").unwrap(),
+   |         ---------------------------------------------------------------- private field
+24 |         // Plausible. Nobody has looked.
+25 |         passport_field: "#passport".to_owned(),
+   |         -------------------------------------- private field
+26 |         destination_field: "#destination".to_owned(),
+   |         -------------------------------------------- private field
+27 |         date_field: None,
+   |         ---------------- private field
+28 |         submit: None,
+   |         ------------ private field
+29 |         panel: "#visa-info".to_owned(),
+   |         ------------------------------ private field
    |
    = note: ...and other private field `_confirmed` that was not provided

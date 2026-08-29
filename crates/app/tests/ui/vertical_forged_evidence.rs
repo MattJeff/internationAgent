@@ -9,10 +9,11 @@ use chrono::{NaiveDate, Utc};
 use url::Url;
 
 fn invented_finding() -> Approach {
-    // Every field of `Evidence` is public to read, and the value is impossible
-    // to build: the eleventh field is a private zero-sized seal that only
-    // `Prober::check` can mint, after two agreeing runs. Without it this
-    // literal has a missing field nobody outside `proof_of_need` can name.
+    // `Evidence` is readable through accessors and impossible to build: one of
+    // its fields is a private zero-sized seal that only `Prober::check` can
+    // mint, after two agreeing runs, and none of the rest can be named from
+    // out here either. See `vertical_doctored_evidence.rs` for the forgery that
+    // needs no literal at all.
     let evidence = Evidence {
         prospect: "Airline Example".to_owned(),
         domain: Domain::parse("book.airline.example").unwrap(),

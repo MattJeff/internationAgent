@@ -1,0 +1,23 @@
+error[E0616]: field `prospect` of struct `agentos_app::proof_of_need::Evidence` is private
+  --> tests/ui/vertical_doctored_evidence.rs:14:12
+   |
+14 |     forged.prospect = "Someone Else Entirely".to_owned();
+   |            ^^^^^^^^ private field
+
+error[E0616]: field `finding` of struct `agentos_app::proof_of_need::Evidence` is private
+  --> tests/ui/vertical_doctored_evidence.rs:15:12
+   |
+15 |     forged.finding = Finding::Contradicts {
+   |            ^^^^^^^ private field
+
+error[E0616]: field `steps` of struct `agentos_app::proof_of_need::Evidence` is private
+  --> tests/ui/vertical_doctored_evidence.rs:19:12
+   |
+19 |     forged.steps = vec!["1. take our word for it".to_owned()];
+   |            ^^^^^ private field
+
+error[E0616]: field `screenshot` of struct `agentos_app::proof_of_need::Evidence` is private
+  --> tests/ui/vertical_doctored_evidence.rs:20:12
+   |
+20 |     forged.screenshot = Vec::new();
+   |            ^^^^^^^^^^ private field

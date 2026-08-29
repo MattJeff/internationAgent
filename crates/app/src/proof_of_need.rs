@@ -893,7 +893,9 @@ mod confirmed {
     /// `Flow { … }` cannot be spelled outside this file, so the only way to a
     /// value [`Prober::check`](super::Prober::check) accepts is
     /// [`Flow::confirmed`](super::Flow::confirmed), which demands a row with a
-    /// name on it.
+    /// name on it. The selectors are private for the other half of it: the seal
+    /// records that a human opened the page, not *which* selectors they checked,
+    /// so it survives having them replaced one field at a time.
     ///
     /// It guards the same class of exposure the evidence seal does, one step
     /// earlier. A forged `Evidence` is a claim nobody observed; a guessed `Flow`
@@ -1016,26 +1018,37 @@ impl FlowError {
 /// `grep -n 'confirmed_by' --include='*.rs'` is the audit: every site that can
 /// put a name on a flow is in that list, and there are two — the CLI verb an
 /// operator runs, and the store row it writes.
+///
+/// # The fields are private, and that is the seal rather than a style
+///
+/// A zero-sized private field stops the struct literal and nothing else. Every
+/// other field being `pub` left `let mut guessed = confirmed.clone(); guessed.panel
+/// = "body".to_owned();` compiling from any crate in the workspace — a confirmed
+/// flow with a guessed selector on it, carrying the seal that says a human
+/// checked. That is the exact value this type exists to make unspellable, and it
+/// was spellable in one line. Reading goes through the accessors below;
+/// `tests/ui/proof_of_need_doctored_flow.rs` is the compile-fail that holds it
+/// shut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flow {
     /// How we refer to them. Ours, so it is safe to render.
-    pub prospect: String,
+    prospect: String,
     /// The domain the gate rules on. Every step is confined to it.
-    pub domain: Domain,
+    domain: Domain,
     /// The page the check starts on.
-    pub entry: Url,
+    entry: Url,
     /// CSS selector of the passport / nationality field.
-    pub passport_field: String,
+    passport_field: String,
     /// CSS selector of the destination field.
-    pub destination_field: String,
+    destination_field: String,
     /// CSS selector of the travel-date field, when the flow has one.
-    pub date_field: Option<String>,
+    date_field: Option<String>,
     /// CSS selector of the button that asks *their* flow for the requirements.
     ///
     /// **Never a booking or payment submit.** See the module docs.
-    pub submit: Option<String>,
+    submit: Option<String>,
     /// CSS selector of the element that displays the answer.
-    pub panel: String,
+    panel: String,
     /// The seal. Not nameable outside this module, which is what makes a guessed
     /// flow unspellable.
     _confirmed: confirmed::Confirmed,
@@ -1106,6 +1119,46 @@ impl Flow {
             panel: row.panel,
             _confirmed: confirmed::Confirmed::new(),
         })
+    }
+
+    /// How we refer to them. Ours, so it is safe to render.
+    pub fn prospect(&self) -> &str {
+        &self.prospect
+    }
+
+    /// The domain the gate rules on.
+    pub const fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
+    /// The page the check starts on.
+    pub const fn entry(&self) -> &Url {
+        &self.entry
+    }
+
+    /// CSS selector of the passport / nationality field.
+    pub fn passport_field(&self) -> &str {
+        &self.passport_field
+    }
+
+    /// CSS selector of the destination field.
+    pub fn destination_field(&self) -> &str {
+        &self.destination_field
+    }
+
+    /// CSS selector of the travel-date field, when the flow has one.
+    pub fn date_field(&self) -> Option<&str> {
+        self.date_field.as_deref()
+    }
+
+    /// CSS selector of the button that asks their flow for the requirements.
+    pub fn submit(&self) -> Option<&str> {
+        self.submit.as_deref()
+    }
+
+    /// CSS selector of the element that displays the answer.
+    pub fn panel(&self) -> &str {
+        &self.panel
     }
 }
 
@@ -1580,8 +1633,14 @@ mod observed {
     /// anywhere but this file, so a plausible-looking finding cannot be
     /// assembled by hand — the same trick, and the same reason, as
     /// `gate::seal::Seal`. "No fabricated evidence" is the one rule here that
-    /// is a legal exposure rather than a preference, and a struct with eleven
-    /// public fields and no seal is an invitation to write one.
+    /// is a legal exposure rather than a preference.
+    ///
+    /// **On its own it is only half the rule**, which is why every other field
+    /// of an [`Evidence`](super::Evidence) is private too. A seal is a fact
+    /// about a value's history, so it survives being assigned over: with public
+    /// fields, `real.clone()` and two lines rewrote a reproduced finding into a
+    /// claim about a different prospect and kept the seal. The expensive forgery
+    /// is the struct literal; the cheap one is the edit.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Observed(());
 
@@ -1595,36 +1654,47 @@ mod observed {
 /// A reproducible observation about a prospect's own product.
 ///
 /// Everything needed to repeat it: the exact inputs, the page, the steps, the
-/// verbatim text, when, and which source the comparison used. The fields are
-/// public to read and the value is impossible to *build* outside this module —
-/// see [`observed`]. [`Prober::check`] is the only thing that returns one, and
+/// verbatim text, when, and which source the comparison used. The value can be
+/// read but neither built nor edited outside this module — see [`observed`] and
+/// the note below. [`Prober::check`] is the only thing that returns one, and
 /// only when the observation survived being made twice.
 ///
 /// Deliberately not `Deserialize`: an `Evidence` that can be parsed from JSON
 /// is an `Evidence` that will one day be parsed from model output. Persist the
 /// fields by all means; a claim is made from a fresh observation, not from a
 /// row somebody rehydrated.
+///
+/// # The fields are private, and that is half the seal
+///
+/// The zero-sized [`observed::Observed`] stops the struct literal. It does not
+/// stop `let mut forged = real.clone(); forged.prospect = …; forged.finding =
+/// …;`, which was one line from any crate in the workspace and produced a claim
+/// about a page nobody looked at, carrying the seal that says two runs agreed.
+/// The forgery this type exists to prevent needs no literal — it only needs one
+/// genuine `Evidence` and a field assignment. Reading goes through the
+/// accessors below; `tests/ui/vertical_doctored_evidence.rs` is the compile-fail
+/// that holds it shut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
     /// Who this is about.
-    pub prospect: String,
+    prospect: String,
     /// Their domain, as the gate ruled on it.
-    pub domain: Domain,
+    domain: Domain,
     /// The page the check ran on.
-    pub entry: Url,
+    entry: Url,
     /// The exact inputs.
-    pub probe: Probe,
+    probe: Probe,
     /// What is wrong.
-    pub finding: Finding,
+    finding: Finding,
     /// The panel text, verbatim and still theirs. Fence it before it goes
     /// anywhere near a prompt.
-    pub observed: Untrusted<String>,
+    observed: Untrusted<String>,
     /// The authoritative answer the comparison used, with its provenance.
     ///
     /// `None` when there was no usable one and the finding did not need it —
     /// which is every [`Finding::stands_on_their_page`] finding, and is the
     /// ordinary case on Orizn's keyless surface.
-    pub authority: Option<Answer>,
+    authority: Option<Answer>,
     /// The destination's own consular fee for one entry, when the authority
     /// prices one this traveller would actually pay and dates it inside
     /// [`MAX_FEE_AGE`].
@@ -1636,21 +1706,83 @@ pub struct Evidence {
     /// `None` is the ordinary case and costs nothing: the
     /// [`Finding::UnattributedFee`] sentence is about their page not naming a
     /// side, and it stands whether or not we can say what the real number is.
-    pub fee: Option<ConsularFee>,
+    fee: Option<ConsularFee>,
     /// How long the correct rule has been in force.
-    pub rule_age: RuleAge,
+    rule_age: RuleAge,
     /// When the observation was made.
-    pub observed_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
     /// How to see it again, in order.
-    pub steps: Vec<String>,
+    steps: Vec<String>,
     /// PNG of the panel as it was, from the run that produced this evidence.
-    pub screenshot: Vec<u8>,
+    screenshot: Vec<u8>,
     /// The seal. Not nameable outside this module, which is what makes a
     /// hand-written finding unspellable.
     _observed: observed::Observed,
 }
 
 impl Evidence {
+    /// Who this is about. Ours, so it is safe to render.
+    pub fn prospect(&self) -> &str {
+        &self.prospect
+    }
+
+    /// Their domain, as the gate ruled on it.
+    pub const fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
+    /// The page the check ran on.
+    pub const fn entry(&self) -> &Url {
+        &self.entry
+    }
+
+    /// The exact inputs.
+    pub const fn probe(&self) -> &Probe {
+        &self.probe
+    }
+
+    /// What is wrong.
+    pub const fn finding(&self) -> &Finding {
+        &self.finding
+    }
+
+    /// The panel text, verbatim and still theirs. Fence it before it goes
+    /// anywhere near a prompt.
+    pub const fn observed(&self) -> &Untrusted<String> {
+        &self.observed
+    }
+
+    /// The authoritative answer the comparison used, with its provenance.
+    pub const fn authority(&self) -> Option<&Answer> {
+        self.authority.as_ref()
+    }
+
+    /// The destination's own consular fee for one entry, when there is one this
+    /// traveller would pay and it is dated inside [`MAX_FEE_AGE`].
+    pub const fn fee(&self) -> Option<&ConsularFee> {
+        self.fee.as_ref()
+    }
+
+    /// How long the correct rule has been in force.
+    pub const fn rule_age(&self) -> RuleAge {
+        self.rule_age
+    }
+
+    /// When the observation was made.
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    /// How to see it again, in order.
+    pub fn steps(&self) -> &[String] {
+        &self.steps
+    }
+
+    /// PNG of the panel as it was, from the run that produced this evidence.
+    pub fn screenshot(&self) -> &[u8] {
+        &self.screenshot
+    }
+
     /// The one sentence this finding comes to.
     ///
     /// Built from our own configuration, the probe inputs, and parsed enums.

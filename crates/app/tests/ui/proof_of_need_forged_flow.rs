@@ -12,9 +12,11 @@ use agentos_domain::action::Domain;
 use url::Url;
 
 fn guessed_selectors() -> Flow {
-    // Every field of `Flow` is public to read, and the value is impossible to
-    // build: the ninth field is a private zero-sized seal that only
-    // `Flow::confirmed` can mint, from a stored row with `confirmed_by` on it.
+    // `Flow` is readable through accessors and impossible to build: one of its
+    // fields is a private zero-sized seal that only `Flow::confirmed` can mint,
+    // from a stored row with `confirmed_by` on it. See
+    // `proof_of_need_doctored_flow.rs` for the version that edits a confirmed
+    // one instead.
     Flow {
         prospect: "Airline Example".to_owned(),
         domain: Domain::parse("book.airline.example").unwrap(),
