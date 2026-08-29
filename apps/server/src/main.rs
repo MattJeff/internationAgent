@@ -50,7 +50,9 @@ use std::time::{Duration, Instant};
 use agentos_app::brief::INBOUND_BRIEF;
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
-use agentos_app::inbound::{self, Errand, Recorded, Secret, Thread, record_raw_email_delivery};
+use agentos_app::inbound::{
+    self, Errand, Recorded, Secret, TelephonyLanding, Thread, record_raw_email_delivery,
+};
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::model_access::NoModel;
@@ -314,7 +316,13 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // one place that acts on it. Both calls take the same `Credentials`, so the
     // provisioner cannot buy a number from Twilio that the effects path then
     // texts from a mock.
-    let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
+    // `public_host` is here for one field: a placed call has to tell the
+    // carrier where to report back, and that is this deployment's own webhook
+    // endpoint. See `mocks::telephony_provider`.
+    let ports = Arc::new(agentos_app::mocks::ports_for(
+        &config.credentials,
+        &config.public_host,
+    ));
     // **One vault per deployment, built here**, and since
     // `0050_tenant_model_key` it has exactly one reader: the provisioner's
     // identity canary. The tenant's model credential used to live here too, and
@@ -1267,7 +1275,8 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
     })
 }
 
-/// `webhook.twilio.received`: a text message becomes a conversation and a turn.
+/// `webhook.twilio.received`: a text message becomes a conversation and a turn,
+/// and a call's status callback becomes the answer its `Ok` never was.
 ///
 /// The other missing joint, and the shorter one.
 /// [`agentos_app::inbound::land_inbound_text`] had exactly one caller in this
@@ -1275,6 +1284,16 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
 /// inbound routing implementations that survived a clean-up, and the one whose
 /// comment said it was waiting for an ingest — therefore had none at all. This
 /// is the ingest.
+///
+/// # Two payloads, one door, and the branch is not made here
+///
+/// The same endpoint receives inbound texts and the status callbacks a placed
+/// call reports back on. This handler does not tell them apart and must not:
+/// this crate cannot name `agentos-providers`, so a predicate exported for it
+/// would be a second opinion about what counts as a call callback.
+/// [`agentos_app::inbound::land_telephony_callback`] reads the form once and
+/// dispatches inside the port boundary; what arrives here is which of the two it
+/// was, for the log line.
 ///
 /// # One phase, and no second queue
 ///
@@ -1320,7 +1339,7 @@ fn on_telephony_webhook<'a>(
         // provider is reached through `agentos_app`, never named here — this
         // crate does not depend on `agentos-providers`, which is why the
         // adapter arrives as a port rather than as a type.
-        let landed = agentos_app::inbound::land_inbound_text(
+        let landed = agentos_app::inbound::land_telephony_callback(
             tx,
             &*ports.telephony,
             body.as_bytes(),
@@ -1339,14 +1358,25 @@ fn on_telephony_webhook<'a>(
             }
         })?;
 
-        // No number and no body. Who wrote is in `messages`, behind RLS.
-        tracing::info!(
-            message_id = %landed.message_id,
-            conversation_id = %landed.conversation_id,
-            turn_event_id = %landed.turn_event_id,
-            duplicate = landed.duplicate,
-            "inbound text landed"
-        );
+        match landed {
+            // No number and no body. Who wrote is in `messages`, behind RLS.
+            TelephonyLanding::Text(landed) => tracing::info!(
+                message_id = %landed.message_id,
+                conversation_id = %landed.conversation_id,
+                turn_event_id = %landed.turn_event_id,
+                duplicate = landed.duplicate,
+                "inbound text landed"
+            ),
+            // No number here either, and the status is one of six authored
+            // words — see `CallStatus::as_str`. The number is on the
+            // `provider_call_attempted` row this joins to.
+            TelephonyLanding::Call(call) => tracing::info!(
+                employee_id = %call.employee_id,
+                status = call.status.as_str(),
+                duration_seconds = call.duration_seconds,
+                "a call we placed reported what became of it"
+            ),
+        }
         Ok(())
     })
 }

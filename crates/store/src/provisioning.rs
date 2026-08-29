@@ -530,6 +530,59 @@ pub async fn unsettled_calls(
         .collect())
 }
 
+/// Which employee sent the request the provider settled under `external_id`,
+/// for one `intent_kind`.
+///
+/// **The reverse of [`settle_send_intent`], and the reason it is worth having
+/// is that it is the only reverse there is.** A provider callback arrives
+/// carrying the vendor's own id and nothing else this system put there: no
+/// tenant, no employee, no ruling. The tenant comes from the endpoint the
+/// delivery was verified against (`app::webhooks::Endpoint`), which is what
+/// scopes this transaction; the employee comes from here, out of the row we
+/// wrote *before* the request left and closed with the id the provider handed
+/// back.
+///
+/// `intent_kind` is part of the match on purpose. Ids are opaque and their
+/// namespaces are the vendor's, so a callback about a message and a callback
+/// about a call are told apart by what we were doing, not by the shape of the
+/// string — and a reader that omitted it would attribute a call outcome to a
+/// row that recorded a text.
+///
+/// `None` covers two different situations and neither is an error here:
+/// nothing under that id was ever sent by us, or the send is still `in_flight`
+/// because its answer never arrived, in which case there is no `external_id` to
+/// match at all and [`unsettled_calls`] is where that row surfaces instead. The
+/// caller decides what to do about it.
+///
+/// `ORDER BY created_at DESC` is a tie-break that should never fire —
+/// `external_id` is the provider's own id — and is here so that if one ever
+/// repeats, the answer is the most recent send rather than row order.
+///
+/// ponytail: no index on `external_id`. The scan is inside one tenant's RLS
+/// and this table holds one row per send; add
+/// `provider_intents (tenant_id, external_id)` the day a tenant's send volume
+/// makes a webhook slow, which is a number an operator will see before this
+/// comment does.
+pub async fn employee_for_external_id(
+    tx: &mut TenantTx<'_>,
+    intent_kind: &str,
+    external_id: &str,
+) -> Result<Option<EmployeeId>, StoreError> {
+    let found: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT employee_id FROM provider_intents \
+          WHERE tenant_id = $1 AND intent_kind = $2 AND external_id = $3 \
+          ORDER BY created_at DESC \
+          LIMIT 1",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(intent_kind)
+    .bind(external_id)
+    .fetch_optional(&mut ***tx)
+    .await?;
+
+    Ok(found.flatten().map(EmployeeId::from_uuid))
+}
+
 // ---------------------------------------------------------------------------
 // Finishing a step
 // ---------------------------------------------------------------------------

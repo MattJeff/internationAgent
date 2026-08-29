@@ -341,8 +341,10 @@ callback URL plus sorted form parameters — and it is **wired**, since
 `migrations/0069`. `/v1/webhooks/{path}` picks the verifier from the endpoint's
 `provider`: `twilio` gets this scheme, anything else gets the Svix one. The
 reader at the other end of the queue is `main::on_telephony_webhook`, which
-calls `agentos_app::inbound::land_inbound_text` — one phase, because the
-callback carries the body and there is nothing to fetch.
+calls `agentos_app::inbound::land_telephony_callback` — one phase, because the
+callback carries the body and there is nothing to fetch. That function serves
+both payloads the endpoint receives: an inbound text (`land_inbound_text`) and
+the status callback a placed call reports back on (`land_call_outcome`).
 
 `Endpoint` did **not** grow the `scheme` field this note predicted, and that is
 deliberate: the scheme and the ingest are one choice, `provider` already has to

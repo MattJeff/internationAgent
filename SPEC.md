@@ -519,36 +519,84 @@ are NOT BUILT.**
 
 ## 7. Voice
 
-**The dialling half is built. Everything a call *says* is NOT BUILT.** There is
-no STT, no TTS, no voice gateway and no media handling, and no audio byte is
-ever produced, consumed or stored.
+**A call now says one sentence and reports what became of it. A *conversation*
+is NOT BUILT.** There is still no STT, no voice gateway and no media handling;
+no audio byte is ever produced, consumed or stored in this process; and the only
+websocket in the workspace is still CDP, for browser automation.
 
-What exists is a call that rings and hangs up. `TelephonyProvider::place_call`
-is the **fifth** method on the trait (`crates/providers/src/telephony.rs`);
-`OutboundCall` carries a `from` and a `to` and deliberately no field for what to
-say, because a `script` field would be a place to put words nothing can speak;
-`TwilioTelephony::place_call` posts to `/Calls.json` with
-`telephony_twilio::SILENT_TWIML` — `<Response><Hangup/></Response>` — **inline
-and never as a `Url`**, since a `Url` would mean this deployment composing TwiML
-mid-call, which is the voice half arriving through the back door as a config
-string; and `Effects::place_call` takes an `Authorized<CallPlace>`, reads the
-number off the token, and writes the `provider_call_attempted` audit row. Three
-sentences that stood here are false and are named rather than deleted: the
-`grep` over `crates/providers/src` does **not** return nothing, the trait does
-**not** have four methods, and the adapter does **not** avoid `/Calls.json`. The
-only websocket in the workspace is still CDP, for browser automation.
+### What a call says
 
-**No model can reach it, in two independent places.** `ActionKind::CallPlace`
-has no catalogue row — it sits in `turn::UNSERVED`, whose entry gives the
-reason: a row there would hand a model the power to make a stranger's phone ring
-and say nothing, which is a nuisance call with an audit trail. And
+`OutboundCall` carries `from`, `to` and **`says: Announcement`**. The paragraph
+that stood here said a `script` field would be "a place to put words nothing can
+speak", which was true while every adapter hung up on connect and is not any
+more: `TwilioTelephony::place_call` posts `<Response><Say>…</Say><Hangup/>
+</Response>`, and `<Say>` is **the carrier's** speech synthesis, on the tenant's
+own Twilio account. No model of ours is involved, no key of ours is spent, and
+nothing crosses this process but a form field.
+
+`Announcement` (`crates/providers/src/telephony.rs`) is the whole safety
+argument and it is a *refusal*, not an escaper. `<Say>` is a sibling of `<Dial>`
+in one document, so a free string reaching the adapter is TwiML injection: a
+body ending `</Say><Dial>+1900…</Dial>` is toll fraud billed to the tenant.
+`Announcement::parse` therefore refuses any of `< > & "` and every control
+character, plus empty and over-500-characters (counted in **characters**, so a
+French sentence is not silently halved). There is deliberately **no escaper
+anywhere in the crate** — an escaper is one function an adapter must remember to
+call, and a value that cannot hold a `<` is safe in the SSML or JSON adapter
+somebody writes next.
+
+`Effects::place_call` takes an `Authorized<CallPlace>` and a `RenderedCall`
+(`from` + `says`), reads the *number* off the token and the *words* off the
+argument, and writes the `provider_call_attempted` audit row. A `Url` is still
+**never** sent: a `Url` would mean this deployment composing TwiML mid-call,
+which is the turn-taking loop arriving as a config string.
+
+### Learning the outcome
+
+`Ok` from `place_call` still means only that a carrier agreed to dial. What has
+changed is that the rest arrives:
+
+* `TwilioTelephony::with_status_callback` sets `StatusCallback` and
+  `StatusCallbackEvent=completed` — one event, which for an outbound call covers
+  *busy*, *no answer*, *failed* and *canceled* as well as a call that connected.
+  It is wired at boot from `PUBLIC_HOST` (`mocks::telephony_provider`) and points
+  at **the endpoint every inbound text already arrives at**; no new route, no
+  second scheme. Absent by default, so an unconfigured build behaves exactly as
+  before.
+* The delivery is authenticated by `routes::webhooks` under Twilio's own scheme
+  (§19), unchanged.
+* `inbound::land_telephony_callback` reads the form once. `CallOutcome::read`
+  answers `Some` for a status callback (discriminating on `CallStatus`, not
+  `CallSid` — an inbound voice webhook carries the latter and is not an outcome)
+  and `None` for a text, so one endpoint serves both and the branch cannot
+  disagree with the parser.
+* `inbound::land_call_outcome` **joins** rather than routes: the employee comes
+  from the `provider_intents` row written before the request left and closed with
+  the carrier's own sid, so a callback for a call this tenant did not place is
+  `InboundError::UnknownCall` and a dead letter, not a stranger's call in
+  somebody's trail. It writes one `AuditKind::CallCompleted` row —
+  `call_sid`, `status`, `duration_seconds`.
+* `CallStatus` is a **closed enum** parsed out of the authenticated bytes;
+  anything the vendor adds is `Unknown`, never the string. `Completed` means
+  *connected and then ended* and deliberately does not claim a person heard
+  anything — `MachineDetection` is a paid guess and is not requested.
+
+It records and does not wake: nobody is waiting at the end of a call that is
+already over, and a turn here would be an event no pack can produce.
+
+### What is still NOT BUILT
+
+The reply. A callee's answer is speech, nothing here turns speech into text, and
+`<Gather>` would need this deployment to compose TwiML mid-call. So a call
+broadcasts once and hangs up.
+
+**No model can reach even that, in two independent places.**
+`ActionKind::CallPlace` has no catalogue row — it sits in `turn::UNSERVED`,
+whose entry now reads "a robocall with a decision id". And
 `store::policy::default_ceiling` grants neither `Channel::Voice` nor any calling
-code, and layers only ever narrow, so no tenant can authorise one.
-
-**Receiving, and learning the outcome, are NOT BUILT.** `Ok` from `place_call`
-means a carrier agreed to dial and can never mean anybody answered: busy, no
-answer, an answering machine and a decline all arrive on a status callback no
-route in this build accepts — which is also why no `StatusCallback` is sent.
+code, and layers only ever narrow, so no tenant can authorise one. Nothing in
+this section loosened either, and the only caller of `Effects::place_call` in the
+workspace is a test.
 
 `Channel::Voice` exists in the domain and in the role packs as a *policy*
 channel — an employee's limits can name it — and in `inbound.rs` as a routing
@@ -560,7 +608,9 @@ The intended shape, kept because it is a decision:
 text -> TTS -> PSTN`, terminating in a secure WebSocket voice gateway, storing
 call metadata, transcript, consent/recording disclosure state, summary,
 extracted commitments and follow-up tasks. Audio retention configurable and
-**off by default** unless the tenant explicitly enables it.
+**off by default** unless the tenant explicitly enables it. What is built above
+is the first and last hop of that diagram with the middle removed: text out,
+outcome back, no audio and no transcript.
 
 ---
 
@@ -1454,9 +1504,14 @@ Dead-lettering is the outbox's — 8 attempts, then the row stops being selected
 > `/v1/webhooks/{path}` picks it when the endpoint's `provider` is `twilio`
 > (`migrations/0069` widened the CHECK that had refused that value while no
 > reader existed). The reader is `main::on_telephony_webhook` →
-> `inbound::land_inbound_text`: **one phase**, since the callback carries the
-> body, so the message and its `agent.turn.requested` commit in the same
-> transaction that retires the delivery.
+> `inbound::land_telephony_callback`, which dispatches on the payload — a text
+> goes to `land_inbound_text`, a call's status callback to `land_call_outcome`
+> (§7). Either way it is **one phase**, since the callback carries the body, so
+> the message and its `agent.turn.requested` — or the `call_completed` row —
+> commit in the same transaction that retires the delivery. The branch is made
+> inside `agentos_app` and not in the handler: `apps/server` cannot name
+> `agentos-providers`, so a predicate exported for it would be a second opinion
+> about what counts as a call callback.
 >
 > Two details that are not obvious from the outside. The endpoint registration
 > did **not** grow a `scheme` field — the scheme is a function of `provider`,
@@ -2263,14 +2318,20 @@ An employee can, today:
   and `FriendlyName` and **no `SmsUrl`**, so Twilio has nowhere to deliver. One
   form field, deliberately unset — it points a live carrier at this deployment
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
-- ⏸️ place a voice call — the dialling half is real and unreachable.
+- ⏸️ place a voice call that speaks — real and unreachable.
   `TelephonyProvider::place_call`, `Effects::place_call` and
-  `TwilioTelephony::place_call` against a hermetic fake all exist; no model can
-  propose it (no `call_place` row in `turn::catalogue`) and no tenant can
-  authorise it (the ceiling grants no `voice`). What the callee hears is
-  `SILENT_TWIML` — **what a call says is NOT BUILT** (§7)
-- ❌ **receive** a voice call, or learn the outcome of one it placed —
-  **NOT BUILT**; no route in this build accepts a status callback
+  `TwilioTelephony::place_call` against a hermetic fake all exist, and the callee
+  now hears one sentence (`Announcement` → `<Say>`, the carrier's synthesis on
+  the tenant's account). No model can propose it (no `call_place` row in
+  `turn::catalogue`) and no tenant can authorise it (the ceiling grants no
+  `voice`). **A conversation is NOT BUILT** — the call broadcasts and hangs up
+  (§7)
+- ⏸️ learn the outcome of a call it placed — built and reachable only where a
+  call is. `StatusCallback` → `/v1/webhooks/{path}` → `CallOutcome::read` →
+  `land_call_outcome` → a `call_completed` audit row, joined to the attempt by
+  the carrier's sid (§7)
+- ❌ **receive** a voice call — **NOT BUILT**; nothing answers an inbound voice
+  webhook
 - ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
   Browserbase client with a live CDP driver
 - ✅ store and retrieve secrets without LLM exposure, envelope-encrypted, with

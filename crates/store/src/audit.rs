@@ -222,6 +222,38 @@ pub enum AuditKind {
     /// that inserts the `messages` row and wakes the agent, so the trail cannot
     /// claim a message the conversation does not have.
     MessageReceived,
+    /// A call this employee placed reached its end, and the carrier said what
+    /// became of it. Written by `app::inbound::land_call_outcome`, in the
+    /// transaction that retires the verified status callback.
+    ///
+    /// # It passes the admission test above, where `MessageSent` failed it
+    ///
+    /// The two variants that were removed were things the employee **did**,
+    /// each already carrying an [`ActionKind`] and each already recorded. This
+    /// is neither. Placing the call is
+    /// [`AuditKind::ProviderCallAttempted`], written by `app::effects` the
+    /// moment the carrier agreed to dial; *busy*, *no answer*, an answering
+    /// machine and a decline all happen minutes later, nobody in this system
+    /// causes them, and no [`ActionKind`] names them. It is
+    /// [`AuditKind::MessageReceived`]'s sibling — something that happened *to*
+    /// an employee — and it exists for the identical reason: before this row
+    /// the trail recorded that a stranger's phone had been made to ring and had
+    /// no record whatsoever of whether anybody was there.
+    ///
+    /// The payload is `call_sid`, `status` and `duration_seconds`, and its
+    /// vocabulary is closed: `agentos_providers::telephony::CallStatus::as_str`
+    /// is six authored constants — named in prose because this crate sits below
+    /// that one — so nothing a third party chose is stored here. The
+    /// counterparty's number is deliberately **not** copied. It is already in
+    /// the trail, two hops away and each hop already load-bearing: `call_sid`
+    /// is the `detail.provider_message_id` of the
+    /// [`AuditKind::ProviderCallAttempted`] row, whose `decision_id` names the
+    /// `call_place` ruling that carries `counterparty`. That is the same chain
+    /// `crate::provisioning::UnsettledCall` documents for the same reason — one
+    /// address, in one place, under one tenant's RLS. Copying it here would put
+    /// a number a third party's request supplied into a column nobody would
+    /// re-check.
+    CallCompleted,
     /// An employee signed a payload with its own key. A signature is an
     /// assertion made in the company name, so it leaves a row like any other.
     MessageSigned,
@@ -325,6 +357,7 @@ impl AuditKind {
             AuditKind::ApprovalDecided => "approval_decided",
             AuditKind::CapabilityDecided => "capability_decided",
             AuditKind::MessageReceived => "message_received",
+            AuditKind::CallCompleted => "call_completed",
             AuditKind::MessageSigned => "message_signed",
             AuditKind::MailRefused => "mail_refused",
             AuditKind::ProviderCallAttempted => "provider_call_attempted",

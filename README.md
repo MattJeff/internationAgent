@@ -396,10 +396,15 @@ makes a vendor swap provable rather than hopeful. Resend runs it as
 `IdentityScope::AccountWide`, because its sending domain genuinely is one
 resource for the whole account rather than one per employee.
 
-Never built: the half of voice that speaks — no STT, no TTS, no gateway, and
-`SILENT_TWIML` is all a called party hears. **Placing the call is built**:
-`TelephonyProvider::place_call` reaches `/Calls.json`, and what keeps it out of
-reach is four independent locks, not an absent adapter — no catalogue row, the
+Never built: the half of voice that *listens* — no STT, no gateway, no media,
+so a call broadcasts one sentence and hangs up on whatever is said back.
+**Placing the call, what it says, and what became of it are built**:
+`TelephonyProvider::place_call` reaches `/Calls.json` with
+`<Response><Say>…</Say><Hangup/></Response>` — the carrier's own synthesis on
+the tenant's own account, from an `Announcement` that refuses markup rather than
+escaping it — and the carrier's status callback lands on the existing signed
+webhook endpoint as a `call_completed` audit row. What keeps all of it out of
+reach is independent locks, not an absent adapter: no catalogue row, the
 `UNSERVED` entry, and a shipped ceiling granting neither `Channel::Voice` nor a
 dialling code. This sentence used to say `Channel::Voice` is a policy channel
 and nothing more, which was false the day the adapter landed. Also never built:
