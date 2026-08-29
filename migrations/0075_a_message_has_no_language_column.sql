@@ -1,0 +1,82 @@
+-- 0075_a_message_has_no_language_column: `messages` carries two columns that
+-- `SPEC.md` says do not exist, and one of them is the socket for a classifier
+-- the same paragraph forbids.
+--
+-- ---------------------------------------------------------------------------
+-- THE CONTRADICTION
+-- ---------------------------------------------------------------------------
+--
+-- `0001_core.sql` gives `messages` two nullable columns beside the body:
+--
+--     language             text,
+--     structured_data      jsonb,
+--
+-- `SPEC.md` §17, describing the inbound message, says the opposite in one
+-- sentence:
+--
+--   > There is no `language` field and no `structured_data` field. **Language
+--   > classification is NOT BUILT and must not be** — `crates/app/src/prompt.rs`
+--   > says so explicitly: there is no classifier and there must never be one,
+--   > because a classifier is a place for attacker-controlled text to change how
+--   > the rest of the pipeline treats it.
+--
+-- Both statements were true when they were written — the spec is about the
+-- domain type, the migration is about the table — and nobody read them
+-- together. What is left is a table whose shape invites the thing the spec
+-- bans: a contributor who needs somewhere to put a detected language finds a
+-- column already named for it, already nullable, already granted, and the
+-- review that would have caught a new column never happens.
+--
+-- ---------------------------------------------------------------------------
+-- THAT NOTHING WRITES AND NOTHING READS THEM, EXHIBITED
+-- ---------------------------------------------------------------------------
+--
+-- `structured_data` appears **zero** times in every `.rs` file in the
+-- workspace — not in a query, not in a struct, not in a comment. `language`
+-- appears as a column name in exactly one place, `contacts.language`, which is
+-- a different column on a different table and is genuinely used
+-- (`store::revenue` writes it in `insert_contact` / `upsert_contact` and reads
+-- it back on the follow-up sweep):
+-- it is a preference a *counterparty supplied*, never an inference this
+-- software made about text, so it is not the thing the spec forbids and it is
+-- not touched here.
+--
+-- Every statement in the tree that names `messages` spells its columns out —
+-- there is no `SELECT *` over this table anywhere, so nothing can be reading
+-- them by accident either. There are five writers and no `UPDATE`: three in
+-- production (`app::inbound::land`, `app::inbound::send`, and
+-- `apps/server/src/main.rs`'s `record_reply`) and two test fixtures. None names
+-- either column, so every row that exists has NULL in both.
+--
+-- Asked of the database as well as of the source: neither column carries an
+-- index, a CHECK, a default or a foreign key. `messages` has six indexes and
+-- four CHECK constraints and not one of them mentions either name. Dropping
+-- them is a catalog edit — no rewrite, no data.
+--
+-- ---------------------------------------------------------------------------
+-- WHY DROP RATHER THAN WRITE THE CORRECTION DOWN
+-- ---------------------------------------------------------------------------
+--
+-- `0068` corrected a false sentence in `0061` with prose alone, because the
+-- schema it described was right and only the sentence was wrong. This is the
+-- other case: the sentence in `SPEC.md` is right and the schema is wrong. A
+-- column that should not exist, that holds nothing, that nothing writes and
+-- nothing reads, and whose *name* is an invitation to build a banned feature
+-- is not technical debt to be documented — it is the feature's first line,
+-- already merged.
+--
+-- The narrower alternative was a CHECK pinning both to NULL. It is worse: it
+-- keeps the name, keeps the invitation, and adds a constraint whose only
+-- purpose is to say the column should not be there — two things to read
+-- instead of none.
+--
+-- `if exists` on both, like every other statement in this tree, so a partially
+-- applied migration is re-runnable.
+--
+-- This cannot be undone by a later migration adding the columns back without
+-- somebody writing a paragraph arguing against `SPEC.md` §17, which is the
+-- point.
+
+alter table messages
+  drop column if exists language,
+  drop column if exists structured_data;

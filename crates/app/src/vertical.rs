@@ -4036,6 +4036,85 @@ mod tests {
         }
     }
 
+    /// **The same table, asked of Postgres.**
+    ///
+    /// The test above compares [`Charter::of`] against a list written out by
+    /// hand a few lines up. That list is a *third* copy of the same table —
+    /// the first is the `match` in [`Charter::of`], the second is the
+    /// `employee_charters_role` CHECK — and a copy is not evidence about the
+    /// thing it copies. Three migrations have already had to move that
+    /// constraint (`0029`, `0030`, `0073`), so the drift this guards against is
+    /// not hypothetical; it is the change this column gets.
+    ///
+    /// Both directions matter and only one of them is loud:
+    ///
+    /// * **CHECK narrower than the binary.** `Charter::save` binds
+    ///   `self.role()`, so chartering that seat fails on a `23514` naming the
+    ///   constraint. Loud, immediate, and about the right thing.
+    /// * **CHECK wider than the binary.** Nothing fails on write, because
+    ///   nothing writes it — `Charter::save` is the only writer and it can only
+    ///   emit names the binary has. What the extra literal buys is the hole
+    ///   `0018`'s decision 2 named and this constraint exists to close: an
+    ///   operator at a `psql` prompt can insert a charter naming a pack this
+    ///   build does not have, and [`Charter::of`]'s own doc comment promises
+    ///   that reaching its `_` arm "means the constraint and this match have
+    ///   drifted". Nothing checked that promise. The seat then saves and cannot
+    ///   load, which is a `Corrupt("role")` on every brief that employee is
+    ///   ever given.
+    ///
+    /// So this reads the literals out of `pg_constraint` and asserts set
+    /// equality with the names the binary answers to. Set equality rather than
+    /// two `contains` sweeps: `contains` in one direction admits the wide case
+    /// and `contains` in the other admits the narrow one, and the whole claim
+    /// is that there is exactly one list.
+    #[tokio::test]
+    async fn the_role_check_admits_exactly_the_packs_this_build_has() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+
+        let def: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+              WHERE conname = 'employee_charters_role'",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect(
+            "employee_charters_role is missing entirely: any role string is writable and \
+             `Charter::of` is the only thing left between an operator's typo and a seat \
+             that cannot load",
+        );
+        tx.rollback().await.expect("rollback");
+
+        // `CHECK ((role = ANY (ARRAY['international-buyer'::text, …])))`.
+        // Parsed rather than string-compared: Postgres normalises the
+        // expression it was given, so the literals are the only stable part.
+        let mut in_check: Vec<String> = def
+            .split("'::text")
+            .filter_map(|piece| piece.rsplit_once('\'').map(|(_, name)| name.to_owned()))
+            .collect();
+        in_check.sort();
+        assert!(
+            !in_check.is_empty(),
+            "no string literals came out of `{def}`; this test is reading a constraint \
+             shape it does not understand and is proving nothing"
+        );
+
+        let mut in_binary: Vec<String> = every_charter()
+            .iter()
+            .map(|charter| charter.role().to_owned())
+            .collect();
+        in_binary.sort();
+
+        assert_eq!(
+            in_check, in_binary,
+            "the `employee_charters_role` CHECK and the `Charter::of` match are two \
+             different lists. A name only the CHECK has is a charter an operator can \
+             write and no brief can load; a name only the binary has is a seat that \
+             cannot be chartered at all. Widen or narrow the constraint in a NEW \
+             migration — an applied one cannot be edited."
+        );
+    }
+
     /// A stored objective is re-parsed, not deserialised. A country code the
     /// constructor would refuse must not come back out of the column.
     #[test]
