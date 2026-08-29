@@ -297,6 +297,26 @@ impl From<Denied> for ApiError {
                 "a human approval is required before this action can run",
             )
             .with_extension("approval_id", json!(id.as_uuid().to_string())),
+            // 403 and not 409: unlike the halt, there is no switch of this
+            // tenant's to flip, and unlike a policy refusal there is no layer to
+            // widen. The action is permanently not permitted against this
+            // recipient, which is what Forbidden means.
+            //
+            // The reason crosses, for the halt's reason one step out: it is a
+            // fixed code from a CHECK — `opt_out`, `complaint`, `bounce`,
+            // `legal_request`, `do_not_contact` — never a counterparty's words
+            // and never a model's, and the caller is an authenticated operator
+            // of the tenant whose own list this is. Without it the console reads
+            // "not permitted" and somebody re-tries the send, then escalates;
+            // with it they read "they replied STOP" and stop. It is deliberately
+            // narrower than the audit row, which is the record: no address goes
+            // in the extension, because the caller supplied the address.
+            Denied::Suppressed(reason) => Self::new(
+                StatusCode::FORBIDDEN,
+                code,
+                "this recipient has asked not to be contacted",
+            )
+            .with_extension("suppression_reason", json!(reason)),
             Denied::NotActive(_) | Denied::Policy(_) | Denied::Redemption(_) => {
                 Self::new(StatusCode::FORBIDDEN, code, "the action was not permitted")
             }
@@ -389,6 +409,28 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], json!("pending_approval"));
         assert_eq!(body["approval_id"], json!(id.as_uuid().to_string()));
+    }
+
+    /// A refusal for suppression is the system working, so the console has to
+    /// be able to say *why* without anyone opening a database.
+    #[tokio::test]
+    async fn a_suppressed_recipient_is_a_403_that_says_why() {
+        let (status, _, body) = render(Denied::Suppressed("opt_out".to_owned()).into()).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], json!("suppressed"));
+        assert_eq!(body["suppression_reason"], json!("opt_out"));
+        assert_eq!(
+            body["title"],
+            json!("this recipient has asked not to be contacted"),
+            "\"not permitted\" is what makes an operator retry the send"
+        );
+        // The address is the caller's own request parameter and does not need
+        // echoing back; the audit row is where it is recorded.
+        assert!(
+            !body.to_string().contains('@'),
+            "no address in the response: {body}"
+        );
     }
 
     #[tokio::test]

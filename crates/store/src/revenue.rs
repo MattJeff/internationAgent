@@ -1398,9 +1398,50 @@ pub async fn queueable(
         .collect())
 }
 
+/// Why this address may not be written to, or `None` if it may.
+///
+/// **The one spelling of the suppression question.** There were two before this
+/// — [`suppressed_among`] below and `agentos_app::vertical::suppression_for` —
+/// and a third was about to be written into `agentos_app::gate`, which is the
+/// point at which "the same query, three times" becomes "three places the rule
+/// drifts". `suppression_for` now calls this, [`suppressed_among`] stays because
+/// its shape is genuinely different (one round trip for N addresses), and the
+/// gate calls this in its own decision transaction.
+///
+/// `revenue_suppression_of` and not a `SELECT` over `suppressions`: the table is
+/// under the ordinary per-tenant RLS policy, so a plain read cannot see a
+/// **global** suppression at all — deliberately, since a global row is somebody
+/// else's row. The function is `SECURITY DEFINER` and takes no tenant argument,
+/// which is what makes it the only correct reader; the tenant it scopes to is
+/// the `app.tenant_id` GUC that `tx` has already set.
+///
+/// Both arguments are `Option` and exactly one is normally `Some`, because the
+/// SQL function tests `channel = 'email' AND address = p_email` **or**
+/// `channel = 'phone' AND address = p_phone`: a `NULL` argument matches nothing
+/// on that channel rather than matching everything. Passing both is legal and
+/// asks about a person reachable two ways.
+///
+/// Returns [`StoreError`] and not [`RevenueError`], unlike everything else in
+/// this section: `revenue_suppression_of` is a `stable` `SELECT` and raises no
+/// `P0002`, so [`RevenueError::Suppressed`] is unreachable from here. This
+/// function *reports* a suppression; it cannot be refused by one, and a caller
+/// that had to match an arm which never fires would read it as a promise.
+pub async fn suppression_of(
+    tx: &mut TenantTx<'_>,
+    email: Option<&str>,
+    phone: Option<&str>,
+) -> Result<Option<String>, StoreError> {
+    sqlx::query_scalar("SELECT revenue_suppression_of($1::text, $2::text)")
+        .bind(email)
+        .bind(phone)
+        .fetch_one(&mut ***tx)
+        .await
+        .map_err(Into::into)
+}
+
 /// Which of these addresses are on a suppression list, global one included.
 ///
-/// The batch twin of `agentos_app::vertical::suppression_for`, and it asks the
+/// The batch twin of [`suppression_of`], and it asks the
 /// same question of the same function for the same reason: `suppressions` is
 /// under the ordinary per-tenant RLS policy, so a plain `SELECT` over it cannot
 /// see a **global** suppression at all. `revenue_suppression_of` is

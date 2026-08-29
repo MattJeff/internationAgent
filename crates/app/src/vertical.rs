@@ -3293,19 +3293,15 @@ pub async fn suppression_for(db: &Db, principal: &Principal, to: &EmailAddress) 
             return refuse();
         }
     };
-    // The schema's own lookup and not a `SELECT` over `suppressions`: the table
-    // is under the ordinary per-tenant RLS policy, so a plain read cannot see a
-    // **global** suppression at all — deliberately, and this function is
-    // exactly the reader that would otherwise miss it. `revenue_suppression_of`
-    // is `SECURITY DEFINER` and takes no tenant argument for that reason.
-    let found: Result<Option<String>, _> =
-        sqlx::query_scalar("SELECT revenue_suppression_of($1, null::text)")
-            // `EmailAddress::parse` lower-cases both halves, and the column and
-            // the suppression row have CHECKs saying they are lower case, so
-            // this is an equality test on one spelling rather than three.
-            .bind(to.to_string())
-            .fetch_one(&mut **tx)
-            .await;
+    // `revenue_store::suppression_of` and not a `SELECT` written here: that is
+    // the one spelling of this question, shared with the gate, and the reason it
+    // asks the schema's own `SECURITY DEFINER` function rather than the table is
+    // written there.
+    //
+    // `EmailAddress::parse` lower-cases both halves, and the column and the
+    // suppression row have CHECKs saying they are lower case, so this is an
+    // equality test on one spelling rather than three.
+    let found = revenue_store::suppression_of(&mut tx, Some(&to.to_string()), None).await;
     let _ = tx.rollback().await;
 
     match found {

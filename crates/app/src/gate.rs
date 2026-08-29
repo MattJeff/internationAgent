@@ -103,6 +103,7 @@ use agentos_store::halt;
 use agentos_store::org::{self, TeamSpendRefused};
 use agentos_store::outreach::{self, ContactBudgetError};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
+use agentos_store::revenue;
 use agentos_store::spend::{CapExceeded, Reservation};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Map, Value, json};
@@ -128,6 +129,20 @@ const COUNTERPARTY_KEY: &str = "counterparty";
 
 /// Audit payload key naming a refusal that has no [`DenyReason`].
 const DENIED_KEY: &str = "denied";
+
+/// Metric label and audit code for "this person asked us to stop".
+///
+/// Fixed and low-cardinality: the *reason* travels beside it under
+/// [`SUPPRESSION_REASON_KEY`], so a dashboard can count the refusals without
+/// the five reasons splitting the series.
+const SUPPRESSED: &str = "suppressed";
+
+/// Audit payload key holding **why** an address is suppressed — one of
+/// `opt_out`, `complaint`, `bounce`, `legal_request`, `do_not_contact`, which
+/// is a CHECK in `0011_revenue.sql` and therefore a closed set rather than free
+/// text. Written so an operator reading the row can answer *why did this not
+/// go out* without a second query against a table the answer may have outlived.
+const SUPPRESSION_REASON_KEY: &str = "suppression_reason";
 
 // ---------------------------------------------------------------------------
 // The seal
@@ -157,6 +172,30 @@ mod seal {
 /// The only way to obtain one is [`PolicyGate::authorize`] or
 /// [`PolicyGate::redeem_approval`]. Hold one and you may perform the effect;
 /// there is no other proof and no way to fabricate this one.
+///
+/// # What it proves about a send, and why that is here rather than in `effects`
+///
+/// For the four actions that address a person on a channel — email, SMS,
+/// WhatsApp, a dial — this token is also **proof that the address was not on the
+/// suppression list when the ruling was made**. [`suppressible`] names those
+/// four, both mints consult the list, and the [`seal::Seal`] means no other code
+/// in the workspace can produce one of these.
+///
+/// So a suppressed send is not refused at the wire; it is *unconstructable*.
+/// [`crate::effects::Effects`] takes an `Authorized<A>` by value on every send
+/// method and holds its ports privately, so "an employee wrote to somebody who
+/// unsubscribed" has no expressible path — the same shape as
+/// `Authorized::reservation` carrying the headroom a payment was measured
+/// against, and as `OpenWindow` carrying the number a WhatsApp window was opened
+/// with. The alternative was a lookup repeated inside five `Effects` methods,
+/// which is five copies of one rule and nothing at all for the sixth send
+/// somebody adds.
+///
+/// It proves it **at ruling time**, which is one function call before the wire
+/// on every path in this workspace and is not a lease: nothing holds one of
+/// these across a wait. The one place a token could be old is a redeemed
+/// approval, which is why `redeem_approval` asks again rather than trusting the
+/// ruling that filed it.
 #[derive(Debug)]
 pub struct Authorized<A> {
     action: A,
@@ -335,6 +374,25 @@ pub enum Denied {
     #[error("the company is stopped: {0}")]
     Halted(String),
 
+    /// The person this action addresses is on the suppression list — this
+    /// tenant's, or the global one that binds every tenant.
+    ///
+    /// Not a policy denial and deliberately not spelled as one: no operator
+    /// wrote a rule that produced this, no ceiling was reached, and no layer can
+    /// be widened to make it go away. It is a fact about a **stranger's** wish,
+    /// recorded by a bounce, a complaint, a reply saying STOP, or the sending
+    /// platform's own unsubscribes, and the nearest thing to it in this enum is
+    /// [`Denied::Halted`] — a row in a table that outranks the policy.
+    ///
+    /// Carries the reason for the same argument [`Denied::Halted`] carries the
+    /// operator's sentence: "denied" without "because they replied STOP on the
+    /// fourteenth" is a support ticket. Unlike the halt's, this string is not
+    /// free text — `suppressions_reason` is a CHECK over five values — so it is
+    /// safe as a metric dimension and safe in a response. [`Denied::code`] still
+    /// answers the fixed [`SUPPRESSED`] so the label does not split.
+    #[error("suppressed: {0}")]
+    Suppressed(String),
+
     /// The employee is not [`Lifecycle::Active`]. Refused before any policy is
     /// consulted.
     #[error("employee is {0}, not active")]
@@ -377,6 +435,7 @@ impl Denied {
     pub const fn code(&self) -> &'static str {
         match self {
             Denied::Halted(_) => audit::COMPANY_HALTED,
+            Denied::Suppressed(_) => SUPPRESSED,
             Denied::NotActive(_) => "employee_not_active",
             Denied::UnknownEmployee => "unknown_employee",
             Denied::Policy(reason) => reason.code(),
@@ -430,6 +489,9 @@ enum Outcome {
     /// The whole company is stopped. Carries the operator's reason so the audit
     /// row and the refusal say the same sentence.
     Halted(String),
+    /// The counterparty asked not to be contacted. Carries the reason for the
+    /// same purpose the halt's does.
+    Suppressed(String),
     Approval {
         id: ApprovalId,
         decision: Decision,
@@ -516,13 +578,16 @@ impl PolicyGate {
     /// turned off after the approval was filed will not stop it being spent.
     ///
     /// The things that *are* checked are the ones a human decision cannot
-    /// substitute for, and there are **four**: the company has not been
+    /// substitute for, and there are **five**: the company has not been
     /// stopped, the employee is still active, the action presented here is not
-    /// itself derived from untrusted text, and the ledger still has the
-    /// headroom. The halt is the one this sentence used to miss — it was written
-    /// before `waveJ-j2` put the arm below in, and the item it left out is the
-    /// one with the widest blast radius. A list in a doc comment is a list that
-    /// has to be re-counted every time the code below it grows an arm.
+    /// itself derived from untrusted text, the person it addresses has not asked
+    /// us to stop, and the ledger still has the headroom. The halt is the one
+    /// this sentence used to miss — it was written before `waveJ-j2` put the arm
+    /// below in, and the item it left out is the one with the widest blast
+    /// radius. The suppression is the newest, and it is the only one of the five
+    /// that is a fact about somebody outside this company. A list in a doc
+    /// comment is a list that has to be re-counted every time the code below it
+    /// grows an arm, and nothing makes it — count it again when you add one.
     pub async fn redeem_approval<A: Authorizable>(
         &self,
         principal: &Principal,
@@ -595,8 +660,31 @@ impl PolicyGate {
                     Outcome::Deny(DenyReason::UntrustedInput)
                 }
                 Some(Lifecycle::Active) => {
-                    self.redeem(&mut tx, principal, approval_id, nonce, &subject, now)
-                        .await?
+                    // The fifth thing a human decision cannot substitute for,
+                    // and the only one of the five that is not about us. An
+                    // approval is a bearer token filed at 09:00 and spent at
+                    // 14:03; between those the person it addresses can have
+                    // bounced, complained, or replied STOP. Nobody's click
+                    // outranks that — an approver was answering "should we make
+                    // this offer", never "may we still write to them" — so this
+                    // is re-asked here rather than inherited from the ruling
+                    // that filed the row. It is the one control on this path
+                    // that a stale token really could get wrong, which is
+                    // exactly why it is not on the list of things this method
+                    // deliberately does not re-judge.
+                    //
+                    // Refused, not burned: the approval stays pending, like the
+                    // halt's refusal above. That is not a courtesy — a
+                    // suppression can be the wrong person's address recorded by
+                    // a bounce, and destroying a human's decision over it would
+                    // make the repair cost a second signature.
+                    match self.suppression(&mut tx, &subject).await? {
+                        Some(reason) => Outcome::Suppressed(reason),
+                        None => {
+                            self.redeem(&mut tx, principal, approval_id, nonce, &subject, now)
+                                .await?
+                        }
+                    }
                 }
                 Some(other) => Outcome::NotActive(other),
                 None => Outcome::UnknownEmployee,
@@ -636,6 +724,7 @@ impl PolicyGate {
             }),
             Outcome::Deny(reason) => Err(Denied::Policy(reason)),
             Outcome::Halted(reason) => Err(Denied::Halted(reason)),
+            Outcome::Suppressed(reason) => Err(Denied::Suppressed(reason)),
             Outcome::Approval { id, .. } => Err(Denied::PendingApproval(id)),
             Outcome::NotActive(lifecycle) => Err(Denied::NotActive(lifecycle)),
             Outcome::UnknownEmployee => Err(Denied::UnknownEmployee),
@@ -714,6 +803,34 @@ impl PolicyGate {
             }
         };
 
+        // 2b. The suppression list, which outranks the policy and is the only
+        //     control here that is about the *counterparty* rather than about
+        //     this company. A bounce, a complaint, a reply saying STOP, or the
+        //     sending platform's own unsubscribes put the row there; nothing an
+        //     operator can write into a policy layer takes it out.
+        //
+        //     **After the policy load and before the context**, and both halves
+        //     of that were chosen:
+        //
+        //     * after, so a tenant whose policy will not load still gets
+        //       `broken_policy` — that refusal is a page rather than a dashboard
+        //       line, and pre-empting it would silence the alert for exactly the
+        //       deployment that is broken;
+        //     * before, so a refused send neither runs `contacts`' aggregate nor
+        //       reaches `take_contact`. Refusing *after* charging would spend one
+        //       of the day's strangers on a message that never left, and the
+        //       trail's `decision = 'allow'` filter means this row cannot give
+        //       the budget a slot back either — it never takes one.
+        //
+        //     Fails closed by construction: an unreadable list is `Unavailable`,
+        //     the transaction is dropped unaudited (`decide`'s contract — no
+        //     verdict was reached), and no token exists, so nothing is sent.
+        //     That matches `vertical::suppression_for`, which answers "assume
+        //     suppressed" for the same reason.
+        if let Some(reason) = self.suppression(tx, action).await? {
+            return Ok(Outcome::Suppressed(reason));
+        }
+
         // 3. Context, from state, inside this transaction. Each read is asked
         //    only for the actions whose arm of `evaluate` can use the answer —
         //    the ledger for a payment, the roster for a charter, and now the
@@ -787,6 +904,29 @@ impl PolicyGate {
                     .await
             }
         }
+    }
+
+    /// Why this action's recipient may not be written to, or `None` — including
+    /// `None` for every action that has no recipient.
+    ///
+    /// One method, called from both mints, so there is exactly one place the
+    /// question is asked of the gate and it cannot answer differently on the two
+    /// paths. It reads through `tx`, the decision's own transaction: the ruling
+    /// and the list it was ruled against commit or fail together, and the
+    /// `app.tenant_id` GUC that `tenant_tx` set is what scopes
+    /// `revenue_suppression_of`'s tenant half — so a caller cannot ask about a
+    /// tenant it is not, and a **global** row still binds it.
+    async fn suppression(
+        &self,
+        tx: &mut TenantTx<'_>,
+        action: &Action,
+    ) -> Result<Option<String>, Denied> {
+        let Some((email, phone)) = suppressible(action) else {
+            return Ok(None);
+        };
+        revenue::suppression_of(tx, email.as_deref(), phone.as_deref())
+            .await
+            .map_err(Denied::Unavailable)
     }
 
     /// The employee's lifecycle, or `None` when there is no such employee in
@@ -1326,6 +1466,70 @@ fn counterparty(action: &Action) -> Option<String> {
     }
 }
 
+/// The address a permitted action would actually reach, as the
+/// `(email, phone)` pair `revenue_suppression_of` takes — `None` for every
+/// action that reaches no such person.
+///
+/// # This is deliberately **not** [`counterparty`], and that is the whole care
+///
+/// The two functions look like they answer the same question and do not, and
+/// reusing the wrong one has already cost this file a working A2A endpoint once
+/// (see [`counterparty`]'s own note, and [`PolicyGate::take_contact`]'s). That
+/// one answers *whom does the trail record*; this one answers *is this a person
+/// who could have asked us to stop*. `A2aSend` is the difference: a peer is a
+/// counterparty, and its slug is not an address anybody unsubscribes. Feeding it
+/// here would ask the suppression list about `partner-corp` — a string that
+/// matches no row today, because `suppressions_address_normalised` forbids
+/// storing one shaped like that, and so a check that silently never fires. A
+/// control that cannot fire is worse than none: it reads as cover.
+///
+/// Total over [`Action`] with no `_` arm, for [`counterparty`]'s reason and one
+/// stronger: a new channel added to the domain must be *classified* here by
+/// whoever adds it. The failure mode of a wildcard is a new way to write to
+/// somebody who opted out, arriving green.
+///
+/// Both spellings are already what the table stores. `EmailAddress::parse`
+/// lower-cases and `suppressions_address_normalised` requires lower case;
+/// [`E164`](agentos_domain::phone::E164) is `+` and digits and that CHECK's
+/// other branch is `^\+[1-9][0-9]{6,14}$`. So the lookup is an equality test on
+/// one spelling, which is exactly what `agentos_store::revenue::suppress` and
+/// `crate::inbound::suppressible` normalise *to*.
+fn suppressible(action: &Action) -> Option<(Option<String>, Option<String>)> {
+    match action {
+        Action::EmailSend { to } => Some((Some(to.to_string()), None)),
+        Action::SmsSend { to } | Action::WhatsappSend { to } | Action::CallPlace { to } => {
+            Some((None, Some(to.as_str().to_owned())))
+        }
+        // A peer is a machine, addressed by a slug this company agreed with
+        // another company. See above: it is the arm that looks most like it
+        // belongs and does not.
+        Action::A2aSend { .. }
+        // A colleague is not a stranger and cannot unsubscribe from their own
+        // employer; `InternalSend` is a `Slug` on an internal thread, and
+        // `crate::effects::Effects::send_internal` never reaches a provider.
+        | Action::InternalSend { .. }
+        // Nobody, or nobody addressable: a page, a file, a tool, money, a
+        // signature, a credential, an erasure, a charter, an hour in a diary.
+        // An invoice is the one worth a second's thought — it does address a
+        // person — and it is `None` on purpose, exactly as it is `None` in
+        // `counterparty`: a customer with a contract is owed their bill, and a
+        // marketing opt-out is not an instruction to stop invoicing. The day a
+        // *legal* erasure has to stop a bill it will not be this list that says
+        // so, because `suppressions` cannot express "except for money owed".
+        | Action::BrowserRead { .. }
+        | Action::BrowserWrite { .. }
+        | Action::FileUpload { .. }
+        | Action::McpCall { .. }
+        | Action::PaymentCreate { .. }
+        | Action::InvoiceIssue { .. }
+        | Action::ContractSign { .. }
+        | Action::CredentialChange { .. }
+        | Action::DataDelete { .. }
+        | Action::CharterSet { .. }
+        | Action::AppointmentBook {} => None,
+    }
+}
+
 /// The one audit row.
 ///
 /// `decision` is `None` only for refusals the domain has no [`DenyReason`]
@@ -1391,6 +1595,25 @@ fn audit_event(
             payload.insert("halt_reason".to_owned(), json!(reason));
             None
         }
+        // The row that answers "why did this not go out". A refusal for
+        // suppression is the system working, not an incident, and the only way
+        // an operator can tell the two apart is a row that names the reason —
+        // so the code and the reason are both written here, beside the
+        // `counterparty` key this same function already sets from
+        // [`counterparty`]. Who, what channel, and why, on one row, without a
+        // join onto a table whose rows deliberately outlive both the contact and
+        // the tenant.
+        //
+        // Nothing else is added and nothing needs to be: the `scope` is not on
+        // this row on purpose. "Tenant or global" is the internal shape of
+        // somebody else's decision, and a refusal that distinguished them would
+        // tell this tenant that another tenant recorded the opt-out — which is
+        // the oracle `0011_revenue.sql` declines to build a unique index for.
+        Outcome::Suppressed(reason) => {
+            payload.insert(DENIED_KEY.to_owned(), json!(SUPPRESSED));
+            payload.insert(SUPPRESSION_REASON_KEY.to_owned(), json!(reason));
+            None
+        }
         Outcome::BrokenPolicy(err) => {
             payload.insert(DENIED_KEY.to_owned(), json!(broken_code(err)));
             payload.insert("detail".to_owned(), json!(err.to_string()));
@@ -1425,7 +1648,9 @@ mod tests {
     use std::num::NonZeroU32;
     use std::time::{Duration, Instant};
 
-    use agentos_domain::action::{Channel, DataScope, EmailAddress, McpTool};
+    use agentos_domain::action::{
+        CallingCode, Channel, DataScope, Domain, E164, EmailAddress, McpTool,
+    };
     use agentos_domain::ids::{SecretRef, Slug};
     use agentos_domain::money::Currency;
     use agentos_domain::policy::{PolicyLimits, SpendLimits};
@@ -1522,6 +1747,71 @@ mod tests {
         Action::EmailSend {
             to: EmailAddress::parse(to).expect("address"),
         }
+    }
+
+    fn number(raw: &str) -> E164 {
+        E164::parse(raw).expect("E.164")
+    }
+
+    /// Record an opt-out the way production records one: through the store, in
+    /// this tenant's own transaction. Not an `INSERT` written here — a row
+    /// inserted by hand is a row that skipped
+    /// `suppressions_deactivate_contacts`, and half the value of this table is
+    /// what the triggers do in the same statement.
+    async fn suppress(
+        db: &Db,
+        principal: &Principal,
+        channel: revenue::Channel,
+        address: &str,
+        reason: &str,
+        scope: revenue::Scope,
+    ) {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        revenue::suppress(
+            &mut tx,
+            Uuid::now_v7(),
+            &revenue::NewSuppression {
+                channel,
+                address,
+                reason,
+                scope,
+                contact_id: None,
+                note: Some("recorded by a gate test"),
+                suppressed_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("record the opt-out");
+        tx.commit().await.expect("commit the opt-out");
+    }
+
+    /// A policy that allows every channel a person can be reached on, so a
+    /// refusal in these tests is never the *channel* being shut.
+    ///
+    /// That is the whole point of the fixture: `limits()` allows email only, so
+    /// an SMS test built on it would pass just as green with the suppression
+    /// check deleted — `channel_not_allowed` is also a refusal. Here the policy
+    /// says yes to all four and only the list says no.
+    async fn reachable_everywhere(db: &Db, principal: &Principal) -> PolicyGate {
+        with_policy(
+            db,
+            principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([
+                    Channel::Email,
+                    Channel::Sms,
+                    Channel::Whatsapp,
+                    Channel::Voice,
+                ]),
+                allowed_calling_codes: BTreeSet::from(
+                    [CallingCode::new(33).expect("calling code")],
+                ),
+                max_new_contacts_per_day: 20,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
     }
 
     fn eur(minor: u64) -> Money {
@@ -1821,6 +2111,451 @@ mod tests {
             Denied::Redemption(RedemptionFailure::ActionMismatch).code(),
             "approval_action_mismatch"
         );
+        // Low cardinality is the property, not the string: the five reasons
+        // share one label so a dashboard counts opt-outs as one series, and the
+        // reason travels beside it on the row.
+        assert_eq!(Denied::Suppressed("opt_out".to_owned()).code(), SUPPRESSED);
+        assert_eq!(
+            Denied::Suppressed("complaint".to_owned()).code(),
+            Denied::Suppressed("bounce".to_owned()).code()
+        );
+    }
+
+    /// Which actions the suppression list is asked about, and — the half that
+    /// matters — which it is **not**.
+    ///
+    /// A peer is the trap: [`counterparty`] says `Some` for `A2aSend` and this
+    /// must not, because a slug is not an address anybody unsubscribes and
+    /// `suppressions_address_normalised` will not store one shaped like that. A
+    /// check that asks the list about `partner-corp` can never fire, and a
+    /// control that cannot fire reads as cover for one that does not exist.
+    #[test]
+    fn the_list_is_asked_about_people_and_not_about_peers() {
+        // Email goes in the email slot, lower-cased by `EmailAddress::parse` to
+        // the exact spelling the column's CHECK requires.
+        assert_eq!(
+            suppressible(&email("Buyer@Example.COM")),
+            Some((Some("buyer@example.com".to_owned()), None))
+        );
+        // Every phone-shaped action goes in the *phone* slot. Crossed slots
+        // would look identical in a test that only asserted `is_some()`.
+        for action in [
+            Action::SmsSend {
+                to: number("+33612345678"),
+            },
+            Action::WhatsappSend {
+                to: number("+33612345678"),
+            },
+            Action::CallPlace {
+                to: number("+33612345678"),
+            },
+        ] {
+            assert_eq!(
+                suppressible(&action),
+                Some((None, Some("+33612345678".to_owned()))),
+                "{action:?}"
+            );
+        }
+        // The two that address somebody and are still `None`, each for its own
+        // reason: a machine, and a colleague.
+        assert_eq!(
+            suppressible(&Action::A2aSend {
+                peer: Domain::parse("partner.example").expect("domain"),
+            }),
+            None
+        );
+        assert_eq!(
+            suppressible(&Action::InternalSend {
+                to: Slug::parse("lena").expect("slug"),
+            }),
+            None
+        );
+        // And one that has nothing to do with marketing consent at all.
+        assert_eq!(
+            suppressible(&Action::InvoiceIssue {
+                amount: eur(10_000)
+            }),
+            None
+        );
+    }
+
+    /// **The hole this closes, at the door it closes it.**
+    ///
+    /// No `Effects` here on purpose: the claim is not "the send path refuses",
+    /// it is that the *token* cannot be obtained — so an operator send, an
+    /// agent's `send_email` tool, a supplier RFQ and the lead-platform push are
+    /// all covered by one assertion, and so is the sixth call site nobody has
+    /// written. `Authorized` carries a private `Seal`, so `expect_err` here is
+    /// the whole workspace's answer and not this call site's.
+    #[tokio::test]
+    async fn a_suppressed_address_can_never_be_authorised_and_costs_no_budget() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        // `limits()`: email allowed, five strangers a day.
+        let gate = gate(&db, &principal).await;
+        let opted_out = "leaver@example.com";
+
+        // One ordinary send first, so the refusal below is about the list and
+        // not about a fixture that refuses email outright.
+        //
+        // A **different** address, and that is the whole reason this comment is
+        // longer than the line. The first version of this test warmed up
+        // `opted_out` itself, which put it in the trail under `decision =
+        // 'allow'` and therefore made it a *known* contact — and a known contact
+        // is free. So the budget assertion at the end could not tell a refusal
+        // that charged the day from one that did not, and the mutation that
+        // moves this control to *after* `take_contact` — the plausible lazy
+        // placement, the one that spends a stranger on a message that never
+        // leaves — survived it green.
+        gate.authorize(&principal, email("warm@example.com"))
+            .await
+            .expect("an ordinary address is allowed under this policy");
+
+        suppress(
+            &db,
+            &principal,
+            revenue::Channel::Email,
+            opted_out,
+            "opt_out",
+            revenue::Scope::Tenant,
+        )
+        .await;
+
+        let err = gate
+            .authorize(&principal, email(opted_out))
+            .await
+            .expect_err("they asked us to stop");
+        assert!(
+            matches!(&err, Denied::Suppressed(reason) if reason == "opt_out"),
+            "the refusal must carry the why: {err:?}"
+        );
+        assert_eq!(err.code(), SUPPRESSED);
+
+        // What an operator reads. `denied` says what happened, the reason says
+        // why, and `counterparty` says to whom — one row, no join onto a table
+        // whose rows outlive the contact and the tenant both.
+        let rows = audit_rows(&db, &principal).await;
+        let (decision, deny_code, payload) = rows.last().expect("a refusal is still a row");
+        assert_eq!(decision.as_deref(), None, "no `Decision` was reached");
+        assert_eq!(deny_code.as_deref(), None);
+        assert_eq!(payload[DENIED_KEY], json!(SUPPRESSED));
+        assert_eq!(payload[SUPPRESSION_REASON_KEY], json!("opt_out"));
+        assert_eq!(payload[COUNTERPARTY_KEY], json!(opted_out));
+        // The scope is deliberately absent: telling this tenant that somebody
+        // *else* recorded the row is the oracle `0011` declines to build.
+        assert_eq!(payload.get("scope"), None);
+
+        // **The refusal takes nothing.** `max_new_contacts_per_day` is 5 and
+        // one was spent on `warm@example.com`, so four strangers remain. If the
+        // suppressed attempt had charged the day — the control after the
+        // bookkeeping rather than before it — the last of these would come back
+        // `contact_budget_exhausted`.
+        for i in 0..4 {
+            gate.authorize(&principal, email(&format!("fresh-{i}@example.com")))
+                .await
+                .unwrap_or_else(|err| panic!("stranger {i} is inside the budget: {err:?}"));
+        }
+        let err = gate
+            .authorize(&principal, email("one-too-many@example.com"))
+            .await
+            .expect_err("the sixth stranger is over the ceiling");
+        assert_eq!(
+            err.code(),
+            DenyReason::ContactBudgetExhausted.code(),
+            "the budget must run out on the sixth, not the fifth: {err:?}"
+        );
+    }
+
+    /// The half a per-tenant `SELECT` cannot see, and the half that must not
+    /// leak the other way.
+    ///
+    /// `suppressions` is under ordinary per-tenant RLS, so the only reason a
+    /// `global` row binds anybody is `revenue_suppression_of` being
+    /// `SECURITY DEFINER`. Both directions are asserted, because a check that
+    /// ignored `scope` entirely — matching any row for any tenant — would pass
+    /// the first assertion and is exactly the mistake that leaks one tenant's
+    /// list into another's.
+    #[tokio::test]
+    async fn a_global_opt_out_binds_a_tenant_that_cannot_read_it() {
+        let Some(db) = db().await else { return };
+        let theirs = seed(&db, "active").await;
+        let ours = seed(&db, "active").await;
+        let gate = gate(&db, &ours).await;
+
+        let everywhere = "erased@example.com";
+        let only_theirs = "theirs@example.com";
+        suppress(
+            &db,
+            &theirs,
+            revenue::Channel::Email,
+            everywhere,
+            "legal_request",
+            revenue::Scope::Global,
+        )
+        .await;
+        suppress(
+            &db,
+            &theirs,
+            revenue::Channel::Email,
+            only_theirs,
+            "opt_out",
+            revenue::Scope::Tenant,
+        )
+        .await;
+
+        // Neither row is readable from here — which is the point, and is
+        // asserted rather than assumed.
+        let mut tx = db.tenant_tx(ours.tenant_id).await.expect("tx");
+        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM suppressions")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        tx.commit().await.expect("commit read");
+        assert_eq!(visible, 0, "RLS hides both rows from this tenant");
+
+        let err = gate
+            .authorize(&ours, email(everywhere))
+            .await
+            .expect_err("a global erasure binds every tenant");
+        assert!(matches!(&err, Denied::Suppressed(why) if why == "legal_request"));
+
+        // …and the tenant-scoped one does not travel. Somebody who unsubscribed
+        // from one company has not unsubscribed from ours.
+        gate.authorize(&ours, email(only_theirs))
+            .await
+            .expect("another tenant's list is not ours");
+    }
+
+    /// The channel half. `suppressions` has carried `phone` since `0011` and
+    /// nothing in this workspace had ever asked it that question.
+    ///
+    /// The policy allows all four channels here, so each refusal below is the
+    /// list and not `channel_not_allowed` — see [`reachable_everywhere`]. One
+    /// row, keyed on the person's number, shuts SMS, WhatsApp and the dial
+    /// together, because somebody who says stop is saying it to *us* and not to
+    /// a transport.
+    #[tokio::test]
+    async fn one_phone_opt_out_shuts_the_text_the_message_and_the_dial() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = reachable_everywhere(&db, &principal).await;
+        let quiet = "+33600000001";
+        let reachable = "+33600000002";
+
+        suppress(
+            &db,
+            &principal,
+            revenue::Channel::Phone,
+            quiet,
+            "do_not_contact",
+            revenue::Scope::Tenant,
+        )
+        .await;
+
+        for action in [
+            Action::SmsSend { to: number(quiet) },
+            Action::WhatsappSend { to: number(quiet) },
+            Action::CallPlace { to: number(quiet) },
+        ] {
+            let err = gate
+                .authorize(&principal, action.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Denied::Suppressed(why) if why == "do_not_contact"),
+                "{action:?} reached a token: {err:?}"
+            );
+        }
+
+        // The other number is untouched — a phone suppression that refused
+        // every number would pass every assertion above.
+        gate.authorize(
+            &principal,
+            Action::SmsSend {
+                to: number(reachable),
+            },
+        )
+        .await
+        .expect("nobody else opted out");
+
+        // And the channels do not cross: `revenue_suppression_of` is asked with
+        // the number in the *phone* argument, so an address that happens to
+        // equal it matches nothing. `suppressions_address_normalised` forbids
+        // storing an email shaped like a number, so this is the reverse test —
+        // the email arm still works with a phone row on the table.
+        gate.authorize(&principal, email("still-reachable@example.com"))
+            .await
+            .expect("a phone opt-out is not an email opt-out");
+    }
+
+    /// A list that will not answer refuses the send, and does it through the
+    /// **named** function.
+    ///
+    /// Two properties in one arrangement, and the second is why it is worth a
+    /// database of its own. Dropping `revenue_suppression_of` and watching an
+    /// ordinary email refuse is the only assertion in this file that the gate
+    /// really executes *that* function on *that* path — every other test here
+    /// would stay green if the check consulted some other oracle that happened
+    /// to agree. And the refusal it produces is [`Denied::Unavailable`], not an
+    /// allow: an unreadable suppression list costs one send, never one person's
+    /// opt-out, which is the same direction `vertical::suppression_for` chose
+    /// when it answers "assume suppressed" on a failed read.
+    ///
+    /// Its own database because this is destructive DDL: `scripts/test.sh` gives
+    /// one database per *package*, so dropping a schema function in the shared
+    /// one would break every test beside it — and `private_db` hands back the
+    /// **same** database on the next run, which is why nothing is asserted while
+    /// the function is missing.
+    ///
+    /// # Not one `assert!` between the drop and the restore, and that is the
+    /// arrangement rather than a style
+    ///
+    /// A panic unwinds past any cleanup written after it, so a test that
+    /// asserted first would leave this database without the function *for
+    /// good*, and the next run would fail at its own arrangement with a message
+    /// about something else entirely. The first version of this test did exactly
+    /// that and was caught by the second mutation run, not by the first. So: the
+    /// outcome is captured, the schema is put back from the definition Postgres
+    /// itself stored — `pg_get_functiondef`, never a copy of `0011`'s SQL, which
+    /// would be a second spelling free to drift from the migration — and only
+    /// then is anything asserted.
+    #[tokio::test]
+    async fn a_suppression_list_that_will_not_answer_refuses_the_send() {
+        let Some(db) = private_db("no_suppression_fn").await else {
+            return;
+        };
+        let principal = seed(&db, "active").await;
+        let gate = gate(&db, &principal).await;
+
+        // Green first, so the drop below is the only thing that changed.
+        gate.authorize(&principal, email("reachable@example.com"))
+            .await
+            .expect("the list answers");
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_functiondef('revenue_suppression_of(text,text)'::regprocedure)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the schema's own copy of the lookup");
+        sqlx::query("DROP FUNCTION revenue_suppression_of(text, text)")
+            .execute(&mut *tx)
+            .await
+            .expect("drop the lookup");
+        tx.commit().await.expect("commit the drop");
+
+        let outcome = gate
+            .authorize(&principal, email("reachable@example.com"))
+            .await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(sqlx::AssertSqlSafe(definition))
+            .execute(&mut *tx)
+            .await
+            .expect("put the lookup back");
+        // The grant is not in `pg_get_functiondef`, and without it the next run
+        // arranges a database whose gate cannot read the list at all.
+        sqlx::query("GRANT EXECUTE ON FUNCTION revenue_suppression_of(text, text) TO app_role")
+            .execute(&mut *tx)
+            .await
+            .expect("re-grant");
+        tx.commit().await.expect("commit the restore");
+
+        let err = outcome.expect_err("a list that cannot be read must not be assumed empty");
+        assert!(
+            matches!(err, Denied::Unavailable(_)),
+            "fails closed, and says it could not reach a verdict: {err:?}"
+        );
+
+        // No verdict, no row — `decide`'s contract, and the reason a refusal
+        // here is not audited while every other refusal in this file is.
+        assert!(
+            audit_rows(&db, &principal)
+                .await
+                .iter()
+                .all(|(decision, _, _)| decision.as_deref() == Some("allow")),
+            "a gate that logged a decision it never made would be worse than one \
+             that logged nothing"
+        );
+
+        // And the database is usable again, which is the half a green run this
+        // time says nothing about.
+        gate.authorize(&principal, email("reachable-again@example.com"))
+            .await
+            .expect("the lookup is back");
+    }
+
+    /// A human's click does not outrank a stranger's opt-out.
+    ///
+    /// The row is filed by hand, exactly as
+    /// `an_approval_no_evaluator_ever_ruled_on_is_still_redeemable` files one:
+    /// `evaluate` never answers `RequireApproval` for an email, and the
+    /// property under test is about `redeem_approval`'s own checks rather than
+    /// about how the row got there. The opt-out lands **after** the approval is
+    /// filed, which is the real sequence — an approver at 09:00, a bounce at
+    /// 11:00, a redemption at 14:03.
+    #[tokio::test]
+    async fn an_approval_filed_before_the_opt_out_cannot_be_spent_after_it() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = gate(&db, &principal).await;
+        let changed_their_mind = "approved-then-left@example.com";
+        let action = email(changed_their_mind);
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let filed = approvals::create(
+            &mut tx,
+            &NewApproval {
+                employee_id: Some(principal.employee_id),
+                action: &action,
+                requested_by: "a-human",
+                required_role: APPROVER_ROLE,
+                reason: Some("the founder wants this one sent by hand"),
+                expires_at: now + APPROVAL_TTL,
+            },
+            now,
+        )
+        .await
+        .expect("file the approval");
+        tx.commit().await.expect("commit");
+
+        suppress(
+            &db,
+            &principal,
+            revenue::Channel::Email,
+            changed_their_mind,
+            "complaint",
+            revenue::Scope::Tenant,
+        )
+        .await;
+
+        let err = gate
+            .redeem_approval(&principal, filed.id(), filed.nonce(), action.clone())
+            .await
+            .expect_err("no click outranks a complaint");
+        assert!(matches!(&err, Denied::Suppressed(why) if why == "complaint"));
+
+        // Refused, not burned. A suppression can be the wrong address recorded
+        // by a bounce, and destroying a human's decision over it would make the
+        // repair cost a second signature. `AlreadyDecided` here would prove the
+        // refusal consumed the row.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let state: String = sqlx::query_scalar("SELECT state FROM approvals WHERE id = $1")
+            .bind(filed.id().as_uuid())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read the approval");
+        tx.commit().await.expect("commit read");
+        assert_eq!(state, "pending", "the approval survived the refusal");
+
+        // The audited row says why, on this path too — `finish` is shared, and
+        // this asserts it rather than assuming it.
+        let rows = audit_rows(&db, &principal).await;
+        let payload = &rows.last().expect("a row").2;
+        assert_eq!(payload[DENIED_KEY], json!(SUPPRESSED));
+        assert_eq!(payload[SUPPRESSION_REASON_KEY], json!("complaint"));
     }
 
     #[tokio::test]

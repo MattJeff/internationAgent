@@ -23,6 +23,21 @@
 //!    [`Seller::touch`] before any subject is built. The suppression list is
 //!    not a filter applied to the outcome; it is the first line of the only
 //!    function that can send.
+//!
+//!    **It is no longer the control, and it is kept anyway.**
+//!    [`PolicyGate::authorize`](crate::gate::PolicyGate::authorize) now reads
+//!    the same list, for every addressed action and every caller, and answers
+//!    [`Denied::Suppressed`](crate::gate::Denied::Suppressed) — which is what
+//!    covers the paths this module never saw: an operator's send, the model's
+//!    `send_email` tool, `crate::sourcing`'s RFQ, `crate::queue`'s push to the
+//!    sending platform. What survives here is a **pre-filter that can only
+//!    narrow**: it names its own outcome ([`Contacted::Suppressed`], which a
+//!    dispatch reports differently from a refusal), and it costs a campaign one
+//!    round trip per prospect rather than one ruling per prospect. If it ever
+//!    drifts from the gate it over-refuses, which is a cadence lost, or it
+//!    under-refuses, which the gate catches. Neither direction reaches an
+//!    inbox, and that asymmetry is the whole argument for two copies of one
+//!    question.
 //! 2. **The sequence is over.** A reply or an opt-out ends a [`Sequence`]
 //!    *immediately* and there is no way to un-end one. An agent that keeps
 //!    sequencing after someone answered is what gets a sending domain
@@ -336,11 +351,17 @@ pub fn qualify(prospect: &Prospect, icp: &Icp) -> Result<(), Unqualified> {
 /// before the gate — because a suppression list that is honoured *sometimes* is
 /// not one.
 ///
-/// ponytail: in memory, and the caller owns persistence. There is no
-/// suppression table and this unit does not own the schema; a set loaded into
-/// the [`Seller`] when it is wired up is enough until a second process needs to
-/// write to it, at which point this becomes a query in the same transaction as
-/// the gate's.
+/// ponytail: in memory, and the caller owns persistence — the set is loaded by
+/// [`crate::vertical::suppression_for`] and is one address wide in practice.
+///
+/// The note here used to say this "becomes a query in the same transaction as
+/// the gate's" the day a second process wrote to the list. That day arrived and
+/// the query was written — in `gate.rs`, against `revenue_suppression_of`, in
+/// the decision's own transaction — and this type was **not** deleted, because
+/// the two are not the same control. That one is the enforcement and binds every
+/// caller in the workspace; this one is a pre-filter that names
+/// [`Contacted::Suppressed`] as a distinct outcome for a dispatch to report, and
+/// it can only narrow. See the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Suppression(BTreeSet<EmailAddress>);
 
