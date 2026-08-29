@@ -22,6 +22,70 @@
 //! The claim is filtered on `aggregate_type`, so the two pollers take disjoint
 //! rows and `SKIP LOCKED` does the rest.
 //!
+//! ## What that filter costs, because no index carries it
+//!
+//! `aggregate_type` is a **filter**, not an index key. `outbox_events_claimable_idx`
+//! is `(tenant_id, available_at, id) where published_at is null and attempt_count < 8`
+//! — see `0057` — so `claim_of`'s inner `LIMIT` is a limit on *matching* rows, and
+//! collecting `BATCH` inbound rows means walking that tenant's whole claimable
+//! range until they turn up. When there are none, it walks all of it and returns
+//! nothing. **The cost of this loop's tick is the size of the *other* poller's
+//! backlog**, which is `0046`'s own failure — one population's rows becoming
+//! another reader's latency — arriving through the one door neither `0046` nor
+//! `0057` looked at, because the discriminating column is in neither index.
+//!
+//! Measured, PostgreSQL 17, one tenant, 123 420 events, median of five, the
+//! claim returning zero rows every time:
+//!
+//! ```text
+//! claimable rows of the other type   this loop's claim   the outbox poller's
+//! -----------------------------------------------------------------------------
+//!                              0            0.077 ms            0.063 ms
+//!                            100            0.082 ms            0.188 ms
+//!                          1 000            0.388 ms            0.293 ms
+//!                         10 000            3.31  ms            0.294 ms
+//!                        100 000           29.6   ms            0.368 ms
+//! ```
+//!
+//! The asymmetry is the whole finding: the outbox poller is flat because its own
+//! rows are the majority and it fills a batch immediately, and this loop — the
+//! one deliberately ticking fastest, `IDLE` is 250 ms — pays for a queue it
+//! does not own. Four replicas at 100 000 claimable rows is 0.5 s of database
+//! time a second spent finding nothing.
+//!
+//! **Not closed here, and the number that says when to.** `attempt_count < 8`
+//! bounds how long anything stays claimable — eight attempts under
+//! `outbox::LEASE_SECS` plus the exponential is about twenty minutes — so
+//! the claimable population is bounded by *throughput*, not by uptime, and it
+//! does not grow with a seventeen-day run. At the deployed cadence
+//! (`docs/orizn-roles/*.json`: 66 turns a day across five seats, five events a
+//! turn) seventeen days is 5 610 events *in total*, and the worst reachable
+//! burst is `outbox::requeue_dead_letters`, which zeroes every dead letter of a
+//! tenant in one unbounded statement — a company that sat a fortnight with no
+//! model connected parks about 1 100 turn events, and the operator connecting a
+//! key makes all of them claimable at once. That is 0.4 ms a tick, not 30.
+//!
+//! So this is a note and not a migration. The index that closes it the day a
+//! tenant really does hold five figures of claimable work is narrow — it carries
+//! inbound rows only, so it is written once per notice and never for the events
+//! that are the other 95 %:
+//!
+//! ```sql
+//! create index outbox_events_inbound_claimable_idx
+//!   on outbox_events (tenant_id, available_at, id)
+//!   where published_at is null and attempt_count < 8
+//!     and aggregate_type = 'inbound';
+//! ```
+//!
+//! Built on the same fixture — 100 000 claimable rows, three of them inbound —
+//! the claim goes from **27.2 ms to 0.110 ms** and the plan becomes an
+//! `Index Only Scan using outbox_events_inbound_claimable_idx`, which is the
+//! proof that the table above is about this column and not about the row count.
+//! It is usable only from a **custom** plan, for the reason `claim_of` already
+//! sets out at length about `attempt_count`: the predicate reaches the planner as
+//! `($4 IS NULL OR aggregate_type = $4)` and only a bound value folds it.
+//! `plan_cache_mode` is a cliff there too.
+//!
 //! # Two phases, and the hour that runs out
 //!
 //! [`ingest_email`] is the phase-two half described in [`agentos_app::inbound`]:
