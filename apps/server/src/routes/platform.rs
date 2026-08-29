@@ -591,10 +591,16 @@ fn registration_refused(err: agentos_app::webhooks::EndpointError, tenant_id: Uu
                 "no ingest reads this provider's deliveries",
             )
             .with_detail(
+                // The caller learns which providers work and nothing about how
+                // this deployment is built. An earlier version named the CHECK
+                // constraint and a source path, which is the rule `error.rs`
+                // states first — a constraint name in a body tells a caller a
+                // table's internals and tells them nothing they can act on —
+                // and it is the same leak the companies route was fixed for on
+                // the same day. Widening the set is an operator's job and it is
+                // written where an operator reads it, not in a 400.
                 "provider: no ingest reads this provider's deliveries on this build. \
-                 `email` and `twilio` are wired; a third needs a reader registered in \
-                 `apps/server/src/main.rs` and the `webhook_endpoints_provider_is_wired` \
-                 CHECK widened to match.",
+                 `email` and `twilio` are wired.",
             )
         }
         EndpointError::Store(err) => err.into(),
