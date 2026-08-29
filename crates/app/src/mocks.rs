@@ -212,14 +212,48 @@ fn email_provider(credentials: &Credentials) -> Arc<dyn EmailProvider> {
     }
 }
 
-/// Numbers and messages: Twilio when there is an account, the fake when there
-/// is not.
-fn telephony_provider(credentials: &Credentials) -> Arc<dyn TelephonyProvider> {
+/// Numbers, messages and calls: Twilio when there is an account, the fake when
+/// there is not.
+///
+/// # `public_host` is here because a call now has an answer to bring back
+///
+/// `TwilioTelephony::with_status_callback` is where a placed call learns where
+/// to report what became of it, and the address is
+/// `${PUBLIC_HOST}/v1/webhooks/{TELEPHONY_PROVIDER}` — the endpoint
+/// `AGENTOS_WEBHOOK_SECRETS` serves, which is the same door every inbound text
+/// already arrives at and is verified with the same signature scheme. Nothing
+/// new is opened.
+///
+/// **Only the real adapter gets one, and neither the mock nor [`adapters_for`]
+/// does.** A fake that never dials cannot be called back, and the provisioner
+/// buys and releases numbers — it has no `place_call` on any path — so
+/// `public_host` is [`None`] there rather than an address that would never be
+/// sent. That is what the parameter's `Option` is for; it is not a convenience.
+///
+/// ponytail: derived at boot, so it can only name the *environment* registry's
+/// path — a deployment whose telephony endpoint is a stored `whe_…` row has a
+/// different address and its status callbacks will 404, which loses the outcome
+/// and not the call. `with_status_callback` carries the upgrade path.
+fn telephony_provider(
+    credentials: &Credentials,
+    public_host: Option<&str>,
+) -> Arc<dyn TelephonyProvider> {
     match &credentials.telephony {
-        Some(telephony) => Arc::new(TwilioTelephony::new(
-            telephony.account_sid.clone(),
-            &telephony.auth_token,
-        )),
+        Some(telephony) => {
+            let client = TwilioTelephony::new(telephony.account_sid.clone(), &telephony.auth_token);
+            Arc::new(match public_host {
+                // `callback_origin` and not a `format!` of our own: the route
+                // that *verifies* an incoming delivery reconstructs the same
+                // origin with the same function, and Twilio's scheme MACs it —
+                // so two spellings is every callback refused at the door.
+                Some(host) => client.with_status_callback(format!(
+                    "{}/v1/webhooks/{}",
+                    crate::inbound::callback_origin(host),
+                    agentos_providers::telephony::PROVIDER,
+                )),
+                None => client,
+            })
+        }
         None => Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
     }
 }
@@ -316,7 +350,9 @@ pub fn adapters_for(
 ) -> Adapters {
     Adapters {
         email: email_provider(credentials),
-        telephony: telephony_provider(credentials),
+        // `None`: the provisioner buys and releases numbers and never places a
+        // call, so there is no outcome for a carrier to report back.
+        telephony: telephony_provider(credentials, None),
         browser: browser_provider(credentials),
         // Passed in rather than built here: see `secret_store`. One deployment,
         // one vault, so the provisioning canary a step writes is the one the
@@ -334,7 +370,9 @@ pub fn adapters_for(
 /// only be fetched back by *this* process's mock. That is a property of running
 /// on fakes, not a bug to design around.
 pub fn ports() -> Ports {
-    ports_for(&Credentials::default())
+    // No credentials, so every port is a fake and the address below reaches
+    // nothing: `telephony_provider` only hands it to the real adapter.
+    ports_for(&Credentials::default(), "http://localhost")
 }
 
 /// The ports this deployment's credentials actually select.
@@ -348,10 +386,15 @@ pub fn ports() -> Ports {
 /// stateless, and the only per-instance state in any real adapter is Twilio's
 /// send de-duplication map — which lives on this side, because `Adapters` never
 /// sends anything. Share them the day a third caller needs the same instance.
-pub fn ports_for(credentials: &Credentials) -> Ports {
+///
+/// `public_host` is `PUBLIC_HOST`, and it is here for one field: a placed call
+/// has to tell the carrier where to report back, and that address is this
+/// deployment's own webhook endpoint. See [`telephony_provider`], which is the
+/// only reader and which gives it to the real adapter only.
+pub fn ports_for(credentials: &Credentials, public_host: &str) -> Ports {
     Ports {
         email: email_provider(credentials),
-        telephony: telephony_provider(credentials),
+        telephony: telephony_provider(credentials, Some(public_host)),
         browser: browser_provider(credentials),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
@@ -848,7 +891,7 @@ mod tests {
         };
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let real = ports_for(&live());
+        let real = ports_for(&live(), "https://agents.test");
         let mock = ports();
 
         // -- email: signed with a secret only Resend was handed -------------
@@ -926,10 +969,13 @@ mod tests {
         use agentos_providers::browser::MOCK_PROVIDER;
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let ports = ports_for(&Credentials {
-            browser: live().browser,
-            ..Credentials::default()
-        });
+        let ports = ports_for(
+            &Credentials {
+                browser: live().browser,
+                ..Credentials::default()
+            },
+            "https://agents.test",
+        );
         let ctx = EnsureCtx::new(
             agentos_domain::ids::TenantId::new_v7(Utc::now()),
             agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
@@ -1006,10 +1052,13 @@ mod tests {
 
         // Per adapter, like every other one: an embedding key on its own does
         // not make the mailbox real.
-        let only_embeddings = ports_for(&Credentials {
-            embedder: live().embedder,
-            ..Credentials::default()
-        });
+        let only_embeddings = ports_for(
+            &Credentials {
+                embedder: live().embedder,
+                ..Credentials::default()
+            },
+            "https://agents.test",
+        );
         let body = br#"{"type":"email.received"}"#;
         let timestamp = Utc::now().timestamp().to_string();
         let headers = agentos_providers::email::WebhookHeaders {

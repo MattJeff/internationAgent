@@ -1456,8 +1456,9 @@ independent reasons, any one of them enough.
 
 **Receiving is a different sentence now, and it has exactly one hole.** The
 ingest exists — `/v1/webhooks/{provider}` verifies Twilio's own scheme,
-`main::on_telephony_webhook` reads the row and `inbound::land_inbound_text`
-lands the message and wakes the employee. The hole is at the purchase:
+`main::on_telephony_webhook` reads the row and `inbound::land_telephony_callback`
+lands it — a text through `land_inbound_text`, which wakes the employee; a
+placed call's status callback through `land_call_outcome`, which does not. The hole is at the purchase:
 `TwilioTelephony::ensure_number` sets **no `SmsUrl`** on the number it buys, so
 Twilio has no address to POST to and the verified door is never knocked on. That
 is one form field in one POST, and it is not set because setting it points a
@@ -1554,17 +1555,34 @@ refuses with `not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on
 every deployment, which is why `degraded` is the healthy steady state.
 
 `Channel::Voice` is no longer a policy channel with *nothing* behind it, and it
-is still not a phone call anybody would want to receive. `TelephonyProvider::
-place_call` dials — mock and Twilio, both held to the shared contract suite —
-and `telephony_twilio::SILENT_TWIML` is the whole of what the callee hears: the
-phone rings, they answer, the call ends. Speech synthesis, recognition and a
-turn-taking loop exist nowhere in this tree. So no employee can reach it
-(`call_place` is not in `turn::catalogue`, and `turn::UNSERVED` says why), no
-tenant could authorise it if one could (`default_ceiling` grants neither
-`voice` nor a calling code, and layers only narrow), and no route in this build
-accepts the status callback that would say whether the phone was answered — a
-successful `place_call` means a carrier agreed to dial and never that anybody
-picked up.
+is still not a phone call anybody can hold a conversation on.
+`TelephonyProvider::place_call` dials — mock and Twilio, both held to the shared
+contract suite — and the callee now hears one sentence: `OutboundCall::says`
+renders as `<Say>`, which is **Twilio's** speech synthesis on the tenant's own
+account, so no model or key of ours is spent and no audio crosses this process.
+What became of the call comes back too: `StatusCallback` is posted to the
+telephony webhook endpoint this deployment already receives texts on, and
+`inbound::land_call_outcome` writes a `call_completed` audit row under the
+employee whose `provider_intents` row named the sid.
+
+Recognition and a turn-taking loop still exist nowhere in this tree, so the call
+broadcasts and hangs up. And none of it is reachable: no employee can propose it
+(`call_place` is not in `turn::catalogue`, and `turn::UNSERVED` says why) and no
+tenant could authorise it if one could (`default_ceiling` grants neither `voice`
+nor a calling code, and layers only narrow). A successful `place_call` still
+means a carrier agreed to dial and never that anybody picked up — the difference
+is that the second row now says which.
+
+**Two operational notes if you ever do configure voice.** The status callback
+address is derived at boot from `PUBLIC_HOST` and names the *environment*
+registry's path (`/v1/webhooks/twilio`), so a deployment whose telephony
+endpoint is a stored `webhook_endpoints` row on a minted `whe_…` path will see
+its callbacks answered **404** — the calls still happen, the outcomes are lost,
+and the symptom is `webhook for an unregistered path` in the log. And a callback
+whose `CallSid` matches no `provider_intents` row is `unknown_call`, dead-
+lettered on the first attempt: that is another application on the same Twilio
+account, or a send whose accept-response never reached us (in which case the row
+is in `unsettled_calls` and no callback can ever join to it).
 
 **No key rotation.** One signing key per employee is the primary key of the
 table and `UPDATE` is revoked, so rotation is delete-then-insert with no overlap

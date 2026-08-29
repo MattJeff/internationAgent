@@ -72,9 +72,16 @@ use uuid::Uuid;
 
 use crate::backlog::{Backlog, BacklogError, PgBacklog, WorkAction};
 use crate::calendar::{Calendar, CalendarError, PgCalendar};
+// The server crate deliberately does not depend on `agentos-providers` — see
+// `crate::inbound`'s re-exports for the whole argument. `RenderedCall::says` is
+// the only field on any `Rendered*` here that is not a `String` or a domain
+// type, so without this line a caller outside this crate could hold the token
+// and not the words. Re-exported under its own name: two names for one type is
+// two things to keep in step.
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 use crate::turn::WHOLE_PAGE;
+pub use agentos_providers::telephony::{Announcement, NotSpeakable};
 
 /// What [`Effects::read_page`] answers when this employee has no browser
 /// context to drive.
@@ -528,6 +535,29 @@ pub struct RenderedSms {
     pub body: String,
 }
 
+/// A rendered call, minus the recipient: who is ringing, and what they say.
+///
+/// **The field that took the longest to be honest about is `says`, and it is
+/// not a `String` where its two neighbours are.** [`RenderedSms::body`] and
+/// [`RenderedEmail::body_text`] land in fields of a JSON request; what a call
+/// says lands in a document whose other elements *are the instructions to the
+/// carrier*, so a free string here is a caller composing TwiML. See
+/// [`Announcement`], which refuses markup at construction rather than escaping
+/// it at the wire.
+///
+/// The words themselves are the caller's, and this build has exactly one kind
+/// of caller: Rust holding an [`Authorized`] token. No role pack proposes
+/// [`Action::CallPlace`] and `turn::catalogue` gives it no row, so nothing a
+/// model wrote can arrive here — and if one ever does, it arrives through
+/// `Authorized<Untrusted<CallPlace>>` and the audit row says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedCall {
+    /// The employee's own number.
+    pub from: E164,
+    /// One sentence, spoken by the carrier, to a callee who cannot reply.
+    pub says: Announcement,
+}
+
 /// A rendered WhatsApp message, minus the recipient.
 ///
 /// Mirrors [`OutboundWhatsapp`] rather than wrapping it because the 24-hour
@@ -919,7 +949,7 @@ pub struct Ports {
     /// billed differently, and only one of them can be told somebody
     /// unsubscribed. See [`agentos_providers::leads`].
     pub leads: Arc<dyn LeadSink>,
-    /// SMS, WhatsApp, and the dial. Not what a call says — see
+    /// SMS, WhatsApp, the dial, and the one sentence a call speaks — see
     /// [`Effects::place_call`].
     pub telephony: Arc<dyn TelephonyProvider>,
     /// The employee's browser.
@@ -1286,26 +1316,32 @@ impl Effects {
         self.record_sent(&ok, sent).await
     }
 
-    /// Ring the number on the token, from this employee's own number.
+    /// Ring the number on the token, from this employee's own number, and say
+    /// the sentence.
     ///
-    /// # There is no body, and that is the shape of the honest half
+    /// # There is a body now, and it is the narrowest one in this module
     ///
-    /// Every other message-shaped method here takes a rendered thing beside its
-    /// token — a [`RenderedEmail`], a [`RenderedSms`]. This one takes an
-    /// [`E164`] and nothing else, because there is nothing else to take: the
-    /// call is silent. What a call *says* is speech synthesis, recognition and
-    /// a turn-taking loop over a media stream, none of which exists anywhere in
-    /// this workspace, and a `body: String` parameter here would be an argument
-    /// every adapter throws away. See
-    /// [`OutboundCall`](agentos_providers::telephony::OutboundCall), which has
-    /// no field for it for the same reason, and
-    /// `telephony_twilio::SILENT_TWIML`, which is the whole of what the callee
-    /// hears.
+    /// This method used to take an [`E164`] and nothing else, and the argument
+    /// was that there was nothing else to take: the call was silent, and a
+    /// `body: String` would be an argument every adapter threw away. Something
+    /// speaks it now — the carrier's own synthesis, driven by
+    /// [`Announcement`], on the tenant's Twilio account, with no model of ours
+    /// anywhere near it and no audio byte crossing this process.
     ///
-    /// So this is the *dialling* half of a phone call, built and testable, and
-    /// it is deliberately not reachable by a model: `ActionKind::CallPlace` is
-    /// still in [`crate::turn::UNSERVED`], with the reason rewritten to name
-    /// what is now missing rather than what used to be.
+    /// [`RenderedCall`] is therefore the neighbour of [`RenderedSms`], with one
+    /// difference that is the whole reason the type exists: its words cannot
+    /// contain markup. A call's body lands in a document whose sibling elements
+    /// are instructions to the carrier, so an escaped string would be one
+    /// forgotten escaper away from `<Dial>` and a premium-rate number billed to
+    /// the tenant.
+    ///
+    /// **It is still not reachable by a model, and nothing here changed that.**
+    /// `ActionKind::CallPlace` is still in [`crate::turn::UNSERVED`], so no
+    /// turn is offered the tool; and `store::policy::default_ceiling` still
+    /// grants neither [`Channel::Voice`] nor any calling code, so
+    /// `always_denies(CallPlace)` is true on the shipped ceiling and layers only
+    /// narrow. Both remain true on purpose — see that entry, which now names
+    /// what is left rather than what used to be.
     ///
     /// # `Ok` means the carrier took the request, not that anybody answered
     ///
@@ -1314,8 +1350,15 @@ impl Effects {
     /// `provider_call_attempted` with `effect: "call_place"` and an `ok`
     /// outcome says *we asked a carrier to ring this number and it agreed to*.
     /// Busy, no answer, an answering machine and a decline all happen after
-    /// this returns, they arrive on a status callback no route in this build
-    /// accepts, and none of them can make this row say anything different.
+    /// this returns.
+    ///
+    /// What has changed is that they are no longer unlearnable. They arrive on
+    /// the carrier's status callback, at the same signed endpoint every text
+    /// message arrives at, and
+    /// [`inbound::land_call_outcome`](crate::inbound::land_call_outcome) writes
+    /// a second row — `call_completed`, under the same employee, joined to this
+    /// one by the id returned here. Two rows and not one, because they are two
+    /// facts minutes apart and nobody in this system causes the second.
     ///
     /// The `from` number comes from the caller and the `to` number comes off
     /// the token — never the other way round, and never both from one place.
@@ -1325,13 +1368,14 @@ impl Effects {
     pub async fn place_call<A: Subject<Of = CallPlace>>(
         &self,
         ok: Authorized<A>,
-        from: E164,
+        call: RenderedCall,
     ) -> Result<ProviderMessageId, EffectError> {
         let call = OutboundCall {
-            from,
+            from: call.from,
             // The number that was ruled on, exactly as `send_email` takes its
             // recipient off the token rather than out of a rendered header.
             to: ok.action().subject().to.clone(),
+            says: call.says,
         };
 
         self.begin_send(&ok, TELEPHONY_PORT).await?;
@@ -3729,6 +3773,11 @@ mod tests {
     /// fixture's `allowed_calling_codes`, so it is denied for a reason no other
     /// channel has — and the assertion that matters is not the `Denied`, it is
     /// that the double's dial log did not grow.
+    ///
+    /// The third half is what it said. The words come off the argument, the
+    /// number off the token, and the double records both — so an adapter that
+    /// dialled the right person and spoke somebody else's sentence would fail
+    /// here rather than in production.
     #[tokio::test]
     async fn the_number_dialled_is_the_number_the_gate_ruled_on() {
         let Some(db) = db().await else { return };
@@ -3739,12 +3788,20 @@ mod tests {
 
         let mine = E164::parse("+15005550006").expect("e164");
         let theirs = E164::parse("+14158675309").expect("e164");
+        let says = Announcement::parse("This is Lena from Orizn about purchase order 4471.")
+            .expect("plain words");
         let ok = gate
             .authorize(&principal, CallPlace { to: theirs.clone() })
             .await
             .expect("voice and +1 are both granted by the fixture policy");
         let placed = effects
-            .place_call(ok, mine.clone())
+            .place_call(
+                ok,
+                RenderedCall {
+                    from: mine.clone(),
+                    says: says.clone(),
+                },
+            )
             .await
             .expect("the carrier took it");
 
@@ -3753,9 +3810,11 @@ mod tests {
             phone.dialled(),
             [OutboundCall {
                 from: mine.clone(),
-                to: theirs
+                to: theirs,
+                says
             }],
-            "the numbers are the token's `to` and the caller's `from`, in that order"
+            "the numbers are the token's `to` and the caller's `from`, in that order, and the \
+             words are the caller's"
         );
 
         // And the row an operator reads afterwards. `ok` here means the carrier
