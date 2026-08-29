@@ -693,9 +693,12 @@ a real model name, because a `vector(1536)` from one embedder and a
 `vector(1536)` from another are the same Postgres type and are not the same
 space — mixing them returns nonsense rather than an error.
 
-Retrieval is **hybrid**: a cosine leg and a `websearch_to_tsquery('english')`
+Retrieval is **hybrid**: a cosine leg and a `plainto_tsquery('english')`
 full-text leg, fused in Rust by reciprocal rank fusion (`RRF_K = 60.0`) with
-ties broken on chunk id. The vector leg first issues three `SET LOCAL` GUCs
+ties broken on chunk id. `plainto_tsquery` rather than `websearch_to_tsquery`
+because the query text is a counterparty's message: the websearch parser is a
+query language and would hand the sender `or` (disjunction) and `-` (negation)
+over the one channel that decides what an employee recalls. The vector leg first issues three `SET LOCAL` GUCs
 (`hnsw.iterative_scan`, `hnsw.scan_mem_multiplier`, `hnsw.max_scan_tuples`)
 because RLS filters *after* the HNSW scan, and a filtered vector search silently
 under-returns without them.
