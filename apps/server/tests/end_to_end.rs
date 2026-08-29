@@ -1250,10 +1250,12 @@ const CHART: [(&str, &str, &str, &str, &str, &str); 7] = [
 ///
 /// # What it cannot reach, named rather than skipped
 ///
-/// * **A payment never reaches a provider.** `mocks::ports_for` binds
+/// * **A payment reaches the port and no further.** `mocks::ports_for` binds
 ///   `payments` to `NotConfigured`, which refuses by design — this build has no
-///   payment adapter. So the strongest thing available past the ruling is that
-///   the ledger *gives the money back*, which is asserted.
+///   payment rail and picking one is SPEC §13's open decision. The approval
+///   route does now call `Effects::pay` (link eight), so what is asserted past
+///   the ruling is the two things that *are* observable: the refusal comes back
+///   as a `502` naming `not_configured`, and the ledger *gives the money back*.
 /// * **A webhook cannot start a turn on a deployment running mocks.** The
 ///   route stores a notice, the inbound loop then asks the provider for the
 ///   body, and `MockEmailProvider`'s inbox is filled by `seed_inbound` — an
@@ -1842,16 +1844,34 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         // `routes::approvals` proves the second half.
         //
         // The *same* body the `ops` key was refused above, so the only
-        // difference between the 403 and this 200 is which credential sent it.
+        // difference between the 403 and this 502 is which credential sent it.
         Some(approve_body),
     );
-    assert_eq!(status, 200, "the approval could not be spent: {redeemed:#}");
+    // **502 and not 200, and the difference is link eight.** This route used to
+    // mint an `Authorized<Action>` and drop it, so a redeemed payment was a 200
+    // that had performed nothing. It now redeems into a typed
+    // `effects::PaymentCreate` and calls `Effects::pay` — which reaches
+    // `NotConfigured`, because this build has no payment rail and choosing one
+    // is SPEC §13's open decision. Both facts come back: the approval *was*
+    // spent, and the money did not move.
+    assert_eq!(status, 502, "the approval could not be spent: {redeemed:#}");
     assert_eq!(redeemed["state"], "redeemed", "{redeemed:#}");
     assert_eq!(
+        redeemed["payment_error"], "not_configured",
+        "a build with no payment adapter must say so rather than report a \
+         payment: {redeemed:#}"
+    );
+    // **And the headroom comes back**, which is the half of link eight that is
+    // not about the money. The reservation `redeem_approval` took is released by
+    // `Effects::book_effect` because the payment failed — the same rule the
+    // refusal one band up follows. Before the bridge existed nothing on this
+    // path reached that code, so this number was 25 000: an approved payment
+    // holding the seat's day, and its team's, until midnight, for money that
+    // never moved.
+    assert_eq!(
         server.count(held).await,
-        25_000,
-        "redeeming an approval must take the day's headroom, or an approved \
-         payment is one the budget never saw"
+        0,
+        "money that did not move is holding the day's headroom"
     );
 
     // -- 6. the audit trail is complete -------------------------------------

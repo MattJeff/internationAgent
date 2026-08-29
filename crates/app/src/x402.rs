@@ -116,8 +116,9 @@
 //!    challenge before the taint wire is even reached. See below.
 //! 3. **`PaymentProvider` is `NotConfigured`.** Even an allowed, human-approved
 //!    payment answers `Terminal { code: "not_configured" }` and says so in the
-//!    audit trail. `crates/app/src/mocks.rs` argues why that refusal is worth
-//!    keeping, and this module does not touch it.
+//!    audit trail — and since link eight exists, it says so in a `502` to
+//!    whoever pressed the button as well. `crates/app/src/mocks.rs` argues why
+//!    that refusal is worth keeping, and this module does not touch it.
 //!
 //! # What blocks this, and the two decisions only the founder can take
 //!
@@ -166,67 +167,73 @@
 //! # The bridge from *a human approved* to *the money moved*
 //!
 //! The intended chain is *MCP call → 402 → read → `PaymentCreate` → gate →
-//! budget → human approval → wallet → payment → replay → receipt*. Seven of
-//! those exist and `crates/app/tests/x402_chain.rs` runs them in one hand
-//! against a loopback double, from a real 402 on the wire to the approval line
-//! and its hash. **This section is the eighth link, and it is written here
-//! because the answer used to be spread across four files.**
+//! budget → human approval → wallet → payment → replay → receipt*. Eight of
+//! those exist now. `crates/app/tests/x402_chain.rs` runs the first seven in one
+//! hand against a loopback double, from a real 402 on the wire to the approval
+//! line and its hash; the eighth is `routes::approvals::approve` and its own
+//! `a_replayed_approval_does_not_pay_twice`. **This section is that link, and it
+//! is written here because the answer used to be spread across four files.**
 //!
-//! ## Where it stops, to the line
+//! ## Link eight, and what it is
 //!
-//! `apps/server/src/routes/approvals.rs::approve` calls
+//! `apps/server/src/routes/approvals.rs::approve` used to call
 //! [`PolicyGate::redeem_approval`](crate::gate::PolicyGate::redeem_approval),
-//! gets an `Authorized<Action>` back, returns its `decision_id`, and **drops
-//! it**. Nothing further happens, and nothing further *can*: every method on
-//! [`Effects`](crate::effects::Effects) is bound `A: Subject<Of = …>`, the
-//! `subject!` macro implements [`Subject`](crate::effects::Subject) for one
-//! newtype per effect, and **there is no `impl Subject for Action`**. So the
-//! token that route mints is a receipt for a ruling, not a capability to do
-//! anything with it. `crates/app/tests/ui/effects_untrusted_action.rs` is the
-//! compiler holding that shut.
+//! get an `Authorized<Action>` back, return its `decision_id` and **drop it** —
+//! because `Authorized<Action>` satisfies no [`Effects`](crate::effects::Effects)
+//! bound: every method there is `A: Subject<Of = …>`, the `subject!` macro
+//! implements [`Subject`](crate::effects::Subject) for one newtype per effect,
+//! and there is no `impl Subject for Action`.
+//! `crates/app/tests/ui/effects_untrusted_action.rs` is the compiler holding
+//! that shut and it still holds.
 //!
-//! ## It is a decision, and this is the second time it is being taken
+//! What crossed it is **one arm**, which is what item 1 below always described:
+//! the route destructures `Action::PaymentCreate` out of the already-parsed
+//! request body into [`effects::PaymentCreate`](crate::effects::PaymentCreate),
+//! redeems *that*, and hands the token to
+//! [`Effects::pay`](crate::effects::Effects::pay). Every other variant takes the
+//! path it always took. No new type, no new trait, no `turn::catalogue` row, and
+//! no change to the hash — `PaymentCreate::to_action()` rebuilds the identical
+//! variant, so a swapped payee is still `approval_action_mismatch`.
 //!
-//! `crate::sourcing::place_order` reached the same wall from the other
-//! direction and wrote it down: it returns an `ApprovalId` because *"the only
-//! thing this function could have returned instead is an `Authorized<Action>`,
-//! which no `Effects` method accepts. Money moves later, elsewhere, through a
-//! payment the gate rules on separately."*
+//! **The thing that argument warned against is still not there, and that is why
+//! this was safe to take.** The danger named was a `match` over every variant of
+//! [`Action`] *from a jsonb column* to a newtype, "kept in step with the enum by
+//! nothing", where the arm somebody got wrong is the arm that spends a human's
+//! click on a different effect. There is no translation from jsonb here and no
+//! whole-enum match: one variant, destructured from a value serde already
+//! parsed, with the `else` arm unchanged. The day a second effect wants a
+//! bridge, it is a second arm and the same question is asked again — which is
+//! the shape that does not rot.
 //!
-//! The reason it is a decision rather than an omission: turning the stored
-//! `Action` back into a typed subject is a `match` over every variant of
-//! [`Action`], from a jsonb column to a newtype, kept in step with the enum by
-//! nothing — and the arm somebody got wrong would be the arm that spends a
-//! human's click on a different effect from the one they read. That match is
-//! worth writing when something is waiting on the far side of it. Today nothing
-//! is: `PaymentProvider` is `NotConfigured` (see `crate::mocks`), so it would be
-//! a whole-enum match feeding a port whose contract is to refuse.
+//! `crate::sourcing::place_order` still reaches the same wall from the other
+//! direction and still returns an `ApprovalId`, because *"money moves later,
+//! elsewhere, through a payment the gate rules on separately"* — and this is
+//! that payment's route.
 //!
-//! ## What the dead end costs today, named rather than left to be discovered
+//! ## What it fixed, which was never the money
 //!
-//! A redeemed payment approval reserves. `Authorized::reservation` says the
-//! executor owes it a `spend::settle` or an `org::release` — and the only code
-//! that pays that debt is `Effects::book_effect`, reached from no path that
-//! starts at this route. **So an approved payment holds the day's headroom
-//! until the bucket's day rolls over.** That is the conservative direction —
-//! headroom stays spent and is never handed back for money that did not move —
-//! but it is a real consequence and it is the *first* thing a bridge has to
-//! fix, not the last.
+//! `PaymentProvider` is still `NotConfigured` (see `crate::mocks`), so the
+//! answer is still `Terminal { code: "not_configured" }` and no money moves.
+//! What moved is the ledger. A redeemed payment approval reserves;
+//! `Authorized::reservation` says the executor owes it a `spend::settle` or an
+//! `org::release`, and the only code that pays that debt is
+//! `Effects::book_effect`. Nothing reached it from this route, so **an approved
+//! payment held the day's headroom — the seat's and its team's — until the
+//! bucket rolled over at midnight**, for money that had not moved. That was
+//! named here as *"the first thing a bridge has to fix, not the last"*, and it
+//! is fixed: the reservation is released on the port's refusal, in the same
+//! transaction as the audit row.
 //!
-//! ## What crossing it would take, smallest first
+//! ## What is left, smallest first
 //!
-//! 1. **A typed redemption for one kind.** `redeem_approval` is already generic
-//!    over `A: Authorizable`; the route passes a bare `Action` only because
-//!    that is what the request body deserialises to. The bridge is a route that
-//!    reads the body into [`effects::PaymentCreate`](crate::effects::PaymentCreate)
-//!    when `approvals.action_kind` says `payment_create`, redeems *that*, and
-//!    hands the token to [`Effects::pay`](crate::effects::Effects::pay) with
-//!    the memo. No new type, no new trait, no `turn::catalogue` row — and
-//!    routing through `Effects::pay` is also what settles or releases the
-//!    reservation above. That is the whole of link eight.
-//! 2. **A `PaymentProvider` that is not `NotConfigured`.** Everything in (1) is
-//!    reachable and testable before this exists; it just answers
-//!    `Terminal { code: "not_configured" }` in the audit trail.
+//! 1. ~~A typed redemption for one kind.~~ Built; see above.
+//! 2. **A `PaymentProvider` that is not `NotConfigured`.** Still nothing behind
+//!    the port, and choosing what goes there is a founder's decision, not an
+//!    omission: §13's closing paragraph keeps the wallet design open —
+//!    *customer-controlled funding source, employee wallet or delegated/session
+//!    signer, small balance and strict spend ceiling, non-exportable signing
+//!    key* — and a rail cannot be picked without answering it. Everything in (1)
+//!    is reachable and tested without one.
 //! 3. **The two decisions above** — [`PRICED_ASSETS`] and whether [`Money`]
 //!    grows a sub-minor representation. Those are what make any of it reachable
 //!    from a *402* rather than from a human typing an amount into a form.
@@ -240,6 +247,36 @@
 //!    it, or is its own spend against `turn::Budgets::max_tool_calls`. Written
 //!    here because that is a founder's question and this is the first place it
 //!    is visible.
+//!
+//! ## Paying once, which is the property the bridge had to carry
+//!
+//! `agentos-providers`' reconcile-before-create contract exists because *a
+//! duplicate is the expensive mistake*, and nowhere is it more expensive than
+//! here. Three things hold it, and none of them is a branch in the route:
+//!
+//! * **The approval row.** `approvals::redeem` moves the row out of `pending`
+//!   in the transaction `redeem_approval` commits *before* `Effects::pay` is
+//!   reached. A caller that crashed after the rail answered and retries the same
+//!   `POST .../approve` gets `RedemptionFailure::AlreadyDecided`, and the port is
+//!   never entered. That is the crash-replay guarantee, and it is a state
+//!   transition rather than a comparison.
+//! * **The write-ahead row.** `Effects::pay` commits a `provider_intents` row
+//!   before the port is entered, so *approaches to the rail* are countable after
+//!   the fact — which is what `a_replayed_approval_does_not_pay_twice` counts,
+//!   and what an operator reads as `unsettled_calls` when a rail answers
+//!   nothing at all.
+//! * **The key.** `Effects::key_for` derives the idempotency token from the
+//!   ruling, so a future adapter that reconciles before it creates has a stable
+//!   string to reconcile on — which is the half of the contract only a rail can
+//!   keep, and there is no rail.
+//!
+//! What none of them stops, said plainly: a **turn** that proposes
+//! `Action::PaymentCreate` under a plain `Allow`, crashes, and is retried
+//! proposes a *fresh* action with a fresh ruling and a fresh key. Nothing here
+//! calls that a duplicate, and nothing should invent a rule for it — "same
+//! amount, same payee, same day" is a heuristic, and a heuristic that refuses a
+//! second genuine payment is worse than the loop it closes. The founder's
+//! escalation threshold is what keeps that path narrow today.
 
 use agentos_domain::action::Action;
 use agentos_domain::money::{Currency, Money, MoneyError};

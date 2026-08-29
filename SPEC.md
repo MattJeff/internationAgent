@@ -908,10 +908,16 @@ policy.
 
 ## 13. Payments
 
-**NOT BUILT.** `PaymentProvider` (`crates/app/src/effects.rs`) has one method,
+**NO RAIL.** `PaymentProvider` (`crates/app/src/effects.rs`) has one method,
 `pay`, and exactly one implementation: `NotConfigured`, which returns
 `Terminal { code: "not_configured" }` and logs it at `error` with the amount.
 There is no MPP, no card integration and no wallet.
+
+The path *to* that port is built end to end and tested — proposal, ruling,
+approval, reservation, execution, settle-or-release — so what is missing is one
+adapter, and the reason it is missing is a decision rather than an omission: see
+the wallet paragraph at the end of this section. **No credential, no signing key
+and no chain is touched anywhere in this workspace.**
 
 That refusal is deliberate and worth preserving. A fake that returns a plausible
 payment id is a fake that will one day be believed; `not_configured` is the
@@ -923,16 +929,27 @@ created.
 
 What **is** built is everything around the payment:
 
-1. the agent proposes `Action::PaymentCreate { amount }` (the `pay` tool);
+1. the agent proposes `Action::PaymentCreate { amount, payee }` (the `pay` tool);
 2. the Policy Gate evaluates it against the four-layer `SpendLimits`;
 3. above the threshold it files a human approval, hashed to the exact action;
 4. allowing it **reserves** against the day's bucket in the same transaction —
    see §14;
-5. the port refuses.
+5. `POST /v1/approvals/{id}/approve` redeems a `payment_create` into a typed
+   `effects::PaymentCreate` and calls `Effects::pay`, which writes a
+   `provider_intents` row before the port is entered;
+6. the port refuses, `502 payment_not_performed` with `payment_error:
+   not_configured`, and the reservation is **released** in the same transaction
+   as the audit row.
 
-Steps 5 through 8 of the intended flow — *payment worker creates intent, signer
-signs only the exact approved transaction, rail submits, receipt persisted* —
-are **NOT BUILT**.
+Step 5 is new and is the eighth link of the x402 chain; the reason it was worth
+building against a port that refuses is that it is what settles or releases the
+reservation. Before it, an approved payment held the seat's headroom — and its
+team's — until midnight, for money that had not moved.
+
+The remaining steps — *signer signs only the exact approved transaction, rail
+submits, receipt persisted* — are **NOT BUILT**, and the missing piece is a
+`PaymentProvider` that is not `NotConfigured`. Which rail that is cannot be
+chosen here: it is the wallet decision at the end of this section.
 
 ### x402 — the reading half, and the two decisions that block the rest
 
@@ -989,13 +1006,27 @@ downcast far enough to read the status. See `mcp::refused_the_credential`.
 The seven links that do exist run end to end against a loopback double in
 `crates/app/tests/x402_chain.rs` — a real 402 on the wire, priced, ruled on,
 refused as untrusted, re-proposed by a human, hashed into an approval line and
-reserved — and it stops where the eighth link is missing. **The eighth link is
-where "a human approved" would become "the money moved", and it is a decision
-rather than a gap**: `routes::approvals::approve` mints an `Authorized<Action>`,
-which satisfies no `Effects` bound, and drops it. What that costs today (a
-payment reservation nobody settles or releases) and what crossing it would take,
-in order, is argued in one place — `x402.rs`, "The bridge from a human approved
-to the money moved".
+reserved. **The eighth link — "a human approved" becoming a call to the payment
+port — is now built**, as one arm in `routes::approvals::approve`, and it is
+still a `not_configured` in the audit trail because there is no rail behind the
+port. It is not a whole-enum translation from jsonb, which is what the argument
+against it warned of: one variant, destructured from a body serde already
+parsed, with every other kind unchanged. The full argument, and what is left
+after it, is in one place — `x402.rs`, "The bridge from a human approved to the
+money moved".
+
+**Paying once survives a crash and a replay**, and by a state transition rather
+than a comparison: `approvals::redeem` moves the row out of `pending` in the
+transaction the gate commits *before* `Effects::pay` runs, so a retried
+`approve` is `AlreadyDecided` and the port is never entered a second time.
+`Effects::pay` also writes a `provider_intents` row before it enters the port —
+which every other send has had and this one did not — so approaches to the rail
+are countable, and one that gets no answer at all surfaces as an
+`unsettled_call` for a person. `a_replayed_approval_does_not_pay_twice` is that
+claim against a real database. What is *not* closed: a **turn** that proposes a
+payment, crashes and is retried proposes a fresh action with a fresh ruling and
+a fresh key. No rule here calls that a duplicate, and inventing one ("same
+amount, same payee, same day") would refuse a second genuine payment.
 
 The wallet design this is aimed at, kept as a decision: customer-controlled
 funding source, employee wallet or delegated/session signer, small balance and

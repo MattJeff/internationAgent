@@ -20,13 +20,18 @@
 //!
 //! # Where it stops, and why that is a decision rather than a gap
 //!
-//! Link seven is the last one. `crates/app/src/x402.rs`'s *"The bridge from a
-//! human approved to the money moved"* is the single place that argues it; this
-//! file does not repeat it. The short form is that
-//! `apps/server/src/routes/approvals.rs::approve` mints an `Authorized<Action>`
-//! and drops it, because `Authorized<Action>` satisfies no `Effects` bound —
-//! and the four links past it (wallet, payment, replay, receipt) are blocked on
-//! two decisions about money that only the founder can take.
+//! Link seven is the last one **this file** covers, and that is now a boundary
+//! rather than the end of the chain. Link eight exists —
+//! `apps/server/src/routes/approvals.rs::approve` redeems a `payment_create`
+//! into a typed subject and calls `Effects::pay` — and it is tested where it
+//! lives, in that route's `a_replayed_approval_does_not_pay_twice`, because it
+//! is an HTTP handler in the binary and this is a crate test in `agentos-app`.
+//! What it reaches is a port with nothing behind it, so the money still does not
+//! move. `crates/app/src/x402.rs`'s *"The bridge from a human approved to the
+//! money moved"* is the single place that argues all of it; this file does not
+//! repeat it. The three links past eight (payment, replay, receipt) are blocked
+//! on the wallet decision and on the two decisions about money that only the
+//! founder can take.
 //!
 //! # Why the wire is dialled with `reqwest` and not with the MCP client
 //!
@@ -635,12 +640,14 @@ async fn a_402_becomes_an_approval_line_and_stops_there() {
     assert_eq!(rows[2].2["denied"], json!("approval_action_mismatch"));
     assert_eq!(rows[3].0.as_deref(), Some("allow"));
 
-    // -- and here the chain stops -----------------------------------------
+    // -- and here this test stops -----------------------------------------
     //
-    // `authorized` is an `Authorized<Action>`. It satisfies no `Effects` bound,
-    // so there is nothing this test could call next and nothing the approval
-    // route calls either — it returns the decision id and drops the token. The
-    // four links past this one are argued in `x402.rs`, "The bridge from a
-    // human approved to the money moved".
+    // `authorized` is an `Authorized<Action>`, which satisfies no `Effects`
+    // bound — so there is nothing this test could call next. The route does not
+    // hit that wall: it destructures the payment variant into
+    // `effects::PaymentCreate` *before* redeeming, and hands the resulting token
+    // to `Effects::pay`, which is link eight and is tested there. What it
+    // reaches is `NotConfigured`. The links past it are argued in `x402.rs`,
+    // "The bridge from a human approved to the money moved".
     assert_eq!(authorized.into_action(), action);
 }
