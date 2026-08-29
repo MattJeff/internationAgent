@@ -280,6 +280,19 @@ struct ApprovalView {
 ///
 /// Note that they are not quite dead: [`deny`] takes any `pending` row without
 /// checking `expires_at`, so an operator *can* clear them — one HTTP call each.
+///
+/// **A third reader has since been fixed, and it makes this list grow faster.**
+/// `server::loops::provisioning::already_asked` deduplicated escalations on
+/// `state = 'pending'` with no deadline either, which is a worse bug in that
+/// position: a queue that *shows* a dead row tells the operator something,
+/// whereas a deduplicator that *believes* one is alive suppresses the next
+/// question forever — the overdue step it silenced was never raised to anyone
+/// again. It now carries `expires_at > now()`, the same clause `redeem` uses. The
+/// consequence lands here: a step whose first escalation nobody answered files a
+/// second, so this list can hold several rows for one resource, each naming the
+/// provider reference of a different failed attempt. Written down rather than
+/// discovered, because it changes what "hide them" above would cost — the dead
+/// rows are now a history of what was asked and when, not just clutter.
 async fn list(
     State(state): State<Approvals>,
     principal: Principal,
