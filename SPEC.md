@@ -357,8 +357,51 @@ loop looks the way it does:
   header.
 - **Suppression is account-scoped at the provider**, not per tenant.
   Suppressing an address for one tenant would silently stop every other
-  tenant's employees mailing them. **Per-tenant suppression is NOT BUILT** — it
-  has to be our own table checked before `send`, and that table does not exist.
+  tenant's employees mailing them. **Our own per-tenant table is built.** This
+  line used to say it did not exist. `suppressions`
+  (`migrations/0011_revenue.sql`) is unique on
+  `(tenant_id, channel, address, scope)` with `scope` in `tenant | global`,
+  append-only by trigger, under the ordinary per-tenant RLS policy, and read
+  through `revenue_suppression_of` — `SECURITY DEFINER` precisely so a global
+  opt-out binds every tenant while no tenant can read another's rows.
+- **What is NOT BUILT is a check inside `Effects`.** `Effects::send_email`
+  consults nothing; the ports are private there and no suppression read happens
+  in that file. **The check is real but it is the outreach pipeline's, in two
+  independent layers**, and the difference matters because only one of them
+  catches a path that skips the pipeline.
+
+  *In Rust, before the send.* `Seller::touch` tests
+  `self.suppression.contains(&to)` and returns `Contacted::Suppressed` **before**
+  it reaches `Seller::send`. The set it tests is loaded, not defaulted:
+  `vertical::suppression_for` asks `revenue_suppression_of` for the one address
+  the turn is about and **fails closed** — a database that will not answer costs
+  one prospect a cadence rather than costing somebody who opted out an email.
+  `Seller::new` has exactly two production call sites, both in
+  `apps/server/src/loops/initiative.rs` (`selling_step`, `chasing_step`), and
+  both pass it. Beside them, `queue::suppression` filters a batch export inside
+  the transaction that marks everybody contacted (and errors rather than
+  failing open, because that one commits nothing), and `vertical::contactable`
+  re-asks the lookup in the query that selects who is writable today.
+
+  *In the schema, where it cannot be forgotten.*
+  `contacts_reject_suppressed` fires `BEFORE INSERT OR UPDATE` and raises
+  `P0002`, so a suppressed address cannot exist as an *active* contact row at
+  all — no import and no reactivation. That one is genuinely upstream of every
+  send. `opportunity_events_reject_suppressed` fires `BEFORE INSERT` on
+  `opportunity_events` for `outreach_sent` and four sibling kinds; it is
+  `SECURITY DEFINER` and refuses the row, but it fires on the *record* of the
+  contact, so a send that got past the Rust check is rolled back in the ledger
+  and not in the world.
+
+  **So a caller that reaches `Effects::send_email` without a contact row and
+  without the pipeline — an operator's own send, an agent turn's `send_email`
+  tool — is not checked at all.**
+
+  Rows arrive from outside by three doors, all wired: a Resend `email.bounced`
+  or `email.complained` delivery (`inbound::record_raw_email_delivery` →
+  `record_refusal`), a counterparty's STOP or `REFUSAL_PHRASES` reply inside
+  `land_inbound_text` (on `Email` and `Phone` both), and the sending platform's
+  own list via `queue::reconcile_opt_outs`. See §21.
 - **The sending domain cannot be released.** One adapter owns one sending
   domain and every employee sits on it, so `release` returns
   `Terminal { code: "release_not_supported" }` — not `Ok(())`, which would clear
@@ -476,15 +519,40 @@ are NOT BUILT.**
 
 ## 7. Voice
 
-**NOT BUILT.** There is no STT, no TTS, no voice gateway, no media handling and
-no call placement. `grep -ni "voice\|stt\|tts\|speech\|transcri"` over
-`crates/providers/src` returns nothing; `TelephonyProvider` has four methods and
-none of them is a call; the Twilio adapter never touches `/Calls.json`. The only
-websocket in the workspace is CDP, for browser automation.
+**The dialling half is built. Everything a call *says* is NOT BUILT.** There is
+no STT, no TTS, no voice gateway and no media handling, and no audio byte is
+ever produced, consumed or stored.
 
-`Channel::Voice` exists in the domain and in the role packs purely as a *policy*
+What exists is a call that rings and hangs up. `TelephonyProvider::place_call`
+is the **fifth** method on the trait (`crates/providers/src/telephony.rs`);
+`OutboundCall` carries a `from` and a `to` and deliberately no field for what to
+say, because a `script` field would be a place to put words nothing can speak;
+`TwilioTelephony::place_call` posts to `/Calls.json` with
+`telephony_twilio::SILENT_TWIML` — `<Response><Hangup/></Response>` — **inline
+and never as a `Url`**, since a `Url` would mean this deployment composing TwiML
+mid-call, which is the voice half arriving through the back door as a config
+string; and `Effects::place_call` takes an `Authorized<CallPlace>`, reads the
+number off the token, and writes the `provider_call_attempted` audit row. Three
+sentences that stood here are false and are named rather than deleted: the
+`grep` over `crates/providers/src` does **not** return nothing, the trait does
+**not** have four methods, and the adapter does **not** avoid `/Calls.json`. The
+only websocket in the workspace is still CDP, for browser automation.
+
+**No model can reach it, in two independent places.** `ActionKind::CallPlace`
+has no catalogue row — it sits in `turn::UNSERVED`, whose entry gives the
+reason: a row there would hand a model the power to make a stranger's phone ring
+and say nothing, which is a nuisance call with an audit trail. And
+`store::policy::default_ceiling` grants neither `Channel::Voice` nor any calling
+code, and layers only ever narrow, so no tenant can authorise one.
+
+**Receiving, and learning the outcome, are NOT BUILT.** `Ok` from `place_call`
+means a carrier agreed to dial and can never mean anybody answered: busy, no
+answer, an answering machine and a decline all arrive on a status callback no
+route in this build accepts — which is also why no `StatusCallback` is sent.
+
+`Channel::Voice` exists in the domain and in the role packs as a *policy*
 channel — an employee's limits can name it — and in `inbound.rs` as a routing
-label. No audio bytes are ever produced, consumed or stored.
+label.
 
 The intended shape, kept because it is a decision:
 
@@ -638,11 +706,22 @@ timestamp — needs a second join to `knowledge_sources`. The older spec's list 
 per-result metadata (source URI, timestamp, ACL, checksum on every hit) is **NOT
 BUILT**; those columns exist on the source row, not on the hit.
 
-**ACL is one field: `employee_id`.** `NULL` means tenant-wide, otherwise the
-chunk is scoped to that employee. It is denormalised onto `knowledge_chunks` and
-copied by the INSERT from the source row, so a chunk can never be more visible
-than its source. Tenant isolation is RLS. **Role, group or team ACLs are NOT
-BUILT.**
+**ACL is a three-way scope stored in two columns**, not the one field this line
+used to name. `store::knowledge::Scope` is `Company | Team(uuid) |
+Employee(id)`, written as `(employee_id, team_id)` with at most one of them set
+— `knowledge_sources_one_scope`, from `migrations/0025_knowledge_team_scope.sql`
+— and both are denormalised onto `knowledge_chunks` and copied by the INSERT
+from the source row, so a chunk can never be more visible than its source.
+Tenant isolation is RLS.
+
+**Team ACLs are built.** The retrieval predicate reads the employee's team out
+of `team_memberships` *inside* the query (`crates/store/src/knowledge.rs`), so a
+document follows the team rather than a roster snapshot, and an employee on no
+team gets NULL out of that subquery and therefore matches company-wide chunks
+only. A dissolved team's private documents are deleted with it (`on delete
+cascade`), not orphaned into visibility. **Role and group ACLs are NOT BUILT** —
+they were the other two names in this sentence and they are the two that are
+still absent.
 
 **Checksum exists but is not cryptographic**: FNV-1a 64 over the normalised
 text, prefixed with its length, used to dedupe ingests keyed on
@@ -731,9 +810,25 @@ Binding happens off the request path, in the `mcp` loop, woken by a nudge or a
 300s tick — an MCP endpoint that is down must not delay a listener that has
 nothing else wrong with it.
 
-**NOT BUILT:** authenticating to an MCP server from a vault reference,
-persisting resources and prompts (only tools are listed and stored), and
-protocol negotiation beyond what the SDK does internally.
+**Authenticating to an MCP server is built** — and deliberately *not* from a
+vault reference, which is the whole of what this line used to deny.
+`migrations/0040_mcp_credentials.sql` adds one nullable `sealed_token` column on
+`mcp_servers`: the same envelope as `employee_signing_keys.sealed_private_key`,
+data key wrapped under `tenant=<id>` and the token sealed under
+`mcp://<tenant>/<server>`, so a blob copied between two of one tenant's server
+handles opens neither. NULL means **no header**, never an empty one. It is a
+column rather than a `SecretRef` because `SecretStore` is keyed on
+`(tenant, employee, name)` and a binding has no employee — the binder loop reads
+a whole tenant's configuration with no seat in hand, and inventing a nil
+employee to fit the key would put a UUID naming nobody into an AAD forever.
+`0042_mcp_oauth.sql` adds the authorisation-code flow beside it —
+`mcp_oauth_flows`, `POST /v1/mcp/oauth/start`, `GET /v1/mcp/oauth/callback` —
+and `0043_mcp_hosted.sql` the hosted-package arm. **That is three MCP tables,
+not the two counted above**; the two above are what `0013` created.
+
+**NOT BUILT:** persisting resources and prompts — only tools are listed and
+stored, and there is no `list_resources` or `list_prompts` call anywhere in the
+workspace — and protocol negotiation beyond what the SDK does internally.
 
 ---
 
@@ -1647,9 +1742,24 @@ the database, and rotation is a deploy rather than a migration.
 - Immutable audit trail: `audit_log` in the same transaction as the change;
   `psyche_episodes` has an append-only trigger.
 - Per-tenant rate limits (§20). **Per-employee rate limits are NOT BUILT.**
-- **Abuse/suppression controls for communications are NOT BUILT** at the
-  provider boundary (§4), though the sales vertical has its own suppression
-  table.
+- **Abuse/suppression controls at the provider boundary are built.** This line
+  said they were not. **Three** production doors write `suppressions` (§4), and
+  every one of them starts outside this system: a Resend `email.bounced` or
+  `email.complained` delivery becomes a `Scope::Tenant` row through
+  `inbound::record_raw_email_delivery` → `record_refusal`, claimed off the
+  outbox by `main::on_webhook`; a counterparty's reply matching
+  `inbound::REFUSAL_PHRASES` — or a bare STOP inside an eight-word email — does
+  the same from inside `land_inbound_text`, on `Email` **and** `Phone`; and
+  `queue::reconcile_opt_outs` pulls the sending platform's own opt-out list
+  through `Effects::opted_out` before any export, from
+  `apps/server/src/routes/queue.rs`. `Scope::Tenant` and never `Global` in all
+  three, deliberately: they complained about *us*.
+- **NOT BUILT**, and these are what is actually missing: a suppression check on
+  the general send path — `Effects::send_email` reads none of it (§4) — a
+  per-employee send rate limit (above), and any bounce, complaint or opt-out
+  **metric** to alarm on (§27). Whether the Resend endpoint is subscribed to
+  those two events at all is a checkbox in a dashboard that no code here can
+  read, and `record_refusal` says so at its own door.
 - Explicit approvals for critical actions (§14), with four-eyes: the approver
   must not be the requester, and must hold the required role. An `AuditActor` of
   `Employee` or `System` can never hold an approval role, so an agent cannot
@@ -2139,7 +2249,14 @@ An employee can, today:
   and `FriendlyName` and **no `SmsUrl`**, so Twilio has nowhere to deliver. One
   form field, deliberately unset — it points a live carrier at this deployment
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
-- ❌ place or receive voice calls — **NOT BUILT**
+- ⏸️ place a voice call — the dialling half is real and unreachable.
+  `TelephonyProvider::place_call`, `Effects::place_call` and
+  `TwilioTelephony::place_call` against a hermetic fake all exist; no model can
+  propose it (no `call_place` row in `turn::catalogue`) and no tenant can
+  authorise it (the ceiling grants no `voice`). What the callee hears is
+  `SILENT_TWIML` — **what a call says is NOT BUILT** (§7)
+- ❌ **receive** a voice call, or learn the outcome of one it placed —
+  **NOT BUILT**; no route in this build accepts a status callback
 - ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
   Browserbase client with a live CDP driver
 - ✅ store and retrieve secrets without LLM exposure, envelope-encrypted, with
