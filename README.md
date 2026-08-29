@@ -190,7 +190,17 @@ Postgres view over observations; there is no privilege level at which a score
 can be written by hand. It influences tone and prioritisation and is never an
 input to the Policy Gate.
 
-**Two verticals.**
+**Five role packs, and two of them carry a vertical.** Purchasing, sales,
+customer service, growth and engineering — plus a figurehead seat with no
+channels and no turns, which exists so the org chart's reporting lines are real.
+A pack is an argument rather than a permission list: it partitions the whole
+action space, so a new verb cannot be added without somebody deciding here
+whether this seat may propose it, and each refusal is named. Engineering's
+`proposable` set is identical to growth's, which is the result and not an
+oversight — every trade here ends the same way, *propose, and a human applies*,
+and the verb that would separate reading a repository from mutating one does not
+exist.
+
 
 *Purchasing* sources suppliers, issues RFQs, parses untrusted quotes into typed
 values and ranks them on landed cost with a reproducible tie-break — total, then
@@ -206,6 +216,26 @@ reproduction steps are rendered from the plan that executed, never written
 beside it. A finding a prospect cannot reproduce is a false statement about
 their product, which is a legal problem rather than a bug. The evidence bar is a
 type: an outreach without it does not compile.
+
+**Five internal tools, each a port before a table.** A customer who brings
+Jira, Google Calendar or a Slack desk plugs an adapter in behind the same port;
+one who brings nothing starts complete, and nobody pays twice.
+
+*A shared work board* an employee posts to, claims from and signs off — and who
+it may assign to is the org chart, not a new rule: exactly the people it can
+already give orders to. *A calendar* that promises an hour and is woken by it,
+storing the instant **and the zone it was promised in**, because "Tuesday 3pm"
+is an instant plus whose Tuesday. *A desk* the founder reads and writes from,
+which needed no table at all: a zero-turn seat was already delivered to without
+being woken, so escalations already landed somewhere — what was missing was a
+window and a pen. *Invoicing*, whose hard part is a gap-free number, since a
+Postgres sequence has holes by construction. *A file store* that keeps the
+signed contract as it is, with `digest = sha256(content)` as a CHECK rather than
+a convention.
+
+Two of the five are reachable from a turn today. The others are built and
+deliberately out of reach: a catalogue row costs input tokens on **every** model
+call whether anybody uses it or not, so each verb has to argue for its rent.
 
 **A phone pool, not one number each.** Numbers are tenant-owned with a capacity;
 allocation picks the least-loaded and counts occupancy under a lock rather than
@@ -334,9 +364,17 @@ Real regardless of any credential:
   invents a phone number costs nothing; a mock cipher costs an identity.
 
 Still fake regardless of any credential, and named as such on every boot: the
-**embedder** (a SHA-256 hash, so retrieval returns something and it is not the
-right thing) and the **employee secret vault** (an in-process plaintext map that
+**embedder** and the **employee secret vault** (an in-process plaintext map that
 forgets on restart — not the envelope cipher above, which is real).
+
+The embedder is the one that reads like a feature and is not: `Embedder` has a
+single variant, a SHA-256 hash, so knowledge ingests, chunks, stores and
+retrieves — and ranks by a hash of the text rather than its meaning. It is the
+only part of a running company that is wired, green, tested and wrong at once;
+every other gap here is absent, and an absence cannot be mistaken for working.
+**`docs/RUNNING.md` carries the whole argument**, including why a real embedder
+is a decision rather than a task: on the CLI path a deployment may be running,
+the subscription exposes no embeddings endpoint at all.
 
 **The Policy Gate reads the four layers out of Postgres on every decision.**
 `main.rs` builds it as `PolicyGate::new(db)` and `gate.rs` calls
@@ -358,8 +396,14 @@ makes a vendor swap provable rather than hopeful. Resend runs it as
 `IdentityScope::AccountWide`, because its sending domain genuinely is one
 resource for the whole account rather than one per employee.
 
-Never built: voice (no STT, no TTS, no gateway — `Channel::Voice` is a policy
-channel and nothing more), payments (the port refuses with `not_configured`
+Never built: the half of voice that speaks — no STT, no TTS, no gateway, and
+`SILENT_TWIML` is all a called party hears. **Placing the call is built**:
+`TelephonyProvider::place_call` reaches `/Calls.json`, and what keeps it out of
+reach is four independent locks, not an absent adapter — no catalogue row, the
+`UNSERVED` entry, and a shipped ceiling granting neither `Channel::Voice` nor a
+dialling code. This sentence used to say `Channel::Voice` is a policy channel
+and nothing more, which was false the day the adapter landed. Also never built:
+payments (the port refuses with `not_configured`
 rather than returning a plausible id somebody will one day believe), the Meta
 WhatsApp adapter (so `whatsapp` fails `no_whatsapp_sender` on every deployment
 and `degraded` is the healthy steady state), a served DID document, and key
