@@ -1083,9 +1083,14 @@ mod tests {
 
     /// The whole point of the module: two workers, one step, one winner.
     ///
-    /// Both transactions run genuinely concurrently on separate pooled
-    /// connections. The loser blocks on the row lock and, when it wakes, sees
-    /// the winner's committed lease.
+    /// **What it arranges is eight tasks, not an interleaving.** Nothing makes
+    /// them meet: the first one through commits its lease before most of the
+    /// others have a transaction, so they read a committed `provisioning` row
+    /// and decline for a reason that has nothing to do with locking. That is a
+    /// real assertion — a `claim_step` with no state check at all fails it — and
+    /// it is blind to the *order* of the lock and the predicate, which is the
+    /// defect this module exists to prevent. The test below arranges that one
+    /// rather than hoping for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_workers_race_and_exactly_one_wins() {
         let Some(db) = db().await else { return };
@@ -1124,6 +1129,165 @@ mod tests {
         let (state, owner, ..) = resource_row(&db, tenant, employee, step).await;
         assert_eq!(state, "provisioning");
         assert_eq!(owner, Some(winners[0]));
+
+        teardown(&db, tenant).await;
+    }
+
+    /// **A worker that waited for the row lock decides again after it wakes.**
+    ///
+    /// This is the fifth claim in this workspace and the last one to get a
+    /// contention test. The other four have one — [`crate::outbox::claim_of`],
+    /// [`crate::initiative::claim_due`], [`crate::calendar::claim_due`],
+    /// [`crate::backlog::claim`] — and this one buys phone numbers.
+    ///
+    /// The mutual exclusion in [`claim_step`] is not the `FOR UPDATE` on its own:
+    /// it is that the `state`, `lease_owner` and `lease_until` the decision is
+    /// made on are read **by** that statement. Read them a statement earlier and
+    /// each worker decides against a version of the row it no longer holds — the
+    /// defect that has already been paid for twice here, once as a turn charged
+    /// twice and once as a phone number allocated twice.
+    ///
+    /// # The arrangement, and why every piece of it is load-bearing
+    ///
+    /// A third transaction holds the row's lock and **writes nothing**. That is
+    /// not a stand-in for a production writer, it *is* a production state: it is
+    /// exactly where [`claim_step`] sits between its own `SELECT … FOR UPDATE`
+    /// and its `UPDATE`, one client round trip wide on every claim this product
+    /// makes. Both workers then run the real statement behind it, both are
+    /// confirmed genuinely blocked by [`crate::db::wait_until_blocked`] before
+    /// the holder lets go, and whichever wins the lock first, the other one only
+    /// gets to read the row after the winner's lease is committed.
+    ///
+    /// **The holder must not write, and that is the whole trick.** `claim_step`
+    /// opens with `INSERT … ON CONFLICT DO NOTHING`, and that statement waits on
+    /// a row another transaction has *updated* — so a holder that had already
+    /// written would stop both workers at the insert, before either had read
+    /// anything, and every implementation would pass. Measured against this
+    /// server: a row merely locked `FOR UPDATE` does not make the insert wait
+    /// (0.3 ms), a row updated does. Give this test a holder that writes and it
+    /// stops testing what it is named after.
+    ///
+    /// **The row exists, committed and `pending`, before anyone moves**, for the
+    /// same reason: production always has it — `employee::save` writes all eleven
+    /// rows when the employee is created, and `loops::provisioning`'s `CLAIM_SQL`
+    /// selects `FROM employee_resources`, so it cannot hand out an employee whose
+    /// rows are missing.
+    ///
+    /// # What a second claim costs, and why nothing downstream refuses it
+    ///
+    /// [`begin_intent`] is keyed on the idempotency key and answers a replay with
+    /// the state already on record, so a second holder is told `in_flight`, reads
+    /// that as its own, and calls the provider. [`finish_step`] refuses the stale
+    /// write afterwards, which saves the row and not the money — the number is
+    /// bought by then. This statement is the only thing between the founder and
+    /// two numbers, which is what this module's first line claims.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_workers_that_both_waited_for_the_lock_still_produce_one_claim() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "lockorder").await;
+        let step = Step::Phone;
+
+        // What `employee::save` leaves behind for a fresh employee.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+               (employee_id, step, tenant_id, state, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'pending', $4, $4)",
+        )
+        .bind(employee.as_uuid())
+        .bind(step.as_str())
+        .bind(tenant.as_uuid())
+        .bind(at(T0))
+        .execute(&mut **tx)
+        .await
+        .expect("materialise the pending row");
+        tx.commit().await.expect("commit the pending row");
+
+        // Somebody is inside `claim_step`, past the lock and short of the write.
+        let mut holder = db.tenant_tx(tenant).await.expect("holder tx");
+        sqlx::query(
+            "SELECT 1 FROM employee_resources \
+             WHERE employee_id = $1 AND step = $2 FOR UPDATE",
+        )
+        .bind(employee.as_uuid())
+        .bind(step.as_str())
+        .fetch_one(&mut **holder)
+        .await
+        .expect("hold the row lock");
+
+        // Two workers queue up behind it, each confirmed blocked before the next
+        // one is spawned, so both have decided whatever they are going to decide
+        // while the row still reads `pending`.
+        let mut racing = Vec::new();
+        for worker in [Uuid::now_v7(), Uuid::now_v7()] {
+            let (send_pid, pid) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn({
+                let db = db.clone();
+                async move {
+                    let mut tx = db.tenant_tx(tenant).await.expect("worker tx");
+                    // Before the statement that blocks: a blocked backend
+                    // answers nothing until it is unblocked.
+                    let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut **tx)
+                        .await
+                        .expect("backend pid");
+                    send_pid
+                        .send(backend)
+                        .expect("the test is waiting for this");
+                    let got = claim_step(&mut tx, employee, step, worker, lease(), at(T0)).await;
+                    tx.commit().await.expect("commit the worker");
+                    got
+                }
+            });
+            crate::db::wait_until_blocked(&db, pid.await.expect("the worker's pid")).await;
+            racing.push((worker, task));
+        }
+
+        holder.rollback().await.expect("the holder wrote nothing");
+
+        let mut winners = Vec::new();
+        for (worker, task) in racing {
+            if task
+                .await
+                .expect("the worker finishes")
+                .expect("claim")
+                .is_some()
+            {
+                winners.push(worker);
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "both workers read this step as claimable and then waited for the lock. \
+             Whichever got it second has to decide again on the row it actually \
+             holds; deciding on the read it took before the wait mints a second \
+             claim, and a claim is a provider call. Winners: {winners:?}"
+        );
+
+        // And the row carries one claim's worth of writing, not two.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (state, owner, attempts): (String, Option<Uuid>, i32) = sqlx::query_as(
+            "SELECT state, lease_owner, attempt_count FROM employee_resources \
+             WHERE employee_id = $1 AND step = $2",
+        )
+        .bind(employee.as_uuid())
+        .bind(step.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the row after the race");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, "provisioning");
+        assert_eq!(
+            owner,
+            Some(winners[0]),
+            "the lease belongs to the worker that was told it had it"
+        );
+        assert_eq!(
+            attempts, 1,
+            "a second claim counts itself, and `attempt_count` is what the retry \
+             backoff and `max_attempts` are both computed from"
+        );
 
         teardown(&db, tenant).await;
     }

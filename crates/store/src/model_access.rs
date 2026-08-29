@@ -379,6 +379,17 @@ mod tests {
     /// `Debug` says how many bytes, never which. See [`Connection`]'s own impl:
     /// the envelope is not a secret, but a hundred bytes of it in every log line
     /// that renders an assignment is noise somebody has to re-audit as harmless.
+    ///
+    /// **The instant is fixed, and it is not decoration.** The second assertion
+    /// scans the *whole* rendering for `171` — `0xAB`, what a derived `Debug`
+    /// prints for each byte — and `verified_at` is the only other thing in that
+    /// string made of digits. A clock puts six fractional digits there on macOS
+    /// and nine on Linux, so `171` lands in the search space on its own: four
+    /// three-digit windows, or seven, each one chance in a thousand. Measured
+    /// under `Utc::now()`: 8 failures in 3 000 runs here, ~7 in 1 000 on a
+    /// nanosecond clock — a leak reported where there was none, rare enough that
+    /// the run gets restarted rather than read. Nothing here needs the time of
+    /// day; put `Utc::now()` back and the flake comes back with it.
     #[test]
     fn debug_gives_the_length_of_the_envelope_and_not_its_bytes() {
         let rendered = format!(
@@ -387,7 +398,7 @@ mod tests {
                 access: ModelAccess {
                     path: ModelPath::ApiKey,
                     model: ModelId::Opus5,
-                    verified_at: Utc::now(),
+                    verified_at: DateTime::from_timestamp(1_700_000_000, 0).expect("an instant"),
                 },
                 sealed_key: Some(vec![0xAB; 96]),
             }
