@@ -5363,7 +5363,7 @@ mod tests {
         // the full-text leg has something real to match" — and it was false in
         // two steps. The recall query is not the body, it is the whole framed
         // message including the `from:` and `subject:` lines; and
-        // `websearch_to_tsquery` ANDs every lexeme in it, so a chunk would have
+        // `plainto_tsquery` ANDs every lexeme in it, so a chunk would have
         // to contain 'accounts', the sender's domain, 'subject', 're' and the
         // question. The text leg matched nothing here, ever. What put the
         // document in the prompt was the vector leg — a SHA-256 ranking of the
@@ -5711,9 +5711,17 @@ mod tests {
             // recalls against a real inbound message rather than a search
             // phrase. The document is on file, it answers the question, and it
             // does not arrive: the recall query is the whole framed message and
-            // `websearch_to_tsquery` ANDs every lexeme of it, so the text leg —
+            // `plainto_tsquery` ANDs every lexeme of it, so the text leg —
             // the only leg `retrieve` consults while `Embedder::is_semantic()`
             // is false — matches nothing an email could ever match.
+            //
+            // That sentence was written of `websearch_to_tsquery` and was true
+            // only of the email this fixture happens to send. An `or` anywhere
+            // in an inbound message used to turn the conjunction into a
+            // disjunction and this assertion into a coin toss decided by the
+            // sender — `agentos_store::knowledge`'s `TEXT_SQL` has the fix and
+            // the argument. This test never sent one, which is why it stayed
+            // green over a real hole.
             //
             // This assertion is the inverse of the one that used to be here. The
             // old one passed on the vector leg: a SHA-256 ranking of the single

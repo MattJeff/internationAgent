@@ -160,13 +160,41 @@ const VECTOR_SQL: &str = concat!(
     "LIMIT $4"
 );
 
-/// Full-text leg. `websearch_to_tsquery` because the input is whatever a person
-/// typed into a box; it never raises a syntax error on stray punctuation, which
-/// `to_tsquery` very much does.
+/// Full-text leg. **`plainto_tsquery`, and the choice of parser is a security
+/// boundary rather than ergonomics.**
+///
+/// `$1` is not a search box. Its only production caller is
+/// `agentos_app::knowledge::recall`, whose query text is the first 512
+/// characters of the message a counterparty sent — and while the embedder is
+/// not semantic, this leg is the *only* thing selecting what an employee
+/// recalls. Whoever writes `$1` therefore chooses which of this tenant's
+/// documents reach the model.
+///
+/// `websearch_to_tsquery`, which was here, is a query *language*: `or` is
+/// disjunction, `-` is negation, `"…"` is a phrase. That handed the sender the
+/// query's boolean structure on top of its words, which is two capabilities
+/// nothing above this line intended to grant. Disjunction lets a message that
+/// reads like ordinary correspondence select one named document — under
+/// conjunction, steering costs a message that visibly quotes its target.
+/// Negation is worse and has no conjunctive equivalent at all: extra words only
+/// narrow, so only `-` can *remove* the passage that constrains the sender and
+/// leave a full, plausible top-k in its place. Both are reproduced in
+/// `agentos_app::knowledge`'s
+/// `a_senders_message_is_words_and_not_a_query_language`.
+///
+/// `plainto_tsquery` ANDs every lexeme and has no operators to write, so the
+/// message is words. It keeps the reason `to_tsquery` was rejected: it never
+/// raises a syntax error on stray punctuation, which arbitrary email very much
+/// contains. What it does not fix is selection itself — a sender who writes the
+/// document's own words still gets that document, which
+/// `agentos_app::knowledge` accepts on purpose and argues.
+///
+/// If a human search box ever lands, it gets its own query built from
+/// structured input. It does not get this one back.
 const TEXT_SQL: &str = concat!(
     "SELECT c.id, c.source_id, c.ordinal, c.content, ",
     "       ts_rank_cd(c.tsv, q)::float8 AS score ",
-    "FROM knowledge_chunks c, websearch_to_tsquery('english', $1) q ",
+    "FROM knowledge_chunks c, plainto_tsquery('english', $1) q ",
     "WHERE c.tsv @@ q ",
     "  AND ",
     entitled!("$2"),

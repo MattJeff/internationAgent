@@ -26,12 +26,16 @@
 //! exactly when it is most wrong.
 //!
 //! What replaces replay is one line: CI pins [`TRUSTED_PROMPT`] and
-//! [`UNTRUSTED_PROMPT`], digests of the request as sent — prefix and tool
-//! schemas both, since a tool description is prompt. Editing the
-//! prompt turns this suite red with *"the recorded live scores are stale"*,
-//! which is a true statement, and the fix is to re-run the live set and update
-//! the constants. That is the whole mechanism: the deterministic half's job is
-//! to **invalidate** the model numbers, not to fabricate them.
+//! [`UNTRUSTED_PROMPT`], digests of the request `--live` sends — prefix and
+//! tool schemas both, since a tool description is prompt. Editing either turns
+//! this suite red with *"the recorded live scores are stale"*, which is a true
+//! statement, and the fix is to re-run the live set and update the constants.
+//! That is the whole mechanism: the deterministic half's job is to
+//! **invalidate** the model numbers, not to fabricate them.
+//!
+//! "The request `--live` sends" and "the request a turn sends" are not the same
+//! request, and the difference is [`BEYOND_THE_PIN`]. Read it before quoting a
+//! score at anyone.
 //!
 //! The live runner prints the digest beside its scores for the same reason —
 //! a score without the prompt it was measured against is a number with no
@@ -223,6 +227,56 @@ pub const TRUSTED_PROMPT: &str = "2119fd017a1a8464";
 /// [`TRUSTED_PROMPT`] by construction.
 pub const UNTRUSTED_PROMPT: &str = "1fc3e84ea1abaf88";
 
+/// **Where the two pins stop, said in the report rather than in a doc
+/// comment.**
+///
+/// The pins cover the model id, `SystemPrompt::render`'s output for *this*
+/// fixture, and every offered tool's name, description and schema. Two kinds of
+/// prompt sit outside that and neither is exotic — both are on a production
+/// turn every day:
+///
+/// 1. **The trusted paragraphs, because they are `messages` and not `system`.**
+///    `Context::with_task` appends a `Message`, and `digest_of` skips
+///    `messages` on the grounds that they vary per case. True of a case's task;
+///    false of the operator-written constants a real turn always prepends —
+///    `main.rs::TURN_BRIEF`, `loops::initiative::{BOARD_BRIEF, DIARY_BRIEF}`,
+///    `routes::interview::INTERVIEW_BRIEF`,
+///    `app::knowledge::{RECALLED_BRIEF, UNAVAILABLE_BRIEF}`. Those are fixed
+///    prose the model reads before it picks a tool, and **two of them have
+///    moved since these constants were last derived**: `BOARD_BRIEF` in
+///    waveG-g1 and `RECALLED_BRIEF` in waveS-s2, both with the pin green.
+///
+///    It is not that the recorded 4/5 went stale — `run_live` never sent those
+///    paragraphs either, so the score is still a fact about the request it was
+///    measured against. It is that the request it was measured against is not
+///    the one an employee receives, and a green pin reads as though it were.
+///
+/// 2. **Two sections of the prefix the fixture never renders.** `render` emits
+///    "# Credentials you hold" only when `with_credential` has been called, and
+///    [`prompt`] never calls it — so that paragraph, which every employee
+///    holding an SMTP password reads, is inside `render` and outside both pins.
+///    (The roster is *not* an instance of this: an empty roster still renders
+///    its "Nobody" branch, and that branch is hashed.)
+///
+/// **What closing this costs, and why no wave agent may do it quietly.**
+/// Hashing the briefs means hashing a canonical request built with them, which
+/// moves `TRUSTED_PROMPT` and `UNTRUSTED_PROMPT` — and a moved pin with no
+/// `--live` run behind it is precisely the laundering the mechanism exists to
+/// stop. The order is: reach the constants first (three of the six are private
+/// to a binary crate, so they move to `agentos_app` or the eval grows a
+/// canonical-turn fixture), then re-derive, then run `--live` in the same
+/// change, then re-pin with the new score. Not before, and not in pieces.
+const BEYOND_THE_PIN: &str = "\
+the trusted paragraphs a real turn prepends — TURN_BRIEF, BOARD_BRIEF, \
+DIARY_BRIEF, INTERVIEW_BRIEF, knowledge::RECALLED_BRIEF and \
+UNAVAILABLE_BRIEF. They are `messages`, not `system`, so neither pin hashes \
+them, and BOARD_BRIEF and RECALLED_BRIEF have both been rewritten since these \
+digests were derived, with this row green throughout. The scores above are not \
+stale — `--live` never sent those paragraphs either — but the request they \
+were measured against is not the one an employee receives. Same gap, second \
+form: `render`'s \"# Credentials you hold\" section, which this fixture never \
+builds and every employee holding a credential reads";
+
 /// The buyer, with one low-risk and one high-risk connected tool — enough for
 /// the taint filter to have something to filter.
 ///
@@ -309,10 +363,18 @@ fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
         .collect()
 }
 
-/// First 16 hex characters of the SHA-256 of **everything the model reads
-/// before it chooses**: the model id, the rendered prefix, and every tool
-/// schema the turn offers. Short enough to read in a report, long enough that
-/// nothing collides by accident.
+/// First 16 hex characters of the SHA-256 of the model id, the rendered
+/// prefix, and every tool schema the turn offers. Short enough to read in a
+/// report, long enough that nothing collides by accident.
+///
+/// **It used to say "everything the model reads before it chooses", and that
+/// sentence was false in two directions.** It is corrected rather than deleted
+/// because it is the sentence that decided what got hashed, and the two things
+/// it was wrong about are still wrong — see [`BEYOND_THE_PIN`], which is where
+/// the boundary is now stated in the report instead of in a doc comment nobody
+/// re-reads. Nothing below this line changed: moving the hash moves both
+/// constants, and moving both constants without a `--live` run is the one thing
+/// this mechanism exists to prevent.
 ///
 /// The model is in here for the reason [`TRUSTED_PROMPT`] gives at length: a
 /// score is a fact about a model, and a pin that could not see the model change
@@ -344,6 +406,9 @@ fn on_a_fresh_deployment(trust: TrustLabel) -> Vec<String> {
 /// The `messages` and `max_tokens` of that request are deliberately *not*
 /// hashed. They vary per case by design — each of [`CASES`] carries its own —
 /// and a pin that moved per case would be a pin on nothing.
+///
+/// That reasoning is right about a case's own task and wrong about everything
+/// else in `messages`, which is [`BEYOND_THE_PIN`]'s subject.
 pub fn digest(trust: TrustLabel) -> String {
     digest_of(&prompt().request(default_model().as_str(), MAX_TOKENS, trust, Vec::new()))
 }
@@ -789,6 +854,7 @@ pub fn evaluate() -> Surface {
              live scores are the CLI's, not llm_anthropic's",
             "prompt-injection resistance beyond one case, and none of it against a model that \
              CAN see `pay` — that combination is unreachable by construction",
+            BEYOND_THE_PIN,
         ],
     }
 }

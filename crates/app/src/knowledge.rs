@@ -170,13 +170,22 @@
 //!
 //! **And on the turn path it is mostly empty**, which is worth stating rather
 //! than discovering. The recall query is the counterparty's whole message and
-//! `websearch_to_tsquery` ANDs every lexeme in it, so a chunk has to contain
-//! every non-stopword of the first [`MAX_QUERY_CHARS`] characters of an email.
-//! That is close to never. Retrieval on this build therefore answers a *search
+//! `plainto_tsquery` ANDs every lexeme in it, so a chunk has to contain every
+//! non-stopword of the first [`MAX_QUERY_CHARS`] characters of an email. That
+//! is close to never. Retrieval on this build therefore answers a *search
 //! phrase* and not a message. Fixing that is query construction — a real piece
 //! of work, and one whose right shape depends on whether the embedder that
 //! eventually lands makes the text leg the fallback or the main event, so it is
 //! not done here.
+//!
+//! That sentence used to name `websearch_to_tsquery` and was false, which
+//! mattered more than a wrong function name. `websearch_to_tsquery` is a query
+//! *language*: `or` is disjunction and `-` is negation, so "a whole email
+//! matches close to never" described honest email and nothing else, while the
+//! only selection channel this build has took its boolean structure from the
+//! sender. `agentos_store::knowledge`'s `TEXT_SQL` argues the parser choice and
+//! `a_senders_message_is_words_and_not_a_query_language` reproduces both
+//! operators.
 //!
 //! [`RECALLED_BRIEF`] says the same thing to the model in one sentence, because
 //! the passage list is the model's only evidence about what its store holds.
@@ -479,7 +488,7 @@ pub const RECALL_LIMIT: i64 = 5;
 /// the same wait spent twice.
 pub const RECALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Longest query text we embed or hand to `websearch_to_tsquery`.
+/// Longest query text we embed or hand to `plainto_tsquery`.
 ///
 /// The query is a counterparty's message and a counterparty's message can be
 /// three megabytes. That is a slow `tsquery`, a rejected embedding call at any
@@ -549,6 +558,15 @@ pub struct Recall<'a> {
     /// model was going to read a document either way; the attacker only gets to
     /// nudge which one — and [`Scope`] is what shrank the set it may nudge
     /// within from the whole company down to this employee's own work.
+    ///
+    /// **The words are theirs; the query's structure is not**, and that
+    /// separation is enforced one layer down rather than here. The parser is
+    /// `plainto_tsquery`, which ANDs lexemes and has no operators — see
+    /// `agentos_store::knowledge`'s `TEXT_SQL` for the two capabilities
+    /// `websearch_to_tsquery` was handing the sender, and note that the bound
+    /// stated above is only true under a parser that cannot express negation:
+    /// "the model was going to read a document either way" stops holding the
+    /// moment the sender can *delete* one from the answer.
     ///
     /// Truncated to [`MAX_QUERY_CHARS`] and exposed with `expose_for_parsing`,
     /// which is what that exit is for: this is a parse into a `tsquery` and an
@@ -1572,12 +1590,19 @@ mod tests {
     /// looks at what else came back. This is the one that looks.
     ///
     /// What half 2 does **not** isolate, and cannot: the miss has a purely
-    /// mechanical cause — `websearch_to_tsquery` ANDs every lexeme, and 'happen'
+    /// mechanical cause — `plainto_tsquery` ANDs every lexeme, and 'happen'
     /// is absent from the document on its own. Asking the same question in the
     /// document's own words *plus* one word it does not use misses too. That is
     /// not a weakness of the fixture, it is the finding: word-AND is the entire
     /// mechanism, there is no meaning underneath it to rescue a near miss, and
     /// the only honest report of a near miss is an empty hand.
+    ///
+    /// **Half 2 only holds because the sender wrote no operator**, which is a
+    /// premise this test cannot see and did not state while the parser was
+    /// `websearch_to_tsquery`: the same sentence with `or crushed skids`
+    /// appended came back full. That is
+    /// `a_senders_message_is_words_and_not_a_query_language`, immediately
+    /// below, and it is the assertion this one was quietly leaning on.
     #[tokio::test]
     async fn a_question_answered_in_other_words_recalls_nothing_rather_than_a_top_k_of_guesses() {
         let Some(db) = db().await else { return };
@@ -1646,6 +1671,107 @@ mod tests {
         let after = missed.into_context(before.clone());
         assert_eq!(after, before, "a miss added something to the prompt");
         assert!(may_pay(after.trust()));
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **The sender writes the recall query. Until this test it also wrote the
+    /// query's boolean structure**, which is a different and larger thing.
+    ///
+    /// [`Recall::question`] bounds what a counterparty-written query buys an
+    /// attacker at "choosing which of this tenant's own documents enter the
+    /// model's context", and that bound was being computed against a mechanism
+    /// the code did not have. `websearch_to_tsquery` is not a tokeniser, it is
+    /// a *query language*: `or` is disjunction, `-` is negation, `"…"` is a
+    /// phrase. So the claim this file makes above — every lexeme is ANDed, a
+    /// whole email therefore matches close to never — held for an honest
+    /// message and for no other kind. With the vector leg not consulted, the
+    /// full-text leg is the **only** selection channel this build has, and its
+    /// operators belonged to the sender.
+    ///
+    /// Both halves below were measured against the unfixed query on this
+    /// fixture, and both are things a conjunction cannot do:
+    ///
+    /// * **`or` makes steering covert.** Under conjunction, a message that
+    ///   retrieves a document has to *be* that document — every word of it in
+    ///   one chunk — which anybody reading the thread can see. The message in
+    ///   the loop below is an ordinary customer email and returned exactly the
+    ///   chunk its last three words name.
+    /// * **`-` suppresses, and adding words never can.** Extra words only
+    ///   narrow. `invoice` returned five passages with the warehouse rule
+    ///   first; `invoice -warehouse` returned five with the rule gone and four
+    ///   more notes in its place — a full, plausible top-k with the one
+    ///   document that constrains the sender deleted from it. [`RECALLED_BRIEF`]
+    ///   tells the model these were "selected because their words appear in the
+    ///   message", so the hole reads as "the company has nothing else on file".
+    ///
+    /// What this does **not** fix is selection itself, and nothing here can: a
+    /// sender who writes "crushed skids" still gets the crushed-skids chunk,
+    /// which the module docs accept on purpose. What it fixes is that the
+    /// message is now *words* — `plainto_tsquery`, in `agentos_store::knowledge`
+    /// — so steering costs the attacker a message that visibly quotes the
+    /// document it is aimed at.
+    #[tokio::test]
+    async fn a_senders_message_is_words_and_not_a_query_language() {
+        let Some(db) = db().await else { return };
+        let tenant = create_tenant(&db).await;
+        stock(&db, tenant, &store_that_answers_in_other_words()).await;
+
+        /// The chunk both halves are about: the rule a sender arguing about a
+        /// damaged delivery would rather the employee did not read.
+        const RULE: &str = "Crushed skids are written off";
+
+        // Half 1 — the premise, which is the assertion of the test above: asked
+        // in words the store does not use, recall comes back empty.
+        let honest = Untrusted::new("what happens to damaged pallets".to_owned());
+        let missed = recall(&db, Embedder::Mock, tenant, &Recall::new(&honest, None)).await;
+        assert!(!missed.unavailable());
+        assert!(missed.hits().is_empty(), "the premise moved");
+
+        // The same miss with one clause appended, inside a message that reads
+        // like every other email this employee gets.
+        let steered = Untrusted::new(
+            "hello, we spoke last week about the shipment that arrived on friday and I \
+             wanted to confirm the paperwork or crushed skids"
+                .to_owned(),
+        );
+        let steered = recall(&db, Embedder::Mock, tenant, &Recall::new(&steered, None)).await;
+        assert!(
+            !steered
+                .hits()
+                .iter()
+                .any(|hit| hit.content.expose_for_parsing().contains(RULE)),
+            "an `or` clause selected a document the same message without it cannot reach: {:?}",
+            steered
+                .hits()
+                .iter()
+                .map(|hit| hit.content.expose_for_parsing().clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Half 2 — suppression. The word on its own retrieves the rule...
+        let plain = Untrusted::new("invoice".to_owned());
+        let plain = recall(&db, Embedder::Mock, tenant, &Recall::new(&plain, None)).await;
+        assert!(
+            plain
+                .hits()
+                .iter()
+                .any(|hit| hit.content.expose_for_parsing().contains(RULE)),
+            "the fixture no longer retrieves the rule, so removing it proves nothing"
+        );
+
+        // ...and one hyphen must not be able to take it back out.
+        let hidden = Untrusted::new("invoice -warehouse".to_owned());
+        let hidden = recall(&db, Embedder::Mock, tenant, &Recall::new(&hidden, None)).await;
+        assert!(
+            hidden
+                .hits()
+                .iter()
+                .any(|hit| hit.content.expose_for_parsing().contains(RULE)),
+            "a `-` clause deleted the passage that constrains the sender and filled the \
+             top-k with {} others",
+            hidden.hits().len()
+        );
 
         drop_tenant(&db, tenant).await;
     }

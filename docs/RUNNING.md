@@ -369,8 +369,16 @@ its name promises — every other gap here is either absent (nothing to mistake 
 working) or off behind a switch. A reader who sees `knowledge` in the node table
 and the doctor's `[OK]` will conclude an employee has memory. It has word search
 over documents somebody uploaded, and on the turn path — where the query is the
-counterparty's whole email and `websearch_to_tsquery` ANDs every lexeme in it —
-that search almost never matches anything.
+counterparty's whole email and `plainto_tsquery` ANDs every lexeme in it — that
+search almost never matches anything.
+
+That parser is `plainto_tsquery` and not `websearch_to_tsquery` for a security
+reason rather than an ergonomic one: the recall query is a message a stranger
+wrote, and while the embedder is not semantic the full-text leg is the *only*
+thing choosing what an employee recalls. `websearch_to_tsquery` would let that
+stranger write `or` and `-` into the query — steer an ordinary-looking email
+onto a named document, or delete the passage that constrains them out of the
+answer. See `crates/store/src/knowledge.rs`.
 
 **It is not a credential and not a wave.** A real embedder is a provider
 integration with a per-call cost, which makes it the same decision as every other
