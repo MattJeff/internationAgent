@@ -870,10 +870,29 @@ impl<'a> Citable<'a> {
 /// field is already [`Untrusted`]. This struct adds routing, not access: no
 /// method here hands out the text unwrapped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ProspectMessageWire")]
 pub struct ProspectMessage {
     pub contact_id: ContactId,
     pub opportunity_id: OpportunityId,
     message: CanonicalMessage,
+}
+
+/// Deserialization funnel, so a stored row cannot file our own outbound text as
+/// their reply — the refusal [`ProspectMessage::inbound`] exists for, applied on
+/// the way back in as well as on the way out.
+#[derive(Deserialize)]
+struct ProspectMessageWire {
+    contact_id: ContactId,
+    opportunity_id: OpportunityId,
+    message: CanonicalMessage,
+}
+
+impl TryFrom<ProspectMessageWire> for ProspectMessage {
+    type Error = RevenueError;
+
+    fn try_from(w: ProspectMessageWire) -> Result<Self, Self::Error> {
+        ProspectMessage::inbound(w.contact_id, w.opportunity_id, w.message)
+    }
 }
 
 impl ProspectMessage {
@@ -1441,7 +1460,16 @@ impl Opportunity {
 
         match event {
             OpportunityEvent::ObjectionRaised(objection) => {
-                self.objections.entry(objection).or_insert(None);
+                // `insert`, not `entry().or_insert()`. Raising an objection that
+                // already carries a resolution is a prospect asking the same
+                // question again, and the answer on file is not the answer to
+                // it — an escalation whose reply never landed reads exactly like
+                // this. Keeping the old resolution would let the deal close over
+                // a live question, which is the failure
+                // `RevenueError::UnresolvedObjection` exists to stop, arriving
+                // by the one door that guard does not watch. Raising an *open*
+                // objection is still idempotent: `None` overwrites `None`.
+                self.objections.insert(objection, None);
             }
             OpportunityEvent::ObjectionResolved(resolved) => {
                 self.objections
@@ -2125,6 +2153,88 @@ mod tests {
         }
     }
 
+    /// **Raising an objection always opens it, even one that was answered.**
+    ///
+    /// The realistic script: the price question is escalated to a human, the
+    /// human's answer does not land, and the prospect asks again. If the second
+    /// raise is swallowed because a resolution is already on file, the deal
+    /// closes over a question nobody answered — which is the exact failure
+    /// [`RevenueError::UnresolvedObjection`] exists to stop, arriving by the one
+    /// door that guard does not watch.
+    ///
+    /// Note what `the_stage_machine_replays_deterministically` cannot see here:
+    /// its post-condition is `stage == Won -> open_objections().count() == 0`,
+    /// and a raise that never reopened anything satisfies it. The property is
+    /// true of the wrong state.
+    #[test]
+    fn re_raising_a_resolved_objection_reopens_it() {
+        let id = account_id();
+        let mut opp = opportunity(id);
+        let msg = ProspectMessage::inbound(contact(id).id, opp.id, canonical(Direction::Inbound))
+            .expect("inbound");
+        let price = Money::from_major_str("2500.00", Eur).unwrap();
+
+        opp.apply(OpportunityEvent::Qualified, at(T0)).unwrap();
+        opp.apply(OpportunityEvent::ReplyReceived(&msg), at(T0 + 1))
+            .unwrap();
+        opp.apply(OpportunityEvent::TermsProposed(price), at(T0 + 2))
+            .unwrap();
+
+        // Raised, then handed to a human. Nothing is open, and the deal may close.
+        opp.apply(
+            OpportunityEvent::ObjectionRaised(Objection::Price),
+            at(T0 + 3),
+        )
+        .unwrap();
+        opp.apply(
+            OpportunityEvent::ObjectionResolved(
+                Objection::Price.resolved(Resolution::Escalated).unwrap(),
+            ),
+            at(T0 + 4),
+        )
+        .unwrap();
+        assert_eq!(opp.open_objections().count(), 0);
+
+        // They ask again. That is a live question, whatever is on file about
+        // the last one.
+        assert_eq!(
+            opp.apply(
+                OpportunityEvent::ObjectionRaised(Objection::Price),
+                at(T0 + 5)
+            ),
+            Ok(Stage::Negotiating)
+        );
+        assert_eq!(
+            opp.open_objections().collect::<Vec<_>>(),
+            vec![Objection::Price],
+            "a re-raised objection must be open again, not still wearing its old resolution"
+        );
+        assert_eq!(opp.objections()[&Objection::Price], None);
+        assert_eq!(
+            opp.apply(OpportunityEvent::Won(price), at(T0 + 6)),
+            Err(RevenueError::UnresolvedObjection(Objection::Price)),
+            "the deal must not close over a question they asked twice"
+        );
+        assert_eq!(opp.stage(), Stage::Negotiating);
+
+        // Answering it again is what unblocks the close.
+        opp.apply(
+            OpportunityEvent::ObjectionResolved(
+                Objection::Price.resolved(Resolution::Conceded).unwrap(),
+            ),
+            at(T0 + 7),
+        )
+        .unwrap();
+        assert_eq!(
+            opp.objections()[&Objection::Price],
+            Some(Resolution::Conceded)
+        );
+        assert_eq!(
+            opp.apply(OpportunityEvent::Won(price), at(T0 + 8)),
+            Ok(Stage::Won)
+        );
+    }
+
     // -- prospect text -----------------------------------------------------
 
     fn canonical(direction: Direction) -> CanonicalMessage {
@@ -2151,6 +2261,33 @@ mod tests {
             ),
             attachments: Vec::new(),
         }
+    }
+
+    /// **The serde door.** `ProspectMessage::inbound` refuses an outbound
+    /// message; the derived `Deserialize` over the private `message` field is a
+    /// second constructor that does not. Every other invariant-carrying type in
+    /// this module — `Evidence`, `Reproduction`, `ResolvedObjection` — funnels
+    /// its serde path through its constructor, and this one did not.
+    #[test]
+    fn the_serde_path_refuses_an_outbound_message_too() {
+        let id = account_id();
+        let opp = opportunity(id);
+        let good = ProspectMessage::inbound(contact(id).id, opp.id, canonical(Direction::Inbound))
+            .expect("inbound");
+
+        let json = serde_json::to_value(&good).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProspectMessage>(json.clone()).unwrap(),
+            good,
+            "a real inbound reply must still round-trip"
+        );
+
+        let mut outbound = json;
+        outbound["message"]["direction"] = serde_json::json!("outbound");
+        assert!(
+            serde_json::from_value::<ProspectMessage>(outbound).is_err(),
+            "serde filed our own outbound text as the prospect's reply"
+        );
     }
 
     #[test]

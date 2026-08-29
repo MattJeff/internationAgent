@@ -210,9 +210,14 @@ impl<'de> Deserialize<'de> for Weight {
 }
 
 /// How strongly a belief is held, in hundredths of MPCP's `force` (`0.0..=1.0`).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
-)]
+///
+/// `Deserialize` is hand-written for the same reason [`Weight`]'s is, four
+/// declarations above: the ceiling is a property of the type, not of the
+/// constructor, and a derived impl over the transparent `u8` would let a stored
+/// row come back as a conviction above full. `Belief::strength` is a `pub` field
+/// on a `Deserialize` struct inside a `Deserialize` [`BeliefJournal`], so the
+/// journal is that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Default)]
 #[serde(transparent)]
 pub struct Strength(u8);
 
@@ -236,6 +241,12 @@ impl Strength {
 
     fn saturating_sub(self, other: Strength) -> Strength {
         Strength(self.0.saturating_sub(other.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Strength {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        u8::deserialize(d).map(Strength::from_hundredths)
     }
 }
 
@@ -626,6 +637,65 @@ mod tests {
 
     fn acme() -> Subject {
         Subject::new("supplier:acme")
+    }
+
+    /// **The clamp has to survive the wire, for both scalars.**
+    ///
+    /// `Weight` hand-writes a `Deserialize` that funnels through
+    /// `Weight::from_hundredths`; `Strength`, declared four lines below it with
+    /// the same kind of clamping constructor, derived one instead. So the two
+    /// neighbours disagreed about whether the ceiling is a property of the type
+    /// or of the constructor — and only one of them was right.
+    ///
+    /// `Belief.strength` is a `pub` field on a `Deserialize` struct inside a
+    /// `Deserialize` `BeliefJournal`, so the whole journal is the path: a stored
+    /// `strength` of 255 comes back as a conviction of 2.55 on a 0.0..=1.0
+    /// scale, and `Display` prints it that way.
+    #[test]
+    fn the_scalars_clamp_on_the_way_in_as_well_as_in_their_constructors() {
+        // The constructors, which were never in doubt.
+        assert_eq!(Weight::from_hundredths(5_000).hundredths(), 1000);
+        assert_eq!(Strength::from_hundredths(255).hundredths(), 100);
+
+        // The wire. `Weight` already held this; `Strength` did not.
+        assert_eq!(
+            serde_json::from_str::<Weight>("60000")
+                .unwrap()
+                .hundredths(),
+            1000
+        );
+        assert_eq!(
+            serde_json::from_str::<Strength>("255").unwrap(),
+            Strength::FULL,
+            "a stored strength above full conviction must clamp, not become 2.55"
+        );
+        // In range, nothing moves, and a real value still round-trips.
+        for h in [0u8, 1, 37, 100] {
+            let s = Strength::from_hundredths(h);
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, h.to_string());
+            assert_eq!(serde_json::from_str::<Strength>(&json).unwrap(), s);
+        }
+
+        // And through the container that actually gets stored.
+        let journal: BeliefJournal = serde_json::from_value(serde_json::json!({
+            "episodes": [],
+            "consolidated": [],
+            "resolved": [],
+            "beliefs": [{
+                "subject": "supplier:acme",
+                "polarity": "negative",
+                "strength": 255,
+                "episode_count": 4,
+                "formed_at": "2026-08-29T00:00:00Z",
+                "last_reinforced_at": "2026-08-29T00:00:00Z",
+                "sources": [1],
+                "first_hand": true
+            }],
+            "next_id": 2
+        }))
+        .expect("a stored journal");
+        assert_eq!(journal.beliefs()[0].strength, Strength::FULL);
     }
 
     fn fact(subject: &Subject, polarity: Polarity, summary: &str) -> NewEpisode {

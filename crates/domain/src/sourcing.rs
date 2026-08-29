@@ -529,11 +529,32 @@ impl Supplier {
 /// this crate can check freshness without a clock. Add the timestamp when the
 /// unit that fetches rates exists and can say what "stale" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ExchangeRateWire")]
 pub struct ExchangeRate {
     from: Currency,
     to: Currency,
     numerator: NonZeroU64,
     denominator: NonZeroU64,
+}
+
+/// Deserialization funnel, so a stored row cannot reintroduce a rate from a
+/// currency to itself — the one shape [`ExchangeRate::new`] refuses and the one
+/// that would launder a cross-currency comparison into a no-op. The zero halves
+/// need no re-check: `NonZeroU64` refuses them itself.
+#[derive(Deserialize)]
+struct ExchangeRateWire {
+    from: Currency,
+    to: Currency,
+    numerator: NonZeroU64,
+    denominator: NonZeroU64,
+}
+
+impl TryFrom<ExchangeRateWire> for ExchangeRate {
+    type Error = SourcingError;
+
+    fn try_from(w: ExchangeRateWire) -> Result<Self, Self::Error> {
+        ExchangeRate::new(w.from, w.to, w.numerator.get(), w.denominator.get())
+    }
 }
 
 impl ExchangeRate {
@@ -781,12 +802,32 @@ impl<'a> LiveQuote<'a> {
 /// field is already [`Untrusted`]. This struct adds routing, not access: there
 /// is no method here that hands out the text unwrapped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SupplierMessageWire")]
 pub struct SupplierMessage {
     pub supplier_id: SupplierId,
     pub rfq_id: RfqId,
     /// Which negotiation round this belongs to.
     pub round: u32,
     message: CanonicalMessage,
+}
+
+/// Deserialization funnel, so a stored row cannot file our own outbound text as
+/// the supplier's answer — the refusal [`SupplierMessage::inbound`] exists for,
+/// applied on the way back in as well as on the way out.
+#[derive(Deserialize)]
+struct SupplierMessageWire {
+    supplier_id: SupplierId,
+    rfq_id: RfqId,
+    round: u32,
+    message: CanonicalMessage,
+}
+
+impl TryFrom<SupplierMessageWire> for SupplierMessage {
+    type Error = SourcingError;
+
+    fn try_from(w: SupplierMessageWire) -> Result<Self, Self::Error> {
+        SupplierMessage::inbound(w.supplier_id, w.rfq_id, w.round, w.message)
+    }
 }
 
 impl SupplierMessage {
@@ -1494,6 +1535,67 @@ mod tests {
         assert_eq!(
             SupplierMessage::inbound(supplier_id, rfq_id, 2, inbound_message(Direction::Outbound)),
             Err(SourcingError::NotInbound(Direction::Outbound))
+        );
+    }
+
+    /// **The serde door, for the two invariants this module states in prose.**
+    ///
+    /// `ExchangeRate::new` refuses a currency against itself and
+    /// `SupplierMessage::inbound` refuses an outbound message. Both types then
+    /// derive `Deserialize` over their private fields, which is a second
+    /// constructor that runs neither check — the same gap `Money`,
+    /// `SpendLimits`, `Evidence`, `Reproduction` and `ResolvedObjection` all
+    /// close with a `Wire` funnel, and this module did not.
+    ///
+    /// Neither type is deserialized anywhere in the workspace today, which is
+    /// why this is a latent hole rather than a live one. It is worth closing at
+    /// the type rather than in the store that will eventually read these rows,
+    /// because the store is where "somebody remembered to check" lives.
+    #[test]
+    fn the_serde_path_enforces_the_same_refusals_as_the_constructors() {
+        let (rfq_id, supplier_id) = ids();
+
+        // A rate from a currency to itself is not a rate — including on the wire,
+        // where it would launder a cross-currency comparison into a no-op.
+        let real = ExchangeRate::new(Cny, Eur, 13, 100).unwrap();
+        let json = serde_json::to_string(&real).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ExchangeRate>(&json).unwrap(),
+            real,
+            "a real rate must still round-trip"
+        );
+        assert!(
+            serde_json::from_str::<ExchangeRate>(
+                r#"{"from":"EUR","to":"EUR","numerator":1,"denominator":1}"#
+            )
+            .is_err(),
+            "serde built a rate from a currency to itself"
+        );
+        // NonZeroU64 already refuses the zero halves; assert it so the funnel
+        // is not asked to repeat work the field type does.
+        assert!(
+            serde_json::from_str::<ExchangeRate>(
+                r#"{"from":"CNY","to":"EUR","numerator":0,"denominator":1}"#
+            )
+            .is_err()
+        );
+
+        // Our own outbound text must not come back out of storage wearing the
+        // supplier's name — the one direction this type exists to forbid.
+        let good =
+            SupplierMessage::inbound(supplier_id, rfq_id, 2, inbound_message(Direction::Inbound))
+                .expect("inbound");
+        let json = serde_json::to_value(&good).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SupplierMessage>(json.clone()).unwrap(),
+            good
+        );
+
+        let mut outbound = json;
+        outbound["message"]["direction"] = serde_json::json!("outbound");
+        assert!(
+            serde_json::from_value::<SupplierMessage>(outbound).is_err(),
+            "serde filed our own outbound text as the supplier's answer"
         );
     }
 

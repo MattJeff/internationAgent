@@ -381,6 +381,11 @@ pub enum IdempotencyKeyError {
         /// The first offending character.
         found: char,
     },
+    /// A stored key that carries neither namespace prefix, i.e. one no
+    /// constructor in this module produced. See [`IdempotencyKey`]'s
+    /// `TryFrom<String>`.
+    #[error("idempotency key must start with `client:` or `employee:`")]
+    Prefix,
 }
 
 /// A stable de-duplication token for an at-most-once side effect.
@@ -436,10 +441,22 @@ impl fmt::Display for IdempotencyKey {
 impl TryFrom<String> for IdempotencyKey {
     type Error = IdempotencyKeyError;
 
-    /// Rehydrate a stored key. Both flavours are already prefixed, so this only
-    /// re-checks the shape invariants.
+    /// Rehydrate a stored key.
+    ///
+    /// This is the `#[serde(try_from = "String")]` path, which makes it a third
+    /// constructor and not merely a shape check — so it has to reject anything
+    /// [`for_step`](IdempotencyKey::for_step) and
+    /// [`from_client`](IdempotencyKey::from_client) could not have produced.
+    /// The prefix is what those two use to keep their namespaces apart, and a
+    /// value carrying neither reproduces the *internal* namespace exactly:
+    /// `employee:{uuid}:step:phone` de-duplicates a number purchase, so a key
+    /// that spells it without having come from `for_step` is a claim that the
+    /// number was already bought.
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.is_empty() || value.len() > Self::MAX_CLIENT_LEN + "client:".len() {
+        if !(value.starts_with("client:") || value.starts_with("employee:")) {
+            return Err(IdempotencyKeyError::Prefix);
+        }
+        if value.len() > Self::MAX_CLIENT_LEN + "client:".len() {
             return Err(IdempotencyKeyError::Length);
         }
         if let Some(found) = value.chars().find(|c| !c.is_ascii_graphic()) {
@@ -617,6 +634,71 @@ mod tests {
             Err(IdempotencyKeyError::Charset { found: '\n' })
         ));
         assert!(IdempotencyKey::from_client("abcd-1234").is_ok());
+    }
+
+    /// **The serde door.** `for_step` and `from_client` are not the only ways to
+    /// hold an `IdempotencyKey`: `TryFrom<String>` is, and it is what
+    /// `#[serde(try_from = "String")]` uses. Its doc comment says both flavours
+    /// are already prefixed — so it has to be the thing that makes that true,
+    /// rather than a sentence relying on it.
+    ///
+    /// The stake is what the key guards: `store::idempotency` and
+    /// `store::provisioning` de-duplicate at-most-once side effects on it, so a
+    /// string that reproduces `employee:{uuid}:step:phone` is a claim that the
+    /// number was already bought.
+    #[test]
+    fn a_rehydrated_key_must_carry_a_prefix_a_constructor_produced() {
+        let employee = EmployeeId::new_v7(at(1_700_000_000));
+        let step = IdempotencyKey::for_step(employee, "phone");
+        let client = IdempotencyKey::from_client("abcd-1234").unwrap();
+
+        // Both real flavours survive a round trip through the wire.
+        for key in [&step, &client] {
+            let json = serde_json::to_string(key).unwrap();
+            assert_eq!(&serde_json::from_str::<IdempotencyKey>(&json).unwrap(), key);
+            assert_eq!(
+                IdempotencyKey::try_from(key.as_str().to_owned()).unwrap(),
+                *key
+            );
+        }
+
+        // An unprefixed string is not a key any constructor could have made.
+        for forged in [
+            "abcd-1234",
+            "step:phone",
+            "PN-1",
+            "",
+            "Client:x",
+            "employee",
+        ] {
+            assert_eq!(
+                IdempotencyKey::try_from(forged.to_owned()),
+                Err(IdempotencyKeyError::Prefix),
+                "rehydrated an unprefixed key: {forged:?}"
+            );
+            assert!(
+                serde_json::from_str::<IdempotencyKey>(&format!("\"{forged}\"")).is_err(),
+                "serde rehydrated an unprefixed key: {forged:?}"
+            );
+        }
+
+        // And the shape rules still apply to a correctly prefixed string.
+        assert!(IdempotencyKey::try_from("client:has space".to_owned()).is_err());
+        assert!(IdempotencyKey::try_from(format!("client:{}", "x".repeat(500))).is_err());
+
+        // **What this does not buy, stated so nobody reads more into it.** The
+        // prefix keeps the two namespaces apart; it does not authenticate the
+        // internal one. `employee:step:phone` is inside that namespace by
+        // spelling and is accepted, because telling it from a real
+        // `for_step(uuid, name)` means re-parsing the whole shape — and no
+        // untrusted input reaches this path today. `from_client` is the only
+        // door a client's bytes take (`apps/server/src/main.rs`), and it
+        // prefixes with `client:`.
+        assert!(IdempotencyKey::try_from("employee:step:phone".to_owned()).is_ok());
+        assert_ne!(
+            IdempotencyKey::try_from("employee:step:phone".to_owned()).unwrap(),
+            step
+        );
     }
 
     // -- secret refs -------------------------------------------------------
