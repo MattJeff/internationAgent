@@ -581,8 +581,8 @@ fn bearer(secret: Option<&str>) -> Vec<(&'static str, String)> {
 /// `Arc<dyn Llm>` inside a process this test only has a socket to, and there is
 /// no route that hands a prompt back.
 ///
-/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude` and reads a JSON
-/// event array back. The **conversation** goes to its stdin — never argv,
+/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude` and reads
+/// JSON Lines back — one event per line, `--output-format stream-json`. The **conversation** goes to its stdin — never argv,
 /// deliberately, because a conversation carries a counterparty's words — and
 /// the **system prompt** goes to `--system-prompt`, which is where it has to be
 /// for it to be the model's system prompt rather than a user message. So the
@@ -594,9 +594,14 @@ fn bearer(secret: Option<&str>) -> Vec<(&'static str, String)> {
 /// below are the bytes the running server produced, not a rendering this test
 /// asked a library for. What it costs is that the CLI backend flattens the
 /// structured request into one string — the system prompt, then the
-/// conversation, then the tool schemas as text — so the assertions are on
-/// substrings of a prompt rather than on typed fields. That is the same
-/// information; `llm_cli::render_prompt` is the only thing between them.
+/// conversation — so the assertions are on substrings of a prompt rather than
+/// on typed fields. That is the same information; `llm_cli::render_prompt` is
+/// the only thing between them.
+///
+/// The tools are the exception: they no longer travel in the prompt at all,
+/// they are declared over MCP. The script below asks that server for them and
+/// appends the names to the capture, which is why a `## tools` section still
+/// exists to assert on.
 struct FakeModel {
     dir: PathBuf,
 }
@@ -626,6 +631,23 @@ p="$(mktemp "$d/prompt.XXXXXXXX")"
 # every `prompt.*` a reader can see is either empty or whole.
 staging="$d/partial.$$"
 { printf '%s\n' "$@"; cat; } > "$staging"
+
+# Les schemas d'outils ne sont plus dans le prompt : ils partent par MCP, sur un
+# serveur de boucle locale que `--mcp-config` nomme — et cette valeur-la EST sur
+# argv, donc dans la capture. On lit `tools/list` exactement comme le vrai CLI
+# le lit, et on ecrit les noms dans la capture sous `## tools`. Sans ca ce
+# harnais ne peut plus rien affirmer sur ce que le tour a offert, et les
+# assertions du filtre de politique — la preuve de bout en bout qu'un outil
+# refuse n'est pas propose — n'auraient plus de source.
+url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/mcp' "$staging" | head -1)
+if [ -n "$url" ]; then
+  { printf '\n## tools\n'
+    curl -s -m 5 -H 'content-type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$url" \
+      | jq -r '.result.tools[]?.name | "- name: " + .'
+  } >> "$staging"
+fi
+
 mv "$staging" "$p"
 
 # Whose turn this is comes out of the prompt itself — the identity line the
@@ -648,7 +670,25 @@ if grep -q '^\[tool ' "$p"; then
   r="$d/reply.default"
 fi
 
-printf '[{"type":"result","result":%s,"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}]' "$(cat "$r")"
+# UNE LIGNE, pas un tableau : `--output-format stream-json` est du JSON Lines
+# et `llm_cli::parse_stream` lit `stdout.lines()`. Un tableau sur une ligne se
+# parse, mais `e["type"]` d'un tableau vaut null, donc aucun evenement `result`
+# n'est trouve — `cli_no_result`, que le probe de /v1/model rend en « la cle a
+# ete refusee ». C'est ce qui a casse ce test quand le parseur a change.
+# Un appel d'outil revient maintenant en bloc `tool_use` d'un evenement
+# `assistant`, prefixe `mcp__agentos__` par le CLI — `parse_stream` ne
+# re-gonfle plus une reponse en JSON strict. Les fichiers `reply.*` gardent
+# leur forme `{"tool": …, "input": …}` : c'est ici qu'on traduit.
+inner=$(jq -r . "$r")
+name=$(printf '%s' "$inner" | jq -r '.tool // empty')
+if [ -n "$name" ]; then
+  printf '{"type":"assistant","message":{"id":"msg_%s","content":[{"type":"tool_use","id":"toolu_%s","name":"mcp__agentos__%s","input":%s}]}}\n' \
+    "$$" "$$" "$name" "$(printf '%s' "$inner" | jq -c '.input // {}')"
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}\n'
+else
+  printf '{"type":"result","subtype":"success","is_error":false,"result":%s,"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}\n' \
+    "$(printf '%s' "$inner" | jq -c 'if .text then .text else tojson end')"
+fi
 "#;
 
 impl FakeModel {
