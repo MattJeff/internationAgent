@@ -471,6 +471,9 @@ That is deliberate.
 | `AGENTOS_PLATFORM_KEYS` | empty | **`/v1/platform/*` is 401 to everybody**, so nobody can sign up and no key can be issued or revoked without a redeploy. Format: `label:secret[,…]` — no tenant uuid, deliberately. Secret ≥ 32 chars. |
 | `AGENTOS_WEBHOOK_SECRETS` | empty | Empty **and** an empty `webhook_endpoints` table means every `/v1/webhooks/{path}` is a 404 and no inbound message can ever arrive. The server warns when the variable is empty. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). Consulted **before** the table so a row cannot shadow it. Holds **one tenant per provider** — two entries on one path is a boot failure; register the second customer with `POST /v1/platform/webhooks`. |
 | `AGENTOS_OAUTH_CLIENTS` | empty | **No connector is advertised by `GET /v1/mcp/catalog`**, so nobody can start an OAuth flow and nobody clicks a button that cannot work. Deployment scope and never tenant scope: a `client_secret` identifies *this product* to a provider, so it is the same value for every customer. Format: `connector:client_id:client_secret[,…]`; a malformed entry is a boot failure naming the position and never the value. This table said it was every variable while this one was missing from it. |
+| `MCP_BRIDGE_BIND` | unset | **Hosted MCP is off**: no bridge runtime is built and every binding on a hosted connector refuses with `hosting_unavailable`, while `POST /v1/mcp/connect` answers 503 for one. Set it to the address bridges publish on — `127.0.0.1` on a development box, the host's address on your bridge subnet in production. The network `accept` admits is **derived** from it as its own `/32` (or `/128`), so there is no second variable to disagree with this one. |
+| `MCP_BRIDGES_PER_TENANT` | `0` | How many hosted servers one tenant may have started on one bind pass. **Zero means an address alone starts nothing** — `POST /v1/mcp/connect` answers 409 `hosted_cap_reached` and the binder asks no runtime. The number is an operator's arithmetic, not a programmer's: box memory ÷ resident size of one runner ÷ tenants per box, then divided again by `bridge::IDLE ÷ 5 min` (currently 4), because a bridge is leased and a tenant holds more containers than rows while a lease runs out. |
+| `MCP_BRIDGE_IMAGE` | `node:22-alpine` | The runner image. The default fetches the pinned stdio package and the pinned gateway with `npx` at container start, which costs a slow first bind per host and no build pipeline. Point it at your own image to move that to build time — or because `supergateway`, the only npm package doing stdio → Streamable HTTP, publishes no licence. |
 | `EMAIL_API_KEY` | — | Unset runs `MockEmailProvider`. Set to the `re_…` key, it **builds the real Resend client**. |
 | `TELEPHONY_API_KEY` | — | Unset runs `MockTelephony`. Set to `ACxxxx:auth_token` — Twilio authenticates with both halves together — it **builds the real Twilio client**. Half of it is a boot failure. |
 | `BROWSER_API_KEY` | — | Unset runs `MockBrowser`. Set to `project-id:api-key`, it **builds the real Browserbase client with a live CDP driver**. Half of it is a boot failure. |
@@ -484,19 +487,30 @@ The email adapter also needs the `whsec_…` signing secret and takes it from th
 `email` entry of `AGENTOS_WEBHOOK_SECRETS`, and its sending domain from
 `AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
 
-There is deliberately **no `EMBEDDER_API_KEY`**. It used to be a row here and
-was the guard's own version of the failure the guard exists to prevent:
-exporting any string turned the alarm off while `Embedder` still had one variant
-and it was still a SHA-256 hash. The embedder and the employee secret vault are
-named as permanent mocks in the boot line instead.
+`EMBEDDER_API_KEY` is a row here again, and the reason it was deleted is worth
+knowing before you set it. It used to be the guard's own version of the failure
+the guard exists to prevent: exporting any string turned the alarm off while
+`Embedder` still had one variant and it was still a SHA-256 hash. It selects a
+real client now — `OpenAiEmbedder`, on the customer's own key,
+`text-embedding-3-small` — so the alarm it quiets is an alarm about something
+that became real. One value, not a pair: the model name is a constant of the
+adapter, because the HNSW index is partial on it. The employee secret vault is
+the only permanent mock left in the boot line.
+
+**Setting it does not re-embed what is already stored.** Every chunk records the
+model it was embedded under and every search binds one model, so a corpus
+ingested on the hash keeps `mock-sha256-1536` and stops being findable until it
+is ingested again. That is deliberate — the alternative is comparing a SHA-256
+digest with a sentence embedding and reporting a score — but it is a migration
+of the customer's documents, not a restart.
 
 ### What a boot says about its adapters
 
 Every boot, real or not, logs one line:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 `/readyz` publishes the same thing as `mock_adapters`, so the question survives
@@ -513,7 +527,7 @@ agentos-server: refusing to start: email, browser would run as mocks and do
 nothing real, and nobody said that was acceptable (set EMAIL_API_KEY,
 BROWSER_API_KEY for the real thing, or AGENTOS_ALLOW_MOCKS=1 to accept exactly
 these). Adapters would be: email=MOCK telephony=twilio browser=MOCK
-llm=anthropic embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+embedder=openai llm=anthropic secrets=MOCK(in-memory)
 ```
 
 The inventory is in the refusal as well as in a successful boot, because the
@@ -1149,10 +1163,30 @@ key's label is the role.* A key labelled `approver` can decide approvals that
 require `approver`; the loops file theirs requiring `operator`, so you need a
 key labelled `operator` to clear a reaper or sweeper escalation.
 
-Approving does **not** perform the effect. It mints the capability token, spends
-the nonce and reports a decision id. `agentos-providers` is deliberately not a
-dependency of this binary, so no route here can reach an executor. That seam is
-open by design and is honest about it.
+**Approving performs the effect for `payment_create`, and for nothing else.**
+Every other kind mints the capability token, spends the nonce, reports a decision
+id and stops — `Authorized<Action>` satisfies no `Effects` bound, so there is
+nothing to hand it to. A payment is redeemed into a typed subject and passed to
+`Effects::pay`.
+
+What you will see today is **`502 payment_not_performed`** with
+`payment_error: "not_configured"`, because this build has no payment rail
+(SPEC §13). That is the system working. The body still carries
+`state: "redeemed"` and the `decision_id`: **the approval is spent either way**,
+so a 502 here is not something to retry. Confirm with
+`GET /v1/approvals/{id}`, which reads `redeemed`.
+
+The reason it is routed through the façade at all is the ledger, not the money:
+redeeming a payment approval *reserves* against the day's bucket, and only
+`Effects::pay` settles or releases it. Before this route reached it, an approved
+payment held the seat's headroom — and its team's — until UTC midnight for money
+that had not moved. Now a refusal releases both. If you see a payment approval
+that ends in neither (the request never returned, say), look for an `in_flight`
+row on `GET /v1/employees/{id}`'s `unsettled_calls` and see §6.
+
+**Approving the same payment twice pays once.** The approval leaves `pending` in
+the transaction the gate commits before the payment is attempted, so a retried
+`approve` is `approval_already_decided` and the rail is never approached again.
 
 Approvals expire: 24 hours for gate-filed ones, 7 days for loop escalations.
 
@@ -1363,10 +1397,13 @@ when it is not — per adapter, decided in `config.rs` and built in
 deployment still does *not* do is listed below; see `docs/PROVIDERS.md` for the
 per-vendor detail.
 
-**The embedder is a SHA-256 hash and no credential changes that.** Retrieval
-runs, returns results, and the results are not semantically related to the
-query: "cat" and "kitten" are as unrelated as "cat" and "diesel". Use it to
-test plumbing.
+**The embedder is a SHA-256 hash unless `EMBEDDER_API_KEY` is set.** Without it,
+retrieval runs on word matching alone — the vector leg is not consulted at all,
+because a hash has no opinion about meaning and five confident unrelated
+passages are worse than none. "cat" and "kitten" are as unrelated as "cat" and
+"diesel". With it, `OpenAiEmbedder` embeds against the customer's key and
+retrieval is hybrid again; documents ingested before the switch keep their old
+model and have to be ingested again.
 
 **The employee secret vault is an in-process plaintext map** that forgets on
 restart. The envelope cipher that seals employee signing keys is real and is a
@@ -1420,6 +1457,10 @@ it is durable because it lives in a table rather than in the store.
 **MCP and payments refuse rather than pretend.** Both ports return
 `Terminal { code: "not_configured" }` and log it. That is deliberate: a fake
 that returns a plausible payment id is a fake that will one day be believed.
+The payment port is now genuinely *reached* — from a turn's `pay` tool and from
+`POST /v1/approvals/{id}/approve` — so that refusal is what an operator sees as
+a `502`, and every attempt leaves a settled `provider_intents` row. Nothing is
+missing but the rail, and which rail is SPEC §13's open decision.
 
 **WhatsApp never provisions.** `Step::Whatsapp` needs
 `EngineConfig::whatsapp_sender`, `EngineConfig::default()` sets it to `None`, and
@@ -1439,8 +1480,9 @@ independent reasons, any one of them enough.
 
 **Receiving is a different sentence now, and it has exactly one hole.** The
 ingest exists — `/v1/webhooks/{provider}` verifies Twilio's own scheme,
-`main::on_telephony_webhook` reads the row and `inbound::land_inbound_text`
-lands the message and wakes the employee. The hole is at the purchase:
+`main::on_telephony_webhook` reads the row and `inbound::land_telephony_callback`
+lands it — a text through `land_inbound_text`, which wakes the employee; a
+placed call's status callback through `land_call_outcome`, which does not. The hole is at the purchase:
 `TwilioTelephony::ensure_number` sets **no `SmsUrl`** on the number it buys, so
 Twilio has no address to POST to and the verified door is never knocked on. That
 is one form field in one POST, and it is not set because setting it points a
@@ -1526,27 +1568,45 @@ documents, and fixing any one of them alone would have read like a correction
 while two copies went on lying. The complementary operational reads remain
 `/readyz`, `/v1/inventory/stranded` and SQL.
 
-**Company knowledge is plaintext and Markdown only, on a hash embedder.** No URL
-fetching, no PDF parsing, no file upload, no malware or content-type validation.
-The embedder is a SHA-256 hash with no semantics, so retrieval quality is not a
-thing this build has yet.
+**Company knowledge is plaintext and Markdown only.** No URL fetching, no PDF
+parsing, no file upload, no malware or content-type validation. Retrieval
+quality now depends on whether `EMBEDDER_API_KEY` is set: without it the
+embedder is a SHA-256 hash with no semantics and retrieval is word matching,
+which on an inbound email almost never matches.
 
 **No payments, no WhatsApp adapter, and a voice half.** The payment port
 refuses with `not_configured`; `Step::Whatsapp` fails `no_whatsapp_sender` on
 every deployment, which is why `degraded` is the healthy steady state.
 
 `Channel::Voice` is no longer a policy channel with *nothing* behind it, and it
-is still not a phone call anybody would want to receive. `TelephonyProvider::
-place_call` dials — mock and Twilio, both held to the shared contract suite —
-and `telephony_twilio::SILENT_TWIML` is the whole of what the callee hears: the
-phone rings, they answer, the call ends. Speech synthesis, recognition and a
-turn-taking loop exist nowhere in this tree. So no employee can reach it
-(`call_place` is not in `turn::catalogue`, and `turn::UNSERVED` says why), no
-tenant could authorise it if one could (`default_ceiling` grants neither
-`voice` nor a calling code, and layers only narrow), and no route in this build
-accepts the status callback that would say whether the phone was answered — a
-successful `place_call` means a carrier agreed to dial and never that anybody
-picked up.
+is still not a phone call anybody can hold a conversation on.
+`TelephonyProvider::place_call` dials — mock and Twilio, both held to the shared
+contract suite — and the callee now hears one sentence: `OutboundCall::says`
+renders as `<Say>`, which is **Twilio's** speech synthesis on the tenant's own
+account, so no model or key of ours is spent and no audio crosses this process.
+What became of the call comes back too: `StatusCallback` is posted to the
+telephony webhook endpoint this deployment already receives texts on, and
+`inbound::land_call_outcome` writes a `call_completed` audit row under the
+employee whose `provider_intents` row named the sid.
+
+Recognition and a turn-taking loop still exist nowhere in this tree, so the call
+broadcasts and hangs up. And none of it is reachable: no employee can propose it
+(`call_place` is not in `turn::catalogue`, and `turn::UNSERVED` says why) and no
+tenant could authorise it if one could (`default_ceiling` grants neither `voice`
+nor a calling code, and layers only narrow). A successful `place_call` still
+means a carrier agreed to dial and never that anybody picked up — the difference
+is that the second row now says which.
+
+**Two operational notes if you ever do configure voice.** The status callback
+address is derived at boot from `PUBLIC_HOST` and names the *environment*
+registry's path (`/v1/webhooks/twilio`), so a deployment whose telephony
+endpoint is a stored `webhook_endpoints` row on a minted `whe_…` path will see
+its callbacks answered **404** — the calls still happen, the outcomes are lost,
+and the symptom is `webhook for an unregistered path` in the log. And a callback
+whose `CallSid` matches no `provider_intents` row is `unknown_call`, dead-
+lettered on the first attempt: that is another application on the same Twilio
+account, or a send whose accept-response never reached us (in which case the row
+is in `unsettled_calls` and no callback can ever join to it).
 
 **No key rotation.** One signing key per employee is the primary key of the
 table and `UPDATE` is revoked, so rotation is delete-then-insert with no overlap

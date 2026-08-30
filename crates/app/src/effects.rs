@@ -72,9 +72,16 @@ use uuid::Uuid;
 
 use crate::backlog::{Backlog, BacklogError, PgBacklog, WorkAction};
 use crate::calendar::{Calendar, CalendarError, PgCalendar};
+// The server crate deliberately does not depend on `agentos-providers` — see
+// `crate::inbound`'s re-exports for the whole argument. `RenderedCall::says` is
+// the only field on any `Rendered*` here that is not a `String` or a domain
+// type, so without this line a caller outside this crate could hold the token
+// and not the words. Re-exported under its own name: two names for one type is
+// two things to keep in step.
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 use crate::turn::WHOLE_PAGE;
+pub use agentos_providers::telephony::{Announcement, NotSpeakable};
 
 /// What [`Effects::read_page`] answers when this employee has no browser
 /// context to drive.
@@ -269,6 +276,21 @@ const TELEPHONY_PORT: &str = "telephony";
 
 /// The email port, for [`TELEPHONY_PORT`]'s reasons.
 const EMAIL_PORT: &str = "email";
+
+/// The payment port, for [`TELEPHONY_PORT`]'s reasons — and the one where the
+/// argument is not about tidiness.
+///
+/// `agentos_store::provisioning::unsettled_calls` already said *"a payment
+/// intent would land in this list too if anything wrote one, and that is correct
+/// — an unsettled payment is exactly as much somebody's morning as an unsettled
+/// text"*. Nothing wrote one, because [`Effects::pay`] was the single send in
+/// this module with no write-ahead row: it called the port and recorded
+/// afterwards, so a process that died mid-payment left the money's whole
+/// existence to the far side's records. It writes one now.
+///
+/// The port and not the rail: no rail is chosen (SPEC §13), and when one is it
+/// will be deployment configuration while this row outlives the deployment.
+const PAYMENT_PORT: &str = "payments";
 
 // ---------------------------------------------------------------------------
 // Subjects
@@ -526,6 +548,29 @@ pub struct RenderedSms {
     pub from: E164,
     /// Body text.
     pub body: String,
+}
+
+/// A rendered call, minus the recipient: who is ringing, and what they say.
+///
+/// **The field that took the longest to be honest about is `says`, and it is
+/// not a `String` where its two neighbours are.** [`RenderedSms::body`] and
+/// [`RenderedEmail::body_text`] land in fields of a JSON request; what a call
+/// says lands in a document whose other elements *are the instructions to the
+/// carrier*, so a free string here is a caller composing TwiML. See
+/// [`Announcement`], which refuses markup at construction rather than escaping
+/// it at the wire.
+///
+/// The words themselves are the caller's, and this build has exactly one kind
+/// of caller: Rust holding an [`Authorized`] token. No role pack proposes
+/// [`Action::CallPlace`] and `turn::catalogue` gives it no row, so nothing a
+/// model wrote can arrive here — and if one ever does, it arrives through
+/// `Authorized<Untrusted<CallPlace>>` and the audit row says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedCall {
+    /// The employee's own number.
+    pub from: E164,
+    /// One sentence, spoken by the carrier, to a callee who cannot reply.
+    pub says: Announcement,
 }
 
 /// A rendered WhatsApp message, minus the recipient.
@@ -919,7 +964,7 @@ pub struct Ports {
     /// billed differently, and only one of them can be told somebody
     /// unsubscribed. See [`agentos_providers::leads`].
     pub leads: Arc<dyn LeadSink>,
-    /// SMS, WhatsApp, and the dial. Not what a call says — see
+    /// SMS, WhatsApp, the dial, and the one sentence a call speaks — see
     /// [`Effects::place_call`].
     pub telephony: Arc<dyn TelephonyProvider>,
     /// The employee's browser.
@@ -994,7 +1039,7 @@ impl Effects {
         // either. Nothing has been sent, which is the state the failure leaves.
         self.begin_send(&ok, EMAIL_PORT).await?;
         let sent = self.ports.email.send(&self.key_for(&ok), &email).await;
-        self.record_sent(&ok, sent).await
+        self.record_sent(&ok, sent, Map::new()).await
     }
 
     /// Put the prospect on the token onto the sending platform's list.
@@ -1134,7 +1179,7 @@ impl Effects {
             .telephony
             .send_sms(&self.key_for(&ok), &sms)
             .await;
-        self.record_sent(&ok, sent).await
+        self.record_sent(&ok, sent, Map::new()).await
     }
 
     /// Whether this employee may write free text to this number on WhatsApp
@@ -1283,29 +1328,35 @@ impl Effects {
             .telephony
             .send_whatsapp(&self.key_for(&ok), &message)
             .await;
-        self.record_sent(&ok, sent).await
+        self.record_sent(&ok, sent, Map::new()).await
     }
 
-    /// Ring the number on the token, from this employee's own number.
+    /// Ring the number on the token, from this employee's own number, and say
+    /// the sentence.
     ///
-    /// # There is no body, and that is the shape of the honest half
+    /// # There is a body now, and it is the narrowest one in this module
     ///
-    /// Every other message-shaped method here takes a rendered thing beside its
-    /// token — a [`RenderedEmail`], a [`RenderedSms`]. This one takes an
-    /// [`E164`] and nothing else, because there is nothing else to take: the
-    /// call is silent. What a call *says* is speech synthesis, recognition and
-    /// a turn-taking loop over a media stream, none of which exists anywhere in
-    /// this workspace, and a `body: String` parameter here would be an argument
-    /// every adapter throws away. See
-    /// [`OutboundCall`](agentos_providers::telephony::OutboundCall), which has
-    /// no field for it for the same reason, and
-    /// `telephony_twilio::SILENT_TWIML`, which is the whole of what the callee
-    /// hears.
+    /// This method used to take an [`E164`] and nothing else, and the argument
+    /// was that there was nothing else to take: the call was silent, and a
+    /// `body: String` would be an argument every adapter threw away. Something
+    /// speaks it now — the carrier's own synthesis, driven by
+    /// [`Announcement`], on the tenant's Twilio account, with no model of ours
+    /// anywhere near it and no audio byte crossing this process.
     ///
-    /// So this is the *dialling* half of a phone call, built and testable, and
-    /// it is deliberately not reachable by a model: `ActionKind::CallPlace` is
-    /// still in [`crate::turn::UNSERVED`], with the reason rewritten to name
-    /// what is now missing rather than what used to be.
+    /// [`RenderedCall`] is therefore the neighbour of [`RenderedSms`], with one
+    /// difference that is the whole reason the type exists: its words cannot
+    /// contain markup. A call's body lands in a document whose sibling elements
+    /// are instructions to the carrier, so an escaped string would be one
+    /// forgotten escaper away from `<Dial>` and a premium-rate number billed to
+    /// the tenant.
+    ///
+    /// **It is still not reachable by a model, and nothing here changed that.**
+    /// `ActionKind::CallPlace` is still in [`crate::turn::UNSERVED`], so no
+    /// turn is offered the tool; and `store::policy::default_ceiling` still
+    /// grants neither [`Channel::Voice`] nor any calling code, so
+    /// `always_denies(CallPlace)` is true on the shipped ceiling and layers only
+    /// narrow. Both remain true on purpose — see that entry, which now names
+    /// what is left rather than what used to be.
     ///
     /// # `Ok` means the carrier took the request, not that anybody answered
     ///
@@ -1314,8 +1365,15 @@ impl Effects {
     /// `provider_call_attempted` with `effect: "call_place"` and an `ok`
     /// outcome says *we asked a carrier to ring this number and it agreed to*.
     /// Busy, no answer, an answering machine and a decline all happen after
-    /// this returns, they arrive on a status callback no route in this build
-    /// accepts, and none of them can make this row say anything different.
+    /// this returns.
+    ///
+    /// What has changed is that they are no longer unlearnable. They arrive on
+    /// the carrier's status callback, at the same signed endpoint every text
+    /// message arrives at, and
+    /// [`inbound::land_call_outcome`](crate::inbound::land_call_outcome) writes
+    /// a second row — `call_completed`, under the same employee, joined to this
+    /// one by the id returned here. Two rows and not one, because they are two
+    /// facts minutes apart and nobody in this system causes the second.
     ///
     /// The `from` number comes from the caller and the `to` number comes off
     /// the token — never the other way round, and never both from one place.
@@ -1325,13 +1383,14 @@ impl Effects {
     pub async fn place_call<A: Subject<Of = CallPlace>>(
         &self,
         ok: Authorized<A>,
-        from: E164,
+        call: RenderedCall,
     ) -> Result<ProviderMessageId, EffectError> {
         let call = OutboundCall {
-            from,
+            from: call.from,
             // The number that was ruled on, exactly as `send_email` takes its
             // recipient off the token rather than out of a rendered header.
             to: ok.action().subject().to.clone(),
+            says: call.says,
         };
 
         self.begin_send(&ok, TELEPHONY_PORT).await?;
@@ -1344,7 +1403,7 @@ impl Effects {
         // a second way: it is the id the provider handed back, which is what
         // the key means, and the row's own `effect` field already says a call
         // is what it was handed back for.
-        self.record_sent(&ok, placed).await
+        self.record_sent(&ok, placed, Map::new()).await
     }
 
     /// Run one browser step in an existing session.
@@ -2056,6 +2115,38 @@ impl Effects {
     /// this signature alone would have reopened it one layer down, where the
     /// gate rules on A and the port is handed B. There is nothing here to
     /// compare, because there is nothing to disagree with.
+    ///
+    /// # The fence, which every other send has had and this one did not
+    ///
+    /// This method used to call the port and then [`Self::record`], one write,
+    /// *after* the answer. That is the shape [`Self::begin_send`]'s own docs
+    /// call insufficient — "the interesting failure is the one where no answer
+    /// arrives, and in that failure `record` is never reached" — and it was
+    /// left on the one effect in this module that moves money, where the
+    /// consequence of an invisible in-flight request is not a text somebody may
+    /// have received twice.
+    ///
+    /// So it is fenced now, exactly like [`Self::send_sms`]: a `provider_intents`
+    /// row committed before the request leaves, closed after it is answered, and
+    /// deliberately left `in_flight` when nothing answers —
+    /// `agentos_store::provisioning::unsettled_calls` renders it for a person.
+    ///
+    /// **The bounded promise is the same one and not a bigger one.** The fence
+    /// does not make a duplicate impossible; what makes a *replayed approval*
+    /// impossible is one layer up, in `approvals::redeem`, which moves the row
+    /// out of `pending` in the transaction `redeem_approval` commits before this
+    /// method is ever reached — so the second attempt is
+    /// `RedemptionFailure::AlreadyDecided` and the port is never entered. See
+    /// `routes::approvals::approve`.
+    ///
+    /// **What a failing fence costs, named rather than discovered.**
+    /// [`Self::begin_send`] returning `Err` short-circuits with `?`, so
+    /// [`Self::book_effect`] never runs and the reservation on the token is
+    /// neither settled nor released — the day's headroom stays spent for money
+    /// that did not move. That is the conservative direction, it is the same
+    /// thing a dropped token cost before this bridge existed, and the only paths
+    /// into it are an unreachable database or a key that has been used before,
+    /// both of which mean nothing left this process.
     pub async fn pay<A: Subject<Of = PaymentCreate>>(
         &self,
         ok: Authorized<A>,
@@ -2066,27 +2157,30 @@ impl Effects {
             payee,
             memo: memo.to_owned(),
         };
+
+        self.begin_send(&ok, PAYMENT_PORT).await?;
         let paid = self
             .ports
             .payments
             .pay(&self.key_for(&ok), amount, &instruction)
-            .await
-            .map_err(EffectError::Provider);
+            .await;
 
-        let detail = Some(json!({
-            "payee": instruction.payee,
-            // `PaymentInstruction::memo` says it lands in the audit row, and
-            // until this line it did not: the field was built by `Turn::perform`
-            // from the model's own arguments, handed to the port, and read by
-            // nothing this side of an adapter that does not exist yet. An
-            // operator asking "what was that payment for" now has the answer
-            // here rather than only on a statement nobody in this system sees.
-            "memo": instruction.memo,
-            "minor": amount.minor(),
-            "currency": amount.currency().code(),
-            "provider_message_id": paid.as_ref().ok().map(ProviderMessageId::as_str),
-        }));
-        self.record(&ok, detail, paid).await
+        // Four fields a provider never tells us and one it does.
+        // `provider_message_id` is no longer spelled here: `record_sent` folds
+        // in `message_detail`'s, so the id keeps one spelling across every
+        // effect that has one.
+        let mut detail = Map::new();
+        detail.insert("payee".to_owned(), json!(instruction.payee));
+        // `PaymentInstruction::memo` says it lands in the audit row, and until
+        // this line it did not: the field was built by `Turn::perform` from the
+        // model's own arguments, handed to the port, and read by nothing this
+        // side of an adapter that does not exist yet. An operator asking "what
+        // was that payment for" now has the answer here rather than only on a
+        // statement nobody in this system sees.
+        detail.insert("memo".to_owned(), json!(instruction.memo));
+        detail.insert("minor".to_owned(), json!(amount.minor()));
+        detail.insert("currency".to_owned(), json!(amount.currency().code()));
+        self.record_sent(&ok, paid, detail).await
     }
 
     /// Ask for the money the token authorises: write one row of the register.
@@ -2799,10 +2893,17 @@ impl Effects {
     /// that is what makes the match total: by the time an error has been widened
     /// to `EffectError` the refusals this method must not settle — including
     /// [`Self::begin_send`]'s own — are indistinguishable from the provider's.
+    ///
+    /// `extra` is what the caller knows and no provider ever said — the payee,
+    /// the memo and the amount of a payment. It is merged with, rather than
+    /// replaced by, [`message_detail`]'s one field, so the provider's id keeps
+    /// exactly one spelling across every effect that has one. Empty for the four
+    /// message-shaped sends, which is byte-for-byte the row they wrote before.
     async fn record_sent<A: Subject>(
         &self,
         ok: &Authorized<A>,
         sent: Result<ProviderMessageId, ProviderError>,
+        extra: Map<String, Value>,
     ) -> Result<ProviderMessageId, EffectError> {
         let now = Utc::now();
         let mut tx = self
@@ -2824,8 +2925,14 @@ impl Effects {
         }
 
         let sent = sent.map_err(EffectError::Provider);
-        self.book_effect(&mut tx, ok, message_detail(&sent), &sent, now)
-            .await?;
+        let mut payload = extra;
+        if let Some(Value::Object(id)) = message_detail(&sent) {
+            payload.extend(id);
+        }
+        // `None` and not an empty object when there is nothing to say, which is
+        // what `message_detail` answered on its own for every failed send.
+        let detail = (!payload.is_empty()).then_some(Value::Object(payload));
+        self.book_effect(&mut tx, ok, detail, &sent, now).await?;
         tx.commit().await.map_err(EffectError::Unavailable)?;
         sent
     }
@@ -3729,6 +3836,11 @@ mod tests {
     /// fixture's `allowed_calling_codes`, so it is denied for a reason no other
     /// channel has — and the assertion that matters is not the `Denied`, it is
     /// that the double's dial log did not grow.
+    ///
+    /// The third half is what it said. The words come off the argument, the
+    /// number off the token, and the double records both — so an adapter that
+    /// dialled the right person and spoke somebody else's sentence would fail
+    /// here rather than in production.
     #[tokio::test]
     async fn the_number_dialled_is_the_number_the_gate_ruled_on() {
         let Some(db) = db().await else { return };
@@ -3739,12 +3851,20 @@ mod tests {
 
         let mine = E164::parse("+15005550006").expect("e164");
         let theirs = E164::parse("+14158675309").expect("e164");
+        let says = Announcement::parse("This is Lena from Orizn about purchase order 4471.")
+            .expect("plain words");
         let ok = gate
             .authorize(&principal, CallPlace { to: theirs.clone() })
             .await
             .expect("voice and +1 are both granted by the fixture policy");
         let placed = effects
-            .place_call(ok, mine.clone())
+            .place_call(
+                ok,
+                RenderedCall {
+                    from: mine.clone(),
+                    says: says.clone(),
+                },
+            )
             .await
             .expect("the carrier took it");
 
@@ -3753,9 +3873,11 @@ mod tests {
             phone.dialled(),
             [OutboundCall {
                 from: mine.clone(),
-                to: theirs
+                to: theirs,
+                says
             }],
-            "the numbers are the token's `to` and the caller's `from`, in that order"
+            "the numbers are the token's `to` and the caller's `from`, in that order, and the \
+             words are the caller's"
         );
 
         // And the row an operator reads afterwards. `ok` here means the carrier
@@ -4555,6 +4677,22 @@ mod tests {
         // hits the provider's idempotency cache instead of paying twice.
         let key = payments.keys().pop().expect("the provider saw a key");
         assert!(key.contains(&decision_id.as_uuid().to_string()), "{key}");
+
+        // The write-ahead row, which this effect did not have until the
+        // payment bridge existed. `step` NULL is what keeps it visible to
+        // `store::provisioning::unsettled_calls`, whose docs asked for exactly
+        // this row and never got one.
+        assert_eq!(
+            intent_rows(&db, &principal).await,
+            vec![(
+                "payment_create".to_owned(),
+                PAYMENT_PORT.to_owned(),
+                None,
+                "succeeded".to_owned(),
+                Some("pay_0001".to_owned()),
+                None,
+            )]
+        );
     }
 
     #[tokio::test]
@@ -4591,6 +4729,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1["outcome"], json!("error"));
         assert_eq!(rows[0].1["effect"], json!("payment_create"));
+
+        // A 400 is an *answer*, so the write-ahead row is settled `failed`
+        // rather than left for a human. The rail that never answers is the one
+        // that stays `in_flight`, and that arm is `record_sent`'s, shared with
+        // every other send.
+        let intents = intent_rows(&db, &principal).await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].3, "failed");
+        assert_eq!(intents[0].5.as_deref(), Some("bad_request"));
     }
 
     /// **The team's headroom comes back too**, which the test above cannot see

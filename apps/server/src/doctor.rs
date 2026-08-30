@@ -66,7 +66,7 @@ const PROBE_SECS: u32 = 10;
 /// with the boot guard. It only carries the human half: where an operator gets
 /// the credential, and what a free authenticated GET against that provider
 /// looks like.
-const PROVIDERS: [(&str, &str, &str); 3] = [
+const PROVIDERS: [(&str, &str, &str); 4] = [
     ("email", "EMAIL_API_KEY", "resend.com -> API Keys"),
     (
         "telephony",
@@ -78,32 +78,35 @@ const PROVIDERS: [(&str, &str, &str); 3] = [
         "BROWSER_API_KEY",
         "browserbase.com -> Settings, as `project-id:api-key`",
     ),
+    (
+        "embedder",
+        "EMBEDDER_API_KEY",
+        "the customer's own OpenAI key — we never supply the model, and the model name is not \
+         configurable because the HNSW index is partial on it",
+    ),
 ];
 
-/// The adapter no credential can make real, and what runs instead.
+/// What running on the hash embedder actually costs, in words an operator can
+/// act on.
 ///
-/// `EMBEDDER_API_KEY` used to be a row in [`PROVIDERS`], which meant exporting
-/// any string at all turned a MOCK verdict green while `Embedder` still had one
-/// variant and it was still a SHA-256 hash. A check that can be satisfied
-/// without changing what runs is worse than no check.
+/// The generic mock line in [`providers`] says "no message it accepts leaves
+/// this process", which is true of the mailbox and false of this one: the hash
+/// embedder embeds, stores and searches perfectly well — it simply has no
+/// opinion about meaning. That difference earns its own sentence, because *an
+/// employee that never finds its documents* is a thing somebody will otherwise
+/// debug for a day.
 ///
-/// It keeps a line of its own, unlike the plaintext secret vault (which is
-/// named only in [`Config::adapter_summary`]), because *an employee that never
-/// finds its documents* is a thing an operator will otherwise debug for a day.
-///
-/// The wording is the symptom, and the symptom changed. It used to read
-/// "retrieval returns something and it is not the right thing", which was
-/// accurate while `agentos_app::knowledge::retrieve` fused a hash-ranked vector
-/// leg into every answer. It no longer does — see the retrieval section of that
-/// module — so the operator now sees an empty recall rather than a wrong one,
-/// and this line has to say which.
-const PERMANENT_MOCK: (&str, &str) = (
-    "embedder",
-    "MOCK — a SHA-256 hash (`mock-sha256-1536`), not semantics. Retrieval therefore runs on word \
-     matching alone: an employee finds a document that repeats the words of the question and \
-     finds nothing otherwise, which on an inbound email is most of the time. This build ships no \
-     real embedder, so no credential changes it.",
-);
+/// It was a `PERMANENT_MOCK` pushed unconditionally onto every report, back
+/// when no credential could change it and adding `EMBEDDER_API_KEY` to
+/// [`PROVIDERS`] would have turned a MOCK verdict green while a SHA-256 hash
+/// went on running. `EMBEDDER_API_KEY` selects a real client now, so this is
+/// the mock half of an ordinary row rather than a standing footnote.
+const EMBEDDER_MOCK_DETAIL: &str = "\
+MOCK — a SHA-256 hash (`mock-sha256-1536`), not semantics. Retrieval therefore runs on word \
+matching alone: an employee finds a document that repeats the words of the question and finds \
+nothing otherwise, which on an inbound email is most of the time. Set EMBEDDER_API_KEY for the \
+real thing — and note that documents already ingested keep the model they were embedded under, \
+so they have to be ingested again to be findable.";
 
 /// Every migration this binary carries, so "are the migrations applied?" is
 /// answered against the build rather than against a directory listing that may
@@ -462,10 +465,16 @@ fn providers(
             report.push(
                 adapter,
                 Status::Ok,
-                format!(
-                    "MOCK — this adapter does nothing real and no message it accepts leaves this \
-                     process. Set {var} for the real thing ({source})."
-                ),
+                if adapter == "embedder" {
+                    // A different failure from the others, and the difference is
+                    // what an operator goes looking for. See the constant.
+                    EMBEDDER_MOCK_DETAIL.to_owned()
+                } else {
+                    format!(
+                        "MOCK — this adapter does nothing real and no message it accepts leaves \
+                         this process. Set {var} for the real thing ({source})."
+                    )
+                },
             );
         } else if mocked {
             report.push(
@@ -478,12 +487,6 @@ fn providers(
             report.push(adapter, status, format!("REAL — {var} is set; {detail}"));
         }
     }
-
-    // Always, not only when something else is mocked. A report whose every
-    // other line is REAL would otherwise read as "all of this is live", and
-    // this port permanently is not.
-    let (adapter, detail) = PERMANENT_MOCK;
-    report.push(adapter, Status::Ok, detail);
 }
 
 /// A live check that costs nothing and changes nothing: one authenticated GET
@@ -544,6 +547,20 @@ fn credential(
                 ),
             }
         }
+        // **Not probed, and that is a rule rather than an omission.** Nothing in
+        // this workspace spends a customer's model key, and `doctor` is a
+        // command an operator runs repeatedly — a `GET /v1/models` here would be
+        // a request on their account every time. The first ingest is where a bad
+        // key surfaces, and it surfaces well: a 401 maps to
+        // `Terminal { code: "unauthorized" }`, which is not retried and names
+        // itself.
+        "embedder" => (
+            Status::Ok,
+            format!(
+                "not verified here: {var} is the customer's own key and nothing in this binary \
+                 spends it to check. A bad one is reported by the first ingest as `unauthorized`."
+            ),
+        ),
         // Browserbase's only free authenticated GET is a project listing, and
         // it is per-project rather than per-account: a wrong project id with a
         // right key looks the same as the reverse. Reporting "not verified" is
@@ -900,17 +917,13 @@ mod tests {
         let report = inspect(&lookup(HashMap::new()));
 
         assert!(!report.checks.is_empty());
+        // No exemptions left. The embedder used to be one — `Status::Missing`
+        // means "the operator has to set or fix something" and there was
+        // nothing to set, so reporting it missing would have sent somebody
+        // looking for a variable that did not exist. `EMBEDDER_API_KEY` exists
+        // and selects a real client, so the embedder is now an ordinary row and
+        // an unconfigured one is ordinary MISSING.
         for check in &report.checks {
-            // One exemption, and it is the honest one: `Status::Missing` means
-            // "the operator has to set or fix something", and there is nothing
-            // to set for the embedder — this build ships no real one, so no
-            // environment can make its line green or red. Reporting it as
-            // missing would send somebody looking for a variable that does not
-            // exist. It still says MOCK, which is the part that matters.
-            if check.name == PERMANENT_MOCK.0 {
-                assert!(check.detail.contains("MOCK"), "{:?}", check.detail);
-                continue;
-            }
             assert_eq!(
                 check.status,
                 Status::Missing,

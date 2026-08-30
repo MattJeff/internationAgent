@@ -533,7 +533,11 @@ mod tests {
                     ),
                 ),
                 approvals: crate::with_api_stack(
-                    super::super::approvals::router(db.clone(), gate.clone()),
+                    super::super::approvals::router(
+                        db.clone(),
+                        gate.clone(),
+                        std::sync::Arc::new(agentos_app::mocks::ports()),
+                    ),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),

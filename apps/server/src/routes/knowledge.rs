@@ -65,14 +65,28 @@ use uuid::Uuid;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
+/// The database and the embedder this deployment's credentials selected.
+///
+/// The embedder arrives from `main.rs` rather than being built here for the
+/// same reason every other adapter does: `config.rs` is the one place that
+/// reads the environment, and an ingest route that picked its own embedder
+/// would be a second answer to "which model is this deployment on" — which is
+/// a question the `model` column on every chunk has to have exactly one answer
+/// to.
+#[derive(Clone)]
+pub struct KnowledgeState {
+    db: Db,
+    embedder: Embedder,
+}
+
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before this handler, and
 /// the 1 MB body cap comes from `with_outer_stack` outside that.
-pub fn router(db: Db) -> Router {
+pub fn router(db: Db, embedder: Embedder) -> Router {
     Router::new()
         .route("/v1/knowledge/documents", post(create_document))
-        .with_state(db)
+        .with_state(KnowledgeState { db, embedder })
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +139,7 @@ struct NewDocument {
 /// file.** The body says which either way, so a client that does not care can
 /// treat both as success and one that is reconciling can tell.
 async fn create_document(
-    State(db): State<Db>,
+    State(KnowledgeState { db, embedder }): State<KnowledgeState>,
     principal: Principal,
     body: Result<Json<NewDocument>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -145,12 +159,12 @@ async fn create_document(
         text: &body.text,
     };
 
-    // `Embedder::default()` is the deterministic hash embedder: no key, no
-    // network, no spend, so ingest works on a laptop and in CI exactly as it
-    // does in a deployment. The day a real backend lands it belongs in `Config`
-    // beside the other adapters, and `AGENTOS_ALLOW_MOCKS` gets an opinion
-    // about this one too; today there is only one variant to choose.
-    let ingested = ingest(&mut tx, Embedder::default(), &document)
+    // Whichever `EMBEDDER_API_KEY` selected. Unset is the deterministic hash —
+    // no key, no network, no spend — so ingest works on a laptop and in CI
+    // exactly as it does in a deployment, and `AGENTOS_ALLOW_MOCKS` is what a
+    // deployment has to say out loud to run on it. The choice is `Config`'s and
+    // arrives here already made.
+    let ingested = ingest(&mut tx, &embedder, &document)
         .await
         .map_err(ingest_failed)?;
     tx.commit().await?;
@@ -311,7 +325,7 @@ mod tests {
 
             Some(Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    router(db.clone(), Embedder::default()),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
@@ -349,7 +363,7 @@ mod tests {
             let question = Untrusted::new(question.to_owned());
             let recalled = recall(
                 &self.db,
-                Embedder::default(),
+                &Embedder::default(),
                 tenant,
                 &Recall::new(&question, None),
             )

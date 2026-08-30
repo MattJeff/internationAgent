@@ -30,6 +30,7 @@
 //! misconfigured.
 
 mod auth; // U30
+mod bridge; // the container runtime `agentos_app::hosted` describes and does not contain
 mod config; // U30
 mod doctor;
 mod error; // U30
@@ -50,7 +51,9 @@ use std::time::{Duration, Instant};
 use agentos_app::brief::INBOUND_BRIEF;
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{PolicyGate, Principal as ActingAs};
-use agentos_app::inbound::{self, Errand, Recorded, Secret, Thread, record_raw_email_delivery};
+use agentos_app::inbound::{
+    self, Errand, Recorded, Secret, TelephonyLanding, Thread, record_raw_email_delivery,
+};
 use agentos_app::knowledge::{self, Embedder};
 use agentos_app::mocks::Llm;
 use agentos_app::model_access::NoModel;
@@ -314,7 +317,19 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // one place that acts on it. Both calls take the same `Credentials`, so the
     // provisioner cannot buy a number from Twilio that the effects path then
     // texts from a mock.
-    let ports = Arc::new(agentos_app::mocks::ports_for(&config.credentials));
+    // `public_host` is here for one field: a placed call has to tell the
+    // carrier where to report back, and that is this deployment's own webhook
+    // endpoint. See `mocks::telephony_provider`.
+    let ports = Arc::new(agentos_app::mocks::ports_for(
+        &config.credentials,
+        &config.public_host,
+    ));
+    // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
+    // the real client and its absence selects the SHA-256 hash. Not a field of
+    // `Ports` — nothing routes an embedding through the gate — so it is built
+    // here and handed to the two callers that need it: the turn's `recall`, and
+    // the ingest route.
+    let embedder = agentos_app::mocks::embedder(&config.credentials);
     // **One vault per deployment, built here**, and since
     // `0050_tenant_model_key` it has exactly one reader: the provisioner's
     // identity canary. The tenant's model credential used to live here too, and
@@ -355,6 +370,45 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // does not depend on `agentos-providers` — see `Cargo.toml`.
     let credentials = agentos_app::mcp::Credentials::from_master_key(&config.master_key);
 
+    // The bridge runtime, or nothing at all.
+    //
+    // `None` here is the state this deployment has been in since `hosted` was
+    // written, and it is still the default: without `MCP_BRIDGE_BIND` every
+    // hosted binding refuses with `hosting_unavailable` and no container is
+    // started for anybody. What changed is that the branch now exists — the
+    // cap, the address and the image are an operator's three decisions, and
+    // `config::Hosting` is where they are made or not made.
+    //
+    // Built here rather than in `routes::mcp` because the *same* handle goes to
+    // the binder loop and to `POST /v1/mcp/connect`: the route starts a bridge
+    // to prove the connection works and the loop renews its lease five minutes
+    // later, and two runtimes would be two lease maps over one set of
+    // containers, each reaping what the other believed it was holding.
+    let bridges = match &config.hosting {
+        None => None,
+        Some(hosting) => {
+            let containers = std::sync::Arc::new(bridge::Containers::new(
+                hosting.image.clone(),
+                hosting.bind,
+                bridge::IDLE,
+            ));
+            // Before anything binds: a restart inherits the containers its
+            // predecessor leased and no map that covers them.
+            containers.sweep().await;
+            tracing::info!(
+                bind = %hosting.bind,
+                per_tenant = hosting.per_tenant,
+                image = hosting.image,
+                "hosted mcp is on"
+            );
+            Some(std::sync::Arc::new(agentos_app::hosted::Bridges::new(
+                containers,
+                hosting.network(),
+                hosting.per_tenant,
+            )))
+        }
+    };
+
     // The agent runtime, wired once and shared by every turn the outbox
     // dispatches. It hangs off the same token, so SIGTERM ends an in-flight
     // turn between effects instead of mid-payment.
@@ -365,6 +419,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         credentials: credentials.clone(),
         gate: gate.clone(),
         ports: ports.clone(),
+        embedder: embedder.clone(),
         fleets: fleets.clone(),
         cancel: cancel.clone(),
     };
@@ -386,6 +441,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 // registration and renewed by the loop with another is a binding
                 // that connects once and dies at its first expiry.
                 config.oauth_clients.clone(),
+                bridges.clone(),
                 rebinds,
                 cancel.clone(),
             )),
@@ -434,6 +490,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             gate,
             fleets,
             credentials,
+            bridges,
             ports.clone(),
             ModelWiring { llm },
         ),
@@ -533,15 +590,30 @@ struct ModelWiring {
     llm: Arc<dyn Llm>,
 }
 
+// Eight, and the eighth is `bridges`. The same `#[allow]` `app::mcp`'s
+// `bind_hosted` carries and for the same reason: every one of these is a
+// distinct wiring decision made once at boot, and a struct that existed only to
+// carry them past a lint would be a type nobody reads with a name nobody chose.
+#[allow(clippy::too_many_arguments)]
 fn app(
     db: Db,
     config: &Config,
     gate: PolicyGate,
     fleets: Fleets,
     credentials: agentos_app::mcp::Credentials,
+    bridges: Option<Arc<agentos_app::hosted::Bridges>>,
     ports: Arc<Ports>,
     model: ModelWiring,
 ) -> Router {
+    // Read off the same `Credentials` the turn path's was, rather than passed
+    // in as a ninth argument. A second instance and not a shared one, which is
+    // the trade `agentos_app::mocks::ports_for` already makes and argues: the
+    // HTTP client is stateless and the model name is a constant, so the two
+    // cannot disagree about anything an operator can observe. The thing that
+    // would matter — one deployment, one model on its chunks — is guaranteed by
+    // `model_name` being an exhaustive `match` and not by object identity.
+    let embedder = agentos_app::mocks::embedder(&config.credentials);
+
     // One state, cloned — not two built side by side. It carries the peer key
     // cache, and a cache per router is two caches, each half as warm.
     let a2a = a2a_state(&db, &gate, config);
@@ -562,6 +634,7 @@ fn app(
         fleets,
         credentials.clone(),
         config.oauth_clients.clone(),
+        bridges,
         &config.public_host,
     );
     let api = with_api_stack(
@@ -592,7 +665,13 @@ fn app(
             // Read-and-settle only — issuing goes through the gate, from a seat,
             // and there is deliberately no operator route for it.
             .merge(routes::invoices::router(db.clone()))
-            .merge(routes::approvals::router(db.clone(), gate.clone()))
+            // `ports` and not a second copy: approving a payment performs it,
+            // through the same adapter a turn would. See `approvals::approve`.
+            .merge(routes::approvals::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
             // route nobody merged is a route nobody can call, and the
@@ -636,7 +715,7 @@ fn app(
                 gate.clone(),
                 ports.clone(),
             ))
-            .merge(routes::knowledge::router(db.clone()))
+            .merge(routes::knowledge::router(db.clone(), embedder.clone()))
             // Beside `knowledge`, deliberately, because the pair is the whole
             // distinction: that one indexes a document so a turn can find what
             // resembles a question, and this one keeps the bytes so a person can
@@ -1267,7 +1346,8 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
     })
 }
 
-/// `webhook.twilio.received`: a text message becomes a conversation and a turn.
+/// `webhook.twilio.received`: a text message becomes a conversation and a turn,
+/// and a call's status callback becomes the answer its `Ok` never was.
 ///
 /// The other missing joint, and the shorter one.
 /// [`agentos_app::inbound::land_inbound_text`] had exactly one caller in this
@@ -1275,6 +1355,16 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
 /// inbound routing implementations that survived a clean-up, and the one whose
 /// comment said it was waiting for an ingest — therefore had none at all. This
 /// is the ingest.
+///
+/// # Two payloads, one door, and the branch is not made here
+///
+/// The same endpoint receives inbound texts and the status callbacks a placed
+/// call reports back on. This handler does not tell them apart and must not:
+/// this crate cannot name `agentos-providers`, so a predicate exported for it
+/// would be a second opinion about what counts as a call callback.
+/// [`agentos_app::inbound::land_telephony_callback`] reads the form once and
+/// dispatches inside the port boundary; what arrives here is which of the two it
+/// was, for the log line.
 ///
 /// # One phase, and no second queue
 ///
@@ -1320,7 +1410,7 @@ fn on_telephony_webhook<'a>(
         // provider is reached through `agentos_app`, never named here — this
         // crate does not depend on `agentos-providers`, which is why the
         // adapter arrives as a port rather than as a type.
-        let landed = agentos_app::inbound::land_inbound_text(
+        let landed = agentos_app::inbound::land_telephony_callback(
             tx,
             &*ports.telephony,
             body.as_bytes(),
@@ -1339,14 +1429,25 @@ fn on_telephony_webhook<'a>(
             }
         })?;
 
-        // No number and no body. Who wrote is in `messages`, behind RLS.
-        tracing::info!(
-            message_id = %landed.message_id,
-            conversation_id = %landed.conversation_id,
-            turn_event_id = %landed.turn_event_id,
-            duplicate = landed.duplicate,
-            "inbound text landed"
-        );
+        match landed {
+            // No number and no body. Who wrote is in `messages`, behind RLS.
+            TelephonyLanding::Text(landed) => tracing::info!(
+                message_id = %landed.message_id,
+                conversation_id = %landed.conversation_id,
+                turn_event_id = %landed.turn_event_id,
+                duplicate = landed.duplicate,
+                "inbound text landed"
+            ),
+            // No number here either, and the status is one of six authored
+            // words — see `CallStatus::as_str`. The number is on the
+            // `provider_call_attempted` row this joins to.
+            TelephonyLanding::Call(call) => tracing::info!(
+                employee_id = %call.employee_id,
+                status = call.status.as_str(),
+                duration_seconds = call.duration_seconds,
+                "a call we placed reported what became of it"
+            ),
+        }
         Ok(())
     })
 }
@@ -1390,6 +1491,15 @@ struct Agent {
     credentials: agentos_app::mcp::Credentials,
     gate: PolicyGate,
     ports: Arc<Ports>,
+    /// The embedding backend this deployment's `EMBEDDER_API_KEY` selected.
+    ///
+    /// A field rather than `Embedder::default()` at the call site, and the
+    /// difference is whether a turn recalls anything at all: unset is the
+    /// SHA-256 hash, whose `is_semantic()` is `false`, which makes
+    /// `knowledge::retrieve` skip the vector leg and answer on word matching
+    /// alone. Reading the deployment's choice here is what lets a customer who
+    /// has bought an embedder get one.
+    embedder: Embedder,
     /// Every tenant's MCP bindings, kept current by the binder loop.
     ///
     /// Not folded into `ports`, and it cannot be: `Ports` is process-wide and
@@ -1801,7 +1911,7 @@ impl Agent {
                     // answer.
                     let recalled = knowledge::recall(
                         &self.db,
-                        Embedder::default(),
+                        &self.embedder,
                         event.tenant_id,
                         &knowledge::Recall::new(&inbound, Some(employee_id)),
                     )
@@ -3432,6 +3542,7 @@ mod tests {
                 ports: Arc::new(agentos_app::mocks::ports()),
                 // No binder loop in this test, so every tenant's fleet is
                 // empty and every MCP call is refused by name.
+                embedder: agentos_app::knowledge::Embedder::default(),
                 fleets: Fleets::new().0,
                 cancel: cancel.clone(),
             };
@@ -3562,6 +3673,7 @@ mod tests {
                 credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
                 gate: PolicyGate::new(self.db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
+                embedder: agentos_app::knowledge::Embedder::default(),
                 fleets: Fleets::new().0,
                 cancel,
             };
@@ -4288,6 +4400,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4668,6 +4781,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -4841,6 +4955,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: Fleets::new().0,
             cancel: cancel.clone(),
         };
@@ -5028,6 +5143,9 @@ mod tests {
             // with anyway.
             credentials: agentos_app::mocks::Credentials::default(),
             oauth_clients: std::sync::Arc::default(),
+            // Hosting off, which is what a deployment that has not set
+            // `MCP_BRIDGE_BIND` has and what every test here wants.
+            hosting: None,
             // No provider callbacks registered, so no webhook handlers. The
             // termination entry does not depend on any of it.
             webhooks: Vec::new(),
@@ -5367,7 +5485,7 @@ mod tests {
         // rather than a tautology about an empty store.
         knowledge::ingest(
             &mut tx,
-            Embedder::default(),
+            &Embedder::default(),
             &knowledge::Document {
                 scope: knowledge::Scope::Company,
                 uri: Some("file://handbook.md"),
@@ -5590,6 +5708,8 @@ mod tests {
             // registered an application has. `refresh_due` finds nothing, so
             // the binder does exactly what it did before `waveI-i1`.
             std::sync::Arc::new(agentos_app::oauth::OauthClients::default()),
+            // And no bridge runtime: both companies dial a URL.
+            None,
             rebinds,
             cancel.clone(),
         ));
@@ -5626,6 +5746,7 @@ mod tests {
             credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
             gate: PolicyGate::new(db.clone()),
             ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
             fleets: fleets.clone(),
             cancel: cancel.clone(),
         };
@@ -5725,6 +5846,17 @@ mod tests {
             // query built from the message instead of quoting it — and that is
             // when somebody should be made to come back and assert the presence
             // again, with a corpus of more than one chunk behind it.
+            //
+            // Half of that day has arrived and this fixture is deliberately on
+            // the other half: `EMBEDDER_API_KEY` now selects a real embedder,
+            // and this `Agent` is built with `Embedder::default()` — the hash —
+            // because a test that reached a vendor would cost money per run.
+            // So what is pinned here is the *mock* deployment's behaviour, which
+            // is still every laptop and every CI run. A deployment with the
+            // credential set runs both legs and this assertion says nothing
+            // about it; asserting the presence needs a fake embeddings endpoint
+            // wired through `mocks::embedder`, which is the piece of work this
+            // comment is now asking for.
             assert!(
                 !whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
                 "{}'s turn recalled its own document, which this build cannot do — \

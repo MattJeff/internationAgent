@@ -12,6 +12,13 @@ rust-version.workspace = true
 agentos-app.workspace = true
 agentos-domain.workspace = true
 agentos-store.workspace = true
+# Promoted out of `[dev-dependencies]` by `crate::bridge`, which implements
+# `agentos_app::hosted::BridgeRuntime` — a trait declared with `#[async_trait]`,
+# so an implementation has to be too. Same reasoning as `base64` above: already
+# in the workspace, already linked into `agentos-app`, nothing new in the lock
+# file. And still not a crack in the `agentos-providers` rule below: this is the
+# macro that spells `async fn` in a trait, not a provider.
+async-trait.workspace = true
 axum.workspace = true
 # Promoted out of `[dev-dependencies]` by `routes::files`, which carries a
 # document's bytes as base64 inside JSON — see that module for why they travel
@@ -32,9 +39,3 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-# Tests only, and it is not a crack in the rule above: `agentos-providers` is
-# still absent, and this is the macro that spells `async fn` in a trait. One
-# test implements `agentos_app::mocks::Llm` — see that re-export for why a
-# scripted model cannot answer the question it asks — and `Llm` is declared with
-# `#[async_trait]`, so an implementation has to be too.
-async-trait.workspace = true

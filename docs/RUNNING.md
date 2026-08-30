@@ -333,25 +333,30 @@ stamping `now` on an hour already past would manufacture a record saying
 somebody kept it.
 
 ## The gap the preflight names and this map did not: memory does not work
+until somebody sets `EMBEDDER_API_KEY`
 
-`agentos-server doctor` reports the embedder as `[OK]` and it is telling the
-truth about the *credential* — there is nothing to set. What it says beside it is
-the part that matters:
+`agentos-server doctor` now reports the embedder the way it reports every other
+adapter: `[MISSING]` with nothing set, `[OK] MOCK — …` once
+`AGENTOS_ALLOW_MOCKS=1` accepts it, `[OK] REAL` with a key. On a box that has
+accepted the mock, what it says beside it is the part that matters:
 
 > `MOCK — a SHA-256 hash (mock-sha256-1536), not semantics. Retrieval therefore
 > runs on word matching alone: an employee finds a document that repeats the
 > words of the question and finds nothing otherwise, which on an inbound email is
-> most of the time. This build ships no real embedder, so no credential changes
-> it.`
+> most of the time. Set EMBEDDER_API_KEY for the real thing — and note that
+> documents already ingested keep the model they were embedded under, so they
+> have to be ingested again to be findable.`
 
-Checked rather than taken on trust: `agentos_providers::embedder::Embedder` has
-**one variant**, `Mock`, and it is the default. There is no second one to switch
-to.
+That line used to end "this build ships no real embedder, so no credential
+changes it", and that is what changed:
+`agentos_providers::embedder::Embedder` has a second variant, `OpenAi`, built by
+`EMBEDDER_API_KEY` against the customer's own key. `Mock` is still the default
+and still what every test and every laptop runs on.
 
-So `knowledge` — what an employee recalls before it answers — ingests, chunks,
-stores and retrieves, and it cannot rank by meaning. Everything around it is
-real: the tenant isolation, the chunking, the `source_id`, the storage. The one
-thing that makes retrieval *retrieval* is not.
+So on a deployment that has not set it, `knowledge` — what an employee recalls
+before it answers — ingests, chunks, stores and retrieves, and cannot rank by
+meaning. Everything around it is real: the tenant isolation, the chunking, the
+`source_id`, the storage. The one thing that makes retrieval *retrieval* is not.
 
 **What changed since this section was written.** It used to say the ranking *is*
 a hash, and it was: `retrieve` fused a hash-ranked vector leg with the full-text
@@ -380,12 +385,26 @@ stranger write `or` and `-` into the query — steer an ordinary-looking email
 onto a named document, or delete the passage that constrains them out of the
 answer. See `crates/store/src/knowledge.rs`.
 
-**It is not a credential and not a wave.** A real embedder is a provider
-integration with a per-call cost, which makes it the same decision as every other
-model spend: whose key, and priced how. On the CLI path Orizn now runs, there is
-no embeddings endpoint at all — the subscription does not expose one — so this is
-the first place where "the customer brings their own model" and "we run on the
-CLI" give different answers.
+**It is a credential now, and the decision it was waiting on has one answer and
+one open question.** Answered: whose key — the customer's, like every other model
+spend, and `EMBEDDER_API_KEY` is one value because the model name is a constant
+of the adapter rather than a setting (the HNSW index is partial on it, and a
+partial index predicate is a SQL literal that cannot name an environment
+variable). Still open: this is the first place where "the customer brings their
+own model" and "we run on the CLI" give different answers, because the CLI
+subscription exposes no embeddings endpoint at all. A customer on the CLI path
+who wants memory has to hold a second, separate key — and nothing in the product
+tells them that yet.
+
+**Two things about the real adapter are worth knowing before setting the
+variable.** The dimension is fixed at 1536 because the column is `vector(1536)`;
+`text-embedding-3-small` is natively that wide, the request asks for it
+explicitly, and a vector of any other width is refused at the adapter rather than
+projected to fit or discovered by Postgres mid-ingest. And a turn's recall runs
+under a two-second budget (`RECALL_TIMEOUT`) that was sized when embedding was a
+local hash — with a network round trip inside it, a slow provider minute becomes
+"could not reach the document store", which the employee says out loud but which
+is a different failure rate from the one that constant was chosen against.
 
 ## What the sweep found, and it is worth reading before trusting the gate
 

@@ -772,8 +772,16 @@ impl Bridges {
     /// bind pass**. See [`BRIDGES_PER_TENANT`] for why that is not the same
     /// number as how many it will be holding.
     ///
-    /// Read by [`crate::mcp::Fleet::bind`], and the reason the count is kept
-    /// there is not that it reaches the runtime — it does not. The chain is
+    /// Read by [`crate::mcp::Fleet::bind`] and by `POST /v1/mcp/connect`, which
+    /// refuses a row past this number rather than writing one that would bind
+    /// as `hosted_cap_reached` forever. **The route reads it from here rather
+    /// than from its own configuration**, and that is the whole reason this is
+    /// `pub`: the cap the route enforces and the cap the binder applies have to
+    /// be one number, and two reads of one operator's variable are two numbers
+    /// the day somebody adds a default to one of them.
+    ///
+    /// The reason the count is kept in `Fleet::bind` is not that it reaches the
+    /// runtime — it does not. The chain is
     /// `Fleet::bind` → [`crate::mcp::Credentials::bind_hosted`] →
     /// [`Self::endpoint`] → [`BridgeRuntime::start`], and the middle link is
     /// the only caller of `endpoint`. What `bind_hosted` cannot do is count:
@@ -781,7 +789,7 @@ impl Bridges {
     /// `Fleet::bind` is the one frame in that chain that holds a tenant's whole
     /// configuration at once, which is what makes it the only place upstream of
     /// the runtime where a per-tenant number means anything.
-    pub(crate) const fn per_tenant(&self) -> usize {
+    pub const fn per_tenant(&self) -> usize {
         self.per_tenant
     }
 

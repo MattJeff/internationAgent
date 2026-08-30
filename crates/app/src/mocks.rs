@@ -52,6 +52,8 @@ use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
 use agentos_providers::email_resend::ResendEmailProvider;
+use agentos_providers::embedder::Embedder;
+use agentos_providers::embedder_openai::OpenAiEmbedder;
 use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
 use agentos_providers::secrets::MemorySecretStore;
@@ -135,6 +137,8 @@ pub struct Credentials {
     pub telephony: Option<TelephonyCredentials>,
     /// Browserbase. `None` is [`MockBrowser`].
     pub browser: Option<BrowserCredentials>,
+    /// The embedding model. `None` is [`Embedder::Mock`], the SHA-256 hash.
+    pub embedder: Option<EmbedderCredentials>,
 }
 
 /// What [`ResendEmailProvider::new`] takes.
@@ -168,6 +172,20 @@ pub struct BrowserCredentials {
     pub api_key: String,
 }
 
+/// What [`OpenAiEmbedder::new`] takes, and the whole of it.
+///
+/// **One field, and no model name beside it.** The customer brings the key and
+/// pays the bill — the same rule [`LlmBackend::pays_with_our_key`] enforces one
+/// port over — but the *model* is a constant of the adapter, because the HNSW
+/// index is partial on a model name and a partial index predicate is a SQL
+/// literal. A model an operator could type would be a model with no index and
+/// therefore a sequential scan on every retrieval. See
+/// `agentos_providers::embedder_openai` and `migrations/0026`.
+pub struct EmbedderCredentials {
+    /// The `sk-…` API key. Nothing else: see above.
+    pub api_key: String,
+}
+
 // A derived Debug would print three live credentials into whatever log line
 // someone dumps the configuration to. Same reason `Config` writes its own.
 impl fmt::Debug for Credentials {
@@ -176,6 +194,7 @@ impl fmt::Debug for Credentials {
             .field("email", &self.email.is_some())
             .field("telephony", &self.telephony.is_some())
             .field("browser", &self.browser.is_some())
+            .field("embedder", &self.embedder.is_some())
             .finish()
     }
 }
@@ -193,14 +212,48 @@ fn email_provider(credentials: &Credentials) -> Arc<dyn EmailProvider> {
     }
 }
 
-/// Numbers and messages: Twilio when there is an account, the fake when there
-/// is not.
-fn telephony_provider(credentials: &Credentials) -> Arc<dyn TelephonyProvider> {
+/// Numbers, messages and calls: Twilio when there is an account, the fake when
+/// there is not.
+///
+/// # `public_host` is here because a call now has an answer to bring back
+///
+/// `TwilioTelephony::with_status_callback` is where a placed call learns where
+/// to report what became of it, and the address is
+/// `${PUBLIC_HOST}/v1/webhooks/{TELEPHONY_PROVIDER}` — the endpoint
+/// `AGENTOS_WEBHOOK_SECRETS` serves, which is the same door every inbound text
+/// already arrives at and is verified with the same signature scheme. Nothing
+/// new is opened.
+///
+/// **Only the real adapter gets one, and neither the mock nor [`adapters_for`]
+/// does.** A fake that never dials cannot be called back, and the provisioner
+/// buys and releases numbers — it has no `place_call` on any path — so
+/// `public_host` is [`None`] there rather than an address that would never be
+/// sent. That is what the parameter's `Option` is for; it is not a convenience.
+///
+/// ponytail: derived at boot, so it can only name the *environment* registry's
+/// path — a deployment whose telephony endpoint is a stored `whe_…` row has a
+/// different address and its status callbacks will 404, which loses the outcome
+/// and not the call. `with_status_callback` carries the upgrade path.
+fn telephony_provider(
+    credentials: &Credentials,
+    public_host: Option<&str>,
+) -> Arc<dyn TelephonyProvider> {
     match &credentials.telephony {
-        Some(telephony) => Arc::new(TwilioTelephony::new(
-            telephony.account_sid.clone(),
-            &telephony.auth_token,
-        )),
+        Some(telephony) => {
+            let client = TwilioTelephony::new(telephony.account_sid.clone(), &telephony.auth_token);
+            Arc::new(match public_host {
+                // `callback_origin` and not a `format!` of our own: the route
+                // that *verifies* an incoming delivery reconstructs the same
+                // origin with the same function, and Twilio's scheme MACs it —
+                // so two spellings is every callback refused at the door.
+                Some(host) => client.with_status_callback(format!(
+                    "{}/v1/webhooks/{}",
+                    crate::inbound::callback_origin(host),
+                    agentos_providers::telephony::PROVIDER,
+                )),
+                None => client,
+            })
+        }
         None => Arc::new(MockTelephony::new(Utc::now(), MOCK_TELEPHONY_TOKEN)),
     }
 }
@@ -220,6 +273,30 @@ fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
                 .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
         ),
         None => Arc::new(MockBrowser::new()),
+    }
+}
+
+/// The embedder: the real client when there is a key, the SHA-256 hash when
+/// there is not.
+///
+/// **Not a field of [`Ports`] or [`Adapters`], and it does not want to be.**
+/// Nothing routes an embedding through the `Effects` façade — `knowledge::ingest`
+/// and `knowledge::recall` take one directly, because an embedding is not an
+/// action an employee proposes and there is nothing for the gate to decide about
+/// it. So it is selected here, like [`llm`], and handed to the two callers that
+/// need it.
+///
+/// The selection is what makes `EMBEDDER_API_KEY` a credential rather than a
+/// switch: with a key, `Embedder::is_semantic()` is `true` and
+/// `knowledge::retrieve` runs the vector leg it refuses to run on a hash. That
+/// is the argument `config.rs` used to make for *removing* the variable, and it
+/// is answered rather than dropped — there is now something for it to select.
+pub fn embedder(credentials: &Credentials) -> Embedder {
+    match &credentials.embedder {
+        Some(embedder) => Embedder::OpenAi(Arc::new(OpenAiEmbedder::new(Secret::new(
+            embedder.api_key.clone(),
+        )))),
+        None => Embedder::Mock,
     }
 }
 
@@ -273,7 +350,9 @@ pub fn adapters_for(
 ) -> Adapters {
     Adapters {
         email: email_provider(credentials),
-        telephony: telephony_provider(credentials),
+        // `None`: the provisioner buys and releases numbers and never places a
+        // call, so there is no outcome for a carrier to report back.
+        telephony: telephony_provider(credentials, None),
         browser: browser_provider(credentials),
         // Passed in rather than built here: see `secret_store`. One deployment,
         // one vault, so the provisioning canary a step writes is the one the
@@ -291,7 +370,9 @@ pub fn adapters_for(
 /// only be fetched back by *this* process's mock. That is a property of running
 /// on fakes, not a bug to design around.
 pub fn ports() -> Ports {
-    ports_for(&Credentials::default())
+    // No credentials, so every port is a fake and the address below reaches
+    // nothing: `telephony_provider` only hands it to the real adapter.
+    ports_for(&Credentials::default(), "http://localhost")
 }
 
 /// The ports this deployment's credentials actually select.
@@ -305,10 +386,15 @@ pub fn ports() -> Ports {
 /// stateless, and the only per-instance state in any real adapter is Twilio's
 /// send de-duplication map — which lives on this side, because `Adapters` never
 /// sends anything. Share them the day a third caller needs the same instance.
-pub fn ports_for(credentials: &Credentials) -> Ports {
+///
+/// `public_host` is `PUBLIC_HOST`, and it is here for one field: a placed call
+/// has to tell the carrier where to report back, and that address is this
+/// deployment's own webhook endpoint. See [`telephony_provider`], which is the
+/// only reader and which gives it to the real adapter only.
+pub fn ports_for(credentials: &Credentials, public_host: &str) -> Ports {
     Ports {
         email: email_provider(credentials),
-        telephony: telephony_provider(credentials),
+        telephony: telephony_provider(credentials, Some(public_host)),
         browser: browser_provider(credentials),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
@@ -781,6 +867,9 @@ mod tests {
                 project_id: "proj_test".to_owned(),
                 api_key: "bb_live_key".to_owned(),
             }),
+            embedder: Some(EmbedderCredentials {
+                api_key: "sk-live-key".to_owned(),
+            }),
         }
     }
 
@@ -802,7 +891,7 @@ mod tests {
         };
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let real = ports_for(&live());
+        let real = ports_for(&live(), "https://agents.test");
         let mock = ports();
 
         // -- email: signed with a secret only Resend was handed -------------
@@ -880,10 +969,13 @@ mod tests {
         use agentos_providers::browser::MOCK_PROVIDER;
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let ports = ports_for(&Credentials {
-            browser: live().browser,
-            ..Credentials::default()
-        });
+        let ports = ports_for(
+            &Credentials {
+                browser: live().browser,
+                ..Credentials::default()
+            },
+            "https://agents.test",
+        );
         let ctx = EnsureCtx::new(
             agentos_domain::ids::TenantId::new_v7(Utc::now()),
             agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
@@ -928,6 +1020,62 @@ mod tests {
         assert!(
             ports.email.verify_webhook(body, &headers).is_err(),
             "email had no credential and must still be the mock"
+        );
+    }
+
+    /// The embedder, which is the adapter whose credential used to select
+    /// nothing.
+    ///
+    /// Not folded into the test above because it takes no socket and no
+    /// signature to tell the two apart: `is_semantic` is the branch
+    /// `knowledge::retrieve` actually reads, and it is the difference between a
+    /// hybrid search and a word search. Asserting on it is asserting on the
+    /// thing the credential is supposed to change.
+    #[test]
+    fn the_embedding_credential_selects_a_backend_that_ranks_by_meaning() {
+        let real = embedder(&live());
+        assert!(
+            real.is_semantic(),
+            "EMBEDDER_API_KEY selected something whose vectors mean nothing, which is \
+             exactly the alarm-quieting the variable was deleted for"
+        );
+        // The other observable difference, and the one the store reads: two
+        // model names, so the two vector spaces never meet in one search.
+        assert_eq!(
+            crate::knowledge::model_name(&real),
+            "text-embedding-3-small"
+        );
+
+        let fake = embedder(&Credentials::default());
+        assert!(!fake.is_semantic());
+        assert_eq!(crate::knowledge::model_name(&fake), "mock-sha256-1536");
+
+        // Per adapter, like every other one: an embedding key on its own does
+        // not make the mailbox real.
+        let only_embeddings = ports_for(
+            &Credentials {
+                embedder: live().embedder,
+                ..Credentials::default()
+            },
+            "https://agents.test",
+        );
+        let body = br#"{"type":"email.received"}"#;
+        let timestamp = Utc::now().timestamp().to_string();
+        let headers = agentos_providers::email::WebhookHeaders {
+            signature: agentos_providers::email::sign_webhook(
+                &Secret::new(LIVE_WEBHOOK_SECRET),
+                "msg_1",
+                &timestamp,
+                body,
+            ),
+            id: "msg_1".to_owned(),
+            timestamp,
+        };
+        assert!(
+            only_embeddings
+                .email
+                .verify_webhook(body, &headers)
+                .is_err()
         );
     }
 

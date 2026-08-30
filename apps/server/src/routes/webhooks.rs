@@ -104,7 +104,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agentos_app::inbound::{
-    TELEPHONY_SIGNATURE_HEADER, WebhookHeaders, verify_signature, verify_telephony_webhook,
+    TELEPHONY_SIGNATURE_HEADER, WebhookHeaders, callback_origin, verify_signature,
+    verify_telephony_webhook,
 };
 use agentos_app::mcp::Credentials;
 use agentos_app::webhooks::{self, Endpoint};
@@ -220,26 +221,13 @@ pub fn router(db: Db, credentials: Credentials, webhooks: Webhooks, public_host:
         })
 }
 
-/// `PUBLIC_HOST` as an absolute origin: scheme, host, no trailing slash.
-///
-/// The trailing slash is trimmed the way `routes::a2a` and `routes::mcp` trim
-/// it, and for the same reason — the path is appended and `//v1` is a different
-/// URL.
-///
-/// **The scheme is defaulted, and that default is `https`.** `.env.example`
-/// shipped `PUBLIC_HOST=agents.example.com` for as long as nothing MACed a URL,
-/// so a deployment that copied it has no scheme at all — and a MAC computed over
-/// `agents.example.com/v1/webhooks/…` matches nothing a provider ever signed.
-/// `https` because it is the only scheme a provider will post a callback to. A
-/// host that names its own scheme keeps it, so a development box on
-/// `http://localhost` is untouched.
-fn callback_origin(public_host: &str) -> String {
-    let host = public_host.trim().trim_end_matches('/');
-    match host.contains("://") {
-        true => host.to_owned(),
-        false => format!("https://{host}"),
-    }
-}
+// `callback_origin` used to be a private function here. It moved to
+// `agentos_app::inbound`, beside the sign/verify pair for the same scheme, the
+// day a *placed call* acquired a status callback: the origin is now MACed at
+// both ends — reconstructed here to verify an arriving delivery, and handed to
+// the adapter by `agentos_app::mocks::telephony_provider` so a call knows where
+// to report back. Two spellings of it is a deployment that answers every call
+// and learns the outcome of none, so there is one.
 
 /// Verify, store, 202.
 ///

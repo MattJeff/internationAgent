@@ -361,7 +361,7 @@
 
 use std::collections::HashSet;
 
-use agentos_domain::action::{E164, EmailAddress};
+use agentos_domain::action::{ActionKind, E164, EmailAddress};
 use agentos_domain::employee::Step;
 use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, TenantId};
 use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
@@ -376,6 +376,7 @@ use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::org;
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
+use agentos_store::provisioning as provisioning_store;
 use agentos_store::revenue as revenue_store;
 use agentos_store::turns;
 use chrono::{DateTime, Utc};
@@ -395,7 +396,7 @@ use crate::turn::Context;
 pub use agentos_providers::Secret;
 pub use agentos_providers::email::{SigError, WebhookHeaders, sign_webhook, verify_signature};
 pub use agentos_providers::telephony::{
-    PROVIDER as TELEPHONY_PROVIDER, SigError as TelephonySigError,
+    CallOutcome, CallStatus, PROVIDER as TELEPHONY_PROVIDER, SigError as TelephonySigError,
     TWILIO_SIGNATURE_HEADER as TELEPHONY_SIGNATURE_HEADER,
 };
 
@@ -435,6 +436,34 @@ pub enum InboundError {
     /// operator rather than retried or guessed at.
     #[error("no employee is allocated to the number this arrived on")]
     Unallocated,
+
+    /// A status callback arrived for a call no row in this tenant says we
+    /// placed.
+    ///
+    /// # Not retryable, and the two ways to get here are both worth seeing
+    ///
+    /// The row is written by `effects::Effects::record_sent` in the transaction
+    /// that commits the audit row, seconds after the carrier accepted the dial
+    /// and minutes before the call can reach a terminal state — so there is no
+    /// race for a retry to win. What is left is:
+    ///
+    /// * **Somebody else is using this Twilio account.** An operator testing
+    ///   from the console, or a second application on the same credentials.
+    ///   Eight retries would not make it ours.
+    /// * **The accept answered into a dead socket**, so `settle_send_intent`
+    ///   was never reached and the row is still `in_flight` with no
+    ///   `external_id` to match. That row is not lost — it is exactly what
+    ///   `store::provisioning::unsettled_calls` surfaces and what
+    ///   `GET /v1/employees/{id}` renders for a person — but no callback can
+    ///   ever join to it, because the id the carrier is naming is the id we
+    ///   never learned.
+    ///
+    /// A dead letter is the honest answer to both: it is visible, and
+    /// `outbox::requeue_dead_letters` is the way back if the first one is ever
+    /// fixed. [`Unallocated`](Self::Unallocated) is filed the same way for the
+    /// same reason.
+    #[error("a status callback arrived for a call this tenant did not place")]
+    UnknownCall,
 
     /// The stored notice is not one this build can act on.
     #[error("stored notice is unusable: {0}")]
@@ -498,6 +527,7 @@ impl InboundError {
             InboundError::Store(StoreError::Conflict(_) | StoreError::NotFound) => false,
             InboundError::UnknownRecipient
             | InboundError::Unallocated
+            | InboundError::UnknownCall
             | InboundError::BadNotice(_)
             | InboundError::Normalize(_)
             | InboundError::TelephonyNormalize(_) => false,
@@ -510,6 +540,7 @@ impl InboundError {
             InboundError::NotReady => "not_ready",
             InboundError::UnknownRecipient => "unknown_recipient",
             InboundError::Unallocated => "unallocated_number",
+            InboundError::UnknownCall => "unknown_call",
             InboundError::BadNotice(_) => "bad_notice",
             InboundError::Provider(err) => err.code(),
             InboundError::Normalize(_) | InboundError::TelephonyNormalize(_) => "unnormalizable",
@@ -993,6 +1024,36 @@ pub fn verify_telephony_webhook(
         }))
 }
 
+/// `PUBLIC_HOST` as an absolute origin: scheme, host, no trailing slash.
+///
+/// # This is one function because the two sides of it must agree exactly
+///
+/// Twilio's scheme MACs the callback URL, so the origin appears twice in this
+/// system and both copies have to be the same string to the character: the
+/// route reconstructs it to *verify* an incoming delivery
+/// (`apps/server/src/routes/webhooks.rs`), and
+/// [`crate::mocks`] hands it to the adapter so a placed call knows where to
+/// *report back*. Two spellings is a deployment where every call is answered
+/// and no outcome is ever learned — or, if the outbound one is the malformed
+/// half, a `POST /Calls` refused with "Url is not a valid URL" and a call that
+/// never happens.
+///
+/// **The scheme is defaulted, and that default is `https`.** `.env.example`
+/// shipped `PUBLIC_HOST=agents.example.com` for as long as nothing MACed a URL,
+/// so a deployment that copied it has no scheme at all. `https` because it is
+/// the only scheme a provider will post a callback to. A host that names its own
+/// scheme keeps it, so a development box on `http://localhost` is untouched.
+///
+/// The trailing slash is trimmed because the path is appended and `//v1` is a
+/// different URL.
+pub fn callback_origin(public_host: &str) -> String {
+    let host = public_host.trim().trim_end_matches('/');
+    match host.contains("://") {
+        true => host.to_owned(),
+        false => format!("https://{host}"),
+    }
+}
+
 /// Produce the header [`verify_telephony_webhook`] accepts.
 ///
 /// The twin of [`sign_webhook`], and it exists for the same reason and with the
@@ -1183,11 +1244,12 @@ const fn telephony_scope(channel: Channel) -> Option<(Step, &'static [&'static s
 ///
 /// # Wired, and by one caller only
 ///
-/// `apps/server/src/main.rs::on_telephony_webhook`, the outbox handler
-/// registered under `webhook.twilio.received`. That is the whole ingest: the
-/// route verified the bytes and stored them, the outbox poller claims the row,
-/// and this lands the message and wakes the employee inside the same
-/// transaction that marks the row done.
+/// [`land_telephony_callback`], which is what
+/// `apps/server/src/main.rs::on_telephony_webhook` calls and which sends a form
+/// here only once [`CallOutcome::read`] has said it is not a call's status
+/// callback. That is the whole ingest: the route verified the bytes and stored
+/// them, the outbox poller claims the row, and this lands the message and wakes
+/// the employee inside the same transaction that marks the row done.
 ///
 /// **There is no second queue, unlike email, and there must not be one.** The
 /// `inbound` notice aggregate that `loops/inbound.rs` drains exists because a
@@ -1241,6 +1303,137 @@ pub async fn land_inbound_text(
         raw_form,
     )?;
     land(tx, &message, now).await
+}
+
+/// What one verified telephony delivery turned out to be.
+///
+/// Two shapes, because one endpoint receives two unrelated things and the
+/// caller's log line is the only place that has to tell them apart. Everything
+/// upstream — the path, the signature, the outbox row — is identical for both,
+/// which is the point: a status callback is not a second door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelephonyLanding {
+    /// Somebody wrote to us. See [`land_inbound_text`].
+    Text(Landed),
+    /// A call we placed reached its end. See [`land_call_outcome`].
+    Call(CallLanded),
+}
+
+/// A call outcome, attributed and recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLanded {
+    /// Whose call it was, read out of the row we wrote before dialling.
+    pub employee_id: EmployeeId,
+    /// What became of it, narrowed to this build's vocabulary.
+    pub status: CallStatus,
+    /// How long it was connected. `None` on a call that never connected.
+    pub duration_seconds: Option<u32>,
+}
+
+/// Land one **verified** telephony callback, whichever of the two it is.
+///
+/// # One entry point, because the branch is not the caller's to make
+///
+/// `apps/server` cannot name `agentos-providers` — that is the whole shape of
+/// the port boundary — so a caller that had to ask "is this a call status?"
+/// before choosing a function would need a predicate exported for it, and a
+/// predicate exported for a caller is a predicate that can disagree with the
+/// parser. [`CallOutcome::read`] answers both questions in one pass and this
+/// function is the only reader of it: `Some` is a call, `None` is a message,
+/// and there is nowhere for a third opinion to live.
+///
+/// The transaction is the caller's, and everything below commits with the
+/// `mark_done` that retires the delivery — so a crash re-runs the whole thing
+/// rather than half of it, exactly as [`land_inbound_text`] describes.
+pub async fn land_telephony_callback(
+    tx: &mut TenantTx<'_>,
+    telephony: &dyn TelephonyProvider,
+    raw_form: &[u8],
+    now: DateTime<Utc>,
+) -> Result<TelephonyLanding, InboundError> {
+    match CallOutcome::read(raw_form)? {
+        Some(outcome) => land_call_outcome(tx, &outcome, now)
+            .await
+            .map(TelephonyLanding::Call),
+        None => land_inbound_text(tx, telephony, raw_form, now)
+            .await
+            .map(TelephonyLanding::Text),
+    }
+}
+
+/// Record what became of a call this tenant placed.
+///
+/// # The routing is a join, not a guess, and that is the whole difference
+///
+/// [`land_inbound_text`] has to *work out* who a text belongs to: a stranger
+/// dialled a number we own, and [`resolve_phone_recipient`] arbitrates between
+/// the employees allocated to it. None of that applies here. We placed this
+/// call, we wrote a `provider_intents` row before the request left, and we
+/// closed it with the carrier's own id when the carrier accepted — so the
+/// employee is *looked up*, by `external_id`, and a callback that does not join
+/// to a row is [`InboundError::UnknownCall`] rather than a number matched to
+/// somebody plausible.
+///
+/// That is stricter than the text path on purpose. An unrecognised inbound text
+/// is a customer; an unrecognised call outcome is another application on our
+/// Twilio account, and attributing it to whichever employee happens to hold the
+/// `From` number would put a stranger's call in somebody's audit trail.
+///
+/// # It records and does not wake
+///
+/// [`land`] enqueues [`TURN_EVENT`] because a text is a person waiting for an
+/// answer. Nobody is waiting here: the call is over, and the employee that
+/// placed it will read this row the next time something else wakes it.
+///
+/// ponytail: no turn, and the upgrade is one `outbox::enqueue` beside the audit
+/// row. Add it when a role pack proposes `CallPlace` and an employee has a
+/// reason to act on *no answer* — today no pack does and no ceiling permits
+/// one, so a wake here would be an event nothing can ever produce.
+///
+/// # Redelivery
+///
+/// Twilio retries a callback that does not get a 2xx, and the edge's dedupe key
+/// is a digest of the bytes — so a redelivery collapses onto the first outbox
+/// row and never reaches this function. What is *not* fenced is the same call
+/// reported twice with different bytes, which would write a second identical
+/// audit row. That is a duplicated line in a log, not a duplicated act, and the
+/// trail is append-only by design.
+pub async fn land_call_outcome(
+    tx: &mut TenantTx<'_>,
+    outcome: &CallOutcome,
+    now: DateTime<Utc>,
+) -> Result<CallLanded, InboundError> {
+    // The kind is part of the match: ids are the vendor's and their namespaces
+    // are too, so what tells a call's callback from a message's is what we were
+    // doing, never the shape of the string.
+    let employee_id = provisioning_store::employee_for_external_id(
+        tx,
+        ActionKind::CallPlace.as_str(),
+        outcome.call_sid.as_str(),
+    )
+    .await?
+    .ok_or(InboundError::UnknownCall)?;
+
+    let mut event = AuditEvent::new(AuditActor::System, AuditKind::CallCompleted, now);
+    event.employee_id = Some(employee_id);
+    // Every value here is either ours or one of six authored constants —
+    // `CallStatus::as_str` — so no text a stranger's request chose is stored.
+    // The counterparty's number is not copied: `call_sid` is the
+    // `provider_call_attempted` row's `detail.provider_message_id`, and that
+    // row's `decision_id` names the `call_place` ruling that carries
+    // `counterparty`. One address, in one place — see `AuditKind::CallCompleted`.
+    event.payload = json!({
+        "call_sid": outcome.call_sid.as_str(),
+        "status": outcome.status.as_str(),
+        "duration_seconds": outcome.duration_seconds,
+    });
+    audit::append(tx, &event).await?;
+
+    Ok(CallLanded {
+        employee_id,
+        status: outcome.status,
+        duration_seconds: outcome.duration_seconds,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -8104,5 +8297,228 @@ mod tests {
                 "a phrase that means nothing else stopped counting by text: {body:?}"
             );
         }
+    }
+
+    // -- what became of a call ---------------------------------------------
+
+    /// A Twilio call status callback, as the edge verified it. The `To` and
+    /// `From` are the outbound direction — the number **we** dialled is `To` —
+    /// which is the mirror image of a text and the reason nothing here routes
+    /// on them.
+    fn status_form(sid: &str, status: &str, duration: Option<&str>) -> Vec<u8> {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("CallSid", sid)
+            .append_pair("CallStatus", status)
+            .append_pair("From", "+33755500001")
+            .append_pair("To", "+33612345678")
+            .append_pair("Direction", "outbound-api")
+            .append_pair("AccountSid", "ACtest");
+        if let Some(seconds) = duration {
+            form.append_pair("CallDuration", seconds);
+        }
+        form.finish().into_bytes()
+    }
+
+    /// The rows `Effects::place_call` leaves behind: written before the request
+    /// leaves, closed with the carrier's own id when it is accepted.
+    ///
+    /// Through the store's own functions and not a hand-written INSERT, because
+    /// the join this whole feature rests on is `external_id` — and a fixture
+    /// that wrote that column itself would keep passing after
+    /// `settle_send_intent` stopped filling it in.
+    async fn a_call_was_placed(db: &Db, tenant: TenantId, employee: EmployeeId, sid: &str) {
+        let key = IdempotencyKey::for_step(employee, &format!("effect:{sid}"));
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        provisioning_store::begin_send_intent(
+            &mut tx,
+            employee,
+            "telephony",
+            ActionKind::CallPlace.as_str(),
+            &key,
+            now,
+        )
+        .await
+        .expect("write-ahead row");
+        provisioning_store::settle_send_intent(&mut tx, &key, Ok(sid), now)
+            .await
+            .expect("the carrier accepted");
+        tx.commit().await.expect("commit the intent");
+    }
+
+    async fn call_rows(db: &Db, tenant: TenantId) -> Vec<(Option<Uuid>, Value)> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let rows = sqlx::query_as(
+            "SELECT employee_id, payload FROM audit_log \
+              WHERE action_kind = 'call_completed' ORDER BY occurred_at, id",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read the trail");
+        tx.rollback().await.expect("rollback");
+        rows
+    }
+
+    async fn message_count(db: &Db, tenant: TenantId, conversation: ConversationId) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE conversation_id = $1")
+                .bind(conversation.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("count messages");
+        tx.rollback().await.expect("rollback");
+        count
+    }
+
+    /// **The claim the outcome half exists for.**
+    ///
+    /// `place_call` returns the instant a carrier agrees to dial, so *busy*,
+    /// *no answer*, an answering machine and a decline were facts this system
+    /// could never learn. They arrive here, and the employee they are filed
+    /// under is **looked up** — out of the row written before the request left
+    /// and closed with the carrier's own id — rather than routed off the
+    /// numbers on the wire.
+    ///
+    /// Both halves, because the first alone would pass against a function that
+    /// filed every callback under whoever it found: an id we placed is
+    /// attributed, and an id we did not is refused with nothing written.
+    #[tokio::test]
+    async fn a_call_outcome_is_attributed_to_the_employee_that_placed_the_call() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let sid = format!("CA_{}", employee.as_uuid().simple());
+        a_call_was_placed(&db, tenant, employee, &sid).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let landed = land_telephony_callback(
+            &mut tx,
+            &MockTelephony::new(Utc::now(), "token"),
+            &status_form(&sid, "no-answer", None),
+            Utc::now(),
+        )
+        .await
+        .expect("a call this tenant placed");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            landed,
+            TelephonyLanding::Call(CallLanded {
+                employee_id: employee,
+                status: CallStatus::NoAnswer,
+                // Absent and not zero: the call never connected, and a zero we
+                // invented would read like a call answered and dropped inside a
+                // second.
+                duration_seconds: None,
+            })
+        );
+
+        // The trail, which is the durable half and the one an operator reads.
+        let rows = call_rows(&db, tenant).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Some(employee.as_uuid()));
+        assert_eq!(rows[0].1["call_sid"], json!(sid));
+        assert_eq!(rows[0].1["status"], json!("no_answer"));
+        // The counterparty is deliberately not copied — it is two already
+        // load-bearing hops away, on the `call_place` ruling this row's sid
+        // reaches through `provider_call_attempted`. A number a stranger's
+        // request supplied must not land in a column nobody re-checks.
+        assert_eq!(rows[0].1.get("to"), None);
+
+        // A call this tenant did not place. Another application on the same
+        // Twilio account, or an operator testing from the console — and
+        // attributing it to whoever holds the `From` number would put a
+        // stranger's call in an employee's audit trail.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let stranger = land_telephony_callback(
+            &mut tx,
+            &MockTelephony::new(Utc::now(), "token"),
+            &status_form("CA_somebody_elses", "completed", Some("31")),
+            Utc::now(),
+        )
+        .await
+        .expect_err("nothing in this tenant says we placed it");
+        tx.commit().await.expect("commit");
+
+        assert!(matches!(stranger, InboundError::UnknownCall));
+        assert_eq!(stranger.code(), "unknown_call");
+        // A dead letter, not eight retries: the row it would join to is written
+        // in the transaction that records the attempt, minutes before a call can
+        // reach a terminal state, so there is no race for a retry to win.
+        assert!(!stranger.is_retryable());
+        assert_eq!(
+            call_rows(&db, tenant).await.len(),
+            1,
+            "a call nobody here placed was written to somebody's trail"
+        );
+    }
+
+    /// **One endpoint, two payloads, and the branch that keeps them apart.**
+    ///
+    /// A status callback carries a `To` and a `From` exactly as a text does, so
+    /// without [`CallOutcome::read`] gating the path it would reach
+    /// [`land_inbound_text`], route on those numbers, and then fail on the
+    /// missing `MessageSid` — a dead letter per call, and, if the parse had ever
+    /// been made lenient, a `messages` row saying a supplier had texted us the
+    /// word "completed".
+    ///
+    /// So the assertion is not only that each lands as its own variant: it is
+    /// that the call outcome left the conversation untouched.
+    #[tokio::test]
+    async fn a_status_callback_is_not_a_text_and_leaves_the_thread_alone() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let ours = number(41);
+        allocate(&db, tenant, employee, &ours, false, Utc::now()).await;
+        let sid = format!("CA_after_{}", employee.as_uuid().simple());
+        a_call_was_placed(&db, tenant, employee, &sid).await;
+        let telephony = MockTelephony::new(Utc::now(), "token");
+
+        // A real text first, so the thread exists and has one message on it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let text = land_telephony_callback(
+            &mut tx,
+            &telephony,
+            &form("SM_first", "+33612345678", &ours, "call me back"),
+            Utc::now(),
+        )
+        .await
+        .expect("a text lands");
+        tx.commit().await.expect("commit");
+        let TelephonyLanding::Text(text) = text else {
+            panic!("a message with a MessageSid was read as a call outcome: {text:?}");
+        };
+
+        let before = message_count(&db, tenant, text.conversation_id).await;
+        assert_eq!(before, 1);
+
+        // And then what became of the call we placed to the same person.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let outcome = land_telephony_callback(
+            &mut tx,
+            &telephony,
+            &status_form(&sid, "completed", Some("18")),
+            Utc::now(),
+        )
+        .await
+        .expect("a call outcome lands");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            outcome,
+            TelephonyLanding::Call(CallLanded {
+                employee_id: employee,
+                // "Connected and then ended", which is all the carrier observed
+                // — an answering machine produces exactly this.
+                status: CallStatus::Completed,
+                duration_seconds: Some(18),
+            })
+        );
+        assert_eq!(
+            message_count(&db, tenant, text.conversation_id).await,
+            before,
+            "a call status was landed as a message on the counterparty's thread"
+        );
+        assert_eq!(call_rows(&db, tenant).await.len(), 1);
     }
 }

@@ -223,9 +223,10 @@ Names the older spec used that do **not** exist, and what replaced them:
 - `McpConnector` → `McpCaller`, plus the concrete `McpServer` / `Fleet`.
 - `A2aGateway` → the concrete `A2aExecutor` + `PgTaskStore`; the trait is
   `AgentRuntime` and only tests implement it.
-- `KnowledgeEmbedder` → `Embedder`, an **enum** with one variant (`Mock`), not a
-  trait. A trait with one implementation is an interface nobody is choosing
-  between.
+- `KnowledgeEmbedder` → `Embedder`, an **enum** with two variants (`Mock`,
+  `OpenAi`), not a trait. It was one variant for a long time, and the enum was
+  the honest shape then too: a trait with one implementation is an interface
+  nobody is choosing between.
 - `SecretProvider` → `SecretStore`.
 
 Provider identifiers are stored in `employee_resources`; secrets are not.
@@ -244,6 +245,7 @@ and a fake phone, which is the normal state of an integration, not an error.
 | `EMAIL_API_KEY` | `re_…` | `ResendEmailProvider` |
 | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` | `TwilioTelephony` |
 | `BROWSER_API_KEY` | `project-id:api-key` | `BrowserbaseBrowser` + `CdpWebsocket` |
+| `EMBEDDER_API_KEY` | `sk-…` | `OpenAiEmbedder` |
 
 Two of them are compound because the adapter behind them takes two values, and
 they are one variable each for the same reason the keyring is: half a
@@ -255,19 +257,27 @@ The email adapter also needs the `whsec_…` signing secret, and takes it from t
 `email` entry of `AGENTOS_WEBHOOK_SECRETS` — where an operator has already
 pasted it — rather than from a fourth variable holding the same string.
 
-`EMBEDDER_API_KEY` **is no longer read at all.** It used to gate the boot guard
-while selecting nothing, because `Embedder` has one variant and it is a SHA-256
-hash; a credential that cannot change what runs must not be able to quiet an
-alarm. The embedder and the secret vault are named as permanent mocks in the
-boot summary instead.
+`EMBEDDER_API_KEY` **is read again, and the argument that removed it is
+answered.** It used to gate the boot guard while *selecting nothing*, because
+`Embedder` had one variant and it was a SHA-256 hash; a credential that cannot
+change what runs must not be able to quiet an alarm. It selects something now —
+`OpenAiEmbedder`, on the customer's key — and three observable things move with
+it: `Embedder::is_semantic()` becomes `true`, so `knowledge::retrieve` runs the
+vector leg; chunks are stamped `text-embedding-3-small` rather than
+`mock-sha256-1536`; and `0076_knowledge_index_real_embedder.sql` gives that
+model a partial HNSW index of its own. It is one value and not a pair because
+the customer brings the key and the **model name is a constant of the adapter** —
+a partial index predicate is a SQL literal and cannot name an environment
+variable, so a configurable model would be a model with no index. The secret
+vault is the only permanent mock left in the boot summary.
 
 Every boot logs one line naming what is behind every port, and `/readyz`
 publishes the same inventory as `mock_adapters` for as long as the replica is
 up:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 The **model is the exception**: `mocks::llm` selects `AnthropicLlm`, `CliLlm` or
@@ -519,36 +529,84 @@ are NOT BUILT.**
 
 ## 7. Voice
 
-**The dialling half is built. Everything a call *says* is NOT BUILT.** There is
-no STT, no TTS, no voice gateway and no media handling, and no audio byte is
-ever produced, consumed or stored.
+**A call now says one sentence and reports what became of it. A *conversation*
+is NOT BUILT.** There is still no STT, no voice gateway and no media handling;
+no audio byte is ever produced, consumed or stored in this process; and the only
+websocket in the workspace is still CDP, for browser automation.
 
-What exists is a call that rings and hangs up. `TelephonyProvider::place_call`
-is the **fifth** method on the trait (`crates/providers/src/telephony.rs`);
-`OutboundCall` carries a `from` and a `to` and deliberately no field for what to
-say, because a `script` field would be a place to put words nothing can speak;
-`TwilioTelephony::place_call` posts to `/Calls.json` with
-`telephony_twilio::SILENT_TWIML` — `<Response><Hangup/></Response>` — **inline
-and never as a `Url`**, since a `Url` would mean this deployment composing TwiML
-mid-call, which is the voice half arriving through the back door as a config
-string; and `Effects::place_call` takes an `Authorized<CallPlace>`, reads the
-number off the token, and writes the `provider_call_attempted` audit row. Three
-sentences that stood here are false and are named rather than deleted: the
-`grep` over `crates/providers/src` does **not** return nothing, the trait does
-**not** have four methods, and the adapter does **not** avoid `/Calls.json`. The
-only websocket in the workspace is still CDP, for browser automation.
+### What a call says
 
-**No model can reach it, in two independent places.** `ActionKind::CallPlace`
-has no catalogue row — it sits in `turn::UNSERVED`, whose entry gives the
-reason: a row there would hand a model the power to make a stranger's phone ring
-and say nothing, which is a nuisance call with an audit trail. And
+`OutboundCall` carries `from`, `to` and **`says: Announcement`**. The paragraph
+that stood here said a `script` field would be "a place to put words nothing can
+speak", which was true while every adapter hung up on connect and is not any
+more: `TwilioTelephony::place_call` posts `<Response><Say>…</Say><Hangup/>
+</Response>`, and `<Say>` is **the carrier's** speech synthesis, on the tenant's
+own Twilio account. No model of ours is involved, no key of ours is spent, and
+nothing crosses this process but a form field.
+
+`Announcement` (`crates/providers/src/telephony.rs`) is the whole safety
+argument and it is a *refusal*, not an escaper. `<Say>` is a sibling of `<Dial>`
+in one document, so a free string reaching the adapter is TwiML injection: a
+body ending `</Say><Dial>+1900…</Dial>` is toll fraud billed to the tenant.
+`Announcement::parse` therefore refuses any of `< > & "` and every control
+character, plus empty and over-500-characters (counted in **characters**, so a
+French sentence is not silently halved). There is deliberately **no escaper
+anywhere in the crate** — an escaper is one function an adapter must remember to
+call, and a value that cannot hold a `<` is safe in the SSML or JSON adapter
+somebody writes next.
+
+`Effects::place_call` takes an `Authorized<CallPlace>` and a `RenderedCall`
+(`from` + `says`), reads the *number* off the token and the *words* off the
+argument, and writes the `provider_call_attempted` audit row. A `Url` is still
+**never** sent: a `Url` would mean this deployment composing TwiML mid-call,
+which is the turn-taking loop arriving as a config string.
+
+### Learning the outcome
+
+`Ok` from `place_call` still means only that a carrier agreed to dial. What has
+changed is that the rest arrives:
+
+* `TwilioTelephony::with_status_callback` sets `StatusCallback` and
+  `StatusCallbackEvent=completed` — one event, which for an outbound call covers
+  *busy*, *no answer*, *failed* and *canceled* as well as a call that connected.
+  It is wired at boot from `PUBLIC_HOST` (`mocks::telephony_provider`) and points
+  at **the endpoint every inbound text already arrives at**; no new route, no
+  second scheme. Absent by default, so an unconfigured build behaves exactly as
+  before.
+* The delivery is authenticated by `routes::webhooks` under Twilio's own scheme
+  (§19), unchanged.
+* `inbound::land_telephony_callback` reads the form once. `CallOutcome::read`
+  answers `Some` for a status callback (discriminating on `CallStatus`, not
+  `CallSid` — an inbound voice webhook carries the latter and is not an outcome)
+  and `None` for a text, so one endpoint serves both and the branch cannot
+  disagree with the parser.
+* `inbound::land_call_outcome` **joins** rather than routes: the employee comes
+  from the `provider_intents` row written before the request left and closed with
+  the carrier's own sid, so a callback for a call this tenant did not place is
+  `InboundError::UnknownCall` and a dead letter, not a stranger's call in
+  somebody's trail. It writes one `AuditKind::CallCompleted` row —
+  `call_sid`, `status`, `duration_seconds`.
+* `CallStatus` is a **closed enum** parsed out of the authenticated bytes;
+  anything the vendor adds is `Unknown`, never the string. `Completed` means
+  *connected and then ended* and deliberately does not claim a person heard
+  anything — `MachineDetection` is a paid guess and is not requested.
+
+It records and does not wake: nobody is waiting at the end of a call that is
+already over, and a turn here would be an event no pack can produce.
+
+### What is still NOT BUILT
+
+The reply. A callee's answer is speech, nothing here turns speech into text, and
+`<Gather>` would need this deployment to compose TwiML mid-call. So a call
+broadcasts once and hangs up.
+
+**No model can reach even that, in two independent places.**
+`ActionKind::CallPlace` has no catalogue row — it sits in `turn::UNSERVED`,
+whose entry now reads "a robocall with a decision id". And
 `store::policy::default_ceiling` grants neither `Channel::Voice` nor any calling
-code, and layers only ever narrow, so no tenant can authorise one.
-
-**Receiving, and learning the outcome, are NOT BUILT.** `Ok` from `place_call`
-means a carrier agreed to dial and can never mean anybody answered: busy, no
-answer, an answering machine and a decline all arrive on a status callback no
-route in this build accepts — which is also why no `StatusCallback` is sent.
+code, and layers only ever narrow, so no tenant can authorise one. Nothing in
+this section loosened either, and the only caller of `Effects::place_call` in the
+workspace is a test.
 
 `Channel::Voice` exists in the domain and in the role packs as a *policy*
 channel — an employee's limits can name it — and in `inbound.rs` as a routing
@@ -560,7 +618,9 @@ The intended shape, kept because it is a decision:
 text -> TTS -> PSTN`, terminating in a secure WebSocket voice gateway, storing
 call metadata, transcript, consent/recording disclosure state, summary,
 extracted commitments and follow-up tasks. Audio retention configurable and
-**off by default** unless the tenant explicitly enables it.
+**off by default** unless the tenant explicitly enables it. What is built above
+is the first and last hop of that diagram with the middle removed: text out,
+outcome back, no audio and no transcript.
 
 ---
 
@@ -683,15 +743,29 @@ Pipeline as built: `text -> normalise -> chunk -> embed -> index -> employee ACL
 AV and no extension check; the only content control is normalisation and a
 refusal of the empty document. The global 1 MiB body cap is the only size limit.
 
-**The embedder is a hash.** `Embedder::Mock` derives a unit-length
-1536-dimension vector from SHA-256: same string in, byte-identical vector out,
-on any machine, forever, with no network and no key. It makes no attempt at
-semantics — "cat" and "kitten" are as unrelated as "cat" and "diesel". Use it to
-test plumbing; use a real embedder to test whether retrieval finds the right
-document. Every chunk records its model as `mock-sha256-1536`, deliberately not
-a real model name, because a `vector(1536)` from one embedder and a
-`vector(1536)` from another are the same Postgres type and are not the same
-space — mixing them returns nonsense rather than an error.
+**The embedder is a hash unless `EMBEDDER_API_KEY` is set.** `Embedder::Mock`
+derives a unit-length 1536-dimension vector from SHA-256: same string in,
+byte-identical vector out, on any machine, forever, with no network and no key.
+It makes no attempt at semantics — "cat" and "kitten" are as unrelated as "cat"
+and "diesel" — and `is_semantic()` is `false`, which is what makes `retrieve`
+drop the vector leg rather than fuse in five passages ranked by a digest.
+`Embedder::OpenAi` (`embedder_openai.rs`) is the real one, on the customer's
+key, `text-embedding-3-small`, `is_semantic()` `true`. Every chunk records its
+model — `mock-sha256-1536` or `text-embedding-3-small` — because a
+`vector(1536)` from one embedder and a `vector(1536)` from another are the same
+Postgres type and are not the same space; mixing them returns nonsense rather
+than an error. The mock's name is deliberately not a vendor model name, and
+switching the credential on does **not** re-embed what is already stored: those
+rows keep their model and stop being findable until they are ingested again.
+
+**The dimension is fixed at 1536 and the real adapter refuses anything else.**
+`vector(1536)` is the column; `text-embedding-3-small` is natively that wide,
+which is why it is the model rather than a preference. The request sends
+`dimensions: 1536` explicitly and the response is measured, so a vendor changing
+a default is `Terminal { code: "embedding_dim_mismatch" }` at the adapter and
+never a Postgres error mid-ingest. Nothing is projected or truncated to fit — a
+transform of ours between the customer's model and the customer's answers would
+be invisible from the outside and would make `model` on the row a lie.
 
 Retrieval is **hybrid**: a cosine leg and a `plainto_tsquery('english')`
 full-text leg, fused in Rust by reciprocal rank fusion (`RRF_K = 60.0`) with
@@ -740,15 +814,22 @@ tools — see §14.
 
 A retrieved document is untrusted data, never executable instruction.
 
-The HNSW index is **partial on the model**, and `0026_knowledge_index_model.sql`
-is the migration that made the predicate name the model this system writes
-(`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing ever
-wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on 20 000
-chunks). There is now one constant for it,
-`store::knowledge::DEFAULT_EMBEDDING_MODEL`, and `app::knowledge::model_name`
-returns *that* rather than a second spelling. A second embedding model is a
-second partial index and therefore a migration, deliberately: that migration is
-where somebody has to say whether the new vectors belong in the old space.
+The HNSW index is **partial on the model**, and there are two of them.
+`0026_knowledge_index_model.sql` made the predicate name the model this system
+writes (`mock-sha256-1536`; `0004` named `text-embedding-3-small`, which nothing
+ever wrote, so the vector leg was a sequential scan — 889 ms against 2.8 ms on
+20 000 chunks). `0076_knowledge_index_real_embedder.sql` is the second model
+arriving on the terms 0026 set, and it answers 0026's question out loud: the two
+spaces are **not** one space, so it is a second index and not a widened
+predicate. There is one constant per model —
+`store::knowledge::DEFAULT_EMBEDDING_MODEL` and
+`store::knowledge::OPENAI_EMBEDDING_MODEL` — and `app::knowledge::model_name`
+returns *those* rather than second spellings. The same drift is now closed in
+both directions it can open: a `const` block in `app::knowledge` proves the
+store's constant and `providers::embedder_openai::OpenAiEmbedder::MODEL` are the
+same bytes at compile time (two crates that cannot see each other), and
+`the_real_embedders_index_names_the_model_it_writes` reads the predicate back
+out of `pg_indexes` and compares it with the constant.
 
 ---
 
@@ -829,6 +910,46 @@ employee to fit the key would put a UUID naming nobody into an AAD forever.
 and `0043_mcp_hosted.sql` the hosted-package arm. **That is three MCP tables,
 not the two counted above**; the two above are what `0013` created.
 
+### Hosted servers — the runtime, and the one variable that turns it on
+
+`crates/app/src/hosted.rs` is the contract and says no implementation belongs in
+`crates/app`. `apps/server/src/bridge.rs` is the implementation: a
+`BridgeRuntime` over the `docker` command, one container per `(tenant, server)`,
+leased rather than stopped and reaped after `bridge::IDLE` (20 minutes). It
+publishes a port — `-p <bind>:0:8000` — rather than routing to a container
+address, because a container's own address is unreachable from the host on
+macOS; the isolation the module argues for is the container, not the route.
+
+Three variables, and hosting is **off** without the first:
+
+| Variable | Meaning |
+|---|---|
+| `MCP_BRIDGE_BIND` | the address bridges publish on. Unset means no `Bridges` at all and every hosted binding refuses with `hosting_unavailable` |
+| `MCP_BRIDGES_PER_TENANT` | the cap. Defaults to `hosted::BRIDGES_PER_TENANT`, which is **zero** |
+| `MCP_BRIDGE_IMAGE` | the runner image. Defaults to `node:22-alpine`, which runs `supergateway` over the pinned stdio package |
+
+The network `accept` admits is **derived** from the bind address as its own
+`/32` (or `/128`) rather than configured, so the set of endpoints admitted is
+exactly the set the runtime can produce. Two settings that must agree are one
+setting somebody eventually gets wrong.
+
+`POST /v1/mcp/connect` accepts a hosted connector: it starts the bridge, lists
+its tools and writes a row with a **NULL url**, under
+`pg_advisory_xact_lock(hashtextextended($tenant, 0))` with a recount against the
+cap, answering **409 `hosted_cap_reached`** past it. Reconnecting an existing
+handle does not count itself, so the last slot stays rotatable.
+
+**NOT BUILT: retirement is not counted against the cap.** `DELETE` refunds a
+slot at once while the container behind it lives until the idle TTL, so a tenant
+cycling handles holds up to `cap × (IDLE ÷ REFRESH)` containers — the multiplier
+`BRIDGES_PER_TENANT`'s own arithmetic already tells an operator to divide by.
+Narrowing it needs a `retired_at` no migration has written.
+
+**Untested against a real daemon in this workspace** — Docker was not running
+when it was written. The parsing and the address derivation have unit tests
+(`bridge::tests`, `config::tests`); the `docker` verbs and the runner command
+line have not been executed once.
+
 **NOT BUILT:** persisting resources and prompts — only tools are listed and
 stored, and there is no `list_resources` or `list_prompts` call anywhere in the
 workspace — and protocol negotiation beyond what the SDK does internally.
@@ -908,10 +1029,16 @@ policy.
 
 ## 13. Payments
 
-**NOT BUILT.** `PaymentProvider` (`crates/app/src/effects.rs`) has one method,
+**NO RAIL.** `PaymentProvider` (`crates/app/src/effects.rs`) has one method,
 `pay`, and exactly one implementation: `NotConfigured`, which returns
 `Terminal { code: "not_configured" }` and logs it at `error` with the amount.
 There is no MPP, no card integration and no wallet.
+
+The path *to* that port is built end to end and tested — proposal, ruling,
+approval, reservation, execution, settle-or-release — so what is missing is one
+adapter, and the reason it is missing is a decision rather than an omission: see
+the wallet paragraph at the end of this section. **No credential, no signing key
+and no chain is touched anywhere in this workspace.**
 
 That refusal is deliberate and worth preserving. A fake that returns a plausible
 payment id is a fake that will one day be believed; `not_configured` is the
@@ -923,16 +1050,27 @@ created.
 
 What **is** built is everything around the payment:
 
-1. the agent proposes `Action::PaymentCreate { amount }` (the `pay` tool);
+1. the agent proposes `Action::PaymentCreate { amount, payee }` (the `pay` tool);
 2. the Policy Gate evaluates it against the four-layer `SpendLimits`;
 3. above the threshold it files a human approval, hashed to the exact action;
 4. allowing it **reserves** against the day's bucket in the same transaction —
    see §14;
-5. the port refuses.
+5. `POST /v1/approvals/{id}/approve` redeems a `payment_create` into a typed
+   `effects::PaymentCreate` and calls `Effects::pay`, which writes a
+   `provider_intents` row before the port is entered;
+6. the port refuses, `502 payment_not_performed` with `payment_error:
+   not_configured`, and the reservation is **released** in the same transaction
+   as the audit row.
 
-Steps 5 through 8 of the intended flow — *payment worker creates intent, signer
-signs only the exact approved transaction, rail submits, receipt persisted* —
-are **NOT BUILT**.
+Step 5 is new and is the eighth link of the x402 chain; the reason it was worth
+building against a port that refuses is that it is what settles or releases the
+reservation. Before it, an approved payment held the seat's headroom — and its
+team's — until midnight, for money that had not moved.
+
+The remaining steps — *signer signs only the exact approved transaction, rail
+submits, receipt persisted* — are **NOT BUILT**, and the missing piece is a
+`PaymentProvider` that is not `NotConfigured`. Which rail that is cannot be
+chosen here: it is the wallet decision at the end of this section.
 
 ### x402 — the reading half, and the two decisions that block the rest
 
@@ -989,13 +1127,27 @@ downcast far enough to read the status. See `mcp::refused_the_credential`.
 The seven links that do exist run end to end against a loopback double in
 `crates/app/tests/x402_chain.rs` — a real 402 on the wire, priced, ruled on,
 refused as untrusted, re-proposed by a human, hashed into an approval line and
-reserved — and it stops where the eighth link is missing. **The eighth link is
-where "a human approved" would become "the money moved", and it is a decision
-rather than a gap**: `routes::approvals::approve` mints an `Authorized<Action>`,
-which satisfies no `Effects` bound, and drops it. What that costs today (a
-payment reservation nobody settles or releases) and what crossing it would take,
-in order, is argued in one place — `x402.rs`, "The bridge from a human approved
-to the money moved".
+reserved. **The eighth link — "a human approved" becoming a call to the payment
+port — is now built**, as one arm in `routes::approvals::approve`, and it is
+still a `not_configured` in the audit trail because there is no rail behind the
+port. It is not a whole-enum translation from jsonb, which is what the argument
+against it warned of: one variant, destructured from a body serde already
+parsed, with every other kind unchanged. The full argument, and what is left
+after it, is in one place — `x402.rs`, "The bridge from a human approved to the
+money moved".
+
+**Paying once survives a crash and a replay**, and by a state transition rather
+than a comparison: `approvals::redeem` moves the row out of `pending` in the
+transaction the gate commits *before* `Effects::pay` runs, so a retried
+`approve` is `AlreadyDecided` and the port is never entered a second time.
+`Effects::pay` also writes a `provider_intents` row before it enters the port —
+which every other send has had and this one did not — so approaches to the rail
+are countable, and one that gets no answer at all surfaces as an
+`unsettled_call` for a person. `a_replayed_approval_does_not_pay_twice` is that
+claim against a real database. What is *not* closed: a **turn** that proposes a
+payment, crashes and is retried proposes a fresh action with a fresh ruling and
+a fresh key. No rule here calls that a duplicate, and inventing one ("same
+amount, same payee, same day") would refuse a second genuine payment.
 
 The wallet design this is aimed at, kept as a decision: customer-controlled
 funding source, employee wallet or delegated/session signer, small balance and
@@ -1454,9 +1606,14 @@ Dead-lettering is the outbox's — 8 attempts, then the row stops being selected
 > `/v1/webhooks/{path}` picks it when the endpoint's `provider` is `twilio`
 > (`migrations/0069` widened the CHECK that had refused that value while no
 > reader existed). The reader is `main::on_telephony_webhook` →
-> `inbound::land_inbound_text`: **one phase**, since the callback carries the
-> body, so the message and its `agent.turn.requested` commit in the same
-> transaction that retires the delivery.
+> `inbound::land_telephony_callback`, which dispatches on the payload — a text
+> goes to `land_inbound_text`, a call's status callback to `land_call_outcome`
+> (§7). Either way it is **one phase**, since the callback carries the body, so
+> the message and its `agent.turn.requested` — or the `call_completed` row —
+> commit in the same transaction that retires the delivery. The branch is made
+> inside `agentos_app` and not in the handler: `apps/server` cannot name
+> `agentos-providers`, so a predicate exported for it would be a second opinion
+> about what counts as a call callback.
 >
 > Two details that are not obvious from the outside. The endpoint registration
 > did **not** grow a `scheme` field — the scheme is a function of `provider`,
@@ -1970,6 +2127,43 @@ default — never acts on its own.
 
 `GET`/`PUT /v1/employees/{id}/initiative` reads and sets the cadence.
 
+### The manager's turn
+
+`managing` is the eighth role (`migrations/0074_charter_role_managing.sql`,
+`rolepack_service::RolePack::managing`) and the only one whose work is other
+employees'. It is the narrowest pack in the workspace: one `ActionKind`,
+`InternalSend`, which the tool catalogue offers as `message_colleague`,
+`brief_direct_reports`, `add_work_item` and `update_work_item`. No `EmailSend`,
+no `McpCall`, no browser — a manager's leverage is its reports.
+
+Its objective is `Seats`: a **mission**, which is a gap, and a table of
+`slug → role`, which deliberately is not — a manager that fills no seat
+automatically is a legitimate and safer answer.
+
+`loops::initiative::managing_step` runs before the model call and does two
+things:
+
+1. **Fills vacant seats.** For a report with *no charter at all* whose slug the
+   objective names, it calls `vertical::delegate` with `Charter::vacant(role)` —
+   an objective that is all gaps. Nothing invents what the seat is for: the
+   report's next turn reads the charter, finds `Stage::Clarify`, and asks. A
+   report that already has a charter is never touched, whatever the table says.
+2. **Shows the manager its team.** One row per active report: role, open
+   questions, when it last acted and with what outcome. It goes on the *brief*
+   and not through `Untrusted` — every field is something this system wrote
+   about its own seats.
+
+`Charter::vacant` covers six of the eight roles. Purchasing and sales are
+excluded because each has a field with no empty value — `what`/`quantity`
+describe a thing being bought, and a `Segment` is a closed enum with no unset
+variant, so a vacant one would have to pick a segment and `gaps()` would not
+report it. Those two seats are chartered by whoever knows what is being bought
+or sold.
+
+**This is the first and only production caller of `vertical::delegate`.** Before
+it, the function was written, gated and tested, and called by nothing outside
+its own tests.
+
 ---
 
 ## 25. The two verticals
@@ -2263,19 +2457,27 @@ An employee can, today:
   and `FriendlyName` and **no `SmsUrl`**, so Twilio has nowhere to deliver. One
   form field, deliberately unset — it points a live carrier at this deployment
 - ❌ route WhatsApp — the step always fails `no_whatsapp_sender`
-- ⏸️ place a voice call — the dialling half is real and unreachable.
+- ⏸️ place a voice call that speaks — real and unreachable.
   `TelephonyProvider::place_call`, `Effects::place_call` and
-  `TwilioTelephony::place_call` against a hermetic fake all exist; no model can
-  propose it (no `call_place` row in `turn::catalogue`) and no tenant can
-  authorise it (the ceiling grants no `voice`). What the callee hears is
-  `SILENT_TWIML` — **what a call says is NOT BUILT** (§7)
-- ❌ **receive** a voice call, or learn the outcome of one it placed —
-  **NOT BUILT**; no route in this build accepts a status callback
+  `TwilioTelephony::place_call` against a hermetic fake all exist, and the callee
+  now hears one sentence (`Announcement` → `<Say>`, the carrier's synthesis on
+  the tenant's account). No model can propose it (no `call_place` row in
+  `turn::catalogue`) and no tenant can authorise it (the ceiling grants no
+  `voice`). **A conversation is NOT BUILT** — the call broadcasts and hangs up
+  (§7)
+- ⏸️ learn the outcome of a call it placed — built and reachable only where a
+  call is. `StatusCallback` → `/v1/webhooks/{path}` → `CallOutcome::read` →
+  `land_call_outcome` → a `call_completed` audit row, joined to the attempt by
+  the carrier's sid (§7)
+- ❌ **receive** a voice call — **NOT BUILT**; nothing answers an inbound voice
+  webhook
 - ✅ use a persistent browser identity — `BROWSER_API_KEY` selects the real
   Browserbase client with a live CDP driver
 - ✅ store and retrieve secrets without LLM exposure, envelope-encrypted, with
   every read audited
-- ⚠️ answer from company knowledge — real hybrid retrieval, on a hash embedder
+- ⚠️ answer from company knowledge — real hybrid retrieval, and whether it ranks
+  by meaning is `EMBEDDER_API_KEY`: set, `OpenAiEmbedder` and both legs; unset,
+  the hash and the full-text leg alone
 - ✅ connect to MCP servers, with operator-pinned tool digests
 - ✅ expose an A2A agent card and three task methods
 - ❌ make a payment — **NOT BUILT**; the gate, the approval and the reservation
@@ -2299,7 +2501,7 @@ An employee can, today:
 2. ✅ Provisioning engine
 3. ✅ Policy Gate + approvals *(loader wired — §14)*
 4. ✅ Email *(Resend, selected by `EMAIL_API_KEY`)*
-5. ⚠️ Knowledge *(text only, hash embedder)*
+5. ⚠️ Knowledge *(text only; hash embedder unless `EMBEDDER_API_KEY` is set)*
 6. ✅ MCP
 7. ✅ A2A
 8. ✅ Browser *(Browserbase + CDP, selected by `BROWSER_API_KEY`)*
@@ -2321,6 +2523,19 @@ sections, the tightening-only role slot), the **initiative loop** with its
 per-day turn budget, **`crates/eval`**, and the **five internal tools** — the
 work board, the calendar, the founder's desk, invoicing and the file store, each
 a port first and a table second (`docs/RUNNING.md`).
+
+Two things that were written and unreachable are now wired, which is a different
+kind of entry from either column above — no new capability, one call site each:
+
+- **Hosted MCP** (§11). `crates/app/src/hosted.rs` had the contract, the cap,
+  the SSRF check and the migration; what it had was `bridges: None` at the one
+  production call site and no runtime. `apps/server/src/bridge.rs` is the
+  runtime and `MCP_BRIDGE_BIND` is the switch. Never run against a live Docker
+  daemon — see §11.
+- **The manager's seat** (§24). `vertical::delegate` had the gate, the audit row
+  and the "one link, not a walk" argument; it had no caller outside its tests,
+  because every one of the seven roles was an individual contributor. The eighth
+  role is the caller.
 
 `store::policy::load` was the entry that stood here longest and it has landed:
 the gate intersects four layers out of Postgres on every decision, so every team

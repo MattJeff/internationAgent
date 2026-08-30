@@ -95,26 +95,132 @@ pub struct OutboundSms {
     pub body: String,
 }
 
-/// A call to place.
+/// The words a placed call speaks, and the only thing it can be built from.
 ///
-/// **There is no field for what the call says, and the absence is this port's
-/// honest edge.** Placing a call is dialling — one number, another number, and
-/// a carrier that rings the second from the first. What a call *says* is a
-/// different machine entirely: speech synthesis, recognition, barge-in, and a
-/// turn-taking loop over a bidirectional media stream. None of those exists
-/// anywhere in this workspace, so a `script` or `voice` field here would be a
-/// place to put words nothing can speak, and every adapter would have to
-/// decide on its own what to do with them.
+/// # Why this is a type and not a `String`
 ///
-/// The adapters below dial and hang up. See [`TelephonyProvider::place_call`],
-/// which is where the two halves of "an employee phoned somebody" are told
-/// apart.
+/// What a call says is text that leaves this building and is read out loud to a
+/// stranger, and the carrier that reads it takes its instructions in **the same
+/// document as the text** — TwiML, where `<Say>` is a sibling of `<Dial>`. So a
+/// bare `String` reaching an adapter is a TwiML injection: a body ending
+/// `</Say><Dial>+1900…</Dial>` is toll fraud billed to the tenant's own account,
+/// composed by whoever wrote the words.
+///
+/// The usual answer is to escape at the point of rendering. This refuses
+/// instead, at construction, and the difference is which mistakes stay
+/// possible. An escaper is one function that one adapter has to remember to
+/// call; a value that **cannot hold a `<`** is safe in the adapter that exists,
+/// in the SSML one somebody writes next, and in the JSON body of whichever
+/// vendor replaces Twilio. There is no escaper anywhere in this crate and there
+/// must not be one — see [`Announcement::parse`] for the exact set.
+///
+/// # It is deliberately not a voice, a language or a turn-taking loop
+///
+/// This is one sentence, said once, to a callee who cannot reply — the callee's
+/// words are speech, and nothing in this workspace turns speech into text. What
+/// this buys over the silence it replaces is a call that says who is calling and
+/// why, which is the difference between a message and a nuisance call. See
+/// [`TelephonyProvider::place_call`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announcement(String);
+
+/// Why a string is not something a call may say.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotSpeakable {
+    /// Nothing, or nothing but whitespace.
+    #[error("a call that says nothing is the nuisance call this type exists to refuse")]
+    Empty,
+    /// Longer than [`Announcement::MAX_CHARS`].
+    #[error("an announcement is at most {} characters", Announcement::MAX_CHARS)]
+    TooLong,
+    /// Markup, or a control character.
+    #[error("an announcement is words: no markup characters and no control characters")]
+    NotWords,
+}
+
+impl Announcement {
+    /// How much a stranger holding a phone is made to listen to.
+    ///
+    /// Twilio's own `<Say>` ceiling is 4096 characters, which is roughly four
+    /// minutes of synthesised speech at a captive stranger, so the vendor's
+    /// limit is not the limit that matters. 500 is about half a minute: long
+    /// enough for who is calling, why, and a number to call back on, and short
+    /// enough that it is a message rather than an audience.
+    ///
+    /// A knob, and named as one — the right length is a thing the founder will
+    /// learn from the first hundred calls and not from this file.
+    pub const MAX_CHARS: usize = 500;
+
+    /// The words, or why they are not words.
+    ///
+    /// Trimmed at the edges, then three refusals:
+    ///
+    /// * empty,
+    /// * longer than [`Self::MAX_CHARS`] **characters** — `chars().count()`,
+    ///   not `len()`, because a French sentence is not ASCII and a byte count
+    ///   would silently make the limit shorter for the languages this
+    ///   deployment actually dials,
+    /// * any control character, or any of `< > & "`.
+    ///
+    /// The last set is what makes the escaper unnecessary rather than
+    /// forgotten. `<` and `&` are the two characters XML element content must
+    /// escape; `>` and `"` cost nothing to refuse and keep the value safe if
+    /// somebody ever puts it in an attribute. `'` is **allowed** and has to be
+    /// — *l'appel*, *aujourd'hui* — which is the whole reason this value is
+    /// documented as element content only.
+    ///
+    /// A newline is a control character and is therefore refused. That is not
+    /// pedantry: TwiML tolerates one, but a body with a line break in it is
+    /// almost always a rendered email that has wandered into the wrong port.
+    pub fn parse(words: &str) -> Result<Self, NotSpeakable> {
+        let words = words.trim();
+        if words.is_empty() {
+            return Err(NotSpeakable::Empty);
+        }
+        if words.chars().count() > Self::MAX_CHARS {
+            return Err(NotSpeakable::TooLong);
+        }
+        if words
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>' | '&' | '"'))
+        {
+            return Err(NotSpeakable::NotWords);
+        }
+        Ok(Self(words.to_owned()))
+    }
+
+    /// The words. Safe in XML **element content** — see [`Self::parse`].
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A call to place: two numbers and what the callee hears.
+///
+/// **The `says` field is new, and the argument that used to forbid it has
+/// expired rather than been overruled.** It said a `script` field would be "a
+/// place to put words nothing can speak", which was true while every adapter
+/// hung up on connect. Something can speak them now: the carrier's own speech
+/// synthesis, driven by [`Announcement`], billed to the tenant's account and
+/// composed nowhere near a model of ours.
+///
+/// What is still absent is everything after the sentence — recognition,
+/// barge-in, a turn-taking loop over a media stream. The callee's reply is
+/// speech, and no part of this workspace turns speech into text. So this field
+/// is not the voice half arriving; it is the half of it that can be built
+/// without one.
+///
+/// There is deliberately no `Option`: a call that says nothing is the nuisance
+/// call [`Announcement`] exists to make unspellable, and an adapter with a
+/// `None` arm is an adapter that has to decide what silence means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundCall {
     /// The employee's own number.
     pub from: E164,
     /// The counterparty.
     pub to: E164,
+    /// What the callee hears, once, before the line is dropped.
+    pub says: Announcement,
 }
 
 /// Proof that the WhatsApp 24-hour customer-service window **with `peer`** is
@@ -290,6 +396,129 @@ pub struct ParseError {
     pub field: &'static str,
 }
 
+/// What became of a call, as the carrier reports it on the status callback.
+///
+/// # `Completed` is the one that reads wrong, so it is spelled out
+///
+/// It means **connected and then ended**. It does not mean a person heard the
+/// announcement: an answering machine that picks up, records thirty seconds of
+/// synthesised speech and hangs up produces exactly this value, and so does a
+/// human who answered and put the handset down without listening. Telling those
+/// apart is `MachineDetection`, which is a paid guess Twilio bills per call and
+/// which no adapter here asks for. So this enum reports what the carrier
+/// observed and nothing about what a person did.
+///
+/// # A closed enum out of third-party bytes, on purpose
+///
+/// The callback is a stranger's HTTP request. It is authenticated — the edge
+/// checks the signature before any of this runs — but authenticated is not
+/// trusted, and the honest treatment of an authenticated field is to **narrow**
+/// it rather than to carry the string. [`Self::parse`] maps the vendor's
+/// documented set and answers [`CallStatus::Unknown`] for everything else, so no
+/// free-form text from this payload survives into a database column, a log line
+/// or a prompt. That is the same move `crate::telephony::TelephonyRoute` makes
+/// one crate up for the two numbers, and the opposite of what
+/// [`normalize_twilio_form`] does with a message body, which really is words a
+/// person wrote and really does stay [`Untrusted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallStatus {
+    /// Connected, then ended. Read the type's docs before believing it.
+    Completed,
+    /// The line was engaged.
+    Busy,
+    /// It rang out.
+    NoAnswer,
+    /// The carrier could not connect it at all.
+    Failed,
+    /// It was cancelled before anybody picked up.
+    Canceled,
+    /// A word this build does not know. Never the string itself.
+    Unknown,
+}
+
+impl CallStatus {
+    /// The carrier's word, narrowed.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "completed" => Self::Completed,
+            "busy" => Self::Busy,
+            "no-answer" => Self::NoAnswer,
+            "failed" => Self::Failed,
+            "canceled" => Self::Canceled,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Stable, low-cardinality label for a column or a metric.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Busy => "busy",
+            Self::NoAnswer => "no_answer",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One call we placed, and what the carrier says happened to it.
+///
+/// This is the answer [`TelephonyProvider::place_call`]'s `Ok` could never be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallOutcome {
+    /// The carrier's handle for the call — the same id `place_call` returned,
+    /// which is what joins this to the row that recorded the attempt.
+    pub call_sid: ProviderMessageId,
+    /// What became of it.
+    pub status: CallStatus,
+    /// How long it was connected, in whole seconds. Absent on a call that never
+    /// connected, and absent rather than zero, because the carrier omits the
+    /// field and a zero we invented would be indistinguishable from a call that
+    /// was answered and hung up inside a second.
+    pub duration_seconds: Option<u32>,
+}
+
+impl CallOutcome {
+    /// Read a status callback out of a **verified** Twilio form body.
+    ///
+    /// Three answers, and the middle one is the reason this returns what it
+    /// does: `Ok(None)` means *this form is not a call status callback at all* —
+    /// no `CallStatus` field — which is the ordinary case, because the same
+    /// endpoint receives every inbound text message. `Err` means it is one and
+    /// it is malformed, which no retry fixes. One pass over the form and one
+    /// function, so the discriminator and the parser cannot disagree about what
+    /// counts as a call callback.
+    ///
+    /// `CallStatus` is the discriminator and not `CallSid`, deliberately: an
+    /// inbound *voice* webhook — the "somebody is calling this number, what do I
+    /// do" request, which this build does not answer — carries a `CallSid` and
+    /// no `CallStatus`, and reading one of those as an outcome would file "a
+    /// stranger rang us" as "our call ended".
+    pub fn read(raw_form: &[u8]) -> Result<Option<Self>, ParseError> {
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in url::form_urlencoded::parse(raw_form) {
+            fields.insert(key.into_owned(), value.into_owned());
+        }
+
+        let Some(status) = fields.get("CallStatus") else {
+            return Ok(None);
+        };
+        let sid = fields
+            .get("CallSid")
+            .ok_or(ParseError { field: "CallSid" })?;
+
+        Ok(Some(Self {
+            call_sid: ProviderMessageId::new(sid.clone()),
+            status: CallStatus::parse(status),
+            // A value we cannot read is absent, never zero — see the field.
+            duration_seconds: fields
+                .get("CallDuration")
+                .and_then(|seconds| seconds.trim().parse().ok()),
+        }))
+    }
+}
+
 /// The raw request body, in the encoding it arrived in.
 ///
 /// Signature verification needs the bytes exactly as received: re-serialising
@@ -401,9 +630,9 @@ pub trait TelephonyProvider: Send + Sync {
         message: &OutboundWhatsapp,
     ) -> Result<ProviderMessageId, ProviderError>;
 
-    /// Dial `call.to` from `call.from`. Same idempotency rule as
-    /// [`Self::send_sms`]: re-dialling with the same `key` returns the first
-    /// attempt's id instead of ringing somebody twice.
+    /// Dial `call.to` from `call.from` and say `call.says`. Same idempotency
+    /// rule as [`Self::send_sms`]: re-dialling with the same `key` returns the
+    /// first attempt's id instead of ringing somebody twice.
     ///
     /// # What comes back is a call that was **accepted**, never one that was
     /// **answered**
@@ -414,17 +643,18 @@ pub trait TelephonyProvider: Send + Sync {
     /// agrees to dial and long before the phone has finished ringing. Busy, no
     /// answer, an answering machine, and a human who declined are all states
     /// the call reaches **after** this future resolves, and not one of them is
-    /// expressible in this return type. They arrive on the provider's status
-    /// callback, and this workspace has no reader for one. The telephony ingest
-    /// itself *is* wired — `agentos_app::inbound::land_inbound_text`, behind
-    /// `main::on_telephony_webhook` — but it lands **messages**: it reads a
-    /// counterparty, a body and a channel off the form, and a call status
-    /// carries none of those. A status callback would need a reader of its own
-    /// and there is none.
+    /// expressible in this return type.
     ///
-    /// So a caller that reports "I called them" on `Ok` is reporting something
-    /// this signature never said. What it did say is "the carrier took the
-    /// request".
+    /// They arrive on the provider's status callback, and **there is a reader
+    /// for one now**: the same signed endpoint the text messages come in on,
+    /// [`CallOutcome::read`] to tell the two apart, and
+    /// `agentos_app::inbound::land_call_outcome` to attribute it. The id above
+    /// is what joins the two — it is `CallOutcome::call_sid` — so the honest
+    /// reading of this method is "the carrier took the request, and what became
+    /// of it will arrive later under this id".
+    ///
+    /// A caller that reports "I called them" on `Ok` is still reporting
+    /// something this signature never said.
     ///
     /// # What *is* here: the refusal to dial at all
     ///
@@ -794,7 +1024,10 @@ impl MockTelephony {
     /// It records the whole [`OutboundCall`] and not a count, because
     /// `from` and `to` are the same type and the seam that fills them in lives
     /// in another crate. A caller that swapped the two would compile, would
-    /// return `Ok`, and would have phoned the employee from the stranger.
+    /// return `Ok`, and would have phoned the employee from the stranger. Since
+    /// [`OutboundCall::says`] exists it also records **what was said**, which is
+    /// the only way a test one crate up can assert that the words the gate
+    /// ruled on are the words that reached the wire.
     pub fn dialled(&self) -> Vec<OutboundCall> {
         self.state().dialled.clone()
     }
@@ -917,10 +1150,11 @@ impl TelephonyProvider for MockTelephony {
         call: &OutboundCall,
     ) -> Result<ProviderMessageId, ProviderError> {
         self.fault.check_before()?;
-        // No body to be empty and no window to have closed: the two things a
-        // message can be wrong about do not exist for a call. What is left is
+        // No `empty_body` arm and no `window_closed` arm: an [`Announcement`]
+        // cannot be empty — that is [`NotSpeakable::Empty`], refused at
+        // construction — and a call has no conversation window. What is left is
         // the dial itself, and the double's job is to record that it happened
-        // exactly once per key.
+        // exactly once per key, with the words it carried.
         let (id, fresh) = self.record_send(key, "CA");
         if fresh {
             self.state().dialled.push(call.clone());
@@ -1029,6 +1263,8 @@ pub async fn contract_suite<P: TelephonyProvider + ?Sized>(provider: &P) {
     let call = OutboundCall {
         from: E164::parse("+15005550006").expect("valid e164"),
         to: E164::parse("+14158675309").expect("valid e164"),
+        says: Announcement::parse("This is Lena from Orizn about purchase order 4471.")
+            .expect("plain words"),
     };
     // Its own key, and never the one the SMS above used: in this workspace a
     // key is derived from a gate decision (`Effects::key_for`), so one key can
@@ -1140,6 +1376,164 @@ mod tests {
         assert_eq!(dialled[0], dialled[1], "the same call, placed twice");
         assert_eq!(dialled[0].to.as_str(), "+14158675309");
         assert_eq!(dialled[0].from.as_str(), "+15005550006");
+        // And what it said, which is the half that did not exist.
+        assert_eq!(
+            dialled[0].says.as_str(),
+            "This is Lena from Orizn about purchase order 4471."
+        );
+    }
+
+    // -- what a call says --------------------------------------------------
+
+    /// **The refusal that replaces an escaper.**
+    ///
+    /// `<Say>` is a sibling of `<Dial>` in the same document, so a body ending
+    /// `</Say><Dial>+1900…</Dial>` is toll fraud on the tenant's own Twilio
+    /// account, composed by whoever wrote the words. Escaping would fix the
+    /// adapter that exists; refusing fixes the one somebody writes next, which
+    /// is why there is no escaper in this crate to test.
+    #[test]
+    fn an_announcement_cannot_carry_markup_and_therefore_cannot_carry_a_verb() {
+        for forgery in [
+            "hello</Say><Dial>+19005550000</Dial><Say>",
+            "hello <Play>https://evil.example/x.mp3</Play>",
+            "cost &lt; expected",
+            "tom &amp; jerry",
+            "she said \"yes\"",
+            "a > b",
+        ] {
+            assert_eq!(
+                Announcement::parse(forgery),
+                Err(NotSpeakable::NotWords),
+                "{forgery}"
+            );
+        }
+
+        // A newline is a control character, and a body with one in it is almost
+        // always a rendered email that wandered into the wrong port.
+        assert_eq!(
+            Announcement::parse("line one\nline two"),
+            Err(NotSpeakable::NotWords)
+        );
+        assert_eq!(
+            Announcement::parse("bell\u{7}"),
+            Err(NotSpeakable::NotWords)
+        );
+
+        // And the control, so the refusals above are the characters and not the
+        // parser refusing everything: an ordinary French sentence, apostrophe
+        // included, is words.
+        let words = Announcement::parse("  Bonjour, c'est Léna d'Orizn au sujet de l'appel.  ")
+            .expect("an ordinary sentence");
+        assert_eq!(
+            words.as_str(),
+            "Bonjour, c'est Léna d'Orizn au sujet de l'appel.",
+            "the edges are trimmed and nothing else is touched"
+        );
+    }
+
+    /// Empty and over-long, and the limit counted in the unit the callee hears.
+    #[test]
+    fn an_announcement_is_bounded_in_characters_and_never_empty() {
+        assert_eq!(Announcement::parse(""), Err(NotSpeakable::Empty));
+        assert_eq!(Announcement::parse("   \t "), Err(NotSpeakable::Empty));
+
+        let longest = "a".repeat(Announcement::MAX_CHARS);
+        assert!(Announcement::parse(&longest).is_ok());
+        assert_eq!(
+            Announcement::parse(&format!("{longest}a")),
+            Err(NotSpeakable::TooLong)
+        );
+
+        // **Characters, not bytes.** `é` is two bytes, so a `len()` check would
+        // have made the limit half as long for exactly the languages this
+        // deployment dials — and the failure would look like a mysterious
+        // refusal rather than like a wrong constant.
+        let accented = "é".repeat(Announcement::MAX_CHARS);
+        assert!(accented.len() > Announcement::MAX_CHARS);
+        assert!(
+            Announcement::parse(&accented).is_ok(),
+            "the limit is counted in bytes, so French is refused at half length"
+        );
+    }
+
+    // -- learning the outcome ----------------------------------------------
+
+    /// The discriminator is `CallStatus`, and the three answers are distinct.
+    #[test]
+    fn a_status_callback_is_read_and_a_text_message_is_not_one() {
+        let outcome = CallOutcome::read(
+            b"CallSid=CA123&CallStatus=no-answer&To=%2B14158675309\
+&From=%2B15005550006&Direction=outbound-api",
+        )
+        .expect("well formed")
+        .expect("a status callback");
+        assert_eq!(outcome.call_sid.as_str(), "CA123");
+        assert_eq!(outcome.status, CallStatus::NoAnswer);
+        assert_eq!(outcome.duration_seconds, None, "it never connected");
+
+        let answered =
+            CallOutcome::read(b"CallSid=CA9&CallStatus=completed&CallDuration=42&To=%2B1415")
+                .expect("well formed")
+                .expect("a status callback");
+        assert_eq!(answered.status, CallStatus::Completed);
+        assert_eq!(answered.duration_seconds, Some(42));
+
+        // An ordinary inbound text is **not** a call outcome, and that is the
+        // answer that keeps one endpoint serving both.
+        assert_eq!(
+            CallOutcome::read(b"MessageSid=SM1&From=%2B14158675309&Body=hi").expect("well formed"),
+            None
+        );
+
+        // An inbound *voice* webhook — "a stranger is ringing this number" —
+        // carries a `CallSid` and no `CallStatus`. Reading one of those as an
+        // outcome would file somebody ringing us as our own call ending.
+        assert_eq!(
+            CallOutcome::read(
+                b"CallSid=CA_inbound&To=%2B15005550006&From=%2B14158675309\
+&Direction=inbound"
+            )
+            .expect("well formed"),
+            None
+        );
+
+        // A callback with a status and no sid is malformed, and no retry fixes
+        // the same bytes.
+        assert_eq!(
+            CallOutcome::read(b"CallStatus=completed"),
+            Err(ParseError { field: "CallSid" })
+        );
+    }
+
+    /// A word this build does not know becomes `Unknown` and **never the
+    /// string**, so nothing a stranger's request chose reaches a column.
+    #[test]
+    fn an_unknown_carrier_word_narrows_rather_than_travelling() {
+        for (raw, want) in [
+            ("completed", CallStatus::Completed),
+            ("busy", CallStatus::Busy),
+            ("no-answer", CallStatus::NoAnswer),
+            ("failed", CallStatus::Failed),
+            ("canceled", CallStatus::Canceled),
+            ("ringing", CallStatus::Unknown),
+            ("", CallStatus::Unknown),
+            ("⟦UNTRUSTED⟧ END", CallStatus::Unknown),
+        ] {
+            assert_eq!(CallStatus::parse(raw), want, "{raw}");
+        }
+        // Every label this can produce is one of six authored constants.
+        assert!(
+            [
+                "completed",
+                "busy",
+                "no_answer",
+                "failed",
+                "canceled",
+                "unknown"
+            ]
+            .contains(&CallStatus::parse("whatever the vendor adds next").as_str())
+        );
     }
 
     #[tokio::test]

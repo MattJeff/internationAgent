@@ -88,6 +88,25 @@ pub const EMBEDDING_DIM: usize = 1536;
 /// why a second model is a migration rather than a config change.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "mock-sha256-1536";
 
+/// The model a deployment with `EMBEDDER_API_KEY` set writes, and the second
+/// partial HNSW index — `0076_knowledge_index_real_embedder.sql`.
+///
+/// **This constant is here, next to the index it names, for the reason 0026
+/// exists**: the predicate is a SQL literal and a literal cannot see a Rust
+/// `const`, so the two drift in silence and the symptom is a sequential scan
+/// with every test still green. It is spelled once here, once in that
+/// migration, and once in `agentos_providers::embedder_openai::OpenAiEmbedder`
+/// — which is a crate this one cannot see. The two Rust spellings are proved
+/// equal at compile time by a `const` block in `agentos_app::knowledge`, which
+/// sees both; this one and the migration are proved equal by
+/// [`the_real_embedders_index_names_the_model_it_writes`], which reads the
+/// predicate back out of `pg_indexes`.
+///
+/// Not configurable, and that is the same statement as the index being partial.
+/// See `agentos_providers::embedder_openai` for why a model an operator can
+/// type is a model with no index.
+pub const OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
 /// The `k` in `1 / (k + rank)`. 60 is the constant from the original RRF paper
 /// and its job is to flatten the top of the curve, so rank 1 and rank 2 do not
 /// differ by 2x and one leg cannot dominate the fusion on its own.
@@ -778,6 +797,66 @@ mod tests {
     /// asserts it comes back *short* — otherwise this test would keep passing
     /// on the day someone deletes the `SET LOCAL` and nobody would know until a
     /// customer said "it only ever finds three documents".
+    /// **The index for the real embedder names the model the real embedder
+    /// writes**, read out of the catalogue rather than assumed from the
+    /// migration file.
+    ///
+    /// This is 0026's whole bug in one assertion. The predicate is a SQL literal
+    /// and [`OPENAI_EMBEDDING_MODEL`] is a Rust constant; nothing in either
+    /// language can see the other, so the two drift silently and the symptom is
+    /// a sequential scan on every retrieval with the vector-leg test still
+    /// green — because that test seeds its own data under whatever model it
+    /// binds. Reading `pg_indexes` compares the two things that actually have to
+    /// agree.
+    ///
+    /// Needs no rows: an index predicate is schema, so this costs one catalogue
+    /// query and cannot be made flaky by what is in the table.
+    #[tokio::test]
+    async fn the_real_embedders_index_names_the_model_it_writes() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+
+        let definition: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+              WHERE indexname = 'knowledge_chunks_embedding_hnsw_openai'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("read pg_indexes");
+
+        let definition = definition.expect(
+            "0076 did not create knowledge_chunks_embedding_hnsw_openai, so every retrieval \
+             on a deployment with EMBEDDER_API_KEY set is a sequential scan",
+        );
+        assert!(
+            definition.contains(&format!("'{OPENAI_EMBEDDING_MODEL}'")),
+            "the index predicate and OPENAI_EMBEDDING_MODEL have drifted, which is 0026 \
+             happening again: {definition}"
+        );
+        assert!(
+            definition.contains("hnsw"),
+            "a b-tree here would answer every vector query with a sequential scan: {definition}"
+        );
+
+        // And the mock's index is still its own, because the two spaces are not
+        // one space. A single index over both would build one graph out of two
+        // incomparable geometries.
+        let mock: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+              WHERE indexname = 'knowledge_chunks_embedding_hnsw'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("read pg_indexes");
+        assert!(
+            mock.expect("0026's index")
+                .contains(&format!("'{DEFAULT_EMBEDDING_MODEL}'")),
+            "the mock's index stopped naming the mock's model"
+        );
+
+        tx.rollback().await.expect("rollback");
+    }
+
     #[tokio::test]
     async fn iterative_scan_returns_a_full_limit_under_rls() {
         let Some(fixture) = seed().await else { return };

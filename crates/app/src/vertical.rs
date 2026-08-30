@@ -257,6 +257,11 @@ pub enum Charter {
         /// applies it.
         objective: rolepack_service::Changes,
     },
+    /// Running other seats: the only charter whose work is other employees'.
+    Managing {
+        /// What the team is for, and which role each report is meant to hold.
+        objective: rolepack_service::Seats,
+    },
 }
 
 impl Charter {
@@ -275,6 +280,7 @@ impl Charter {
             Charter::Finance { .. } => rolepack_service::FINANCE,
             Charter::EntryRequirements { .. } => rolepack_service::ENTRY_REQUIREMENTS,
             Charter::Engineering { .. } => rolepack_service::ENGINEERING,
+            Charter::Managing { .. } => rolepack_service::MANAGING,
         }
     }
 
@@ -290,6 +296,7 @@ impl Charter {
                 rolepack_service::RolePack::entry_requirements().briefing()
             }
             Charter::Engineering { .. } => rolepack_service::RolePack::engineering().briefing(),
+            Charter::Managing { .. } => rolepack_service::RolePack::managing().briefing(),
         }
     }
 
@@ -317,6 +324,7 @@ impl Charter {
                 rolepack_service::RolePack::entry_requirements().model()
             }
             Charter::Engineering { .. } => rolepack_service::RolePack::engineering().model(),
+            Charter::Managing { .. } => rolepack_service::RolePack::managing().model(),
         }
     }
 
@@ -355,6 +363,7 @@ impl Charter {
             Charter::Engineering { .. } => rolepack_service::RolePack::engineering()
                 .proposable()
                 .clone(),
+            Charter::Managing { .. } => rolepack_service::RolePack::managing().proposable().clone(),
         };
         SystemPrompt::new(format!("{identity}\n\n{}", self.briefing())).with_proposable(proposable)
     }
@@ -382,6 +391,7 @@ impl Charter {
             Charter::Finance { objective } => steps_of(&objective.plan()),
             Charter::EntryRequirements { objective } => steps_of(&objective.plan()),
             Charter::Engineering { objective } => steps_of(&objective.plan()),
+            Charter::Managing { objective } => steps_of(&objective.plan()),
         };
         format!(
             "Your standing objective, as a plan. Work it in order; a stage you cannot finish is \
@@ -439,6 +449,7 @@ impl Charter {
             Charter::Finance { objective } => service_questions(objective.gaps()),
             Charter::EntryRequirements { objective } => service_questions(objective.gaps()),
             Charter::Engineering { objective } => service_questions(objective.gaps()),
+            Charter::Managing { objective } => service_questions(objective.gaps()),
         }
     }
 
@@ -534,6 +545,9 @@ impl Charter {
             rolepack_service::ENGINEERING => Ok(Charter::Engineering {
                 objective: changes_objective(objective)?,
             }),
+            rolepack_service::MANAGING => Ok(Charter::Managing {
+                objective: seats_objective(objective)?,
+            }),
             _ => Err(CharterError::Corrupt("role")),
         }
     }
@@ -591,8 +605,131 @@ impl Charter {
                 "checks": objective.checks,
                 "reviewer": objective.reviewer,
             }),
+            Charter::Managing { objective } => json!({
+                "mission": objective.mission,
+                // A `BTreeMap<Slug, String>` renders as an object with sorted
+                // keys, which is what makes this row stable under an update
+                // that changed nothing — see `rolepack_service::Seats::seats`.
+                "seats": objective
+                    .seats
+                    .iter()
+                    .map(|(report, role)| (report.as_str().to_owned(), Value::from(role.clone())))
+                    .collect::<serde_json::Map<String, Value>>(),
+            }),
         }
     }
+
+    /// This role, with an objective nobody has filled in yet.
+    ///
+    /// **The charter a head gives a report that has none**, and the only shape
+    /// of delegation that is safe to do without a person in the loop:
+    /// `vertical::delegate` writes it, the report's next turn reads it, and
+    /// [`Charter::open_questions`] is non-empty — so the plan is one
+    /// `Stage::Clarify` task and the initiative loop writes the question to
+    /// `last_detail` for a human instead of spending a turn. Nobody has
+    /// invented an objective; a seat has been created that asks for one.
+    ///
+    /// # Why purchasing and sales are not here
+    ///
+    /// Both have a field with no empty value. `rolepack::Objective::what` and
+    /// `quantity` describe a thing being bought, and `rolepack_sales::Objective`
+    /// carries a `Segment`, which is a closed enum with no "unset" variant — so
+    /// a vacant one would have to pick a segment, and a seller working the
+    /// wrong segment is not something `gaps()` would report, because the field
+    /// is filled. An empty string is a gap the objective can hold; a wrong enum
+    /// is one it cannot. Those two seats are filled by whoever knows what is
+    /// being bought or sold, through `PUT /v1/employees/{id}/initiative`.
+    ///
+    /// `Managing` is here, and a manager may therefore create a manager below
+    /// it. That is a reporting line the operator drew, one link at a time, and
+    /// `delegate`'s "one link and not a walk" still holds at every level of it.
+    pub fn vacant(role: &str) -> Option<Self> {
+        match role {
+            rolepack_service::CUSTOMER_SUCCESS => Some(Charter::Support {
+                objective: rolepack_service::Support {
+                    product: String::new(),
+                    // Zero rather than a default, because `Support::gaps`
+                    // reports zero as unanswered: a promise nobody made is not
+                    // a promise of twenty-four hours.
+                    first_response_hours: 0,
+                    escalate_to: None,
+                },
+            }),
+            rolepack_service::GROWTH => Some(Charter::Growth {
+                objective: rolepack_service::Growth {
+                    topic: String::new(),
+                    market: None,
+                    measure: None,
+                },
+            }),
+            rolepack_service::FINANCE => Some(Charter::Finance {
+                objective: rolepack_service::Books {
+                    period: String::new(),
+                    currency: None,
+                    obligations: Vec::new(),
+                },
+            }),
+            rolepack_service::ENTRY_REQUIREMENTS => Some(Charter::EntryRequirements {
+                objective: rolepack_service::Corridors {
+                    destinations: String::new(),
+                    passports: Vec::new(),
+                    max_age_days: 0,
+                },
+            }),
+            rolepack_service::ENGINEERING => Some(Charter::Engineering {
+                objective: rolepack_service::Changes {
+                    repository: String::new(),
+                    checks: None,
+                    reviewer: None,
+                },
+            }),
+            rolepack_service::MANAGING => Some(Charter::Managing {
+                objective: rolepack_service::Seats {
+                    mission: String::new(),
+                    seats: std::collections::BTreeMap::new(),
+                },
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A managing objective, re-parsed rather than deserialised.
+///
+/// `seats` is absent-tolerant and value-strict, the shape `optional_string`
+/// draws elsewhere: no key at all is an empty table, which
+/// [`rolepack_service::Seats`] documents as a legitimate answer, and a key
+/// present and not an object is a named corruption. A seat whose slug does not
+/// parse, or whose role has no vacant charter, is refused here rather than
+/// discovered by the loop at the moment a report would have been given a
+/// charter that cannot be built — the same reason every other objective is
+/// re-parsed through its constructors.
+fn seats_objective(raw: &Value) -> Result<rolepack_service::Seats, CharterError> {
+    let mut seats = std::collections::BTreeMap::new();
+    match raw.get("seats") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(table)) => {
+            for (report, role) in table {
+                let report =
+                    Slug::parse(report).map_err(|_| CharterError::Corrupt("seats.report"))?;
+                let role = role.as_str().ok_or(CharterError::Corrupt("seats.role"))?;
+                if Charter::vacant(role).is_none() {
+                    return Err(CharterError::Corrupt("seats.role"));
+                }
+                seats.insert(report, role.to_owned());
+            }
+        }
+        Some(_) => return Err(CharterError::Corrupt("seats")),
+    }
+
+    Ok(rolepack_service::Seats {
+        mission: raw
+            .get("mission")
+            .and_then(Value::as_str)
+            .ok_or(CharterError::Corrupt("mission"))?
+            .to_owned(),
+        seats,
+    })
 }
 
 /// One thing nobody has said yet, put as a question.
@@ -3885,7 +4022,147 @@ mod tests {
                     reviewer: Some("the CTO".to_owned()),
                 },
             },
+            Charter::Managing {
+                objective: rolepack_service::Seats {
+                    mission: "keep the visa data right and the customers answered".to_owned(),
+                    seats: [
+                        (
+                            Slug::parse("ada").expect("slug"),
+                            rolepack_service::ENTRY_REQUIREMENTS.to_owned(),
+                        ),
+                        (
+                            Slug::parse("bob").expect("slug"),
+                            rolepack_service::CUSTOMER_SUCCESS.to_owned(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            },
         ]
+    }
+
+    /// **The invariant `loops::initiative::managing_step` stands on.** A head
+    /// fills a vacant seat without a person in the loop, so the charter it
+    /// writes must not answer anything: every vacant one has at least one open
+    /// question, and its plan is the single `Stage::Clarify` task that makes the
+    /// report ask rather than start. A pack whose vacant objective came out
+    /// *complete* would be a seat that quietly began work nobody described.
+    #[test]
+    fn a_vacant_charter_asks_before_it_acts() {
+        let mut vacant: Vec<&str> = Vec::new();
+        for role in [
+            "international-buyer",
+            "sales-development",
+            rolepack_service::CUSTOMER_SUCCESS,
+            rolepack_service::GROWTH,
+            rolepack_service::FINANCE,
+            rolepack_service::ENTRY_REQUIREMENTS,
+            rolepack_service::ENGINEERING,
+            rolepack_service::MANAGING,
+        ] {
+            let Some(charter) = Charter::vacant(role) else {
+                continue;
+            };
+            vacant.push(role);
+            assert_eq!(charter.role(), role, "{role}: vacant returned another role");
+            assert!(
+                !charter.open_questions().is_empty(),
+                "{role}: a vacant charter with nothing to ask is a seat that starts working"
+            );
+            assert!(
+                charter.brief().to_lowercase().contains("clarify"),
+                "{role}: a vacant charter must plan one clarification and nothing else"
+            );
+            // And it survives the column, because that is how the report reads
+            // it back: `delegate` calls `save`, the loop calls `load`.
+            assert_eq!(
+                Charter::of(role, &charter.objective_json()).expect("round trip"),
+                charter
+            );
+        }
+
+        // The two that cannot be created empty, named rather than left to a set
+        // difference — each is a statement about the objective, and
+        // `Charter::vacant` argues both.
+        assert_eq!(
+            vacant,
+            vec![
+                rolepack_service::CUSTOMER_SUCCESS,
+                rolepack_service::GROWTH,
+                rolepack_service::FINANCE,
+                rolepack_service::ENTRY_REQUIREMENTS,
+                rolepack_service::ENGINEERING,
+                rolepack_service::MANAGING,
+            ],
+            "purchasing and sales have a field with no empty value"
+        );
+        assert!(Charter::vacant("poet").is_none());
+    }
+
+    /// A seat table is refused when it is read, not when it is used.
+    ///
+    /// The failure this prevents is specific: a manager whose objective names a
+    /// role with no vacant charter would load fine, run for weeks, and skip one
+    /// report every turn without saying why. Refusing at `Charter::of` makes it
+    /// an error an operator sees at the moment they write it.
+    #[test]
+    fn a_seat_naming_a_role_nobody_can_leave_empty_is_refused() {
+        let with = |seats: Value| {
+            Charter::of(
+                rolepack_service::MANAGING,
+                &json!({ "mission": "keep the lights on", "seats": seats }),
+            )
+        };
+
+        assert!(with(json!({ "ada": rolepack_service::ENGINEERING })).is_ok());
+        // Both are real role names and neither can be created empty.
+        assert!(matches!(
+            with(json!({ "ada": "sales-development" })),
+            Err(CharterError::Corrupt("seats.role"))
+        ));
+        assert!(matches!(
+            with(json!({ "ada": "international-buyer" })),
+            Err(CharterError::Corrupt("seats.role"))
+        ));
+        assert!(matches!(
+            with(json!({ "ada": "poet" })),
+            Err(CharterError::Corrupt("seats.role"))
+        ));
+        // A key that is not a slug, and a value that is not a string.
+        assert!(matches!(
+            with(json!({ "Ada Lovelace": rolepack_service::GROWTH })),
+            Err(CharterError::Corrupt("seats.report"))
+        ));
+        assert!(matches!(
+            with(json!({ "ada": 7 })),
+            Err(CharterError::Corrupt("seats.role"))
+        ));
+        assert!(matches!(
+            with(json!("everyone")),
+            Err(CharterError::Corrupt("seats"))
+        ));
+
+        // No table at all is a manager that fills no seat automatically, which
+        // `rolepack_service::Seats` documents as a legitimate answer — and it is
+        // deliberately *not* a gap, so this charter has no open question.
+        let empty = Charter::of(
+            rolepack_service::MANAGING,
+            &json!({ "mission": "keep the lights on" }),
+        )
+        .expect("an empty seat table is an objective");
+        assert!(empty.open_questions().is_empty());
+        // A missing mission is, and it is the only one.
+        let no_mission = Charter::of(rolepack_service::MANAGING, &json!({ "mission": "" }))
+            .expect("an empty mission is storable, and a question");
+        assert_eq!(
+            no_mission
+                .open_questions()
+                .into_iter()
+                .map(|question| question.code)
+                .collect::<Vec<_>>(),
+            vec!["mission"]
+        );
     }
 
     fn rfq() -> sourcing::Outreach {
@@ -4092,6 +4369,7 @@ mod tests {
                 "finance",
                 "entry-requirements",
                 "engineering",
+                "managing",
             ]
         );
 

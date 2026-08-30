@@ -25,16 +25,18 @@ integration, not an error.
 | **Resend** | `email_resend.rs` | `EMAIL_API_KEY` | `re_…` |
 | **Twilio** | `telephony_twilio.rs` | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` |
 | **Browserbase** | `browser_browserbase.rs` + `cdp.rs` | `BROWSER_API_KEY` | `project-id:api-key` |
+| **OpenAI embeddings** | `embedder_openai.rs` | `EMBEDDER_API_KEY` | `sk-…` |
 | Meta WhatsApp | none at all | — | — |
-| embedder | mock only, permanently — a SHA-256 hash | none, and none possible | — |
 | secret vault | mock only — an in-process plaintext map | — | — |
 | MCP | none — refuses | — | — |
 | payments | none — refuses | — | — |
 
-Two of the three are compound because the adapter behind them takes two values,
+Two of the four are compound because the adapter behind them takes two values,
 and they are one variable each for the same reason the keyring is. **Half of one
 is a named boot failure** — an adapter holding half a credential is the
-deployment that believes it is sending mail and is not.
+deployment that believes it is sending mail and is not. `EMBEDDER_API_KEY` is
+single because the adapter takes one value: the customer's key. The model is a
+constant, not a second half.
 
 The email adapter's third input, the `whsec_…` signing secret, comes from the
 `email` entry of `AGENTOS_WEBHOOK_SECRETS`, where you have already pasted it.
@@ -46,9 +48,14 @@ with a second customer registers theirs in `webhook_endpoints` instead — see
 adapter still takes its signing secret from here, because the adapter is one per
 deployment.
 
-`EMBEDDER_API_KEY` is **no longer read**. It used to satisfy the boot guard
-while selecting nothing, because `Embedder` has one variant and it is a hash. A
-credential that cannot change what runs must not be able to quiet an alarm.
+`EMBEDDER_API_KEY` is read again, and the argument that deleted it is answered
+rather than dropped. It used to satisfy the boot guard while *selecting
+nothing*, because `Embedder` had one variant and it was a hash — a credential
+that cannot change what runs must not be able to quiet an alarm. It changes what
+runs now: it builds `OpenAiEmbedder`, `Embedder::is_semantic()` becomes `true`,
+and `knowledge::retrieve` runs the vector leg it refuses to run on a hash. One
+value and not a pair, because the customer brings the key and the **model name
+is ours** — see "The embedder" below.
 
 Two things are real whatever the credentials say. The **envelope cipher**:
 `AGENTOS_MASTER_KEY` is threaded into a real `LocalEnvelopeSecretStore`, because
@@ -56,17 +63,17 @@ Two things are real whatever the credentials say. The **envelope cipher**:
 database column — a mock provider that invents a phone number costs nothing, a
 mock cipher costs an identity. And the **model**, chosen by `AGENTOS_LLM`.
 
-Two are permanently fake, and are named on every boot so a line with no `MOCK`
-in it cannot be manufactured by omission: the **embedder** above, and the
-**employee secret vault**, which is a plaintext in-process map that forgets on
-restart (not the envelope cipher — that one is real).
+One is permanently fake, and it is named on every boot so a line with no `MOCK`
+in it cannot be manufactured by omission: the **employee secret vault**, which is
+a plaintext in-process map that forgets on restart (not the envelope cipher —
+that one is real). The embedder used to be the other and is a credential now.
 
 Every boot logs one line naming what is behind every port, and `/readyz` carries
 the same inventory as `mock_adapters` for as long as the replica is up:
 
 ```
-adapters: email=resend telephony=MOCK browser=browserbase llm=anthropic \
-          embedder=MOCK(sha256-hash) secrets=MOCK(in-memory)
+adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
+          llm=anthropic secrets=MOCK(in-memory)
 ```
 
 Adding a new provider is a change to `crates/app/src/mocks.rs`, plus a row in
@@ -341,8 +348,10 @@ callback URL plus sorted form parameters — and it is **wired**, since
 `migrations/0069`. `/v1/webhooks/{path}` picks the verifier from the endpoint's
 `provider`: `twilio` gets this scheme, anything else gets the Svix one. The
 reader at the other end of the queue is `main::on_telephony_webhook`, which
-calls `agentos_app::inbound::land_inbound_text` — one phase, because the
-callback carries the body and there is nothing to fetch.
+calls `agentos_app::inbound::land_telephony_callback` — one phase, because the
+callback carries the body and there is nothing to fetch. That function serves
+both payloads the endpoint receives: an inbound text (`land_inbound_text`) and
+the status callback a placed call reports back on (`land_call_outcome`).
 
 `Endpoint` did **not** grow the `scheme` field this note predicted, and that is
 deliberate: the scheme and the ingest are one choice, `provider` already has to
@@ -582,27 +591,51 @@ sees the password. Keep that when you write the real adapter.
 
 ## The embedder
 
-`Embedder` has one variant: `Mock`, which derives a unit-length 1536-dimension
-vector from a SHA-256 hash of the input. Same string in, byte-identical vector
-out, on any machine, forever, with no network and no key.
+`Embedder` has two variants, selected by credential like every other adapter.
 
-It is a *hash*, so it makes no attempt at semantics: "cat" and "kitten" are as
-unrelated as "cat" and "diesel". Use it to test plumbing — dimensions, batching,
-storage round-trips, top-k ordering, cosine arithmetic — and a real embedder to
-test whether retrieval finds the right documents.
+`Mock` is the default: a unit-length 1536-dimension vector derived from a
+SHA-256 hash of the input. Same string in, byte-identical vector out, on any
+machine, forever, with no network and no key. It is a *hash*, so it makes no
+attempt at semantics — "cat" and "kitten" are as unrelated as "cat" and
+"diesel". Use it to test plumbing (dimensions, batching, storage round-trips,
+top-k ordering, cosine arithmetic) and the real one to test whether retrieval
+finds the right documents. `Embedder::is_semantic()` is `false` on it, and that
+is a branch rather than a caveat: `knowledge::retrieve` skips the vector leg
+entirely rather than fusing in five passages ranked by a digest.
 
-Every knowledge chunk records its `model_name`, and the mock's is
-`mock-sha256-1536`, deliberately **not** `text-embedding-3-small`. A
-`vector(1536)` from one embedder and a `vector(1536)` from another are the same
-Postgres type and are not the same space; mixing them returns nonsense rather
-than an error. Labelling hash vectors as a real model would be exactly that
-silent mixing.
+`OpenAi` is `embedder_openai.rs`, selected by `EMBEDDER_API_KEY`, and
+`is_semantic()` is `true` on it. Three things about it are worth knowing before
+you set the variable.
 
-There is **no `EMBEDDER_API_KEY`**. There used to be, and it gated the boot
-guard: exporting any string at all turned a MOCK verdict green while this hash
-kept running. A credential that cannot change what runs must not be able to
-quiet an alarm, so it was deleted and the embedder is named as a permanent mock
-in the boot summary and in `agentos-server doctor` instead.
+**The key is the customer's and the model is ours.** `text-embedding-3-small`,
+a constant, not configurable. That is not an oversight: the HNSW index is
+*partial on the model name*, a partial index predicate is a SQL literal, and a
+literal cannot name a string an operator types into an environment variable. A
+configurable model would be a model with no index — the 889 ms against 2.8 ms
+`0026_knowledge_index_model.sql` measured. The bill is still entirely theirs,
+which is the invariant that actually matters.
+
+**1536 is the column, not a default.** `knowledge_chunks.embedding` is
+`vector(1536)`; `text-embedding-3-small` is natively that wide, which is why it
+is the model. The request asks for `dimensions: 1536` explicitly anyway and the
+response is measured, because a vendor changing a default would otherwise be
+discovered by Postgres, mid-ingest. A vector of any other width is
+`Terminal { code: "embedding_dim_mismatch" }` before a row is written. **Nothing
+is projected to fit** — a random projection down to 1536 would make any model
+storable and would put an invisible transform of ours between the customer's
+model and the customer's answers.
+
+**Turning it on does not re-embed anything.** Every knowledge chunk records its
+`model_name` and every search binds it, because a `vector(1536)` from one
+embedder and a `vector(1536)` from another are the same Postgres type and are
+not the same space — mixing them returns nonsense rather than an error. So
+documents ingested under the hash keep `mock-sha256-1536`, stop being findable,
+and have to be ingested again. The mock's name is deliberately **not** a vendor
+model name for the same reason: labelling hash vectors as a real model would be
+exactly that silent mixing.
+
+Nothing in this repository ever calls the real adapter against a real account.
+Its tests speak the same wire shape to a loopback socket.
 
 ---
 
@@ -616,6 +649,17 @@ This is deliberate and worth preserving. A fake that returns a plausible payment
 id is a fake that will one day be believed; `not_configured` is the honest answer
 and shows up in the audit trail as one. If you are testing a payment flow and
 seeing `not_configured`, the system is working.
+
+**The payment port is now reached from a human's click**, not only from a turn:
+`POST /v1/approvals/{id}/approve` on a `payment_create` redeems the approval into
+a typed subject and calls `Effects::pay`, which answers `502
+payment_not_performed` with `payment_error: not_configured`. Writing an adapter
+for this port therefore has a live call site waiting for it — and two obligations
+beyond the trait, both in this file's next section: **reconcile before you
+create** (the `IdempotencyKey` the port is handed is derived from the Policy Gate
+ruling and is stable for that ruling, so look the payment up by it before making
+one), and never hold a signing key an LLM can reach. Which rail goes behind it is
+SPEC §13's open wallet decision, not an adapter author's.
 
 ---
 
