@@ -61,7 +61,7 @@ use axum::routing::get as get_route;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::auth::Principal;
@@ -472,6 +472,21 @@ struct InitiativeView {
     last_detail: Option<String>,
     /// Which role's objective this employee carries, if any.
     role: Option<&'static str>,
+    /// The stored objective, in the shape `PUT` accepts back.
+    ///
+    /// **Without this, the only way to read an objective was to write one.**
+    /// `PUT` is a whole replacement — `SetInitiative` demands both halves and
+    /// refuses unknown fields — so a caller wanting to change a cadence alone
+    /// had to re-send an objective it could not read. The only place the
+    /// stored one surfaced was `AnswerView`, which is a *write* that spends a
+    /// model turn, so a console kept a local copy of what it had last written
+    /// and hoped — a copy that is wrong the moment anything else edits the
+    /// charter.
+    ///
+    /// `Charter::objective_json` already calls itself the wire shape — *every
+    /// key here is a field of the body this route accepts* — so this is that
+    /// sentence made reachable, not a second spelling of it.
+    objective: Option<Value>,
     /// The plan, recomputed now. `None` when there is no charter or it cannot be
     /// worked as stated — in which case `clarify` says what is missing.
     plan: Option<Vec<TaskView>>,
@@ -492,6 +507,7 @@ impl InitiativeView {
             last_outcome: schedule.last_outcome.clone(),
             last_detail: schedule.last_detail.clone(),
             role: charter.map(Charter::role),
+            objective: charter.map(Charter::objective_json),
             plan: None,
             clarify: None,
         };

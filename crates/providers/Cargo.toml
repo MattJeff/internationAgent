@@ -9,6 +9,11 @@ rust-version.workspace = true
 agentos-domain.workspace = true
 async-trait.workspace = true
 aes-gcm.workspace = true
+# `llm_cli` declares this process's tools to the `claude` CLI over MCP, which is
+# an HTTP server on loopback. Already a workspace dependency (apps/server), so
+# no new third-party code enters the tree — and hand-rolling HTTP parsing in a
+# production path to save it would be the worse trade.
+axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true

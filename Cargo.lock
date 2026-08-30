@@ -168,6 +168,7 @@ dependencies = [
  "aes-gcm",
  "agentos-domain",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
