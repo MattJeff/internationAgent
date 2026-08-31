@@ -1592,7 +1592,6 @@ async fn selling_step(
         &agent.db,
         &prober,
         &seller,
-        &vertical::orizn_binding(),
         principal,
         pack,
         objective,

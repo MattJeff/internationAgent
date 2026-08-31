@@ -25,7 +25,6 @@ pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod model_access; // wave H: the tenant's own model, connected and proven
 pub mod oauth; // wave I: a consent page instead of a pasted token
-pub mod orizn; // wave 4 — the authoritative half of proof_of_need
 pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23

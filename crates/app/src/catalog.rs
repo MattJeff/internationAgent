@@ -512,7 +512,8 @@ pub const CATALOG: &[Connector] = &[
         label: "Orizn — visa rules and consular fees",
         // **The first hosted entry, and the one this workspace has measured.**
         //
-        // `crates/app/tests/orizn.rs` is the evidence and it points both ways:
+        // Mesuré le 2026-08-25 en parlant MCP à `npx -y orizn-visa-mcp`, et la
+        // mesure pointe des deux côtés :
         // `https://visa.orizn.app/mcp` answers Streamable HTTP but serves one
         // tool of six and ignores an API key in every header form, while the
         // stdio package serves all six and reads `ORIZN_API_KEY` out of its
@@ -521,9 +522,11 @@ pub const CATALOG: &[Connector] = &[
         // `check_visa_requirement`, the tool that prices a visa — and the
         // credential field on it would do nothing at all.
         //
-        // Pinned at 1.3.0: the version `crates/app/src/orizn.rs`'s fixture was
-        // captured from, so the tools this entry's declarations will be written
-        // against are the tools that were read.
+        // Épinglé à 1.3.0 : la version depuis laquelle la surface a été
+        // capturée, de sorte que les outils contre lesquels les déclarations de
+        // cette entrée seront écrites sont les outils qui ont été lus. La
+        // capture vit dans `crates/app/tests/orizn.rs`, qui en est la
+        // contrepartie testée.
         provision: Provision::Host(Package {
             spec: "orizn-visa-mcp@1.3.0",
             env: Some("ORIZN_API_KEY"),

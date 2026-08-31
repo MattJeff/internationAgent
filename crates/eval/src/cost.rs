@@ -432,10 +432,10 @@ pub fn charters() -> Vec<(&'static str, Charter)> {
 ///
 /// Two incompatible sentences about one trip is
 /// `proof_of_need::Finding::Conflates` — one of the three findings that stand on
-/// the prospect's own page alone. `allowed_mcp_tools` is empty in both operator
-/// documents, so `vertical::orizn_binding`'s lookup is refused by name and
-/// `sell` runs with no authority; the two findings that need Orizn's own row are
-/// unavailable on this surface. A panel that produced one of those would file
+/// the prospect's own page alone. `sell` tourne sans autorité — aucune source
+/// n'est branchée sur ce déploiement, voir la doc de module de
+/// `proof_of_need` — donc les deux constatations qui demandent une ligne à nous
+/// sont indisponibles sur cette surface. A panel that produced one of those would file
 /// evidence no employee may send, which measures a different path.
 pub struct Prospect {
     /// `accounts.legal_name`. Ours, and the only name in the vertical's note.

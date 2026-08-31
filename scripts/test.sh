@@ -281,12 +281,12 @@ cargo clippy --workspace --all-targets -- -D warnings \
 # it. Keeping those tests out of a default *run* is right — they want `npx`, the
 # open internet, a logged-in `claude` binary and ten minutes — but the price
 # nobody meant to pay was that `cargo` never so much as parsed them. There are
-# five `#[cfg(feature = "live-orizn")]` sites, and behind them:
-# `crates/eval/src/dryrun.rs` (2 280 lines that stand Orizn up against the real
-# model — the only end-to-end measurement of this product there is, gated at
-# `crates/eval/src/lib.rs`), the `--dry-run` arm of `crates/eval/src/main.rs`,
-# `crates/app/tests/orizn.rs`'s `mod live`, and `crates/app/src/orizn.rs`'s one
-# live test plus the `mod live` it dials through.
+# deux `#[cfg(feature = "live-orizn")]` sites, and behind them:
+# `crates/eval/src/dryrun.rs` (2 280 lines that stand a tenant up against the
+# real model — the only end-to-end measurement of this product there is, gated
+# at `crates/eval/src/lib.rs`), and the `--dry-run` arm of
+# `crates/eval/src/main.rs`. There were three more, in `agentos-app`; they
+# dialled the real Orizn MCP server and went with it.
 # `dryrun.rs` used to say so about itself, in the comment above the finance caps
 # it reads out of `docs/orizn-roles/finance.json` — that this script "compiles
 # neither `cargo test -p agentos-eval` nor `cargo clippy --all-targets` with

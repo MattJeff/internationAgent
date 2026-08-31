@@ -137,12 +137,14 @@ the visa and never says whether that price is the consular fee or their own \
 service fee; their flow says both that no visa is required and that a visa is \
 issued on arrival.
 
-Does not stand on its own, because it is made of nothing but our database: \
-their stated requirement differs from ours; their stay length is shorter than \
-the entitlement we hold. Both are worth finding and worth handing over. Neither \
-is yours to assert, for the reason above — our database has been wrong, and a \
-prospect who checks and finds we were wrong is a prospect who is finished with \
-us.
+Does not stand on its own, because it would be made of nothing but our own \
+database: their stated requirement differs from ours; their stay length is \
+shorter than the entitlement we hold. **Neither is available to you today** — \
+this deployment has no authoritative source wired, so a finding of that shape \
+cannot be produced at all. The rule stands for the day one is wired again: \
+neither is yours to assert, for the reason above — our database has been wrong, \
+and a prospect who checks and finds we were wrong is a prospect who is finished \
+with us.
 
 # What you may say about Orizn
 

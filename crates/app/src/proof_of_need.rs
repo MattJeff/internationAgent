@@ -7,6 +7,30 @@
 //! about their product. This module produces the second thing, or it produces
 //! nothing.
 //!
+//! # Il n'y a plus de producteur d'`Answer` branché
+//!
+//! Ce module compare ce que dit la page d'un prospect à une [`Answer`], et
+//! l'`Answer` est **passée par l'appelant**. Le seul producteur qui ait existé
+//! était un client MCP de l'API visa d'Orizn : la vérification de bout en bout
+//! du produit contre un vrai SaaS, et non un morceau du produit. Il est parti
+//! avec ce qu'il était.
+//!
+//! Rien de ce fichier n'a changé pour autant, parce que rien n'avait à changer :
+//! [`Prober::check`] prend `Option<&Answer>` et le `None` est un chemin écrit,
+//! testé et voulu. Trois des cinq constatations tiennent sur la page du prospect
+//! — et ce sont **exactement** les trois qu'un mail sortant a le droit de citer,
+//! celles pour lesquelles [`Finding::stands_on_their_page`] rend `true`. Les
+//! deux autres, [`Finding::Contradicts`] et [`Finding::StayLength`], deviennent
+//! inatteignables : ce sont celles qui n'allaient jamais au prospect.
+//!
+//! Ce qui change vraiment, et qu'un opérateur doit savoir : toute page qui
+//! énonce une exigence lisible tombe désormais sur [`Checked::TruthStale`].
+//! Ce n'est plus un incident, c'est l'état ordinaire — n'allez pas chercher une
+//! panne de provisioning derrière ce taux.
+//!
+//! Rebrancher une source est un module à écrire, pas une réécriture : [`Answer`]
+//! a cinq champs publics et [`ConsularFee::new`] est public. Le socle est ouvert.
+//!
 //! # The criterion is a missing category, not a wrong value
 //!
 //! This module used to compare one value — what their page says the requirement
@@ -62,7 +86,7 @@
 //! detector here and must not get one. It is not a property of the page, and the
 //! authority has no field for it: `quick_visa_check` answers a requirement code
 //! and a date, and reading `partial_restrictions` or `special` as "this is a
-//! tolerance" is the same fabrication [`crate::orizn`] already refuses when it
+//! tolerance" is the same fabrication le producteur d'`Answer` already refuses when it
 //! declines to map those codes onto a [`Claim`]. The day the surface carries the
 //! legal basis, it becomes the strongest finding in this file; until then it is
 //! a sentence with nothing behind it.
@@ -195,13 +219,13 @@
 //! The three findings that stand on the prospect's page need no authority at
 //! all, so a lookup that produced nothing no longer costs the seller every
 //! finding it could have made. Orizn's keyless surface answers
-//! `last_verified: null`, which [`crate::orizn`] correctly refuses to turn into
+//! `last_verified: null`, which le producteur d'`Answer` correctly refuses to turn into
 //! an [`Answer`] — and under the old criterion that meant **no finding could be
 //! produced at all**, because every claim shape needed a requirement to compare
 //! against. Now it means the two findings that rest on our row are not made, and
 //! the three that rest on their page are.
 //!
-//! [`crate::orizn`] is what builds one in the running system: a gated
+//! le producteur d'`Answer` is what builds one in the running system: a gated
 //! [`Action::McpCall`] against Orizn's own MCP surface, whose result stays
 //! [`Untrusted`] and reaches this module as an enum, a day count and a date.
 //! [`Answer::retrieved_at`] carries the argument about *whose* clock
@@ -1265,7 +1289,7 @@ pub struct Answer {
     /// **Ours, never the source's own words.** This is the one field of an
     /// `Answer` that [`Evidence::claim_line`] interpolates into the sentence a
     /// human sends, so a value taken off a tool result would be a writable slot
-    /// in our outbound mail. [`crate::orizn::SOURCE`] is a constant for exactly
+    /// in our outbound mail. `Answer::source` is a constant for exactly
     /// that reason.
     pub source: String,
     /// How many days the exempt stay is worth, when the source says.
@@ -1284,7 +1308,7 @@ pub struct Answer {
     /// quickly, and stamping the call time here would make [`MAX_AUTHORITY_AGE`]
     /// unfalsifiable — every answer a second old, forever, on a fact about our
     /// own clock. So a caller whose source dates its own data puts the **earlier**
-    /// of the two here; see [`crate::orizn::read_answer`], which is the only
+    /// of the two here; see le producteur d'`Answer`, which is the only
     /// thing in the running system that builds one.
     pub retrieved_at: DateTime<Utc>,
     /// When the current rule took effect, when the source knows.
@@ -1342,7 +1366,7 @@ impl Answer {
 /// it is admitted only as **three upper-case ASCII letters** — an alphabet of
 /// 17,576 values, none of which is a sentence. Everything else on the wire,
 /// including the schedule's prose `notes` and its `sources` URLs, stays off this
-/// struct: see [`crate::orizn::read_fee`] for what is dropped and why.
+/// struct: see le producteur de `ConsularFee` for what is dropped and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsularFee {
     amount: u64,
@@ -1362,7 +1386,7 @@ impl ConsularFee {
     /// ponytail: three letters, not an ISO 4217 table. The table is 180 rows to
     /// stop a value that is already incapable of carrying a sentence, and a code
     /// that is well-formed but wrong is a data error rather than an injection —
-    /// `MAX_FEE_AGE` and the `sources` gate in [`crate::orizn::read_fee`] are
+    /// `MAX_FEE_AGE` and the `sources` gate in le producteur de `ConsularFee` are
     /// what stand between us and that. Add the table the day a rendered
     /// currency has to be resolved to a symbol.
     pub fn new(amount: u64, currency: &str, as_of: NaiveDate) -> Option<Self> {
@@ -1395,7 +1419,7 @@ impl ConsularFee {
     /// [`Answer::usable_at`]'s does. `as_of` is a **date**, so it is read as the
     /// start of that day: reading it as the end would borrow up to a day of
     /// freshness the authority never asserted, the same argument
-    /// [`crate::orizn::read_answer`] makes about `last_verified`.
+    /// le producteur d'`Answer` makes about `last_verified`.
     pub fn usable_at(&self, now: DateTime<Utc>) -> bool {
         // Midnight exists on every date; the fallback is unreachable and yields
         // the epoch, which reads as maximally stale rather than as fresh.
@@ -1828,7 +1852,7 @@ impl Evidence {
             // nobody publishes, and it is appended only when there is a fee this
             // traveller would actually pay, dated inside `MAX_FEE_AGE`. Three
             // bounded values — a `u64`, three upper-case letters and a date —
-            // and no URL: see `crate::orizn::read_fee` for why the authority's
+            // and no URL: see le producteur de `ConsularFee` for why the authority's
             // own `sources` gate this sentence without appearing in it.
             Finding::UnattributedFee => {
                 let mut line = format!(
@@ -3067,8 +3091,8 @@ mod tests {
     /// is knowing that.
     ///
     /// The decision is made where the payload is read —
-    /// [`crate::orizn::read_fee`] returns
-    /// [`TruthError::FeeNotOwed`](crate::orizn::TruthError::FeeNotOwed) for
+    /// le producteur de `ConsularFee` returns
+    /// `FeeNotOwed` for
     /// every requirement but `visa_required`, so nothing arrives here at all.
     /// This is the assertion that the *consequence* is the right one: the
     /// finding still stands, because it never needed the number.
@@ -3376,7 +3400,7 @@ mod tests {
         );
     }
 
-    /// The keyless surface answers `last_verified: null`, so `crate::orizn`
+    /// The keyless surface answers `last_verified: null`, so le producteur d'`Answer`
     /// builds no [`Answer`] at all — and under the old criterion that meant no
     /// finding could be produced, ever, because every claim shape needed a
     /// requirement to compare against.
