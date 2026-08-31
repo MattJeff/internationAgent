@@ -703,6 +703,11 @@ fn app(
             // mounted the table was empty in every deployment, which the
             // ledger reads as "may not spend" — safe, and unusable.
             .merge(routes::spend::router(db.clone()))
+            // Beside `spend`, which is the same act one table over: an
+            // operator's key lowering a ceiling, audited in the write's own
+            // transaction. The only route that can change a `policy_layers`
+            // row, and it can only ever narrow one.
+            .merge(routes::policy::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
             // The only caller of `agentos_app::queue`, which had ten unit tests,
             // a compile-fail case and nothing calling it. The export has to be a
