@@ -31,13 +31,19 @@
 //! `apps::server::policy` for why a route here would have been defensible on
 //! authorisation grounds and was still not built.
 //!
-//! The one exception is `routes::companies`, and it is drawn precisely so this
-//! sentence keeps its meaning: `POST /v1/companies` may write a role layer for a
-//! role that has **none**, which — because an absent layer inherits the layer
-//! above and the loader intersects — cannot widen anything, and it answers `409`
-//! for a role that already has one. There is still exactly one place to *change*
-//! a limit. What that route does that this one must not is stand a company up
-//! from nothing; editing one is still this surface, one field at a time. The
+//! There are two exceptions, and both are drawn precisely so this sentence keeps
+//! its meaning. `POST /v1/companies` may write a role layer for a role that has
+//! **none**, which — because an absent layer inherits the layer above and the
+//! loader intersects — cannot widen anything, and it answers `409` for a role
+//! that already has one. [`routes::policy`](super::policy) may *replace* one,
+//! and may only ever **tighten**: it compares the incoming layer against the one
+//! it displaces with the loader's own `intersect` and answers `409
+//! policy_widens` for anything not contained in it. So the sentence at the top
+//! of this paragraph now reads exactly: there is still no way to *raise* a limit
+//! over HTTP, and the platform ceiling is still nobody's to write from a
+//! request. What `POST /v1/companies` does that this surface must not is stand a
+//! company up from nothing; editing the *chart* is still this surface, one field
+//! at a time, and editing a *layer* is the route next door. The
 //! direct consequence, and the thing to tell an operator once: **a team can only
 //! ever tighten.** The loader takes the minimum of each cap across platform ∧
 //! tenant ∧ role ∧ employee, so a role layer naming a wider number than the

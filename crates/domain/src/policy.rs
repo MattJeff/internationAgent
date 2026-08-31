@@ -406,6 +406,37 @@ pub struct PolicyLimits {
 }
 
 impl PolicyLimits {
+    /// Whether this layer is contained in `other`: every cap no higher, every
+    /// allowlist no wider, every permission flag no more permissive, and every
+    /// denylist no *shorter* — a lower layer may always add a block and never
+    /// remove one, which is the same direction stated for the one field that
+    /// unions instead of intersecting.
+    ///
+    /// # Why it is `other ∧ self == self` and not a field-by-field comparison
+    ///
+    /// Because a field-by-field comparison is the one thing that can silently
+    /// answer "contained" about a limit nobody taught it, and that answer is in
+    /// the permissive direction. [`PolicyLimits::intersect`] destructures every
+    /// field with no `..` — the module header's second structural commitment —
+    /// so the day a limit is added the intersection is a compile error until
+    /// somebody handles it, and the derived `PartialEq` then covers the new
+    /// field here for free. There is no second list of fields to forget.
+    ///
+    /// It is also *exactly* the arithmetic the loader runs, rather than a
+    /// paraphrase of it: `EffectivePolicy::try_new` is `intersect` three times,
+    /// so "contained under `intersect`" and "cannot raise what the gate
+    /// enforces" are one statement. Intersection is monotone in each argument,
+    /// so replacing one layer with a layer contained in it can only narrow or
+    /// leave unchanged the intersection of all four.
+    ///
+    /// `Err` is [`PolicyError::MixedCurrency`], which is the honest answer for
+    /// two layers denominated differently: neither narrower nor wider, simply
+    /// unintersectable. There is no exchange rate in this domain and there must
+    /// not be one.
+    pub fn narrows(&self, other: &Self) -> Result<bool, PolicyError> {
+        Ok(other.intersect(self)? == *self)
+    }
+
     /// The stricter of two layers.
     fn intersect(&self, other: &Self) -> Result<Self, PolicyError> {
         let spend = match (self.spend, other.spend) {
@@ -2859,6 +2890,96 @@ mod tests {
             DenyReason::SendingDomainWarming.code(),
             DenyReason::ContactBudgetExhausted.code()
         );
+    }
+
+    /// [`PolicyLimits::narrows`] agrees with the intersection in every
+    /// direction a limit can move — which is the property `routes::policy`
+    /// rests its whole refusal on.
+    ///
+    /// Every field is moved once, and each of the four kinds of field is moved
+    /// in **both** directions, because a containment check that is merely
+    /// conservative would pass a "wider is refused" test while refusing every
+    /// legitimate tightening as well.
+    #[test]
+    fn narrows_is_containment_under_the_intersection() {
+        let base = permissive();
+        assert!(
+            base.narrows(&base).unwrap(),
+            "a layer is contained in itself, so a replay is not a widening"
+        );
+
+        // A cap: down is contained, up is not.
+        let cap = |turns| PolicyLimits {
+            max_turns_per_day: turns,
+            ..permissive()
+        };
+        assert!(cap(100).narrows(&base).unwrap());
+        assert!(!cap(501).narrows(&base).unwrap());
+
+        // An allowlist: a subset is contained, an element the parent does not
+        // name is not — even though the *intersection* would quietly drop it,
+        // which is exactly why a route must refuse rather than store the
+        // intersection and answer 200.
+        let models = |set: &[ModelId]| PolicyLimits {
+            allowed_models: set.iter().copied().collect(),
+            ..permissive()
+        };
+        assert!(models(&[ModelId::Haiku45]).narrows(&base).unwrap());
+        assert!(
+            !models(&[ModelId::Haiku45])
+                .narrows(&models(&[ModelId::Sonnet5]))
+                .unwrap(),
+            "a model the parent does not permit is a widening, not a swap"
+        );
+
+        // A permission flag: off is contained, on over an off parent is not.
+        let off = PolicyLimits {
+            allow_data_delete: false,
+            ..permissive()
+        };
+        assert!(off.narrows(&base).unwrap());
+        assert!(!base.narrows(&off).unwrap());
+
+        // The denylist, which unions rather than intersects: adding a block is
+        // contained, *removing* one is the widening. This is the field a
+        // hand-written "every set must be a subset" check gets backwards.
+        let denied = PolicyLimits {
+            denied_domains: [domain("evil.example.com")].into_iter().collect(),
+            ..permissive()
+        };
+        assert!(denied.narrows(&base).unwrap());
+        assert!(
+            !base.narrows(&denied).unwrap(),
+            "dropping a denied domain lets an employee reach a host it could not"
+        );
+
+        // Spend: `None` permits no spending at all, so it is contained in any
+        // parent, and a parent that permits none contains only itself.
+        let broke = PolicyLimits {
+            spend: None,
+            ..permissive()
+        };
+        assert!(broke.narrows(&base).unwrap());
+        assert!(!base.narrows(&broke).unwrap());
+
+        // Two currencies are neither, and say so rather than answering `false`
+        // — a route that rendered this as "you widened" would send an operator
+        // hunting for a number they did not raise.
+        let euros = PolicyLimits {
+            spend: Some(
+                SpendLimits::try_new(
+                    Money::new(1, Eur).unwrap(),
+                    Money::new(2, Eur).unwrap(),
+                    Money::new(1, Eur).unwrap(),
+                )
+                .unwrap(),
+            ),
+            ..permissive()
+        };
+        assert!(matches!(
+            euros.narrows(&base),
+            Err(PolicyError::MixedCurrency { .. })
+        ));
     }
 
     /// The whole mechanism, in one function's worth of assertions.

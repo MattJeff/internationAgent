@@ -31,7 +31,11 @@ pub mod invoices;
 pub mod knowledge;
 pub mod mcp;
 pub mod model; // wave H: the tenant connects the model their employees think with
+// the one route that changes a limit. `POST /v1/companies` creates a role layer
+// where none exists; this one replaces one, and can only tighten — see its
+// module docs for the invariant and the three mechanisms that hold it.
 pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
+pub mod policy;
 pub mod pool;
 pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
 pub mod reports; // the manager's view of its own line
