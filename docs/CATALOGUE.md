@@ -11,6 +11,15 @@ Le catalogue lui-même est `crates/app/src/catalog.rs`. Une entrée y est une
 il peut atteindre. Ce document est ce qui adosse chaque affirmation à une
 mesure.
 
+> **Mise à jour du 2026-08-31, deuxième vague.** Quatorze entrées écrites, une
+> cinquième variante d'`OptOuts` (`HeldHere`) et un second registre public
+> (`OUTREACH_HELD_HERE`). Le catalogue nomme vingt-deux connecteurs, plus
+> `CUSTOM`. Chaque
+> endpoint ci-dessous a été resondé avant d'être écrit en littéral, et **cinq
+> verdicts de la première vague se sont révélés faux** — dont Canva, qui passe
+> d'ajoutable à impossible. Les contradictions sont listées à leur place plutôt
+> que corrigées en silence.
+
 ## Les cinq murs
 
 Ce ne sont pas des préférences, ce sont des propriétés du code. Les connaître
@@ -44,6 +53,16 @@ Granola, Higgsfield, Magnific. **Deux la font expirer** : Linear et Sentry à
 90 jours, Plaud à 30 — une rotation que rien dans le produit ne rappelle
 aujourd'hui.
 
+Quatre d'entre eux ont été réenregistrés à la main le 2026-08-31 pour vérifier
+plutôt que pour croire, et les quatre rendent bien `client_secret_expires_at: 0`
+avec `token_endpoint_auth_method: client_secret_basic` : Notion, Canva, Granola,
+Magnific. **Et c'est là qu'apparaît un mur que ce document n'avait pas :
+enregistrer n'est pas autoriser.** Canva accepte l'enregistrement de notre URL de
+retour et refuse ensuite la même URL à `/authorize`. Le secret permanent n'était
+donc pas la dernière question à poser à ces serveurs — la question suivante est
+« et le `/authorize` accepte-t-il notre redirection ? », et elle se pose avec un
+seul `curl`.
+
 ## Comment lire un verdict
 
 | | |
@@ -57,67 +76,203 @@ devant quelqu'un qui n'a rien demandé ?** C'est la question que le champ
 `OptOuts` pose, et le bloc `const NO_OUTREACH` fait échouer la compilation d'une
 entrée qui y répond « non » sans qu'on ait lu la liste d'outils du fournisseur.
 
+### Ce que la deuxième vague a changé à cette colonne
+
+`OptOuts` a une cinquième variante, **`HeldHere`**, et trois connecteurs que ce
+document classait bloqués sont entrés grâce à elle. Elle dit : *ce serveur peut
+atteindre quelqu'un qui n'a rien demandé, et le fournisseur ne tient aucune liste
+de désabonnement à rapatrier — donc le seul registre de ce refus est
+`suppressions`, chez nous.*
+
+Le raisonnement qui manquait était celui-ci : **`NO_OUTREACH` est un registre, pas
+un verrou d'exécution.** Rien ne le lit au moment de l'appel. Refuser une entrée
+n'a donc jamais empêché un message de partir — le client branchait le même
+fournisseur par `CUSTOM`, et le registre se taisait exactement là où il aurait dû
+parler. Ce qui arrête un appel, c'est la Policy Gate et l'approbation humaine, et
+les deux sont en aval de toutes les valeurs de cet enum.
+
+Il y a donc maintenant **deux registres publics**, qui se lisent ensemble :
+`NO_OUTREACH` nomme les connecteurs qui n'atteignent personne, et
+`OUTREACH_HELD_HERE` nomme ceux qui atteignent des inconnus sans liste amont.
+Chacun a son bloc `const` qui casse la compilation si on ajoute une entrée sans
+monter sa longueur, et le message de `OUTREACH_HELD_HERE` réclame **deux**
+lectures et pas une : la liste d'outils du fournisseur, puis son API, pour
+vérifier qu'aucun endpoint de suppression n'existe. Un test,
+`every_entry_is_on_exactly_one_of_the_two_registers`, additionne les deux et
+refuse qu'une entrée tombe entre.
+
 ---
 
 # Ce qui est ajoutable aujourd'hui
 
-Quinze entrées, dont sept sans la moindre inscription préalable.
+Vingt-deux connecteurs sont nommés dans le catalogue. La première vague en avait
+écrit huit, la deuxième en a écrit quatorze, et une seule des entrées qui
+restaient s'est révélée fermée à la mesure.
 
-| Connecteur | Forme | Plancher | Ce qu'il reste à faire |
+| Connecteur | Forme | Plancher | État |
 |---|---|---|---|
-| **GitHub** | `Dial` + OAuth | `Write` | ✅ **déjà dans le catalogue.** Créer l'OAuth App et poser `AGENTOS_OAUTH_CLIENTS` |
-| **Gmail** | `Dial` + OAuth | `Write` | Client OAuth Web dans la Google Cloud Console |
-| **Google Drive** | `Dial` + OAuth | `Write` | Le même client Google |
-| **Zoom** | `Dial` + OAuth (`Basic`) | `Read` | Une *General app* sur le Marketplace Zoom |
-| **Notion** | `Dial` + OAuth | `Write` | Un `POST /register` à la main, secret permanent |
-| **Canva** | `Dial` + OAuth | `Write` | Idem, secret permanent |
-| **Granola** | `Dial` + OAuth | `Read` | Idem, secret permanent |
-| **Magnific** | `Dial` + OAuth | `Write` | Idem, secret permanent |
-| **Atlassian Rovo** | `Dial` + `Bearer` | `Write` | Une clé de compte de service |
-| **Malwarebytes** | `Dial` + **aucun credential** | `Read` | **Rien.** L'entrée la moins chère du document |
-| **Context7** | `Dial` + `None` ou `Bearer` | `Read` | Rien, ou une clé pour une limite plus haute |
-| **Supabase** | `Dial` + `Bearer` | `Destructive` | Un PAT — ⚠ voir plus bas |
-| **Neon** | `Dial` + `Bearer` | `Destructive` | Une clé API — ⚠ voir plus bas |
-| **PostHog** | `Dial` + `Bearer` | `Destructive` | Une clé personnelle |
-| **Mixpanel** | `Dial` + `Bearer` | `Destructive` | Un Service Account |
-| **MotherDuck** | `Dial` + `Bearer` | `Destructive` | Un jeton d'accès |
-| **Linear** | `Dial` + `Bearer` | `Write` / `Read` | Une clé API. Deux entrées possibles, dont `/mcp/readonly` |
-| **Stripe** | `Dial` + `Bearer` | `Write` | Une clé restreinte **en lecture seule** — ⚠ voir plus bas |
-| **Serpstat** | `Host` (npm) | `Read` | Épingler la version et capturer sa surface d'outils |
-| **Exa** | `Dial` + `Bearer` | `Read` | Vérifier qu'il accepte `Authorization: Bearer` et pas seulement `x-api-key` |
+| **GitHub** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste à créer l'OAuth App et poser `AGENTOS_OAUTH_CLIENTS` |
+| **Gmail** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste le client OAuth Web dans la Google Cloud Console |
+| **Google Drive** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Le même client Google |
+| **Google Calendar** | `Dial` + OAuth | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠ voir plus bas |
+| **Zoom** | `Dial` + OAuth (`Basic`) | `Read` | ✅ **dans le catalogue.** Reste une *General app* sur le Marketplace Zoom |
+| **Notion** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Secret permanent confirmé (`client_secret_expires_at: 0`) |
+| **Canva** | — | — | ❌ **IMPOSSIBLE.** La mesure a contredit ce document — voir plus bas |
+| **Granola** | `Dial` + OAuth | `Read` | ✅ **dans le catalogue.** Secret permanent confirmé |
+| **Magnific** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue**, à `https://mcp.magnific.com` et non `.ai` — voir plus bas |
+| **Atlassian Rovo** | `Dial` + `Bearer` | `Write` | ✅ **dans le catalogue.** Reste une clé de compte de service |
+| **Malwarebytes** | `Dial` + **aucun credential** | `Write` | ✅ **dans le catalogue.** L'entrée la moins chère du document — plancher corrigé, voir plus bas |
+| **Context7** | `Dial` + `None` | `Read` | ✅ **dans le catalogue.** Rien à faire du tout |
+| **Supabase** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue.** Reste un PAT — ⚠ voir plus bas |
+| **Neon** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue**, en `HeldHere` — ⚠ voir plus bas |
+| **PostHog** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue**, en `Pulled { from: "opt-outs-list" }` |
+| **Mixpanel** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue.** ⚠ l'en-tête n'est pas une clé — voir plus bas |
+| **MotherDuck** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue.** Reste un jeton d'accès |
+| **Linear** | `Dial` + `Bearer` | `Write` / `Read` | ✅ **deux entrées dans le catalogue**, dont `/mcp/readonly` |
+| **Stripe** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠ voir plus bas |
+| **Cloudflare** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠⚠ voir plus bas |
+| **Exa** | `Dial` + `Bearer` | `Read` | ✅ **dans le catalogue.** `Authorization: Bearer` **vérifié par la mesure** — voir plus bas |
+| **Serpstat** | `Host` (npm) | `Read` | Reste à faire : épingler la version et capturer sa surface d'outils |
+
+## Ce que la mesure a contredit dans ce document
+
+Cinq points, chacun tranché par un appel réel le 2026-08-31 et non par une
+relecture.
+
+**Canva passe d'AJOUTABLE à IMPOSSIBLE.** `POST https://mcp.canva.com/register`
+accepte `https://siglair.com/v1/mcp/oauth/callback` et le renvoie tel quel dans
+sa réponse — puis `GET /authorize` répond **400 `Invalid redirect URI`** pour
+cette URI, pour `https://example.com/cb`, et pour toute URI en `https`. Le même
+client réenregistré avec `http://localhost:33418/oauth/callback` obtient un 302
+vers la page de consentement. Le serveur d'autorisation MCP de Canva n'accepte
+que des redirections de bouclage : c'est un flux de client de bureau, et il est
+incompatible avec le mur n°5. Second constat de la même sonde, sans objet mais
+utile : Canva ignore le `scope` qu'on envoie et lui substitue ses seize portées
+complètes, donc `OAuth::scopes` y aurait été décoratif de toute façon.
+
+**Le serveur MCP de Magnific n'est pas où ce document le laissait croire.**
+`mcp.magnific.ai` ne résout pas. `https://api.freepik.com/mcp` répond 200 avec
+une erreur JSON-RPC qui nomme elle-même son successeur :
+`https://mcp.magnific.com` — en `.com`, et **sans chemin `/mcp`**, ce que confirme
+le champ `resource` de son document de ressource protégée.
+
+**Le plancher de Malwarebytes passe de `Read` à `Write`.** Le bloc
+`instructions` du serveur annonce cinq outils ; `tools/list` en répond **six**, et
+le sixième est `reputation-report`, qui « soumet l'indicateur au système de
+renseignement sur les menaces ». `RiskClass::Read` est défini comme « observe sans
+rien changer », et ce n'en est pas. Le coût de la correction est nul : `Read` et
+`Write` valent tous deux `Risk::Low`.
+
+**Exa lit bien `Authorization: Bearer`.** Trois appels sur la même session :
+sans en-tête, `web_search_exa` renvoie des résultats (palier gratuit) ; avec
+`Authorization: Bearer 0000…`, `error (401): Invalid API key` ; avec
+`x-api-key: 0000…`, le même message au caractère près. Les deux en-têtes
+atteignent la même vérification amont — donc le bearer *est* lu comme la clé, et
+l'entrée n'est pas le bouton cassé qu'Atlassian a failli être.
+
+**La portée de Granola n'était lisible dans aucune métadonnée.** Le document
+d'autorisation liste `["email", "offline_access", "openid", "profile"]` et **pas**
+`mcp` ; celui de la ressource protégée liste `["mcp"]`. Tranché en enregistrant un
+client à la main puis en sondant `/authorize` : `scope=mcp` → 302 vers le
+consentement, `scope=mcp offline_access` → 302, `scope=bogus_scope_xyz` → retour
+avec `error=invalid_scope`. L'endpoint valide donc réellement, `mcp` existe, et
+c'est la métadonnée du serveur d'autorisation qui est incomplète.
 
 ## Les jetons dont un mauvais accord coûte cher
 
 À lire avant d'écrire l'une de ces entrées.
 
-**Stripe** est le plus coûteux du document. `stripe_api_write` couvre les
-remboursements, la finalisation de factures et la résiliation d'abonnements —
-c'est la caisse. Et finaliser une facture **envoie un e-mail à un client**, sans
-qu'aucune liste de désabonnement Stripe existe à rapatrier. **La seule forme
-honnête est une clé restreinte en lecture seule** : le plancher tombe à `Write`,
-`NoStrangers` redevient vrai, et on garde l'essentiel de ce qu'un employé a à
-faire — lire les soldes, les rapports et l'analytique.
+**Stripe** est le plus coûteux du document, et il est entré à **`Destructive`**.
+`stripe_api_write` est documenté comme « écrire avec n'importe quelle méthode
+`POST`, `PATCH`, `PUT` et `DELETE` de l'API Stripe » : un outil dont le paramètre
+est le verbe. Remboursements, finalisation de factures et résiliation
+d'abonnements sont dedans, et aucun n'est défait par un autre appel. La forme la
+moins chère reste une **clé restreinte en lecture seule**, mais c'est un choix qui
+se fait chez le client et qu'aucun champ d'ici ne voit — donc le plancher est
+écrit pour la pire clé qu'il puisse coller, pas pour la meilleure. Finaliser une
+facture **envoie un e-mail à un client**, sans qu'aucune liste de désabonnement
+Stripe existe à rapatrier : c'est `OptOuts::HeldHere`, et la sortie propre est
+nommée dans le code — couper l'e-mail de facture de Stripe et le faire passer par
+le fournisseur dont le `List-Unsubscribe` atterrit déjà sur une de nos routes fait
+basculer l'entrée en `Pushed`.
 
-**Cloudflare** est le plus dangereux, et il ne le montre pas.
-`https://mcp.cloudflare.com/mcp` n'expose que deux outils, `search()` et
-`execute()` — et `execute()` fait écrire du JavaScript qui appelle **n'importe
-lequel des ~2 500 endpoints de l'API Cloudflare**. Détruire une zone DNS est
-atteignable sans qu'aucun nom d'outil destructeur n'apparaisse. Le plancher de
-risque ne voit que deux outils d'apparence anodine ; déclarer `execute` en `Read`
-serait une faute grave.
+**Cloudflare** est le plus dangereux, et il ne le montre pas. Son serveur expose
+`search`, `execute` et — d'après le dépôt, contre deux dans la page produit — un
+`docs`. **La liste d'outils ne dit rien de ce qu'il peut faire** : `execute` fait
+écrire du JavaScript qui appelle `cloudflare.request()` sur **n'importe lequel des
+~2 500 endpoints de l'API Cloudflare**. Détruire une zone DNS, vider un bucket R2,
+supprimer une base D1 ou un Worker sont tous atteignables sans qu'aucun nom
+d'outil destructeur n'apparaisse nulle part. La méthode habituelle — énumérer les
+outils, prendre le pire, écrire sa classe — lit trois noms anodins et répond
+`Read` ; **déclarer `execute` en `Read` serait une faute grave.** La seule
+frontière de permission réelle est la portée du jeton API que le client a collé,
+et rien dans ce binaire ne la voit. Le plancher `Destructive` est donc la seule
+chose qui rattrape ce connecteur, et il force l'approbation humaine jusque sur
+`docs`, qui est une recherche documentaire. C'est le prix correct.
 
-**Trois entrepôts exposent un SQL en écriture qu'aucun plancher ne distingue de
-son jumeau en lecture** : `execute_sql` chez BigQuery (accepte DML *et* DDL, donc
-`DROP TABLE`, alors qu'un `execute_sql_readonly` existe), `query_rw` chez
-MotherDuck, `execute-sql` chez PostHog. Un plancher `Destructive` force
-l'approbation humaine sur les deux, et c'est le prix correct d'une seule classe
-par connecteur.
+Même serveur, même couvercle, pointé sur l'autre affirmation : les invitations de
+membre de compte et la vérification de destination d'Email Routing sont des
+endpoints de l'API Cloudflare, donc `execute` peut mettre du courrier devant une
+adresse que quelqu'un a tapée — et aucun nom d'outil ne le dirait jamais. D'où
+`HeldHere` plutôt que `NoStrangers`.
 
-**Supabase** : un PAT non restreint donne la base de production entière, et
-`execute_sql` accepte `DROP TABLE`. L'endpoint `?read_only=true` justifie une
-seconde entrée à plancher `Write`, et c'est probablement celle à écrire d'abord.
+**Quatre serveurs donnent un SQL arbitraire à l'agent**, et aucun plancher ne
+distingue le SQL en écriture de son jumeau en lecture : `execute_sql` chez
+Supabase, `run_sql` chez Neon, `query_rw` chez MotherDuck, `execute-sql` chez
+PostHog. (`stripe_analytics` fait du SQL sur des tables de reporting seulement.)
+Un plancher `Destructive` force l'approbation humaine sur les deux jumeaux, et
+c'est le prix correct d'une seule classe par connecteur. La bonne réponse pour un
+tenant qui veut lire sans approbation n'est pas de déclarer l'outil plus bas,
+c'est une **seconde entrée** sur l'endpoint en lecture seule — `?read_only=true`
+chez Supabase, `/mcp/readonly` chez Linear, qui est déjà écrite ainsi.
 
-**Neon** : une clé API porte le **compte entier**, pas un projet.
+**Supabase** : un PAT non restreint donne la base de production entière.
+`delete_branch`, `reset_branch` et `pause_project` sont irréversibles en plus du
+SQL. Aucun outil n'y prend d'adresse — `deploy_edge_function` prend du *code*, et
+la ligne que ce catalogue trace est celle d'un outil dont le **paramètre est un
+destinataire**, pas d'un outil qu'on pourrait écrire pour en devenir un. C'est la
+même ligne qui laisse GitHub en `NoStrangers` alors que GitHub Actions exécute
+n'importe quoi.
+
+**Neon** : une clé API porte le **compte entier**, pas un projet. C'est aussi la
+seule entrée de cette vague dont la revendication d'opt-out n'a pas pu être
+énumérée : `https://mcp.neon.tech/mcp` exige un jeton avant `tools/list`, et la
+surface documentée contient `create_auth_user`, un outil dont le paramètre est
+l'adresse e-mail d'une personne. La page de Neon ne dit ni que cet appel envoie un
+courrier ni qu'il n'en envoie pas (vérifié le 2026-08-31). `NoStrangers` affirme
+qu'aucun outil ne peut atteindre quelqu'un : c'est exactement la phrase que
+l'énumération manquante ne soutient pas. La moitié certaine est l'autre — Neon ne
+publie aucune liste de suppression — donc `HeldHere`, en se trompant *vers* le
+registre plutôt qu'en dehors. Une entrée listée à tort est une ligne qu'on lit et
+qu'on retire ; une entrée absente à tort est une ligne que personne ne sait
+chercher.
+
+**Mixpanel** : ⚠ **la chaîne que le client colle n'est pas une clé.** Le chemin
+compte de service veut la valeur d'en-tête littérale
+`Authorization: Bearer Basic <base64(nom:secret)>` — un credential Basic transporté
+dans le jeton du schéma Bearer. `mcp.rs` écrit le préfixe `Bearer ` lui-même, donc
+ce qui va dans le champ est `Basic <base64>` et le fil ressort correct. Un client
+qui colle le secret seul obtient un 401 indébogable. C'est le piège d'Atlassian à
+l'envers, et Mixpanel marque lui-même cette interface **beta**. Son plancher est
+`Destructive` pour les suppressions et `Update-Feature-Flag` (qui change le ciblage
+sur du trafic de production), pas pour du SQL : `Run-Query` est un appel structuré.
+
+**Google Calendar** est entré à **`Destructive`**, et c'est le seul plancher de ce
+document qui ne suit pas la règle « `Write` pour le reste ». `delete_event` est
+dans la liste des neuf outils et Google Calendar n'a pas de corbeille : l'événement
+disparaît du calendrier de tous les participants, et le courrier d'annulation est
+déjà parti. `RiskClass::Destructive` est défini comme « irréversible, ou coûteux à
+défaire ». Le prix est réel et assumé : `list_events` doit être déclaré
+`Destructive` aussi, donc un humain approuve une lecture de calendrier. C'est ce
+que coûte une classe grossière par connecteur quand un connecteur a un outil
+irréversible — et Atlassian en est le miroir, où `Write` est écrit *parce que* rien
+sur ce serveur ne supprime. Une entrée Calendar en lecture seule sur des portées
+réduites serait celle qui porterait `Read` ; personne n'a pris cette décision.
+
+Sur l'autre affirmation : le schéma d'entrée de `create_event` a un tableau
+`attendees` dont le membre exige un `email`, mesuré le 2026-08-31, et **Google
+envoie une invitation à chaque adresse**. Google ne publie aucune liste de
+désabonnement pour ces invitations — donc `HeldHere`.
 
 **Alpaca et Longbridge** passent des ordres réels. **Binance est le seul
 connecteur financier du document qui borne structurellement le sinistre** : sa
@@ -152,26 +307,37 @@ portées, et on reçoit un client confidentiel — c'est exactement notre modèl
 plusieurs workspaces clients impose une **publication au Marketplace**, avec revue
 et délai. Une app *interne* ne vit que dans un workspace.
 
-## Une décision de produit
+## Une décision de produit — et ce qu'elle est devenue
 
-Ces trois-là passent tous les murs techniques. C'est le champ `OptOuts` qui les
-retient, et c'est le catalogue qui fonctionne comme prévu.
+Ce paragraphe disait que trois connecteurs passaient tous les murs techniques et
+que le champ `OptOuts` les retenait. **Deux d'entre eux sont entrés**, et ce n'est
+pas le champ qui a cédé : c'est l'inférence qu'on en tirait. Voir plus haut — un
+registre qui refuse une entrée ne protège personne, il se tait.
 
-**Google Calendar** — `create_event` prend une liste de participants et **envoie
-une invitation à une adresse arbitraire**. `NoStrangers` serait faux, et Google
-n'expose aucune liste de désabonnement : ni `Pulled` ni `Pushed` ne peut nommer
-une chaîne honnête. Il n'y a pas de bonne valeur à écrire aujourd'hui.
-`delete_event` est en outre irréversible.
+**Google Calendar** — entré en `OptOuts::HeldHere`, plancher `Destructive`.
+L'argument est intégralement au-dessus.
 
-**Superhuman Mail** — `send_email` prend To/Cc/**Bcc** et atteint n'importe
-quelle adresse. C'est une boîte personnelle, pas une plateforme d'envoi : aucune
-liste de désabonnement n'existe nulle part.
+**Superhuman Mail** — reste dehors, et pour une raison qui n'a rien à voir avec
+`OptOuts` : `send_email` prend To/Cc/**Bcc** et atteint n'importe quelle adresse,
+depuis une boîte personnelle. `HeldHere` serait techniquement écrivable, et le
+serait malhonnêtement : ce connecteur *est* un envoyeur, pas un produit qui envoie
+en passant. Un connecteur dont la fonction principale est de mettre un message
+devant quelqu'un appartient au chemin `EmailProvider`, où `opt_outs` est une
+méthode requise et où aucune des deux variantes bon marché n'existe. Le catalogue
+n'est pas la bonne porte pour lui.
 
-**PostHog** est l'exception heureuse, et mérite d'être signalée : il **peut**
-envoyer (`subscriptions-create`, `workflows-patch-action-email`) **et il expose
-`opt-outs-list`**. C'est le seul connecteur de tout le document dont le
-désabonnement est nommable, donc dont l'entrée est écrivable honnêtement en
-`OptOuts::Pulled`.
+**PostHog** est l'exception heureuse, et c'est elle qui garde `HeldHere` honnête :
+il **peut** envoyer (`subscriptions-create`, dont le `target_type` est `email` ou
+`slack`, et un workflow publié) **et il expose `opt-outs-list`** — orthographié
+exactement ainsi, minuscules et traits d'union, défini dans le
+`products/messaging/mcp/tools.yaml` de PostHog comme
+`messaging_preferences_opt_outs_retrieve`, annoté `readOnly: true`, avec
+`opt-outs-add` et `opt-outs-remove` à côté. C'est le seul connecteur de tout le
+document dont le désabonnement est nommable, donc son entrée est écrite en
+`OptOuts::Pulled { from: "opt-outs-list" }` et **pas** en `HeldHere`, qui aurait
+été un mot moins cher et aurait jeté la seule liste rapatriable de la
+qualification. C'est exactement pour ça que le message d'échec de
+`OUTREACH_HELD_HERE` réclame la deuxième lecture.
 
 ---
 
@@ -183,6 +349,15 @@ désabonnement est nommable, donc dont l'entrée est écrivable honnêtement en
 clients hors de son catalogue, et sa documentation le dit : seuls VS Code, Cursor
 et Claude Code y ont accès. Il y a une liste d'attente, pas une URL. Le serveur
 local, lui, tombe sur le mur n°2.
+
+**Canva** — le seul verdict que la deuxième vague a **retourné**. Son
+`/register` accepte notre URL de retour et la renvoie ; son `/authorize` la
+refuse ensuite en **400 `Invalid redirect URI`**, comme il refuse toute URI en
+`https`. Seul `http://localhost` obtient une page de consentement. C'est un flux
+de client de bureau, et il est incompatible avec le mur n°5 — une seule URL de
+retour publique pour tout le déploiement. Ce n'est pas une inscription qui manque,
+c'est le fournisseur qui doit changer. La mesure est datée du 2026-08-31 et vaut
+pour trois clients enregistrés séparément.
 
 **Apollo.io** — l'enregistrement OAuth est conditionné à un partenariat. Et
 surtout : il **envoie des e-mails à des destinataires arbitraires et inscrit des
@@ -248,7 +423,7 @@ Meta, et aucune chaîne de ce binaire ne peut nommer cette lecture.
 
 ---
 
-# Trois limites du catalogue que cette qualification a révélées
+# Cinq limites du catalogue que cette qualification a révélées
 
 Elles ne bloquent rien d'urgent, mais elles reviendront.
 
@@ -262,3 +437,18 @@ Elles ne bloquent rien d'urgent, mais elles reviendront.
    nouvelle surface de sécurité : il faudrait décider ce qu'un client a le droit
    de substituer, et c'est précisément la question que `Dial` évite en écrivant
    l'URL dans le binaire.
+4. **`Credential` n'a pas de « facultatif ».** Context7 marche sans rien et
+   accepte une clé qui monte la limite de débit ; `Credential::None` refuse la
+   clé qu'un client voudrait coller, `Credential::Bearer` l'exige. L'entrée est
+   écrite en `None`, parce que celle qui ne demande aucune inscription est celle
+   qui vaut la peine, et ça devient `Bearer` en un mot le jour où un tenant tape
+   dans la limite. Une variante `Optional` serait un troisième état à porter dans
+   la route de connexion pour un seul connecteur — pas encore.
+5. **Le plancher est une classe par connecteur, et deux serveurs en font une
+   fiction.** Chez Cloudflare et chez Stripe, un outil unique dont le paramètre
+   est « n'importe quelle méthode de l'API du fournisseur » n'a pas de liste
+   d'outils à lire : `Destructive` est alors la seule valeur défendable, et elle
+   fait approuver par un humain jusqu'à une recherche documentaire. La sortie
+   n'est pas une table par outil ici — l'argument contre est dans les docs du
+   module — c'est une **seconde entrée sur un endpoint en lecture seule**, comme
+   `linear-readonly`, quand le fournisseur en publie un.

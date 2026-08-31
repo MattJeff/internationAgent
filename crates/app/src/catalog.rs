@@ -363,6 +363,52 @@ pub enum OptOuts {
     /// somebody has to name. An entry that named none would be a click with
     /// nowhere to go.
     Pushed { at: &'static str },
+    /// This connector can put a message in front of a person who did not ask
+    /// for it, and the vendor keeps no list of the ones who refused. So the
+    /// only register of that refusal is `suppressions`, here, and there is
+    /// nothing upstream for [`crate::queue::reconcile_opt_outs`] to fetch.
+    ///
+    /// # It is an admission, not a permission
+    ///
+    /// The three variants above all end in somewhere to look: a vendor's list,
+    /// a path of ours, or a claim that nobody can be reached. This one ends in
+    /// a fact about the vendor — *they do not keep one* — and that fact is not
+    /// ours to fix by refusing the entry.
+    ///
+    /// That is the reasoning that was wrong before this variant existed, and it
+    /// is worth writing down because it is the reasoning somebody will reach for
+    /// again. [`NO_OUTREACH`] is a **register**, not an execution lock: nothing
+    /// reads it at call time, no gate consults it, and no message is stopped by
+    /// it. It is the document somebody has to be able to read to answer for an
+    /// obligation. Refusing to write an entry therefore protected nobody — the
+    /// customer connected the same vendor through [`CUSTOM`] and the register
+    /// went quiet exactly where it should have spoken. What stops a call is the
+    /// policy gate and a human approval, and both of them are downstream of
+    /// every value in this enum.
+    ///
+    /// So this variant **widens** what the document says rather than what the
+    /// product may do. [`OUTREACH_HELD_HERE`] is the second register it makes
+    /// possible, and it is the honest half of [`NO_OUTREACH`]: one array names
+    /// the connectors that reach nobody, the other names the connectors that
+    /// reach strangers with no vendor list behind them. A connector that is in
+    /// neither has named its read.
+    ///
+    /// # What it still costs
+    ///
+    /// The same discipline as [`OptOuts::NoStrangers`], for the same reason:
+    /// both are claims about a tool list that only a person can check, and the
+    /// cheap one is the one that gets typed by somebody in a hurry. Writing it
+    /// fails the build until [`OUTREACH_HELD_HERE`]'s length is bumped, and that
+    /// failure message asks for the reading that was owed — every tool this
+    /// server serves, and which of them takes an address.
+    ///
+    /// It is also not the escape hatch for a vendor that *does* keep a list and
+    /// nobody looked. [`OptOuts::Pulled`] is one string away and is strictly
+    /// more useful, so the only entries here are the ones where somebody went
+    /// looking for a suppression endpoint and found the vendor has none —
+    /// `posthog` is the connector that proves the difference, because it can
+    /// send and it publishes `opt-outs-list`, so it is `Pulled` and not this.
+    HeldHere,
     /// Nobody here has ever seen this server.
     ///
     /// [`Provision::Customer`] and nothing else — asserted at compile time by
@@ -510,19 +556,30 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   Slack Marketplace listing, and until that exists an entry here is a button
 ///   that works for exactly the workspace whose app we registered. That is a
 ///   demo, not a connector.
-/// * **Notion and Sentry.** Their `client_id`/`client_secret` come from a
-///   hand-made `POST /register` rather than a console, and Sentry's secret
-///   **expires at ninety days**. Nothing in this repository would remind anybody,
-///   so the entry's real cost is a quarterly chore that fails silently as an
-///   `invalid_client` on a Tuesday. Out of scope until something owns that clock.
+/// * **Sentry.** Its `client_id`/`client_secret` come from a hand-made
+///   `POST /register` rather than a console, and the secret **expires at ninety
+///   days**. Nothing in this repository would remind anybody, so the entry's
+///   real cost is a quarterly chore that fails silently as an `invalid_client`
+///   on a Tuesday. Out of scope until something owns that clock. Notion, Canva,
+///   Granola and Magnific were in this paragraph for the same reason and are
+///   not any more: all four answer `POST /register` with
+///   `client_secret_expires_at: 0`, measured 2026-08-31, so the secret is
+///   permanent and there is no clock to own. Three of them are entries below.
 /// * **Figma.** Its authorization server answers 403 to clients outside its own
 ///   catalogue, so the consent page cannot be reached from here at all.
-/// * **Google Calendar.** Dialled and working, and held back on `opt_outs`
-///   alone. The argument is beside the two Google entries below, where the next
-///   person to wonder will be looking.
-/// * **Stripe and Cloudflare.** Both refused on the opt-out claim, and the
-///   reason is one property they share rather than two separate judgements. See
-///   [`OptOuts`] and the note above [`NO_OUTREACH`].
+/// * **Canva.** The fourth of that group, and the one that did not survive its
+///   own measurement. `POST https://mcp.canva.com/register` accepts
+///   `https://siglair.com/v1/mcp/oauth/callback` and echoes it back — and then
+///   `GET /authorize` answers **400 `Invalid redirect URI`** for that URI, for
+///   `https://example.com/cb`, and for every `https` URI tried. The same client
+///   registered with `http://localhost:33418/oauth/callback` gets a 302 to
+///   Canva's consent page. Canva's MCP authorization server accepts loopback
+///   redirects only, which is a desktop-client flow and is mutually exclusive
+///   with this deployment having exactly one public callback. A second finding
+///   from the same probe, moot but worth keeping: Canva ignores the `scope` we
+///   send and substitutes its own full sixteen, so `OAuth::scopes` would have
+///   been decorative here even if the redirect had worked. Not a registration
+///   away — the provider has to change.
 ///
 /// Each token entry below carries the reason it is a static bearer token, because
 /// that is the question every one of them raises.
@@ -703,30 +760,65 @@ pub const CATALOG: &[Connector] = &[
         // A permission-granting tool appearing here is what breaks this claim.
         opt_outs: OptOuts::NoStrangers,
     },
-    // **Google Calendar was measured on 2026-08-31 and is deliberately not the
-    // fourth entry.** Everything mechanical about it works: the same server
-    // family as the two above, Streamable HTTP at
-    // `https://calendarmcp.googleapis.com/mcp/v1`, protocol `2025-06-18`,
-    // `tools/list` answering unauthenticated, and the same `GOOGLE_AUTHORIZE` /
-    // `GOOGLE_TOKEN` pair. Nothing here is a technical blocker, and this note
-    // exists so nobody repeats the measurement to find that out.
-    //
-    // What holds it back is `opt_outs`, and there is no value that can be
-    // written. Its nine tools include `create_event`, which takes a list of
-    // attendees, and **Google mails an invitation to every address on it** — so
-    // `NoStrangers` is a lie. Google publishes no unsubscribe list for those
-    // invitations, so neither `Pulled` nor `Pushed` can name an honest string
-    // either, and `Pushed` could not register anyway (`0069`'s
-    // `webhook_endpoints_provider_is_wired`). `delete_event` is in the same list
-    // and is irreversible, so the floor is `Write` at best and not the `Read`
-    // this entry was first drafted with.
-    //
-    // Restricting `scopes` to the read-only three would make both claims true at
-    // the provider, which is a real option and is exactly why this is a product
-    // decision rather than an engineering one: it is an entry that can read a
-    // calendar and never write one, and nobody has decided whether that is the
-    // Calendar connector we want to sell. Until somebody does, the honest
-    // catalogue is one that does not mention Calendar.
+    Connector {
+        key: "google-calendar",
+        label: "Google Calendar",
+        // Same server family as the two above and the same probe on
+        // **2026-08-31**: Streamable HTTP, protocol `2025-06-18`,
+        // `StatelessServer`/`ESF`, and `tools/list` answering without a
+        // credential. Re-measured on the same day this entry was written, and
+        // the nine tools below were read off that answer.
+        provision: Provision::Dial("https://calendarmcp.googleapis.com/mcp/v1"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: GOOGLE_AUTHORIZE,
+            token: GOOGLE_TOKEN,
+            // Three scopes chosen against the nine tools rather than copied off
+            // a page. `calendar.events` is read and write on events and is the
+            // only wide one; the alternative spelling `calendar` would have
+            // added settings, ACLs and calendar creation for one fewer word.
+            // `calendar.calendarlist.readonly` is what `list_calendars` needs
+            // and grants nothing else; `calendar.freebusy` is what
+            // `suggest_time` reads across other people's calendars, and it
+            // returns busy intervals rather than event contents.
+            scopes: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.freebusy",
+            auth: ClientAuth::Post,
+        }),
+        // **`Destructive`, and this is the one floor in the array that is not
+        // `Write` for a connector of this shape.** `delete_event` is in the tool
+        // list and Google Calendar has no trash for it: the event is gone from
+        // every attendee's calendar, and the cancellation mail has already been
+        // sent. `RiskClass::Destructive` is defined as "irreversible, or
+        // expensive to undo", so this is the class the worst tool served here
+        // actually is — and one class per connector means it is the floor.
+        //
+        // The price is real and is the honest half: `list_events` must be
+        // declared `Destructive` too, so a human approves a calendar read. That
+        // is what one coarse class per connector costs when a connector has one
+        // irreversible tool, and `atlassian` above is the mirror of it —
+        // `Write` there, recorded explicitly, *because* nothing on that server
+        // deletes. A read-only Calendar entry on narrowed scopes is the entry
+        // that would carry `Read`, and it is a product decision nobody has made.
+        floor: RiskClass::Destructive,
+        // Nine tools on **2026-08-31**: `list_events`, `get_event`,
+        // `list_calendars`, `suggest_time`, `create_event`, `update_event`,
+        // `delete_event`, `respond_to_event`, `search_events`.
+        // `create_event`'s input schema has an `attendees` array whose member
+        // type requires an `email`, and **Google mails an invitation to every
+        // address on it** — so this connector can put a message in front of
+        // somebody who did not ask, and `NoStrangers` would be a lie.
+        //
+        // `HeldHere` is the honest value and the reading behind it is the second
+        // half of that variant's price: Google publishes **no** unsubscribe or
+        // suppression list for calendar invitations. There is nothing at Google
+        // for `reconcile_opt_outs` to fetch, so `Pulled` would have to name a
+        // read that does not exist, and `Pushed` could not register a handle
+        // anyway (`0069`'s `webhook_endpoints_provider_is_wired`). What answers
+        // for a refusal is `suppressions`, here, and `OUTREACH_HELD_HERE` is
+        // where this connector is written down as one of the four it answers
+        // for.
+        opt_outs: OptOuts::HeldHere,
+    },
     Connector {
         key: "linear",
         label: "Linear",
@@ -878,6 +970,586 @@ pub const CATALOG: &[Connector] = &[
         // claim and the floor together, the same way it would have on Calendar.
         opt_outs: OptOuts::NoStrangers,
     },
+    Connector {
+        key: "malwarebytes",
+        label: "Malwarebytes ScamGuard",
+        // **The cheapest entry in the array, and the only one that needs
+        // nothing at all.** Dialled 2026-08-31: `initialize` answers 200 over
+        // Streamable HTTP with no credential, `serverInfo` names
+        // `Malwarebytes ScamGuard 3.4.4`, and `tools/list` answers the same way.
+        // No account, no key, no registration — so unlike every OAuth entry
+        // above, this one is live the moment it is deployed.
+        provision: Provision::Dial("https://scamguard.malwarebytes.com/claude/mcp"),
+        reach: Reach::Public,
+        // Nothing to send, and `mcp.rs`'s connect route refuses a token for this
+        // connector rather than storing one nobody reads.
+        credential: Credential::None,
+        // **`Write`, not the `Read` this entry was drafted with, and the
+        // difference is one tool that only a live enumeration shows.** The
+        // server's own `instructions` block advertises five tools, all
+        // reputation lookups; `tools/list` on 2026-08-31 answered with **six**,
+        // and the sixth changes the floor: `reputation-report` "submits the
+        // indicator to the threat intelligence system", which is a write into
+        // somebody else's dataset with an effect on whoever owns the domain or
+        // number reported. `RiskClass::Read` is "observes without changing
+        // anything" and that is not this.
+        //
+        // The cost of being right here is nil: `Read` and `Write` both map to
+        // `Risk::Low` in `mcp.rs`, so no approval changes. It is written down
+        // because the floor is a claim, and a claim read off five tools when the
+        // server serves six is the kind that is wrong for years.
+        floor: RiskClass::Write,
+        // Six tools, read off the live list: `reputation-check_link`,
+        // `-check_phone`, `-check_email`, `-whois`, `-scan_all` and `-report`.
+        // Three of them *take* an address or a phone number and none of them
+        // sends anything to it — they hash it against a threat database and hand
+        // back a verdict. `reputation-report` submits an indicator to
+        // Malwarebytes' own analysts, who are the vendor and not a stranger.
+        // There is nobody here who could ask to be left alone, and therefore no
+        // list at Malwarebytes to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "context7",
+        label: "Context7 — library documentation",
+        // Dialled 2026-08-31: 200 with no credential, `exa`-style Streamable
+        // HTTP, two tools on `tools/list`.
+        provision: Provision::Dial("https://mcp.context7.com/mcp"),
+        reach: Reach::Public,
+        // **`None` and not `Bearer`, and it is a choice rather than a
+        // measurement.** Context7 works with no credential and accepts an
+        // optional API key as `Authorization: Bearer <key>` that buys a higher
+        // rate limit and nothing else. There is no "optional credential" variant
+        // and there should not be one: `Credential::Bearer` makes the key
+        // *required* and turns the one entry that needs no signup into one that
+        // does, while `Credential::None` makes the connect route refuse a key
+        // somebody wanted to paste. The free tier is the entry worth having; the
+        // day a tenant hits the limit, this becomes `Bearer` in one word.
+        credential: Credential::None,
+        // Two tools, both lookups against Context7's documentation index:
+        // `resolve-library-id` maps a package name to an id, `query-docs`
+        // returns documentation for one. Nothing writes. `Read` is a claim that
+        // was checked, which is the difference between this and `CUSTOM`.
+        //
+        // What it *does* do, and what the floor cannot express, is return third
+        // party prose straight into a turn — this is an `Untrusted` firehose by
+        // design, and `crate::turn`'s trust filter is what handles that.
+        floor: RiskClass::Read,
+        // Neither tool takes an address, a number or a recipient. A
+        // documentation index has nobody to reach.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "exa",
+        label: "Exa — web search",
+        // **The one entry in this batch whose credential shape had to be
+        // measured rather than read, because Exa's REST API documents
+        // `x-api-key` and the catalogue can only send `Authorization: Bearer`.**
+        //
+        // Measured 2026-08-31, three calls to the same session:
+        //   * no header at all → `web_search_exa` returns results (free tier)
+        //   * `Authorization: Bearer 0000…` → `error (401): Invalid API key`
+        //   * `x-api-key: 0000…`            → `error (401): Invalid API key`
+        // Identical upstream rejection from both headers, and neither is ignored
+        // — so the bearer header *is* read as the API key, and this entry is not
+        // the broken button `atlassian` nearly was. That is the evidence; the
+        // documentation alone would not have settled it.
+        provision: Provision::Dial("https://mcp.exa.ai/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Two tools on 2026-08-31: `web_search_exa` and `web_fetch_exa`. Both
+        // read the public web and neither writes anywhere. Same caveat as
+        // `context7` and larger: everything this returns is `Untrusted`.
+        floor: RiskClass::Read,
+        // Neither tool takes a recipient. Searching the web reaches nobody.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "supabase",
+        label: "Supabase",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_request", …resource_metadata=…`. OAuth is Supabase's
+        // default door and is not the only one — a personal access token goes in
+        // the same header ("create a personal access token (PAT) with the
+        // necessary scopes and pass it as a header", `Authorization: Bearer
+        // ${SUPABASE_ACCESS_TOKEN}`), which is what makes this a pasted string.
+        //
+        // The caveat is the customer's and is worth saying out loud in the UI: a
+        // PAT is **account-wide** unless they scope it, so the narrow thing to
+        // paste is a scoped token, and `?read_only=true` on the URL would be a
+        // second, better entry the day somebody wants it.
+        provision: Provision::Dial("https://mcp.supabase.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `execute_sql` takes arbitrary SQL, so `DROP TABLE` and `DELETE FROM`
+        // are one string away and no tool name says so. `delete_branch` and
+        // `reset_branch` ("discards writes since the branch diverged") are
+        // separately irreversible, and `pause_project` stops a production
+        // database. `RiskClass::Destructive` is "irreversible, or expensive to
+        // undo", and three tools here are exactly that.
+        //
+        // Worth naming the trap this floor is really for: `execute_sql` and a
+        // hypothetical `execute_sql_readonly` would be **indistinguishable to
+        // the floor**, because the floor is one class for the whole connector.
+        // A tenant who wants reads without a human approves them at
+        // `?read_only=true` on a second entry, not by declaring this tool lower.
+        floor: RiskClass::Destructive,
+        // Thirty-two published tools across projects, branches, migrations,
+        // edge functions and storage. **Not one of them takes an address**:
+        // there is no auth-admin invite tool, no email tool and no SMS tool on
+        // this server. `deploy_edge_function` takes *code*, and the line this
+        // file draws — the same one that makes GitHub `NoStrangers` while GitHub
+        // Actions can run anything — is a tool whose **parameter is a
+        // recipient**, not a tool that could be written into one.
+        //
+        // What breaks it is an `auth_admin` tool arriving: Supabase's Auth admin
+        // API can invite a user by email, and an MCP tool wrapping it would
+        // reach a stranger with no list at Supabase to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "neon",
+        label: "Neon",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_token", error_description="No authorization provided"`.
+        // Neon documents the header directly — `Authorization: Bearer
+        // <YOUR_NEON_API_KEY>`, "for API key or remote agent setups" — so OAuth
+        // is the alternative here rather than the requirement.
+        //
+        // The caveat that belongs in the UI: **a Neon API key carries the whole
+        // account**, not one project.
+        provision: Provision::Dial("https://mcp.neon.tech/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `run_sql` is documented as supporting "both read and write
+        // operations", so it is the same arbitrary-SQL tool `supabase` has under
+        // another name. `delete_project` ("deletes an existing Neon project"),
+        // `delete_branch` and `reset_from_parent` ("discards writes since the
+        // branch diverged") are three irreversible tools on top of it.
+        floor: RiskClass::Destructive,
+        // **The one entry in this batch whose opt-out claim could not be
+        // enumerated, and the value says so rather than guessing kindly.**
+        //
+        // Neon's MCP tools are served per category and `https://mcp.neon.tech/mcp`
+        // needs a token before `tools/list`, so nobody here has read the list
+        // this URL actually serves. What is documented is that the surface
+        // includes `create_auth_user` — a tool whose parameter is a person's
+        // email address — and Neon Auth ships email verification and
+        // customizable emails. Whether *that* call sends one is not stated on
+        // Neon's own page, checked 2026-08-31.
+        //
+        // So `NoStrangers` is unavailable: it asserts that not one tool here can
+        // reach somebody who did not ask, and that is exactly the sentence the
+        // missing enumeration cannot support. The half that *is* certain is the
+        // other one — Neon publishes no suppression, unsubscribe or opt-out
+        // listing anywhere, so there is nothing for `reconcile_opt_outs` to
+        // fetch and `Pulled` would name a read that does not exist. `HeldHere`
+        // is what both halves add up to, and it errs into the register rather
+        // than out of it: an entry wrongly listed here is a line somebody reads
+        // and removes, an entry wrongly absent is a line nobody knows to look
+        // for.
+        //
+        // Enumerate this endpoint with a real key and the claim tightens in
+        // whichever direction the list says.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "posthog",
+        label: "PostHog",
+        // Dialled 2026-08-31: 401 whose body is "No token provided, please
+        // provide a valid API token", which is the vendor saying the quiet part.
+        // PostHog documents a personal API key created under its **MCP Server**
+        // preset — "add the `Authorization: Bearer YOUR_API_KEY` header" — and
+        // that preset scopes the key to one project, which is the narrow thing
+        // to tell a customer to paste.
+        provision: Provision::Dial("https://mcp.posthog.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Several hundred generated tools, and the floor is decided by two
+        // families. `execute-sql` runs arbitrary HogQL — other tools' own
+        // descriptions instruct the agent to route through it — and the deletes
+        // are named and plural: `action-delete`, `alert-delete`,
+        // `annotation-delete`, `insights-bulk-delete-create`,
+        // `data-catalog-metrics-bulk-delete-create`, `messaging-templates-destroy`,
+        // `data-warehouse-delete-org-destroy`. Irreversible, so `Destructive`.
+        floor: RiskClass::Destructive,
+        // **The connector that proves [`OptOuts::HeldHere`] is not the lazy
+        // answer, and the only one of its kind in this array.**
+        //
+        // PostHog can send: `subscriptions-create` schedules recurring delivery
+        // whose "`target_type` — `email` or `slack`" goes to caller-supplied
+        // addresses, and a published workflow sends real messages
+        // (`workflows-publish`; a workflow created over MCP is a draft until
+        // then, and `workflows-test-run` deliberately does not reach real
+        // recipients). So `NoStrangers` is false here in the plainest way.
+        //
+        // And **PostHog publishes the list**. `opt-outs-list` is a real tool,
+        // spelled exactly that way — lowercase, hyphenated, plural — defined in
+        // PostHog's own `products/messaging/mcp/tools.yaml` as
+        // `messaging_preferences_opt_outs_retrieve`, annotated `readOnly: true`,
+        // with `opt-outs-add` and `opt-outs-remove` beside it. That is a read
+        // `crate::queue::reconcile_opt_outs` can be pointed at, which is the
+        // entire bar `OptOuts::Pulled` sets.
+        //
+        // Writing `HeldHere` here would have been one word cheaper and would
+        // have thrown away the only vendor in this whole qualification whose
+        // unsubscribes can be named. That is why `OUTREACH_HELD_HERE`'s failure
+        // message asks for the second reading and not just the first.
+        opt_outs: OptOuts::Pulled {
+            from: "opt-outs-list",
+        },
+    },
+    Connector {
+        key: "mixpanel",
+        label: "Mixpanel",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_token"…`. Live, and a bearer is what it reads.
+        //
+        // **The string a customer pastes here is not an API key, and getting
+        // that wrong is a 401 nobody can debug.** Mixpanel's service-account
+        // path wants the *literal* header value
+        // `Authorization: Bearer Basic <base64(username:secret)>` — a Basic
+        // credential carried inside the Bearer scheme token. `mcp.rs` writes the
+        // `Bearer ` prefix itself and sends the stored string after it, so what
+        // goes in the field is `Basic <base64>` and the wire ends up correct.
+        // A customer who pastes the service-account secret alone gets a 401.
+        //
+        // This is `atlassian`'s trap wearing the opposite disguise: there a
+        // Basic credential looked like a bearer and was not; here a Basic
+        // credential really does ride inside one, and only because Mixpanel
+        // built it that way. Their own docs mark it **beta** — "the interface
+        // may change" — which is the sentence that will break this entry.
+        provision: Provision::Dial("https://mcp.mixpanel.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Sixty-odd tools in Capital-Hyphen-Case, unlike every other server
+        // here. `Delete-Dashboard`, `Delete-Cohort` and `Delete-Tag` are
+        // irreversible; `Merge-Group` collapses duplicate Lexicon entities into
+        // one and there is no unmerge; `Update-Feature-Flag` changes targeting
+        // on **production traffic**, which is a write whose blast radius is a
+        // live product rather than a report.
+        //
+        // Worth recording what this floor is *not* about: `Run-Query` is a
+        // structured insights/funnel/retention call, **not** arbitrary SQL. The
+        // three other warehouses here are `Destructive` for the SQL; Mixpanel is
+        // `Destructive` for the deletes and the flag.
+        floor: RiskClass::Destructive,
+        // Read off Mixpanel's published tool list, 2026-08-31. Dashboards,
+        // cohorts, metrics, experiments, feature flags and lexicon entities —
+        // every object lives inside a Mixpanel project and every person who
+        // sees one holds a seat on it. No tool takes an email address, a phone
+        // number or any recipient, and there is no invite, share or report-email
+        // tool on this server.
+        //
+        // What breaks it is a scheduled-report tool: Mixpanel's product mails
+        // digests, and an MCP tool wrapping that would take a recipient list
+        // with no suppression endpoint at Mixpanel to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "motherduck",
+        label: "MotherDuck",
+        // Dialled 2026-08-31: 401 whose body is a JSON-RPC error saying it
+        // plainly — "Authentication required. Please authenticate using OAuth or
+        // provide a Bearer token." The `WWW-Authenticate` header also carries a
+        // `resource` matching this URL exactly, which is the RFC 8707 indicator
+        // this deployment never sends; see the module docs for that residual.
+        provision: Provision::Dial("https://api.motherduck.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `query_rw` is "SQL that can change data or schema" — create tables,
+        // insert, update, save views, and therefore `DROP TABLE`. Its read-only
+        // twin `query` sits right beside it in the same list, and **the floor
+        // cannot tell them apart**: one class per connector means the class of
+        // the worst tool, so `query` costs a human approval it does not deserve
+        // in order that `query_rw` cannot avoid one. That is the price of coarse,
+        // paid deliberately, and the alternative — a per-tool table maintained
+        // here — is argued against in the module docs.
+        floor: RiskClass::Destructive,
+        // Seven core tools: `query`, `query_rw`, `list_databases`,
+        // `list_tables`, `list_columns`, `search_catalog`, `ask_docs_question`.
+        // None takes a recipient. Three further families exist — Dive, Flight
+        // and Guide — whose individual names MotherDuck does not publish, and
+        // Flight runs **scheduled Python jobs**, which is code and not an
+        // address: the same line this file draws at GitHub Actions and at
+        // Supabase's `deploy_edge_function`. A tool whose parameter is a
+        // program is not a tool whose parameter is a person.
+        //
+        // What breaks it is a Flight tool that takes a destination — a job that
+        // mails a report is a plausible product, and MotherDuck publishes no
+        // suppression list to bring home if one ships. Enumerate with a real
+        // token before extending this claim.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "stripe",
+        label: "Stripe",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // resource_metadata=…`, so it is live and a bearer is what it reads.
+        // `Credential::Bearer` and not the OAuth realm it also advertises: a
+        // Stripe API key — and specifically a **restricted** key — goes straight
+        // into that header, which is a string the customer pastes with no client
+        // registration for this deployment to obtain first.
+        provision: Provision::Dial("https://mcp.stripe.com"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // **This is the caisse, and the floor is the only thing in this binary
+        // that knows it.** `stripe_api_write` is documented as "write data with
+        // any Stripe API `POST`, `PATCH`, `PUT` and `DELETE` method" — one tool
+        // whose parameter is the verb. Refunds, invoice finalization and
+        // subscription cancellation are all inside it, and none of them is
+        // undone by another call.
+        //
+        // Same shape as `cloudflare` below and the same conclusion: the tool
+        // list is a lid, not an inventory, so `Destructive` is read off what the
+        // one tool can reach rather than off how many tools there are. The
+        // cheaper and better entry is a **read-only restricted key**, which is
+        // the customer's own choice to make at their end and which this field
+        // cannot see — so the floor is written for the worst key they might
+        // paste, not the best.
+        floor: RiskClass::Destructive,
+        // Finalizing an invoice **mails it** to whatever address a
+        // `create_customer` call put on the record, and then keeps mailing it:
+        // dunning is a sequence. That mail carries no unsubscribe link, and
+        // **Stripe publishes no suppression endpoint at all** — there is nothing
+        // to reconcile against, so `Pulled` would have to name a read that does
+        // not exist and `Pushed` could not register a handle (`0069`'s
+        // `webhook_endpoints_provider_is_wired`). `NoStrangers` is a claim with
+        // no referent on a tool whose list is Stripe's whole REST surface.
+        //
+        // `HeldHere` is what is true: this connector can reach somebody who did
+        // not ask, the only register of their refusal is `suppressions`, and
+        // `OUTREACH_HELD_HERE` names it. The way out is a real one and is
+        // written above [`NO_OUTREACH`] — turn Stripe's own invoice mail off,
+        // send it through the provider whose `List-Unsubscribe` already lands on
+        // a route of ours, and this becomes `OptOuts::Pushed`.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "cloudflare",
+        label: "Cloudflare",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer realm="OAuth"`.
+        // The realm says OAuth and the server does not mean it exclusively —
+        // Cloudflare documents a plain API token in the same header
+        // ("create a Cloudflare API token with the permissions you need and pass
+        // it as a bearer token in the Authorization header"), which is what
+        // makes this a pasted string rather than a consent flow this deployment
+        // would have to register for. One caveat that is the customer's and not
+        // ours: a token with Client IP Address Filtering enabled is refused.
+        provision: Provision::Dial("https://mcp.cloudflare.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // ## Read this before touching the floor on this entry
+        //
+        // **Cloudflare's server serves three tools — `docs`, `search` and
+        // `execute` — and the tool list tells you nothing about what it can
+        // do.** `search` writes JavaScript that queries an OpenAPI `spec.paths`;
+        // `execute` writes JavaScript that calls `cloudflare.request()` against
+        // **any of the ~2,500 endpoints of the Cloudflare API**. Cloudflare's
+        // own headline for it is "2500 endpoints in 1k tokens".
+        //
+        // So the usual method — enumerate the tools, take the worst one, write
+        // its class down — reads three innocuous names and returns `Read`.
+        // **Declaring `execute` as `read` would be a grave fault**: destroying a
+        // DNS zone, dropping a D1 database, emptying an R2 bucket and deleting a
+        // Worker are all reachable through it, and not one of them makes a
+        // destructive-sounding tool name appear anywhere. The only permission
+        // boundary on this connector is the scope of the API token the customer
+        // pasted, and nothing in this binary can see that.
+        //
+        // `Destructive` is therefore the floor, and on this entry the floor is
+        // the only thing standing between "the agent called a tool" and "the
+        // account is gone". It forces every call on this connector — including
+        // `docs`, which is a documentation search — through a human. That is the
+        // correct price, and the same argument in reverse to `atlassian`'s
+        // `Write`: there the tool list is the truth, here the tool list is a lid.
+        floor: RiskClass::Destructive,
+        // The same lid, pointed at the other claim. Account-member invitations
+        // and Email Routing destination verification are both Cloudflare API
+        // endpoints, so `execute` can put mail in front of an address somebody
+        // typed — and no tool name here would ever say so. `NoStrangers` is a
+        // claim with no referent on a connector whose tool list *is* a vendor's
+        // whole REST surface, which is precisely the argument that kept this
+        // entry out of the array until `OptOuts::HeldHere` existed.
+        //
+        // Cloudflare publishes no suppression or unsubscribe list — there is
+        // nothing there to reconcile against, because Cloudflare is not an
+        // outbound-messaging product; mail is a side effect of administration.
+        // So the register is `suppressions`, here, and `OUTREACH_HELD_HERE` is
+        // where this connector is named.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "notion",
+        label: "Notion",
+        // Dialled 2026-08-31: 401, `WWW-Authenticate: Bearer realm="OAuth"`,
+        // `resource_metadata` at `/.well-known/oauth-protected-resource/mcp`.
+        //
+        // **OAuth and not a pasted key, and that is measured twice.** Notion
+        // documents it — "Notion MCP currently requires you to complete the
+        // OAuth authorization flow" — and the protected-resource document says
+        // the same by having no other answer. An `ntn_` internal integration
+        // token belongs to the older open-source server, not this one.
+        provision: Provision::Dial("https://mcp.notion.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            // Read off `https://mcp.notion.com/.well-known/oauth-authorization-server`
+            // on 2026-08-31, not off a blog post: `issuer` is
+            // `https://mcp.notion.com`, and these are its two endpoints.
+            authorize: "https://mcp.notion.com/authorize",
+            token: "https://mcp.notion.com/token",
+            // **`default` is the whole vocabulary**: `scopes_supported` is
+            // `["default"]` on both the protected-resource and the
+            // authorization-server document. Worth writing down what that costs,
+            // because this file treats `scopes` as the one bound on a token that
+            // survives every other control failing: Notion's `/authorize` hands
+            // our request straight to `api.notion.com/v1/oauth/authorize` with
+            // `owner=user` and **does not validate scope at all** — a probe with
+            // `bogus_scope_xyz` was accepted exactly as `default` was. So the
+            // token's real bound is the page tree the human ticks on Notion's
+            // own consent screen, and this field is honest rather than
+            // load-bearing. It is the only entry here of which that is true.
+            scopes: "default",
+            // `client_secret_basic` first in
+            // `token_endpoint_auth_methods_supported`, and the variant this
+            // file's `ClientAuth` docs already name Notion for.
+            auth: ClientAuth::Basic,
+        }),
+        // Thirty-three published tools. `notion-create-pages`,
+        // `notion-update-page`, `notion-create-database`, `notion-create-view`,
+        // `notion-move-pages` and the comment and upload tools all write, and
+        // `notion-fetch` hands back page bodies — an `Untrusted` surface the
+        // size of Drive's. Nothing is observation-only, so not `Read`.
+        //
+        // And not `Destructive` either, which is the half worth recording: **no
+        // published tool deletes.** Notion's REST API cannot permanently delete
+        // a page at all — trashing is a reversible `in_trash` flag — so even a
+        // pass-through would be undoable. `Write` is the truth about this list,
+        // the same sentence `atlassian` carries.
+        floor: RiskClass::Write,
+        // Read off Notion's published tool list, 2026-08-31. There is no invite
+        // tool, no email tool, and no way to address anybody outside the
+        // workspace: `notion-create-comment` notifies the people already
+        // following a page, all of whom hold an account on it. The tool that
+        // needed checking is `notion-get-users`, which lists members and guests
+        // **with their email addresses** — it reads an address book it has no
+        // way to mail, which is an exfiltration question for the trust filter
+        // and not an outreach question for this field.
+        //
+        // What breaks it is a user-provisioning tool, the same falsifier written
+        // beside `atlassian`.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "granola",
+        label: "Granola — meeting notes",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer`, pointing at
+        // `/.well-known/oauth-protected-resource`, whose `authorization_servers`
+        // is a **different host** — `https://mcp-auth.granola.ai`. The two
+        // literals below come from that host's own metadata document and not
+        // from the resource's, which is the mistake this note exists to prevent.
+        //
+        // OAuth is the only door: "there is no API key or service account access
+        // method for MCP".
+        provision: Provision::Dial("https://mcp.granola.ai/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://mcp-auth.granola.ai/oauth2/authorize",
+            token: "https://mcp-auth.granola.ai/oauth2/token",
+            // **The one scope string in this file that the metadata document
+            // would have got wrong.** The authorization server's
+            // `scopes_supported` is `["email", "offline_access", "openid",
+            // "profile"]` and **does not list `mcp`** — but the protected
+            // resource's own document says `scopes_supported: ["mcp"]`, and the
+            // resource is the thing being asked for.
+            //
+            // Settled by probing rather than by choosing, 2026-08-31, against a
+            // client registered by hand at `/oauth2/register`:
+            //   * `scope=mcp`                  → 302 to the consent page
+            //   * `scope=mcp offline_access`   → 302 to the consent page
+            //   * `scope=bogus_scope_xyz`      → 302 back with `error=invalid_scope`
+            // So the endpoint does validate, `mcp` is real, and the metadata is
+            // simply incomplete. `offline_access` is here because Granola lists
+            // `refresh_token` in `grant_types_supported` and `crate::oauth::
+            // refresh_due` needs something in the column to renew with.
+            scopes: "mcp offline_access",
+            auth: ClientAuth::Basic,
+        }),
+        // Six tools: `query_granola_meetings`, `list_meetings`, `get_meetings`,
+        // `list_meeting_folders`, `get_meeting_transcript`, `get_account_info`.
+        // Every one of them reads the customer's own notes; there is no create,
+        // update, share or send tool on this server at all. `Read` is a checked
+        // claim, like `orizn-visa`'s and unlike `CUSTOM`'s.
+        //
+        // The sensitivity is real and is not what the floor measures:
+        // `get_meeting_transcript` returns verbatim minutes of meetings other
+        // people were in. That is an `Untrusted`-text and a data-egress question,
+        // and both are answered elsewhere.
+        floor: RiskClass::Read,
+        // Falls out of the same list. A surface with no write tool has nothing
+        // that could put anything in front of anybody, and Granola is a notepad
+        // rather than a sender. The falsifier is a share-by-email tool.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "magnific",
+        label: "Magnific — image and video generation",
+        // **The address had to be found, and the old one is a trap.**
+        // `mcp.magnific.ai` does not resolve, and `https://api.freepik.com/mcp`
+        // — the endpoint most pages still name — answers 200 with a JSON-RPC
+        // error saying it is deprecated and naming its successor. So this
+        // literal comes from the deprecated server itself, dialled 2026-08-31,
+        // and it is `magnific.com` rather than `magnific.ai`.
+        //
+        // 401 with `WWW-Authenticate: Bearer …, scope="openid profile email
+        // mcp:custom-audience"`, and the protected-resource document's
+        // `resource` is this bare URL with **no `/mcp` path** — which is why the
+        // string below has none. OAuth only: "You don't need to manage an API
+        // key."
+        provision: Provision::Dial("https://mcp.magnific.com"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            // A Keycloak realm, read off
+            // `https://auth.magnific.com/realms/mcp/.well-known/oauth-authorization-server`
+            // on 2026-08-31. The authorization server is a third host again —
+            // neither the MCP endpoint nor `magnific.com`.
+            authorize: "https://auth.magnific.com/realms/mcp/protocol/openid-connect/auth",
+            token: "https://auth.magnific.com/realms/mcp/protocol/openid-connect/token",
+            // The vendor's own answer, copied from the `scope=` parameter its
+            // 401 challenge sends, and then probed against a hand-registered
+            // client on 2026-08-31:
+            //   * this string        → 302 to Magnific's login page
+            //   * `bogus_scope_xyz`  → 302 back with
+            //     `error=invalid_scope&error_description=Invalid+scopes%3A+…`
+            // So the endpoint validates and this string passes. `offline_access`
+            // is in the realm's `scopes_supported` and is deliberately **not**
+            // asked for: Keycloak returns a session-bound refresh token for the
+            // authorization-code grant without it, and `offline_access` is the
+            // wider one that survives logout. If bindings here start dying at
+            // the session boundary, that is the word to add.
+            scopes: "openid profile email mcp:custom-audience",
+            auth: ClientAuth::Basic,
+        }),
+        // Twenty-three published tools. Most generate: `images_generate`,
+        // `images_upscale`, `video_generate`, `audio_tts`, `models3d_generate`
+        // and their siblings, plus `creations_search`/`_get`/`_move` and
+        // `account_balance`. Generating writes an asset into the customer's
+        // Magnific account and **spends credits from a real balance**, so
+        // nothing here is observation-only.
+        //
+        // Not `Destructive`: no tool deletes — `creations_move` relocates
+        // between folders. The cost is money rather than data, and money spent
+        // is the tenant's own ceiling to set, which `crate::policy` already has
+        // a lever for.
+        floor: RiskClass::Write,
+        // Nothing on this server publishes, shares or sends. A generation tool
+        // returns an asset to the caller; it does not put it in front of a third
+        // party. One thing left unmeasured and worth naming rather than
+        // assuming: whether the returned asset URLs are public CDN links. That
+        // is an egress question, not an outreach one — nobody receives a message
+        // either way.
+        opt_outs: OptOuts::NoStrangers,
+    },
     CUSTOM,
 ];
 
@@ -896,9 +1568,11 @@ pub const CATALOG: &[Connector] = &[
 /// [`OptOuts::Pushed`] already cost the person adding an entry something real —
 /// a string they can only get by reading a vendor's documentation, and one this
 /// block refuses to accept empty. [`OptOuts::NoStrangers`] costs nothing, is
-/// true of every entry here, and is the answer somebody in a hurry reaches
+/// true of most entries here, and is the answer somebody in a hurry reaches
 /// for. So it is the one that has to be paid for twice, and the second payment
 /// is this length, whose failure message says what reading is owed.
+/// [`OUTREACH_HELD_HERE`] charges the identical price for the identical reason,
+/// on the one other variant that is a claim rather than a string.
 ///
 /// The other assertion is the trapdoor: [`OptOuts::Unseen`] is pinned to
 /// [`Provision::Customer`], so the "we have not looked yet" answer is
@@ -906,48 +1580,53 @@ pub const CATALOG: &[Connector] = &[
 /// variant to leave in place, and no way to borrow the one variant that sounds
 /// like it.
 ///
-/// # The two connectors this block cost us, and the one property they shared
+/// # The two connectors this block cost us, and what getting them back changed
 ///
-/// `stripe` and `cloudflare` were both meant to be in the array above and
-/// neither is, for one reason rather than two: **each serves a single tool whose
-/// parameter is "any method of the vendor's API"** — `stripe_api_write`
-/// ("write data with any Stripe API `POST`, `PATCH`, `PUT` and `DELETE`
-/// method"), and Cloudflare's `execute`. A tool like that has no tool list to
-/// read. Its list is the vendor's entire REST surface, it grows whenever they
-/// ship anything, and nobody can assert over it — so [`OptOuts::NoStrangers`] on
-/// such an entry is not a claim that turned out wrong, it is a claim with no
-/// referent.
+/// `stripe` and `cloudflare` were both refused an entry once, for one reason
+/// rather than two: **each serves a tool whose parameter is "any method of the
+/// vendor's API"** — `stripe_api_write` ("write data with any Stripe API
+/// `POST`, `PATCH`, `PUT` and `DELETE` method"), and Cloudflare's `execute`. A
+/// tool like that has no tool list to read. Its list is the vendor's entire REST
+/// surface, it grows whenever they ship anything, and nobody can assert over it
+/// — so [`OptOuts::NoStrangers`] on such an entry is not a claim that turned out
+/// wrong, it is a claim with no referent.
 ///
-/// It is not hypothetical in either case. Stripe's own supported-method list
-/// includes *finalize an invoice*, which mails an invoice to whatever address a
-/// `create_customer` call put on the record, and then keeps mailing it: dunning
-/// is a sequence, invoice mail carries no unsubscribe link, and **Stripe has no
-/// suppression endpoint at all**, so [`OptOuts::Pulled`] would have to name a
-/// read that does not exist. Cloudflare's `execute` reaches account-member
-/// invitations and Email Routing destination verification, both of which put
-/// mail in front of an address somebody typed.
-///
-/// [`OptOuts::Pushed`] is not the escape either, and the reason is a good one:
-/// `0069`'s `webhook_endpoints_provider_is_wired` allows `provider in ('email',
+/// That much was right and still is. What was wrong was the conclusion.
+/// [`OptOuts::Pulled`] cannot name a read that does not exist — Stripe's
+/// invoice mail carries no unsubscribe link and Stripe publishes no suppression
+/// endpoint; Cloudflare's `execute` reaches account-member invitations and Email
+/// Routing destination verification and Cloudflare publishes none either. And
+/// [`OptOuts::Pushed`] is no escape: `0069`'s
+/// `webhook_endpoints_provider_is_wired` allows `provider in ('email',
 /// 'twilio')`, so a `stripe` handle invented here would fail at registration
 /// rather than quietly accept callbacks nobody consumes. Three variants, none of
-/// them true, no fourth — which is the enum working exactly as [`OptOuts`] says
-/// it should. Add either connector the day something owns its outbound mail:
-/// disable Stripe's own invoice emails and send them through the provider whose
-/// `List-Unsubscribe` already lands on a route of ours, and the entry becomes
-/// writable.
+/// them true — and the inference drawn from that was "then the entry must not be
+/// written", which **protected nobody**.
+///
+/// This array is a register. Nothing reads it at call time; no message was ever
+/// stopped by an entry's absence. A customer who wanted Stripe connected Stripe
+/// through [`CUSTOM`], with a URL they pasted themselves, and the register said
+/// nothing about it at all. The refusal bought silence where the document should
+/// have spoken, and it bought it at the price of the two connectors most worth
+/// writing down. [`OptOuts::HeldHere`] is the fourth answer, [`OUTREACH_HELD_HERE`]
+/// is where it is recorded, and both entries are in the array above.
+///
+/// The upgrade path is unchanged and is still worth taking: the day something
+/// owns Stripe's outbound mail — disable Stripe's own invoice emails, send them
+/// through the provider whose `List-Unsubscribe` already lands on a route of
+/// ours — that entry becomes [`OptOuts::Pushed`] and moves off the other array.
 ///
 /// It is `pub` because it is the artifact the obligation actually needs: the
 /// list of connectors this deployment asserts have no unsubscribe list
 /// anywhere, in one place, readable by whoever has to answer for it.
-pub const NO_OUTREACH: [&str; 8] = {
-    let mut out = [""; 8];
+pub const NO_OUTREACH: [&str; 17] = {
+    let mut out = [""; 17];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         vet(&CATALOG[i]);
         if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
             assert!(
-                n < 8,
+                n < 17,
                 "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
                  NO_OUTREACH's length was not updated. That claim is read off the vendor's \
                  own tool list — every tool this server serves, and not one of them can put \
@@ -962,9 +1641,73 @@ pub const NO_OUTREACH: [&str; 8] = {
         i += 1;
     }
     assert!(
-        n == 8,
+        n == 17,
         "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
          not updated"
+    );
+    out
+};
+
+/// Every connector we have written down that **can** put a message in front of
+/// somebody who did not ask for it, and whose vendor keeps no list of the ones
+/// who refused — so the only register of that refusal is `suppressions`, here.
+///
+/// # This is the register [`NO_OUTREACH`] could not hold
+///
+/// The two arrays are one document read from both ends. `NO_OUTREACH` names the
+/// connectors that reach nobody; this one names the connectors that reach
+/// strangers with nothing upstream to reconcile against. Everything else in
+/// [`CATALOG`] has named its read in [`OptOuts::Pulled`] or [`OptOuts::Pushed`],
+/// and `every_entry_is_on_exactly_one_of_the_two_registers` is the assertion
+/// that no entry falls between them.
+///
+/// Before [`OptOuts::HeldHere`] existed there was no third answer, so a
+/// connector in this position could not be written at all — and `stripe` and
+/// `cloudflare` were both refused on exactly that. That refusal read as caution
+/// and was not: `NO_OUTREACH` is a register, nothing consults it at call time,
+/// and a customer who wanted Stripe connected Stripe through [`CUSTOM`] with
+/// **no** entry in any array here. The refusal cost the document its two most
+/// important lines and cost the customer nothing. Naming them is the safer half.
+///
+/// # Why it is pinned the same way
+///
+/// [`OptOuts::HeldHere`] is as cheap to type as [`OptOuts::NoStrangers`] and is
+/// wrong in a worse direction: `NoStrangers` typed by mistake understates a
+/// connector that sends, and `HeldHere` typed by mistake hides a vendor list
+/// that exists and could have been reconciled. Both are claims about a tool list
+/// no machine can check, so both cost a length. `posthog` is the entry that
+/// shows the difference is real — it sends *and* publishes `opt-outs-list`, so
+/// it is [`OptOuts::Pulled`] and appears in neither array.
+///
+/// `pub` for the same reason [`NO_OUTREACH`] is: it is the artifact the
+/// obligation needs. Somebody answering for what this deployment can reach
+/// reads these two arrays and nothing else.
+pub const OUTREACH_HELD_HERE: [&str; 4] = {
+    let mut out = [""; 4];
+    let (mut i, mut n) = (0, 0);
+    while i < CATALOG.len() {
+        if matches!(CATALOG[i].opt_outs, OptOuts::HeldHere) {
+            assert!(
+                n < 4,
+                "a connector claiming `OptOuts::HeldHere` was added to CATALOG and \
+                 OUTREACH_HELD_HERE's length was not updated. That claim is two readings, \
+                 not one: the vendor's own tool list, to see which tool takes the address of \
+                 a person who did not ask — and the vendor's API, to see that no suppression \
+                 or unsubscribe endpoint exists to reconcile against. If you have done both \
+                 and the second came back empty, bump the length and this deployment answers \
+                 for that connector's outreach itself. If the vendor does publish such a \
+                 list, `OptOuts::Pulled` names it and is strictly better. If no tool there \
+                 reaches anybody, `OptOuts::NoStrangers` and NO_OUTREACH is where you say so."
+            );
+            out[n] = CATALOG[i].key;
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        n == 4,
+        "a connector stopped claiming `OptOuts::HeldHere` and OUTREACH_HELD_HERE's length \
+         was not updated"
     );
     out
 };
@@ -1001,6 +1744,17 @@ const fn vet(connector: &Connector) {
             "`Provision::Customer` is a server nobody here has seen, so `NoStrangers` is a \
              claim about a tool list nobody has read. `OptOuts::Unseen`, for the same reason \
              this entry's floor is `RiskClass::Read`."
+        ),
+        // Same trapdoor, same sentence, other direction: `HeldHere` says
+        // somebody read a tool list, found a tool that reaches a stranger, and
+        // went looking for the vendor's suppression endpoint. None of that has
+        // happened for a URL that arrives in a request body.
+        OptOuts::HeldHere => assert!(
+            !unseen_server,
+            "`Provision::Customer` is a server nobody here has seen, so `HeldHere` is a claim \
+             about a tool list nobody has read — and about a vendor nobody has asked for a \
+             suppression endpoint. `OptOuts::Unseen`, for the same reason this entry's floor \
+             is `RiskClass::Read`."
         ),
         OptOuts::Pulled { from: source } | OptOuts::Pushed { at: source } => {
             assert!(
@@ -1321,12 +2075,51 @@ mod tests {
         vet(&a_sender_nobody_has_looked_up(OptOuts::Pulled {
             from: "list_unsubscribed",
         }));
+        vet(&a_sender_nobody_has_looked_up(OptOuts::HeldHere));
+    }
+
+    /// The two registers are one document, and nothing falls between them.
+    ///
+    /// This replaces an assertion that used to read `NO_OUTREACH.len() ==
+    /// CATALOG.len() - 1` — true only while every entry but [`CUSTOM`] claimed
+    /// [`OptOuts::NoStrangers`], and quietly meaningless the moment one did not.
+    /// The property actually worth holding is that **every catalogued connector
+    /// is accounted for exactly once**: it is on the roster that says it reaches
+    /// nobody, on the roster that says this deployment answers for its outreach,
+    /// or it named the read where its unsubscribes come in. There is no fourth
+    /// place for one to be, and a connector in none of the three would be the
+    /// `Unwired` state [`OptOuts`] refuses to have.
+    ///
+    /// The two `const` blocks each hold their own length; what neither can see
+    /// is the other, and this is the line that adds them up.
+    #[test]
+    fn every_entry_is_on_exactly_one_of_the_two_registers() {
+        let named = CATALOG
+            .iter()
+            .filter(|c| matches!(c.opt_outs, OptOuts::Pulled { .. } | OptOuts::Pushed { .. }))
+            .count();
         assert_eq!(
-            NO_OUTREACH.len(),
+            NO_OUTREACH.len() + OUTREACH_HELD_HERE.len() + named,
             CATALOG.len() - 1,
-            "the roster is every entry but `CUSTOM`; if that changed, one of them \
-             can now reach a stranger and this array is the audit line for it"
+            "every entry but `CUSTOM` reaches nobody, is answered for here, or named its \
+             read — and one of them is now in none of the three"
         );
+        for key in NO_OUTREACH {
+            assert!(
+                !OUTREACH_HELD_HERE.contains(&key),
+                "{key} claims both that it reaches nobody and that it reaches strangers"
+            );
+            assert!(
+                find(key).is_some(),
+                "{key} is on a register and not in CATALOG"
+            );
+        }
+        for key in OUTREACH_HELD_HERE {
+            assert!(
+                find(key).is_some(),
+                "{key} is on a register and not in CATALOG"
+            );
+        }
     }
 
     /// [`CUSTOM`] cannot make the claim either, from the other direction: a
@@ -1337,6 +2130,22 @@ mod tests {
     fn the_custom_entry_cannot_claim_it_reaches_nobody() {
         vet(&Connector {
             opt_outs: OptOuts::NoStrangers,
+            ..CUSTOM
+        });
+    }
+
+    /// And it cannot make the *opposite* claim either, which is the arm
+    /// [`OptOuts::HeldHere`] added to [`vet`].
+    ///
+    /// `HeldHere` is two readings — a tool list, then a vendor's API — and
+    /// neither has happened for a URL that arrives in a request body. Without
+    /// this arm it would have been the one variant a customer entry could carry
+    /// freely, which is exactly the `Unwired` hole [`OptOuts`] refuses to have.
+    #[test]
+    #[should_panic(expected = "about a vendor nobody has asked for a suppression endpoint")]
+    fn the_custom_entry_cannot_claim_this_deployment_answers_for_it() {
+        vet(&Connector {
+            opt_outs: OptOuts::HeldHere,
             ..CUSTOM
         });
     }
