@@ -812,6 +812,9 @@ fn app(
         .with_state(Health {
             db: db.clone(),
             mocks: config.mock_adapters.clone().into(),
+            // The port `routes::approvals` refuses on, not a second opinion
+            // about it.
+            payment_rail: ports.payments.configured(),
         })
         .merge(metrics::router(db));
 
@@ -2383,6 +2386,17 @@ struct Health {
     db: Db,
     /// Exactly [`Config::mock_adapters`], no second opinion.
     mocks: Arc<[&'static str]>,
+    /// Whether anything is bound behind `Ports::payments`, read off the port
+    /// itself rather than off the environment.
+    ///
+    /// Not a row in `mock_adapters` and deliberately not: those adapters have a
+    /// credential that makes them real and a fake that answers meanwhile, and
+    /// this one has neither — no `PaymentProvider` exists in this workspace to
+    /// configure. Filing it there would say "set the variable"; there is no
+    /// variable. It is its own field so that a replica can be asked, rather
+    /// than an operator inferring it from a `502` — which is the shape of the
+    /// question this struct exists to answer on demand.
+    payment_rail: bool,
 }
 
 /// Readiness: this replica can usefully take traffic *right now*.
@@ -2413,6 +2427,13 @@ struct Health {
 /// be able to come up, so `mock_adapters` is reported and never fails the
 /// probe — an always-present field, empty on a fully real deployment, so an
 /// operator can diff two replicas rather than infer from a silence.
+///
+/// `payment_rail` is reported on the same terms and for the same reason: a
+/// deployment with no `PaymentProvider` is a legitimate deployment — every
+/// build in this workspace is one — that simply refuses `payment_create` at
+/// the approval, with `no_payment_rail`. Failing readiness on it would take
+/// every replica out of the load balancer over a capability most tenants never
+/// use. Reported, never fatal.
 async fn readyz(State(health): State<Health>) -> Response {
     match agentos_store::policy::platform_ceiling_installed(&health.db).await {
         Ok(true) => {}
@@ -2449,6 +2470,9 @@ async fn readyz(State(health): State<Health>) -> Response {
             "ready": true,
             "outbox_lag_secs": lag,
             "mock_adapters": &*health.mocks,
+            // False on every build today. The route that reads the same port
+            // answers `501 no_payment_rail` and leaves the approval pending.
+            "payment_rail": health.payment_rail,
         })),
     )
         .into_response()
@@ -2890,6 +2914,7 @@ mod tests {
                 .with_state(Health {
                     db,
                     mocks: Vec::new().into(),
+                    payment_rail: false,
                 })
                 .oneshot(
                     HttpRequest::get("/readyz")

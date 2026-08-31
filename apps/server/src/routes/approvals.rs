@@ -129,12 +129,18 @@
 //! `main` already builds one for every turn; this route is handed the same
 //! `Arc`.
 //!
-//! **No money moves.** `Ports::payments` is `NotConfigured` — SPEC §13 — so a
-//! redeemed payment answers `Terminal { code: "not_configured" }` and this route
-//! answers `502`. What routing through the façade buys today is the *other* debt
-//! the dropped token left: the reservation the redemption took is settled or
-//! released by `Effects::book_effect`, which nothing on this path reached. See
-//! [`approve`].
+//! **No money moves, and nothing is spent trying.** `Ports::payments` is
+//! `NotConfigured` — SPEC §13 — so this deployment has no rail, and the route
+//! says so *before* it redeems: `501 no_payment_rail`, the approval left
+//! `pending`, replayable the day a rail exists. It used to redeem first and
+//! discover the missing rail second, which answered `502` with `state:
+//! "redeemed"` — the human's decision burned, the money not moved, and no way
+//! to try again. See [`approve`] and [`NO_PAYMENT_RAIL`].
+//!
+//! What routing through the façade buys, on the deployments that do have a
+//! rail, is the *other* debt the dropped token left: the reservation the
+//! redemption took is settled or released by `Effects::book_effect`, which
+//! nothing on this path reached.
 //!
 //! # Why there is no "where did this come from" on the queue
 //!
@@ -471,6 +477,21 @@ struct Approve {
 /// `not_configured` without going to the audit trail.
 const PAYMENT_NOT_PERFORMED: &str = "payment_not_performed";
 
+/// What an approved payment reports on a deployment that has no payment rail.
+///
+/// A different sentence from [`PAYMENT_NOT_PERFORMED`], and the difference is
+/// the whole point of the code: *nothing was attempted and nothing was spent*,
+/// against *the approval is gone and the money is not*. An operator reading
+/// this one has a deployment to configure; an operator reading the other has a
+/// payment to chase.
+///
+/// `501` because the honest reading is the one HTTP already has for it: this
+/// server does not support the functionality required to fulfil the request. It
+/// is not a `502` — no upstream was asked — and not a `503`, which would
+/// promise that waiting helps. Nothing about this changes until somebody binds
+/// a `PaymentProvider`, which is a deployment decision and not a retry.
+const NO_PAYMENT_RAIL: &str = "no_payment_rail";
+
 /// Spend the approval on the action in the body.
 ///
 /// # Link eight, and the one arm it is
@@ -500,26 +521,56 @@ const PAYMENT_NOT_PERFORMED: &str = "payment_not_performed";
 /// `redeem_approval` once, with the same id and the same nonce, and neither can
 /// reach the other's.
 ///
-/// # Why a failed payment is a 502 and not a 200
+/// # The order, and the one line that moves in it
 ///
-/// Two facts come out of this handler and they can disagree: the approval was
-/// redeemed (irreversibly — `approvals.state` left `pending` in the transaction
-/// the gate committed), and the money did not move. A 200 would state the first
-/// and bury the second, which is the failure `agentos_app::mocks` is arranged
-/// against one layer down: *"a fake that returns a plausible payment id is a
-/// fake that will one day be believed"*. An error that carries `state:
+/// Read, `may_decide`, **ask whether this deployment can pay at all**, redeem,
+/// pay. The third step is new and it is the only one that can be added without
+/// changing what any of the others mean: it reads a port and writes nothing, so
+/// a refusal there leaves the approval `pending`, the nonce live, and the queue
+/// exactly as the approver found it.
+///
+/// It is there because of what the fourth step costs. `redeem_approval` commits
+/// its own transaction — `approvals.state` leaves `pending`, the decision row is
+/// written, the reservation is taken — and only then is the port entered. On a
+/// deployment with no rail that trade spends a human's decision, the one thing
+/// on this path a person had to produce, on an outcome that was knowable before
+/// anyone was asked. So it is asked first. See [`NO_PAYMENT_RAIL`] and
+/// [`PaymentProvider::configured`](agentos_app::effects::PaymentProvider::configured).
+///
+/// # Why a failed payment is still a 502 and not a 200, and why that case has not gone away
+///
+/// Two facts come out of the last step and they can disagree: the approval was
+/// redeemed (irreversibly), and the money did not move. A 200 would state the
+/// first and bury the second, which is the failure `agentos_app::mocks` is
+/// arranged against one layer down: *"a fake that returns a plausible payment
+/// id is a fake that will one day be believed"*. An error that carries `state:
 /// "redeemed"` and the `decision_id` as extension members states both, and the
 /// audit row is the same either way.
 ///
-/// **Today it is always the 502**, because [`Ports::payments`] is
-/// `NotConfigured` and answers `Terminal { code: "not_configured" }` — see SPEC
-/// §13. That is the system working, and the point of routing through
-/// [`Effects::pay`](agentos_app::effects::Effects::pay) anyway is the half that
-/// is not about the money: the token carries a spend reservation that somebody
-/// owes the ledger a `settle` or a `release`, and `Effects::book_effect` is the
-/// only code that pays that debt. Dropping the token — which is what this route
-/// did — left an approved payment holding the day's headroom, and the team's,
-/// until the bucket rolled over at midnight.
+/// **This is irreducible and the guard above does not touch it.** A rail that
+/// exists can decline, time out, or answer after this process died — after a
+/// redemption that is already committed and cannot be taken back. No ordering
+/// fixes it: the two writes are in two systems, and asking the rail is the
+/// thing that changes the world. What the guard removes is the *knowable* half
+/// — the deployment that could never have paid — which is today the only half
+/// that fires, because [`Ports::payments`] is `NotConfigured` (SPEC §13). The
+/// 502 is unreachable on this build and stays in the code because it becomes
+/// reachable, and stops being rare, on the first build with a rail.
+///
+/// Whoever reads a 502 here is looking at money possibly in flight with an
+/// approval already spent. There is no replay: `approvals::redeem` requires
+/// `pending`, so a retry is `approval_already_decided`. The recovery is a
+/// person reading `provider_intents` — `Effects::pay` commits a row *before*
+/// the port is entered — against the rail's own statement, and filing a fresh
+/// approval if the money really did not move.
+///
+/// The point of routing through
+/// [`Effects::pay`](agentos_app::effects::Effects::pay) rather than minting and
+/// dropping is the half that is not about the money: the token carries a spend
+/// reservation that somebody owes the ledger a `settle` or a `release`, and
+/// `Effects::book_effect` is the only code that pays that debt. Dropping the
+/// token — which is what this route did — left an approved payment holding the
+/// day's headroom, and the team's, until the bucket rolled over at midnight.
 async fn approve(
     State(state): State<Approvals>,
     principal: Principal,
@@ -568,6 +619,26 @@ async fn approve(
             "decision_id": authorized.decision_id().as_uuid().to_string(),
         })));
     };
+
+    // The last instant at which nothing has been spent. A deployment with no
+    // rail behind `payments` cannot end this request with money moved whatever
+    // happens next, so the approval is not put through the redemption to find
+    // that out — it stays `pending`, and this same button works the day a
+    // `PaymentProvider` is bound.
+    if !state.ports.payments.configured() {
+        tracing::warn!(
+            approval_id = %id,
+            "an approved payment was refused: this deployment has no payment rail"
+        );
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            NO_PAYMENT_RAIL,
+            "this deployment has no payment provider, so this approval cannot be spent",
+        )
+        // The same extension member the 502 carries, holding the other value:
+        // one key answers "is the approval still there?" on both replies.
+        .with_extension("state", json!("pending")));
+    }
 
     let authorized = state
         .gate
@@ -1068,18 +1139,63 @@ mod tests {
         }
     }
 
+    /// A payment port that **exists**, in the two ways one can answer.
+    ///
+    /// `mocks::ports()` binds `NotConfigured`, which is what every deployment
+    /// binds today — see SPEC §13 — and which the route now refuses *in front
+    /// of* the redemption. That refusal must not become the only thing this
+    /// file can observe: the two behaviours on the far side of it, paying and
+    /// failing after a committed redemption, are the ones that matter the day a
+    /// PSP is chosen. So a double, here in the test module and reachable from
+    /// nowhere else — `agentos_app::mocks` still refuses to ship a fake that
+    /// returns a plausible payment id, and this is why that rule can hold.
+    enum Rail {
+        /// The rail moves the money and hands back a receipt.
+        Pays,
+        /// The rail is bound, is entered, and says no — a real provider's bad
+        /// day, arriving *after* the approval is already spent. This is the
+        /// case the upfront guard cannot remove; see [`approve`].
+        Declines,
+    }
+
+    #[async_trait::async_trait]
+    impl agentos_app::effects::PaymentProvider for Rail {
+        async fn pay(
+            &self,
+            _key: &agentos_domain::ids::IdempotencyKey,
+            _amount: agentos_domain::money::Money,
+            _instruction: &agentos_app::effects::PaymentInstruction,
+        ) -> Result<agentos_app::mocks::ProviderMessageId, agentos_app::mocks::ProviderError>
+        {
+            match self {
+                Rail::Pays => Ok(agentos_app::mocks::ProviderMessageId::new("pay_test_1")),
+                Rail::Declines => {
+                    Err(agentos_app::mocks::ProviderError::Terminal { code: "declined" })
+                }
+            }
+        }
+        // `configured` is left at its default `true`: both variants are rails
+        // that exist, which is the whole point of the double.
+    }
+
+    /// The process-wide ports with `payments` replaced. Everything else is
+    /// `mocks::ports()`, because nothing else on this route is reached.
+    fn ports_with(rail: Rail) -> Ports {
+        Ports {
+            payments: Arc::new(rail),
+            ..agentos_app::mocks::ports()
+        }
+    }
+
     fn mount(db: &Db, gate: &PolicyGate, keys: ApiKeys) -> Router {
         // `mocks::ports()` binds `NotConfigured` behind `payments`, which is
-        // what a deployment binds too — see SPEC §13. A test that wanted a
-        // payment to *succeed* would have to install a fake that returns a
-        // plausible payment id, which is the one thing `agentos_app::mocks`
-        // refuses to ship.
-        router(
-            db.clone(),
-            gate.clone(),
-            Arc::new(agentos_app::mocks::ports()),
-        )
-        .layer(from_fn_with_state(
+        // what a deployment binds too — see SPEC §13. A test that wants a
+        // payment to be *attempted* mounts [`ports_with`] instead.
+        mount_ports(db, gate, keys, agentos_app::mocks::ports())
+    }
+
+    fn mount_ports(db: &Db, gate: &PolicyGate, keys: ApiKeys, ports: Ports) -> Router {
+        router(db.clone(), gate.clone(), Arc::new(ports)).layer(from_fn_with_state(
             crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
             require_api_key,
         ))
@@ -1304,7 +1420,17 @@ mod tests {
 
         let approved = pay(50_000, "Cabinet Dubois");
         let id = file(&gate, &GatePrincipal::employee(tenant, employee), &approved).await;
-        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+        // A rail that pays, because the second half of this test is that the
+        // *right* payee goes through — and on `NotConfigured` it would stop at
+        // the guard in front of the redemption and prove nothing about the
+        // hash. This is also the standing proof that a configured port still
+        // pays exactly as it did before that guard existed.
+        let app = mount_ports(
+            &db,
+            &gate,
+            keys(tenant, "approver", SECRET),
+            ports_with(Rail::Pays),
+        );
 
         // First: the queue says who is being paid. It read `pay EUR 500.00`
         // and stopped, because no payee had ever been filed to show — which is
@@ -1337,20 +1463,103 @@ mod tests {
             "a refused swap must not burn the approval"
         );
 
-        // And what the human did approve still goes through, so the refusal
-        // above is the payee and not the fixture being unredeemable.
-        //
-        // "Goes through" is now a 502 and not a 200, and that is the bridge
-        // rather than a regression: the token is handed to `Effects::pay`, and
-        // `Ports::payments` is `NotConfigured`. The approval is redeemed either
-        // way — which is the line that proves the earlier refusal was the payee
-        // — and the body says which of the two facts is which.
+        // And what the human did approve goes through, so the refusal above is
+        // the payee and not the fixture being unredeemable — and the whole
+        // chain past the redemption runs: `Effects::pay` fences the intent,
+        // enters the port, records the receipt and settles the reservation.
         let (status, body) = call(&app, &uri, SECRET, Some(json!({ "action": approved }))).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
-        assert_eq!(body["code"], json!("payment_not_performed"));
+        assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(body["state"], json!("redeemed"));
-        assert_eq!(body["payment_error"], json!("not_configured"));
+        assert_eq!(body["payment"]["provider_message_id"], json!("pay_test_1"));
         assert_eq!(state_of(&db, tenant, id).await, "redeemed");
+        assert_eq!(
+            payment_intents(&db, tenant, employee).await,
+            vec![("succeeded".to_owned(), None)],
+            "the write-ahead row must close on the receipt"
+        );
+        assert_eq!(
+            reservation_states(&db, tenant, employee).await,
+            vec!["settled".to_owned()],
+            "money that moved must be settled against the day's headroom"
+        );
+    }
+
+    /// **An approval a deployment cannot spend is refused before it is spent.**
+    ///
+    /// The defect this test pins: `Ports::payments` is `NotConfigured` on every
+    /// build in this workspace, and the route used to redeem first and find out
+    /// second — so a human pressed approve, got a `502`, and the reply read
+    /// `state: "redeemed"`. The decision was gone, the money had not moved, and
+    /// `approvals::redeem` requires `pending`, so there was no second attempt to
+    /// make. The day a rail is bound, that approval is still dead.
+    ///
+    /// Three claims, and the third is why the guard is on the payment arm
+    /// rather than on the handler: an approval that is *not* a payment is
+    /// untouched by any of this. Nothing else in this file has an executor —
+    /// the token is minted, reported and dropped — so nothing else can be
+    /// refused for want of a port.
+    #[tokio::test]
+    async fn an_approved_payment_with_no_rail_is_refused_and_stays_pending() {
+        let Some(db) = db().await else { return };
+        let gate = PolicyGate::new(db.clone());
+        let (tenant, employee) = seed(&db).await;
+        may_spend_up_to_500(&db, tenant, employee).await;
+
+        let principal = GatePrincipal::employee(tenant, employee);
+        let approved = pay(50_000, "Cabinet Dubois");
+        let payment_id = file(&gate, &principal, &approved).await;
+        let paperwork = contract("Annual retainer");
+        let contract_id = file(&gate, &principal, &paperwork).await;
+
+        // The deployment as it ships: no `PaymentProvider` behind the port.
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+
+        let (status, body) = call(
+            &app,
+            &format!("/v1/approvals/{}/approve", payment_id.as_uuid()),
+            SECRET,
+            Some(json!({ "action": approved })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body:?}");
+        assert_eq!(body["code"], json!(NO_PAYMENT_RAIL));
+        assert_eq!(
+            body["state"],
+            json!("pending"),
+            "the reply must not claim the approval was spent: {body:?}"
+        );
+
+        // The claim the whole change is about.
+        assert_eq!(
+            state_of(&db, tenant, payment_id).await,
+            "pending",
+            "a deployment that cannot pay must not burn the approval"
+        );
+        // And nothing downstream was touched: no approach to a rail, and the
+        // day's headroom is neither taken nor owed back.
+        assert_eq!(
+            payment_intents(&db, tenant, employee).await,
+            Vec::new(),
+            "nothing approached a rail that does not exist"
+        );
+        assert_eq!(
+            reservation_states(&db, tenant, employee).await,
+            Vec::<String>::new(),
+            "a refused approval took no headroom"
+        );
+
+        // An approval that is not a payment is unaffected on the same
+        // deployment: minted, reported, dropped, exactly as before.
+        let (status, body) = call(
+            &app,
+            &format!("/v1/approvals/{}/approve", contract_id.as_uuid()),
+            SECRET,
+            Some(json!({ "action": paperwork })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["state"], json!("redeemed"));
+        assert_eq!(state_of(&db, tenant, contract_id).await, "redeemed");
     }
 
     /// **A redeemed payment is attempted exactly once, and a replay does not
@@ -1375,6 +1584,14 @@ mod tests {
     /// redemption took is **released**, because the money did not move. Before
     /// the bridge the token was dropped, nothing settled it, and an approved
     /// payment held the seat's headroom — and its team's — until midnight.
+    ///
+    /// **And it is the `split` case, deliberately kept.** The rail here is
+    /// bound and declines, which is the failure the guard in front of the
+    /// redemption cannot remove: a redemption committed, a rail entered, and no
+    /// money moved. It used to be reachable on this build through
+    /// `NotConfigured`; it is now reachable only through a rail that exists,
+    /// which is what a real PSP is. `502` with `state: "redeemed"` is the honest
+    /// answer to it and stays.
     #[tokio::test]
     async fn a_replayed_approval_does_not_pay_twice() {
         let Some(db) = db().await else { return };
@@ -1384,19 +1601,30 @@ mod tests {
 
         let approved = pay(50_000, "Cabinet Dubois");
         let id = file(&gate, &GatePrincipal::employee(tenant, employee), &approved).await;
-        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+        let app = mount_ports(
+            &db,
+            &gate,
+            keys(tenant, "approver", SECRET),
+            ports_with(Rail::Declines),
+        );
         let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
         let body = json!({ "action": approved });
 
         let (status, answer) = call(&app, &uri, SECRET, Some(body.clone())).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer:?}");
-        assert_eq!(answer["payment_error"], json!("not_configured"));
+        assert_eq!(answer["code"], json!("payment_not_performed"));
+        assert_eq!(
+            answer["state"],
+            json!("redeemed"),
+            "the split has to be stated, not flattened: {answer:?}"
+        );
+        assert_eq!(answer["payment_error"], json!("declined"));
 
         // One approach to the money, and the port's own vocabulary in the
         // column an operator reads.
         assert_eq!(
             payment_intents(&db, tenant, employee).await,
-            vec![("failed".to_owned(), Some("not_configured".to_owned()))],
+            vec![("failed".to_owned(), Some("declined".to_owned()))],
             "the write-ahead row says the rail answered, and what it said"
         );
         assert_eq!(

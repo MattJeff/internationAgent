@@ -1043,7 +1043,8 @@ and no chain is touched anywhere in this workspace.**
 That refusal is deliberate and worth preserving. A fake that returns a plausible
 payment id is a fake that will one day be believed; `not_configured` is the
 honest answer and shows up in the audit trail as one. If you are testing a
-payment flow and seeing `not_configured`, the system is working.
+payment flow and seeing `not_configured` — or `no_payment_rail` on an
+approval — the system is working.
 
 `Step::Wallet` provisions a *local* placeholder binding. No external wallet is
 created.
@@ -1055,17 +1056,25 @@ What **is** built is everything around the payment:
 3. above the threshold it files a human approval, hashed to the exact action;
 4. allowing it **reserves** against the day's bucket in the same transaction —
    see §14;
-5. `POST /v1/approvals/{id}/approve` redeems a `payment_create` into a typed
+5. `POST /v1/approvals/{id}/approve` asks the port whether this deployment can
+   pay at all **before** it redeems. On every build here it cannot, so the
+   answer is `501 no_payment_rail`, the approval is left `pending`, and nothing
+   is spent — it is still there to approve the day a rail exists;
+6. with a rail bound, the same route redeems the `payment_create` into a typed
    `effects::PaymentCreate` and calls `Effects::pay`, which writes a
-   `provider_intents` row before the port is entered;
-6. the port refuses, `502 payment_not_performed` with `payment_error:
-   not_configured`, and the reservation is **released** in the same transaction
-   as the audit row.
+   `provider_intents` row before the port is entered and **settles or releases**
+   the reservation on the answer. A rail that is entered and fails is `502
+   payment_not_performed` carrying `state: "redeemed"` — the approval is spent
+   and the money did not move, which is irreducible once a real rail is asked
+   and is why that code stays.
 
-Step 5 is new and is the eighth link of the x402 chain; the reason it was worth
-building against a port that refuses is that it is what settles or releases the
-reservation. Before it, an approved payment held the seat's headroom — and its
-team's — until midnight, for money that had not moved.
+Steps 5 and 6 are the eighth link of the x402 chain. Step 6 was worth building
+against a port that refuses because it is what settles or releases the
+reservation: before it, an approved payment held the seat's headroom — and its
+team's — until midnight, for money that had not moved. Step 5 was added after,
+for the failure the refusing port made routine: the route redeemed *first*, so
+every approved payment on every build burned a human's decision to discover
+something the port already knew.
 
 The remaining steps — *signer signs only the exact approved transaction, rail
 submits, receipt persisted* — are **NOT BUILT**, and the missing piece is a
@@ -1128,9 +1137,10 @@ The seven links that do exist run end to end against a loopback double in
 `crates/app/tests/x402_chain.rs` — a real 402 on the wire, priced, ruled on,
 refused as untrusted, re-proposed by a human, hashed into an approval line and
 reserved. **The eighth link — "a human approved" becoming a call to the payment
-port — is now built**, as one arm in `routes::approvals::approve`, and it is
-still a `not_configured` in the audit trail because there is no rail behind the
-port. It is not a whole-enum translation from jsonb, which is what the argument
+port — is now built**, as one arm in `routes::approvals::approve`. With no rail
+behind the port that arm refuses in front of the redemption — `501
+no_payment_rail`, approval left `pending` — so there is no audit row at all,
+where there used to be a `not_configured` and a burned approval. It is not a whole-enum translation from jsonb, which is what the argument
 against it warned of: one variant, destructured from a body serde already
 parsed, with every other kind unchanged. The full argument, and what is left
 after it, is in one place — `x402.rs`, "The bridge from a human approved to the
