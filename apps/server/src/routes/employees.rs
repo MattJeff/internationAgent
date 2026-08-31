@@ -1,4 +1,4 @@
-//! `/v1/employees`: create, read, list, suspend, terminate.
+//! `/v1/employees`: create, read, list, suspend, resume, terminate.
 //!
 //! # Creation is an acceptance, not a provisioning run
 //!
@@ -97,6 +97,7 @@ pub fn router(db: Db) -> Router {
         .route("/v1/employees", post(create).get(list))
         .route("/v1/employees/{id}", get_route(get))
         .route("/v1/employees/{id}/suspend", post(suspend))
+        .route("/v1/employees/{id}/resume", post(resume))
         .route("/v1/employees/{id}/terminate", post(terminate))
         .with_state(db)
 }
@@ -434,6 +435,56 @@ async fn suspend(
     .await
 }
 
+/// `POST /v1/employees/{id}/resume` — put a suspended employee back to work.
+///
+/// The exact reverse of [`suspend`], and only that: **`suspended → active`**.
+///
+/// # What it refuses, and why the two refusals are not the same refusal
+///
+/// * **`terminated`** — refused by the state machine itself, `illegal_lifecycle`.
+///   [`Lifecycle::Terminated`] is absorbing, and by the time anyone could ask for
+///   this the `employee.terminated` handler has already handed the provider
+///   resources back: there is nothing left to resume onto.
+/// * **`draft`** — refused by *this* route, by name, `draft_is_not_resumable`,
+///   even though `Lifecycle::can_move_to` allows the move. `draft → active`
+///   belongs to the provisioning loop alone: `main::on_step_ready` makes it when
+///   every blocking step is ready, and that readiness *is* what the transition
+///   means. A route that made it on demand would answer 200 with an `active`
+///   employee owning no number, no mailbox and no identity — a seat the Policy
+///   Gate then lets act against resources that do not exist. The guard lives in
+///   [`set_lifecycle`], inside the row's own transaction, so a provisioning tick
+///   cannot be raced past it.
+///
+/// # It restores nothing, and does not need to
+///
+/// [`terminate`] hands the work board back and settles the outstanding
+/// appointments. Resume is not the inverse of that and must not try to be:
+/// **suspension takes nothing away** — that is the whole difference between the
+/// two verbs. The resource rows survive, `work_items.assignee_id` is untouched,
+/// future appointments keep their `rang_at IS NULL`. There is no state to put
+/// back. Everything that stopped was stopped by a `lifecycle = 'active'` filter
+/// or by the gate reading the lifecycle, and every one of those starts again on
+/// its own the moment this row says `active` — including `health`, which is
+/// derived on every read and never stored.
+///
+/// So a seat that came back from a week away does not replay the week: the
+/// initiative engine reads its own clock, not this transition. Nothing here
+/// re-opens a closed item or un-cancels a cancelled hour, and nothing should —
+/// that state belongs to a termination that did not happen.
+async fn resume(
+    State(db): State<Db>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    set_lifecycle(
+        &db,
+        &principal,
+        EmployeeId::from_uuid(id),
+        Lifecycle::Active,
+    )
+    .await
+}
+
 /// `POST /v1/employees/{id}/terminate` — end of life.
 ///
 /// Absorbing: nothing transitions out of `terminated`, so a later suspend is a
@@ -556,6 +607,19 @@ async fn set_lifecycle(
         version,
     } = employee_store::load(&mut tx, id).await?;
     let from = employee.lifecycle();
+    // The one move the domain allows and this API does not — see [`resume`].
+    // The provisioning loop owns `draft -> active` because the readiness it
+    // waits for is what the transition means. Checked here rather than in the
+    // handler so it shares the transaction that reads the row, instead of
+    // needing a second read that a provisioning tick could land between.
+    if from == Lifecycle::Draft && to == Lifecycle::Active {
+        tracing::info!(%id, "refused to activate a draft employee from the API");
+        return Err(ApiError::conflict(
+            "draft_is_not_resumable",
+            "a draft employee becomes active when its provisioning completes; it cannot be \
+             resumed by hand",
+        ));
+    }
     employee.set_lifecycle(to, now).map_err(|err| {
         tracing::info!(%id, %err, "refused an illegal lifecycle transition");
         ApiError::conflict(
@@ -1025,6 +1089,10 @@ mod tests {
         for (method, uri) in [
             ("GET", format!("/v1/employees/{id}")),
             ("POST", format!("/v1/employees/{id}/suspend")),
+            // Resume is the one that would be tempting to answer early: its
+            // first refusal is a 409 about a lifecycle, and a 409 for another
+            // tenant's id confirms the id exists just as loudly as a 403.
+            ("POST", format!("/v1/employees/{id}/resume")),
             ("POST", format!("/v1/employees/{id}/terminate")),
         ] {
             let (status, problem) = h.send(method, &uri, SECRET_B, None, None).await;
@@ -1278,6 +1346,231 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(problem["code"], "illegal_lifecycle");
+
+        h.teardown().await;
+    }
+
+    /// Hire one, then move it to `active` the way `main::on_step_ready` does —
+    /// straight at the row, because that transition has no route on purpose and
+    /// this is the test's way of standing in for the provisioning loop.
+    async fn hired_and_active(h: &Harness, slug: &str) -> String {
+        let (status, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key(slug)),
+                Some(body(slug)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = created["id"].as_str().expect("id").to_owned();
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let StoredEmployee {
+            mut employee,
+            version,
+        } = employee_store::load(&mut tx, EmployeeId::from_uuid(id.parse().expect("uuid")))
+            .await
+            .expect("load");
+        employee
+            .set_lifecycle(Lifecycle::Active, Utc::now())
+            .expect("activate");
+        employee_store::update(&mut tx, &employee, version)
+            .await
+            .expect("update");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    /// The verb that was missing, and the two states it will not accept.
+    ///
+    /// `draft` is the interesting one: the domain's own table allows
+    /// `draft → active`, so nothing below the route would have stopped this and
+    /// the refusal has to be the route's. It is named separately from
+    /// `illegal_lifecycle` because it is a different sentence — not "you cannot
+    /// get there from here" but "you are not the one who makes this move".
+    #[tokio::test]
+    async fn a_suspended_employee_resumes_and_draft_and_terminated_are_refused_by_name() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (_, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key("resume-draft")),
+                Some(body("ines")),
+            )
+            .await;
+        let id = created["id"].as_str().expect("id").to_owned();
+
+        // Draft: the provisioning loop's move, refused by name rather than by
+        // the state machine, which would have allowed it.
+        let (status, problem) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/resume"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(problem["code"], "draft_is_not_resumable");
+        let (_, view) = h
+            .send("GET", &format!("/v1/employees/{id}"), SECRET_A, None, None)
+            .await;
+        assert_eq!(view["lifecycle"], "draft", "the refusal wrote nothing");
+
+        let id = hired_and_active(&h, "noor").await;
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/suspend"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, view) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/resume"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["lifecycle"], "active");
+
+        // Re-asserting `active` is a no-op, the same as a second suspend is.
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/resume"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The mark the bill is derived from: `billing::billed_days` replays
+        // `payload ->> 'to'` off the trail, so a resume that left no row would
+        // read as a seat still suspended for the rest of the month.
+        let employee_id = EmployeeId::from_uuid(id.parse().expect("uuid"));
+        let trail = h.trail(h.a, employee_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(kind, _, payload)| kind == "employee_lifecycle_changed"
+                    && payload["from"] == "suspended"
+                    && payload["to"] == "active"),
+            "the resume left no lifecycle mark: {trail:?}"
+        );
+
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/terminate"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Terminated is absorbing, and that refusal is the state machine's.
+        let (status, problem) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/resume"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(problem["code"], "illegal_lifecycle");
+
+        h.teardown().await;
+    }
+
+    /// Two operators pressing resume at once.
+    ///
+    /// # Why this asserts an invariant and not a pair of status codes
+    ///
+    /// The obvious assertion — one 200 and one 409 — is wrong, and writing it
+    /// first is how this comment exists: it passes or fails on scheduling. The
+    /// two requests have two legal shapes. If both transactions read version *n*
+    /// the second `update` quotes a version the first already bumped, matches no
+    /// row, and is `StoreError::Conflict` → 409. If the second one's `load`
+    /// happens after the first commits, it reads `active` and re-asserting a
+    /// lifecycle is a documented no-op → 200. Nothing chooses between them but
+    /// which future the executor polls first.
+    ///
+    /// What must hold either way is the edge itself: **`suspended → active`
+    /// happens exactly once.** That is the thing `agentos_store::billing` counts
+    /// — it replays these marks to close spans — and it is what a lost update
+    /// would break, by letting two writers both move off version *n* and file
+    /// two departures from `suspended`. Neither request may 5xx, and the seat
+    /// must end up back at work.
+    #[tokio::test]
+    async fn two_concurrent_resumes_produce_one_winner() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let id = hired_and_active(&h, "vera").await;
+        let (status, _) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{id}/suspend"),
+                SECRET_A,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let uri = format!("/v1/employees/{id}/resume");
+        let (first, second) = tokio::join!(
+            h.send("POST", &uri, SECRET_A, None, None),
+            h.send("POST", &uri, SECRET_A, None, None),
+        );
+
+        for (status, body) in [&first, &second] {
+            assert!(
+                *status == StatusCode::OK || *status == StatusCode::CONFLICT,
+                "a concurrent resume answered {status}: {body}"
+            );
+        }
+
+        let (_, view) = h
+            .send("GET", &format!("/v1/employees/{id}"), SECRET_A, None, None)
+            .await;
+        assert_eq!(view["lifecycle"], "active");
+
+        let employee_id = EmployeeId::from_uuid(id.parse().expect("uuid"));
+        let trail = h.trail(h.a, employee_id).await;
+        let departures = trail
+            .iter()
+            .filter(|(kind, _, payload)| {
+                kind == "employee_lifecycle_changed"
+                    && payload["from"] == "suspended"
+                    && payload["to"] == "active"
+            })
+            .count();
+        assert_eq!(
+            departures, 1,
+            "the seat left `suspended` more than once: {trail:?}"
+        );
 
         h.teardown().await;
     }
