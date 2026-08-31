@@ -114,11 +114,14 @@
 //!    ground, which is the approval flow that already exists.
 //! 2. **[`PRICED_ASSETS`] is empty**, so [`demand`] refuses every real
 //!    challenge before the taint wire is even reached. See below.
-//! 3. **`PaymentProvider` is `NotConfigured`.** Even an allowed, human-approved
-//!    payment answers `Terminal { code: "not_configured" }` and says so in the
-//!    audit trail — and since link eight exists, it says so in a `502` to
-//!    whoever pressed the button as well. `crates/app/src/mocks.rs` argues why
-//!    that refusal is worth keeping, and this module does not touch it.
+//! 3. **`PaymentProvider` is `NotConfigured`.** A payment an employee is
+//!    *allowed* to make answers `Terminal { code: "not_configured" }` and says
+//!    so in the audit trail. A **human-approved** one does not get that far:
+//!    `routes::approvals::approve` asks the port before it redeems and answers
+//!    `501 no_payment_rail` with the approval left `pending`, because spending a
+//!    person's decision to learn what the port already knew buys nothing and
+//!    cannot be undone. `crates/app/src/mocks.rs` argues why the refusal itself
+//!    is worth keeping, and this module does not touch it.
 //!
 //! # What blocks this, and the two decisions only the founder can take
 //!
@@ -212,16 +215,20 @@
 //!
 //! ## What it fixed, which was never the money
 //!
-//! `PaymentProvider` is still `NotConfigured` (see `crate::mocks`), so the
-//! answer is still `Terminal { code: "not_configured" }` and no money moves.
-//! What moved is the ledger. A redeemed payment approval reserves;
+//! `PaymentProvider` is still `NotConfigured` (see `crate::mocks`), so no money
+//! moves — and this route no longer redeems to find that out, which is the
+//! second thing it fixed: an approval it cannot spend is refused `501
+//! no_payment_rail` and stays `pending`.
+//!
+//! What moved first was the ledger, and that half is about the deployments that
+//! *do* have a rail. A redeemed payment approval reserves;
 //! `Authorized::reservation` says the executor owes it a `spend::settle` or an
 //! `org::release`, and the only code that pays that debt is
 //! `Effects::book_effect`. Nothing reached it from this route, so **an approved
 //! payment held the day's headroom — the seat's and its team's — until the
 //! bucket rolled over at midnight**, for money that had not moved. That was
 //! named here as *"the first thing a bridge has to fix, not the last"*, and it
-//! is fixed: the reservation is released on the port's refusal, in the same
+//! is fixed: the reservation is released on the rail's refusal, in the same
 //! transaction as the audit row.
 //!
 //! ## What is left, smallest first

@@ -365,7 +365,7 @@ Then, from another shell:
 KEY=0123456789abcdef0123456789abcdef
 
 curl -s localhost:8090/livez                      # -> ok
-curl -s localhost:8090/readyz   # -> {"ready":true,"outbox_lag_secs":0,"mock_adapters":[…]}
+curl -s localhost:8090/readyz   # -> {"ready":true,"outbox_lag_secs":0,"mock_adapters":[…],"payment_rail":false}
 # ...but 503 with `"code":"no_platform_policy"` until §1.5 has been run — the
 # error bodies are problem+json, see §/readyz below.
 curl -s -H "Authorization: Bearer $KEY" localhost:8090/v1/whoami
@@ -517,8 +517,16 @@ adapters: email=resend telephony=MOCK browser=browserbase embedder=openai
 the log rotation:
 
 ```json
-{"ready": true, "outbox_lag_secs": 0, "mock_adapters": ["telephony"]}
+{"ready": true, "outbox_lag_secs": 0, "mock_adapters": ["telephony"],
+ "payment_rail": false}
 ```
+
+`payment_rail` is beside it and is not one of the mocks: those have a credential
+that makes them real, and this one has no adapter in the workspace to configure
+at all. It is `false` on every build today, and it is the same port
+`POST /v1/approvals/{id}/approve` refuses a `payment_create` on — so a replica
+can be asked whether an approval will be spendable *before* someone presses the
+button. Neither field fails the probe.
 
 ### What the boot refusal looks like
 
@@ -792,7 +800,7 @@ killed and restarted into the same slow database, now with a cold pool.
 ### `/readyz`
 
 ```json
-{"ready": true, "outbox_lag_secs": 0, "mock_adapters": []}
+{"ready": true, "outbox_lag_secs": 0, "mock_adapters": [], "payment_rail": false}
 ```
 
 or, and **these bodies are RFC 9457 problem details** — `application/problem+json`,
@@ -1169,12 +1177,22 @@ id and stops — `Authorized<Action>` satisfies no `Effects` bound, so there is
 nothing to hand it to. A payment is redeemed into a typed subject and passed to
 `Effects::pay`.
 
-What you will see today is **`502 payment_not_performed`** with
-`payment_error: "not_configured"`, because this build has no payment rail
-(SPEC §13). That is the system working. The body still carries
-`state: "redeemed"` and the `decision_id`: **the approval is spent either way**,
-so a 502 here is not something to retry. Confirm with
-`GET /v1/approvals/{id}`, which reads `redeemed`.
+What you will see today is **`501 no_payment_rail`** with `state: "pending"`,
+because this build has no payment rail (SPEC §13) and the route asks the port
+before it redeems. That is the system working, and **the approval is not
+spent**: it stays in the queue and the same button works the day an adapter is
+bound. Confirm with `GET /v1/approvals/{id}`, which still reads `pending`.
+`/readyz` reports the same fact ahead of time as `payment_rail: false`, and
+`agentos-server doctor` has a `payments` line saying it in full.
+
+On a deployment that *does* have a rail, the failure to know about is
+**`502 payment_not_performed`** with the provider's own word in
+`payment_error`. That body carries `state: "redeemed"` and the `decision_id`:
+**the approval is spent**, so the 502 is not something to retry — a second
+`POST` is `approval_already_decided`. It means money possibly in flight against
+a decision already consumed. Read the `provider_intents` row (written *before*
+the port is entered) against the rail's own statement, and file a fresh approval
+only once you know the money did not move.
 
 The reason it is routed through the façade at all is the ledger, not the money:
 redeeming a payment approval *reserves* against the day's bucket, and only

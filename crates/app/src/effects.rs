@@ -766,6 +766,29 @@ pub trait PaymentProvider: Send + Sync {
         amount: Money,
         instruction: &PaymentInstruction,
     ) -> Result<ProviderMessageId, ProviderError>;
+
+    /// Is there a rail behind this port at all?
+    ///
+    /// Every adapter that can move money answers `true`, which is why that is
+    /// the default: an implementation is written because there is something to
+    /// call. `false` is [`crate::mocks`]'s refusing stub saying *no deployment
+    /// decision has been taken here yet* — which is a different sentence from
+    /// "the payment failed", and the difference is worth a method because of
+    /// what one caller does before it reaches [`Effects::pay`].
+    ///
+    /// `routes::approvals::approve` **spends a human's approval** to get here:
+    /// the redemption is committed — the row leaves `pending`, the nonce is
+    /// dead — and only then is the port entered. Against a port that cannot
+    /// pay, that trade burns the one thing on this path that a person had to
+    /// produce and buys nothing. So the route asks this first and refuses
+    /// before redeeming, leaving the approval spendable the day a rail exists.
+    ///
+    /// It is deliberately *not* consulted by [`Effects::pay`]: an effect that
+    /// reaches the port and is refused is an audited fact, and a payment
+    /// proposed inside a turn has nothing irreversible to protect.
+    fn configured(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
