@@ -357,10 +357,17 @@ async fn no_part_of_a_flow_is_findable_after_it_completes() {
 
     // --- 4. and drive the refresh step's FAILURE path ------------------------
     //
-    // `connector` is stored as `github` above, which is a real catalogue entry
-    // that takes a pasted bearer — so `refresh_due` selects the row and then
-    // refuses it. That is the branch worth searching: an error path is where a
-    // token gets logged "just this once, for debugging".
+    // `connector` est stocké en `github` plus haut : une vraie entrée du
+    // catalogue, en OAuth depuis le 2026-08-31 — donc `refresh_due` sélectionne
+    // la ligne, puis la refuse faute d'enregistrement client dans ce processus
+    // de test. C'est la branche qui vaut d'être fouillée : un chemin d'erreur
+    // est l'endroit où un jeton se fait journaliser « juste cette fois, pour
+    // déboguer ».
+    //
+    // Ce test se servait de `github` comme d'un connecteur qui n'est PAS OAuth,
+    // et il refusait alors en `connector_is_not_oauth`. Ce n'est plus vrai de
+    // cette entrée ; le refus a changé de mot, pas de nature, et l'intention du
+    // test est intacte — c'est toujours le chemin d'échec d'une entrée réelle.
     //
     // The shipped catalogue, deliberately: this test is about what a *real*
     // entry does on the failure path, so handing it a fixture would be handing
@@ -512,7 +519,7 @@ async fn no_part_of_a_flow_is_findable_after_it_completes() {
         "the refresh failure must actually have been logged:\n{logged}"
     );
     assert!(
-        logged.contains("connector_is_not_oauth"),
+        logged.contains("connector_not_registered"),
         "and with its stable code:\n{logged}"
     );
     assert!(

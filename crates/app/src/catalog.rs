@@ -484,13 +484,43 @@ pub const CATALOG: &[Connector] = &[
     Connector {
         key: "github",
         label: "GitHub",
-        // GitHub's own remote MCP server, Streamable HTTP, and it takes a
-        // personal access token as a bearer — which is why it is the first
-        // entry: it is the one major connector that works today with a string
-        // the customer can paste, with no OAuth dance to build first.
+        // Le serveur MCP distant de GitHub, en Streamable HTTP.
         provision: Provision::Dial("https://api.githubcopilot.com/mcp/"),
         reach: Reach::Public,
-        credential: Credential::Bearer,
+        // OAuth, et non plus un jeton personnel collé. Les quatre littéraux
+        // ci-dessous ne sont pas devinés : ils sortent du document RFC 8414 que
+        // GitHub sert lui-même, relevé le 2026-08-31.
+        //
+        //   POST https://api.githubcopilot.com/mcp/  → 401, www-authenticate:
+        //     resource_metadata=".../.well-known/oauth-protected-resource/mcp/"
+        //   → authorization_servers: ["https://github.com/login/oauth"]
+        //   GET https://github.com/.well-known/oauth-authorization-server/login/oauth
+        //   → authorization_endpoint, token_endpoint,
+        //     code_challenge_methods_supported: ["S256"]
+        //
+        // `Post` parce que c'est ce que GitHub documente : `client_id` et
+        // `client_secret` en champs de formulaire.
+        //
+        // Les trois portées sont un SOUS-ENSEMBLE de `scopes_supported`, choisi
+        // et non recopié : `repo` pour lire et écrire le code, `read:org` pour
+        // voir l'organisation, `read:user` pour savoir au nom de qui on parle.
+        // Ni `delete_repo`, ni `workflow`, ni `write:packages` — un employé qui
+        // ne peut pas supprimer un dépôt est un employé dont le refus n'a pas à
+        // être décidé ailleurs.
+        //
+        // **Une OAuth App GitHub émet un jeton sans expiration et sans jeton de
+        // rafraîchissement**, donc `sealed_refresh_token` reste nul et
+        // `refresh_due` ne le sélectionne jamais : rien à renouveler, rien qui
+        // casse. Une GitHub App donnerait huit heures et un rafraîchissement,
+        // mais ignore `scope` au profit de ses propres permissions — ce qui
+        // rendrait le champ ci-dessous décoratif, et un champ décoratif sur une
+        // limite est pire qu'un champ absent.
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://github.com/login/oauth/authorize",
+            token: "https://github.com/login/oauth/access_token",
+            scopes: "repo read:org read:user",
+            auth: ClientAuth::Post,
+        }),
         // Nothing GitHub's server exposes is observation-only in the sense that
         // matters here: the same token that reads an issue opens one, and the
         // read tools return repository content that becomes `Untrusted` text an
