@@ -878,6 +878,10 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
             Arc::new(on_suspended),
         )
         .on(
+            routes::employees::lifecycle_event(Lifecycle::Active),
+            Arc::new(on_resumed),
+        )
+        .on(
             routes::employees::lifecycle_event(Lifecycle::Terminated),
             Arc::new(move |event, tx| on_terminated(engine.clone(), event, tx)),
         )
@@ -1129,6 +1133,29 @@ fn on_suspended<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handle
         tracing::info!(
             employee_id = %event.aggregate_id,
             "employee suspended; resources deliberately kept so a resume is free"
+        );
+        Ok(())
+    })
+}
+
+/// `employee.active`: recorded, and nothing else.
+///
+/// The mirror of [`on_suspended`], and empty for the same reason it is: a
+/// suspension released nothing, so a resume has nothing to re-acquire. What
+/// stopped, stopped because the gate and a handful of `lifecycle = 'active'`
+/// filters read the column; they read it again on the next tick and the seat is
+/// simply back.
+///
+/// Registered rather than omitted because `handlers` fails an event it has no
+/// entry for, retries it eight times and dead-letters it: leaving this line out
+/// would turn every resume into a permanent error about a side effect that was
+/// never wanted. `routes::employees::resume` is the only producer —
+/// `on_step_ready` moves `draft → active` without an outbox event.
+fn on_resumed<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        tracing::info!(
+            employee_id = %event.aggregate_id,
+            "employee resumed; nothing to restore because suspension released nothing"
         );
         Ok(())
     })
