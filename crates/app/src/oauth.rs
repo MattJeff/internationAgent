@@ -1396,6 +1396,45 @@ mod tests {
     }
 
     // -- the flow ------------------------------------------------------------
+    /// A provider's own query parameters survive the ones `start` appends.
+    ///
+    /// `google-gmail`'s `authorize` is not a bare path: it carries
+    /// `access_type=offline&prompt=consent`, and without the first of them
+    /// Google issues no refresh token at all — a binding that works for one hour
+    /// and then has nothing for `refresh_due` to renew. The whole of that
+    /// depends on `Url::query_pairs_mut` *appending* rather than replacing, which
+    /// is a property of a dependency and therefore exactly the kind of thing to
+    /// assert instead of remember. This drives the real catalogue literal, so it
+    /// also fails if somebody edits the two parameters out of it.
+    #[test]
+    fn a_providers_own_authorize_query_survives_what_start_appends() {
+        let connector = catalog::find("google-gmail").expect("google-gmail is catalogued");
+        let clients =
+            OauthClients::parse("google-gmail:our-client-id:our-client-secret").expect("clients");
+        let started = start(
+            &clients,
+            &credentials(),
+            tenant(),
+            connector,
+            REDIRECT,
+            Utc::now(),
+        )
+        .expect("start");
+
+        assert_eq!(
+            param(&started.authorize_url, "access_type"),
+            "offline",
+            "no refresh token without it, and the binding dies in an hour"
+        );
+        assert_eq!(param(&started.authorize_url, "prompt"), "consent");
+        // And what `start` adds is still all there, on the same URL.
+        assert_eq!(param(&started.authorize_url, "response_type"), "code");
+        assert_eq!(param(&started.authorize_url, "client_id"), "our-client-id");
+        assert_eq!(
+            param(&started.authorize_url, "code_challenge_method"),
+            "S256"
+        );
+    }
 
     /// The whole path, against a provider that checks PKCE itself.
     #[tokio::test]
