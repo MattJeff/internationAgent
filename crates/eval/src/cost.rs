@@ -159,7 +159,23 @@ pub fn ceiling_calls_per_turn() -> f64 {
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "e52428c12582296e";
+///
+/// # Déplacé le 2026-09-01, et voici de combien les chiffres sont périmés
+///
+/// Le briefing du rôle commercial a perdu deux paragraphes : ceux qui
+/// décrivaient les deux constats reposant sur une ligne à nous, devenus
+/// inatteignables quand le client MCP de l'API visa d'Orizn est sorti du
+/// produit — voir la doc de module de `vertical`. Ce texte est du **prompt**,
+/// donc du jeton, donc `digest` a bougé et il devait bouger.
+///
+/// Ce que cela dit des figures ci-dessous : elles ont été échantillonnées
+/// contre un préfixe légèrement plus long. L'écart est un paragraphe sur un
+/// briefing, à la baisse, sur un seul des six sièges — assez pour que le pin
+/// refuse de se taire, pas assez pour invalider un ordre de grandeur affiché à
+/// ±20 %. Elles restent des mesures d'une entreprise qui n'existe plus
+/// exactement, et c'est précisément ce que ce pin sert à rendre impossible à
+/// oublier.
+pub const DIGEST: &str = "b5bcbd7a98ee5502";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
