@@ -724,6 +724,72 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   à accepter que n'importe qui rejoue notre `client_id`. Netlify annonce
 ///   `client_secret_post` en plus de `none` ; c'est toute la différence entre
 ///   les deux, et c'est pour cela qu'il y en a un des deux dans la liste.
+///
+/// # La vague réseaux sociaux du 2026-09-02 — la découpe, et les refus
+///
+/// Seize candidats sondés en direct. **Quatre** deviennent des entrées (`x`,
+/// `ayrshare`, `blotato`, `zernio` — plus bas). **Trois** sont « [`CUSTOM`] est
+/// la réponse » et pas une étape d'attente. **Deux** sont impossibles (Buffer,
+/// SocialBee). **Sept** sont du travail-produit (les six plateformes directes,
+/// plus Hootsuite et Publer). Le détail long — endpoints, licences, mode
+/// d'emploi client — est dans `docs/CATALOGUE.md` ; ici, le fait exact qui
+/// débloque chacun, parce que c'est ce qui évite de re-sonder dans six mois.
+///
+/// * **Les six plateformes directes** — Meta (Pages + Instagram), TikTok,
+///   LinkedIn, YouTube, Pinterest, Threads. Un préambule partagé : **aucune ne
+///   sert de serveur MCP** (négatifs DNS/404/400 mesurés le 2026-09-02), donc
+///   le chemin serait un paquet stdio sous [`Provision::Host`] — et
+///   l'hébergement est éteint (`BRIDGES_PER_TENANT = 0`, `hosted.rs`,
+///   connect → 503). Le fait qui débloque est double : un paquet épinglé À
+///   PRODUIRE, et l'hébergement rallumé. Puis le fait propre à chacune :
+///   * Meta — un client OAuth Graph confidentiel est obtenable, mais l'app
+///     review « Advanced Access » impose son délai avant de publier pour un
+///     tiers.
+///   * TikTok — l'app reste `SELF_ONLY` tant que l'audit n'est pas passé
+///     (citation de la sonde du 2026-09-02) : elle ne poste que pour son
+///     propre compte de test.
+///   * LinkedIn — `w_member_social` est self-serve, mais AUCUNE analytics
+///     membre n'existe, et les analytics d'organisation sont derrière le
+///     Marketing API Program.
+///   * YouTube — `videos.insert` coûte 1600 unités sur un quota de
+///     10 000/jour, soit ≈ 6 uploads (page `determine_quota_cost`,
+///     2026-06-01).
+///   * Pinterest — 401 générique SANS `www-authenticate`, donc pas de
+///     RFC 9728 : le « serveur MCP » annoncé est démasqué. L'API v5 est
+///     verte, mais en trial access.
+///   * Threads — cinq scopes exacts, et une app review.
+///
+/// * **Buffer** — le miroir exact du refus Vercel, resondé le 2026-09-02 sur
+///   `mcp.buffer.com` : `token_endpoint_auth_methods_supported: ["none"]` et
+///   rien d'autre — un client public en PKCE seul — aggravé de
+///   `resource_parameter_supported: true`, l'indicateur RFC 8707 que ce
+///   déploiement n'envoie jamais. Fait qui débloque : un mode confidentiel ou
+///   une clé API.
+///
+/// * **SocialBee** — `mcp.socialbee.io` n'existe pas : zéro enregistrement A
+///   (DNS NOERROR/ANSWER 0, resondé 2026-09-02), et aucune API publique
+///   n'existe. Fait qui débloque : l'existence même d'un serveur.
+///
+/// * **Hootsuite** — des métadonnées RFC 8414 valides (resondées 2026-09-02 :
+///   `client_secret_basic` accepté, endpoints sur `platform.hootsuite.com`),
+///   mais `scopes_supported: ["offline", "analytics:read"]` seuls — un outil
+///   de publication sans portée d'écriture — et aucun chemin d'endpoint MCP ne
+///   répond (`/mcp` et `/` → 404 sur `mcp.hootsuite.com`, resondés). Deux
+///   faits qui débloquent : le chemin documenté, et des outils d'écriture.
+///
+/// * **Publer** — beta Enterprise dont l'URL MCP est générée PAR utilisateur,
+///   donc elle passerait par [`CUSTOM`] de toute façon ; et le paquet npm
+///   `publer-mcp-server@1.1.0` est un tiers non affilié, épinglable seulement
+///   sur une décision assumée que personne n'a prise.
+///
+/// * **Zapier / Postiz / Mixpost Pro** — « CUSTOM est la réponse », même
+///   argument que le démon Docker : une URL par compte (Zapier), ou une
+///   instance auto-hébergée dont le client fournit l'adresse (Postiz AGPL,
+///   13 outils sans DM, backend `/mcp` en Bearer ; Mixpost Pro payant, 31
+///   outils sans DM). Une entrée nommée ferait une affirmation sur un serveur
+///   dont le client fournit l'adresse — exactement ce que le floor `Read` de
+///   [`CUSTOM`] refuse de faire. `docs/CATALOGUE.md` porte le mode d'emploi
+///   pour qu'un client se branche aujourd'hui.
 pub const CATALOG: &[Connector] = &[
     Connector {
         key: "github",
@@ -1048,7 +1114,7 @@ pub const CATALOG: &[Connector] = &[
         // read that does not exist, and `Pushed` could not register a handle
         // anyway (`0069`'s `webhook_endpoints_provider_is_wired`). What answers
         // for a refusal is `suppressions`, here, and `OUTREACH_HELD_HERE` is
-        // where this connector is written down as one of the four it answers
+        // where this connector is written down as one of the six it answers
         // for.
         opt_outs: OptOuts::HeldHere,
     },
@@ -1783,6 +1849,182 @@ pub const CATALOG: &[Connector] = &[
         // either way.
         opt_outs: OptOuts::NoStrangers,
     },
+    Connector {
+        key: "x",
+        label: "X",
+        // Le serveur MCP hébergé de X, en Streamable HTTP — docs.x.com/tools/mcp.md
+        // (relu 2026-09-02) : recherche plein-archive, utilisateurs, signets,
+        // tendances, actualités, et la création + publication d'Articles.
+        // Resondé le 2026-09-02, au moment d'écrire ces littéraux :
+        //
+        //   POST https://api.x.com/mcp → 401, www-authenticate: Bearer
+        //     resource_metadata="https://api.x.com/.well-known/oauth-protected-resource"
+        //   GET  …/oauth-protected-resource → resource: "https://api.x.com/mcp",
+        //     scopes_supported: [tweet.read … offline.access] — la liste
+        //     VERBATIM du champ `scopes` ci-dessous, SANS tweet.write et SANS
+        //     dm.*
+        //   GET  …/oauth-authorization-server → authorization_endpoint,
+        //     token_endpoint, token_endpoint_auth_methods_supported:
+        //     ["none", "client_secret_basic"]
+        //
+        // `client_secret_basic` est annoncé : le mur qui a tué Vercel — client
+        // public seul — passe ici, et `ClientAuth::Basic` est la lecture de ce
+        // document, pas un défaut.
+        //
+        // Deux caveats d'exploitation, mesurés le même jour :
+        //   * Pas d'enregistrement dynamique — `POST /2/oauth2/register` → 404.
+        //     L'app vient du portail développeur, où la redirect URI est
+        //     librement enregistrable : ce n'est PAS le piège Canva (là-bas,
+        //     `/authorize` refusait ensuite toute URI https).
+        //   * `GET /v1/mcp/catalog` omet un connecteur OAuth sans paire dans
+        //     `AGENTOS_OAUTH_CLIENTS` : l'entrée n'apparaît en console qu'après
+        //     cette étape d'exploitation. Un bouton invisible plutôt que cassé.
+        //
+        // Et le coût, parce que chaque appel se paie : X facture à l'usage,
+        // Post: Create $0.015/req
+        // (docs.x.com/x-api/getting-started/pricing.md, relu 2026-09-02).
+        provision: Provision::Dial("https://api.x.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://x.com/i/oauth2/authorize",
+            token: "https://api.x.com/2/oauth2/token",
+            // Copié VERBATIM du `scopes_supported` du document
+            // oauth-protected-resource, re-curlé le 2026-09-02 : la liste que
+            // le serveur de ressource lui-même annonce — et pas celle, plus
+            // large, du serveur d'autorisation, qui ajoute `ads.read`,
+            // `ads.write` et `media.write`, trois portées que rien ici ne
+            // demande. Ce qui manque compte autant que ce qui y est : aucun
+            // `dm.*` — voir `opt_outs`.
+            scopes: "tweet.read users.read follows.read space.read mute.read like.read list.read list.write block.read block.write bookmark.read bookmark.write developer.billing.write developer.write offline.access",
+            auth: ClientAuth::Basic,
+        }),
+        // Le serveur crée et PUBLIE des Articles — publiquement, au nom du
+        // compte. Publier engage l'entreprise, donc le plancher ne peut pas
+        // être `Read`, quelle que soit la liste d'outils : c'est la doctrine,
+        // pas une lecture.
+        floor: RiskClass::Write,
+        // Justifié par un fait MESURÉ, pas par une intention :
+        // `scopes_supported` du document de ressource (re-curlé 2026-09-02) ne
+        // contient aucun `dm.*`, donc ce serveur ne peut pas frapper de jeton
+        // DM — l'envoi privé est hors de portée du seul jeton que cette entrée
+        // sait obtenir. Et un post public ne met pas un message devant une
+        // personne qui n'a rien demandé : les abonnés ont choisi de suivre.
+        //
+        // La liste d'outils réelle exige un bearer d'app X (le 401 ci-dessus),
+        // donc elle n'a pas été énumérée ici : le pin SHA-256 à la déclaration
+        // est la seconde lecture, celle qui fige chaque outil au moment où un
+        // opérateur le classe. Le jour où `dm.*` apparaît dans le document de
+        // ressource, cette valeur est fausse et l'entrée change de registre.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "ayrshare",
+        label: "Ayrshare — multi-network posting",
+        // L'API de publication multi-réseaux, serveur MCP officiel en
+        // Streamable HTTP. Resondé le 2026-09-02 : `initialize` répond 200
+        // SANS credential (`ayrshare-action-mcp 0.1.0`, protocole 2025-06-18),
+        // et `tools/list` aussi — 27 outils énumérés en direct, ce qui fait de
+        // cette entrée une des mieux lues du catalogue.
+        provision: Provision::Dial("https://api.ayrshare.com/mcp"),
+        reach: Reach::Public,
+        // La clé API Ayrshare, collée telle quelle. Le header `Profile-Key`
+        // (multi-profils, plan Business) n'a pas de place dans
+        // `Credential::Bearer` : cette entrée sert le cas mono-profil, et elle
+        // le dit plutôt que de le laisser découvrir en 403.
+        credential: Credential::Bearer,
+        // `create_post` publie sur jusqu'à 13 réseaux au nom du client :
+        // publier engage l'entreprise publiquement, donc jamais `Read`. Pas
+        // `Destructive` non plus — c'est la vérité de la liste, rien n'y
+        // efface un compte. Mais `send_message` — un DM à quelqu'un ne se
+        // reprend pas — ne doit jamais être déclaré sous `Destructive`, et un
+        // outil que personne n'a déclaré l'est déjà.
+        floor: RiskClass::Write,
+        // Les 27 outils, lus en direct le 2026-09-02, contiennent
+        // `send_message` et `get_messages` : des messages privés Facebook,
+        // Instagram, X et WhatsApp, vers un destinataire que l'appelant
+        // fournit. `NoStrangers` serait donc un mensonge.
+        //
+        // Et la seconde lecture est faite — c'est la discipline du const
+        // block, `HeldHere` ne s'écrit que par quelqu'un qui est allé
+        // chercher : l'index complet des docs Ayrshare (218 pages,
+        // www.ayrshare.com/docs, llms.txt relu le 2026-09-02) ne contient ni
+        // « unsubscribe », ni « opt-out », ni « suppression », et les pages
+        // Messages (overview, send-message) décrivent les fenêtres de Meta —
+        // 24 h WhatsApp, Message requests — mais aucun endpoint qui liste les
+        // gens qui ont refusé. Le fournisseur ne tient pas de liste : le seul
+        // registre du refus est `suppressions`, chez nous, et
+        // `OUTREACH_HELD_HERE` nomme cette entrée.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "blotato",
+        label: "Blotato — multi-network posting",
+        // Resondé le 2026-09-02 : 401 avec `WWW-Authenticate: Bearer
+        // realm="mcp" … "Missing API key or OAuth2.1 token"`. La clé API est
+        // offerte au premier rang par le serveur lui-même, et c'est la voie
+        // prise — la voie OAuth (Supabase) passerait le mur du client
+        // confidentiel, mais on ne fait pas une danse de consentement pour
+        // obtenir ce qu'un champ de formulaire donne.
+        provision: Provision::Dial("https://mcp.blotato.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // 35 outils (help.blotato.com/api/mcp/tools.md, relu 2026-09-02).
+        // Publier engage l'entreprise, donc jamais `Read`. Et deux outils ne
+        // doivent jamais être déclarés sous `Destructive` — la ligne est ici
+        // parce que c'est celle qu'un opérateur pressé lira :
+        // `blotato_buy_credits` rend un lien Stripe Checkout, de l'argent, et
+        // `blotato_send_message` met un message privé devant une personne. Un
+        // outil que personne n'a déclaré l'est déjà.
+        floor: RiskClass::Write,
+        // `blotato_send_message` envoie des DM Instagram et Facebook. Les docs
+        // disent « reply to people who already have a conversation with you »,
+        // mais le schéma prend un `recipientId` libre — et une affirmation ne
+        // se pose pas sur de la prose quand le schéma dit autre chose.
+        //
+        // Seconde lecture faite le 2026-09-02 : l'index complet des docs
+        // (help.blotato.com/llms.txt) et le Tools Reference ne contiennent ni
+        // « unsubscribe », ni « opt-out », ni « suppression », ni blocklist.
+        // Pas de liste chez le fournisseur : `suppressions` est le seul
+        // registre, et `OUTREACH_HELD_HERE` nomme cette entrée.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "zernio",
+        label: "Zernio — social publishing and messaging",
+        // Resondé le 2026-09-02 : `tools/list` répond en direct — 52 outils.
+        // La voie OAuth a ses `.well-known` en 404 (authorization-server) et
+        // 308 (protected-resource) à la racine ; la clé API évite ce mur
+        // entièrement, et c'est elle que cette entrée prend.
+        provision: Provision::Dial("https://mcp.zernio.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // 52 outils sondés, MAIS deux d'entre eux — `search_tools` et
+        // `call_tool` — atteignent 496 outils au total, dont DM, WhatsApp, SMS
+        // et Broadcasts. **`call_tool` défait la promesse du pin par-outil** :
+        // le digest SHA-256 fige un schéma qui prend un nom d'outil
+        // arbitraire, donc épingler `call_tool` n'épingle rien de ce qu'il
+        // peut atteindre. Il ne doit jamais être déclaré sous `Destructive`,
+        // et un outil que personne n'a déclaré l'est déjà. Publier engage
+        // l'entreprise : jamais `Read`.
+        floor: RiskClass::Write,
+        // L'issue attendue était `HeldHere` ; la lecture a dit autre chose, et
+        // c'est exactement pour ça qu'elle est due avant d'écrire. Zernio
+        // PUBLIE sa liste : « List SMS opt-outs » — les destinataires qui ont
+        // répondu STOP, export CSV, lecture seule
+        // (docs.zernio.com/sms/list-sms-opt-outs, relu 2026-09-02). C'est une
+        // lecture que `crate::queue::reconcile_opt_outs` peut viser, et
+        // `posthog` est le précédent : écrire `HeldHere` quand une liste
+        // existe cache une liste réconciliable.
+        //
+        // Ce que la liste couvre, dit honnêtement : les STOP SMS. Les canaux
+        // sociaux passent par le consentement tenu par Meta — « Meta only
+        // answers for people who have MESSAGED the account », mêmes docs — et
+        // WhatsApp par sa fenêtre de 24 h : des refus tenus par la plateforme
+        // d'en face, pas une liste à rapatrier.
+        opt_outs: OptOuts::Pulled {
+            from: "GET /v1/sms/opt-outs",
+        },
+    },
     CUSTOM,
 ];
 
@@ -1852,14 +2094,14 @@ pub const CATALOG: &[Connector] = &[
 /// It is `pub` because it is the artifact the obligation actually needs: the
 /// list of connectors this deployment asserts have no unsubscribe list
 /// anywhere, in one place, readable by whoever has to answer for it.
-pub const NO_OUTREACH: [&str; 19] = {
-    let mut out = [""; 19];
+pub const NO_OUTREACH: [&str; 20] = {
+    let mut out = [""; 20];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         vet(&CATALOG[i]);
         if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
             assert!(
-                n < 19,
+                n < 20,
                 "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
                  NO_OUTREACH's length was not updated. That claim is read off the vendor's \
                  own tool list — every tool this server serves, and not one of them can put \
@@ -1874,7 +2116,7 @@ pub const NO_OUTREACH: [&str; 19] = {
         i += 1;
     }
     assert!(
-        n == 19,
+        n == 20,
         "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
          not updated"
     );
@@ -1915,13 +2157,13 @@ pub const NO_OUTREACH: [&str; 19] = {
 /// `pub` for the same reason [`NO_OUTREACH`] is: it is the artifact the
 /// obligation needs. Somebody answering for what this deployment can reach
 /// reads these two arrays and nothing else.
-pub const OUTREACH_HELD_HERE: [&str; 4] = {
-    let mut out = [""; 4];
+pub const OUTREACH_HELD_HERE: [&str; 6] = {
+    let mut out = [""; 6];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         if matches!(CATALOG[i].opt_outs, OptOuts::HeldHere) {
             assert!(
-                n < 4,
+                n < 6,
                 "a connector claiming `OptOuts::HeldHere` was added to CATALOG and \
                  OUTREACH_HELD_HERE's length was not updated. That claim is two readings, \
                  not one: the vendor's own tool list, to see which tool takes the address of \
@@ -1938,7 +2180,7 @@ pub const OUTREACH_HELD_HERE: [&str; 4] = {
         i += 1;
     }
     assert!(
-        n == 4,
+        n == 6,
         "a connector stopped claiming `OptOuts::HeldHere` and OUTREACH_HELD_HERE's length \
          was not updated"
     );

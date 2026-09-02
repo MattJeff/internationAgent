@@ -105,9 +105,9 @@ refuse qu'une entrée tombe entre.
 
 # Ce qui est ajoutable aujourd'hui
 
-Vingt-deux connecteurs sont nommés dans le catalogue. La première vague en avait
-écrit huit, la deuxième en a écrit quatorze, et une seule des entrées qui
-restaient s'est révélée fermée à la mesure.
+Vingt-huit connecteurs sont nommés dans le catalogue. La première vague en
+avait écrit huit, la deuxième quatorze, l'ajout du 2026-09-02 deux, et la vague
+réseaux sociaux du même jour quatre — voir sa section en fin de document.
 
 | Connecteur | Forme | Plancher | État |
 |---|---|---|---|
@@ -139,6 +139,10 @@ restaient s'est révélée fermée à la mesure.
 | **Cloudflare** | `Dial` + `Bearer` | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠⚠ voir plus bas |
 | **Exa** | `Dial` + `Bearer` | `Read` | ✅ **dans le catalogue.** `Authorization: Bearer` **vérifié par la mesure** — voir plus bas |
 | **Serpstat** | `Host` (npm) | `Read` | Reste à faire : épingler la version et capturer sa surface d'outils |
+| **X** | `Dial` + OAuth (`Basic`) | `Write` | ✅ **dans le catalogue** (2026-09-02). Reste l'app du portail développeur + `AGENTOS_OAUTH_CLIENTS` — voir la vague réseaux sociaux |
+| **Ayrshare** | `Dial` + `Bearer` | `Write` | ✅ **dans le catalogue** (2026-09-02), en `HeldHere` — mono-profil seulement |
+| **Blotato** | `Dial` + `Bearer` | `Write` | ✅ **dans le catalogue** (2026-09-02), en `HeldHere` — ⚠ `buy_credits` = argent |
+| **Zernio** | `Dial` + `Bearer` | `Write` | ✅ **dans le catalogue** (2026-09-02), en `Pulled { from: "GET /v1/sms/opt-outs" }` — ⚠ `call_tool` |
 
 ## Ce que la mesure a contredit dans ce document
 
@@ -625,3 +629,143 @@ est un *quatrième* schéma : chemin non devinable qui fait office de credential
 plus égalité en temps constant sur le `secret_key` du corps, après parse. Ce
 n'est plus un mur ; c'est une valeur qui manque, et le code qui l'attend est
 écrit et testé.
+
+
+---
+
+## La vague réseaux sociaux du 2026-09-02
+
+Demande : « publier sur les réseaux sociaux, avec toute l'infrastructure —
+l'automatisation, la récupération des métriques ». Le cadre d'abord, parce
+qu'il décide de tout : **ce n'est pas un sous-système neuf.** Publier est un
+outil MCP appelé via `ActionKind::McpCall`, sous la gate ; l'automatisation est
+l'initiative qui existe déjà (cadence 5 min à 30 jours, budget en tours par
+jour, zéro par défaut) ; les métriques sont un outil de LECTURE sur le même
+connecteur. Donc « toute l'infrastructure » = des entrées de catalogue, la
+politique, l'écran. Pas de 18e `ActionKind`, pas de scheduler, pas de table.
+
+Seize candidats sondés en direct. **Quatre entrées, trois « CUSTOM est la
+réponse », deux impossibles, sept travail-produit.** Chaque littéral du
+catalogue a été resondé le jour de son écriture.
+
+Et un point de doctrine qui a décidé des planchers : un post PUBLIC ne met pas
+un message devant une personne qui n'a rien demandé — les abonnés ont choisi de
+suivre. `OptOuts::NoStrangers` peut donc être honnête pour un outil de
+publication, MAIS seulement après lecture de la liste d'outils réelle : si le
+serveur expose aussi des messages privés, la réponse change. Trois des quatre
+serveurs ci-dessous exposent des DM, et un seul ne le peut pas — par
+construction de ses scopes. Et publier ENGAGE l'entreprise publiquement : le
+plancher ne peut jamais être `Read`.
+
+### Les quatre entrées
+
+* **X** — `https://api.x.com/mcp`, OAuth confidentiel. Le document RFC 8414
+  d'`api.x.com` annonce `token_endpoint_auth_methods_supported:
+  ["none", "client_secret_basic"]` (resondé 2026-09-02) : le mur qui a tué
+  Vercel passe. Les scopes sont copiés VERBATIM du document
+  `oauth-protected-resource` — `tweet.read` … `offline.access`, **sans
+  `tweet.write` et sans `dm.*`** — et cette absence de `dm.*` est le fait
+  mesuré qui rend `NoStrangers` honnête : le serveur ne peut pas frapper de
+  jeton DM. Le serveur crée et publie des Articles, donc plancher `Write`.
+  Deux caveats d'exploitation : pas d'enregistrement dynamique
+  (`POST /2/oauth2/register` → 404 ; l'app vient du portail développeur, la
+  redirect URI y est librement enregistrable — pas le piège Canva), et
+  `GET /v1/mcp/catalog` n'affiche l'entrée qu'une fois la paire posée dans
+  `AGENTOS_OAUTH_CLIENTS`. Coût à l'usage : Post: Create $0.015/req
+  (docs.x.com/x-api/getting-started/pricing.md, 2026-09-02).
+
+* **Ayrshare** — `https://api.ayrshare.com/mcp`, clé API en Bearer. La mieux
+  lue de la vague : `initialize` **et** `tools/list` répondent sans credential
+  (resondé 2026-09-02), 27 outils énumérés en direct — dont `send_message` et
+  `get_messages`, des DM Facebook/Instagram/X/WhatsApp. `NoStrangers` serait
+  donc un mensonge, et la seconde lecture est faite : l'index complet des docs
+  (218 pages, llms.txt) ne contient ni unsubscribe, ni opt-out, ni
+  suppression — le fournisseur ne tient pas de liste, donc `HeldHere`.
+  Mono-profil seulement : le header `Profile-Key` (plan Business) n'a pas de
+  place dans `Credential::Bearer`.
+
+* **Blotato** — `https://mcp.blotato.com/mcp`, clé API en Bearer — la voie que
+  le `WWW-Authenticate` du 401 offre au premier rang (« Missing API key or
+  OAuth2.1 token », resondé 2026-09-02) ; la voie OAuth Supabase passerait le
+  mur mais ne vaut pas la danse. 35 outils
+  (help.blotato.com/api/mcp/tools.md), dont deux à ne jamais déclarer sous
+  `Destructive` : `blotato_buy_credits` (un lien Stripe Checkout — de
+  l'argent) et `blotato_send_message` (DM Instagram/Facebook — les docs disent
+  « reply only », le schéma prend un `recipientId` libre). Lecture opt-out
+  négative sur l'index complet des docs → `HeldHere`.
+
+* **Zernio** — `https://mcp.zernio.com/mcp`, clé API en Bearer (les
+  `.well-known` OAuth sont en 404/308 à la racine — la clé évite le mur
+  entièrement). 52 outils sondés en direct, MAIS `search_tools`/`call_tool`
+  atteignent **496** outils, dont DM, WhatsApp, SMS et Broadcasts —
+  `call_tool` défait la promesse du pin par-outil (le digest fige un schéma
+  qui prend un nom d'outil arbitraire) et ne se déclare jamais sous
+  `Destructive`. **La lecture opt-out a contredit l'issue attendue** : on
+  prévoyait `HeldHere`, et Zernio publie sa liste — « List SMS opt-outs »,
+  `GET /v1/sms/opt-outs`, lecture seule, export CSV
+  (docs.zernio.com/sms/list-sms-opt-outs, 2026-09-02). Donc
+  `Pulled { from: "GET /v1/sms/opt-outs" }`, le précédent PostHog appliqué :
+  `HeldHere` quand une liste existe cache une liste réconciliable. La liste
+  couvre les STOP SMS ; les canaux sociaux sont tenus par le consentement de
+  Meta (« Meta only answers for people who have MESSAGED the account »).
+
+### « CUSTOM est la réponse » — et le mode d'emploi pour aujourd'hui
+
+Trois candidats ne peuvent pas porter d'entrée nommée, pour l'argument du démon
+Docker : une entrée est une affirmation sur une adresse, et ces serveurs n'ont
+pas d'adresse que CE binaire peut nommer. Une entrée « Postiz » qui pointe vers
+l'instance du client affirmerait sur un serveur qu'on n'a jamais vu — exactement
+ce que le floor `Read` de `CUSTOM` refuse de faire.
+
+* **Zapier MCP** — l'URL est générée par compte (`mcp.zapier.com/api/mcp/…`),
+  avec le secret dans l'URL. Le client la colle dans `CUSTOM` tel quel.
+* **Postiz** — auto-hébergé, AGPL-3.0. Le backend sert `/mcp` en Bearer
+  (la clé API du compte) ; 13 outils, publication et planification, **sans
+  DM**. Le client branche `https://<son-instance>/mcp` dans `CUSTOM`.
+* **Mixpost Pro** — auto-hébergé, licence payante. 31 outils, **sans DM**,
+  MCP en Bearer sur l'instance du client. Même chemin `CUSTOM`.
+
+### Impossibles
+
+* **Buffer** — le miroir exact de Vercel, resondé 2026-09-02 :
+  `token_endpoint_auth_methods_supported: ["none"]` seul (mur n°3), aggravé de
+  `resource_parameter_supported: true` (mur n°4). Fait qui débloque : un mode
+  confidentiel ou une clé API.
+* **SocialBee** — `mcp.socialbee.io` : zéro enregistrement A (DNS NOERROR/ANSWER 0, resondé
+  2026-09-02), aucune API publique. Fait qui
+  débloque : l'existence même d'un serveur.
+
+### Travail-produit
+
+* **Les six plateformes directes** (Meta Pages + Instagram, TikTok, LinkedIn,
+  YouTube, Pinterest, Threads) — préambule partagé : aucune ne sert de MCP
+  (négatifs DNS/404/400, 2026-09-02), et l'hébergement stdio est éteint
+  (`BRIDGES_PER_TENANT = 0`, connect → 503). Le fait qui débloque est double :
+  un paquet stdio épinglé à produire, et l'hébergement rallumé. Par
+  plateforme : Meta = OAuth Graph confidentiel vert, mais app review
+  « Advanced Access » (délai) ; TikTok = `SELF_ONLY` tant que l'audit n'est
+  pas passé ; LinkedIn = `w_member_social` self-serve mais aucune analytics
+  membre, analytics d'orga derrière le Marketing API Program ; YouTube =
+  `videos.insert` 1600 unités / quota 10 000 jour ≈ 6 uploads
+  (`determine_quota_cost`, 2026-06-01) ; Pinterest = 401 générique sans
+  `www-authenticate` ≠ RFC 9728 (démasqué), API v5 verte, trial access ;
+  Threads = cinq scopes exacts, app review.
+* **Hootsuite** — métadonnées RFC 8414 valides, mais scopes
+  `[offline, analytics:read]` seuls et aucun chemin d'endpoint ne répond
+  (tous 404, resondés 2026-09-02). Deux faits qui débloquent : le chemin
+  documenté, et des outils d'écriture.
+* **Publer** — beta Enterprise, URL générée par utilisateur (→ passerait par
+  `CUSTOM`), et le paquet npm `publer-mcp-server@1.1.0` est un tiers non
+  affilié, épinglable seulement sur décision assumée.
+
+### Planification récurrente et métriques : zéro code, et c'est prouvé
+
+La sonde runtime du 2026-09-02 a cherché le trou et n'en a pas trouvé. La
+cadence est la carte Planning d'un employé
+(`PUT /v1/employees/{id}/initiative`, 300 s à 30 jours, budget en tours par
+jour à zéro par défaut, dérive 0→+2 h 24 par jour sans ancre) ; une heure
+précise est une promesse d'heure via l'Agenda ; et le résultat d'un outil de
+lecture de métriques entre par le chemin qui existe déjà — `work_items`, le
+`BOARD_BRIEF` et le journal (`loops/initiative.rs:30` et `:1261`). Un ingest
+métriques→knowledge serait une seconde porte pour des données qui en ont déjà
+une. Pas de scheduler, pas de migration, pas de table.
