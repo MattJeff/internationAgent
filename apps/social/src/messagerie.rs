@@ -18,14 +18,12 @@
 //! l'enveloppe en Untrusted (meme discipline que les lectures GitHub du
 //! catalogue). Le service ne « nettoie » rien : il marque.
 
-use agentos_domain::ids::TenantId;
 use agentos_providers::Secret;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::adapters::{ErreurMessagerie, ErreurPlateforme, linkedin};
 use crate::mcp::{Erreur, Etat, arg_str, arg_uuid, avec_rejeu_401, erreur_rpc, reponse};
-use crate::oauth_flux;
 use crate::store;
 
 // ---------------------------------------------------------------------------
@@ -315,32 +313,16 @@ fn erreur_outil(e: ErreurMessagerie) -> Erreur {
     }
 }
 
-/// Ouvre le jeton scelle d'un compte — la meme paire d'erreurs nommees que le
-/// chemin de publication de l'editeur.
-fn jeton_du_compte(
+/// Ouvre le jeton du compte en deleguant a `mcp::jeton_frais` — l'UNIQUE
+/// ouverture de jeton des deux surfaces : memes erreurs nommees, et le
+/// rafraichissement proactif d'Instagram (son jeton long doit se rafraichir
+/// AVANT d'expirer) sert la messagerie sans une ligne de plus ici.
+async fn jeton_du_compte(
     etat: &Etat,
     tenant: Uuid,
     compte: &store::CompteScelle,
 ) -> Result<Secret, Erreur> {
-    let octets = compte.sealed_token.as_ref().ok_or_else(|| {
-        Erreur::nouvelle(
-            "compte_sans_jeton",
-            "ce compte n'a pas de jeton scelle — reconnecter via account_connect_url",
-        )
-    })?;
-    oauth_flux::ouvrir_jeton(
-        &etat.chiffreur,
-        TenantId::from_uuid(tenant),
-        &compte.platform,
-        &compte.handle,
-        octets,
-    )
-    .map_err(|_| {
-        Erreur::nouvelle(
-            "descellement",
-            "le jeton de ce compte ne s'ouvre pas — reconnecter",
-        )
-    })
+    crate::mcp::jeton_frais(etat, tenant, compte).await
 }
 
 /// L'identifiant plateforme du compte — celui que les chemins
@@ -418,7 +400,7 @@ async fn appeler_outil(
     // En Arc parce que la fonction de rejeu partagee prend une propriete
     // partagee (Secret n'est pas Clone, a dessein). Un seul bras s'execute :
     // chacun peut le deplacer.
-    let jeton = std::sync::Arc::new(jeton_du_compte(etat, tenant, &compte)?);
+    let jeton = std::sync::Arc::new(jeton_du_compte(etat, tenant, &compte).await?);
     // Une reference nue (Copy) : les fermetures `async move` la copient au
     // lieu de deplacer la String hors de `compte`, encore emprunte a cote.
     let handle: &str = &compte.handle;
@@ -567,19 +549,23 @@ mod tests {
     };
     use crate::mcp;
     use crate::medias;
+    use crate::oauth_flux;
+    use agentos_domain::ids::TenantId;
     use agentos_providers::secrets::LocalEnvelopeSecretStore;
 
     // -- L'invariant numero zero : la table de l'editeur, intacte. ----------
 
-    /// Ce lot ne touche pas la table de l'editeur : son empreinte v2 (celle
-    /// posee par le chantier medias) reste la DERNIERE. Si ce test rougit,
-    /// quelqu'un a change /mcp depuis /mcp/messagerie — interdit.
+    /// Cette surface ne touche pas la table de l'editeur : son empreinte v3
+    /// (celle posee par le chantier IG/TikTok/YouTube — enum platform a cinq,
+    /// privacy, publish_at) reste la DERNIERE. Si ce test rougit, quelqu'un a
+    /// change /mcp sans passer par le paragraphe de bump — interdit : c'est
+    /// exactement le travail de ce test de forcer ce paragraphe a etre ecrit.
     #[test]
-    fn la_table_de_l_editeur_reste_celle_du_chantier_medias() {
-        assert_eq!(mcp::VERSION_TABLE, "2");
+    fn la_table_de_l_editeur_reste_celle_du_chantier_ig_tiktok_youtube() {
+        assert_eq!(mcp::VERSION_TABLE, "3");
         assert_eq!(
             empreinte(&mcp::description_outils().to_string()),
-            "5e0d09aa3063c5a058935a2afe2d9230a9965b015e32c5071ca7140216d78870"
+            "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78"
         );
     }
 
@@ -723,7 +709,10 @@ mod tests {
                 user_id, ID_X_DE_TEST,
                 "post_like a recu autre chose que l'id plateforme"
             );
-            Ok(ActionFaite { cout_usd: 0.015 })
+            Ok(ActionFaite {
+                cout_usd: 0.015,
+                cout_quota: None,
+            })
         }
         async fn post_unlike(
             &self,
@@ -829,7 +818,7 @@ mod tests {
             .unwrap();
             comptes.push(
                 crate::store::connecter_compte(
-                    &pool, tenant, plateforme, handle, id, &scelle, None,
+                    &pool, tenant, plateforme, handle, id, &scelle, None, None,
                 )
                 .await
                 .unwrap(),
@@ -847,6 +836,10 @@ mod tests {
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
+            oauth_meta: None,
+            oauth_tiktok: None,
+            oauth_google: None,
+            depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: vec![Box::new(FauxMessagerie {
                 reponses: compteurs.reponses.clone(),
                 ouvertures: compteurs.ouvertures.clone(),
@@ -986,6 +979,7 @@ mod tests {
             "agent_sans_id",
             None,
             &scelle,
+            None,
             None,
         )
         .await

@@ -6,7 +6,10 @@
 //! d'outils versionnee.
 //!
 //! Deux modes :
-//!   agentos-social                      — sert POST /mcp, GET /livez, GET /oauth/callback
+//!   agentos-social                      — sert POST /mcp, POST /mcp/messagerie,
+//!                                         GET /livez, GET /oauth/callback,
+//!                                         GET /medias/{digest} (octets vettes,
+//!                                         pour les plateformes a modele pull)
 //!   agentos-social mint-tenant <label>  — frappe un jeton de tenant (affiche UNE fois)
 //!
 //! Environnement : SOCIAL_DATABASE_URL (base SEPAREE du runtime),
@@ -70,6 +73,18 @@ async fn main() -> anyhow::Result<()> {
         "SOCIAL_MASTER_KEY est obligatoire — sans elle aucun jeton de plateforme ne se scelle",
     )?;
     let bind = std::env::var("SOCIAL_BIND").unwrap_or_else(|_| "127.0.0.1:8791".into());
+    let url_publique =
+        std::env::var("SOCIAL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+    // Le depot des octets vettes : le MEME Arc va aux adaptateurs (qui
+    // deposent au debut de `publier`) et a l'Etat (dont la route publique
+    // GET /medias/{digest} sert) — c'est la couture des modeles « pull »
+    // (images Instagram, photos TikTok : la plateforme tire NOS octets
+    // vettes, jamais l'URL du client).
+    let depot = Arc::new(medias::DepotMedias::new());
+    let ctx = adapters::ContexteAdaptateurs {
+        base_publique: url_publique.clone(),
+        depot: depot.clone(),
+    };
     let etat = Arc::new(mcp::Etat {
         pool,
         // Meme derivation que crates/app/src/identity.rs::envelope : SHA-256
@@ -78,13 +93,12 @@ async fn main() -> anyhow::Result<()> {
         chiffreur: Arc::new(agentos_providers::secrets::LocalEnvelopeSecretStore::new(
             Sha256::digest(clef.as_bytes()).into(),
         )),
-        adaptateurs: adapters::adaptateurs(),
+        adaptateurs: adapters::adaptateurs(&ctx),
         // Le vrai téléchargeur : https seul, IP publiques seules, plafond
         // 512 MiB — la boucle locale n'est ouvrable QUE par le constructeur
         // de test, jamais d'ici ni d'une variable d'environnement.
         telechargeur: medias::Telechargeur::new(),
-        url_publique: std::env::var("SOCIAL_PUBLIC_URL")
-            .unwrap_or_else(|_| format!("http://{bind}")),
+        url_publique,
         // Les credentials client OAuth, enregistres par le fondateur sur
         // chaque portail dev. Optionnels : sans eux le service sert (preview,
         // idempotence, historique) et account_connect_url explique ce qui
@@ -94,9 +108,18 @@ async fn main() -> anyhow::Result<()> {
             "SOCIAL_LINKEDIN_CLIENT_ID",
             "SOCIAL_LINKEDIN_CLIENT_SECRET",
         ),
-        // La seconde surface : X seul — LinkedIn n'implemente pas le trait,
-        // l'absence EST le refus, cite par linkedin::refus_messagerie.
-        adaptateurs_messagerie: adapters::adaptateurs_messagerie(),
+        // META et pas INSTAGRAM, GOOGLE et pas YOUTUBE : les apps clientes
+        // vivent sur developers.facebook.com et console.cloud.google.com —
+        // nommer la variable d'apres la plateforme servie enverrait le
+        // fondateur chercher un portail qui n'existe pas. La valeur TikTok
+        // est le `client_key` du portail developers.tiktok.com.
+        oauth_meta: credentiels_env("SOCIAL_META_CLIENT_ID", "SOCIAL_META_CLIENT_SECRET"),
+        oauth_tiktok: credentiels_env("SOCIAL_TIKTOK_CLIENT_ID", "SOCIAL_TIKTOK_CLIENT_SECRET"),
+        oauth_google: credentiels_env("SOCIAL_GOOGLE_CLIENT_ID", "SOCIAL_GOOGLE_CLIENT_SECRET"),
+        depot,
+        // La seconde surface — l'absence d'un adaptateur EST le refus, cite
+        // (LinkedIn : linkedin::refus_messagerie).
+        adaptateurs_messagerie: adapters::adaptateurs_messagerie(&ctx),
     });
 
     let ecoute = tokio::net::TcpListener::bind(&bind).await.context(bind)?;
@@ -127,7 +150,53 @@ fn routeur(etat: Arc<mcp::Etat>) -> Router {
         .route("/mcp/messagerie", post(poste_mcp_messagerie))
         .route("/livez", get(|| async { "ok" }))
         .route("/oauth/callback", get(retour_oauth))
+        .route("/medias/{digest}", get(servir_media))
         .with_state(etat)
+}
+
+/// GET /medias/{digest} — la route publique des modeles « pull ».
+///
+/// Publique SANS auth, et inoffensive par construction : elle ne sert que des
+/// octets deja vettes et EN COURS de publication publique, adresses par leur
+/// SHA-256 (2^256 n'est pas un espace qui s'enumere), entre le depot fait par
+/// l'adaptateur et le `retirer` post-confirmation (ou le TTL d'une heure).
+/// Un digest difforme est un 404 sans meme prendre le verrou du depot.
+async fn servir_media(
+    State(etat): State<Arc<mcp::Etat>>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+) -> Response {
+    let bien_forme = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|o| o.is_ascii_hexdigit() && !o.is_ascii_uppercase());
+    if !bien_forme {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match etat.depot.servir(&digest) {
+        // Content-Type = le type detecte AUX OCTETS par le telechargeur ;
+        // no-store : la fenetre de vie est le TTL du depot, pas celle d'un
+        // cache intermediaire qui servirait un media apres son retrait.
+        Some((octets, mime)) => (
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            axum::body::Bytes::from_owner(ArcOctets(octets)),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `Bytes::from_owner` veut un proprietaire `AsRef<[u8]>` : ce chapeau donne
+/// cette vue a l'`Arc<Vec<u8>>` du depot — zero copie, meme pour une photo
+/// TikTok de 20 MB que la plateforme tire plusieurs fois.
+struct ArcOctets(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for ArcOctets {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Les deux surfaces MCP du binaire — le transport et l'authentification sont
@@ -283,6 +352,9 @@ async fn retour_oauth(
         Some(&id_plateforme),
         &scelle,
         refresh_scelle.as_deref(),
+        // L'heure de mort annoncee du jeton : c'est elle que le
+        // rafraichissement PROACTIF d'Instagram (mcp::jeton_frais) lit.
+        Some(jeton.duree_s as i64),
     )
     .await
     .is_err()
@@ -314,6 +386,10 @@ mod tests {
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
+            oauth_meta: None,
+            oauth_tiktok: None,
+            oauth_google: None,
+            depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: Vec::new(),
         }))
     }
@@ -398,5 +474,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rep.status(), StatusCode::OK);
+    }
+
+    /// La route publique des octets vettes : les octets EXACTS du digest tant
+    /// que l'entree vit, 404 pour tout le reste — digest inconnu, digest
+    /// difforme (pas 64 hex minuscules), et apres `retirer`.
+    #[tokio::test]
+    async fn la_route_medias_sert_le_digest_vivant_et_404_tout_le_reste() {
+        let Some(etat) = etat_nu().await else { return };
+        let octets = medias::octets_png(b"octets pour instagram");
+        let digest = medias::hex_sha256(&octets);
+        etat.depot.deposer(
+            &digest,
+            Arc::new(octets.clone()),
+            crate::adapters::TypeMedia::Png,
+        );
+
+        let get = |chemin: String| {
+            let routeur = routeur(etat.clone());
+            async move {
+                routeur
+                    .oneshot(Request::get(&chemin).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // L'entree vivante : les octets exacts, le type detecte AUX octets,
+        // no-store — et sans aucune authentification, c'est le contrat.
+        let rep = get(format!("/medias/{digest}")).await;
+        assert_eq!(rep.status(), StatusCode::OK);
+        assert_eq!(rep.headers()["content-type"], "image/png");
+        assert_eq!(rep.headers()["cache-control"], "no-store");
+        let corps = axum::body::to_bytes(rep.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(corps.as_ref(), octets.as_slice());
+
+        // Digest inconnu et digest difformes : 404, sans distinction.
+        for mauvais in [
+            "0".repeat(64),                 // inconnu
+            "0".repeat(63),                 // trop court
+            digest.to_uppercase(),          // hex majuscule
+            format!("{}zz", &digest[..62]), // pas hex
+        ] {
+            let rep = get(format!("/medias/{mauvais}")).await;
+            assert_eq!(rep.status(), StatusCode::NOT_FOUND, "{mauvais}");
+        }
+
+        // Apres retirer (la confirmation du conteneur plateforme) : plus rien.
+        etat.depot.retirer(&digest);
+        let rep = get(format!("/medias/{digest}")).await;
+        assert_eq!(rep.status(), StatusCode::NOT_FOUND);
     }
 }

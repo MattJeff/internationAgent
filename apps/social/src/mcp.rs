@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::adapters::{ErreurPlateforme, MediaPret, Plateforme, Sondage};
+use crate::adapters::{ErreurPlateforme, MediaPret, OptionsPost, Plateforme, Privacy, Sondage};
 use crate::medias;
 use crate::oauth_flux::{self, PlateformeOauth};
 use crate::store::{self, Reclamation};
@@ -46,6 +46,19 @@ pub struct Etat {
     pub url_publique: String,
     pub oauth_x: Option<CredentielsClient>,
     pub oauth_linkedin: Option<CredentielsClient>,
+    /// Le client Meta du chemin « Instagram API with Instagram Login » —
+    /// nommé meta parce que l'app vit sur developers.facebook.com, même si la
+    /// plateforme servie s'appelle `instagram` dans les tables.
+    pub oauth_meta: Option<CredentielsClient>,
+    pub oauth_tiktok: Option<CredentielsClient>,
+    /// Le client Google (console.cloud.google.com) — la plateforme des tables
+    /// s'appelle `youtube`.
+    pub oauth_google: Option<CredentielsClient>,
+    /// Le dépôt des octets vettés pour les plateformes à modèle « pull »
+    /// (images Instagram, photos TikTok). Servi par GET /medias/{digest}
+    /// (main.rs) et alimenté par les adaptateurs via ContexteAdaptateurs —
+    /// le MÊME Arc des deux côtés, c'est toute la couture.
+    pub depot: Arc<medias::DepotMedias>,
     /// Les adaptateurs de la SECONDE surface (/mcp/messagerie). Une liste
     /// separee de `adaptateurs` : les deux tables d'outils sont disjointes
     /// par construction, leurs adaptateurs aussi. Les tests y glissent leur
@@ -72,6 +85,9 @@ impl Etat {
         match plateforme {
             "x" => Some(PlateformeOauth::X).zip(self.oauth_x.as_ref()),
             "linkedin" => Some(PlateformeOauth::Linkedin).zip(self.oauth_linkedin.as_ref()),
+            "instagram" => Some(PlateformeOauth::Instagram).zip(self.oauth_meta.as_ref()),
+            "tiktok" => Some(PlateformeOauth::Tiktok).zip(self.oauth_tiktok.as_ref()),
+            "youtube" => Some(PlateformeOauth::Youtube).zip(self.oauth_google.as_ref()),
             _ => None,
         }
     }
@@ -85,7 +101,13 @@ impl Etat {
 /// `description_outils` bumpe cette constante ET ajoute une ligne a
 /// `EMPREINTES` dans les tests — sinon `la_table_ne_change_pas_sans_bumper`
 /// echoue, et c'est son travail.
-pub const VERSION_TABLE: &str = "2";
+/// v3 (chantier IG/TikTok/YouTube) : l'enum platform passe à cinq, et
+/// post_preview/post_publish gagnent deux champs optionnels — `privacy`
+/// (REQUIS par TikTok : `privacy_level` est obligatoire au Direct Post, et
+/// servi par YouTube : `status.privacyStatus` ; verdict refus ailleurs) et
+/// `publish_at` (ISO 8601, YouTube seul : `status.publishAt` ; verdict refus
+/// ailleurs) — relevés 2026-09-02.
+pub const VERSION_TABLE: &str = "3";
 
 /// Les six outils, et pas un de plus. C'est la piece que le pin SHA-256 du
 /// runtime fige, donc elle est une valeur deterministe, pas du code.
@@ -101,7 +123,7 @@ pub fn description_outils() -> Value {
             "description": "L'URL d'autorisation OAuth a ouvrir pour connecter un compte. Le retour se fait sur GET /oauth/callback.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "platform": { "type": "string", "enum": ["x", "linkedin"] } },
+                "properties": { "platform": { "type": "string", "enum": ["x", "linkedin", "instagram", "tiktok", "youtube"] } },
                 "required": ["platform"],
                 "additionalProperties": false
             }
@@ -144,7 +166,13 @@ pub fn description_outils() -> Value {
                         "required": ["options", "duration_minutes"],
                         "additionalProperties": false
                     },
-                    "made_with_ai": { "type": "boolean" }
+                    "made_with_ai": { "type": "boolean" },
+                    // privacy : requis par TikTok (privacy_level), servi par
+                    // YouTube (privacyStatus) ; publish_at : YouTube seul
+                    // (status.publishAt, ISO 8601). Ailleurs : verdict refus
+                    // de l'adaptateur, jamais une ignorance silencieuse.
+                    "privacy":    { "type": "string", "enum": ["public", "friends", "followers", "private", "unlisted"] },
+                    "publish_at": { "type": "string" }
                 },
                 "required": ["account_id", "text"],
                 "additionalProperties": false
@@ -183,6 +211,8 @@ pub fn description_outils() -> Value {
                         "additionalProperties": false
                     },
                     "made_with_ai": { "type": "boolean" },
+                    "privacy":    { "type": "string", "enum": ["public", "friends", "followers", "private", "unlisted"] },
+                    "publish_at": { "type": "string" },
                     "expected_media_digests": {
                         "type": "array",
                         "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
@@ -324,6 +354,10 @@ struct Contenu {
     medias: Vec<MediaDemande>,
     sondage: Option<Sondage>,
     made_with_ai: bool,
+    /// `privacy` + `publish_at` (table v3) — voyagent vers l'adaptateur par
+    /// le paramètre `options` d'`apercu`/`publier` et entrent dans l'empreinte
+    /// globale : un `privacy` différent est un contreseing différent.
+    options: OptionsPost,
 }
 
 fn champ_texte(
@@ -433,10 +467,47 @@ fn parser_contenu(args: &Value) -> Result<Contenu, Erreur> {
             .ok_or_else(|| invalide("`made_with_ai` doit etre un booleen"))?,
     };
 
+    // Le miroir C1 des deux champs v3 : l'enum de `privacy` est celle du
+    // schema publie, mot pour mot ; `publish_at` n'est verifie qu'en type —
+    // le format ISO 8601 est le verdict de l'adaptateur YouTube, qui cite
+    // `status.publishAt` (les autres refusent le champ entier de toute facon).
+    let privacy = match args.get("privacy") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| invalide("`privacy` doit etre une chaine"))?;
+            Some(match s {
+                "public" => Privacy::Public,
+                "friends" => Privacy::Friends,
+                "followers" => Privacy::Followers,
+                "private" => Privacy::Private,
+                "unlisted" => Privacy::Unlisted,
+                autre => {
+                    return Err(invalide(format!(
+                        "`privacy` vaut public|friends|followers|private|unlisted, pas `{autre}`"
+                    )));
+                }
+            })
+        }
+    };
+    let publish_at = match args.get("publish_at") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| invalide("`publish_at` doit etre une chaine (ISO 8601)"))?
+                .to_owned(),
+        ),
+    };
+
     Ok(Contenu {
         medias,
         sondage,
         made_with_ai,
+        options: OptionsPost {
+            privacy,
+            publish_at,
+        },
     })
 }
 
@@ -533,14 +604,19 @@ async fn connecter(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
         ));
     }
     // Refuser AVANT d'envoyer un humain consentir : sans client_id/secret,
-    // l'echange du retour echouerait de toute facon.
+    // l'echange du retour echouerait de toute facon. Les VRAIS noms de
+    // variables — la derivation SOCIAL_{PLATFORM}_* mentirait pour instagram
+    // (l'app client vit chez Meta) et youtube (chez Google).
+    let prefixe = match plateforme {
+        "instagram" => "SOCIAL_META".to_owned(),
+        "youtube" => "SOCIAL_GOOGLE".to_owned(),
+        autre => format!("SOCIAL_{}", autre.to_uppercase()),
+    };
     let Some((pf, credentiels)) = etat.oauth(plateforme) else {
         return Err(Erreur::nouvelle(
             "oauth_non_configure",
             format!(
-                "pas de credentials client pour `{plateforme}` — poser SOCIAL_{}_CLIENT_ID et SOCIAL_{}_CLIENT_SECRET",
-                plateforme.to_uppercase(),
-                plateforme.to_uppercase()
+                "pas de credentials client pour `{plateforme}` — poser {prefixe}_CLIENT_ID et {prefixe}_CLIENT_SECRET"
             ),
         ));
     };
@@ -596,6 +672,7 @@ async fn previsualiser(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value,
         &medias_prets,
         contenu.sondage.as_ref(),
         contenu.made_with_ai,
+        &contenu.options,
     );
     Ok(serde_json::to_value(apercu).expect("Apercu se serialise"))
 }
@@ -654,6 +731,7 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
         &medias_prets,
         contenu.sondage.as_ref(),
         contenu.made_with_ai,
+        &contenu.options,
     );
     if !apercu.platform_limits_ok || apercu.media.iter().any(|m| !m.limits_ok) {
         // Les mots exacts de l'adaptateur : les verdicts globaux (sondage,
@@ -725,35 +803,15 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
         }
     };
 
-    // La cle est a nous : ouvrir le jeton, publier, marquer. Toute sortie en
-    // erreur marque 'failed' pour qu'un rejeu puisse re-reclamer. Le jeton
-    // reste un `Secret` jusqu'au bearer_auth de l'adaptateur — pas de String
-    // intermediaire qui trainerait dans un Debug.
-    let jeton = match &compte.sealed_token {
-        None => {
+    // La cle est a nous : ouvrir un jeton FRAIS, publier, marquer. Toute
+    // sortie en erreur marque 'failed' pour qu'un rejeu puisse re-reclamer.
+    // Le jeton reste un `Secret` jusqu'au bearer_auth de l'adaptateur — pas
+    // de String intermediaire qui trainerait dans un Debug.
+    let jeton = match jeton_frais(etat, tenant, &compte).await {
+        Ok(secret) => secret,
+        Err(e) => {
             store::marquer_echec(&etat.pool, id).await?;
-            return Err(Erreur::nouvelle(
-                "compte_sans_jeton",
-                "ce compte n'a pas de jeton scelle — reconnecter via account_connect_url",
-            ));
-        }
-        Some(octets) => {
-            match oauth_flux::ouvrir_jeton(
-                &etat.chiffreur,
-                TenantId::from_uuid(tenant),
-                &compte.platform,
-                &compte.handle,
-                octets,
-            ) {
-                Ok(secret) => secret,
-                Err(_) => {
-                    store::marquer_echec(&etat.pool, id).await?;
-                    return Err(Erreur::nouvelle(
-                        "descellement",
-                        "le jeton de ce compte ne s'ouvre pas — reconnecter",
-                    ));
-                }
-            }
+            return Err(e);
         }
     };
 
@@ -770,9 +828,10 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
     let medias: &[MediaPret] = &medias_prets;
     let sondage = contenu.sondage.as_ref();
     let made_with_ai = contenu.made_with_ai;
+    let options = &contenu.options;
     let resultat = avec_rejeu_401(etat, tenant, &compte, Arc::new(jeton), |j| async move {
         adaptateur
-            .publier(&j, handle, texte, medias, sondage, made_with_ai)
+            .publier(&j, handle, texte, medias, sondage, made_with_ai, options)
             .await
     })
     .await;
@@ -918,11 +977,72 @@ async fn jeton_rafraichi(
         compte.id,
         &sealed_token,
         sealed_refresh.as_deref(),
+        Some(emis.duree_s as i64),
     )
     .await
     .ok()?;
 
     Some(emis.acces)
+}
+
+/// Faut-il rafraichir AVANT d'appeler la plateforme ? Instagram seul : son
+/// jeton long n'a pas de refresh_token separe — il se rafraichit LUI-MEME
+/// (`ig_refresh_token`) et SEULEMENT tant qu'il est encore valide (« The
+/// token must be at least 24 hours old but not expired », refresh_access_token,
+/// releve 2026-09-02). Attendre le 401 serait attendre que le rafraichissement
+/// soit devenu impossible. Sept jours de marge : un service qui dort un
+/// week-end ou deux ne rate pas la fenetre. Les autres plateformes gardent
+/// leur chemin 401 -> refresh (avec_rejeu_401), qui marche parce que LEUR
+/// refresh token survit au jeton d'acces.
+pub(crate) fn doit_rafraichir(
+    plateforme: &str,
+    expire_epoch: Option<i64>,
+    maintenant_epoch: i64,
+) -> bool {
+    const SEPT_JOURS_S: i64 = 7 * 24 * 3600;
+    plateforme == "instagram"
+        && expire_epoch.is_some_and(|expire| expire < maintenant_epoch + SEPT_JOURS_S)
+}
+
+/// L'UNIQUE ouverture de jeton des deux surfaces (post_publish, post_metrics,
+/// et `messagerie::jeton_du_compte` qui delegue ici) : rafraichissement
+/// proactif quand `doit_rafraichir` le dit, sinon le jeton scelle tel quel.
+///
+/// Si le rafraichissement proactif echoue (reseau, refus), on rend quand meme
+/// le jeton scelle : il peut vivre encore plusieurs jours, et le 401 eventuel
+/// dira la verite mieux qu'une erreur de refresh maquillee.
+pub(crate) async fn jeton_frais(
+    etat: &Etat,
+    tenant: Uuid,
+    compte: &store::CompteScelle,
+) -> Result<Secret, Erreur> {
+    if doit_rafraichir(
+        &compte.platform,
+        compte.token_expires_epoch,
+        chrono::Utc::now().timestamp(),
+    ) && let Some(frais) = jeton_rafraichi(etat, tenant, compte).await
+    {
+        return Ok(frais);
+    }
+    let octets = compte.sealed_token.as_ref().ok_or_else(|| {
+        Erreur::nouvelle(
+            "compte_sans_jeton",
+            "ce compte n'a pas de jeton scelle — reconnecter via account_connect_url",
+        )
+    })?;
+    oauth_flux::ouvrir_jeton(
+        &etat.chiffreur,
+        TenantId::from_uuid(tenant),
+        &compte.platform,
+        &compte.handle,
+        octets,
+    )
+    .map_err(|_| {
+        Erreur::nouvelle(
+            "descellement",
+            "le jeton de ce compte ne s'ouvre pas — reconnecter",
+        )
+    })
 }
 
 async fn metriques(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
@@ -946,22 +1066,7 @@ async fn metriques(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
         )
     })?;
 
-    let jeton = match &compte.sealed_token {
-        None => {
-            return Err(Erreur::nouvelle(
-                "compte_sans_jeton",
-                "reconnecter via account_connect_url",
-            ));
-        }
-        Some(octets) => oauth_flux::ouvrir_jeton(
-            &etat.chiffreur,
-            TenantId::from_uuid(tenant),
-            &compte.platform,
-            &compte.handle,
-            octets,
-        )
-        .map_err(|_| Erreur::nouvelle("descellement", "le jeton de ce compte ne s'ouvre pas"))?,
-    };
+    let jeton = jeton_frais(etat, tenant, &compte).await?;
     let id_plateforme = post.platform_post_id.ok_or_else(|| {
         Erreur::nouvelle("post_sans_id", "publie sans id de plateforme — incoherent")
     })?;
@@ -1092,6 +1197,13 @@ mod tests {
             "2",
             "5e0d09aa3063c5a058935a2afe2d9230a9965b015e32c5071ca7140216d78870",
         ),
+        // v3 : l'enum platform passe a cinq (instagram, tiktok, youtube) et
+        // post_preview/post_publish gagnent privacy + publish_at (chantier
+        // IG/TikTok/YouTube, 2026-09-02).
+        (
+            "3",
+            "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78",
+        ),
     ];
 
     #[test]
@@ -1133,16 +1245,24 @@ mod tests {
             medias: &[MediaPret],
             sondage: Option<&Sondage>,
             made_with_ai: bool,
+            options: &OptionsPost,
         ) -> Apercu {
             Apercu {
                 rendered_text: texte.to_owned(),
                 // L'empreinte GLOBALE du contrat C3 — LA formule partagée de
                 // mod.rs, pour que le rejeu compare la même chose que les
                 // vrais adaptateurs.
-                digest: crate::adapters::empreinte_globale(texte, medias, sondage, made_with_ai),
+                digest: crate::adapters::empreinte_globale(
+                    texte,
+                    medias,
+                    sondage,
+                    made_with_ai,
+                    options,
+                ),
                 platform_limits_ok: texte.chars().count() <= 280,
                 cost_estimate_usd: Some(0.015),
                 verdicts: Vec::new(),
+                cout_quota: None,
                 media: medias
                     .iter()
                     .map(|m| ApercuMedia {
@@ -1164,6 +1284,7 @@ mod tests {
             _medias: &[MediaPret],
             _sondage: Option<&Sondage>,
             _made_with_ai: bool,
+            _options: &OptionsPost,
         ) -> Result<Publication, ErreurPlateforme> {
             assert_eq!(
                 jeton.expose_for_transport(),
@@ -1215,10 +1336,18 @@ mod tests {
             &Secret::new("jeton-plateforme"),
         )
         .unwrap();
-        let compte =
-            crate::store::connecter_compte(&pool, tenant, "x", "agent_test", None, &scelle, None)
-                .await
-                .unwrap();
+        let compte = crate::store::connecter_compte(
+            &pool,
+            tenant,
+            "x",
+            "agent_test",
+            None,
+            &scelle,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let publications = Arc::new(AtomicUsize::new(0));
         let etat = Etat {
             pool,
@@ -1233,6 +1362,10 @@ mod tests {
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
+            oauth_meta: None,
+            oauth_tiktok: None,
+            oauth_google: None,
+            depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: Vec::new(),
         };
         Some((etat, tenant, compte, publications))
@@ -1508,5 +1641,39 @@ mod tests {
         assert!(err, "{rep}");
         assert_eq!(rep["erreur"], "cle_reutilisee");
         assert_eq!(publications.load(Ordering::SeqCst), 1);
+    }
+
+    // -- Le rafraichissement proactif d'Instagram : la fonction pure. --------
+
+    #[test]
+    fn seul_un_jeton_instagram_bientot_mort_se_rafraichit_proactivement() {
+        let maintenant = 1_756_800_000; // un epoch quelconque, fige
+        let sept_jours = 7 * 24 * 3600;
+        // Instagram, expiration DANS la fenetre de 7 jours : oui.
+        assert!(doit_rafraichir(
+            "instagram",
+            Some(maintenant + sept_jours - 1),
+            maintenant
+        ));
+        // Deja expire : oui aussi — le refresh echouera (« not expired »),
+        // mais c'est a la plateforme de le dire, pas a nous de le deviner.
+        assert!(doit_rafraichir(
+            "instagram",
+            Some(maintenant - 1),
+            maintenant
+        ));
+        // Instagram mais loin de la mort : non.
+        assert!(!doit_rafraichir(
+            "instagram",
+            Some(maintenant + sept_jours + 1),
+            maintenant
+        ));
+        // Expiration inconnue (compte d'avant 0006) : non — pas de devinette.
+        assert!(!doit_rafraichir("instagram", None, maintenant));
+        // Les autres plateformes ont un refresh token qui survit au jeton :
+        // leur chemin est 401 -> refresh, jamais le proactif.
+        for autre in ["x", "linkedin", "tiktok", "youtube"] {
+            assert!(!doit_rafraichir(autre, Some(maintenant - 1), maintenant));
+        }
     }
 }

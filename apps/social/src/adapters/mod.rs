@@ -13,8 +13,11 @@ use agentos_providers::Secret;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+pub mod instagram;
 pub mod linkedin;
+pub mod tiktok;
 pub mod x;
+pub mod youtube;
 
 /// Un média téléchargé, vetté et empreinté par medias.rs. Les octets sont EN
 /// MEMOIRE : le plafond absolu du téléchargeur (512 MiB) le permet.
@@ -76,6 +79,82 @@ pub struct Sondage {
     pub duration_minutes: u32,
 }
 
+/// La visibilité demandée à la publication — le vocabulaire COMMUN de la
+/// table v3 (`privacy`). Chaque adaptateur mappe vers SON vocabulaire ou
+/// refuse avec citation : TikTok (privacy_level REQUIS — direct-post, relevé
+/// le 2026-09-02) et YouTube (status.privacyStatus — docs/videos, relevé le
+/// 2026-09-02) servent ; X, LinkedIn et Instagram refusent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privacy {
+    Public,
+    Friends,
+    Followers,
+    Private,
+    Unlisted,
+}
+
+impl Privacy {
+    /// Le mot de la table v3 vers la variante — le parseur du cœur s'en sert.
+    pub fn depuis(mot: &str) -> Option<Self> {
+        match mot {
+            "public" => Some(Self::Public),
+            "friends" => Some(Self::Friends),
+            "followers" => Some(Self::Followers),
+            "private" => Some(Self::Private),
+            "unlisted" => Some(Self::Unlisted),
+            _ => None,
+        }
+    }
+
+    /// Le mot stable de la table — sert aux verdicts ET à l'empreinte C3.
+    pub fn nom(&self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Friends => "friends",
+            Self::Followers => "followers",
+            Self::Private => "private",
+            Self::Unlisted => "unlisted",
+        }
+    }
+}
+
+/// Les deux champs optionnels de la table v3 qui n'entrent ni dans le texte
+/// ni dans `Sondage` : la visibilité, et la date de publication différée
+/// (ISO 8601, YouTube seul). L'exception assumée du plan figé : `apercu` et
+/// `publier` les reçoivent en paramètre — un fait de plateforme (le
+/// privacy_level REQUIS de TikTok) l'impose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OptionsPost {
+    pub privacy: Option<Privacy>,
+    pub publish_at: Option<String>,
+}
+
+impl OptionsPost {
+    /// Vrai quand rien n'est demandé — le cas de TOUS les posts d'avant la
+    /// table v3, dont l'empreinte ne doit pas bouger (compat C3).
+    pub fn est_vide(&self) -> bool {
+        self.privacy.is_none() && self.publish_at.is_none()
+    }
+}
+
+/// Ce que main.rs donne aux adaptateurs à la construction : la base publique
+/// du service (pour `url_pull`) et le dépôt des octets vettés (medias.rs).
+/// Instagram (images) et TikTok (photos) s'en servent — leurs plateformes ne
+/// tirent JAMAIS l'URL du client, elles tirent NOS octets contresignés ;
+/// X, LinkedIn et YouTube l'ignorent (octets directs partout).
+pub struct ContexteAdaptateurs {
+    pub base_publique: String,
+    pub depot: std::sync::Arc<crate::medias::DepotMedias>,
+}
+
+/// L'adresse publique d'un média vetté, dérivée du digest — LA fonction pure
+/// figée de la couture : c'est elle (et rien d'autre) qui fabrique ce qu'une
+/// plateforme « pull » tire. Sous 256 caractères pour toute base raisonnable
+/// (limite documentée des URL TikTok, relevée le 2026-09-02).
+pub fn url_pull(base: &str, digest: &str) -> String {
+    format!("{base}/medias/{digest}")
+}
+
 /// Le verdict d'UN média dans l'aperçu.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApercuMedia {
@@ -108,6 +187,7 @@ pub trait Plateforme: Send + Sync {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
+        options: &OptionsPost,
     ) -> Apercu;
 
     /// Publie pour le compte `handle`. Ne retente rien : l'idempotence
@@ -117,6 +197,11 @@ pub trait Plateforme: Send + Sync {
     /// X (il construit l'URL publique), l'URN `urn:li:person:{id}` chez
     /// LinkedIn (il est l'auteur du corps de requête) — c'est ce que le flux
     /// de connexion (oauth_flux::identite) a rangé là.
+    ///
+    /// Huit paramètres : le huitième (`options`) est l'exception assumée de
+    /// la table v3 — les regrouper dans une struct de plus serait une
+    /// indirection sans deuxième client.
+    #[allow(clippy::too_many_arguments)]
     async fn publier(
         &self,
         jeton: &Secret,
@@ -125,6 +210,7 @@ pub trait Plateforme: Send + Sync {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
+        options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme>;
 
     /// `Ok(None)` quand la plateforme ne sert pas de métriques pour ce type de
@@ -137,11 +223,18 @@ pub trait Plateforme: Send + Sync {
     ) -> Result<Option<Metriques>, ErreurPlateforme>;
 }
 
-/// Les deux plateformes du jour un, et pas une de plus. C'est ce que
-/// `mcp::Etat` embarque ; les tests du cœur y substituent leur adaptateur
-/// compteur.
-pub fn adaptateurs() -> Vec<Box<dyn Plateforme>> {
-    vec![Box::new(x::X), Box::new(linkedin::Linkedin)]
+/// Les cinq plateformes de l'éditeur. C'est ce que `mcp::Etat` embarque ;
+/// les tests du cœur y substituent leur adaptateur compteur. Instagram et
+/// TikTok reçoivent le contexte (dépôt + base publique) : leurs modèles
+/// « pull » servent NOS octets vettés, jamais l'URL du client.
+pub fn adaptateurs(ctx: &ContexteAdaptateurs) -> Vec<Box<dyn Plateforme>> {
+    vec![
+        Box::new(x::X),
+        Box::new(linkedin::Linkedin),
+        Box::new(instagram::Instagram::nouvel(ctx)),
+        Box::new(tiktok::Tiktok::nouvel(ctx)),
+        Box::new(youtube::Youtube),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +309,9 @@ pub struct Inbox {
 pub struct PostsLus {
     pub posts: Vec<ElementLu>,
     pub cout_usd: f64,
+    /// Unités de quota YouTube (`None` ailleurs) — même règle que `Apercu`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cout_quota: Option<u64>,
 }
 
 /// Un profil lu — contenu de tiers comme le reste.
@@ -232,6 +328,9 @@ pub struct ProfilLu {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ActionFaite {
     pub cout_usd: f64,
+    /// Unités de quota YouTube (`None` ailleurs) — même règle que `Apercu`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cout_quota: Option<u64>,
 }
 
 /// Une réponse publique partie (reply/comment/quote) — la publication et son
@@ -241,6 +340,9 @@ pub struct ReponsePubliee {
     pub id_plateforme: String,
     pub url: String,
     pub cout_usd: f64,
+    /// Unités de quota YouTube (`None` ailleurs) — même règle que `Apercu`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cout_quota: Option<u64>,
 }
 
 /// Le second trait — la surface `/mcp/messagerie`.
@@ -372,11 +474,18 @@ pub trait PlateformeMessagerie: Send + Sync {
     ) -> Result<PostsLus, ErreurMessagerie>;
 }
 
-/// Les adaptateurs messagerie du jour un : X seul. LinkedIn n'y est pas —
-/// l'absence est le refus, servie par [`linkedin::refus_messagerie`] avec les
-/// citations datées, jamais par un stub.
-pub fn adaptateurs_messagerie() -> Vec<Box<dyn PlateformeMessagerie>> {
-    vec![Box::new(x::X)]
+/// Les adaptateurs messagerie : X, Instagram, TikTok, YouTube — quatre.
+/// LinkedIn n'y est toujours pas : l'absence est le refus, servie par
+/// [`linkedin::refus_messagerie`] avec les citations datées, jamais par un
+/// stub. IG/TikTok/YouTube implémentent le trait parce que chacun SERT une
+/// partie de la table ; chaque méthode non servie rend `NeSertPas` cité.
+pub fn adaptateurs_messagerie(ctx: &ContexteAdaptateurs) -> Vec<Box<dyn PlateformeMessagerie>> {
+    vec![
+        Box::new(x::X),
+        Box::new(instagram::Instagram::nouvel(ctx)),
+        Box::new(tiktok::Tiktok::nouvel(ctx)),
+        Box::new(youtube::Youtube),
+    ]
 }
 
 /// Ce que `post_preview` rend, et que `post_publish` doit reproduire à l'octet.
@@ -404,6 +513,11 @@ pub struct Apercu {
     /// `platform_limits_ok: false` sur un sondage serait muet — et une
     /// ignorance silencieuse est interdite par le contrat.
     pub verdicts: Vec<String>,
+    /// En unités de quota YouTube — la seule monnaie d'une API gratuite
+    /// (« determine_quota_cost », relevé le 2026-09-02). `None` partout
+    /// ailleurs : les autres plateformes ne comptent pas en unités.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cout_quota: Option<u64>,
 }
 
 /// Un post accepté par la plateforme.
@@ -500,8 +614,9 @@ pub fn empreinte_globale(
     medias: &[MediaPret],
     sondage: Option<&Sondage>,
     made_with_ai: bool,
+    options: &OptionsPost,
 ) -> String {
-    if medias.is_empty() && sondage.is_none() && !made_with_ai {
+    if medias.is_empty() && sondage.is_none() && !made_with_ai && options.est_vide() {
         return empreinte(texte);
     }
     let mut composantes = vec![empreinte(texte)];
@@ -517,7 +632,36 @@ pub fn empreinte_globale(
     if made_with_ai {
         composantes.push("made_with_ai".to_owned());
     }
+    // Table v3 : un `privacy` différent est un contreseing différent — même
+    // texte, mêmes octets, mais « public » et « private » ne sont pas le même
+    // post. Ordre fixe, après made_with_ai. `publish_at` passe par
+    // `empreinte` : une date hostile portant un '\n' ne peut pas forger une
+    // composante voisine.
+    if let Some(p) = &options.privacy {
+        composantes.push(format!("privacy:{}", p.nom()));
+    }
+    if let Some(quand) = &options.publish_at {
+        composantes.push(format!("publish_at:{}", empreinte(quand)));
+    }
     empreinte(&composantes.join("\n"))
+}
+
+/// Envoie et lit (statut, corps) — le corps ne finit jamais dans une erreur,
+/// seul le lecteur décidera ce qu'il en garde. Partagé par les quatre
+/// adaptateurs qui parlent JSON simple (x, instagram, tiktok, youtube).
+pub(crate) async fn envoyer(
+    requete: reqwest::RequestBuilder,
+) -> Result<(u16, Vec<u8>), ErreurPlateforme> {
+    let reponse = requete
+        .send()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    let statut = reponse.status().as_u16();
+    let corps = reponse
+        .bytes()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    Ok((statut, corps.to_vec()))
 }
 
 /// Le client HTTP des adaptateurs : redirections coupées (un point d'API qui
@@ -580,6 +724,12 @@ pub(crate) mod test_medias {
 mod tests {
     use super::*;
 
+    /// Des options vides : le cas de tous les posts d'avant la table v3.
+    const SANS: OptionsPost = OptionsPost {
+        privacy: None,
+        publish_at: None,
+    };
+
     #[test]
     fn l_empreinte_est_le_sha256_du_texte() {
         // Vecteur connu : sha256("abc"), FIPS 180-2 annexe B.1.
@@ -609,16 +759,19 @@ mod tests {
     #[test]
     fn sans_media_ni_sondage_l_empreinte_globale_est_celle_du_texte() {
         // C3 : compat totale — les posts texte existants gardent leur digest.
-        assert_eq!(empreinte_globale("abc", &[], None, false), empreinte("abc"));
+        assert_eq!(
+            empreinte_globale("abc", &[], None, false, &OptionsPost::default()),
+            empreinte("abc")
+        );
     }
 
     #[test]
     fn l_empreinte_globale_change_quand_un_media_change_ou_quand_l_ordre_change() {
         let a = test_medias::media(b"octets A", TypeMedia::Png);
         let b = test_medias::media(b"octets B", TypeMedia::Png);
-        let ab = empreinte_globale("texte", &[a.clone(), b.clone()], None, false);
-        let ba = empreinte_globale("texte", &[b.clone(), a.clone()], None, false);
-        let aa = empreinte_globale("texte", &[a.clone(), a.clone()], None, false);
+        let ab = empreinte_globale("texte", &[a.clone(), b.clone()], None, false, &SANS);
+        let ba = empreinte_globale("texte", &[b.clone(), a.clone()], None, false, &SANS);
+        let aa = empreinte_globale("texte", &[a.clone(), a.clone()], None, false, &SANS);
         // Une image différente = un contreseing différent : c'est toute la
         // raison d'empreinter les octets, pas seulement le texte.
         assert_ne!(ab, aa);
@@ -629,15 +782,47 @@ mod tests {
     }
 
     #[test]
+    fn l_empreinte_globale_couvre_privacy_et_publish_at() {
+        // Table v3 : un privacy différent est un contreseing différent…
+        let publique = OptionsPost {
+            privacy: Some(Privacy::Public),
+            publish_at: None,
+        };
+        let privee = OptionsPost {
+            privacy: Some(Privacy::Private),
+            publish_at: None,
+        };
+        let differee = OptionsPost {
+            privacy: None,
+            publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+        };
+        let nu = empreinte_globale("texte", &[], None, false, &SANS);
+        let avec_public = empreinte_globale("texte", &[], None, false, &publique);
+        let avec_prive = empreinte_globale("texte", &[], None, false, &privee);
+        let avec_date = empreinte_globale("texte", &[], None, false, &differee);
+        assert_ne!(nu, avec_public);
+        assert_ne!(avec_public, avec_prive);
+        assert_ne!(nu, avec_date);
+        // …et des options VIDES gardent l'empreinte d'avant la table v3
+        // (compat C3) : les posts déjà en base rejouent à l'identique.
+        assert_eq!(nu, empreinte("texte"));
+        // L'URL de pull est LA formule figée de la couture.
+        assert_eq!(
+            url_pull("https://s.example", "ab12"),
+            "https://s.example/medias/ab12"
+        );
+    }
+
+    #[test]
     fn l_empreinte_globale_couvre_sondage_et_made_with_ai() {
         let sondage = Sondage {
             question: None,
             options: vec!["oui".into(), "non".into()],
             duration_minutes: 1440,
         };
-        let sans = empreinte_globale("texte", &[], None, false);
-        let avec_sondage = empreinte_globale("texte", &[], Some(&sondage), false);
-        let avec_ai = empreinte_globale("texte", &[], None, true);
+        let sans = empreinte_globale("texte", &[], None, false, &SANS);
+        let avec_sondage = empreinte_globale("texte", &[], Some(&sondage), false, &SANS);
+        let avec_ai = empreinte_globale("texte", &[], None, true, &SANS);
         assert_ne!(sans, avec_sondage);
         assert_ne!(sans, avec_ai);
         assert_ne!(avec_sondage, avec_ai);
@@ -648,7 +833,7 @@ mod tests {
         };
         assert_ne!(
             avec_sondage,
-            empreinte_globale("texte", &[], Some(&sondage2), false)
+            empreinte_globale("texte", &[], Some(&sondage2), false, &SANS)
         );
     }
 }

@@ -48,8 +48,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    Apercu, ApercuMedia, ErreurMessagerie, ErreurPlateforme, MediaPret, Metriques, Plateforme,
-    Publication, Sondage, TypeMedia, empreinte_globale, http, http_upload,
+    Apercu, ApercuMedia, ErreurMessagerie, ErreurPlateforme, MediaPret, Metriques, OptionsPost,
+    Plateforme, Publication, Sondage, TypeMedia, empreinte_globale, http, http_upload,
 };
 
 /// <https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api>,
@@ -652,8 +652,27 @@ impl Plateforme for Linkedin {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
+        options: &OptionsPost,
     ) -> Apercu {
         let mut verdicts = Vec::new();
+
+        // Table v3 : le corps posts-api fixe `visibility: PUBLIC` et ne
+        // documente aucune planification pour un membre (posts-api, relevé le
+        // 2026-09-02) — les deux champs sont refusés avec citation.
+        if options.privacy.is_some() {
+            verdicts.push(
+                "linkedin ne sert pas `privacy` pour un post de membre : la visibilité \
+                 documentée est PUBLIC (posts-api, relevé le 2026-09-02)"
+                    .to_owned(),
+            );
+        }
+        if options.publish_at.is_some() {
+            verdicts.push(
+                "linkedin ne sert pas `publish_at` : aucune planification dans posts-api \
+                 (relevé le 2026-09-02)"
+                    .to_owned(),
+            );
+        }
 
         if made_with_ai {
             verdicts.push(
@@ -746,7 +765,7 @@ impl Plateforme for Linkedin {
         let media: Vec<ApercuMedia> = medias.iter().map(apercu_media).collect();
         Apercu {
             rendered_text: texte.to_owned(),
-            digest: empreinte_globale(texte, medias, sondage, made_with_ai),
+            digest: empreinte_globale(texte, medias, sondage, made_with_ai, options),
             // La doc nomme les refus `INVALID_VALUE_BLANK_FIELD` et
             // `FIELD_LENGTH_TOO_LONG` mais ne publie AUCUN nombre pour
             // `commentary` (vérifié dans posts-api et post-api-schema le
@@ -760,6 +779,8 @@ impl Plateforme for Linkedin {
             cost_estimate_usd: None,
             media,
             verdicts,
+            // LinkedIn ne compte pas en unités de quota.
+            cout_quota: None,
         }
     }
 
@@ -775,7 +796,9 @@ impl Plateforme for Linkedin {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         _made_with_ai: bool,
+        _options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme> {
+        // `options` : refusé par l'aperçu (C7 le passe avant publier).
         // made_with_ai : refusé par l'aperçu (C7 le passe avant publier) —
         // ignoré ici serait un mensonge, mais il ne peut pas arriver vrai.
         let contenu = if let Some(s) = sondage {
@@ -924,6 +947,12 @@ pub fn refus_messagerie(outil: &str) -> Option<ErreurMessagerie> {
 mod tests {
     use super::*;
     use crate::adapters::test_medias::media;
+
+    /// Des options vides — le cas de tous les posts d'avant la table v3.
+    const SANS: OptionsPost = OptionsPost {
+        privacy: None,
+        publish_at: None,
+    };
 
     fn avec_alt(mut m: MediaPret, alt: &str) -> MediaPret {
         m.alt_text = Some(alt.to_owned());
@@ -1164,8 +1193,12 @@ mod tests {
 
     #[test]
     fn l_apercu_refuse_le_vide_et_n_invente_pas_de_tarif() {
-        assert!(!Linkedin.apercu("  ", &[], None, false).platform_limits_ok);
-        let apercu = Linkedin.apercu("Bonjour", &[], None, false);
+        assert!(
+            !Linkedin
+                .apercu("  ", &[], None, false, &SANS)
+                .platform_limits_ok
+        );
+        let apercu = Linkedin.apercu("Bonjour", &[], None, false, &SANS);
         assert!(apercu.platform_limits_ok);
         assert_eq!(apercu.cost_estimate_usd, None);
         assert_eq!(apercu.rendered_text, "Bonjour");
@@ -1177,7 +1210,13 @@ mod tests {
     #[test]
     fn les_verdicts_medias_refusent_ce_que_linkedin_refuse() {
         // WEBP → refus nommé.
-        let apercu = Linkedin.apercu("t", &[media(b"RIFFxxxxWEBP", TypeMedia::Webp)], None, false);
+        let apercu = Linkedin.apercu(
+            "t",
+            &[media(b"RIFFxxxxWEBP", TypeMedia::Webp)],
+            None,
+            false,
+            &SANS,
+        );
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.media[0]
@@ -1192,7 +1231,7 @@ mod tests {
         let vingt_et_une: Vec<_> = (0..21)
             .map(|i| media(&[i as u8], TypeMedia::Jpeg))
             .collect();
-        let apercu = Linkedin.apercu("t", &vingt_et_une, None, false);
+        let apercu = Linkedin.apercu("t", &vingt_et_une, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("20 images max")),
@@ -1201,7 +1240,7 @@ mod tests {
         );
         assert!(
             Linkedin
-                .apercu("t", &vingt_et_une[..20], None, false)
+                .apercu("t", &vingt_et_une[..20], None, false, &SANS)
                 .platform_limits_ok
         );
 
@@ -1211,6 +1250,7 @@ mod tests {
             &[avec_alt(media(b"i", TypeMedia::Png), &"x".repeat(4087))],
             None,
             false,
+            &SANS,
         );
         assert!(!apercu.platform_limits_ok);
         assert!(
@@ -1224,13 +1264,20 @@ mod tests {
                     "t",
                     &[avec_alt(media(b"i", TypeMedia::Png), &"x".repeat(4086))],
                     None,
-                    false
+                    false,
+                    &SANS
                 )
                 .platform_limits_ok
         );
 
         // Vidéo : sous 75 KB refusée, mélange vidéo+image refusé.
-        let apercu = Linkedin.apercu("t", &[media(&[0u8; 1000], TypeMedia::Mp4)], None, false);
+        let apercu = Linkedin.apercu(
+            "t",
+            &[media(&[0u8; 1000], TypeMedia::Mp4)],
+            None,
+            false,
+            &SANS,
+        );
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.media[0]
@@ -1244,7 +1291,7 @@ mod tests {
             media(&vec![0u8; 100_000], TypeMedia::Mp4),
             media(b"i", TypeMedia::Png),
         ];
-        let apercu = Linkedin.apercu("t", &mixte, None, false);
+        let apercu = Linkedin.apercu("t", &mixte, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("pas de mélange")),
@@ -1261,13 +1308,14 @@ mod tests {
                         "Ma vidéo"
                     )],
                     None,
-                    false
+                    false,
+                    &SANS
                 )
                 .platform_limits_ok
         );
 
         // made_with_ai → X seulement.
-        let apercu = Linkedin.apercu("t", &[], None, true);
+        let apercu = Linkedin.apercu("t", &[], None, true, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("made_with_ai")),
@@ -1282,7 +1330,8 @@ mod tests {
                     "t",
                     &[avec_titre(media(b"i", TypeMedia::Png), "Titre")],
                     None,
-                    false
+                    false,
+                    &SANS
                 )
                 .platform_limits_ok
         );
@@ -1294,7 +1343,8 @@ mod tests {
                     "t",
                     &[avec_titre(media(b"%PDF-", TypeMedia::Pdf), "Mon PDF")],
                     None,
-                    false
+                    false,
+                    &SANS
                 )
                 .platform_limits_ok
         );
@@ -1303,6 +1353,7 @@ mod tests {
             &[media(&vec![0u8; 100_000_001], TypeMedia::Pdf)],
             None,
             false,
+            &SANS,
         );
         assert!(!apercu.platform_limits_ok);
         assert!(
@@ -1324,7 +1375,7 @@ mod tests {
         };
         assert!(
             Linkedin
-                .apercu("t", &[], Some(&bon), false)
+                .apercu("t", &[], Some(&bon), false, &SANS)
                 .platform_limits_ok
         );
 
@@ -1333,7 +1384,7 @@ mod tests {
             question: None,
             ..bon.clone()
         };
-        let apercu = Linkedin.apercu("t", &[], Some(&sans_question), false);
+        let apercu = Linkedin.apercu("t", &[], Some(&sans_question), false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu
@@ -1349,7 +1400,7 @@ mod tests {
             duration_minutes: 3000,
             ..bon.clone()
         };
-        let apercu = Linkedin.apercu("t", &[], Some(&hors), false);
+        let apercu = Linkedin.apercu("t", &[], Some(&hors), false, &SANS);
         assert!(!apercu.platform_limits_ok);
         let verdict = apercu
             .verdicts
@@ -1367,7 +1418,7 @@ mod tests {
         };
         assert!(
             !Linkedin
-                .apercu("t", &[], Some(&option_longue), false)
+                .apercu("t", &[], Some(&option_longue), false, &SANS)
                 .platform_limits_ok
         );
 
@@ -1378,12 +1429,18 @@ mod tests {
         };
         assert!(
             !Linkedin
-                .apercu("t", &[], Some(&question_longue), false)
+                .apercu("t", &[], Some(&question_longue), false, &SANS)
                 .platform_limits_ok
         );
 
         // Sondage + média : les formes de content sont des alternatives.
-        let apercu = Linkedin.apercu("t", &[media(b"i", TypeMedia::Png)], Some(&bon), false);
+        let apercu = Linkedin.apercu(
+            "t",
+            &[media(b"i", TypeMedia::Png)],
+            Some(&bon),
+            false,
+            &SANS,
+        );
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("exclusif")),
@@ -1399,7 +1456,7 @@ mod tests {
             };
             assert!(
                 Linkedin
-                    .apercu("t", &[], Some(&s), false)
+                    .apercu("t", &[], Some(&s), false, &SANS)
                     .platform_limits_ok,
                 "{duree}"
             );

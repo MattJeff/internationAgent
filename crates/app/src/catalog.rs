@@ -751,9 +751,11 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   * LinkedIn — `w_member_social` est self-serve, mais AUCUNE analytics
 ///     membre n'existe, et les analytics d'organisation sont derrière le
 ///     Marketing API Program.
-///   * YouTube — `videos.insert` coûte 1600 unités sur un quota de
-///     10 000/jour, soit ≈ 6 uploads (page `determine_quota_cost`,
-///     2026-06-01).
+///   * YouTube — le modèle de quota a CHANGÉ : `videos.insert` et
+///     `search.list` vivent chacun dans un bucket dédié de 100 appels/jour
+///     (1 point par appel), le pool général restant 10 000 unités/jour —
+///     les vieux 1600 unités/upload sont morts (page `determine_quota_cost`,
+///     resondée le 2026-09-02).
 ///   * Pinterest — 401 générique SANS `www-authenticate`, donc pas de
 ///     RFC 9728 : le « serveur MCP » annoncé est démasqué. L'API v5 est
 ///     verte, mais en trial access.

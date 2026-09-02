@@ -37,6 +37,35 @@
 //!   pas de PKCE dans cette doc ; jetons d'accès à 60 jours ; « Programmatic
 //!   refresh tokens are available for a limited set of partners » — pour nous,
 //!   pas de rafraîchissement : on refait consentir, et l'outil le dit.
+//! * Instagram (« Instagram API with Instagram Login ») —
+//!   <https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login>,
+//!   relevé 2026-09-02 : autorisation `https://www.instagram.com/oauth/authorize`
+//!   (scopes séparés par des VIRGULES), échange
+//!   `POST https://api.instagram.com/oauth/access_token` — « must be made in
+//!   server-side code », client_id + client_secret dans le corps ; le code est
+//!   « valid for 1 hour and can only be used once ». Le jeton court est
+//!   CHAÎNÉ vers le long :
+//!   `GET https://graph.instagram.com/access_token?grant_type=ig_exchange_token`
+//!   → « valid for 60 days ». Pas de refresh_token séparé : le jeton long se
+//!   rafraîchit LUI-MÊME (`grant_type=ig_refresh_token`) tant qu'il est
+//!   « at least 24 hours old » ET encore valide — d'où le rafraîchissement
+//!   PROACTIF de `mcp::jeton_frais`, un 401 arrive trop tard. Pas de PKCE
+//!   documenté.
+//! * TikTok — <https://developers.tiktok.com/doc/oauth-user-access-token-management>,
+//!   relevé 2026-09-02 : autorisation `https://www.tiktok.com/v2/auth/authorize/`
+//!   avec le paramètre **`client_key`** (pas client_id), scopes séparés par des
+//!   VIRGULES ; jeton `POST https://open.tiktokapis.com/v2/oauth/token/`
+//!   (client_key + secret dans le corps). access 86400 s, refresh 31536000 s ;
+//!   ROTATION : « The returned refresh_token may be different... You must use
+//!   the newly-returned token » — couvert par `resceller_jetons` (remplace
+//!   quand `Some`, COALESCE sinon).
+//! * YouTube/Google — <https://developers.google.com/identity/protocols/oauth2/web-server>,
+//!   relevé 2026-09-02 : autorisation `https://accounts.google.com/o/oauth2/v2/auth`
+//!   avec `access_type=offline` ET `prompt=consent` — le refresh token n'est
+//!   rendu qu'au PREMIER échange sans `prompt=consent` ; jeton
+//!   `POST https://oauth2.googleapis.com/token` (client_id + secret dans le
+//!   corps). Limite : 100 refresh tokens par compte Google et par client_id —
+//!   le plus ancien meurt en silence au 101e.
 
 use agentos_domain::ids::TenantId;
 use agentos_providers::secrets::{Envelope, LocalEnvelopeSecretStore};
@@ -54,6 +83,17 @@ pub const X_AUTORISATION: &str = "https://x.com/i/oauth2/authorize";
 pub const X_JETON: &str = "https://api.x.com/2/oauth2/token";
 pub const LINKEDIN_AUTORISATION: &str = "https://www.linkedin.com/oauth/v2/authorization";
 pub const LINKEDIN_JETON: &str = "https://www.linkedin.com/oauth/v2/accessToken";
+pub const INSTAGRAM_AUTORISATION: &str = "https://www.instagram.com/oauth/authorize";
+pub const INSTAGRAM_JETON: &str = "https://api.instagram.com/oauth/access_token";
+/// L'échange court → long (`grant_type=ig_exchange_token`) — le second maillon
+/// du chaînage d'`echanger`.
+pub const INSTAGRAM_JETON_LONG: &str = "https://graph.instagram.com/access_token";
+/// Le rafraîchissement du jeton long PAR LUI-MÊME (`grant_type=ig_refresh_token`).
+pub const INSTAGRAM_RAFRAICHIR: &str = "https://graph.instagram.com/refresh_access_token";
+pub const TIKTOK_AUTORISATION: &str = "https://www.tiktok.com/v2/auth/authorize/";
+pub const TIKTOK_JETON: &str = "https://open.tiktokapis.com/v2/oauth/token/";
+pub const YOUTUBE_AUTORISATION: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const YOUTUBE_JETON: &str = "https://oauth2.googleapis.com/token";
 
 /// Qui est ce jeton ? Un point de jeton ne rend que des jetons ; le compte à
 /// nommer en base vient d'un second appel :
@@ -68,6 +108,18 @@ pub const LINKEDIN_JETON: &str = "https://www.linkedin.com/oauth/v2/accessToken"
 ///   id : `urn:li:person:{id}` (post-api-schema).
 pub const X_ME: &str = "https://api.x.com/2/users/me";
 pub const LINKEDIN_USERINFO: &str = "https://api.linkedin.com/v2/userinfo";
+/// Instagram : `GET /me?fields=user_id,username` → le username comme handle,
+/// `user_id` comme id plateforme (référence ig-user, relevé 2026-09-02).
+pub const INSTAGRAM_ME: &str = "https://graph.instagram.com/me";
+/// TikTok : `GET /v2/user/info/?fields=open_id,display_name` (scope
+/// user.info.basic, relevé 2026-09-02) — `open_id` est l'identifiant que tous
+/// les endpoints Content Posting/Display exigent.
+pub const TIKTOK_USERINFO: &str = "https://open.tiktokapis.com/v2/user/info/";
+/// YouTube : `GET /youtube/v3/channels?part=snippet&mine=true` → le titre du
+/// channel comme handle, `items[0].id` (UC…) comme id plateforme. Coûte
+/// 1 unité de quota (channels.list, relevé 2026-09-02) — dit ici parce que
+/// c'est le seul appel d'identité du service qui a un prix.
+pub const YOUTUBE_CHANNELS: &str = "https://www.googleapis.com/youtube/v3/channels";
 
 /// `tweet.write` publie (creation-of-a-post), `tweet.read`/`users.read` lisent
 /// les métriques (get-post-by-id) ET servent `GET /2/users/me`,
@@ -93,6 +145,20 @@ pub const X_SCOPES: &str =
 /// (sign-in-with-linkedin-v2, produit « Sign In with LinkedIn using OpenID
 /// Connect », sans revue d'app). Relevés le 2026-09-02.
 pub const LINKEDIN_SCOPES: &str = "openid profile w_member_social";
+/// Les quatre scopes du chemin « Instagram API with Instagram Login » (tableau
+/// de permissions, developers.facebook.com/docs/instagram-platform, relevé
+/// 2026-09-02) : publier (content_publish), modérer les commentaires
+/// (manage_comments), répondre aux DM (manage_messages), et le socle (basic).
+/// Séparés par des VIRGULES — la forme de l'URL d'exemple de business-login.
+pub const INSTAGRAM_SCOPES: &str = "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments,instagram_business_manage_messages";
+/// `video.publish` (Direct Post), `video.list` (read_timeline/metriques),
+/// `user.info.basic` (identité) — tiktok-api-scopes, relevé 2026-09-02.
+/// Séparés par des VIRGULES (« comma-separated », oauth-user-access-token).
+pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish";
+/// `youtube.upload` publie ; `youtube.force-ssl` couvre commentaires, likes,
+/// recherche et lectures (commentThreads/insert, videos/rate — relevés
+/// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
+pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl";
 
 /// Mêmes largeurs que `oauth.rs` : 32 octets d'OS pour le `state` (256 bits
 /// contre qui regarde les flux passer), 32 pour le vérifieur (le minimum de
@@ -104,6 +170,9 @@ const VERIFIEUR_OCTETS: usize = 32;
 pub enum PlateformeOauth {
     X,
     Linkedin,
+    Instagram,
+    Tiktok,
+    Youtube,
 }
 
 /// Ce qu'un flux démarré laisse derrière lui.
@@ -256,16 +325,37 @@ pub fn demarrer(
     let (point, scopes) = match plateforme {
         PlateformeOauth::X => (X_AUTORISATION, X_SCOPES),
         PlateformeOauth::Linkedin => (LINKEDIN_AUTORISATION, LINKEDIN_SCOPES),
+        PlateformeOauth::Instagram => (INSTAGRAM_AUTORISATION, INSTAGRAM_SCOPES),
+        PlateformeOauth::Tiktok => (TIKTOK_AUTORISATION, TIKTOK_SCOPES),
+        PlateformeOauth::Youtube => (YOUTUBE_AUTORISATION, YOUTUBE_SCOPES),
+    };
+    // TikTok nomme son identifiant client `client_key` — le seul des cinq
+    // (oauth-user-access-token-management, relevé 2026-09-02). Les scopes,
+    // eux, sont DANS la constante : virgules ou espaces selon la plateforme,
+    // la valeur est déjà de la bonne forme.
+    let nom_client = match plateforme {
+        PlateformeOauth::Tiktok => "client_key",
+        _ => "client_id",
     };
     // `Url` et pas `format!` : les scopes ont des espaces, un client_id est
     // une valeur opaque du fournisseur — la raison exacte de `oauth::start`.
     let mut url = Url::parse(point).expect("littéral https statique");
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", client_id)
+        .append_pair(nom_client, client_id)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", scopes)
         .append_pair("state", &state);
+    if plateforme == PlateformeOauth::Youtube {
+        // Sans `access_type=offline` Google n'émet pas de refresh token, et
+        // sans `prompt=consent` il ne le ré-émet qu'au PREMIER consentement de
+        // la vie du couple (compte, client_id) — un utilisateur qui reconnecte
+        // repartirait sans refresh et devrait re-consentir chaque heure
+        // (web-server flow, relevé 2026-09-02).
+        url.query_pairs_mut()
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent");
+    }
 
     let verifieur_scelle = match plateforme {
         PlateformeOauth::X => {
@@ -287,7 +377,11 @@ pub fn demarrer(
                     .to_bytes(),
             )
         }
-        PlateformeOauth::Linkedin => None,
+        // Aucune des quatre autres docs ne définit de PKCE pour son flux web
+        // confidentiel (LinkedIn étape 3 ; business-login IG ; oauth TikTok ;
+        // web-server Google — relevés 2026-09-02) : sceller un vérifieur que
+        // personne ne vérifiera serait le théâtre de la sécurité.
+        _ => None,
     };
 
     Ok(FluxDemarre {
@@ -314,7 +408,10 @@ pub fn ouvrir_verifieur(
 /// X : `code_verifier` requis (PKCE), le client confidentiel s'authentifie par
 /// l'en-tête Basic — donc ni `client_id` ni `client_secret` dans le corps.
 /// LinkedIn : `client_id` et `client_secret` dans le corps, requis par la
-/// table de l'étape 3 de sa doc.
+/// table de l'étape 3 de sa doc. Instagram et YouTube : pareil (docs citées en
+/// tête de module). TikTok : pareil, mais l'identifiant s'appelle
+/// **`client_key`** — copier la forme LinkedIn ici produirait un
+/// `invalid_client` qui ne nomme rien.
 pub fn corps_d_echange<'a>(
     plateforme: PlateformeOauth,
     code: &'a str,
@@ -330,10 +427,17 @@ pub fn corps_d_echange<'a>(
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifieur.unwrap_or_default()),
         ],
-        PlateformeOauth::Linkedin => vec![
+        PlateformeOauth::Linkedin | PlateformeOauth::Instagram | PlateformeOauth::Youtube => vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", client_id),
+            ("client_secret", client_secret.unwrap_or_default()),
+            ("redirect_uri", redirect_uri),
+        ],
+        PlateformeOauth::Tiktok => vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_key", client_id),
             ("client_secret", client_secret.unwrap_or_default()),
             ("redirect_uri", redirect_uri),
         ],
@@ -360,7 +464,58 @@ pub async fn echanger(
         client_id,
         Some(secret_texte),
     );
-    poster_jeton(plateforme, client_id, client_secret, &corps).await
+    let jeton = poster_jeton(plateforme, client_id, client_secret, &corps).await?;
+    if plateforme != PlateformeOauth::Instagram {
+        return Ok(jeton);
+    }
+    // Instagram, second maillon OBLIGATOIRE : le jeton de
+    // api.instagram.com/oauth/access_token est court ; l'échange
+    // `ig_exchange_token` le troque contre le jeton long « valid for 60 days »
+    // (long-lived-tokens, relevé 2026-09-02). C'est le long qu'on scelle —
+    // sceller le court condamnerait le compte à mourir dans l'heure.
+    let long = obtenir_jeton_en_get(
+        INSTAGRAM_JETON_LONG,
+        &[
+            ("grant_type", "ig_exchange_token"),
+            ("client_secret", secret_texte),
+            ("access_token", jeton.acces.expose_for_transport()),
+        ],
+    )
+    .await?;
+    Ok(copie_en_rafraichissement(long))
+}
+
+/// Instagram n'a PAS de refresh_token séparé : le jeton long se rafraîchit
+/// lui-même. La colonne `sealed_refresh` reçoit donc une COPIE du jeton long —
+/// toute la machinerie existante (sceller, resceller, `jeton_rafraichi`)
+/// marche alors sans une ligne de spécial-casing hors d'ici.
+fn copie_en_rafraichissement(jeton: JetonEmis) -> JetonEmis {
+    let copie = Secret::new(jeton.acces.expose_for_transport());
+    JetonEmis {
+        rafraichissement: Some(copie),
+        ..jeton
+    }
+}
+
+/// Les deux points GET d'Instagram (échange long, rafraîchissement) rendent la
+/// même forme `{access_token, token_type, expires_in}` que les points POST —
+/// même lecteur `jeton_depuis`, même discipline anti-fuite.
+async fn obtenir_jeton_en_get(
+    point: &'static str,
+    parametres: &[(&str, &str)],
+) -> Result<JetonEmis, ErreurPlateforme> {
+    let reponse = http()
+        .get(point)
+        .query(parametres)
+        .send()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    let statut = reponse.status().as_u16();
+    let octets = reponse
+        .bytes()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    jeton_depuis(statut, &octets)
 }
 
 /// Rafraîchit un jeton X. Pour LinkedIn c'est un refus immédiat et nommé,
@@ -374,16 +529,69 @@ pub async fn rafraichir(
     client_secret: &Secret,
     rafraichissement: &Secret,
 ) -> Result<JetonEmis, ErreurPlateforme> {
-    if plateforme == PlateformeOauth::Linkedin {
-        return Err(ErreurPlateforme::RafraichissementIndisponible);
+    match plateforme {
+        PlateformeOauth::Linkedin => Err(ErreurPlateforme::RafraichissementIndisponible),
+        PlateformeOauth::Instagram => {
+            // Le jeton long se rafraîchit LUI-MÊME (`sealed_refresh` en porte
+            // la copie) — exige un jeton « at least 24 hours old » ET encore
+            // valide (refresh_access_token, relevé 2026-09-02). C'est pour ce
+            // « encore valide » que `mcp::jeton_frais` appelle PROACTIVEMENT :
+            // au premier 401 le rafraîchissement serait déjà impossible.
+            let frais = obtenir_jeton_en_get(
+                INSTAGRAM_RAFRAICHIR,
+                &[
+                    ("grant_type", "ig_refresh_token"),
+                    ("access_token", rafraichissement.expose_for_transport()),
+                ],
+            )
+            .await?;
+            Ok(copie_en_rafraichissement(frais))
+        }
+        _ => {
+            // X, TikTok, YouTube : `grant_type=refresh_token` sur le même
+            // point de jeton — le chemin partagé sert tel quel, seule la
+            // place des credentials client change (corps_de_rafraichissement).
+            let corps = corps_de_rafraichissement(
+                plateforme,
+                rafraichissement.expose_for_transport(),
+                client_id,
+                client_secret.expose_for_transport(),
+            );
+            poster_jeton(plateforme, client_id, client_secret, &corps).await
+        }
     }
-    // Forme documentée : `grant_type=refresh_token` + `refresh_token` sur le
-    // même point de jeton ; le client confidentiel passe par Basic.
-    let corps = vec![
-        ("grant_type", "refresh_token"),
-        ("refresh_token", rafraichissement.expose_for_transport()),
-    ];
-    poster_jeton(plateforme, client_id, client_secret, &corps).await
+}
+
+/// Le corps d'un rafraîchissement POST, sorti en fonction pour être comparé
+/// aux tables des docs sans réseau. X : client en Basic, rien dans le corps.
+/// TikTok : `client_key` + secret dans le corps (oauth-user-access-token).
+/// YouTube : `client_id` + secret dans le corps (web-server, « Refreshing an
+/// access token »). LinkedIn et Instagram ne passent jamais ici (refus nommé
+/// et GET dédié, plus haut).
+pub fn corps_de_rafraichissement<'a>(
+    plateforme: PlateformeOauth,
+    rafraichissement: &'a str,
+    client_id: &'a str,
+    client_secret: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    match plateforme {
+        PlateformeOauth::Tiktok => vec![
+            ("grant_type", "refresh_token"),
+            ("client_key", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", rafraichissement),
+        ],
+        PlateformeOauth::Youtube => vec![
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", rafraichissement),
+        ],
+        _ => vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rafraichissement),
+        ],
+    }
 }
 
 /// Le POST vers un point de jeton — l'authentification client est ajoutée ici
@@ -398,6 +606,9 @@ async fn poster_jeton(
     let point = match plateforme {
         PlateformeOauth::X => X_JETON,
         PlateformeOauth::Linkedin => LINKEDIN_JETON,
+        PlateformeOauth::Instagram => INSTAGRAM_JETON,
+        PlateformeOauth::Tiktok => TIKTOK_JETON,
+        PlateformeOauth::Youtube => YOUTUBE_JETON,
     };
     // `Accept: application/json` : inoffensif partout (c'est le type que RFC
     // 6749 §5.1 impose déjà), et la leçon GitHub de `post_token` dit qu'un
@@ -460,12 +671,18 @@ pub async fn identite(
     plateforme: PlateformeOauth,
     acces: &Secret,
 ) -> Result<(String, String), ErreurPlateforme> {
-    let point = match plateforme {
-        PlateformeOauth::X => X_ME,
-        PlateformeOauth::Linkedin => LINKEDIN_USERINFO,
+    // Le couple (point, query) de chaque plateforme — le jeton passe en
+    // Bearer partout, jamais dans la query : une URL finit dans des logs.
+    let (point, query): (&str, &[(&str, &str)]) = match plateforme {
+        PlateformeOauth::X => (X_ME, &[]),
+        PlateformeOauth::Linkedin => (LINKEDIN_USERINFO, &[]),
+        PlateformeOauth::Instagram => (INSTAGRAM_ME, &[("fields", "user_id,username")]),
+        PlateformeOauth::Tiktok => (TIKTOK_USERINFO, &[("fields", "open_id,display_name")]),
+        PlateformeOauth::Youtube => (YOUTUBE_CHANNELS, &[("part", "snippet"), ("mine", "true")]),
     };
     let reponse = http()
         .get(point)
+        .query(query)
         .bearer_auth(acces.expose_for_transport())
         .send()
         .await
@@ -512,6 +729,24 @@ pub fn identite_depuis(
             let urn = format!("urn:li:person:{}", champ("/sub")?);
             Ok((urn.clone(), urn))
         }
+        // `GET graph.instagram.com/me?fields=user_id,username` →
+        // `{"user_id": "...", "username": "..."}` (ig-user, relevé 2026-09-02).
+        // Le username est le handle humain ; `user_id` est l'id que les
+        // chemins `/{ig-user-id}/media` exigent.
+        PlateformeOauth::Instagram => Ok((champ("/username")?, champ("/user_id")?)),
+        // `GET /v2/user/info/` enveloppe sous `data.user` (get-user-info,
+        // relevé 2026-09-02) ; `open_id` est l'identifiant de TOUS les
+        // endpoints Content Posting/Display.
+        PlateformeOauth::Tiktok => Ok((
+            champ("/data/user/display_name")?,
+            champ("/data/user/open_id")?,
+        )),
+        // `channels.list?mine=true` → `items[0]` est LE channel du jeton ;
+        // son `id` (UC…) est l'id plateforme, `snippet.title` le nom montrable
+        // (channels/list, relevé 2026-09-02). Un compte Google sans channel
+        // YouTube rend `items` vide — Illisible, et l'humain crée son channel
+        // avant de reconnecter.
+        PlateformeOauth::Youtube => Ok((champ("/items/0/snippet/title")?, champ("/items/0/id")?)),
     }
 }
 
@@ -721,9 +956,218 @@ mod tests {
             LINKEDIN_JETON,
             X_ME,
             LINKEDIN_USERINFO,
+            INSTAGRAM_AUTORISATION,
+            INSTAGRAM_JETON,
+            INSTAGRAM_JETON_LONG,
+            INSTAGRAM_RAFRAICHIR,
+            INSTAGRAM_ME,
+            TIKTOK_AUTORISATION,
+            TIKTOK_JETON,
+            TIKTOK_USERINFO,
+            YOUTUBE_AUTORISATION,
+            YOUTUBE_JETON,
+            YOUTUBE_CHANNELS,
         ] {
             assert!(point.starts_with("https://"), "{point}");
         }
+    }
+
+    // -- Les trois flux du chantier IG/TikTok/YouTube, contre leurs docs. ----
+
+    #[test]
+    fn instagram_demarre_sans_pkce_avec_les_scopes_a_virgules() {
+        let flux = demarrer(
+            PlateformeOauth::Instagram,
+            "client-ig",
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        let params = parametres(&flux.authorize_url);
+        assert!(flux.authorize_url.starts_with(INSTAGRAM_AUTORISATION));
+        assert_eq!(params["client_id"], "client-ig");
+        // Les quatre scopes instagram_business_*, séparés par des virgules —
+        // la forme de l'URL d'exemple de business-login (2026-09-02).
+        assert_eq!(params["scope"], INSTAGRAM_SCOPES);
+        assert!(params["scope"].contains(','));
+        assert!(
+            !params.contains_key("code_challenge"),
+            "pas de PKCE documenté"
+        );
+        assert!(flux.verifieur_scelle.is_none());
+    }
+
+    #[test]
+    fn tiktok_demarre_avec_client_key_jamais_client_id() {
+        let flux = demarrer(
+            PlateformeOauth::Tiktok,
+            "clef-tiktok",
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        let params = parametres(&flux.authorize_url);
+        assert!(flux.authorize_url.starts_with(TIKTOK_AUTORISATION));
+        // LE piège de TikTok : `client_key`, pas `client_id`
+        // (oauth-user-access-token-management, 2026-09-02).
+        assert_eq!(params["client_key"], "clef-tiktok");
+        assert!(!params.contains_key("client_id"));
+        assert_eq!(params["scope"], "user.info.basic,video.list,video.publish");
+        assert!(flux.verifieur_scelle.is_none());
+    }
+
+    #[test]
+    fn youtube_demarre_en_offline_et_reforce_le_consentement() {
+        let flux = demarrer(
+            PlateformeOauth::Youtube,
+            "client-g",
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        let params = parametres(&flux.authorize_url);
+        assert!(flux.authorize_url.starts_with(YOUTUBE_AUTORISATION));
+        // Sans ces deux paramètres, pas de refresh token à la reconnexion —
+        // la citation vit sur le code qui les pose.
+        assert_eq!(params["access_type"], "offline");
+        assert_eq!(params["prompt"], "consent");
+        assert_eq!(params["scope"], YOUTUBE_SCOPES);
+        assert!(flux.verifieur_scelle.is_none());
+    }
+
+    #[test]
+    fn les_corps_d_echange_des_trois_nouvelles_plateformes_suivent_leurs_docs() {
+        // Instagram et YouTube : la forme LinkedIn (credentials dans le corps).
+        for plateforme in [PlateformeOauth::Instagram, PlateformeOauth::Youtube] {
+            assert_eq!(
+                corps_d_echange(
+                    plateforme,
+                    "auth-code",
+                    "https://cb.example",
+                    None,
+                    "id",
+                    Some("secret"),
+                ),
+                vec![
+                    ("grant_type", "authorization_code"),
+                    ("code", "auth-code"),
+                    ("client_id", "id"),
+                    ("client_secret", "secret"),
+                    ("redirect_uri", "https://cb.example"),
+                ],
+            );
+        }
+        // TikTok : la même table, mais `client_key` (fetch-user-token, 2026-09-02).
+        assert_eq!(
+            corps_d_echange(
+                PlateformeOauth::Tiktok,
+                "auth-code",
+                "https://cb.example",
+                None,
+                "clef",
+                Some("secret"),
+            ),
+            vec![
+                ("grant_type", "authorization_code"),
+                ("code", "auth-code"),
+                ("client_key", "clef"),
+                ("client_secret", "secret"),
+                ("redirect_uri", "https://cb.example"),
+            ],
+        );
+    }
+
+    #[test]
+    fn les_corps_de_rafraichissement_portent_les_credentials_au_bon_endroit() {
+        // X : client en Basic, le corps ne porte QUE le grant et le jeton.
+        assert_eq!(
+            corps_de_rafraichissement(PlateformeOauth::X, "r1", "id", "secret"),
+            vec![("grant_type", "refresh_token"), ("refresh_token", "r1")],
+        );
+        assert_eq!(
+            corps_de_rafraichissement(PlateformeOauth::Tiktok, "r1", "clef", "secret"),
+            vec![
+                ("grant_type", "refresh_token"),
+                ("client_key", "clef"),
+                ("client_secret", "secret"),
+                ("refresh_token", "r1"),
+            ],
+        );
+        assert_eq!(
+            corps_de_rafraichissement(PlateformeOauth::Youtube, "r1", "id", "secret"),
+            vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", "id"),
+                ("client_secret", "secret"),
+                ("refresh_token", "r1"),
+            ],
+        );
+    }
+
+    /// Le rafraîchissement Instagram recopie le jeton frais dans la case
+    /// refresh : c'est TOUTE l'astuce qui fait marcher la machinerie existante
+    /// (resceller_jetons remplace quand `Some`) sans spécial-casing ailleurs.
+    #[test]
+    fn le_jeton_long_instagram_repart_en_acces_et_en_copie_refresh() {
+        let jeton = jeton_depuis(
+            200,
+            br#"{"access_token":"IGQVJ-long","expires_in":5184000}"#,
+        )
+        .expect("forme documentée ig_exchange_token");
+        let chaine = copie_en_rafraichissement(jeton);
+        assert_eq!(chaine.acces.expose_for_transport(), "IGQVJ-long");
+        assert_eq!(
+            chaine
+                .rafraichissement
+                .as_ref()
+                .expect("la copie existe")
+                .expose_for_transport(),
+            "IGQVJ-long"
+        );
+        assert_eq!(chaine.duree_s, 5_184_000);
+    }
+
+    /// Les fixtures d'identité des trois nouvelles docs, sans réseau.
+    #[test]
+    fn l_identite_des_trois_nouvelles_plateformes_se_lit_comme_leurs_docs() {
+        // ig-user : GET /me?fields=user_id,username (2026-09-02).
+        let ig = identite_depuis(
+            PlateformeOauth::Instagram,
+            200,
+            br#"{"user_id":"17841405822304914","username":"orizn_app"}"#,
+        )
+        .expect("forme documentée Instagram");
+        assert_eq!(ig, ("orizn_app".into(), "17841405822304914".into()));
+        // get-user-info : l'enveloppe data.user (2026-09-02).
+        let tt = identite_depuis(
+            PlateformeOauth::Tiktok,
+            200,
+            br#"{"data":{"user":{"open_id":"723f24d7-e717-40f8","display_name":"Orizn"}},"error":null}"#,
+        )
+        .expect("forme documentée TikTok");
+        assert_eq!(tt, ("Orizn".into(), "723f24d7-e717-40f8".into()));
+        // channels/list : items[0].id + snippet.title (2026-09-02).
+        let yt = identite_depuis(
+            PlateformeOauth::Youtube,
+            200,
+            br#"{"items":[{"id":"UC_x5XG1OV2P6uZZ5FSM9Ttw","snippet":{"title":"Google Developers"}}]}"#,
+        )
+        .expect("forme documentée YouTube");
+        assert_eq!(
+            yt,
+            (
+                "Google Developers".into(),
+                "UC_x5XG1OV2P6uZZ5FSM9Ttw".into()
+            )
+        );
+        // Un compte Google SANS channel : items vide — illisible, pas un panic.
+        assert_eq!(
+            identite_depuis(PlateformeOauth::Youtube, 200, br#"{"items":[]}"#),
+            Err(ErreurPlateforme::Illisible)
+        );
     }
 
     /// Les fixtures d'identité des deux docs, sans réseau.

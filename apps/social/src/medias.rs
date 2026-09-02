@@ -11,9 +11,10 @@
 //! sur l'extension ni sur le Content-Type annoncé, qui sont des déclarations,
 //! pas des preuves.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -351,6 +352,87 @@ impl Telechargeur {
 // consomme — une seule formule, pas deux qui divergeraient à la couture.
 
 // ---------------------------------------------------------------------------
+// Le dépôt des octets vettés — le service des modèles « pull »
+// ---------------------------------------------------------------------------
+
+/// TTL d'un dépôt : 3600 s. Le fait qui le dimensionne : l'`upload_url` de
+/// TikTok est « valid for one hour after issuance »
+/// (content-posting-api-reference-direct-post, rejoué le 2026-09-02) — la
+/// fenêtre pendant laquelle une plateforme qui tire
+/// depuis chez nous a une raison légitime de revenir. Au-delà, la publication
+/// a réussi (et `retirer` a déjà nettoyé) ou échoué (rien à servir).
+pub const TTL_DEPOT: Duration = Duration::from_secs(3600);
+
+/// Le dépôt des octets vettés, adressé par digest — ce que la route publique
+/// `GET /medias/{digest}` sert aux plateformes à modèle « pull » (images
+/// Instagram, photos TikTok).
+///
+/// La garantie d'empreinte tient PAR CONSTRUCTION : `deposer` ne reçoit que
+/// des octets déjà téléchargés et empreintés par le téléchargeur — la
+/// plateforme qui tire `{base}/medias/{digest}` reçoit l'octet exact
+/// contresigné, jamais l'URL du client (que `MediaPret` ne porte même pas).
+///
+/// ponytail: un HashMap sous Mutex et une purge au passage — le volume est
+/// celui des publications en cours, pas d'un CDN ; un vrai balayeur viendra
+/// si un profil montre des dépôts orphelins qui pèsent.
+/// Une entrée du dépôt : (octets vettés, type détecté aux octets, heure de dépôt).
+type EntreeDepot = (Arc<Vec<u8>>, TypeMedia, Instant);
+
+pub struct DepotMedias {
+    entrees: Mutex<HashMap<String, EntreeDepot>>,
+    ttl: Duration,
+}
+
+impl Default for DepotMedias {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DepotMedias {
+    pub fn new() -> Self {
+        Self::avec_ttl(TTL_DEPOT)
+    }
+
+    /// TTL choisi — les tests ne dorment pas une heure pour voir une entrée
+    /// mourir. Public parce que le constructeur de test des adaptateurs (un
+    /// autre module) en a besoin ; en production, seul `new` est appelé.
+    pub fn avec_ttl(ttl: Duration) -> Self {
+        Self {
+            entrees: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// Dépose des octets vettés sous leur digest. L'appelant (l'adaptateur, au
+    /// début de `publier`) tient un `MediaPret` : le digest EST celui des
+    /// octets, la route ne peut pas servir autre chose que ce qui est signé.
+    pub fn deposer(&self, digest: &str, octets: Arc<Vec<u8>>, type_detecte: TypeMedia) {
+        self.entrees
+            .lock()
+            .expect("mutex du depot")
+            .insert(digest.to_owned(), (octets, type_detecte, Instant::now()));
+    }
+
+    /// Retire une entrée — après la confirmation du conteneur plateforme : les
+    /// octets d'un post parti n'ont plus rien à faire sur une route publique.
+    pub fn retirer(&self, digest: &str) {
+        self.entrees.lock().expect("mutex du depot").remove(digest);
+    }
+
+    /// Sert une entrée vivante, et purge les expirées au passage — pas de
+    /// balayeur, le nettoyage vit sur le seul chemin qui regarde la table.
+    pub fn servir(&self, digest: &str) -> Option<(Arc<Vec<u8>>, &'static str)> {
+        let mut entrees = self.entrees.lock().expect("mutex du depot");
+        let ttl = self.ttl;
+        entrees.retain(|_, (_, _, depose)| depose.elapsed() < ttl);
+        entrees
+            .get(digest)
+            .map(|(octets, type_detecte, _)| (octets.clone(), type_detecte.mime()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aide aux tests (partagée avec les tests de mcp.rs)
 // ---------------------------------------------------------------------------
 
@@ -539,4 +621,47 @@ mod tests {
     // adapters/mod.rs — une formule, un seul jeu de tests. Le rejeu de bout
     // en bout (même clé + image différente => cle_reutilisee) est prouvé
     // contre la base dans les tests de mcp.rs.
+
+    // -- Le dépôt des octets vettés. ----------------------------------------
+
+    #[test]
+    fn le_depot_sert_les_octets_exacts_puis_plus_rien_apres_retirer() {
+        let depot = DepotMedias::new();
+        let octets = Arc::new(octets_png(b"pour instagram"));
+        let digest = hex_sha256(&octets);
+
+        assert!(depot.servir(&digest).is_none(), "rien avant le dépôt");
+        depot.deposer(&digest, octets.clone(), TypeMedia::Png);
+
+        let (servis, mime) = depot.servir(&digest).expect("l'entrée vit");
+        // Les octets EXACTS (même allocation, même contenu) et le type détecté
+        // aux octets — jamais une déclaration.
+        assert!(Arc::ptr_eq(&servis, &octets));
+        assert_eq!(mime, "image/png");
+
+        // Un digest inconnu ne sert rien — l'adressage par digest est aussi
+        // l'anti-énumération : 2^256 n'est pas un espace qui se devine.
+        assert!(depot.servir(&"0".repeat(64)).is_none());
+
+        depot.retirer(&digest);
+        assert!(
+            depot.servir(&digest).is_none(),
+            "après retirer, la route publique n'a plus rien à dire"
+        );
+    }
+
+    #[test]
+    fn une_entree_expiree_meurt_au_passage() {
+        let depot = DepotMedias::avec_ttl(Duration::from_millis(0));
+        let octets = Arc::new(octets_png(b"ephemere"));
+        let digest = hex_sha256(&octets);
+        depot.deposer(&digest, octets, TypeMedia::Png);
+        // TTL nul : l'entrée est déjà morte au premier regard, et la purge au
+        // passage l'a retirée de la table (pas seulement cachée).
+        assert!(depot.servir(&digest).is_none());
+        assert!(
+            depot.entrees.lock().unwrap().is_empty(),
+            "purgée, pas cachée"
+        );
+    }
 }

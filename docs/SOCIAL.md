@@ -88,10 +88,33 @@ sous `SOCIAL_MASTER_KEY`, AAD `social://<tenant>/<platform>/<account>` —
 même discipline que `crates/app/src/mcp.rs` sur
 `crates/providers/src/secrets.rs` : un chiffré déplacé ne déchiffre rien.
 
-## Périmètre, et il est fermé : X et LinkedIn — texte, médias, sondages
+## Périmètre : cinq plateformes — X, LinkedIn, Instagram, TikTok, YouTube
 
-Les deux seules plateformes en libre-service — aucune revue d'app entre le
-fondateur et le premier post :
+Cinq adaptateurs derrière les DEUX mêmes traits (`Plateforme`,
+`PlateformeMessagerie`) et les six mêmes outils — la table de l'éditeur est
+passée v2 → v3 (chantier IG/TikTok/YouTube, 2026-09-02) : l'enum `platform`
+compte cinq valeurs, et `post_preview`/`post_publish` gagnent deux champs
+optionnels, `privacy` (`public|friends|followers|private|unlisted` — REQUIS
+par TikTok via `privacy_level`, servi par YouTube via `privacyStatus`, refus
+cité ailleurs) et `publish_at` (ISO 8601 — YouTube seul via
+`status.publishAt`, qui force `private` ; refus cité ailleurs). Les deux
+champs entrent dans l'empreinte globale : un `privacy` différent est un
+contreseing différent.
+
+**La règle des modèles pull, tenue par construction** : Instagram (images ET
+REELS — l'upload direct rupload est « Only for apps that have implemented
+Facebook Login for Business », content-publishing Instagram Login, rejoué le
+2026-09-02, et notre chemin est Instagram Login) et TikTok photos (« Only
+PULL_FROM_URL is allowed », photo-post, rejoué le 2026-09-02) savent « tirer »
+un média depuis une URL. Ils ne tirent JAMAIS l'URL du client : le service
+dépose les octets vettés dans un dépôt adressé par digest et sert
+`GET /medias/{digest}` (public, sans auth, `no-store`, TTL 1 h = la fenêtre
+`upload_url` TikTok) — la plateforme tire l'octet exact contresigné, et
+`MediaPret` ne porte même pas l'URL d'origine. TikTok vidéo part en octets
+DIRECTS (FILE_UPLOAD chunké 5–64 MB, final ≤ 128 MB) ; YouTube en resumable
+(chunks multiples de 256 KB, 308 par chunk non final).
+
+Les cinq, chaque limite citée et datée dans son adaptateur :
 
 * **X** — `POST /2/tweets`, contexte utilisateur OAuth 2.0. Le document
   RFC 8414 d'`api.x.com` annonce `token_endpoint_auth_methods_supported:
@@ -110,12 +133,37 @@ fondateur et le premier post :
   répond « la plateforme ne les sert pas » au lieu de zéros — les analytics
   d'organisation sont derrière le Marketing API Program, hors périmètre.
 
-Les médias sont LÀ (phase 2 livrée — voir plus bas) : photos, vidéo,
-sondages, et documents PDF côté LinkedIn, dans les ARGUMENTS de
-`post_preview`/`post_publish` — table toujours à six outils, version bumpée
-1 → 2. Meta/TikTok/Threads exigent des revues que seul le fondateur peut
-déposer — la liste exécutable est ci-dessous, on ne les code pas
-aujourd'hui.
+* **Instagram** — chemin « Instagram API with Instagram Login » (compte pro,
+  PAS de Page Facebook). Image JPEG SEUL (« 8 MB maximum », largeur
+  320–1440, ratio 4:5 à 1.91:1, alt_text ≤ 1000), REELS MP4/MOV 3 s–15 min
+  300 MB, carrousel 2–10, `is_ai_generated` servi (= `made_with_ai`),
+  100 posts API/24 h (verdict informatif). Métriques : like_count +
+  comments_count (les insights complets = chemin Facebook Login). Version
+  Graph figée v26.0. Tout rejoué le 2026-09-02 (ig-user/media,
+  content-publishing Instagram Login).
+* **TikTok** — Content Posting API (Direct Post) + Display API. Vidéo
+  MP4/WebM/MOV, titre ≤ 2200 unités UTF-16, FILE_UPLOAD direct ; photos
+  WebP/JPEG jusqu'à 35, description ≤ 4000, PULL_FROM_URL seul (préfixe
+  d'URL à vérifier au portail — voir la liste fondateur) ; `is_aigc` servi ;
+  `privacy_level` REQUIS, vérifié contre `privacy_level_options`
+  (creator_info/query obligatoire avant chaque post, 20 req/min) ; défaut
+  sans `privacy` : SELF_ONLY. Métriques : view/like/comment/share_count
+  (scope video.list). Rejoué le 2026-09-02 (direct-post, photo-post,
+  media-transfer-guide, content-sharing-guidelines).
+* **YouTube** — Data API v3, la plus riche. Vidéo en resumable direct
+  (256 GB côté plateforme, 512 MiB notre plafond), `media[].title`
+  OBLIGATOIRE (`snippet.title`), texte = description, une image JPEG/PNG
+  accompagnante = miniature (2 MB max, 50 unités), `privacy`
+  private/public/unlisted, `publish_at` (force private — « It can be set
+  only if the privacy status of the video is private », docs/videos, rejoué
+  le 2026-09-02). GRATUIT : le quota est la seule monnaie — le champ de
+  sortie `cout_quota` porte les unités, `cost_estimate_usd` reste `None`.
+
+Les médias (phase médias) : photos, vidéo, sondages, et documents PDF côté
+LinkedIn, dans les ARGUMENTS de `post_preview`/`post_publish` — table
+toujours à six outils, versions bumpées 1 → 2 (médias) → 3 (IG/TikTok/
+YouTube). Threads et les Pages Facebook restent hors périmètre (revues à
+déposer — liste ci-dessous).
 
 ## La seconde surface — `/mcp/messagerie`
 
@@ -157,6 +205,22 @@ est pas est un choix cité : `post_quote` (Enterprise seulement chez X),
   répondre à qui a écrit en premier n'est pas un contact à froid. Aucun outil
   MCP ne lit ni n'écrit cette table : un agent n'efface pas la liste des gens
   qui ont dit non.
+* **Instagram, TikTok et YouTube entrent dans le registre messagerie** (la
+  table, elle, ne bouge pas : v1, empreinte intacte) — chacun sert SA part et
+  refuse le reste avec citation datée (rejouées le 2026-09-02). Instagram :
+  `dm_reply` (fenêtre 24 h, divulgation d'automatisation préfixée PAR
+  l'adaptateur), `post_comment` avec `parent_comment_id`
+  (`POST /<COMMENT_ID>/replies`), `read_post`/`read_timeline` (ses médias) ;
+  refusés : `dm_open` (le business répond, il n'initie pas), likes et
+  commentaires racine (absents de comment-moderation), recherche (IPCA +
+  App Review), `inbox_list` (webhooks non câblés). TikTok : lectures de ses
+  propres vidéos/profil seulement — AUCUN scope commentaires/likes/DM
+  (tiktok-api-scopes, rejoué : la liste exhaustive n'en porte pas ; la
+  Research API est réservée aux chercheurs vettés). YouTube :
+  `post_reply`/`post_comment` (commentThreads/comments.insert, 50 unités),
+  `post_like`/`post_unlike` (videos.rate, 50), `search_posts` (bucket dédié
+  100/jour), lectures (1–2 unités) ; refusés : DM (aucune ressource),
+  bookmarks (Watch Later retiré de l'API), reposts (n'existent pas).
 * **LinkedIn ne sert RIEN de cette table à un membre self-serve** : chaque
   outil rend `plateforme_ne_sert_pas` avec la citation datée du 2026-09-02 et
   le fait qui débloquerait (`apps/social/src/adapters/linkedin.rs`) — jamais
@@ -232,37 +296,76 @@ le 2026-09-02.
   Portal), la recherche, les bookmarks (l'API n'existe pas).
   **Délai : non publié par la doc.**
 
-### Meta (Pages + Instagram) — Advanced Access (phase 2)
+### Meta/Instagram — jour un SANS revue, puis l'Advanced Access
 
-* **Portail** : https://developers.facebook.com (App Review → Permissions
-  and Features → Advanced Access).
-* **Quoi** : demander, pour publier au nom de tiers via Facebook Login :
-  `pages_manage_posts` (+ ses dépendances `pages_read_engagement`,
-  `pages_show_list`) pour les Pages, et `instagram_basic` +
-  `instagram_content_publish` pour Instagram ; la voie Instagram Login
-  demande `instagram_business_basic` + `instagram_business_content_publish`
-  (developers.facebook.com/docs/instagram-platform/content-publishing et
-  /docs/permissions, 2026-09-02).
-* **La revue exige** : une URL de politique de confidentialité, une vidéo de
-  démo (screencast montrant chaque permission en usage — « provide specific
-  examples of why your app needs to create or manage posts on behalf of
-  other users »), et la vérification business de l'entreprise.
-* **Débloque** : publier pour des comptes qui n'ont aucun rôle sur notre
-  app. **Délai : non publié par la doc** ; la sonde note seulement que la
-  revue « impose son délai avant de publier pour un tiers ».
+* **Portail** : https://developers.facebook.com.
+* **Jour un** : créer l'app, ajouter le produit Instagram (chemin
+  « Instagram API with Instagram Login » — compte professionnel, pas de Page
+  Facebook), et donner au compte du fondateur un RÔLE sur l'app : « If your
+  app will only be used by app users who have a role on the app itself, App
+  Review is not required » (app-review, rejoué le 2026-09-02) — c'est le
+  Standard Access, « can only be requested from app users who have a role on
+  the requesting app » (access-levels, rejoué le 2026-09-02). Tout le flux
+  (OAuth, publication, commentaires, DM) se teste ainsi sans revue. Pour les
+  DM entrants, activer « Allow Access to Messages » dans les réglages
+  Instagram du compte. Poser `SOCIAL_META_CLIENT_ID` /
+  `SOCIAL_META_CLIENT_SECRET` (META et pas INSTAGRAM : l'app cliente vit
+  chez Meta). Le service exige aussi que `SOCIAL_PUBLIC_URL` soit joignable
+  publiquement : Instagram « cURL » les médias sur `GET /medias/{digest}`.
+  **Délai : aucun.**
+* **Pour servir des tiers (Tech Provider)** : Advanced Access permission par
+  permission (les 4 scopes `instagram_business_*`), « at least 1 successful
+  API call » avant de soumettre, screencasts, et « Business Verification is
+  required to get Advanced Access » (access-levels, rejoué le 2026-09-02).
+  Gratuit. **Délai : non publié par la doc.**
 
-### TikTok — l'audit qui lève SELF_ONLY (phase 2)
+### TikTok — jour un en Sandbox, puis l'audit qui lève SELF_ONLY
 
 * **Portail** : https://developers.tiktok.com.
-* **Quoi** : enregistrer l'app, ajouter la **Content Posting API** (Direct
-  Post activé), obtenir le scope `video.publish` — puis demander **l'audit**
-  du client : « All content posted by unaudited clients will be restricted
-  to private viewing mode » — c'est le `SELF_ONLY` de la sonde — et « your
-  API client must undergo an audit to verify compliance with our Terms of
-  Service » (doc Content Posting API, get-started, 2026-09-02).
-* **Débloque** : des posts publics pour des comptes tiers ; sans audit,
-  l'app ne poste qu'en privé pour son propre compte de test.
+* **Jour un** : créer l'app, ajouter Login Kit + **Content Posting API**
+  (Direct Post) ; la Sandbox se crée sans soumettre l'app en revue (jusqu'à
+  10 comptes cibles, config importable vers un Draft de production).
+  **Vérifier le PRÉFIXE d'URL `{SOCIAL_PUBLIC_URL}/medias/` dans le
+  portail** — requis par PULL_FROM_URL : « Once a URL prefix's ownership is
+  verified, all URLs with the exact prefix are considered owned by the
+  developer application » (media-transfer-guide, rejoué le 2026-09-02) ;
+  sans lui, les photos prennent `url_ownership_unverified`. Redirect URI
+  https statique. Poser `SOCIAL_TIKTOK_CLIENT_ID` (la valeur est le
+  `client_key` du portail) / `SOCIAL_TIKTOK_CLIENT_SECRET`.
+* **Avant audit, l'état que l'aperçu rend en verdict** : « Unaudited API
+  Clients can only post contents in SELF_ONLY viewership », « up to 5 users
+  to post in a 24 hour window » (content-sharing-guidelines, rejoué le
+  2026-09-02) — le défaut du service (`privacy` absent = SELF_ONLY) épouse
+  cet état ; demander `public` avant audit sort en refus nommé.
+* **L'audit** (« undergo an audit to verify compliance with our Terms of
+  Service », rejoué le 2026-09-02) lève tout. Gratuit.
   **Délai : non publié par la doc.**
+
+### Google/YouTube — jour un en Testing, DEUX verrous INDÉPENDANTS
+
+* **Portail** : https://console.cloud.google.com.
+* **Jour un** : projet + YouTube Data API v3 + écran de consentement
+  (external), le fondateur en test user. ATTENTION : en Testing « a
+  publishing status of "Testing" is issued a refresh token expiring in
+  7 days » (oauth2, rejoué le 2026-09-02) — reconnexion hebdomadaire jusqu'à
+  la vérification. Autre limite citée en dur dans `oauth_flux.rs` : 100
+  refresh tokens par compte Google et par client_id, le plus ancien meurt en
+  silence. Poser `SOCIAL_GOOGLE_CLIENT_ID` / `SOCIAL_GOOGLE_CLIENT_SECRET`
+  (GOOGLE et pas YOUTUBE : l'app cliente vit chez Google).
+* **Verrou 1 — la vérification OAuth** (passage en production + scopes
+  sensibles) : lève l'écran « unverified app » et le cap de 100 utilisateurs.
+* **Verrou 2 — l'audit YouTube**
+  (https://support.google.com/youtube/contact/yt_api_form) : « All videos
+  uploaded via the videos.insert endpoint from unverified API projects
+  created after 28 July 2020 will be restricted to private viewing mode. To
+  lift this restriction, each API project must undergo an audit »
+  (videos/insert, rejoué le 2026-09-02) — et c'est le prérequis de toute
+  extension de quota. Les deux verrous sont indépendants et gratuits.
+  **Délais : non publiés par la doc.**
+* **Quotas par défaut** (determine_quota_cost, rejoué le 2026-09-02) :
+  « 100 search.list calls, 100 videos.insert calls, and 10,000 units per
+  day combined for all other endpoints » — les buckets dédiés ont remplacé
+  les vieux 1600 unités/upload. Reset à minuit heure du Pacifique.
 
 ### Threads — cinq scopes et une revue (phase 2)
 
@@ -304,9 +407,15 @@ le 2026-09-02.
    vers l'upload chunké), PPT/PPTX/DOC/DOCX LinkedIn (magic bytes zip/OLE
    ambigus), frames/pixels/durée non vérifiés aux octets, GIF statique non
    distingué du GIF animé.
-2. **Meta, TikTok, Threads** — après les revues ci-dessus (credentials et
-   dépôts que seul le fondateur peut faire), chacune une plateforme de plus
-   derrière les six mêmes outils, sans nouvel outil.
+2. **Instagram, TikTok, YouTube — LIVRÉS** (chantier du 2026-09-02) : trois
+   adaptateurs de plus derrière les six mêmes outils et le registre
+   messagerie, sans nouvel outil — voir le périmètre ci-dessus. Le jour un
+   passe par les étapes fondateur SANS revue (rôle sur l'app Meta, Sandbox
+   TikTok, Testing Google) ; les revues listées lèvent les états avant-audit
+   que l'aperçu rend en verdicts.
+3. **Threads, Pages Facebook** — après leurs revues (dépôts que seul le
+   fondateur peut faire), chacune une plateforme de plus derrière les six
+   mêmes outils, sans nouvel outil.
 
 ## L'entrée au catalogue — plus tard, et pourquoi
 

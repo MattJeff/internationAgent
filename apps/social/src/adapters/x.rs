@@ -50,8 +50,9 @@ use serde_json::json;
 
 use super::{
     ActionFaite, Apercu, ApercuMedia, ElementLu, ErreurMessagerie, ErreurPlateforme, Inbox,
-    MediaPret, MessagePrive, Metriques, Plateforme, PlateformeMessagerie, PostsLus, ProfilLu,
-    Publication, ReponsePubliee, Sondage, TypeMedia, empreinte_globale, http, http_upload,
+    MediaPret, MessagePrive, Metriques, OptionsPost, Plateforme, PlateformeMessagerie, PostsLus,
+    ProfilLu, Publication, ReponsePubliee, Sondage, TypeMedia, empreinte_globale, envoyer, http,
+    http_upload,
 };
 
 /// <https://docs.x.com/x-api/posts/creation-of-a-post>, relevé le 2026-09-02.
@@ -557,10 +558,29 @@ impl Plateforme for X {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
+        options: &OptionsPost,
     ) -> Apercu {
         // made_with_ai : X le sert (champ de POST /2/tweets) — rien à refuser.
         let _ = made_with_ai;
         let mut verdicts = Vec::new();
+
+        // Table v3 : X ne sert ni visibilité ni planification à la création —
+        // aucun champ correspondant dans POST /2/tweets (creation-of-a-post,
+        // relevé le 2026-09-02). Un refus cité, jamais une ignorance muette.
+        if options.privacy.is_some() {
+            verdicts.push(
+                "x ne sert pas `privacy` : aucun champ de visibilité dans POST /2/tweets \
+                 (creation-of-a-post, relevé le 2026-09-02)"
+                    .to_owned(),
+            );
+        }
+        if options.publish_at.is_some() {
+            verdicts.push(
+                "x ne sert pas `publish_at` : aucune planification dans POST /2/tweets \
+                 (creation-of-a-post, relevé le 2026-09-02)"
+                    .to_owned(),
+            );
+        }
 
         let photos = medias
             .iter()
@@ -634,7 +654,7 @@ impl Plateforme for X {
         let base = cout_creation_post(texte);
         Apercu {
             rendered_text: texte.to_owned(),
-            digest: empreinte_globale(texte, medias, sondage, made_with_ai),
+            digest: empreinte_globale(texte, medias, sondage, made_with_ai, options),
             platform_limits_ok: !texte.trim().is_empty()
                 && poids(texte) <= LIMITE_PONDEREE
                 && verdicts.is_empty()
@@ -644,6 +664,8 @@ impl Plateforme for X {
             cost_estimate_usd: Some(base + COUT_PAR_ALT_TEXT_USD * alt_texts as f64),
             media,
             verdicts,
+            // X compte en dollars, pas en unités de quota.
+            cout_quota: None,
         }
     }
 
@@ -655,7 +677,10 @@ impl Plateforme for X {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
+        _options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme> {
+        // `options` : refusé par l'aperçu (C7 le passe avant publier) — un
+        // privacy/publish_at posé ne peut pas arriver ici.
         let mut media_ids = Vec::with_capacity(medias.len());
         for m in medias {
             let media_id = match m.type_detecte {
@@ -987,21 +1012,6 @@ pub fn profil_depuis(statut: u16, corps: &[u8]) -> Result<ProfilLu, ErreurPlatef
     })
 }
 
-/// Envoie et lit (statut, corps) — le corps ne finit jamais dans une erreur,
-/// seul le lecteur décidera ce qu'il en garde.
-async fn envoyer(requete: reqwest::RequestBuilder) -> Result<(u16, Vec<u8>), ErreurPlateforme> {
-    let reponse = requete
-        .send()
-        .await
-        .map_err(|_| ErreurPlateforme::Injoignable)?;
-    let statut = reponse.status().as_u16();
-    let corps = reponse
-        .bytes()
-        .await
-        .map_err(|_| ErreurPlateforme::Injoignable)?;
-    Ok((statut, corps.to_vec()))
-}
-
 #[async_trait]
 impl PlateformeMessagerie for X {
     fn nom(&self) -> &'static str {
@@ -1090,6 +1100,7 @@ impl PlateformeMessagerie for X {
             // 0,015 — ou 0,200 dès que le texte porte une URL : le même
             // calcul que l'aperçu de l'éditeur, à un seul endroit.
             cout_usd: cout_creation_post(texte),
+            cout_quota: None,
         })
     }
 
@@ -1125,6 +1136,7 @@ impl PlateformeMessagerie for X {
         }
         Ok(ActionFaite {
             cout_usd: COUT_INTERACTION_CREATE_USD,
+            cout_quota: None,
         })
     }
 
@@ -1145,6 +1157,7 @@ impl PlateformeMessagerie for X {
         }
         Ok(ActionFaite {
             cout_usd: COUT_INTERACTION_DELETE_USD,
+            cout_quota: None,
         })
     }
 
@@ -1166,6 +1179,7 @@ impl PlateformeMessagerie for X {
         }
         Ok(ActionFaite {
             cout_usd: COUT_BOOKMARK_USD,
+            cout_quota: None,
         })
     }
 
@@ -1186,6 +1200,7 @@ impl PlateformeMessagerie for X {
         }
         Ok(ActionFaite {
             cout_usd: COUT_INTERACTION_DELETE_USD,
+            cout_quota: None,
         })
     }
 
@@ -1207,6 +1222,7 @@ impl PlateformeMessagerie for X {
         }
         Ok(ActionFaite {
             cout_usd: COUT_INTERACTION_CREATE_USD,
+            cout_quota: None,
         })
     }
 
@@ -1249,7 +1265,11 @@ impl PlateformeMessagerie for X {
         // Facturé PAR RÉSULTAT (0,005, dédup 24 h UTC) : le coût réel est
         // résultats × tarif — le plan exige que l'outil le rende.
         let cout_usd = posts.len() as f64 * COUT_PAR_POST_LU_USD;
-        Ok(PostsLus { posts, cout_usd })
+        Ok(PostsLus {
+            posts,
+            cout_usd,
+            cout_quota: None,
+        })
     }
 
     async fn read_post(
@@ -1295,7 +1315,11 @@ impl PlateformeMessagerie for X {
         .await?;
         let posts = elements_depuis(statut, &corps, "author_id")?;
         let cout_usd = posts.len() as f64 * COUT_PAR_POST_LU_USD;
-        Ok(PostsLus { posts, cout_usd })
+        Ok(PostsLus {
+            posts,
+            cout_usd,
+            cout_quota: None,
+        })
     }
 }
 
@@ -1304,6 +1328,12 @@ mod tests {
     use super::*;
     use crate::adapters::empreinte;
     use crate::adapters::test_medias::media;
+
+    /// Des options vides — le cas de tous les posts d'avant la table v3.
+    const SANS: OptionsPost = OptionsPost {
+        privacy: None,
+        publish_at: None,
+    };
 
     fn avec_alt(mut m: MediaPret, alt: &str) -> MediaPret {
         m.alt_text = Some(alt.to_owned());
@@ -1488,28 +1518,28 @@ mod tests {
         // 280 latins passent, 281 non.
         assert_eq!(poids(&"a".repeat(280)), 280);
         assert!(
-            X.apercu(&"a".repeat(280), &[], None, false)
+            X.apercu(&"a".repeat(280), &[], None, false, &SANS)
                 .platform_limits_ok
         );
         assert!(
-            !X.apercu(&"a".repeat(281), &[], None, false)
+            !X.apercu(&"a".repeat(281), &[], None, false, &SANS)
                 .platform_limits_ok
         );
         // « All URLs count as exactly 23 characters ».
         assert_eq!(poids("https://exemple.example/un/chemin/vraiment/long"), 23);
         // « emojis count as 2 » : 140 passent, 141 débordent.
         assert!(
-            X.apercu(&"🦀".repeat(140), &[], None, false)
+            X.apercu(&"🦀".repeat(140), &[], None, false, &SANS)
                 .platform_limits_ok
         );
         assert!(
-            !X.apercu(&"🦀".repeat(141), &[], None, false)
+            !X.apercu(&"🦀".repeat(141), &[], None, false, &SANS)
                 .platform_limits_ok
         );
         // Les blancs comptent aussi.
         assert_eq!(poids("a b"), 3);
         // Un texte vide ne part pas.
-        assert!(!X.apercu("   ", &[], None, false).platform_limits_ok);
+        assert!(!X.apercu("   ", &[], None, false, &SANS).platform_limits_ok);
     }
 
     /// « Post: Create (with URL) $0.200 » contre « Post: Create $0.015 » — le
@@ -1518,11 +1548,12 @@ mod tests {
     #[test]
     fn le_cout_distingue_un_post_avec_lien_et_compte_les_alt_texts() {
         assert_eq!(
-            X.apercu("bonjour", &[], None, false).cost_estimate_usd,
+            X.apercu("bonjour", &[], None, false, &SANS)
+                .cost_estimate_usd,
             Some(0.015)
         );
         assert_eq!(
-            X.apercu("bonjour https://orizn.example", &[], None, false)
+            X.apercu("bonjour https://orizn.example", &[], None, false, &SANS)
                 .cost_estimate_usd,
             Some(0.200)
         );
@@ -1532,14 +1563,15 @@ mod tests {
             media(b"c", TypeMedia::Png),
         ];
         assert_eq!(
-            X.apercu("bonjour", &medias, None, false).cost_estimate_usd,
+            X.apercu("bonjour", &medias, None, false, &SANS)
+                .cost_estimate_usd,
             Some(0.015 + 2.0 * 0.005)
         );
     }
 
     #[test]
     fn l_apercu_rend_le_texte_exact_et_son_empreinte() {
-        let apercu = X.apercu("Texte à publier", &[], None, false);
+        let apercu = X.apercu("Texte à publier", &[], None, false, &SANS);
         assert_eq!(apercu.rendered_text, "Texte à publier");
         assert_eq!(apercu.digest, empreinte("Texte à publier"));
         assert!(apercu.media.is_empty());
@@ -1550,7 +1582,7 @@ mod tests {
     fn les_verdicts_medias_refusent_ce_que_x_refuse() {
         // 5 photos → « 4 max ».
         let cinq: Vec<_> = (0..5).map(|i| media(&[i as u8], TypeMedia::Jpeg)).collect();
-        let apercu = X.apercu("t", &cinq, None, false);
+        let apercu = X.apercu("t", &cinq, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("4 photos max")),
@@ -1560,7 +1592,7 @@ mod tests {
 
         // image + vidéo → « pas de mélange ».
         let mixte = vec![media(b"i", TypeMedia::Png), media(b"v", TypeMedia::Mp4)];
-        let apercu = X.apercu("t", &mixte, None, false);
+        let apercu = X.apercu("t", &mixte, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.verdicts.iter().any(|v| v.contains("pas de mélange")),
@@ -1570,7 +1602,7 @@ mod tests {
 
         // 6 MB en tweet_image → « 5 MB max », taille citée.
         let lourde = vec![media(&vec![0u8; 6_000_000], TypeMedia::Jpeg)];
-        let apercu = X.apercu("t", &lourde, None, false);
+        let apercu = X.apercu("t", &lourde, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.media[0]
@@ -1586,7 +1618,8 @@ mod tests {
                 "t",
                 &[media(&vec![0u8; 6_000_000], TypeMedia::Gif)],
                 None,
-                false
+                false,
+                &SANS
             )
             .platform_limits_ok
         );
@@ -1595,14 +1628,15 @@ mod tests {
                 "t",
                 &[media(&vec![0u8; 16_000_000], TypeMedia::Gif)],
                 None,
-                false
+                false,
+                &SANS
             )
             .platform_limits_ok
         );
 
         // alt 1001 → « 1000 max ».
         let alt_long = vec![avec_alt(media(b"i", TypeMedia::Png), &"x".repeat(1001))];
-        let apercu = X.apercu("t", &alt_long, None, false);
+        let apercu = X.apercu("t", &alt_long, None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.media[0].verdicts.iter().any(|v| v.contains("1000")),
@@ -1614,7 +1648,8 @@ mod tests {
                 "t",
                 &[avec_alt(media(b"i", TypeMedia::Png), &"x".repeat(1000))],
                 None,
-                false
+                false,
+                &SANS
             )
             .platform_limits_ok
         );
@@ -1622,10 +1657,13 @@ mod tests {
         // title → refusé (X ne le sert pas).
         let mut avec_titre = media(b"i", TypeMedia::Png);
         avec_titre.title = Some("Titre".to_owned());
-        assert!(!X.apercu("t", &[avec_titre], None, false).platform_limits_ok);
+        assert!(
+            !X.apercu("t", &[avec_titre], None, false, &SANS)
+                .platform_limits_ok
+        );
 
         // PDF → refusé, « aucun type document dans l'enum media_type ».
-        let apercu = X.apercu("t", &[media(b"%PDF-", TypeMedia::Pdf)], None, false);
+        let apercu = X.apercu("t", &[media(b"%PDF-", TypeMedia::Pdf)], None, false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu.media[0]
@@ -1638,7 +1676,10 @@ mod tests {
 
         // 4 photos propres passent.
         let quatre: Vec<_> = (0..4).map(|i| media(&[i as u8], TypeMedia::Webp)).collect();
-        assert!(X.apercu("t", &quatre, None, false).platform_limits_ok);
+        assert!(
+            X.apercu("t", &quatre, None, false, &SANS)
+                .platform_limits_ok
+        );
     }
 
     #[test]
@@ -1649,7 +1690,7 @@ mod tests {
             duration_minutes: 1440,
         };
         assert!(
-            X.apercu("La question ?", &[], Some(&bon), false)
+            X.apercu("La question ?", &[], Some(&bon), false, &SANS)
                 .platform_limits_ok
         );
 
@@ -1658,7 +1699,7 @@ mod tests {
             question: Some("Q ?".to_owned()),
             ..bon.clone()
         };
-        let apercu = X.apercu("t", &[], Some(&avec_question), false);
+        let apercu = X.apercu("t", &[], Some(&avec_question), false, &SANS);
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu
@@ -1675,7 +1716,7 @@ mod tests {
             ..bon.clone()
         };
         assert!(
-            !X.apercu("t", &[], Some(&option_longue), false)
+            !X.apercu("t", &[], Some(&option_longue), false, &SANS)
                 .platform_limits_ok
         );
 
@@ -1685,7 +1726,7 @@ mod tests {
                 duration_minutes: duree,
                 ..bon.clone()
             };
-            let apercu = X.apercu("t", &[], Some(&hors), false);
+            let apercu = X.apercu("t", &[], Some(&hors), false, &SANS);
             assert!(!apercu.platform_limits_ok);
             assert!(
                 apercu.verdicts.iter().any(|v| v.contains("10080")),
@@ -1695,7 +1736,13 @@ mod tests {
         }
 
         // Sondage + média : non documenté, donc refusé.
-        let apercu = X.apercu("t", &[media(b"i", TypeMedia::Png)], Some(&bon), false);
+        let apercu = X.apercu(
+            "t",
+            &[media(b"i", TypeMedia::Png)],
+            Some(&bon),
+            false,
+            &SANS,
+        );
         assert!(!apercu.platform_limits_ok);
         assert!(
             apercu
@@ -1708,10 +1755,38 @@ mod tests {
     }
 
     #[test]
+    fn privacy_et_publish_at_sont_refuses_avec_citation() {
+        // Table v3 : X ne les sert pas — le verdict le dit, l'ignorance
+        // silencieuse est interdite.
+        let avec_privacy = OptionsPost {
+            privacy: Some(crate::adapters::Privacy::Private),
+            publish_at: None,
+        };
+        let apercu = X.apercu("t", &[], None, false, &avec_privacy);
+        assert!(!apercu.platform_limits_ok);
+        assert!(
+            apercu.verdicts.iter().any(|v| v.contains("privacy")),
+            "{:?}",
+            apercu.verdicts
+        );
+        let avec_date = OptionsPost {
+            privacy: None,
+            publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+        };
+        let apercu = X.apercu("t", &[], None, false, &avec_date);
+        assert!(!apercu.platform_limits_ok);
+        assert!(
+            apercu.verdicts.iter().any(|v| v.contains("publish_at")),
+            "{:?}",
+            apercu.verdicts
+        );
+    }
+
+    #[test]
     fn made_with_ai_passe_chez_x_et_entre_dans_l_empreinte() {
-        let apercu = X.apercu("t", &[], None, true);
+        let apercu = X.apercu("t", &[], None, true, &SANS);
         assert!(apercu.platform_limits_ok);
-        assert_ne!(apercu.digest, X.apercu("t", &[], None, false).digest);
+        assert_ne!(apercu.digest, X.apercu("t", &[], None, false, &SANS).digest);
     }
 
     #[test]

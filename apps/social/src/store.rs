@@ -25,9 +25,15 @@ pub struct CompteScelle {
     pub platform_user_id: Option<String>,
     pub sealed_token: Option<Vec<u8>>,
     /// Le refresh token scellé, quand la plateforme en a émis un (X avec
-    /// `offline.access`). C'est lui qui permet au chemin de publication de
-    /// survivre à l'expiration du jeton d'accès sans re-consentement humain.
+    /// `offline.access` ; chez Instagram c'est une COPIE du jeton long, qui
+    /// se rafraîchit lui-même). C'est lui qui permet au chemin de publication
+    /// de survivre à l'expiration du jeton d'accès sans re-consentement humain.
     pub sealed_refresh: Option<Vec<u8>>,
+    /// L'heure de mort annoncée du jeton d'accès, en secondes epoch — lue en
+    /// entier plutôt qu'en timestamptz pour que `mcp::doit_rafraichir` reste
+    /// une fonction pure sur deux nombres. None = inconnue (compte d'avant
+    /// 0006) : pas de rafraîchissement proactif, le chemin 401 fait foi.
+    pub token_expires_epoch: Option<i64>,
 }
 
 /// Une ligne de social_posts, telle que les outils la rendent.
@@ -83,7 +89,8 @@ pub async fn compte_scelle(
     compte: Uuid,
 ) -> sqlx::Result<Option<CompteScelle>> {
     let ligne = sqlx::query(
-        "SELECT id, platform, handle, platform_user_id, sealed_token, sealed_refresh \
+        "SELECT id, platform, handle, platform_user_id, sealed_token, sealed_refresh, \
+                EXTRACT(EPOCH FROM token_expires_at)::bigint AS token_expires_epoch \
          FROM social_accounts WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
@@ -97,11 +104,15 @@ pub async fn compte_scelle(
         platform_user_id: l.get("platform_user_id"),
         sealed_token: l.get("sealed_token"),
         sealed_refresh: l.get("sealed_refresh"),
+        token_expires_epoch: l.get("token_expires_epoch"),
     }))
 }
 
 /// Connecte (ou reconnecte) un compte. L'upsert est ce qui permet a l'AAD de
 /// porter le handle : la ligne survit a la reconnexion, le scellement aussi.
+// Huit paramètres plats pour un INSERT plat : les grouper dans une struct ne
+// ferait que déplacer les mêmes huit noms — le SQL en dessous est la vérité.
+#[allow(clippy::too_many_arguments)]
 pub async fn connecter_compte(
     pool: &PgPool,
     tenant: Uuid,
@@ -110,19 +121,25 @@ pub async fn connecter_compte(
     platform_user_id: Option<&str>,
     sealed_token: &[u8],
     sealed_refresh: Option<&[u8]>,
+    duree_s: Option<i64>,
 ) -> sqlx::Result<Uuid> {
     let ligne = sqlx::query(
         // COALESCE sur platform_user_id : une reconnexion qui ne le porterait
         // pas n'efface jamais un id deja connu — le meme argument que le
         // refresh token dans resceller_jetons.
+        // token_expires_at = now() + duree_s : l'heure de mort du jeton frais.
+        // NULL quand la duree est inconnue — et une reconnexion ECRASE (pas de
+        // COALESCE ici) : le jeton est neuf, son ancienne heure de mort ment.
         "INSERT INTO social_accounts \
-             (id, tenant_id, platform, handle, platform_user_id, sealed_token, sealed_refresh) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             (id, tenant_id, platform, handle, platform_user_id, sealed_token, sealed_refresh, \
+              token_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8)) \
          ON CONFLICT (tenant_id, platform, handle) \
          DO UPDATE SET sealed_token = EXCLUDED.sealed_token, \
                        sealed_refresh = EXCLUDED.sealed_refresh, \
                        platform_user_id = COALESCE(EXCLUDED.platform_user_id, \
                                                    social_accounts.platform_user_id), \
+                       token_expires_at = EXCLUDED.token_expires_at, \
                        status = 'connected' \
          RETURNING id",
     )
@@ -133,6 +150,7 @@ pub async fn connecter_compte(
     .bind(platform_user_id)
     .bind(sealed_token)
     .bind(sealed_refresh)
+    .bind(duree_s.map(|s| s as f64))
     .fetch_one(pool)
     .await?;
     Ok(ligne.get("id"))
@@ -150,16 +168,22 @@ pub async fn resceller_jetons(
     compte: Uuid,
     sealed_token: &[u8],
     sealed_refresh: Option<&[u8]>,
+    duree_s: Option<i64>,
 ) -> sqlx::Result<()> {
     sqlx::query(
+        // Meme COALESCE pour l'heure de mort que pour le refresh : une duree
+        // absente ne remplace pas une heure connue par NULL — mais une duree
+        // connue ecrase, le jeton vient d'etre re-emis.
         "UPDATE social_accounts \
-         SET sealed_token = $3, sealed_refresh = COALESCE($4, sealed_refresh) \
+         SET sealed_token = $3, sealed_refresh = COALESCE($4, sealed_refresh), \
+             token_expires_at = COALESCE(now() + make_interval(secs => $5), token_expires_at) \
          WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
     .bind(tenant)
     .bind(sealed_token)
     .bind(sealed_refresh)
+    .bind(duree_s.map(|s| s as f64))
     .execute(pool)
     .await?;
     Ok(())
