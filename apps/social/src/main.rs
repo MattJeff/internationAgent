@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 pub mod adapters;
 pub mod mcp;
+pub mod medias;
 pub mod oauth_flux;
 pub mod store;
 pub mod tenants;
@@ -77,6 +78,10 @@ async fn main() -> anyhow::Result<()> {
             Sha256::digest(clef.as_bytes()).into(),
         )),
         adaptateurs: adapters::adaptateurs(),
+        // Le vrai téléchargeur : https seul, IP publiques seules, plafond
+        // 512 MiB — la boucle locale n'est ouvrable QUE par le constructeur
+        // de test, jamais d'ici ni d'une variable d'environnement.
+        telechargeur: medias::Telechargeur::new(),
         url_publique: std::env::var("SOCIAL_PUBLIC_URL")
             .unwrap_or_else(|_| format!("http://{bind}")),
         // Les credentials client OAuth, enregistres par le fondateur sur
@@ -270,6 +275,7 @@ mod tests {
                 Sha256::digest("clef-de-test").into(),
             )),
             adaptateurs: Vec::new(),
+            telechargeur: medias::Telechargeur::new(),
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,

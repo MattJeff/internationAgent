@@ -32,6 +32,10 @@ pub struct Post {
     pub account_id: Uuid,
     pub text_body: String,
     pub digest: String,
+    /// SHA-256 hex de chaque média publié, dans l'ordre du tableau `media`
+    /// de l'appel — vide pour un post texte seul. Pour l'audit : `digest`
+    /// reste l'empreinte GLOBALE que le rejeu compare.
+    pub media_digests: Vec<String>,
     pub platform_post_id: Option<String>,
     pub url: Option<String>,
     pub status: String,
@@ -43,6 +47,7 @@ fn post_de(l: &sqlx::postgres::PgRow) -> Post {
         account_id: l.get("account_id"),
         text_body: l.get("text_body"),
         digest: l.get("digest"),
+        media_digests: l.get("media_digests"),
         platform_post_id: l.get("platform_post_id"),
         url: l.get("url"),
         status: l.get("status"),
@@ -172,10 +177,11 @@ pub async fn reclamer(
     cle: &str,
     texte: &str,
     digest: &str,
+    media_digests: &[String],
 ) -> sqlx::Result<Reclamation> {
     let gagne = sqlx::query(
-        "INSERT INTO social_posts (id, tenant_id, account_id, idempotency_key, text_body, digest) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO social_posts (id, tenant_id, account_id, idempotency_key, text_body, digest, media_digests) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING id",
     )
     .bind(Uuid::now_v7())
@@ -184,14 +190,18 @@ pub async fn reclamer(
     .bind(cle)
     .bind(texte)
     .bind(digest)
+    .bind(media_digests)
     .fetch_optional(pool)
     .await?;
     if let Some(l) = gagne {
         return Ok(Reclamation::ANous(l.get("id")));
     }
 
+    // La comparaison du rejeu reste sur `digest` SEUL : c'est l'empreinte
+    // GLOBALE (texte + médias + sondage), donc une image différente sous la
+    // même clé y tombe déjà — `media_digests` n'est que de l'audit.
     let existant = sqlx::query(
-        "SELECT id, account_id, text_body, digest, platform_post_id, url, status \
+        "SELECT id, account_id, text_body, digest, media_digests, platform_post_id, url, status \
          FROM social_posts WHERE tenant_id = $1 AND idempotency_key = $2",
     )
     .bind(tenant)
@@ -251,7 +261,7 @@ pub async fn marquer_echec(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
 
 pub async fn post(pool: &PgPool, tenant: Uuid, id: Uuid) -> sqlx::Result<Option<Post>> {
     let ligne = sqlx::query(
-        "SELECT id, account_id, text_body, digest, platform_post_id, url, status \
+        "SELECT id, account_id, text_body, digest, media_digests, platform_post_id, url, status \
          FROM social_posts WHERE id = $1 AND tenant_id = $2",
     )
     .bind(id)
@@ -263,7 +273,7 @@ pub async fn post(pool: &PgPool, tenant: Uuid, id: Uuid) -> sqlx::Result<Option<
 
 pub async fn posts(pool: &PgPool, tenant: Uuid, limite: i64) -> sqlx::Result<Vec<Post>> {
     let lignes = sqlx::query(
-        "SELECT id, account_id, text_body, digest, platform_post_id, url, status \
+        "SELECT id, account_id, text_body, digest, media_digests, platform_post_id, url, status \
          FROM social_posts WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2",
     )
     .bind(tenant)

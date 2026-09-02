@@ -1,0 +1,15 @@
+-- 0003_medias : les empreintes des medias d'un post.
+--
+-- `media_digests` porte le SHA-256 hex de CHAQUE media publie, dans l'ordre
+-- du tableau `media` de l'appel — '{}' pour un post texte seul. C'est de
+-- l'audit : posts_list la rend, et un humain peut retrouver ce que son
+-- approbation a contresigne octet par octet.
+--
+-- La colonne `digest` existante devient l'empreinte GLOBALE (texte + digest
+-- de chaque media dans l'ordre + sondage + made_with_ai, contrat C3) : le
+-- rejeu de `reclamer` compare toujours `digest` seul, donc rejouer la meme
+-- cle avec le meme texte mais une IMAGE differente tombe dans TexteDifferent
+-- sans changer une ligne de la logique d'idempotence. Pour les posts texte
+-- seul, l'empreinte globale EST l'empreinte du texte — aucune ligne
+-- existante ne change de sens.
+ALTER TABLE social_posts ADD COLUMN media_digests TEXT[] NOT NULL DEFAULT '{}';

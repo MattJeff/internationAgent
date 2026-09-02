@@ -53,8 +53,14 @@ d'un tiers.
    seule ligne, un seul appel plateforme.
 3. **Prévisualisable.** `post_preview` rend le contenu EXACT qui partirait,
    plus son empreinte SHA-256 — c'est cette empreinte qu'une approbation
-   humaine contresigne. Le test vérifie que le digest de la preview est le
-   hash de ce que `post_publish` enverrait pour le même texte.
+   humaine contresigne. Depuis la phase médias, l'empreinte est GLOBALE :
+   texte + SHA-256 des octets de chaque média (téléchargés au moment de la
+   preview), dans un ordre fixe, + sondage + made_with_ai. Une preview qui
+   n'empreinterait que le texte laisserait changer l'image après contreseing ;
+   le test le prouve — même clé, même texte, autre image → refus. Et
+   `expected_media_digests` sur `post_publish` compare terme à terme les
+   octets réellement téléchargés à ceux contresignés (`media_change` sinon,
+   AVANT de consommer la clé d'idempotence).
 4. **Table d'outils stable et versionnée.** Le pin SHA-256 du runtime fige un
    schéma : la table porte une version, et un test recalcule l'empreinte des
    schémas — changer un schéma sans bumper la version fait échouer le test.
@@ -65,8 +71,8 @@ d'un tiers.
 |---|---|---|
 | `accounts_list` | `{}` | comptes connectés (plateforme, handle, état) |
 | `account_connect_url` | `{ platform }` | l'URL d'autorisation OAuth à ouvrir (retour : `GET /oauth/callback`) |
-| `post_preview` | `{ account_id, text }` | `{ rendered_text, digest, platform_limits_ok, cost_estimate }` |
-| `post_publish` | `{ idempotency_key, account_id, text }` | `{ post_id, platform_post_id, url }` — rejouable sans double |
+| `post_preview` | `{ account_id, text, media?, poll?, made_with_ai? }` | `{ rendered_text, digest, platform_limits_ok, cost_estimate, media[], verdicts[] }` — digest = empreinte globale ; un verdict par média (digest, taille, type détecté aux octets, limites) |
+| `post_publish` | `{ idempotency_key, account_id, text, media?, poll?, made_with_ai?, expected_media_digests? }` | `{ post_id, platform_post_id, url }` — rejouable sans double ; `expected_media_digests` refuse (`media_change`) si les octets ne sont plus ceux contresignés |
 | `post_metrics` | `{ post_id }` | impressions/likes/reposts si la plateforme les sert — et quand elle ne les sert pas (LinkedIn membre), l'outil LE DIT au lieu de rendre des zéros |
 | `posts_list` | `{ limit? }` | l'historique du tenant |
 
@@ -82,7 +88,7 @@ sous `SOCIAL_MASTER_KEY`, AAD `social://<tenant>/<platform>/<account>` —
 même discipline que `crates/app/src/mcp.rs` sur
 `crates/providers/src/secrets.rs` : un chiffré déplacé ne déchiffre rien.
 
-## Périmètre jour un, et il est fermé : X et LinkedIn, texte seul
+## Périmètre, et il est fermé : X et LinkedIn — texte, médias, sondages
 
 Les deux seules plateformes en libre-service — aucune revue d'app entre le
 fondateur et le premier post :
@@ -104,10 +110,12 @@ fondateur et le premier post :
   répond « la plateforme ne les sert pas » au lieu de zéros — les analytics
   d'organisation sont derrière le Marketing API Program, hors périmètre.
 
-Texte seul : les médias (images/vidéo) sont une phase 2 nommée, pas un début
-d'implémentation. Meta/TikTok/Threads exigent des revues que seul le
-fondateur peut déposer — la liste exécutable est ci-dessous, on ne les code
-pas aujourd'hui.
+Les médias sont LÀ (phase 2 livrée — voir plus bas) : photos, vidéo,
+sondages, et documents PDF côté LinkedIn, dans les ARGUMENTS de
+`post_preview`/`post_publish` — table toujours à six outils, version bumpée
+1 → 2. Meta/TikTok/Threads exigent des revues que seul le fondateur peut
+déposer — la liste exécutable est ci-dessous, on ne les code pas
+aujourd'hui.
 
 ## Les revues d'app — la part que seul le fondateur peut faire
 
@@ -192,12 +200,36 @@ le 2026-09-02.
 * **Débloque** : publier sur Threads pour des tiers.
   **Délai : non publié par la doc.**
 
-## Phase 2, nommée
+## Phase 2 — les médias sont livrés, le reste attend le fondateur
 
-1. **Médias** — images puis vidéo. LinkedIn : register/upload d'asset avant
-   le post ; X : upload média puis attache. Rien de tout cela n'est commencé.
-2. **Meta, TikTok, Threads** — après les revues ci-dessus, chacune une
-   plateforme de plus derrière les six mêmes outils, sans nouvel outil.
+1. **Médias — LIVRÉ.** Les deux outils de post acceptent `media` (1–20 URLs
+   https, avec `alt_text`/`title`), `poll` et `made_with_ai` ; `post_publish`
+   accepte `expected_media_digests`. Le service TÉLÉCHARGE les médias
+   lui-même (`apps/social/src/medias.rs`) et cette surface est vettée :
+   https seul, IP publique seule (même discipline que `placement()` de
+   `crates/app/src/mcp.rs` — plages privées, loopback, link-local,
+   metadata cloud refusées), connexion épinglée sur l'IP vettée (anti
+   DNS-rebinding), redirections coupées, plafond 512 MiB vérifié sur
+   l'annonce ET compté en vol (un Content-Length menteur ne remplit pas la
+   RAM), timeout 60 s, type détecté aux MAGIC BYTES (jpeg/png/gif/webp/mp4/
+   pdf), jamais à l'extension ni au Content-Type. Chaque limite de
+   plateforme vit dans son adaptateur, mot exact et chiffre cité de la doc
+   officielle (relevée le 2026-09-02) : X — 5 MB image, 15 MB GIF, 4 photos
+   OU 1 GIF OU 1 vidéo sans mélange, alt_text ≤ 1000, sondage 2–4 options de
+   1–25 chars sur 5–10080 min, PDF refusé, upload chunké
+   initialize→append→finalize→STATUS, 403 post-finalize géré ; LinkedIn —
+   JPG/GIF/PNG (WEBP refusé), 1 ou 2–20 images (multiImage), altText ≤ 4086,
+   vidéo MP4 75 KB–500 MB en parts de 4 MiB (ETags dans l'ordre), PDF
+   ≤ 100 MB, sondage question obligatoire ≤ 140 / options ≤ 30 / durées
+   ∈ {1440, 4320, 10080, 20160} min. L'historique (`posts_list`) rend les
+   `media_digests` publiés — l'audit du contreseing, octet par octet.
+   Restes nommés en `ponytail:` dans le code : vidéos X 8/16 GB (streaming
+   vers l'upload chunké), PPT/PPTX/DOC/DOCX LinkedIn (magic bytes zip/OLE
+   ambigus), frames/pixels/durée non vérifiés aux octets, GIF statique non
+   distingué du GIF animé.
+2. **Meta, TikTok, Threads** — après les revues ci-dessus (credentials et
+   dépôts que seul le fondateur peut faire), chacune une plateforme de plus
+   derrière les six mêmes outils, sans nouvel outil.
 
 ## L'entrée au catalogue — plus tard, et pourquoi
 

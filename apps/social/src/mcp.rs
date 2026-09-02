@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::adapters::{ErreurPlateforme, Plateforme};
+use crate::adapters::{ErreurPlateforme, MediaPret, Plateforme, Sondage};
+use crate::medias;
 use crate::oauth_flux::{self, PlateformeOauth};
 use crate::store::{self, Reclamation};
 
@@ -37,6 +38,10 @@ pub struct Etat {
     /// Le trait unique vit dans crate::adapters ; les tests d'ici y glissent
     /// leur adaptateur compteur, main.rs y met adapters::adaptateurs().
     pub adaptateurs: Vec<Box<dyn Plateforme>>,
+    /// Le téléchargeur de médias — la surface d'attaque vettée de medias.rs.
+    /// Les tests d'ici le remplacent par le constructeur `de_test`, seul
+    /// chemin qui parle à un serveur 127.0.0.1.
+    pub telechargeur: medias::Telechargeur,
     /// Base publique du service, pour construire le redirect_uri OAuth.
     pub url_publique: String,
     pub oauth_x: Option<CredentielsClient>,
@@ -73,7 +78,7 @@ impl Etat {
 /// `description_outils` bumpe cette constante ET ajoute une ligne a
 /// `EMPREINTES` dans les tests — sinon `la_table_ne_change_pas_sans_bumper`
 /// echoue, et c'est son travail.
-pub const VERSION_TABLE: &str = "1";
+pub const VERSION_TABLE: &str = "2";
 
 /// Les six outils, et pas un de plus. C'est la piece que le pin SHA-256 du
 /// runtime fige, donc elle est une valeur deterministe, pas du code.
@@ -94,14 +99,45 @@ pub fn description_outils() -> Value {
                 "additionalProperties": false
             }
         },
+        // Bornes des champs media/poll = le MAXIMUM inter-plateformes, cite :
+        // maxItems 20 (LinkedIn multiImage max 20, multiimage-post-api,
+        // releve 2026-09-02), alt_text maxLength 4086 (altText LinkedIn,
+        // images-api, 2026-09-02), duration_minutes max 20160 (FOURTEEN_DAYS
+        // LinkedIn). Le RESSERREMENT par plateforme est le travail de
+        // l'adaptateur, avec le mot exact et le chiffre cite — jamais
+        // d'ignorance silencieuse.
         {
             "name": "post_preview",
-            "description": "Le contenu EXACT qui partirait, son empreinte SHA-256, le verdict des limites de plateforme et le cout estime. C'est ce qu'une approbation humaine contresigne.",
+            "description": "Le contenu EXACT qui partirait — texte, medias telecharges et empreintes (SHA-256 de chaque octet), sondage — l'empreinte globale, le verdict des limites de plateforme et le cout estime. C'est ce qu'une approbation humaine contresigne.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "account_id": { "type": "string" },
-                    "text": { "type": "string" }
+                    "text": { "type": "string" },
+                    "media": {
+                        "type": "array", "minItems": 1, "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url":      { "type": "string" },
+                                "alt_text": { "type": "string", "maxLength": 4086 },
+                                "title":    { "type": "string" }
+                            },
+                            "required": ["url"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "poll": {
+                        "type": "object",
+                        "properties": {
+                            "question":         { "type": "string" },
+                            "options":          { "type": "array", "minItems": 2, "maxItems": 4, "items": { "type": "string" } },
+                            "duration_minutes": { "type": "integer", "minimum": 5, "maximum": 20160 }
+                        },
+                        "required": ["options", "duration_minutes"],
+                        "additionalProperties": false
+                    },
+                    "made_with_ai": { "type": "boolean" }
                 },
                 "required": ["account_id", "text"],
                 "additionalProperties": false
@@ -109,13 +145,41 @@ pub fn description_outils() -> Value {
         },
         {
             "name": "post_publish",
-            "description": "Publie un texte. idempotency_key OBLIGATOIRE : rejouer la meme cle rend le meme post sans republier.",
+            "description": "Publie un contenu (texte, medias, sondage). idempotency_key OBLIGATOIRE : rejouer la meme cle rend le meme post sans republier. expected_media_digests (ceux de post_preview) garantit que les octets publies sont ceux contresignes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 },
                     "account_id": { "type": "string" },
-                    "text": { "type": "string" }
+                    "text": { "type": "string" },
+                    "media": {
+                        "type": "array", "minItems": 1, "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url":      { "type": "string" },
+                                "alt_text": { "type": "string", "maxLength": 4086 },
+                                "title":    { "type": "string" }
+                            },
+                            "required": ["url"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "poll": {
+                        "type": "object",
+                        "properties": {
+                            "question":         { "type": "string" },
+                            "options":          { "type": "array", "minItems": 2, "maxItems": 4, "items": { "type": "string" } },
+                            "duration_minutes": { "type": "integer", "minimum": 5, "maximum": 20160 }
+                        },
+                        "required": ["options", "duration_minutes"],
+                        "additionalProperties": false
+                    },
+                    "made_with_ai": { "type": "boolean" },
+                    "expected_media_digests": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                    }
                 },
                 "required": ["idempotency_key", "account_id", "text"],
                 "additionalProperties": false
@@ -237,6 +301,185 @@ fn arg_uuid(args: &Value, nom: &'static str) -> Result<Uuid, Erreur> {
         .map_err(|_| Erreur::nouvelle("argument_invalide", format!("`{nom}` n'est pas un uuid")))
 }
 
+fn invalide(message: impl Into<String>) -> Erreur {
+    Erreur::nouvelle("argument_invalide", message)
+}
+
+/// Une demande de média AVANT téléchargement : l'URL et ses annotations.
+struct MediaDemande {
+    url: String,
+    alt_text: Option<String>,
+    title: Option<String>,
+}
+
+/// Les arguments de contenu partagés par post_preview et post_publish.
+struct Contenu {
+    medias: Vec<MediaDemande>,
+    sondage: Option<Sondage>,
+    made_with_ai: bool,
+}
+
+fn champ_texte(
+    objet: &serde_json::Map<String, Value>,
+    nom: &str,
+) -> Result<Option<String>, Erreur> {
+    match objet.get(nom) {
+        None => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_str()
+                .ok_or_else(|| invalide(format!("`{nom}` doit etre une chaine")))?
+                .to_owned(),
+        )),
+    }
+}
+
+/// Parse `media`/`poll`/`made_with_ai` À LA MAIN contre le schéma C1 : ce
+/// serveur ne roule pas de validateur JSON-Schema, donc le schéma publié et
+/// ce parseur doivent dire la même phrase — bornes inter-plateformes ici, le
+/// resserrement par plateforme dans l'adaptateur.
+fn parser_contenu(args: &Value) -> Result<Contenu, Erreur> {
+    let mut medias = Vec::new();
+    if let Some(v) = args.get("media") {
+        let tableau = v
+            .as_array()
+            .ok_or_else(|| invalide("`media` doit etre un tableau"))?;
+        if tableau.is_empty() || tableau.len() > 20 {
+            return Err(invalide(
+                "`media` porte 1 a 20 elements (20 = multiImage LinkedIn, le maximum servi)",
+            ));
+        }
+        for (i, element) in tableau.iter().enumerate() {
+            let objet = element
+                .as_object()
+                .ok_or_else(|| invalide(format!("`media[{i}]` doit etre un objet")))?;
+            for cle in objet.keys() {
+                if !["url", "alt_text", "title"].contains(&cle.as_str()) {
+                    return Err(invalide(format!("`media[{i}].{cle}` n'existe pas")));
+                }
+            }
+            let url = champ_texte(objet, "url")?
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| invalide(format!("`media[{i}].url` est obligatoire")))?;
+            let alt_text = champ_texte(objet, "alt_text")?;
+            if let Some(alt) = &alt_text
+                && alt.chars().count() > 4086
+            {
+                return Err(invalide(format!(
+                    "`media[{i}].alt_text` depasse 4086 caracteres (altText LinkedIn, le maximum servi)"
+                )));
+            }
+            let title = champ_texte(objet, "title")?;
+            medias.push(MediaDemande {
+                url,
+                alt_text,
+                title,
+            });
+        }
+    }
+
+    let sondage = match args.get("poll") {
+        None => None,
+        Some(v) => {
+            let objet = v
+                .as_object()
+                .ok_or_else(|| invalide("`poll` doit etre un objet"))?;
+            for cle in objet.keys() {
+                if !["question", "options", "duration_minutes"].contains(&cle.as_str()) {
+                    return Err(invalide(format!("`poll.{cle}` n'existe pas")));
+                }
+            }
+            let options: Vec<String> = objet
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalide("`poll.options` est obligatoire"))?
+                .iter()
+                .map(|o| {
+                    o.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| invalide("chaque option de `poll.options` est une chaine"))
+                })
+                .collect::<Result<_, _>>()?;
+            if !(2..=4).contains(&options.len()) {
+                return Err(invalide("`poll.options` porte 2 a 4 options"));
+            }
+            let duree = objet
+                .get("duration_minutes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalide("`poll.duration_minutes` est obligatoire"))?;
+            if !(5..=20160).contains(&duree) {
+                return Err(invalide(
+                    "`poll.duration_minutes` va de 5 (minimum X) a 20160 (FOURTEEN_DAYS LinkedIn)",
+                ));
+            }
+            Some(Sondage {
+                question: champ_texte(objet, "question")?,
+                options,
+                duration_minutes: duree as u32,
+            })
+        }
+    };
+
+    let made_with_ai = match args.get("made_with_ai") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| invalide("`made_with_ai` doit etre un booleen"))?,
+    };
+
+    Ok(Contenu {
+        medias,
+        sondage,
+        made_with_ai,
+    })
+}
+
+/// `expected_media_digests`, optionnel sur post_publish seul.
+fn parser_digests_attendus(args: &Value) -> Result<Option<Vec<String>>, Erreur> {
+    let Some(v) = args.get("expected_media_digests") else {
+        return Ok(None);
+    };
+    let tableau = v
+        .as_array()
+        .ok_or_else(|| invalide("`expected_media_digests` doit etre un tableau"))?;
+    tableau
+        .iter()
+        .map(|d| {
+            d.as_str()
+                .filter(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|o| o.is_ascii_hexdigit() && !o.is_ascii_uppercase())
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| invalide("chaque digest attendu est un SHA-256 hex minuscule de 64"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Télécharge, vet et empreinte chaque média demandé, dans l'ordre.
+/// ponytail: séquentiel — 20 médias max et l'agent attend de toute façon ;
+/// paralléliser viendra si un profil s'en plaint.
+async fn telecharger_tous(
+    etat: &Etat,
+    demandes: &[MediaDemande],
+) -> Result<Vec<MediaPret>, Erreur> {
+    let mut prets = Vec::with_capacity(demandes.len());
+    for demande in demandes {
+        prets.push(
+            etat.telechargeur
+                .telecharger(
+                    &demande.url,
+                    demande.alt_text.clone(),
+                    demande.title.clone(),
+                )
+                .await
+                .map_err(|e| Erreur::nouvelle(e.code(), e.to_string()))?,
+        );
+    }
+    Ok(prets)
+}
+
 async fn appeler_outil(
     etat: &Etat,
     tenant: Uuid,
@@ -263,7 +506,7 @@ async fn appeler_outil(
             let posts = store::posts(&etat.pool, tenant, limite).await?;
             Ok(json!({ "posts": posts.iter().map(|p| json!({
                 "post_id": p.id, "account_id": p.account_id, "text": p.text_body,
-                "digest": p.digest, "status": p.status,
+                "digest": p.digest, "media_digests": p.media_digests, "status": p.status,
                 "platform_post_id": p.platform_post_id, "url": p.url
             })).collect::<Vec<_>>() }))
         }
@@ -333,12 +576,21 @@ async fn previsualiser(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value,
         )
     })?;
 
-    // Texte seul, jour un : ce qui part est exactement ce qui entre — c'est
-    // l'adaptateur qui le promet (son test fige rendered_text == texte), et
-    // l'empreinte rendue ici est celle que post_publish recalculera.
-    // cost_estimate_usd est PAR TEXTE : un lien dans un post X multiplie le
-    // tarif par treize, et l'apercu contresigne doit le montrer.
-    Ok(serde_json::to_value(adaptateur.apercu(texte)).expect("Apercu se serialise"))
+    // L'aperçu couvre le contenu EXACT : les médias sont TÉLÉCHARGÉS ici,
+    // maintenant, et chaque octet entre dans son digest — une preview qui
+    // n'empreinterait que le texte laisserait changer l'image après
+    // contreseing. Le champ `digest` rendu est l'empreinte GLOBALE (C3), et
+    // les digests par média sont ceux que post_publish acceptera en
+    // expected_media_digests.
+    let contenu = parser_contenu(args)?;
+    let medias_prets = telecharger_tous(etat, &contenu.medias).await?;
+    let apercu = adaptateur.apercu(
+        texte,
+        &medias_prets,
+        contenu.sondage.as_ref(),
+        contenu.made_with_ai,
+    );
+    Ok(serde_json::to_value(apercu).expect("Apercu se serialise"))
 }
 
 async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
@@ -357,23 +609,93 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
         )
     })?;
 
-    // Limites AVANT la reclamation : un texte invalide ne consomme pas la cle,
-    // pour que le tour corrige puisse la reutiliser.
-    let apercu = adaptateur.apercu(texte);
-    if !apercu.platform_limits_ok {
+    // L'ordre du contrat C7 : tout ce qui precede `reclamer` ne consomme pas
+    // la cle — un refus ici laisse le tour corrige la reutiliser.
+    let contenu = parser_contenu(args)?;
+    let attendus = parser_digests_attendus(args)?;
+    let medias_prets = telecharger_tous(etat, &contenu.medias).await?;
+
+    // Le pont contreseing -> octets publies : ce que post_preview a montre
+    // doit etre ce qu'on tient. On ne re-telecharge JAMAIS pour
+    // « reverifier » — une URL peut servir un octet different une minute
+    // plus tard, et c'est exactement ce que cette comparaison attrape.
+    if let Some(attendus) = &attendus {
+        if attendus.len() != medias_prets.len() {
+            return Err(invalide(format!(
+                "`expected_media_digests` porte {} digests pour {} medias",
+                attendus.len(),
+                medias_prets.len()
+            )));
+        }
+        for (i, (attendu, media)) in attendus.iter().zip(&medias_prets).enumerate() {
+            if attendu != &media.digest {
+                return Err(Erreur::nouvelle(
+                    "media_change",
+                    format!(
+                        "media {i} a change depuis l'apercu : attendu {attendu}, obtenu {} — re-previsualiser et refaire contresigner",
+                        media.digest
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Limites AVANT la reclamation : un contenu invalide ne consomme pas la
+    // cle, pour que le tour corrige puisse la reutiliser.
+    let apercu = adaptateur.apercu(
+        texte,
+        &medias_prets,
+        contenu.sondage.as_ref(),
+        contenu.made_with_ai,
+    );
+    if !apercu.platform_limits_ok || apercu.media.iter().any(|m| !m.limits_ok) {
+        // Les mots exacts de l'adaptateur : les verdicts globaux (sondage,
+        // melange interdit) puis ceux de chaque media — jamais un refus muet.
+        let verdicts: Vec<&str> = apercu
+            .verdicts
+            .iter()
+            .map(String::as_str)
+            .chain(
+                apercu
+                    .media
+                    .iter()
+                    .flat_map(|m| m.verdicts.iter().map(String::as_str)),
+            )
+            .collect();
         return Err(Erreur::nouvelle(
             "limites_plateforme",
-            format!(
-                "texte hors limites pour {} — post_preview donne le verdict avant de bruler un appel",
-                compte.platform
-            ),
+            if verdicts.is_empty() {
+                format!(
+                    "contenu hors limites pour {} — post_preview donne le verdict avant de bruler un appel",
+                    compte.platform
+                )
+            } else {
+                format!(
+                    "contenu hors limites pour {} : {}",
+                    compte.platform,
+                    verdicts.join(" ; ")
+                )
+            },
         ));
     }
 
-    // La meme empreinte que post_preview a montree : c'est elle que
-    // l'approbation humaine a contresignee, et elle que le rejeu compare.
+    // La meme empreinte GLOBALE que post_preview a montree (texte + digest de
+    // chaque media + sondage, contrat C3) : c'est elle que l'approbation
+    // humaine a contresignee, et elle que le rejeu compare — une image
+    // differente sous la meme cle tombe dans TexteDifferent toute seule.
     let digest = apercu.digest;
-    let id = match store::reclamer(&etat.pool, tenant, compte_id, cle, texte, &digest).await? {
+    let empreintes_medias: Vec<String> = medias_prets.iter().map(|m| m.digest.clone()).collect();
+    let id = match store::reclamer(
+        &etat.pool,
+        tenant,
+        compte_id,
+        cle,
+        texte,
+        &digest,
+        &empreintes_medias,
+    )
+    .await?
+    {
         Reclamation::ANous(id) => id,
         Reclamation::DejaPublie(p) => {
             // LE rejeu : meme post_id, aucune republication.
@@ -435,11 +757,31 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
     // token dort scellé en base depuis la connexion. Un seul rejeu, jamais de
     // boucle : si le jeton frais prend aussi un 401, le problème n'est pas
     // l'expiration et le dire vaut mieux que retenter.
-    let resultat = adaptateur.publier(&jeton, &compte.handle, texte).await;
+    let resultat = adaptateur
+        .publier(
+            &jeton,
+            &compte.handle,
+            texte,
+            &medias_prets,
+            contenu.sondage.as_ref(),
+            contenu.made_with_ai,
+        )
+        .await;
     let resultat = match resultat {
         Err(ErreurPlateforme::Refus { statut: 401 }) => {
             match jeton_rafraichi(etat, tenant, &compte).await {
-                Some(frais) => adaptateur.publier(&frais, &compte.handle, texte).await,
+                Some(frais) => {
+                    adaptateur
+                        .publier(
+                            &frais,
+                            &compte.handle,
+                            texte,
+                            &medias_prets,
+                            contenu.sondage.as_ref(),
+                            contenu.made_with_ai,
+                        )
+                        .await
+                }
                 // Rien à rafraîchir (pas de refresh token, pas de credentials
                 // client, ou la plateforme refuse le grant) : le 401 d'origine
                 // est la vérité, on le rend tel quel.
@@ -610,7 +952,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::adapters::{Apercu, ErreurPlateforme, Metriques, Publication, empreinte};
+    use crate::adapters::{
+        Apercu, ApercuMedia, ErreurPlateforme, Metriques, Publication, empreinte,
+    };
 
     // -- Le test anti-DM : la promesse fondatrice du produit. ---------------
     //
@@ -692,10 +1036,18 @@ mod tests {
     /// derniere ligne d'ici ne la porte pas, ce test echoue — et le corriger
     /// exige d'ajouter une ligne AVEC une nouvelle version. Reecrire une
     /// ligne existante est une falsification, pas une correction.
-    const EMPREINTES: &[(&str, &str)] = &[(
-        "1",
-        "2d8f2821a0c4cc02f85ea5cdf650c1e6e3c0d57afb4d87bad514013cf9cbffbe",
-    )];
+    const EMPREINTES: &[(&str, &str)] = &[
+        (
+            "1",
+            "2d8f2821a0c4cc02f85ea5cdf650c1e6e3c0d57afb4d87bad514013cf9cbffbe",
+        ),
+        // v2 : post_preview et post_publish gagnent media/poll/made_with_ai,
+        // post_publish gagne expected_media_digests (contrat C1).
+        (
+            "2",
+            "5e0d09aa3063c5a058935a2afe2d9230a9965b015e32c5071ca7140216d78870",
+        ),
+    ];
 
     #[test]
     fn la_table_ne_change_pas_sans_bumper_la_version() {
@@ -730,12 +1082,33 @@ mod tests {
         fn nom(&self) -> &'static str {
             "x"
         }
-        fn apercu(&self, texte: &str) -> Apercu {
+        fn apercu(
+            &self,
+            texte: &str,
+            medias: &[MediaPret],
+            sondage: Option<&Sondage>,
+            made_with_ai: bool,
+        ) -> Apercu {
             Apercu {
                 rendered_text: texte.to_owned(),
-                digest: empreinte(texte),
+                // L'empreinte GLOBALE du contrat C3 — LA formule partagée de
+                // mod.rs, pour que le rejeu compare la même chose que les
+                // vrais adaptateurs.
+                digest: crate::adapters::empreinte_globale(texte, medias, sondage, made_with_ai),
                 platform_limits_ok: texte.chars().count() <= 280,
                 cost_estimate_usd: Some(0.015),
+                verdicts: Vec::new(),
+                media: medias
+                    .iter()
+                    .map(|m| ApercuMedia {
+                        digest: m.digest.clone(),
+                        size_bytes: m.octets.len() as u64,
+                        detected_type: m.type_detecte.mime(),
+                        alt_text: m.alt_text.clone(),
+                        limits_ok: true,
+                        verdicts: Vec::new(),
+                    })
+                    .collect(),
             }
         }
         async fn publier(
@@ -743,6 +1116,9 @@ mod tests {
             jeton: &Secret,
             handle: &str,
             _texte: &str,
+            _medias: &[MediaPret],
+            _sondage: Option<&Sondage>,
+            _made_with_ai: bool,
         ) -> Result<Publication, ErreurPlateforme> {
             assert_eq!(
                 jeton.expose_for_transport(),
@@ -806,6 +1182,9 @@ mod tests {
                 publications: publications.clone(),
                 jeton_mort: false,
             })],
+            // Le constructeur de test : seul chemin qui accepte de parler aux
+            // serveurs 127.0.0.1 que ces tests montent.
+            telechargeur: medias::Telechargeur::de_test(medias::PLAFOND_ABSOLU_OCTETS),
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
@@ -976,5 +1355,112 @@ mod tests {
         // refus explique.
         assert_eq!(rep["available"], false);
         assert!(rep["raison"].as_str().unwrap().contains("ne sert pas"));
+    }
+
+    // -- Les medias : le pont contreseing -> octets publies. ----------------
+
+    /// Le flux complet du contrat C4 : post_preview montre les digests, un
+    /// expected divergent refuse en `media_change` SANS consommer la cle, le
+    /// meme expected correct publie — et l'historique porte les digests.
+    #[tokio::test]
+    async fn un_digest_attendu_divergent_refuse_avant_de_bruler_la_cle() {
+        let Some((etat, tenant, compte, publications)) = etat_de_test().await else {
+            return;
+        };
+        let png = medias::octets_png(b"les octets contresignes");
+        let base = medias::serveur_brut(medias::reponse_http("image/png", &png)).await;
+        let url = format!("{base}/photo.png");
+
+        // 1. L'apercu telecharge et empreinte : c'est ce que l'humain signe.
+        let (err, apercu) = appel(
+            &etat,
+            tenant,
+            "post_preview",
+            json!({ "account_id": compte.to_string(), "text": "Avec image",
+                    "media": [{ "url": url, "alt_text": "une image" }] }),
+        )
+        .await;
+        assert!(!err, "{apercu}");
+        let digest_media = apercu["media"][0]["digest"].as_str().unwrap().to_owned();
+        assert_eq!(digest_media, medias::hex_sha256(&png));
+        assert_eq!(apercu["media"][0]["detected_type"], "image/png");
+        // L'empreinte globale n'est PLUS celle du texte seul : l'image est
+        // dans le contreseing.
+        assert_ne!(apercu["digest"], json!(empreinte("Avec image")));
+
+        // 2. Un digest attendu divergent : refus nomme, index et valeurs, et
+        //    AUCUN appel plateforme — la comparaison precede `reclamer`.
+        let (err, rep) = appel(
+            &etat,
+            tenant,
+            "post_publish",
+            json!({ "idempotency_key": "tour-img", "account_id": compte.to_string(),
+                    "text": "Avec image", "media": [{ "url": url, "alt_text": "une image" }],
+                    "expected_media_digests": ["0".repeat(64)] }),
+        )
+        .await;
+        assert!(err, "{rep}");
+        assert_eq!(rep["erreur"], "media_change");
+        assert!(
+            rep["message"].as_str().unwrap().contains("media 0"),
+            "{rep}"
+        );
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+
+        // 3. La MEME cle avec le bon digest publie : elle n'a pas ete brulee.
+        let (err, rep) = appel(
+            &etat,
+            tenant,
+            "post_publish",
+            json!({ "idempotency_key": "tour-img", "account_id": compte.to_string(),
+                    "text": "Avec image", "media": [{ "url": url, "alt_text": "une image" }],
+                    "expected_media_digests": [digest_media] }),
+        )
+        .await;
+        assert!(!err, "{rep}");
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+
+        // 4. L'historique rend les digests des medias publies.
+        let (err, liste) = appel(&etat, tenant, "posts_list", json!({})).await;
+        assert!(!err, "{liste}");
+        let post = liste["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["post_id"] == rep["post_id"])
+            .expect("le post publie est dans l'historique");
+        assert_eq!(post["media_digests"], json!([medias::hex_sha256(&png)]));
+    }
+
+    /// Le rejeu C3 : meme cle, meme texte, IMAGE differente — l'empreinte
+    /// globale diverge et `reclamer` repond TexteDifferent sans qu'on ait
+    /// touche sa logique.
+    #[tokio::test]
+    async fn la_meme_cle_avec_une_autre_image_est_refusee_comme_un_autre_texte() {
+        let Some((etat, tenant, compte, publications)) = etat_de_test().await else {
+            return;
+        };
+        let premiere = medias::serveur_brut(medias::reponse_http(
+            "image/png",
+            &medias::octets_png(b"image approuvee"),
+        ))
+        .await;
+        let autre = medias::serveur_brut(medias::reponse_http(
+            "image/png",
+            &medias::octets_png(b"image substituee"),
+        ))
+        .await;
+
+        let args = |base: &str| {
+            json!({ "idempotency_key": "tour-swap", "account_id": compte.to_string(),
+                    "text": "Le meme texte", "media": [{ "url": format!("{base}/i.png") }] })
+        };
+        let (err, rep) = appel(&etat, tenant, "post_publish", args(&premiere)).await;
+        assert!(!err, "{rep}");
+
+        let (err, rep) = appel(&etat, tenant, "post_publish", args(&autre)).await;
+        assert!(err, "{rep}");
+        assert_eq!(rep["erreur"], "cle_reutilisee");
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
     }
 }
