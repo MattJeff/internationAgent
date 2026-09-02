@@ -758,6 +758,19 @@ ce que le floor `Read` de `CUSTOM` refuse de faire.
   `CUSTOM`), et le paquet npm `publer-mcp-server@1.1.0` est un tiers non
   affilié, épinglable seulement sur décision assumée.
 
+### La suite décidée (2026-09-02) : notre propre agrégateur — `docs/SOCIAL.md`
+
+Le travail-produit ci-dessus ne sera pas un paquet stdio par plateforme :
+la voie retenue est NOTRE service d'agrégation, `apps/social`
+(`agentos-social`), documenté dans `docs/SOCIAL.md`. Le fait fondateur vient
+de cette vague même : les trois agrégateurs entrés au catalogue exposent
+tous des DM (Ayrshare et Blotato → `HeldHere`, Zernio → `Pulled`), donc
+aucun ne pouvait porter `NoStrangers`. Le nôtre n'a aucune surface DM par
+construction, et un test le prouve. Jour un : X + LinkedIn, texte seul —
+les deux seules plateformes self-serve. Pas d'entrée au catalogue avant
+déploiement et sondage en direct ; la forme qu'elle aura est écrite dans
+`SOCIAL.md` et dans le bloc de refus de `catalog.rs`.
+
 ### Planification récurrente et métriques : zéro code, et c'est prouvé
 
 La sonde runtime du 2026-09-02 a cherché le trou et n'en a pas trouvé. La

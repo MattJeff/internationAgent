@@ -759,6 +759,21 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///     verte, mais en trial access.
 ///   * Threads — cinq scopes exacts, et une app review.
 ///
+///   **2026-09-02, la décision** : la voie retenue n'est aucun de ces paquets
+///   à produire — c'est NOTRE propre service d'agrégation, `apps/social`
+///   (`docs/SOCIAL.md`). Raison de fond : aucun des trois agrégateurs entrés
+///   plus bas n'a pu recevoir [`OptOuts::NoStrangers`], parce que tous
+///   exposent des DM ; le nôtre n'a aucune surface DM, par construction, et
+///   un test le lit dans la table d'outils. Son entrée ici viendra quand il
+///   sera DÉPLOYÉ et sondé — une entrée [`Provision::Dial`] sur une URL qui
+///   ne répond pas encore violerait la règle du sondage en direct que chaque
+///   littéral de ce bloc respecte. La forme qu'elle aura : `Dial` vers notre
+///   hôte, [`Credential::Bearer`] (jeton par tenant), `floor` `Write`
+///   (publier engage l'entreprise, rien n'efface un compte), et
+///   `NoStrangers` PROUVÉ par le test anti-DM du service lui-même — une
+///   première pour ce registre, où la revendication tient sur un test qui
+///   casse et pas sur une lecture datée de la liste d'outils d'un tiers.
+///
 /// * **Buffer** — le miroir exact du refus Vercel, resondé le 2026-09-02 sur
 ///   `mcp.buffer.com` : `token_endpoint_auth_methods_supported: ["none"]` et
 ///   rien d'autre — un client public en PKCE seul — aggravé de
