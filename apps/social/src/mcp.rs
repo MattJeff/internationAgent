@@ -46,6 +46,13 @@ pub struct Etat {
     pub url_publique: String,
     pub oauth_x: Option<CredentielsClient>,
     pub oauth_linkedin: Option<CredentielsClient>,
+    /// Les adaptateurs de la SECONDE surface (/mcp/messagerie). Une liste
+    /// separee de `adaptateurs` : les deux tables d'outils sont disjointes
+    /// par construction, leurs adaptateurs aussi. Les tests y glissent leur
+    /// adaptateur compteur ; l'absence d'adaptateur pour une plateforme EST
+    /// le refus (LinkedIn : adapters::linkedin::refus_messagerie porte les
+    /// citations datees).
+    pub adaptateurs_messagerie: Vec<Box<dyn crate::adapters::PlateformeMessagerie>>,
 }
 
 impl Etat {
@@ -212,13 +219,13 @@ pub fn description_outils() -> Value {
 // ---------------------------------------------------------------------------
 
 /// Une erreur d'outil : un code stable pour l'agent, un message pour l'humain.
-struct Erreur {
-    code: &'static str,
-    message: String,
+pub(crate) struct Erreur {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl Erreur {
-    fn nouvelle(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn nouvelle(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -232,11 +239,11 @@ impl From<sqlx::Error> for Erreur {
     }
 }
 
-fn reponse(id: &Value, result: Value) -> Value {
+pub(crate) fn reponse(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-fn erreur_rpc(id: &Value, code: i64, message: &str) -> Value {
+pub(crate) fn erreur_rpc(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
@@ -289,14 +296,14 @@ pub async fn traiter(etat: &Etat, tenant: Uuid, req: &Value) -> Option<Value> {
 // Les outils
 // ---------------------------------------------------------------------------
 
-fn arg_str<'a>(args: &'a Value, nom: &'static str) -> Result<&'a str, Erreur> {
+pub(crate) fn arg_str<'a>(args: &'a Value, nom: &'static str) -> Result<&'a str, Erreur> {
     args.get(nom)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Erreur::nouvelle("argument_manquant", format!("`{nom}` est obligatoire")))
 }
 
-fn arg_uuid(args: &Value, nom: &'static str) -> Result<Uuid, Erreur> {
+pub(crate) fn arg_uuid(args: &Value, nom: &'static str) -> Result<Uuid, Erreur> {
     Uuid::parse_str(arg_str(args, nom)?)
         .map_err(|_| Erreur::nouvelle("argument_invalide", format!("`{nom}` n'est pas un uuid")))
 }
@@ -757,39 +764,18 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
     // token dort scellé en base depuis la connexion. Un seul rejeu, jamais de
     // boucle : si le jeton frais prend aussi un 401, le problème n'est pas
     // l'expiration et le dire vaut mieux que retenter.
-    let resultat = adaptateur
-        .publier(
-            &jeton,
-            &compte.handle,
-            texte,
-            &medias_prets,
-            contenu.sondage.as_ref(),
-            contenu.made_with_ai,
-        )
-        .await;
-    let resultat = match resultat {
-        Err(ErreurPlateforme::Refus { statut: 401 }) => {
-            match jeton_rafraichi(etat, tenant, &compte).await {
-                Some(frais) => {
-                    adaptateur
-                        .publier(
-                            &frais,
-                            &compte.handle,
-                            texte,
-                            &medias_prets,
-                            contenu.sondage.as_ref(),
-                            contenu.made_with_ai,
-                        )
-                        .await
-                }
-                // Rien à rafraîchir (pas de refresh token, pas de credentials
-                // client, ou la plateforme refuse le grant) : le 401 d'origine
-                // est la vérité, on le rend tel quel.
-                None => Err(ErreurPlateforme::Refus { statut: 401 }),
-            }
-        }
-        autre => autre,
-    };
+    // Des references nues (Copy) : la fermeture `async move` les copie au
+    // lieu de deplacer les valeurs, qu'elle doit pouvoir rejouer une fois.
+    let handle: &str = &compte.handle;
+    let medias: &[MediaPret] = &medias_prets;
+    let sondage = contenu.sondage.as_ref();
+    let made_with_ai = contenu.made_with_ai;
+    let resultat = avec_rejeu_401(etat, tenant, &compte, Arc::new(jeton), |j| async move {
+        adaptateur
+            .publier(&j, handle, texte, medias, sondage, made_with_ai)
+            .await
+    })
+    .await;
 
     match resultat {
         Ok(publie) => {
@@ -803,6 +789,65 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
             store::marquer_echec(&etat.pool, id).await?;
             Err(Erreur::nouvelle(e.code(), e.to_string()))
         }
+    }
+}
+
+/// Le chemin 401 → refresh → UN rejeu, partagé par les deux surfaces (/mcp et
+/// /mcp/messagerie). Un jeton d'accès X meurt en deux heures : sans ce chemin,
+/// chaque initiative quotidienne finirait en `plateforme_refus` et en
+/// re-consentement humain, alors que le refresh token dort scellé en base.
+/// Un seul rejeu, jamais de boucle : si le jeton frais prend aussi un 401, le
+/// problème n'est pas l'expiration et le dire vaut mieux que retenter.
+/// Le seul fait dont le chemin de rejeu a besoin : « est-ce un 401 ? ». Les
+/// deux surfaces portent des types d'erreur differents (ErreurPlateforme pour
+/// l'editeur, ErreurMessagerie pour la messagerie) — ce trait est ce qu'elles
+/// ont en commun, et rien de plus.
+pub(crate) trait Porte401 {
+    fn est_401(&self) -> bool;
+}
+
+impl Porte401 for ErreurPlateforme {
+    fn est_401(&self) -> bool {
+        matches!(self, ErreurPlateforme::Refus { statut: 401 })
+    }
+}
+
+impl Porte401 for crate::adapters::ErreurMessagerie {
+    fn est_401(&self) -> bool {
+        matches!(
+            self,
+            crate::adapters::ErreurMessagerie::Plateforme(ErreurPlateforme::Refus { statut: 401 })
+        )
+    }
+}
+
+/// `jeton` arrive en `Arc` parce que `Secret` n'est — a dessein — pas `Clone`
+/// et que le rejeu appelle la fermeture une seconde fois avec un jeton FRAIS :
+/// la fermeture recoit une propriete partagee, jamais un emprunt qui forcerait
+/// des lifetimes d'ordre superieur.
+pub(crate) async fn avec_rejeu_401<T, E, F, Fut>(
+    etat: &Etat,
+    tenant: Uuid,
+    compte: &store::CompteScelle,
+    jeton: Arc<Secret>,
+    appel: F,
+) -> Result<T, E>
+where
+    E: Porte401,
+    F: Fn(Arc<Secret>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match appel(jeton).await {
+        Err(e) if e.est_401() => {
+            match jeton_rafraichi(etat, tenant, compte).await {
+                Some(frais) => appel(Arc::new(frais)).await,
+                // Rien à rafraîchir (pas de refresh token, pas de credentials
+                // client, ou la plateforme refuse le grant) : le 401 d'origine
+                // est la vérité, on le rend tel quel.
+                None => Err(e),
+            }
+        }
+        autre => autre,
     }
 }
 
@@ -1171,7 +1216,7 @@ mod tests {
         )
         .unwrap();
         let compte =
-            crate::store::connecter_compte(&pool, tenant, "x", "agent_test", &scelle, None)
+            crate::store::connecter_compte(&pool, tenant, "x", "agent_test", None, &scelle, None)
                 .await
                 .unwrap();
         let publications = Arc::new(AtomicUsize::new(0));
@@ -1188,6 +1233,7 @@ mod tests {
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
+            adaptateurs_messagerie: Vec::new(),
         };
         Some((etat, tenant, compte, publications))
     }

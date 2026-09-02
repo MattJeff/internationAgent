@@ -144,6 +144,241 @@ pub fn adaptateurs() -> Vec<Box<dyn Plateforme>> {
     vec![Box::new(x::X), Box::new(linkedin::Linkedin)]
 }
 
+// ---------------------------------------------------------------------------
+// La messagerie (`/mcp/messagerie`) — un SECOND trait, jamais une extension du
+// premier : la table de l'éditeur et sa garantie anti-DM ne partagent pas une
+// ligne avec ce qui suit.
+// ---------------------------------------------------------------------------
+
+/// Le refus d'une capacité messagerie, nommé.
+///
+/// `NeSertPas` porte deux `&'static str` recopiés des docs sondées (plan du
+/// 2026-09-02) : la citation qui fonde le refus, et le fait qui le
+/// débloquerait. Statiques par construction : aucun octet venu d'une réponse
+/// plateforme (ni d'un jeton) ne peut transiter par cette erreur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ErreurMessagerie {
+    #[error(transparent)]
+    Plateforme(#[from] ErreurPlateforme),
+    /// La plateforme ne sert pas cette capacité — un fait cité, jamais un
+    /// stub silencieux.
+    #[error("la plateforme ne sert pas cette capacité : {citation}")]
+    NeSertPas {
+        citation: &'static str,
+        /// Ce qui débloquerait — « rien » est une réponse valable, mais elle
+        /// se dit.
+        deblocage: &'static str,
+    },
+}
+
+impl ErreurMessagerie {
+    /// Le code stable que les réponses d'outil montrent aux agents.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Plateforme(e) => e.code(),
+            Self::NeSertPas { .. } => "plateforme_ne_sert_pas",
+        }
+    }
+}
+
+/// Un DM parti — la réponse documentée de X porte les deux identifiants.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MessagePrive {
+    pub dm_conversation_id: String,
+    pub dm_event_id: String,
+    /// Le coût réel de l'appel, en USD — le plan exige que l'outil le rende.
+    pub cout_usd: f64,
+}
+
+/// Un élément lu chez la plateforme (DM reçu, mention, post, résultat de
+/// recherche). `third_party: true` toujours : c'est du texte de tiers, le
+/// runtime l'enveloppe en Untrusted — le service marque, il ne « nettoie » pas.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElementLu {
+    pub id: String,
+    pub auteur_id: Option<String>,
+    pub texte: String,
+    pub third_party: bool,
+}
+
+/// Ce que `inbox_list` rend : DM reçus + mentions, et le coût réel constaté
+/// (0,010 USD par événement DM + 0,005 par mention chez X).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Inbox {
+    pub dm_events: Vec<ElementLu>,
+    pub mentions: Vec<ElementLu>,
+    pub cout_usd: f64,
+}
+
+/// Une liasse de posts lus (recherche, timeline) — le coût est PAR RÉSULTAT
+/// chez X (0,005 USD), donc il ne se connaît qu'au retour : résultats × tarif.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PostsLus {
+    pub posts: Vec<ElementLu>,
+    pub cout_usd: f64,
+}
+
+/// Un profil lu — contenu de tiers comme le reste.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProfilLu {
+    pub id: String,
+    pub username: String,
+    pub nom: String,
+    pub third_party: bool,
+}
+
+/// Une action sans corps intéressant (like, bookmark, repost…) : ce qui reste
+/// à dire est ce qu'elle a coûté.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ActionFaite {
+    pub cout_usd: f64,
+}
+
+/// Une réponse publique partie (reply/comment/quote) — la publication et son
+/// coût réel (0,015 USD, 0,200 si le texte porte une URL chez X).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ReponsePubliee {
+    pub id_plateforme: String,
+    pub url: String,
+    pub cout_usd: f64,
+}
+
+/// Le second trait — la surface `/mcp/messagerie`.
+///
+/// `dm_reply` (conversation existante) et `dm_open` (nouvelle) sont DEUX
+/// méthodes parce que X en fait deux chemins d'API distincts : la plateforme
+/// elle-même sépare les deux risques, le découpage épouse cette coupe. La
+/// gate des suppressions (table locale, avant tout réseau) appartient au
+/// cœur, pas à l'adaptateur.
+///
+/// Une plateforme qui ne sert pas une capacité rend
+/// [`ErreurMessagerie::NeSertPas`] avec la citation — jamais un panic, jamais
+/// un stub vide. LinkedIn n'implémente pas ce trait du tout : l'absence
+/// d'implémentation EST le refus, et le dispatcher rend
+/// [`linkedin::refus_messagerie`].
+#[async_trait]
+pub trait PlateformeMessagerie: Send + Sync {
+    /// "x" ou "linkedin" — la même clé que `Plateforme::nom`.
+    fn nom(&self) -> &'static str;
+
+    /// Répondre dans une conversation EXISTANTE. Un id de conversation
+    /// inconnu est un refus plateforme (404), jamais une ouverture.
+    async fn dm_reply(
+        &self,
+        jeton: &Secret,
+        dm_conversation_id: &str,
+        texte: &str,
+    ) -> Result<MessagePrive, ErreurMessagerie>;
+
+    /// Ouvrir une NOUVELLE conversation avec `participant_id` — l'outil
+    /// qu'une politique fait contresigner. Le cœur consulte la table des
+    /// suppressions AVANT d'appeler ceci.
+    async fn dm_open(
+        &self,
+        jeton: &Secret,
+        participant_id: &str,
+        texte: &str,
+    ) -> Result<MessagePrive, ErreurMessagerie>;
+
+    /// DM reçus + mentions du compte. `user_id` est l'id plateforme du compte
+    /// connecté (les mentions de X se lisent sous `/2/users/{id}/mentions`).
+    async fn inbox(&self, jeton: &Secret, user_id: &str) -> Result<Inbox, ErreurMessagerie>;
+
+    /// Répondre publiquement à un post — l'invitation est publique.
+    async fn post_reply(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        in_reply_to_post_id: &str,
+        texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie>;
+
+    /// Commenter un post (`parent_comment` pour répondre à un commentaire).
+    /// Chez X, commenter EST répondre : même geste, même endpoint.
+    async fn post_comment(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        post_id: &str,
+        parent_comment: Option<&str>,
+        texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie>;
+
+    async fn post_like(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie>;
+
+    async fn post_unlike(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie>;
+
+    async fn post_bookmark(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie>;
+
+    async fn post_unbookmark(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie>;
+
+    async fn post_repost(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie>;
+
+    /// Citer un post avec un texte. AUCUNE plateforme ne le sert à notre
+    /// palier (Enterprise seulement chez X) : chaque impl rend le refus cité.
+    async fn post_quote(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        post_id: &str,
+        texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie>;
+
+    async fn search_posts(
+        &self,
+        jeton: &Secret,
+        query: &str,
+        max_results: u8,
+    ) -> Result<PostsLus, ErreurMessagerie>;
+
+    async fn read_post(&self, jeton: &Secret, post_id: &str)
+    -> Result<ElementLu, ErreurMessagerie>;
+
+    async fn read_profile(
+        &self,
+        jeton: &Secret,
+        username: &str,
+    ) -> Result<ProfilLu, ErreurMessagerie>;
+
+    async fn read_timeline(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+    ) -> Result<PostsLus, ErreurMessagerie>;
+}
+
+/// Les adaptateurs messagerie du jour un : X seul. LinkedIn n'y est pas —
+/// l'absence est le refus, servie par [`linkedin::refus_messagerie`] avec les
+/// citations datées, jamais par un stub.
+pub fn adaptateurs_messagerie() -> Vec<Box<dyn PlateformeMessagerie>> {
+    vec![Box::new(x::X)]
+}
+
 /// Ce que `post_preview` rend, et que `post_publish` doit reproduire à l'octet.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Apercu {

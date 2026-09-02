@@ -49,8 +49,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    Apercu, ApercuMedia, ErreurPlateforme, MediaPret, Metriques, Plateforme, Publication, Sondage,
-    TypeMedia, empreinte_globale, http, http_upload,
+    ActionFaite, Apercu, ApercuMedia, ElementLu, ErreurMessagerie, ErreurPlateforme, Inbox,
+    MediaPret, MessagePrive, Metriques, Plateforme, PlateformeMessagerie, PostsLus, ProfilLu,
+    Publication, ReponsePubliee, Sondage, TypeMedia, empreinte_globale, http, http_upload,
 };
 
 /// <https://docs.x.com/x-api/posts/creation-of-a-post>, relevé le 2026-09-02.
@@ -144,6 +145,18 @@ pub fn poids(texte: &str) -> usize {
 /// Ce qui fait basculer le tarif de 0,015 à 0,200 USD.
 fn contient_url(morceau: &str) -> bool {
     morceau.starts_with("https://") || morceau.starts_with("http://")
+}
+
+/// Le coût d'UN `POST /2/tweets` selon son texte — « Post: Create $0.015 »,
+/// « Post: Create (with URL) $0.200 » (pricing, relevé le 2026-09-02). Servi
+/// par l'aperçu de l'éditeur ET par `post_reply` côté messagerie : le facteur
+/// treize se calcule à un seul endroit.
+pub fn cout_creation_post(texte: &str) -> f64 {
+    if texte.split(char::is_whitespace).any(contient_url) {
+        COUT_PAR_POST_AVEC_URL_USD
+    } else {
+        COUT_PAR_POST_USD
+    }
 }
 
 /// Le corps exact de `POST /2/tweets` — un post texte reste `{"text": ...}`
@@ -618,12 +631,7 @@ impl Plateforme for X {
 
         let media: Vec<ApercuMedia> = medias.iter().map(apercu_media).collect();
         let alt_texts = medias.iter().filter(|m| m.alt_text.is_some()).count();
-        let avec_url = texte.split(char::is_whitespace).any(contient_url);
-        let base = if avec_url {
-            COUT_PAR_POST_AVEC_URL_USD
-        } else {
-            COUT_PAR_POST_USD
-        };
+        let base = cout_creation_post(texte);
         Apercu {
             rendered_text: texte.to_owned(),
             digest: empreinte_globale(texte, medias, sondage, made_with_ai),
@@ -703,6 +711,591 @@ impl Plateforme for X {
             .await
             .map_err(|_| ErreurPlateforme::Injoignable)?;
         metriques_depuis(statut, &corps).map(Some)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// La messagerie — endpoints, tarifs et citations recopiés du plan figé sur les
+// sondes du 2026-09-02. Rien d'inventé : chaque constante porte sa source.
+// ---------------------------------------------------------------------------
+
+/// DM reçus : `GET /2/dm_events`, scopes dm.read + users.read + tweet.read ;
+/// 15 req/15 min/user ; rétention 30 jours —
+/// docs.x.com/x-api/direct-messages/lookup/introduction, relevé le 2026-09-02.
+pub const POINT_DM_EVENTS: &str = "https://api.x.com/2/dm_events";
+/// « Available to all developers », fenêtre 7 jours, query 1-4096 caractères,
+/// max_results 10-100 — docs.x.com, relevé le 2026-09-02.
+pub const POINT_RECHERCHE: &str = "https://api.x.com/2/tweets/search/recent";
+/// Racine des chemins `/2/users/{id}/…` (mentions, likes, bookmarks,
+/// retweets, tweets) — docs.x.com, relevés le 2026-09-02.
+pub const POINT_USERS: &str = "https://api.x.com/2/users/";
+
+/// Tarifs pay-per-use — docs.x.com/x-api/getting-started/pricing.md, relevé le
+/// 2026-09-02 (« subject to change », les rates courants vivent dans la
+/// Console) :
+/// « DM Interaction: Create » — dm_reply comme dm_open.
+pub const COUT_DM_CREATE_USD: f64 = 0.015;
+/// Lecture DM : 0,010 USD PAR ÉVÉNEMENT RETOURNÉ.
+pub const COUT_DM_EVENEMENT_USD: f64 = 0.010;
+/// Mentions : 0,005 USD/post lu — le tarif Owned Read 0,001 exige que {id}
+/// soit le propriétaire de l'app, ce que nos tenants ne sont pas.
+pub const COUT_MENTION_USD: f64 = 0.005;
+/// « User Interaction: Create » — like 0,015, retweet 0,015.
+pub const COUT_INTERACTION_CREATE_USD: f64 = 0.015;
+/// « Interaction: Delete » — unlike 0,010, retweet delete 0,010. Le plan ne
+/// relève AUCUNE ligne propre au delete de bookmark : on rend ce chiffre-ci,
+/// la ligne delete relevée, plutôt qu'un zéro inventé.
+pub const COUT_INTERACTION_DELETE_USD: f64 = 0.010;
+/// Bookmark : 0,005 USD — le write le moins cher ; OAuth2 PKCE uniquement
+/// (notre flux X est déjà PKCE).
+pub const COUT_BOOKMARK_USD: f64 = 0.005;
+/// Lecture de posts (recherche PAR RÉSULTAT, timeline, read_post) : 0,005
+/// USD/post — une recherche à 100 résultats coûte jusqu'à 0,50 USD, d'où le
+/// coût réel constaté dans chaque retour. Plafond global : 3 000 000 lectures
+/// de posts/cycle.
+pub const COUT_PAR_POST_LU_USD: f64 = 0.005;
+/// « User: Read » : 0,010 USD/user.
+pub const COUT_PAR_USER_LU_USD: f64 = 0.010;
+
+/// « Quote-posting (using the quote_tweet_id parameter) requires an
+/// Enterprise plan. It is not available on self-serve (pay-per-use) tiers. »
+/// — docs.x.com/x-api/posts/create-post, relevé le 2026-09-02.
+pub const CITATION_QUOTE_ENTERPRISE: &str = "« Quote-posting (using the quote_tweet_id parameter) requires an Enterprise plan. \
+     It is not available on self-serve (pay-per-use) tiers. » \
+     — docs.x.com/x-api/posts/create-post, relevé le 2026-09-02";
+
+/// Refuse tout identifiant qui ne peut pas être un id X : des chiffres, plus
+/// `-` pour un id de conversation (forme `{id}-{id}` documentée). Un id
+/// hostile ne devient jamais un morceau de chemin — ni `../`, ni `with/…` qui
+/// transformerait une réponse (dm_reply) en ouverture (dm_open). Le statut
+/// 400 est le nôtre : le refus part d'ici, aucun octet ne part vers X.
+fn id_x(id: &str, avec_tiret: bool) -> Result<&str, ErreurPlateforme> {
+    if !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_digit() || (avec_tiret && c == '-'))
+    {
+        Ok(id)
+    } else {
+        Err(ErreurPlateforme::Refus { statut: 400 })
+    }
+}
+
+/// Même garde pour un username X : alphanumériques et `_`, rien d'autre.
+fn username_x(username: &str) -> Result<&str, ErreurPlateforme> {
+    if !username.is_empty()
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Ok(username)
+    } else {
+        Err(ErreurPlateforme::Refus { statut: 400 })
+    }
+}
+
+/// Conversation EXISTANTE : `POST /2/dm_conversations/{dm_conversation_id}/messages`
+/// (docs.x.com/x-api/direct-messages/manage/integrate, relevé le 2026-09-02 ;
+/// dm.write, qui exige dm.read + tweet.read + users.read ; app-only interdit :
+/// « All Direct Messages are private » ; 15/15 min + 1440/24 h par user).
+pub fn url_dm_reply(dm_conversation_id: &str) -> String {
+    format!("https://api.x.com/2/dm_conversations/{dm_conversation_id}/messages")
+}
+
+/// NOUVELLE conversation : `POST /2/dm_conversations/with/{participant_id}/messages`
+/// — « Creates a new conversation if one doesn't exist » (même page, relevé le
+/// 2026-09-02). Le chemin `/with/` est CE qui sépare initier de répondre :
+/// c'est l'API elle-même qui découpe les deux risques.
+pub fn url_dm_open(participant_id: &str) -> String {
+    format!("https://api.x.com/2/dm_conversations/with/{participant_id}/messages")
+}
+
+/// `GET /2/users/{id}/mentions` — 300/15 min/user (relevé le 2026-09-02).
+pub fn url_mentions(user_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/mentions")
+}
+
+/// `POST /2/users/{id}/likes` — like.write ; 50/15 min + 1000/24 h (relevé le
+/// 2026-09-02).
+pub fn url_likes(user_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/likes")
+}
+
+/// `DELETE /2/users/{id}/likes/{tweet_id}` (relevé le 2026-09-02).
+pub fn url_unlike(user_id: &str, tweet_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/likes/{tweet_id}")
+}
+
+/// `POST /2/users/{id}/bookmarks` — bookmark.write, OAuth2 PKCE uniquement ;
+/// 50/15 min (relevé le 2026-09-02).
+pub fn url_bookmarks(user_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/bookmarks")
+}
+
+/// `DELETE /2/users/{id}/bookmarks/{tweet_id}` (relevé le 2026-09-02).
+pub fn url_unbookmark(user_id: &str, tweet_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/bookmarks/{tweet_id}")
+}
+
+/// `POST /2/users/{id}/retweets` — tweet.write ; 50/15 min (relevé le
+/// 2026-09-02).
+pub fn url_retweets(user_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/retweets")
+}
+
+/// `GET /2/users/{id}/tweets` — 900/15 min/user (relevé le 2026-09-02).
+pub fn url_timeline(user_id: &str) -> String {
+    format!("{POINT_USERS}{user_id}/tweets")
+}
+
+/// `GET /2/users/by/username/{username}` (relevé le 2026-09-02).
+pub fn url_profil(username: &str) -> String {
+    format!("{POINT_USERS}by/username/{username}")
+}
+
+/// Le corps d'un DM : `{"text": ...}` — les deux endpoints DM (reply et open)
+/// portent la même forme (integrate, relevé le 2026-09-02).
+pub fn corps_dm(texte: &str) -> serde_json::Value {
+    json!({ "text": texte })
+}
+
+/// Une réponse publique : `POST /2/tweets` avec
+/// `reply.in_reply_to_tweet_id` (creation-of-a-post, relevé le 2026-09-02).
+pub fn corps_reponse_publique(texte: &str, in_reply_to_tweet_id: &str) -> serde_json::Value {
+    json!({ "text": texte, "reply": { "in_reply_to_tweet_id": in_reply_to_tweet_id } })
+}
+
+/// Le corps des actions like/bookmark/retweet : `{"tweet_id": ...}` (relevé le
+/// 2026-09-02).
+pub fn corps_action(tweet_id: &str) -> serde_json::Value {
+    json!({ "tweet_id": tweet_id })
+}
+
+/// Lit `{"data": {"dm_conversation_id", "dm_event_id"}}` — la réponse
+/// documentée des deux endpoints DM. Le corps n'entre jamais dans l'erreur.
+pub fn message_prive_depuis(statut: u16, corps: &[u8]) -> Result<MessagePrive, ErreurPlateforme> {
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let lire = |champ: &str| {
+        document
+            .pointer(&format!("/data/{champ}"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or(ErreurPlateforme::Illisible)
+    };
+    Ok(MessagePrive {
+        dm_conversation_id: lire("dm_conversation_id")?,
+        dm_event_id: lire("dm_event_id")?,
+        cout_usd: COUT_DM_CREATE_USD,
+    })
+}
+
+/// Lit un tableau `data` d'éléments (DM events : auteur sous `sender_id` ;
+/// posts : sous `author_id`). Un `data` absent est une liste vide — c'est la
+/// forme documentée d'un résultat sans rien (meta.result_count: 0), pas une
+/// réponse illisible. Tout texte rendu est du contenu de tiers : marqué.
+pub fn elements_depuis(
+    statut: u16,
+    corps: &[u8],
+    champ_auteur: &str,
+) -> Result<Vec<ElementLu>, ErreurPlateforme> {
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let Some(data) = document.get("data") else {
+        return Ok(Vec::new());
+    };
+    data.as_array()
+        .ok_or(ErreurPlateforme::Illisible)?
+        .iter()
+        .map(|e| {
+            Ok(ElementLu {
+                id: e
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or(ErreurPlateforme::Illisible)?
+                    .to_owned(),
+                auteur_id: e
+                    .get(champ_auteur)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                // Un événement DM sans texte existe (pièce jointe seule) :
+                // texte vide, pas Illisible.
+                texte: e
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                third_party: true,
+            })
+        })
+        .collect()
+}
+
+/// Lit UN post : `{"data": {"id", "text", "author_id"?}}`.
+pub fn element_depuis(statut: u16, corps: &[u8]) -> Result<ElementLu, ErreurPlateforme> {
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let data = document.get("data").ok_or(ErreurPlateforme::Illisible)?;
+    Ok(ElementLu {
+        id: data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or(ErreurPlateforme::Illisible)?
+            .to_owned(),
+        auteur_id: data
+            .get("author_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        texte: data
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        third_party: true,
+    })
+}
+
+/// Lit `{"data": {"id", "name", "username"}}` — get-user-by-username, relevé
+/// le 2026-09-02.
+pub fn profil_depuis(statut: u16, corps: &[u8]) -> Result<ProfilLu, ErreurPlateforme> {
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let lire = |champ: &str| {
+        document
+            .pointer(&format!("/data/{champ}"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or(ErreurPlateforme::Illisible)
+    };
+    Ok(ProfilLu {
+        id: lire("id")?,
+        username: lire("username")?,
+        nom: lire("name")?,
+        third_party: true,
+    })
+}
+
+/// Envoie et lit (statut, corps) — le corps ne finit jamais dans une erreur,
+/// seul le lecteur décidera ce qu'il en garde.
+async fn envoyer(requete: reqwest::RequestBuilder) -> Result<(u16, Vec<u8>), ErreurPlateforme> {
+    let reponse = requete
+        .send()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    let statut = reponse.status().as_u16();
+    let corps = reponse
+        .bytes()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    Ok((statut, corps.to_vec()))
+}
+
+#[async_trait]
+impl PlateformeMessagerie for X {
+    fn nom(&self) -> &'static str {
+        "x"
+    }
+
+    async fn dm_reply(
+        &self,
+        jeton: &Secret,
+        dm_conversation_id: &str,
+        texte: &str,
+    ) -> Result<MessagePrive, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .post(url_dm_reply(id_x(dm_conversation_id, true)?))
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_dm(texte)),
+        )
+        .await?;
+        Ok(message_prive_depuis(statut, &corps)?)
+    }
+
+    async fn dm_open(
+        &self,
+        jeton: &Secret,
+        participant_id: &str,
+        texte: &str,
+    ) -> Result<MessagePrive, ErreurMessagerie> {
+        // La gate des suppressions appartient au cœur, AVANT cet appel : ici
+        // il n'y a plus que le réseau.
+        let (statut, corps) = envoyer(
+            http()
+                .post(url_dm_open(id_x(participant_id, false)?))
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_dm(texte)),
+        )
+        .await?;
+        Ok(message_prive_depuis(statut, &corps)?)
+    }
+
+    async fn inbox(&self, jeton: &Secret, user_id: &str) -> Result<Inbox, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .get(POINT_DM_EVENTS)
+                .query(&[("dm_event.fields", "sender_id,text")])
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        let dm_events = elements_depuis(statut, &corps, "sender_id")?;
+        let (statut, corps) = envoyer(
+            http()
+                .get(url_mentions(id_x(user_id, false)?))
+                .query(&[("tweet.fields", "author_id")])
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        let mentions = elements_depuis(statut, &corps, "author_id")?;
+        // Le coût réel constaté : facturation PAR élément retourné.
+        let cout_usd = dm_events.len() as f64 * COUT_DM_EVENEMENT_USD
+            + mentions.len() as f64 * COUT_MENTION_USD;
+        Ok(Inbox {
+            dm_events,
+            mentions,
+            cout_usd,
+        })
+    }
+
+    async fn post_reply(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        in_reply_to_post_id: &str,
+        texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .post(POINT_PUBLICATION)
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_reponse_publique(texte, in_reply_to_post_id)),
+        )
+        .await?;
+        let publication = publication_depuis(statut, &corps, handle)?;
+        Ok(ReponsePubliee {
+            id_plateforme: publication.id_plateforme,
+            url: publication.url,
+            // 0,015 — ou 0,200 dès que le texte porte une URL : le même
+            // calcul que l'aperçu de l'éditeur, à un seul endroit.
+            cout_usd: cout_creation_post(texte),
+        })
+    }
+
+    async fn post_comment(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        post_id: &str,
+        parent_comment: Option<&str>,
+        texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie> {
+        // Chez X commenter EST répondre : un seul geste, un seul endpoint —
+        // répondre à un commentaire, c'est répondre à ce commentaire-post.
+        self.post_reply(jeton, handle, parent_comment.unwrap_or(post_id), texte)
+            .await
+    }
+
+    async fn post_like(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie> {
+        let (statut, _) = envoyer(
+            http()
+                .post(url_likes(id_x(user_id, false)?))
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_action(post_id)),
+        )
+        .await?;
+        if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+            return Err(erreur.into());
+        }
+        Ok(ActionFaite {
+            cout_usd: COUT_INTERACTION_CREATE_USD,
+        })
+    }
+
+    async fn post_unlike(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie> {
+        let (statut, _) = envoyer(
+            http()
+                .delete(url_unlike(id_x(user_id, false)?, id_x(post_id, false)?))
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+            return Err(erreur.into());
+        }
+        Ok(ActionFaite {
+            cout_usd: COUT_INTERACTION_DELETE_USD,
+        })
+    }
+
+    async fn post_bookmark(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie> {
+        let (statut, _) = envoyer(
+            http()
+                .post(url_bookmarks(id_x(user_id, false)?))
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_action(post_id)),
+        )
+        .await?;
+        if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+            return Err(erreur.into());
+        }
+        Ok(ActionFaite {
+            cout_usd: COUT_BOOKMARK_USD,
+        })
+    }
+
+    async fn post_unbookmark(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie> {
+        let (statut, _) = envoyer(
+            http()
+                .delete(url_unbookmark(id_x(user_id, false)?, id_x(post_id, false)?))
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+            return Err(erreur.into());
+        }
+        Ok(ActionFaite {
+            cout_usd: COUT_INTERACTION_DELETE_USD,
+        })
+    }
+
+    async fn post_repost(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+        post_id: &str,
+    ) -> Result<ActionFaite, ErreurMessagerie> {
+        let (statut, _) = envoyer(
+            http()
+                .post(url_retweets(id_x(user_id, false)?))
+                .bearer_auth(jeton.expose_for_transport())
+                .json(&corps_action(post_id)),
+        )
+        .await?;
+        if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+            return Err(erreur.into());
+        }
+        Ok(ActionFaite {
+            cout_usd: COUT_INTERACTION_CREATE_USD,
+        })
+    }
+
+    async fn post_quote(
+        &self,
+        _jeton: &Secret,
+        _handle: &str,
+        _post_id: &str,
+        _texte: &str,
+    ) -> Result<ReponsePubliee, ErreurMessagerie> {
+        // Refusé au palier pay-per-use — pas un stub : le fait cité, et ce
+        // qui débloquerait.
+        Err(ErreurMessagerie::NeSertPas {
+            citation: CITATION_QUOTE_ENTERPRISE,
+            deblocage: "un plan Enterprise chez X",
+        })
+    }
+
+    async fn search_posts(
+        &self,
+        jeton: &Secret,
+        query: &str,
+        max_results: u8,
+    ) -> Result<PostsLus, ErreurMessagerie> {
+        // max_results documenté : 10-100 (relevé le 2026-09-02) — on borne
+        // plutôt que de laisser la plateforme répondre 400 pour un 5.
+        let borne = max_results.clamp(10, 100);
+        let (statut, corps) = envoyer(
+            http()
+                .get(POINT_RECHERCHE)
+                .query(&[
+                    ("query", query),
+                    ("max_results", &borne.to_string()),
+                    ("tweet.fields", "author_id"),
+                ])
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        let posts = elements_depuis(statut, &corps, "author_id")?;
+        // Facturé PAR RÉSULTAT (0,005, dédup 24 h UTC) : le coût réel est
+        // résultats × tarif — le plan exige que l'outil le rende.
+        let cout_usd = posts.len() as f64 * COUT_PAR_POST_LU_USD;
+        Ok(PostsLus { posts, cout_usd })
+    }
+
+    async fn read_post(
+        &self,
+        jeton: &Secret,
+        post_id: &str,
+    ) -> Result<ElementLu, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .get(format!("{POINT_LECTURE}{}", id_x(post_id, false)?))
+                .query(&[("tweet.fields", "author_id")])
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        Ok(element_depuis(statut, &corps)?)
+    }
+
+    async fn read_profile(
+        &self,
+        jeton: &Secret,
+        username: &str,
+    ) -> Result<ProfilLu, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .get(url_profil(username_x(username)?))
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        Ok(profil_depuis(statut, &corps)?)
+    }
+
+    async fn read_timeline(
+        &self,
+        jeton: &Secret,
+        user_id: &str,
+    ) -> Result<PostsLus, ErreurMessagerie> {
+        let (statut, corps) = envoyer(
+            http()
+                .get(url_timeline(id_x(user_id, false)?))
+                .query(&[("tweet.fields", "author_id")])
+                .bearer_auth(jeton.expose_for_transport()),
+        )
+        .await?;
+        let posts = elements_depuis(statut, &corps, "author_id")?;
+        let cout_usd = posts.len() as f64 * COUT_PAR_POST_LU_USD;
+        Ok(PostsLus { posts, cout_usd })
     }
 }
 
@@ -1129,6 +1722,231 @@ mod tests {
             POINT_UPLOAD,
             POINT_INITIALIZE,
             POINT_METADATA,
+        ] {
+            assert!(point.starts_with("https://"), "{point}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_messagerie {
+    use super::*;
+
+    /// LE test du découpage : les deux chemins d'API sont distincts, et un
+    /// dm_conversation_id ne tombe JAMAIS dans le chemin `/with/` — répondre
+    /// ne peut pas devenir initier par construction d'URL.
+    #[test]
+    fn les_deux_chemins_dm_sont_figes_et_disjoints() {
+        assert_eq!(
+            url_dm_reply("123123123-456456456"),
+            "https://api.x.com/2/dm_conversations/123123123-456456456/messages"
+        );
+        assert_eq!(
+            url_dm_open("2244994945"),
+            "https://api.x.com/2/dm_conversations/with/2244994945/messages"
+        );
+        // Quel que soit l'id VALIDE, le chemin reply ne contient jamais /with/.
+        for id in ["1", "123-456", "2244994945"] {
+            assert!(!url_dm_reply(id).starts_with("https://api.x.com/2/dm_conversations/with/"));
+        }
+        assert!(url_dm_open("2244994945").contains("/with/"));
+    }
+
+    /// Un id qui n'a pas la forme d'un id X (« with », « ../ », vide…) est
+    /// refusé AVANT de construire une URL : un conversation_id hostile ne
+    /// peut pas fabriquer le chemin `/with/` et transformer une réponse en
+    /// ouverture — le refus est local (400 à nous), aucun octet ne part.
+    #[tokio::test]
+    async fn un_id_hostile_est_refuse_avant_toute_url() {
+        let jeton = Secret::new("jeton");
+        for hostile in ["with", "../123", "123/messages", "", "with/99"] {
+            let erreur = X
+                .dm_reply(&jeton, hostile, "texte")
+                .await
+                .expect_err("un id difforme n'est pas une conversation");
+            assert_eq!(
+                erreur,
+                ErreurMessagerie::Plateforme(ErreurPlateforme::Refus { statut: 400 }),
+                "{hostile}"
+            );
+            let erreur = X
+                .dm_open(&jeton, hostile, "texte")
+                .await
+                .expect_err("un id difforme n'est pas un participant");
+            assert_eq!(
+                erreur,
+                ErreurMessagerie::Plateforme(ErreurPlateforme::Refus { statut: 400 }),
+                "{hostile}"
+            );
+        }
+        // Et un id de conversation (tirets permis) n'est pas un participant.
+        assert!(X.dm_open(&jeton, "123-456", "t").await.is_err());
+    }
+
+    /// `{"text": ...}` — integrate, relevé le 2026-09-02. La même forme pour
+    /// les deux endpoints DM.
+    #[test]
+    fn le_corps_dm_est_celui_de_la_doc() {
+        assert_eq!(
+            corps_dm("Hello, just you!"),
+            json!({ "text": "Hello, just you!" })
+        );
+    }
+
+    /// `reply.in_reply_to_tweet_id` — creation-of-a-post, relevé le 2026-09-02.
+    #[test]
+    fn le_corps_de_reponse_publique_est_celui_de_la_doc() {
+        assert_eq!(
+            corps_reponse_publique("Bien vu !", "1455953449422516226"),
+            json!({
+                "text": "Bien vu !",
+                "reply": { "in_reply_to_tweet_id": "1455953449422516226" }
+            })
+        );
+    }
+
+    /// `{"tweet_id": ...}` pour like/bookmark/retweet — relevé le 2026-09-02.
+    #[test]
+    fn le_corps_d_action_et_les_urls_d_action_sont_ceux_de_la_doc() {
+        assert_eq!(
+            corps_action("1455953449422516226"),
+            json!({ "tweet_id": "1455953449422516226" })
+        );
+        assert_eq!(url_likes("42"), "https://api.x.com/2/users/42/likes");
+        assert_eq!(
+            url_unlike("42", "7"),
+            "https://api.x.com/2/users/42/likes/7"
+        );
+        assert_eq!(
+            url_bookmarks("42"),
+            "https://api.x.com/2/users/42/bookmarks"
+        );
+        assert_eq!(
+            url_unbookmark("42", "7"),
+            "https://api.x.com/2/users/42/bookmarks/7"
+        );
+        assert_eq!(url_retweets("42"), "https://api.x.com/2/users/42/retweets");
+        assert_eq!(url_mentions("42"), "https://api.x.com/2/users/42/mentions");
+        assert_eq!(url_timeline("42"), "https://api.x.com/2/users/42/tweets");
+        assert_eq!(
+            url_profil("XDevelopers"),
+            "https://api.x.com/2/users/by/username/XDevelopers"
+        );
+    }
+
+    /// La réponse documentée des deux endpoints DM porte les deux ids — et le
+    /// coût DM (0,015 USD, « DM Interaction: Create ») sort avec.
+    #[test]
+    fn un_dm_parti_se_lit_comme_la_doc_et_porte_son_cout() {
+        let corps = br#"{"data":{"dm_conversation_id":"123123123-456456456","dm_event_id":"1050118621198921728"}}"#;
+        let message = message_prive_depuis(201, corps).expect("forme documentée");
+        assert_eq!(message.dm_conversation_id, "123123123-456456456");
+        assert_eq!(message.dm_event_id, "1050118621198921728");
+        assert_eq!(message.cout_usd, COUT_DM_CREATE_USD);
+        // Un 2xx difforme est illisible, pas un DM à moitié parti.
+        assert!(message_prive_depuis(201, b"{}").is_err());
+    }
+
+    /// Aucun corps hostile (écho de la requête, Authorization comprise) ne
+    /// traverse vers l'erreur — sur TOUS les lecteurs messagerie.
+    #[test]
+    fn aucun_lecteur_messagerie_ne_laisse_fuir_un_jeton() {
+        let hostile = br#"{"errors":[{"detail":"Bearer JETON-SECRET refuse"}]}"#;
+        for statut in [400, 401, 403, 404, 429, 500] {
+            let rendus = [
+                format!("{:?}", message_prive_depuis(statut, hostile)),
+                format!("{:?}", elements_depuis(statut, hostile, "author_id")),
+                format!("{:?}", element_depuis(statut, hostile)),
+                format!("{:?}", profil_depuis(statut, hostile)),
+            ];
+            for rendu in rendus {
+                assert!(!rendu.contains("JETON-SECRET"), "le jeton a fui: {rendu}");
+            }
+        }
+    }
+
+    /// La recherche est facturée PAR RÉSULTAT (0,005 USD) : trois posts
+    /// rendus = 0,015 USD constaté — et zéro résultat coûte zéro.
+    #[test]
+    fn le_cout_de_lecture_est_par_resultat_constate() {
+        let corps = br#"{"data":[
+            {"id":"1","text":"un","author_id":"11"},
+            {"id":"2","text":"deux","author_id":"22"},
+            {"id":"3","text":"trois"}
+        ],"meta":{"result_count":3}}"#;
+        let posts = elements_depuis(200, corps, "author_id").expect("forme documentée");
+        assert_eq!(posts.len(), 3);
+        assert_eq!(posts.len() as f64 * COUT_PAR_POST_LU_USD, 0.015);
+        assert_eq!(posts[0].auteur_id.as_deref(), Some("11"));
+        assert!(posts[2].auteur_id.is_none());
+        // Tout ce qui est lu est marqué contenu de tiers.
+        assert!(posts.iter().all(|p| p.third_party));
+        // `data` absent = résultat vide documenté (meta.result_count: 0).
+        let vide = elements_depuis(200, br#"{"meta":{"result_count":0}}"#, "author_id")
+            .expect("un résultat vide n'est pas une panne");
+        assert!(vide.is_empty());
+    }
+
+    /// Les DM events lisent l'auteur sous `sender_id` (dm_event.fields), et un
+    /// événement sans texte (pièce jointe seule) ne casse rien.
+    #[test]
+    fn les_dm_events_se_lisent_avec_sender_id() {
+        let corps = br#"{"data":[{"id":"e1","text":"salut","sender_id":"99"},{"id":"e2","sender_id":"98"}]}"#;
+        let events = elements_depuis(200, corps, "sender_id").expect("forme documentée");
+        assert_eq!(events[0].auteur_id.as_deref(), Some("99"));
+        assert_eq!(events[1].texte, "");
+    }
+
+    #[test]
+    fn un_profil_se_lit_comme_la_doc() {
+        let corps = br#"{"data":{"id":"2244994945","name":"Developers","username":"XDevelopers"}}"#;
+        let profil = profil_depuis(200, corps).expect("forme documentée");
+        assert_eq!(profil.id, "2244994945");
+        assert_eq!(profil.username, "XDevelopers");
+        assert_eq!(profil.nom, "Developers");
+        assert!(profil.third_party);
+    }
+
+    /// Le quote est refusé au palier pay-per-use — un fait cité (Enterprise),
+    /// jamais un stub silencieux ni un panic.
+    #[tokio::test]
+    async fn le_quote_rend_le_refus_cite_sans_reseau() {
+        let erreur = X
+            .post_quote(&Secret::new("jeton"), "orizn", "1", "je cite")
+            .await
+            .expect_err("aucune plateforme ne sert le quote à notre palier");
+        assert_eq!(erreur.code(), "plateforme_ne_sert_pas");
+        let ErreurMessagerie::NeSertPas {
+            citation,
+            deblocage,
+        } = erreur
+        else {
+            panic!("le refus doit être NeSertPas, reçu {erreur:?}");
+        };
+        assert!(citation.contains("Enterprise plan"));
+        assert!(citation.contains("2026-09-02"));
+        assert!(deblocage.contains("Enterprise"));
+    }
+
+    /// Le coût d'une réponse publique suit la règle de l'éditeur : 0,015 nu,
+    /// 0,200 dès qu'une URL est dans le texte (« Post: Create (with URL) »).
+    #[test]
+    fn le_cout_d_une_reponse_bascule_avec_une_url() {
+        assert_eq!(cout_creation_post("merci !"), 0.015);
+        assert_eq!(cout_creation_post("voir https://orizn.example"), 0.200);
+    }
+
+    #[test]
+    fn les_points_messagerie_sont_en_https() {
+        for point in [
+            POINT_DM_EVENTS,
+            POINT_RECHERCHE,
+            &url_dm_reply("1"),
+            &url_dm_open("1"),
+            &url_likes("1"),
+            &url_bookmarks("1"),
+            &url_retweets("1"),
+            &url_profil("a"),
         ] {
             assert!(point.starts_with("https://"), "{point}");
         }

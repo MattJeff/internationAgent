@@ -117,6 +117,63 @@ sondages, et documents PDF côté LinkedIn, dans les ARGUMENTS de
 déposer — la liste exécutable est ci-dessous, on ne les code pas
 aujourd'hui.
 
+## La seconde surface — `/mcp/messagerie`
+
+L'éditeur (`/mcp`) ne peut atteindre personne qui n'a rien demandé —
+`NoStrangers`, prouvé par un test qui lit sa table. La messagerie
+(`/mcp/messagerie`) peut atteindre des gens : c'est son métier. Elle n'est
+donc pas `NoStrangers` et ne le prétendra jamais — elle est `HeldHere` :
+chaque premier contact passe la table des suppressions, chaque refus y entre
+pour toujours, et `dm_open` est l'outil qu'une politique fait contresigner.
+La garantie de l'éditeur survit à l'extension parce que les deux tables ne
+partagent pas une ligne : même serveur, même jeton de tenant, mais SA table,
+SA version (`VERSION_TABLE_MESSAGERIE`), SES empreintes — et un test croisé
+qui fige l'empreinte de l'éditeur depuis la messagerie.
+
+Quatorze outils (`apps/social/src/messagerie.rs`), tous servis par X au
+palier pay-per-use, chaque endpoint/scope/prix relevé le 2026-09-02 :
+`inbox_list` (0,010 USD/événement DM + 0,005/mention), `dm_reply` et
+`dm_open` (0,015 chacun — DEUX outils parce que X en fait deux chemins d'API
+distincts : répondre `POST /2/dm_conversations/{id}/messages`, initier
+`POST /2/dm_conversations/with/{participant_id}/messages` ; un test fige que
+le chemin de `dm_reply` ne tombe jamais dans `/with/`), `post_reply` (0,015 ;
+0,200 avec URL), `post_comment` (chez X = `post_reply`, même endpoint),
+`post_like`/`post_unlike` (0,015/0,010), `post_bookmark`/`post_unbookmark`
+(0,005/0,010 — aucune ligne pricing propre au delete de bookmark relevée : on
+rend la ligne « Interaction: Delete »), `post_repost` (0,015), `search_posts`
+(0,005 PAR RÉSULTAT — jusqu'à 0,50 USD pour 100 résultats ; le retour porte
+le coût réel constaté), `read_post` (0,005), `read_profile` (0,010),
+`read_timeline` (0,005/post, plafond global 3 M lectures/cycle). Ce qui n'y
+est pas est un choix cité : `post_quote` (Enterprise seulement chez X),
+`dm_delete` (doc ambiguë v1.1/v2), DM de groupe (aucun besoin jour un).
+
+* **La règle des suppressions** (`social_suppressions`, migration 0004) : X
+  ne sert aucune liste d'opt-out — le refus n'est détectable qu'à l'envoi
+  (403 « The recipient may have DM settings that prevent messages from
+  unknown users, or may have blocked you », relevé 2026-09-02). Donc
+  `dm_open` consulte la table AVANT tout appel réseau (un supprimé = refus
+  nommé `destinataire_supprime`, compteur adaptateur à zéro — testé), et un
+  403 de plateforme insère la ligne pour toujours. `dm_reply` n'est PAS gaté :
+  répondre à qui a écrit en premier n'est pas un contact à froid. Aucun outil
+  MCP ne lit ni n'écrit cette table : un agent n'efface pas la liste des gens
+  qui ont dit non.
+* **LinkedIn ne sert RIEN de cette table à un membre self-serve** : chaque
+  outil rend `plateforme_ne_sert_pas` avec la citation datée du 2026-09-02 et
+  le fait qui débloquerait (`apps/social/src/adapters/linkedin.rs`) — jamais
+  un stub. Les conditionnels (`post_comment`, `post_like`, `read_timeline`)
+  nomment le Community Management API ; le jour où la candidature est
+  approuvée, l'adaptateur arrive SANS bump de la table d'outils.
+* **Contenu de tiers** : tout texte rendu par `inbox_list`, `search_posts`,
+  `read_post`, `read_profile`, `read_timeline` porte `third_party: true` —
+  le runtime l'enveloppe en `Untrusted`, même discipline que les lectures
+  GitHub du catalogue. Le service marque, il ne « nettoie » rien.
+* **L'id plateforme** (migration 0005) : le `handle` X est le USERNAME, mais
+  `/2/users/{id}/…` (mentions, likes, bookmarks, retweets) exige l'id
+  NUMÉRIQUE — `/2/users/me` donne les deux au connect, on garde les deux. Un
+  compte connecté avant 0005 (ou avant les scopes `dm.read dm.write
+  like.write bookmark.write`) répond par une erreur nommée qui renvoie vers
+  `account_connect_url` : un seul re-consentement humain répare les deux.
+
 ## Les revues d'app — la part que seul le fondateur peut faire
 
 Chaque ligne : le portail, ce qu'on demande, ce que ça débloque, le délai
@@ -133,7 +190,9 @@ le 2026-09-02.
   poser la paire client dans la config du service (`SOCIAL_X_CLIENT_ID` /
   `SOCIAL_X_CLIENT_SECRET`) ; acheter des crédits (pay-per-usage, aucun
   abonnement). Scopes demandés par le service : `tweet.read tweet.write
-  users.read offline.access`.
+  users.read offline.access dm.read dm.write like.write bookmark.write`
+  (les quatre derniers pour `/mcp/messagerie` ; un compte connecté avant
+  leur ajout re-consent via `account_connect_url`).
 * **Débloque** : la publication immédiatement — aucune revue.
 * **Coût** : 0,015 USD/post créé ; 0,200 USD/post avec URL ; lectures de
   posts 0,005 USD/ressource (pricing.md, 2026-09-02). **Délai : aucun.**
@@ -154,6 +213,24 @@ le 2026-09-02.
   Self-serve, **sans revue. Délai : aucun.**
 * **Ne débloque PAS** : les analytics (membre : inexistantes ; organisation :
   Marketing API Program, une candidature séparée avec revue).
+
+### LinkedIn — Community Management API, la candidature (messagerie)
+
+* **Portail** : https://www.linkedin.com/developers (Products → Community
+  Management API, candidature avec revue).
+* **Quoi** : demander l'accès qui délivre `w_member_social_feed` — le scope
+  qu'exigent `POST /rest/socialActions/{urn}/comments` et
+  `POST /rest/reactions` (learn.microsoft.com/increasing-access, ms.date
+  2026-07-28, consulté 2026-09-02). Palier Development par défaut :
+  500 appels/app/24 h, 100/membre/24 h.
+* **Débloque** : `post_comment`, `post_like`/`post_unlike` et
+  `read_timeline` (ses propres posts) côté LinkedIn sur `/mcp/messagerie` —
+  les outils existent déjà, seul l'adaptateur change, sans bump de table.
+  Gratuit : l'accès LinkedIn est gaté par programme, pas facturé.
+* **Ne débloque PAS** : les DM (`POST /v2/messages` reste « restricted to
+  approved partners » — accord partenaire ad hoc via le Developer Support
+  Portal), la recherche, les bookmarks (l'API n'existe pas).
+  **Délai : non publié par la doc.**
 
 ### Meta (Pages + Instagram) — Advanced Access (phase 2)
 
@@ -241,4 +318,8 @@ jour où `agentos-social` est DÉPLOYÉ et sondé, l'entrée aura cette forme :
 tenant), `floor: RiskClass::Write` (publier engage l'entreprise, jamais
 `Read` ; rien n'efface un compte, pas `Destructive`), et
 `OptOuts::NoStrangers` — prouvé par le test anti-DM du service, une première
-pour ce registre.
+pour ce registre. La messagerie aura SA seconde entrée (`social-messagerie`,
+`Dial` vers `/mcp/messagerie`, même jeton Bearer de tenant) : `floor:
+RiskClass::Write` et `OptOuts::HeldHere` — la seule liste des refus est
+`social_suppressions`, tenue chez nous, parce que X ne rend le refus d'un
+destinataire qu'à l'envoi.

@@ -48,8 +48,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    Apercu, ApercuMedia, ErreurPlateforme, MediaPret, Metriques, Plateforme, Publication, Sondage,
-    TypeMedia, empreinte_globale, http, http_upload,
+    Apercu, ApercuMedia, ErreurMessagerie, ErreurPlateforme, MediaPret, Metriques, Plateforme,
+    Publication, Sondage, TypeMedia, empreinte_globale, http, http_upload,
 };
 
 /// <https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api>,
@@ -819,6 +819,107 @@ impl Plateforme for Linkedin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// La messagerie : LinkedIn ne sert RIEN de cette table à un membre self-serve
+// aujourd'hui. LinkedIn n'implémente donc PAS `PlateformeMessagerie` —
+// l'absence d'implémentation EST le refus, et le dispatcher du cœur rend
+// `refus_messagerie(outil)` : un fait cité et daté, jamais un stub silencieux.
+// Sondes du 2026-09-02, figées dans le plan.
+// ---------------------------------------------------------------------------
+
+/// Le refus LinkedIn pour UN outil de la table messagerie — citation datée +
+/// le fait qui débloquerait. `None` pour un nom d'outil inconnu (au cœur de
+/// dire « outil inexistant », pas à nous d'inventer un refus).
+///
+/// Les entrées CONDITIONNELLES (comment, like, timeline) portent le fait
+/// exact : le jour où la candidature Community Management du fondateur est
+/// approuvée, l'implémentation arrive et cette table rétrécit — SANS bump de
+/// la table d'outils (les outils existaient déjà, seul l'adaptateur change).
+pub fn refus_messagerie(outil: &str) -> Option<ErreurMessagerie> {
+    let (citation, deblocage): (&'static str, &'static str) = match outil {
+        "inbox_list" => (
+            "« aucun endpoint feed ni notifications membre documenté » (index \
+             learn.microsoft.com, 198 docs LinkedIn, relevé le 2026-09-02)",
+            "le scope r_member_social_feed, « select developers only », via le \
+             Developer Support Portal",
+        ),
+        "dm_reply" => (
+            "POST /v2/messages est « restricted to approved partners, subject to \
+             limitations via API agreement » (learn.microsoft.com, page NOINDEX, \
+             ms.date 2019-11-20, consultée le 2026-09-02)",
+            "un accord partenaire ad hoc via le Developer Support Portal",
+        ),
+        "dm_open" => (
+            // Doublement fermé : l'accès, ET les règles produit même approuvé.
+            "accès « restricted to approved partners », ET même approuvé « chaque \
+             message doit être une action membre explicite, pas d'événement \
+             automatisé ou planifié, 1er degré uniquement » (learn.microsoft.com, \
+             page messages NOINDEX, consultée le 2026-09-02)",
+            "rien — le DM froid automatisé est interdit par l'accès ET par les \
+             règles produit ; aucun fait ne le débloque pour un agent",
+        ),
+        "post_reply" => (
+            "pour un membre self-serve, la page Share on LinkedIn ne documente que \
+             POST /v2/ugcPosts, et la page Comments API ne liste pas \
+             w_member_social (relevé le 2026-09-02)",
+            "le Community Management API — le même chemin que post_comment",
+        ),
+        "post_comment" => (
+            "POST /rest/socialActions/{urn}/comments exige w_member_social_feed, \
+             délivré uniquement par le Community Management API sur candidature \
+             (palier Development : 500 appels/app/24 h, 100/membre/24 h — \
+             learn.microsoft.com/increasing-access, ms.date 2026-07-28, consulté \
+             le 2026-09-02)",
+            "la candidature Community Management API du fondateur approuvée",
+        ),
+        "post_like" | "post_unlike" => (
+            "POST /rest/reactions?actor= exige w_member_social_feed, délivré \
+             uniquement par le Community Management API sur candidature (relevé le \
+             2026-09-02)",
+            "la candidature Community Management API du fondateur approuvée",
+        ),
+        "post_bookmark" | "post_unbookmark" => (
+            "« aucune API de bookmarks/saved items n'existe dans la doc » \
+             (getting-access + index learn.microsoft.com, relevés le 2026-09-02)",
+            "rien — l'API n'existe pas",
+        ),
+        "post_repost" | "post_quote" => (
+            "aucun endpoint de reshare membre documenté (sondes de l'index \
+             learn.microsoft.com, relevées le 2026-09-02)",
+            "rien de documenté",
+        ),
+        "search_posts" => (
+            "« aucune API de recherche n'apparaît dans getting-access ni dans \
+             l'index learn.microsoft.com ; zéro people-search API » (relevé le \
+             2026-09-02)",
+            "rien de générique — SNAP ne donne que r_sales_nav_* en \
+             display/validation",
+        ),
+        "read_post" => (
+            "les posts d'autrui ne se lisent pas, et ses propres posts exigent \
+             r_member_social « restricted, approved users only » (Posts API, \
+             ms.date 2026-05-07, consulté le 2026-09-02)",
+            "r_member_social accordé (approved users only) — et seulement pour \
+             SES propres posts",
+        ),
+        "read_profile" => (
+            "aucune API de lecture de profil tiers pour un membre (relevé le \
+             2026-09-02)",
+            "rien de documenté",
+        ),
+        "read_timeline" => (
+            "uniquement SES posts, via GET /rest/posts?q=author sous \
+             r_member_social « restricted » (relevé le 2026-09-02)",
+            "r_member_social accordé — et la timeline reste limitée à SES posts",
+        ),
+        _ => return None,
+    };
+    Some(ErreurMessagerie::NeSertPas {
+        citation,
+        deblocage,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1416,91 @@ mod tests {
             POINT_INIT_DOCUMENT,
         ] {
             assert!(point.starts_with("https://"), "{point}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_messagerie {
+    use super::*;
+
+    /// La liste FERMÉE des outils de la table messagerie (plan du 2026-09-02).
+    const OUTILS: &[&str] = &[
+        "inbox_list",
+        "dm_reply",
+        "dm_open",
+        "post_reply",
+        "post_comment",
+        "post_like",
+        "post_unlike",
+        "post_bookmark",
+        "post_unbookmark",
+        "post_repost",
+        "post_quote",
+        "search_posts",
+        "read_post",
+        "read_profile",
+        "read_timeline",
+    ];
+
+    /// Chaque refus est un fait : code stable, citation datée, fait de
+    /// déblocage — jamais un stub silencieux.
+    #[test]
+    fn chaque_outil_de_la_table_a_son_refus_cite_et_date() {
+        for outil in OUTILS {
+            let erreur = refus_messagerie(outil)
+                .unwrap_or_else(|| panic!("{outil} doit avoir un refus cité"));
+            assert_eq!(erreur.code(), "plateforme_ne_sert_pas", "{outil}");
+            let ErreurMessagerie::NeSertPas {
+                citation,
+                deblocage,
+            } = erreur
+            else {
+                panic!("{outil}: le refus doit être NeSertPas");
+            };
+            assert!(
+                citation.contains("2026-09-02"),
+                "{outil}: citation non datée"
+            );
+            assert!(
+                !deblocage.is_empty(),
+                "{outil}: le déblocage se dit, même « rien »"
+            );
+        }
+        // Un outil inconnu n'a pas de refus inventé.
+        assert!(refus_messagerie("post_teleport").is_none());
+    }
+
+    /// Les citations clés, mot pour mot — si une sonde future les contredit,
+    /// c'est ici que ça casse.
+    #[test]
+    fn les_citations_portent_les_faits_sondes() {
+        let citation = |outil: &str| match refus_messagerie(outil) {
+            Some(ErreurMessagerie::NeSertPas { citation, .. }) => citation,
+            autre => panic!("{outil}: {autre:?}"),
+        };
+        // Les DM sont un partenariat fermé.
+        assert!(citation("dm_reply").contains("restricted to approved partners"));
+        // Le DM froid : interdit par l'accès ET par les règles produit.
+        assert!(citation("dm_open").contains("action membre explicite"));
+        // comment/like : Community Management API, quotas cités.
+        assert!(citation("post_comment").contains("Community Management"));
+        assert!(citation("post_comment").contains("500 appels/app/24 h"));
+        assert!(citation("post_like").contains("w_member_social_feed"));
+        // Bookmarks et recherche : l'API n'existe pas.
+        assert!(citation("post_bookmark").contains("aucune API de bookmarks"));
+        assert!(citation("search_posts").contains("aucune API de recherche"));
+    }
+
+    /// Ce que « rien ne débloque » dit, il le dit — bookmarks et dm_open.
+    #[test]
+    fn les_impasses_se_disent_au_lieu_de_promettre() {
+        for outil in ["post_bookmark", "dm_open"] {
+            let Some(ErreurMessagerie::NeSertPas { deblocage, .. }) = refus_messagerie(outil)
+            else {
+                panic!("{outil}");
+            };
+            assert!(deblocage.starts_with("rien"), "{outil}: {deblocage}");
         }
     }
 }

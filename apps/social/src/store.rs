@@ -19,6 +19,10 @@ pub struct CompteScelle {
     pub id: Uuid,
     pub platform: String,
     pub handle: String,
+    /// L'identifiant du compte chez la plateforme (id numerique chez X, URN
+    /// chez LinkedIn) — celui que les chemins `/2/users/{id}/…` exigent.
+    /// None = compte connecte avant 0005 : reconnecter via account_connect_url.
+    pub platform_user_id: Option<String>,
     pub sealed_token: Option<Vec<u8>>,
     /// Le refresh token scellé, quand la plateforme en a émis un (X avec
     /// `offline.access`). C'est lui qui permet au chemin de publication de
@@ -79,8 +83,8 @@ pub async fn compte_scelle(
     compte: Uuid,
 ) -> sqlx::Result<Option<CompteScelle>> {
     let ligne = sqlx::query(
-        "SELECT id, platform, handle, sealed_token, sealed_refresh FROM social_accounts \
-         WHERE id = $1 AND tenant_id = $2",
+        "SELECT id, platform, handle, platform_user_id, sealed_token, sealed_refresh \
+         FROM social_accounts WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
     .bind(tenant)
@@ -90,6 +94,7 @@ pub async fn compte_scelle(
         id: l.get("id"),
         platform: l.get("platform"),
         handle: l.get("handle"),
+        platform_user_id: l.get("platform_user_id"),
         sealed_token: l.get("sealed_token"),
         sealed_refresh: l.get("sealed_refresh"),
     }))
@@ -102,21 +107,30 @@ pub async fn connecter_compte(
     tenant: Uuid,
     platform: &str,
     handle: &str,
+    platform_user_id: Option<&str>,
     sealed_token: &[u8],
     sealed_refresh: Option<&[u8]>,
 ) -> sqlx::Result<Uuid> {
     let ligne = sqlx::query(
-        "INSERT INTO social_accounts (id, tenant_id, platform, handle, sealed_token, sealed_refresh) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        // COALESCE sur platform_user_id : une reconnexion qui ne le porterait
+        // pas n'efface jamais un id deja connu — le meme argument que le
+        // refresh token dans resceller_jetons.
+        "INSERT INTO social_accounts \
+             (id, tenant_id, platform, handle, platform_user_id, sealed_token, sealed_refresh) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (tenant_id, platform, handle) \
          DO UPDATE SET sealed_token = EXCLUDED.sealed_token, \
-                       sealed_refresh = EXCLUDED.sealed_refresh, status = 'connected' \
+                       sealed_refresh = EXCLUDED.sealed_refresh, \
+                       platform_user_id = COALESCE(EXCLUDED.platform_user_id, \
+                                                   social_accounts.platform_user_id), \
+                       status = 'connected' \
          RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(tenant)
     .bind(platform)
     .bind(handle)
+    .bind(platform_user_id)
     .bind(sealed_token)
     .bind(sealed_refresh)
     .fetch_one(pool)
@@ -281,6 +295,54 @@ pub async fn posts(pool: &PgPool, tenant: Uuid, limite: i64) -> sqlx::Result<Vec
     .fetch_all(pool)
     .await?;
     Ok(lignes.iter().map(post_de).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Suppressions : la regle des refus permanents
+// ---------------------------------------------------------------------------
+
+/// `dm_open` appelle ceci AVANT tout appel plateforme : un destinataire
+/// supprime rend un refus nomme, zero requete reseau, zero centime.
+pub async fn est_supprime(
+    pool: &PgPool,
+    tenant: Uuid,
+    platform: &str,
+    target: &str,
+) -> sqlx::Result<bool> {
+    let ligne = sqlx::query(
+        "SELECT 1 AS un FROM social_suppressions \
+         WHERE tenant_id = $1 AND platform = $2 AND target = $3",
+    )
+    .bind(tenant)
+    .bind(platform)
+    .bind(target)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.is_some())
+}
+
+/// Le refus de la plateforme devient permanent chez nous : un 403 au retour
+/// de `dm_open` insere la ligne avant de rendre l'erreur. `ON CONFLICT DO
+/// NOTHING` : la premiere raison enregistree est la bonne, on ne la reecrit
+/// pas.
+pub async fn supprimer(
+    pool: &PgPool,
+    tenant: Uuid,
+    platform: &str,
+    target: &str,
+    reason: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO social_suppressions (tenant_id, platform, target, reason) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(platform)
+    .bind(target)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

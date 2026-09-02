@@ -72,7 +72,20 @@ pub const LINKEDIN_USERINFO: &str = "https://api.linkedin.com/v2/userinfo";
 /// `tweet.write` publie (creation-of-a-post), `tweet.read`/`users.read` lisent
 /// les métriques (get-post-by-id) ET servent `GET /2/users/me`,
 /// `offline.access` fait émettre le refresh token — tous relevés le 2026-09-02.
-pub const X_SCOPES: &str = "tweet.read tweet.write users.read offline.access";
+///
+/// La surface messagerie (relevés docs.x.com/x-api/direct-messages/manage/integrate,
+/// 2026-09-02) : `dm.read` + `dm.write` pour les DM (« dm.write exige dm.read »,
+/// et tous les scopes dm exigent `tweet.read` + `users.read`, déjà là),
+/// `like.write` pour `POST /2/users/{id}/likes`, `bookmark.write` pour les
+/// bookmarks (« OAuth2 PKCE uniquement » — notre flux X est déjà PKCE).
+///
+/// Un compte connecté AVANT cet élargissement n'a PAS ces scopes : son jeton
+/// prendra un 403 de plateforme sur les outils messagerie, et
+/// `account_connect_url` reste le chemin de re-consentement — pas de
+/// migration de jetons, l'humain re-consent et la ligne de compte se
+/// re-scelle par l'upsert de `connecter_compte`.
+pub const X_SCOPES: &str =
+    "tweet.read tweet.write users.read offline.access dm.read dm.write like.write bookmark.write";
 /// `w_member_social` : « Post, comment, and like posts on behalf of an
 /// authenticated member » (posts-api, table Permissions). `openid` + `profile` :
 /// requis pour `GET /v2/userinfo`, qui est le SEUL moyen self-serve de savoir
@@ -439,12 +452,14 @@ pub fn jeton_depuis(statut: u16, corps: &[u8]) -> Result<JetonEmis, ErreurPlatef
 }
 
 /// Demande à la plateforme QUI est ce jeton — l'étape entre l'échange et la
-/// ligne de compte : c'est elle qui donne le `handle` de `social_accounts`
-/// (nom d'écran chez X, URN d'auteur chez LinkedIn).
+/// ligne de compte : elle donne le `handle` de `social_accounts` (nom d'écran
+/// chez X, URN d'auteur chez LinkedIn) ET `platform_user_id`, l'identifiant
+/// que les chemins d'API `/2/users/{id}/…` exigent (l'id numérique chez X ;
+/// chez LinkedIn l'URN sert aux deux rôles).
 pub async fn identite(
     plateforme: PlateformeOauth,
     acces: &Secret,
-) -> Result<String, ErreurPlateforme> {
+) -> Result<(String, String), ErreurPlateforme> {
     let point = match plateforme {
         PlateformeOauth::X => X_ME,
         PlateformeOauth::Linkedin => LINKEDIN_USERINFO,
@@ -464,33 +479,39 @@ pub async fn identite(
 }
 
 /// Lit la réponse d'identité — pur, comparé aux fixtures des deux docs.
+/// Rend `(handle, platform_user_id)`.
 ///
-/// X : `{"data": {"id", "name", "username"}}` → le `username` (user-lookup-me).
+/// X : `{"data": {"id", "name", "username"}}` (user-lookup-me) → le `username`
+/// comme handle, et `data.id` — l'id NUMÉRIQUE que `/2/users/{id}/likes`,
+/// `/bookmarks`, `/retweets` et `/mentions` exigent : le username n'y passe
+/// pas.
 /// LinkedIn : `{"sub": "782bbtaQ", ...}` → `urn:li:person:{sub}` — `sub` est
 /// « User identifier » (sign-in-with-linkedin-v2) et l'URN d'auteur du Posts
-/// API est `urn:li:person:{id}` (post-api-schema) ; les deux relevés le
-/// 2026-09-02.
+/// API est `urn:li:person:{id}` (post-api-schema) ; l'URN sert aux deux
+/// rôles. Les deux relevés le 2026-09-02.
 pub fn identite_depuis(
     plateforme: PlateformeOauth,
     statut: u16,
     corps: &[u8],
-) -> Result<String, ErreurPlateforme> {
+) -> Result<(String, String), ErreurPlateforme> {
     if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
         return Err(erreur);
     }
     let document: serde_json::Value =
         serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
-    match plateforme {
-        PlateformeOauth::X => document
-            .pointer("/data/username")
+    let champ = |pointeur: &str| {
+        document
+            .pointer(pointeur)
             .and_then(|v| v.as_str())
             .map(str::to_owned)
-            .ok_or(ErreurPlateforme::Illisible),
-        PlateformeOauth::Linkedin => document
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .map(|sub| format!("urn:li:person:{sub}"))
-            .ok_or(ErreurPlateforme::Illisible),
+            .ok_or(ErreurPlateforme::Illisible)
+    };
+    match plateforme {
+        PlateformeOauth::X => Ok((champ("/data/username")?, champ("/data/id")?)),
+        PlateformeOauth::Linkedin => {
+            let urn = format!("urn:li:person:{}", champ("/sub")?);
+            Ok((urn.clone(), urn))
+        }
     }
 }
 
@@ -715,15 +736,19 @@ mod tests {
             br#"{"data":{"id":"2244994945","name":"X Dev","username":"XDevelopers"}}"#,
         )
         .expect("forme documentée X");
-        assert_eq!(x, "XDevelopers");
-        // sign-in-with-linkedin-v2 : le sub de l'exemple devient l'URN d'auteur.
+        // Le handle est le username ; l'id NUMÉRIQUE part à part — c'est lui
+        // que les chemins /2/users/{id}/… exigent.
+        assert_eq!(x, ("XDevelopers".into(), "2244994945".into()));
+        // sign-in-with-linkedin-v2 : le sub de l'exemple devient l'URN d'auteur,
+        // qui sert aux deux rôles.
         let li = identite_depuis(
             PlateformeOauth::Linkedin,
             200,
             br#"{"sub":"782bbtaQ","name":"John Doe","locale":"en-US"}"#,
         )
         .expect("forme documentée LinkedIn");
-        assert_eq!(li, "urn:li:person:782bbtaQ");
+        assert_eq!(li.0, "urn:li:person:782bbtaQ");
+        assert_eq!(li.0, li.1);
         // Un refus reste un refus, un 2xx difforme est illisible.
         assert_eq!(
             identite_depuis(PlateformeOauth::X, 401, b"{}"),

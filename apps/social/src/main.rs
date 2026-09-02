@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 pub mod adapters;
 pub mod mcp;
 pub mod medias;
+pub mod messagerie;
 pub mod oauth_flux;
 pub mod store;
 pub mod tenants;
@@ -93,6 +94,9 @@ async fn main() -> anyhow::Result<()> {
             "SOCIAL_LINKEDIN_CLIENT_ID",
             "SOCIAL_LINKEDIN_CLIENT_SECRET",
         ),
+        // La seconde surface : X seul — LinkedIn n'implemente pas le trait,
+        // l'absence EST le refus, cite par linkedin::refus_messagerie.
+        adaptateurs_messagerie: adapters::adaptateurs_messagerie(),
     });
 
     let ecoute = tokio::net::TcpListener::bind(&bind).await.context(bind)?;
@@ -120,18 +124,44 @@ fn credentiels_env(id: &str, secret: &str) -> Option<mcp::CredentielsClient> {
 fn routeur(etat: Arc<mcp::Etat>) -> Router {
     Router::new()
         .route("/mcp", post(poste_mcp))
+        .route("/mcp/messagerie", post(poste_mcp_messagerie))
         .route("/livez", get(|| async { "ok" }))
         .route("/oauth/callback", get(retour_oauth))
         .with_state(etat)
 }
 
+/// Les deux surfaces MCP du binaire — le transport et l'authentification sont
+/// identiques, seule la table servie change.
+enum Surface {
+    Editeur,
+    Messagerie,
+}
+
 /// POST /mcp — Streamable HTTP, forme JSON simple : un message JSON-RPC entre,
 /// un message sort (ou 202 pour une notification). Pas de flux SSE : aucun de
-/// nos six outils ne progresse par etapes.
+/// nos outils ne progresse par etapes.
 async fn poste_mcp(
     State(etat): State<Arc<mcp::Etat>>,
     en_tetes: HeaderMap,
     corps: String,
+) -> Response {
+    servir(etat, en_tetes, corps, Surface::Editeur).await
+}
+
+/// POST /mcp/messagerie — meme transport, meme auth Bearer tenant, SA table.
+async fn poste_mcp_messagerie(
+    State(etat): State<Arc<mcp::Etat>>,
+    en_tetes: HeaderMap,
+    corps: String,
+) -> Response {
+    servir(etat, en_tetes, corps, Surface::Messagerie).await
+}
+
+async fn servir(
+    etat: Arc<mcp::Etat>,
+    en_tetes: HeaderMap,
+    corps: String,
+    surface: Surface,
 ) -> Response {
     let autorisation = en_tetes
         .get(header::AUTHORIZATION)
@@ -153,7 +183,11 @@ async fn poste_mcp(
         }))
         .into_response();
     };
-    match mcp::traiter(&etat, tenant, &req).await {
+    let rep = match surface {
+        Surface::Editeur => mcp::traiter(&etat, tenant, &req).await,
+        Surface::Messagerie => messagerie::traiter(&etat, tenant, &req).await,
+    };
+    match rep {
         Some(rep) => Json(rep).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -222,7 +256,7 @@ async fn retour_oauth(
         Ok(j) => j,
         Err(e) => return refus(&e.to_string()),
     };
-    let handle = match oauth_flux::identite(pf, &jeton.acces).await {
+    let (handle, id_plateforme) = match oauth_flux::identite(pf, &jeton.acces).await {
         Ok(h) => h,
         Err(e) => return refus(&format!("identite du compte introuvable : {e}")),
     };
@@ -246,6 +280,7 @@ async fn retour_oauth(
         tenant,
         &plateforme,
         &handle,
+        Some(&id_plateforme),
         &scelle,
         refresh_scelle.as_deref(),
     )
@@ -279,11 +314,12 @@ mod tests {
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
             oauth_linkedin: None,
+            adaptateurs_messagerie: Vec::new(),
         }))
     }
 
-    fn requete_mcp(autorisation: Option<&str>) -> Request<Body> {
-        let mut r = Request::post("/mcp").header("content-type", "application/json");
+    fn requete_sur(chemin: &str, autorisation: Option<&str>) -> Request<Body> {
+        let mut r = Request::post(chemin).header("content-type", "application/json");
         if let Some(a) = autorisation {
             r = r.header("authorization", a);
         }
@@ -307,15 +343,23 @@ mod tests {
             Some("Bearer soc_0000000000000000000000000000000000000000000000000000000000000000"),
             Some("Basic abc"),
         ] {
-            let rep = routeur(etat.clone())
-                .oneshot(requete_mcp(mauvais))
-                .await
-                .unwrap();
-            assert_eq!(rep.status(), StatusCode::UNAUTHORIZED, "{mauvais:?}");
+            // La MEME porte sur les DEUX surfaces : un jeton qui ne passe pas
+            // /mcp ne passe pas /mcp/messagerie non plus.
+            for chemin in ["/mcp", "/mcp/messagerie"] {
+                let rep = routeur(etat.clone())
+                    .oneshot(requete_sur(chemin, mauvais))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rep.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{chemin} {mauvais:?}"
+                );
+            }
         }
 
         let rep = routeur(etat.clone())
-            .oneshot(requete_mcp(Some(&format!("Bearer {jeton}"))))
+            .oneshot(requete_sur("/mcp", Some(&format!("Bearer {jeton}"))))
             .await
             .unwrap();
         assert_eq!(rep.status(), StatusCode::OK);
@@ -327,6 +371,25 @@ mod tests {
             v["result"]["tools"].as_array().unwrap().len(),
             6,
             "les six outils, pas un de plus"
+        );
+
+        // Et la seconde surface sert SA table : les quatorze outils.
+        let rep = routeur(etat.clone())
+            .oneshot(requete_sur(
+                "/mcp/messagerie",
+                Some(&format!("Bearer {jeton}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(rep.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+        assert_eq!(
+            v["result"]["tools"].as_array().unwrap().len(),
+            14,
+            "les quatorze outils messagerie, pas un de plus"
         );
 
         // /livez ne demande rien : c'est une sonde, pas une surface.
