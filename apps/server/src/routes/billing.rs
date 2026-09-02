@@ -68,6 +68,20 @@
 //! The tenant comes from the API key. `audit_log` and `employees` both carry
 //! forced row-level security, so another tenant's invoice is not filtered out —
 //! it does not exist to be summed.
+//!
+//! # `GET /v1/billing/worked-seats`: the same trail, read as a price position
+//!
+//! `/v1/billing` is the meter. Its sibling is the sentence we are willing to
+//! print on a contract: **a provisioned seat that has never passed the gate
+//! costs nothing.** It answers, for one month, how many seats exist and how many
+//! of them decided anything at all, allowed or refused.
+//!
+//! It lives in this file rather than a module of its own because the two are one
+//! definition read at two altitudes, and the failure mode of splitting them is
+//! the one that matters commercially: an invoice and a sales page that disagree
+//! about whether a seat did something. See [`worked_seats`] for why a refusal
+//! counts, and [`resolve_month`] for why the window is a month and not
+//! [`Window`].
 
 use std::collections::BTreeMap;
 
@@ -78,8 +92,8 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get as get_route;
-use chrono::{Days, NaiveDate};
-use serde::Serialize;
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::autonomy::{Window, WindowQuery};
 use crate::auth::Principal;
@@ -89,6 +103,12 @@ use crate::error::ApiError;
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/billing", get_route(get))
+        // Beside `/v1/billing` and not in a module of its own, because the two
+        // read the same trail and answer the same question at two altitudes:
+        // that one is the meter, this one is the position — *we bill the seat
+        // that worked*. Splitting them would let the definition of "a seat did
+        // something" drift between the invoice and the sales page.
+        .route("/v1/billing/worked-seats", get_route(worked_seats))
         .with_state(db)
 }
 
@@ -252,12 +272,150 @@ async fn get(
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/billing/worked-seats
+// ---------------------------------------------------------------------------
+
+/// `?month=2026-09`. Absent means the month that is running.
+///
+/// Un mois et pas la [`Window`] d'à côté, délibérément : c'est la période sur
+/// laquelle un contrat se facture, et laisser choisir des bornes libres
+/// inviterait à découper la fenêtre jusqu'à ce que le nombre de sièges
+/// travaillés tombe. `/v1/billing` garde la fenêtre libre parce que c'est un
+/// compteur qu'on interroge, pas une position de prix.
+#[derive(Debug, Deserialize)]
+struct MonthQuery {
+    month: Option<String>,
+}
+
+/// Un siège qui a travaillé, et ce qu'il a fait.
+#[derive(Debug, Serialize)]
+struct SeatLine {
+    employee_id: String,
+    /// Le slug — voir [`agentos_store::billing::Seat`].
+    name: String,
+    /// La première décision du mois. Toujours présente ici : un siège sans
+    /// première décision n'est pas dans cette liste, c'est la définition même.
+    first_decision_at: DateTime<Utc>,
+    /// Permises **et** refusées.
+    decisions: i64,
+}
+
+/// L'écart entre ce qui existe et ce qui a servi.
+#[derive(Debug, Serialize)]
+struct WorkedSeatsView {
+    /// `YYYY-MM`, réécrit depuis ce qui a été résolu — pas l'écho de la requête.
+    /// Un mois par défaut doit se lire dans la réponse.
+    month: String,
+    /// Les sièges qui existent.
+    provisioned: usize,
+    /// Ceux qui ont passé la gate au moins une fois. `provisioned - worked` est
+    /// ce que ce produit ne facture pas.
+    worked: usize,
+    /// Les sièges travaillés, les plus actifs d'abord.
+    seats: Vec<SeatLine>,
+}
+
+/// Le mois, en `[since, until)`.
+///
+/// La borne haute est exclusive et calculée en ajoutant un mois plutôt qu'en
+/// comptant des jours : février et les années bissextiles sont le genre de
+/// détail qui rend une facture fausse une fois tous les quatre ans, ce qui est
+/// précisément la fréquence à laquelle personne ne le remarque.
+fn resolve_month(raw: Option<&str>) -> Result<(String, DateTime<Utc>, DateTime<Utc>), ApiError> {
+    let bad = || ApiError::bad_request("month: expected YYYY-MM");
+    let today = Utc::now().date_naive();
+    let (year, month) = match raw {
+        None => (today.year(), today.month()),
+        Some(text) => {
+            let (year, month) = text.split_once('-').ok_or_else(bad)?;
+            let year: i32 = year.parse().map_err(|_| bad())?;
+            let month: u32 = month.parse().map_err(|_| bad())?;
+            (year, month)
+        }
+    };
+    let first = NaiveDate::from_ymd_opt(year, month, 1).ok_or_else(bad)?;
+    let next = match month {
+        12 => NaiveDate::from_ymd_opt(year + 1, 1, 1),
+        _ => NaiveDate::from_ymd_opt(year, month + 1, 1),
+    }
+    .ok_or_else(bad)?;
+
+    Ok((
+        format!("{year:04}-{month:02}"),
+        first.and_time(NaiveTime::MIN).and_utc(),
+        next.and_time(NaiveTime::MIN).and_utc(),
+    ))
+}
+
+/// `GET /v1/billing/worked-seats?month=…` — **on ne facture que le siège qui a
+/// travaillé.**
+///
+/// # La position, et pourquoi elle est déjà mesurée
+///
+/// Un siège provisionné qui n'a jamais passé la gate ne coûte rien. Ce n'est pas
+/// une remise commerciale accordée après coup, c'est une lecture du journal : la
+/// gate écrit une ligne par décision, permise comme refusée, depuis
+/// `0001_core.sql`. Il n'y a rien à instrumenter, donc rien qui puisse manquer
+/// le jour où quelqu'un oublie d'appeler un compteur.
+///
+/// # Refusé compte
+///
+/// Un employé dont toutes les tentatives ont été refusées a consommé le
+/// système, et le dire autrement serait une facture qui récompense une
+/// configuration cassée. L'argument complet est sur
+/// [`agentos_store::billing::seats`].
+///
+/// # `provisioned` et `worked` sortent de la même liste
+///
+/// Une requête, deux lectures. Un second `SELECT count(*) FROM employees`
+/// donnerait un `provisioned` qui peut, un jour, ne plus être le dénominateur de
+/// `worked` — et l'écart entre les deux nombres est exactement l'argument de
+/// vente.
+async fn worked_seats(
+    State(db): State<Db>,
+    principal: Principal,
+    query: Result<Query<MonthQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let (month, since, until) = resolve_month(query.month.as_deref())?;
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let seats = billing::seats(&mut tx, since, until).await?;
+    tx.rollback().await?;
+
+    let lines: Vec<SeatLine> = seats
+        .iter()
+        .filter_map(|seat| {
+            // `first_decision_at` est présent si et seulement si le siège a
+            // décidé quelque chose, donc ce `?` *est* le filtre « travaillé » —
+            // il n'y a pas de second critère à garder d'accord avec le SQL.
+            Some(SeatLine {
+                employee_id: seat.employee_id.to_string(),
+                name: seat.name.clone(),
+                first_decision_at: seat.first_decision_at?,
+                decisions: seat.decisions,
+            })
+        })
+        .collect();
+
+    Ok(axum::Json(WorkedSeatsView {
+        month,
+        provisioned: seats.len(),
+        worked: lines.len(),
+        seats: lines,
+    })
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use agentos_domain::action::ActionKind;
     use agentos_domain::ids::{EmployeeId, TenantId};
+    use agentos_domain::policy::{Decision, DenyReason};
     use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
     use agentos_store::model_usage::{self, Consumed};
     use axum::body::{Body, to_bytes};
@@ -361,6 +519,39 @@ mod tests {
             }
             tx.commit().await.expect("commit");
             id
+        }
+
+        /// Une décision de la gate sur un siège, comme `app::gate` l'écrit :
+        /// une ligne, quel qu'ait été le verdict.
+        async fn decide(
+            &self,
+            tenant: TenantId,
+            slug: &str,
+            decision: Decision,
+            when: DateTime<Utc>,
+        ) {
+            let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
+            let employee: uuid::Uuid =
+                sqlx::query_scalar("SELECT id FROM employees WHERE slug = $1")
+                    .bind(slug)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .expect("employee");
+            audit::append(
+                &mut tx,
+                &AuditEvent {
+                    employee_id: Some(EmployeeId::from_uuid(employee)),
+                    decision: Some(decision),
+                    ..AuditEvent::new(
+                        AuditActor::System,
+                        AuditKind::Action(ActionKind::EmailSend),
+                        when,
+                    )
+                },
+            )
+            .await
+            .expect("append");
+            tx.commit().await.expect("commit");
         }
 
         /// One MCP administrative act, as `routes::mcp::record` writes it.
@@ -572,6 +763,86 @@ mod tests {
         let (_, body) = h.get("/v1/billing", SECRET_B).await;
         assert_eq!(body["days"].as_array().expect("days").len(), 30);
         assert_eq!(body["employee_days"], 0);
+
+        h.teardown().await;
+    }
+
+    /// **La position de prix, sur le fil.** Deux sièges provisionnés, un seul
+    /// qui a tenté quelque chose — et ce qu'il a tenté a été refusé.
+    ///
+    /// Le siège refusé est le cas qui décide de la définition : s'il ne comptait
+    /// pas, la facture récompenserait une configuration cassée, et un locataire
+    /// qui interdit tout à un employé le ferait tourner gratuitement.
+    #[tokio::test]
+    async fn a_seat_that_only_ever_got_refused_still_worked_and_a_silent_one_did_not() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let now = Utc::now();
+        h.hire(h.a, "lena", now).await;
+        h.hire(h.a, "mo", now).await;
+        // `mo` ne fait rien du tout. `lena` se fait refuser deux fois et
+        // autoriser une : trois décisions, aucune n'ayant rien produit de plus
+        // qu'une ligne dans le journal.
+        for decision in [
+            Decision::Deny {
+                reason: DenyReason::ToolNotAllowed,
+            },
+            Decision::Deny {
+                reason: DenyReason::ToolNotAllowed,
+            },
+            Decision::Allow,
+        ] {
+            h.decide(h.a, "lena", decision, now).await;
+        }
+
+        let month = format!("{:04}-{:02}", now.year(), now.month());
+        let (status, body) = h
+            .get(&format!("/v1/billing/worked-seats?month={month}"), SECRET_A)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["month"], month);
+        assert_eq!(body["provisioned"], 2, "{body}");
+        assert_eq!(
+            body["worked"], 1,
+            "a seat that never passed the gate costs nothing: {body}"
+        );
+
+        let seats = body["seats"].as_array().expect("seats");
+        assert_eq!(seats.len(), 1, "{body}");
+        assert_eq!(seats[0]["name"], "lena");
+        assert_eq!(
+            seats[0]["decisions"], 3,
+            "allowed and refused both consumed the system: {body}"
+        );
+        assert!(seats[0]["first_decision_at"].is_string(), "{body}");
+        assert!(
+            !body.to_string().contains("\"mo\""),
+            "the silent seat is counted in `provisioned` and billed nowhere: {body}"
+        );
+
+        // Un mois où il ne s'est rien passé : les sièges existent toujours, et
+        // aucun n'a travaillé. C'est la fenêtre qui filtre, et elle filtre.
+        let (status, body) = h
+            .get("/v1/billing/worked-seats?month=1999-01", SECRET_A)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["provisioned"], 2, "{body}");
+        assert_eq!(body["worked"], 0, "{body}");
+
+        // Le siège de A est invisible pour B, pas filtré.
+        let (_, body) = h.get("/v1/billing/worked-seats", SECRET_B).await;
+        assert_eq!(body["provisioned"], 0, "{body}");
+
+        for bad in [
+            "/v1/billing/worked-seats?month=2026",
+            "/v1/billing/worked-seats?month=2026-13",
+            "/v1/billing/worked-seats?month=2026-09-01",
+            "/v1/billing/worked-seats?month=septembre",
+        ] {
+            let (status, _) = h.get(bad, SECRET_A).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} was accepted");
+        }
 
         h.teardown().await;
     }

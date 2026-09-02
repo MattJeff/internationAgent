@@ -139,8 +139,9 @@
 //!
 //! [`Lifecycle::Active`]: agentos_domain::employee::Lifecycle::Active
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::db::{StoreError, TenantTx};
 
@@ -289,6 +290,100 @@ pub async fn billed_days(
         .await?;
 
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Le siège qui a travaillé
+// ---------------------------------------------------------------------------
+
+/// Un siège provisionné, et ce qu'il a fait passer la gate sur la fenêtre.
+///
+/// # Pourquoi `employee_id` est ici alors que [`BilledDay`] le refuse
+///
+/// Ce ne sont pas les mêmes documents. [`BilledDay`] alimente une facture, que
+/// quelqu'un imprime et transfère, et son argument tient : un slug est
+/// vérifiable de mémoire et incapable de porter une phrase. Celui-ci alimente un
+/// écran où le fondateur décide quoi faire d'un siège qui n'a rien fait —
+/// suspendre, reconfigurer, résilier — et chacun de ces gestes est une route qui
+/// veut un `employee_id`. Le slug seul obligerait l'appelant à faire une
+/// deuxième requête pour retrouver l'identifiant qu'on vient de lui cacher.
+///
+/// `name` reste le slug pour la raison de [`BilledDay`], et pas
+/// `display_name` : le nom d'affichage est du texte libre.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct Seat {
+    /// Le siège.
+    pub employee_id: Uuid,
+    /// Son slug — `lena` — et jamais son nom d'affichage.
+    pub name: String,
+    /// La première décision de la fenêtre, ou `None` pour un siège qui n'a
+    /// jamais rien tenté. C'est exactement ce qui distingue les deux
+    /// populations, et c'est pour ça qu'il n'y a pas de second `SELECT`.
+    pub first_decision_at: Option<DateTime<Utc>>,
+    /// Combien de décisions sur la fenêtre. Permises **et** refusées.
+    pub decisions: i64,
+}
+
+/// Tous les sièges, avec leur activité de `[since, until)`.
+///
+/// # La position commerciale, en une clause SQL
+///
+/// Un siège provisionné qui n'a jamais passé la gate ne coûte rien. Ce n'est
+/// pas une remise, c'est ce que le journal mesure déjà : `LEFT JOIN`, donc tout
+/// siège existant remonte, et `count(a.id)` vaut zéro pour celui qui n'a rien
+/// fait. L'appelant lit `provisioned` et `worked` sur **la même liste**, et les
+/// deux nombres ne peuvent pas diverger.
+///
+/// # `a.decision IS NOT NULL`, et rien de plus fin
+///
+/// Autorisé comme refusé. Un employé dont toutes les tentatives ont été
+/// refusées a consommé le système : la gate a chargé sa politique, ouvert une
+/// transaction et écrit une ligne à chaque fois. Ne facturer que les `allow`
+/// serait une facture qui récompense une configuration cassée, et elle
+/// s'exploiterait toute seule.
+///
+/// Le `IS NOT NULL` est ce qui écarte le reste du journal — un message reçu, un
+/// changement de cycle de vie — parce que ce sont des choses qui arrivent *à* un
+/// siège et pas des choses qu'il a tentées.
+///
+/// Pas de prédicat de locataire : `employees` et `audit_log` portent tous les
+/// deux `tenant_isolation`, forcée. Le siège d'un autre n'est pas filtré, il
+/// n'existe pas.
+///
+/// ponytail : pas d'index propre, pour la raison de [`BILLED_DAYS_SQL`] —
+/// `audit_log_tenant_time_idx` borne déjà au locataire, et un mois de journal
+/// pour une entreprise se scanne. Si un très gros locataire le rend lent,
+/// l'index est `(tenant_id, employee_id, occurred_at) where decision is not
+/// null`, pas une table de compteurs.
+const WORKED_SEATS_SQL: &str = "\
+SELECT e.id                AS employee_id, \
+       e.slug              AS name, \
+       min(a.occurred_at)  AS first_decision_at, \
+       count(a.id)         AS decisions \
+  FROM employees e \
+  LEFT JOIN audit_log a \
+         ON a.employee_id = e.id \
+        AND a.decision IS NOT NULL \
+        AND a.occurred_at >= $1 \
+        AND a.occurred_at <  $2 \
+ GROUP BY e.id, e.slug \
+ ORDER BY count(a.id) DESC, e.slug";
+
+/// Tous les sièges de ce locataire, les plus actifs d'abord.
+///
+/// Rend aussi les sièges à zéro : c'est l'appelant qui sait s'il montre la
+/// facture (les sièges travaillés) ou l'écart (tous). Deux requêtes ici
+/// laisseraient `provisioned` et `worked` se contredire.
+pub async fn seats(
+    tx: &mut TenantTx<'_>,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Result<Vec<Seat>, StoreError> {
+    Ok(sqlx::query_as(WORKED_SEATS_SQL)
+        .bind(since)
+        .bind(until)
+        .fetch_all(&mut ***tx)
+        .await?)
 }
 
 // ---------------------------------------------------------------------------

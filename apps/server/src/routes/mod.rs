@@ -37,6 +37,10 @@ pub mod model; // wave H: the tenant connects the model their employees think wi
 pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
 pub mod policy;
 pub mod pool;
+// le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
+// pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
+// lecture est montée hors de toute clé; sa bascule est un acte de locataire.
+pub mod public_register;
 pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
 pub mod reports; // the manager's view of its own line
 pub mod spend;

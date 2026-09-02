@@ -687,6 +687,10 @@ fn app(
             // customer's bill from Anthropic, this one is ours. Keeping them
             // adjacent is what stops the two ever being folded into one number.
             .merge(routes::billing::router(db.clone()))
+            // La moitié à clé du registre public: l'entreprise dit oui, ou se
+            // retire. La lecture, elle, est sur l'étage sans credential — un
+            // registre public derrière une clé n'en est pas un.
+            .merge(routes::public_register::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
@@ -792,7 +796,12 @@ fn app(
     // stands in for the credential is the `state` parameter, and
     // `routes::mcp::public_router` is where that argument lives.
     .merge(routes::mcp::public_router(mcp_state))
-    .merge(routes::well_known::router(db.clone()));
+    .merge(routes::well_known::router(db.clone()))
+    // Sans credential, et délibérément pas derrière `platform/*`: cet étage-là
+    // protège l'émission de clés, c'est-à-dire un pouvoir, et ceci est une
+    // lecture agrégée d'un consentement déjà donné. Le module dit pourquoi
+    // l'anonymat tient sans porte.
+    .merge(routes::public_register::public_router(db.clone()));
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
     // and that is a deliberate reading of the two tiers above rather than the
