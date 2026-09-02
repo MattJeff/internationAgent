@@ -116,7 +116,8 @@ restaient s'est révélée fermée à la mesure.
 | **Netlify** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue** (2026-09-02). Reste l'app OAuth |
 | **Vercel** | — | — | ❌ **IMPOSSIBLE.** `token_endpoint_auth_methods_supported: ["none"]` — client public seulement, mur n°3 |
 | **Docker Hub** | — | — | ⏳ **TRAVAIL PRODUIT.** Serveur officiel réel, mais ni endpoint hébergé ni paquet publié : on clone et on compile |
-| **Smartlead** | — | — | ⏳ **TRAVAIL PRODUIT.** `OptOuts::Pushed` — l'événement `EMAIL_UNSUBSCRIBED` existe. Manque le nom de l'en-tête de signature |
+| **Docker (le démon d'un serveur)** | `CUSTOM` | `Write` | ⏳ **ÉCRIT, PAS PUBLIÉ** (2026-09-02). `packages/docker-mcp` sert les neuf outils de la moitié « liste » et refuse la moitié « interpréteur », test à l'appui. Pas d'entrée `CATALOG` : paquet non publié, et `Provision::Host` ne peut pas piloter le démon d'un client — voir plus bas |
+| **Smartlead** | — | — | ⏳ **CÂBLÉ, PAS OUVERT** (2026-09-02). Migration, schéma de signature, ingestion et handler écrits ; l'enregistrement **refuse** et la route répond `401` tant que le nom de l'en-tête n'a pas été lu sur une livraison réelle — et la recherche conclut qu'il n'existe pas |
 | **Gmail** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste le client OAuth Web dans la Google Cloud Console |
 | **Google Drive** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Le même client Google |
 | **Google Calendar** | `Dial` + OAuth | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠ voir plus bas |
@@ -499,6 +500,38 @@ dans le commentaire de leur entrée, et se rejouent en deux `curl` :
   `a_sender` décrit depuis le début. **La première lecture était fausse et elle
   est corrigée ci-dessous.**
 
+### Le Docker qu'on a fini d'écrire, et celui qu'on n'a pas commencé
+
+Il y a deux Docker dans la demande et il ne faut pas les confondre.
+
+**Docker Hub** — des dépôts d'images, des tags, des vulnérabilités. C'est ce que
+sert `docker/hub-mcp`, et le verdict ci-dessus est inchangé : ni endpoint
+hébergé, ni paquet publié.
+
+**Le démon Docker d'un serveur** — « est-ce que ça tourne, pourquoi c'est
+tombé, redémarre-le ». C'est ce qu'on veut vraiment dire par « connecter un
+serveur », et `packages/docker-mcp` l'a écrit le 2026-09-02 : neuf outils
+(`containers_list`, `container_inspect`, `container_logs`, `container_stats`,
+`images_list`, `events_recent`, `container_start`, `container_stop`,
+`container_restart`), et rien de la colonne de droite du tableau de
+`catalog.rs` — aucun `exec`, aucun `create`/`run`, aucun montage hôte, aucun
+`commit`/`push`, aucune suppression.
+
+La promesse est négative, donc elle est testée en lisant la table et le source
+plutôt qu'en appelant des outils qui n'existent pas
+(`test/forbidden.test.js`). Éprouvée plutôt que promise : ajouter un vrai
+`container_exec` fait tomber **quatre tests sur seize**, cinq si on élargit
+aussi `ALLOWED_PATHS`.
+
+**Et il n'y a pas d'entrée dans `CATALOG`**, pour deux raisons distinctes : le
+paquet n'est pas publié (donc pas de `Package::spec` à épingler), et surtout
+`Provision::Host` **ne peut pas** piloter le démon d'un client — le bridge
+tourne chez nous, le démon chez lui, et `hosted.rs` exige du bridge une racine
+en lecture seule et aucun montage, alors que parler à
+`/var/run/docker.sock` réclame ce montage, qui donne root sur l'hôte. Le
+chemin est donc `CUSTOM`, et ce n'est pas un pis-aller : c'est le même
+argument « SSH est un déploiement, pas un connecteur », une couche plus bas.
+
 ### Et « connecter un serveur » ?
 
 C'est déjà là, et ça s'appelle `CUSTOM`. Le client fait tourner un serveur MCP
@@ -546,12 +579,49 @@ schémas.
    `suppressions` — laquelle désactive le **contact**, donc le téléphone tombe
    avec le mail (`0011_revenue.sql`, `suppressions_deactivate_contacts`).
 
-### Ce qui débloque, dans l'ordre
+### Ce qui a été écrit le 2026-09-02, et ce qui reste
 
-1. Une **clé d'API valide** — celle configurée répond `401`.
-2. **Une livraison réelle** vers une URL qu'on contrôle, et le nom de l'en-tête
-   lu dessus. C'est le seul fait qui ne s'obtient pas en lisant.
-3. Puis : la migration, le troisième schéma de signature, l'ingestion, l'entrée.
-   **Rien dans cette liste n'est incertain.**
+L'après-midi de travail a eu lieu. Sont dans l'arbre :
 
-C'est un après-midi de travail, pas un mur. Le mur était une phrase fausse.
+1. `migrations/0077_un_desabonnement_pousse_est_un_endpoint_aussi.sql` —
+   `webhook_endpoints_provider_is_wired` accepte `'smartlead'`.
+2. Le **troisième schéma de signature** dans `apps/server/src/routes/webhooks.rs` :
+   HMAC-SHA256 hexadécimal sur le corps brut, comparaison en temps constant,
+   choisi par le `provider` de l'endpoint comme les deux autres.
+3. L'**ingestion** : `agentos_app::inbound::record_smartlead_unsubscribe` fait
+   d'un `EMAIL_UNSUBSCRIBED` (ou `LEAD_UNSUBSCRIBED` — les deux orthographes
+   sont attestées, par deux sources différentes) une ligne de `suppressions`,
+   écrite par la même fonction que la porte tirée
+   (`queue::record_platform_opt_out`), donc une personne arrivée par les deux
+   portes est une ligne et pas deux. Le contact est désactivé, donc le téléphone
+   tombe avec le mail. Un rejeu n'écrit rien de plus, à trois niveaux.
+4. Le **handler** `main::on_smartlead_webhook`, enregistré sans condition, parce
+   qu'un `event_type` sans lecteur est huit tentatives puis une lettre morte.
+
+**Ce qui n'y est pas, et ne peut pas y être : l'entrée dans `CATALOG`.**
+`webhooks::register` refuse un endpoint `smartlead` avec
+`EndpointError::SignatureHeaderUnposed`, et la route refuse chaque livraison,
+tant que `inbound::SMARTLEAD_SIGNATURE_HEADER` vaut `None`. Un connecteur qui
+refuse de s'enregistrer est un connecteur pas fini ; un en-tête deviné qui
+accepte ce qu'il ne devrait pas est pire, et un dépôt tiers documente avoir
+vécu exactement ça — toutes ses livraisons authentiques refusées `401` pendant
+des semaines par un `X-Smartlead-Signature` inventé.
+
+### Et le nom de l'en-tête n'existe probablement pas
+
+La recherche du 2026-09-02 conclut à l'absence, sur trois lignes d'évidence
+indépendantes : l'API d'enregistrement des webhooks n'a aucun champ où saisir
+un secret partagé (donc le HMAC de la doc n'a pas de clé) ; deux sources
+attestent que Smartlead renvoie son propre secret **dans le corps JSON**, champ
+`secret_key` ; et le rapport de production ci-dessus. Les trois dépôts qui
+donnent `X-Smartlead-Signature` portent tous le même triplet exact et aucun n'a
+reçu de livraison. Le détail et les URLs sont au-dessus de
+`SMARTLEAD_SIGNATURE_HEADER`, dans `crates/app/src/inbound.rs`.
+
+Donc ce qui débloque : **une livraison réelle vers une URL qu'on contrôle, et la
+lecture de ses en-têtes.** S'il y a un en-tête, c'est un `Some("…")` à poser et
+tout ce qui précède se met à marcher. S'il n'y en a pas, ce qu'il faut câbler
+est un *quatrième* schéma : chemin non devinable qui fait office de credential,
+plus égalité en temps constant sur le `secret_key` du corps, après parse. Ce
+n'est plus un mur ; c'est une valeur qui manque, et le code qui l'attend est
+écrit et testé.

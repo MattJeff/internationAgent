@@ -615,15 +615,39 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   livraisons authentiques répondues `401`, soit — bien pire — un
 ///   vérificateur qui accepte ce qu'il ne devrait pas.
 ///
-///   Il reste aussi une migration : `webhook_endpoints_provider_is_wired` est
-///   contraint à `('email', 'twilio')`, et cette CHECK existe précisément pour
-///   qu'on ne puisse pas enregistrer un handle qu'aucune ingestion ne lit.
+///   **Le 2026-09-02, tout ce qui pouvait être écrit sans ce nom l'a été.** La
+///   migration existe (`0077`, `webhook_endpoints_provider_is_wired` accepte
+///   `'smartlead'`), le troisième schéma de signature existe
+///   (`routes::webhooks`, HMAC-SHA256 hexadécimal sur le corps brut, comparaison
+///   en temps constant), l'ingestion existe
+///   ([`crate::inbound::record_smartlead_unsubscribe`], qui écrit sa ligne de
+///   `suppressions` par la même fonction que la porte tirée) et son handler est
+///   enregistré. **Il n'y a toujours pas d'entrée dans [`CATALOG`]**, et il n'y
+///   en aura pas tant que le nom manquera : la voie d'enregistrement refuse avec
+///   [`crate::webhooks::EndpointError::SignatureHeaderUnposed`], et la route
+///   refuse toute livraison. Un connecteur qui refuse de s'enregistrer est un
+///   connecteur pas fini ; un en-tête deviné qui accepte ce qu'il ne devrait pas
+///   est pire.
 ///
-///   **Ce qui débloque, dans l'ordre : une clé d'API valide (celle du compte
-///   répond `401`), une livraison réelle vers une URL qu'on contrôle, et le nom
-///   de l'en-tête lu dessus.** Après ça : la migration, le troisième schéma de
-///   signature, l'ingestion qui écrit une ligne de `suppressions`, et l'entrée.
-///   Rien dans cette liste n'est incertain.
+///   **Et la recherche du même jour conclut que cet en-tête n'existe pas.**
+///   Trois lignes d'évidence indépendantes convergent — l'API d'enregistrement
+///   des webhooks n'a aucun champ où saisir un secret partagé, deux sources
+///   attestent que Smartlead renvoie son propre secret *dans le corps JSON*
+///   (champ `secret_key`), et une intégration en production documente que ses
+///   livraisons authentiques ont toutes été refusées `401` par un vérificateur
+///   d'en-tête deviné. Les URLs et le détail sont au-dessus de
+///   [`crate::inbound::SMARTLEAD_SIGNATURE_HEADER`].
+///
+///   **Ce qui débloque, donc, et ce n'est plus la même liste :** une livraison
+///   réelle vers une URL qu'on contrôle, et la lecture de ses en-têtes. S'il y
+///   en a un, c'est un `Some("…")` à poser dans ce const et tout ce qui est
+///   déjà écrit se met à marcher. S'il n'y en a pas — ce que la recherche
+///   prédit — alors le schéma à câbler est le quatrième et pas le troisième :
+///   chemin de livraison non devinable qui fait office de credential, plus
+///   égalité en temps constant sur le champ `secret_key` du corps, comparé
+///   **après** parse et jamais avant. Ce jour-là il faudra aussi décider où le
+///   `secret_key` est appris, puisque Smartlead le génère et qu'on ne le
+///   choisit pas.
 ///
 /// * **Docker** — le serveur officiel (`github.com/docker/hub-mcp`) existe, mais
 ///   il n'a **ni endpoint hébergé ni paquet publié** : on clone et on compile.
@@ -672,6 +696,25 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   [`CUSTOM`] — le client fait tourner ce serveur sur sa machine et branche
 ///   son adresse, ce qui est exactement l'argument « SSH est un déploiement,
 ///   pas un connecteur ».
+///
+///   **Le 2026-09-02, cette moitié-là a été écrite** : `packages/docker-mcp`
+///   sert les neuf outils du tableau ci-dessus et aucun de la colonne de
+///   droite, et son `test/forbidden.test.js` lit la table et le source pour que
+///   ce soit vérifiable et pas promis (éprouvé en y ajoutant un vrai
+///   `container_exec` : quatre tests sur seize tombent, cinq si on élargit
+///   aussi `ALLOWED_PATHS`). **Il n'y a toujours pas d'entrée dans [`CATALOG`]**,
+///   et pour deux raisons distinctes qu'il ne faut pas confondre :
+///
+///   1. Le paquet n'est pas publié, donc il n'existe pas de `Package::spec`
+///      épinglé à nommer. C'est une étape d'exploitation, pas du code.
+///   2. Et même publié, **[`Provision::Host`] ne conviendrait pas pour le démon
+///      d'un client.** Un bridge hébergé tourne chez nous, le démon est chez
+///      lui ; et [`crate::hosted`] exige du bridge une racine en lecture seule
+///      et aucun montage, or parler à `/var/run/docker.sock` réclame justement
+///      ce montage — qui donne root sur l'hôte. [`CUSTOM`] n'est donc pas une
+///      étape en attendant mieux ici, c'est la réponse. `Provision::Host`
+///      conviendrait au *premier* Docker de la liste ci-dessus, celui qui parle
+///      à une API distante (Docker Hub), pas au second.
 ///
 /// * **Vercel** — sondé, et refusé pour une raison mesurée :
 ///   `mcp.vercel.com/.well-known/oauth-authorization-server` annonce

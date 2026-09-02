@@ -944,8 +944,90 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on(
             routes::webhooks::received_event(routes::webhooks::TELEPHONY_PROVIDER),
             Arc::new(move |event, tx| on_telephony_webhook(ports.clone(), event, tx)),
+        )
+        // Le troisième, et il est enregistré ici pour la même raison que les
+        // deux autres : `0077` a élargi `webhook_endpoints_provider_is_wired` à
+        // `'smartlead'`, et cette CHECK est exactement l'affirmation que cette
+        // ligne existe. Sans condition, comme les deux au-dessus : une ligne
+        // `webhook_endpoints` n'est pas visible au démarrage.
+        //
+        // Aucune livraison ne l'atteint aujourd'hui — le schéma de signature la
+        // refuse tant que personne n'a lu l'en-tête de Smartlead sur une vraie
+        // livraison — et c'est la bonne moitié à poser en premier : le jour où
+        // l'en-tête est posé, un désabonnement qui arrive trouve son lecteur au
+        // lieu d'être réessayé huit fois puis mis en lettre morte.
+        .on(
+            routes::webhooks::received_event(routes::webhooks::SMARTLEAD_PROVIDER),
+            Arc::new(on_smartlead_webhook),
         );
     handlers
+}
+
+/// `webhook.smartlead.received` : un désabonnement poussé devient une ligne de
+/// `suppressions`, et le contact tombe avec elle.
+///
+/// La troisième jointure, et la plus courte des trois. Elle n'a ni port ni
+/// fournisseur à joindre : tout ce dont elle a besoin est dans les octets que
+/// l'edge a vérifiés, et l'écriture est celle que
+/// [`agentos_app::queue::record_platform_opt_out`] fait déjà pour la porte
+/// tirée — donc la même personne, arrivée par la poussée ou par le tirage, est
+/// une ligne et pas deux.
+///
+/// # Une phase, pas deux
+///
+/// Pour la raison de `on_telephony_webhook` : la livraison **porte** le corps.
+/// Il n'y a rien à aller chercher chez la plateforme, donc aucune notice
+/// intermédiaire à écrire, et la suppression commet dans la transaction qui
+/// retire la livraison de la file.
+///
+/// # Ce qui est terminal
+///
+/// `InboundError::is_retryable` décide, exactement comme pour les deux autres.
+/// Ce qui est terminal ici — un corps qui n'est pas du JSON, un désabonnement
+/// sans adresse lisible — ne devient pas autre chose à la huitième tentative,
+/// et une lettre morte est visible là où un `Ok` silencieux ne l'est pas.
+/// `outbox::requeue_dead_letters` est le chemin du retour.
+fn on_smartlead_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        // Terminal, pour la raison de `on_webhook` : ce payload est écrit une
+        // fois, par la route, et une livraison stockée sans corps n'en fera pas
+        // pousser un.
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
+
+        // Exactement les octets sur lesquels la signature a été vérifiée.
+        let suppressed =
+            agentos_app::inbound::record_smartlead_unsubscribe(tx, body.as_bytes(), Utc::now())
+                .await
+                .map_err(|err| {
+                    // Jamais le payload et jamais le texte de la plateforme :
+                    // `code()` est une étiquette fixe, chaque `InboundError` se
+                    // rend depuis une phrase écrite ici, et cette chaîne part
+                    // dans `last_error`.
+                    let why = format!("{}: {err}", err.code());
+                    if err.is_retryable() {
+                        Failure::Retry(why)
+                    } else {
+                        Failure::Terminal(why)
+                    }
+                })?;
+
+        // Pas d'adresse dans la ligne : qui c'était est dans `suppressions`,
+        // derrière la RLS. `false` est le cas ordinaire — la plateforme pousse
+        // aussi les envois et les ouvertures, et aucun de ces événements ne doit
+        // toucher une ligne.
+        match suppressed {
+            true => tracing::info!(
+                "a lead unsubscribed on the sending platform; they are suppressed and their \
+                 contact is deactivated on every channel"
+            ),
+            false => tracing::debug!("a smartlead delivery that is not an unsubscribe"),
+        }
+        Ok(())
+    })
 }
 
 /// `employee.created`: confirm the provisioner actually has a job.

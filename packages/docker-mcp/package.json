@@ -1,0 +1,31 @@
+{
+  "name": "@internationalagent/docker-mcp",
+  "version": "0.1.0",
+  "description": "Serveur MCP stdio en lecture sur le demon Docker: lister, inspecter, journaux, statistiques, evenements, et demarrer/arreter/redemarrer un conteneur qui existe deja. Aucun exec, aucun create, aucun run.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "docker-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test test/*.test.js",
+    "start": "node dist/index.js",
+    "pretest": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

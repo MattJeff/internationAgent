@@ -1004,8 +1004,6 @@ pub fn verify_telephony_webhook(
     signature: &str,
     raw_form: &[u8],
 ) -> Result<String, TelephonySigError> {
-    use sha2::Digest as _;
-
     telephony::verify_twilio_signature(
         auth_token,
         callback_url,
@@ -1015,13 +1013,11 @@ pub fn verify_telephony_webhook(
 
     // Only after the MAC. Hashing before it would be work an unauthenticated
     // caller can ask for, which is the same argument the body cap makes.
-    Ok(sha2::Sha256::digest(raw_form)
-        .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        }))
+    //
+    // `body_digest` plutôt que la boucle qui était ici : le schéma Smartlead
+    // dédoublonne sur la même empreinte des mêmes octets, et deux orthographes
+    // de ce digest seraient deux réponses à « est-ce la même livraison ».
+    Ok(body_digest(raw_form))
 }
 
 /// `PUBLIC_HOST` as an absolute origin: scheme, host, no trailing slash.
@@ -1073,6 +1069,361 @@ pub fn sign_telephony_webhook(auth_token: &Secret, callback_url: &str, raw_form:
         telephony::WebhookBody::Form(raw_form),
     )
     .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Smartlead : la plateforme d'envoi pousse ses désabonnements
+// ---------------------------------------------------------------------------
+
+/// Le `provider` d'un endpoint dont les livraisons viennent de Smartlead.
+///
+/// Une chaîne à nous, comme `'twilio'` : elle nomme l'adaptateur dont le schéma
+/// de signature vérifie la livraison, et elle doit être la même à trois
+/// endroits — le `match` de `routes::webhooks`, l'enregistrement du handler
+/// dans `main::handlers`, et la CHECK `webhook_endpoints_provider_is_wired`
+/// élargie par `0077`. Deux des trois sont compilés ; c'est pourquoi c'est un
+/// const et pas un littéral recopié.
+pub const SMARTLEAD_PROVIDER: &str = "smartlead";
+
+/// L'en-tête dans lequel Smartlead met sa signature — **personne ne l'a lu, et
+/// ce n'est pas un échec de recherche.**
+///
+/// `None` veut dire « pas encore posé ». Tant que c'est `None`,
+/// [`crate::webhooks::register`] refuse d'enregistrer un endpoint `smartlead`
+/// et `routes::webhooks` refuse toute livraison qui en viendrait. Un en-tête
+/// deviné qui accepte ce qu'il ne devrait pas est le pire résultat possible ;
+/// un connecteur qui refuse de s'enregistrer est seulement un connecteur pas
+/// encore fini.
+///
+/// # Ce que la recherche du 2026-09-02 a rendu, et pourquoi elle conclut à
+/// l'absence plutôt qu'à l'ignorance
+///
+/// 1. **Preuve négative structurelle.**
+///    <https://api.smartlead.ai/reference/add-update-campaign-webhook>
+///    n'accepte que `id`, `name`, `webhook_url`, `event_types` : aucun champ
+///    secret, donc nulle part où saisir la clé partagée que l'exemple Python de
+///    <https://api.smartlead.ai/core/webhooks> utilise. Un HMAC sans secret
+///    configurable est un fragment de doc sans fonctionnalité derrière.
+/// 2. **Le mécanisme réel, attesté deux fois.** Smartlead met son propre secret
+///    généré *dans le corps JSON*, champ `secret_key` : la référence API
+///    officielle vendorée dans
+///    <https://raw.githubusercontent.com/whrit/n8n-nodes-smartlead/HEAD/docs/API-Docs/smartlead-api-reference.md>
+///    le montre comme champ de premier niveau d'un payload réel, et le nœud n8n
+///    <https://github.com/whrit/n8n-nodes-smartlead/blob/HEAD/nodes/SmartleadTrigger/SmartleadTrigger.node.ts>
+///    vérifie contre ce champ. Aucune des deux ne mentionne d'en-tête.
+/// 3. **Rapport de production.**
+///    <https://github.com/tjallingvds/linkedin-network-map/blob/HEAD/server/src/routes/webhooks/smartlead.ts>
+///    écrit en clair que Smartlead ne signe pas ses webhooks, et que leur route
+///    a rejeté *toutes* les livraisons authentiques en `401` tant qu'elle a
+///    exigé un `X-Smartlead-Signature` — exactement le mode d'échec que ce
+///    `None` refuse de reproduire.
+///
+/// Trois dépôts donnent bien `X-Smartlead-Signature` + `sha256=` +
+/// `X-Request-Id` (kiamiya/dmh-stack, Vierra-Digital/Vierra-Website,
+/// api-evangelist/smartlead-ai) et ils ont été écartés : le premier cite « la
+/// doc » pour un préfixe que la doc ne contient pas, le deuxième se déclare
+/// lui-même non vérifié en tête de fichier, le troisième est un dépôt
+/// d'artefacts générés. Le même triplet exact chez trois auteurs sans livraison
+/// reçue est la signature d'une hallucination partagée, pas d'une observation —
+/// et `sha256=` est la convention GitHub, que l'exemple Python de Smartlead
+/// contredit puisqu'il compare un `hexdigest()` nu.
+///
+/// # Ce qu'il faut faire pour le poser
+///
+/// Recevoir une livraison réelle sur une URL qu'on contrôle et lire ses
+/// en-têtes. S'il y en a un, l'écrire ici en `Some("…")` avec la date et
+/// l'URL de la livraison, et tout ce qui suit se met à marcher. S'il n'y en a
+/// pas — ce que la recherche prédit — alors le schéma à câbler n'est pas
+/// celui-ci : c'est le chemin non devinable qui fait office de credential plus
+/// une égalité en temps constant sur le champ `secret_key` du corps, et ce sera
+/// un quatrième schéma dans `routes::webhooks`, pas une valeur à poser ici.
+pub const SMARTLEAD_SIGNATURE_HEADER: Option<&str> = None;
+
+/// Les deux orthographes attestées de l'événement « ce lead s'est désabonné ».
+///
+/// `EMAIL_UNSUBSCRIBED` est celle du catalogue d'événements officiel
+/// (<https://api.smartlead.ai/core/webhooks>, relevé le 2026-09-02, « When
+/// unsubscribe link clicked »). `LEAD_UNSUBSCRIBED` est celle de la référence
+/// API vendorée dans whrit/n8n-nodes-smartlead et des libellés du nœud n8n
+/// (mêmes URLs que [`SMARTLEAD_SIGNATURE_HEADER`], relevées le même jour).
+///
+/// Les deux sont acceptées parce que les deux sont citées et qu'aucune source
+/// ne dit laquelle une livraison porte réellement — et le coût d'une erreur
+/// n'est pas symétrique : ignorer la bonne orthographe, c'est un désabonnement
+/// perdu et une personne qu'on continue de démarcher.
+pub const SMARTLEAD_UNSUBSCRIBED: [&str; 2] = ["EMAIL_UNSUBSCRIBED", "LEAD_UNSUBSCRIBED"];
+
+/// Le champ qui porte l'adresse du lead dans un payload de webhook Smartlead.
+///
+/// Attesté par la liste de champs d'un payload réel dans la référence API
+/// vendorée (whrit/n8n-nodes-smartlead, `docs/API-Docs/smartlead-api-reference.md`,
+/// relevée le 2026-09-02) : `sl_lead_email` y voisine `from_email`, `to_email`,
+/// `campaign_id` et `secret_key`.
+///
+/// **Un seul champ, et pas de repli sur `to_email`.** Aucune source ne montre
+/// le payload d'un désabonnement, donc on ne sait pas qui est `to_email` sur
+/// cet événement-là ; `sl_lead_email` est le seul dont le nom dit qu'il est le
+/// lead. Se tromper coûterait une ligne de `suppressions` — table sans DELETE,
+/// sans UPDATE — sur *notre propre* boîte d'envoi, c'est-à-dire l'auto-
+/// suppression d'un client. Un `BadNotice` terminal, visible en lettre morte,
+/// est le prix correct de l'incertitude.
+const SMARTLEAD_LEAD_EMAIL: &str = "sl_lead_email";
+
+/// L'empreinte des octets vérifiés, telle que la clé de dédoublonnage la porte.
+///
+/// Une fonction plutôt que deux boucles identiques : les deux schémas qui n'ont
+/// pas d'identifiant d'événement dans un en-tête signé — Twilio et Smartlead —
+/// dédoublonnent sur le même digest, et deux orthographes de ce digest seraient
+/// deux réponses à « est-ce la même livraison ». L'argument long est au-dessus
+/// de [`verify_telephony_webhook`].
+fn body_digest(raw_body: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    body_hex(&sha2::Sha256::digest(raw_body))
+}
+
+/// Le HMAC-SHA256 hexadécimal du corps brut, dans l'orthographe que l'exemple
+/// de la doc compare.
+///
+/// Le jumeau de [`sign_telephony_webhook`], avec le même avertissement :
+/// **fixtures et tests seulement**. Les vraies signatures sont faites par la
+/// plateforme. Ce que ça achète est ce que ça achète là-bas — pouvoir montrer
+/// qu'un refus est un refus de *signature* et pas de forme de payload, ce qui
+/// demande un témoin signé correctement.
+///
+/// `hexdigest()` en minuscules et sans préfixe : c'est ce que rend
+/// `hmac.new(secret, payload, hashlib.sha256).hexdigest()` dans l'exemple
+/// Python de <https://api.smartlead.ai/core/webhooks> (relevé le 2026-09-02).
+/// Le `sha256=` de trois dépôts tiers est la convention GitHub et contredit cet
+/// exemple ; voir [`SMARTLEAD_SIGNATURE_HEADER`] pour pourquoi ces dépôts ne
+/// comptent pas comme des sources.
+pub fn sign_smartlead_webhook(secret: &Secret, raw_body: &[u8]) -> String {
+    use hmac::Mac as _;
+
+    let mut mac =
+        <hmac::Hmac<sha2::Sha256>>::new_from_slice(secret.expose_for_transport().as_bytes())
+            .expect("HMAC-SHA256 accepte une clé de n'importe quelle longueur");
+    mac.update(raw_body);
+    body_hex(&mac.finalize().into_bytes())
+}
+
+/// L'hexadécimal minuscule de n'importe quel tableau d'octets.
+fn body_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Authentifier une livraison Smartlead, et nommer l'identifiant sur lequel un
+/// rejeu se referme.
+///
+/// Le troisième schéma, et la troisième fois que la même paire de réponses est
+/// rendue par une seule expression : voir [`verify_telephony_webhook`] pour
+/// pourquoi l'identifiant de dédoublonnage sort d'ici et pas d'un en-tête lu
+/// par l'edge. Smartlead n'annonce aucun en-tête d'identifiant, donc `id` y
+/// vaudrait la chaîne vide à chaque livraison et `outbox::enqueue` replierait
+/// tous les désabonnements d'un client sur le premier.
+///
+/// **Aucune fenêtre de rejeu, et elle ne pourrait pas exister.** Rien dans ce
+/// qui est documenté n'est horodaté *sous* la signature : l'exemple de la doc
+/// signe le corps et rien d'autre. Ce qui rend ça vivable est le même argument
+/// que côté Twilio — un rejeu ne pose rien plutôt que d'être refusé : mêmes
+/// octets, même digest, même ligne d'outbox, et `revenue_store::suppress` est
+/// de toute façon `ON CONFLICT DO NOTHING`.
+///
+/// La comparaison est en temps constant et sur toute la longueur : un `==` sur
+/// un MAC fuit son préfixe par le temps qu'il met à échouer.
+pub fn verify_smartlead_webhook(
+    secret: &Secret,
+    signature: &str,
+    raw_body: &[u8],
+) -> Result<String, SigError> {
+    // Vide veut dire « l'en-tête n'était pas là », et c'est la seule chose que
+    // cette fonction distingue d'un refus : le reste — pas de l'hexadécimal, la
+    // moitié d'un MAC, la signature de quelqu'un d'autre — est un `Mismatch`,
+    // parce que rien de tout ça ne se répare autrement qu'en renvoyant la bonne.
+    let presented = signature.trim();
+    if presented.is_empty() {
+        return Err(SigError::MissingHeader);
+    }
+
+    // Minusculisé avant comparaison : `hexdigest()` rend des minuscules, et une
+    // plateforme qui enverrait les mêmes octets en majuscules ferait échouer
+    // une comparaison d'octets sur une différence qui n'en est pas une. Ça ne
+    // fuit rien — la casse d'un MAC n'est pas un secret.
+    let expected = sign_smartlead_webhook(secret, raw_body);
+    match ct_eq(
+        expected.as_bytes(),
+        presented.to_ascii_lowercase().as_bytes(),
+    ) {
+        true => Ok(body_digest(raw_body)),
+        false => Err(SigError::Mismatch),
+    }
+}
+
+/// Le schéma que Smartlead utilise réellement : son secret, dans le corps.
+///
+/// # Pourquoi ce n'est pas un HMAC, et pourquoi ce n'est pas plus faible qu'il
+/// n'y paraît
+///
+/// [`SMARTLEAD_SIGNATURE_HEADER`] porte les trois lignes d'évidence : il n'y a
+/// pas d'en-tête de signature, il n'y a nulle part où saisir une clé partagée à
+/// l'enregistrement, et Smartlead renvoie à la place **son propre secret généré,
+/// dans le corps JSON, sous `secret_key`**. Deux sources indépendantes
+/// l'attestent sur un payload réel, une troisième rapporte avoir répondu `401` à
+/// toutes ses livraisons authentiques pour avoir exigé un en-tête inexistant.
+///
+/// Un secret dans le corps n'authentifie pas le corps — il authentifie
+/// l'émetteur, et rien de plus. Un intermédiaire qui verrait passer une
+/// livraison pourrait en rejouer une autre. C'est vrai, et c'est le prix que la
+/// plateforme fixe ; ce qui compte est ce qui reste debout à côté :
+///
+/// * **Le chemin est déjà le credential.** `0053_webhook_endpoints.sql` frappe
+///   un chemin opaque précisément pour ça — « ce qui les sépare est l'adresse à
+///   laquelle le fournisseur poste, et rien d'autre ». Un attaquant qui ne
+///   connaît pas le chemin n'a personne à qui parler ; celui qui le connaît a
+///   déjà lu une livraison, donc il a déjà le `secret_key`. Les deux moitiés
+///   tombent ensemble ou pas du tout, et c'est pour cela que la seconde ne
+///   prétend pas être plus qu'un second facteur.
+/// * **La liaison est en TLS**, et Smartlead refuse un `webhook_url` en clair.
+/// * **Ce qu'une livraison peut faire est borné à un seul verbe** :
+///   [`record_smartlead_unsubscribe`] écrit une ligne de `suppressions`. Le pire
+///   qu'un rejeu obtienne est de désabonner deux fois quelqu'un qui l'était déjà
+///   — la table est en ajout seul et le second insert ne change rien. Il n'y a
+///   pas de chemin où une livraison forgée fasse *sortir* quoi que ce soit.
+///
+/// # Ce que cette fonction ne fait pas, exprès
+///
+/// Elle ne valide pas la forme du reste du corps. Son seul travail est de dire
+/// « ceci vient bien de l'endpoint que cet opérateur a enregistré » ; ce que le
+/// corps contient ensuite est l'affaire de [`smartlead_unsubscribed_email`], qui
+/// traite tout ce qu'il lit comme du texte d'un tiers.
+///
+/// Un corps illisible rend `Mismatch` et non une erreur d'analyse : un corps
+/// qu'on ne sait pas lire est un corps qu'on ne sait pas authentifier, et les
+/// deux se réparent en renvoyant la bonne livraison.
+pub fn verify_smartlead_secret_key(secret: &Secret, raw_body: &[u8]) -> Result<String, SigError> {
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(raw_body) else {
+        return Err(SigError::Mismatch);
+    };
+    // `MissingHeader` et pas `Mismatch` : la distinction que fait déjà
+    // `verify_smartlead_webhook` est « le credential n'était pas là » contre
+    // « il était là et il est faux », et elle vaut autant quand le credential
+    // voyage dans le corps. C'est la seule des deux qu'un opérateur répare en
+    // changeant sa configuration Smartlead plutôt que son secret.
+    let Some(presented) = body.get("secret_key").and_then(serde_json::Value::as_str) else {
+        return Err(SigError::MissingHeader);
+    };
+
+    match ct_eq(
+        secret.expose_for_transport().as_bytes(),
+        presented.as_bytes(),
+    ) {
+        true => Ok(body_digest(raw_body)),
+        false => Err(SigError::Mismatch),
+    }
+}
+
+/// Comparaison d'octets qui ne s'arrête pas à la première différence.
+///
+/// Recopiée plutôt que réutilisée, et c'est visible : `providers::email` et
+/// `providers::telephony` en ont chacun une, privée. Les exporter serait une
+/// quatrième adresse pour la même primitive de six lignes ; ce qui compte est
+/// qu'aucun des trois n'ait de sortie anticipée, pas qu'ils partagent un
+/// symbole. La différence de longueur est mélangée dans le résultat, donc une
+/// signature tronquée est refusée sans que la boucle soit plus courte.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Un `EMAIL_UNSUBSCRIBED` vérifié devient une ligne de `suppressions`.
+///
+/// Rend `true` quand un désabonnement a été enregistré, `false` quand la
+/// livraison était un autre événement — un `EMAIL_SENT`, un `EMAIL_OPENED` —
+/// qu'aucune ligne ne doit toucher. Ce `false` est le garde-fou qui compte :
+/// supprimer quelqu'un parce qu'on lui a *envoyé* un mail serait irréversible.
+///
+/// # Pourquoi ça n'écrit pas la ligne soi-même
+///
+/// [`crate::queue::record_platform_opt_out`] l'écrit, et c'est la même fonction
+/// que la porte *tirée* ([`crate::queue::reconcile_opt_outs`]) appelle. Deux
+/// écrivains sur une table append-only depuis deux côtés est précisément la
+/// couture qui fabrique un bug — l'argument est déjà écrit au-dessus de
+/// [`record_refusal`], qui a payé pour l'apprendre. Conséquence concrète : la
+/// même personne arrivant par la poussée et par le tirage est une ligne, pas
+/// deux, parce que `suppressions_address_key` porte la même orthographe des
+/// deux côtés.
+///
+/// # Un rejeu n'écrit pas deux lignes, et à trois niveaux
+///
+/// `outbox::enqueue` replie la seconde livraison sur la première (même corps,
+/// même digest, même clé de dédoublonnage) ; si elle passe quand même, la
+/// contrainte `suppressions_address_key` la rattrape via le `ON CONFLICT DO
+/// NOTHING` de `suppress` ; et le contact était déjà désactivé de toute façon.
+///
+/// # Ce qui est terminal et ce qui est réessayable
+///
+/// Un corps qui n'est pas du JSON et un désabonnement sans adresse lisible sont
+/// [`InboundError::BadNotice`], donc terminaux : les mêmes octets ne
+/// deviendront pas autre chose à la huitième tentative, et une lettre morte est
+/// visible là où un `Ok` silencieux ne l'est pas. C'est délibérément plus dur
+/// que la porte tirée, qui saute une adresse illisible pour ne pas perdre les
+/// autres opt-outs du même lot : ici il n'y a qu'une personne dans la
+/// livraison, et la perdre en silence serait perdre exactement ce que cette
+/// fonction existe pour attraper.
+pub async fn record_smartlead_unsubscribe(
+    tx: &mut TenantTx<'_>,
+    raw_body: &[u8],
+    now: DateTime<Utc>,
+) -> Result<bool, InboundError> {
+    let payload: Value = serde_json::from_slice(raw_body)
+        .map_err(|_| InboundError::BadNotice("this Smartlead delivery is not JSON"))?;
+
+    // Texte tiers, comparé à des constantes et jamais rendu ni journalisé.
+    //
+    // Le NOM du champ vient du même payload réel que [`SMARTLEAD_LEAD_EMAIL`] —
+    // référence API vendorée dans whrit/n8n-nodes-smartlead,
+    // `docs/API-Docs/smartlead-api-reference.md`, relevée le 2026-09-02, où
+    // `event_type` voisine `sl_lead_email` et `secret_key`. Le catalogue
+    // d'événements de <https://api.smartlead.ai/core/webhooks> l'orthographie
+    // `event_types` (au pluriel) à l'*enregistrement* ; c'est le champ qu'on
+    // envoie, pas celui qu'on reçoit, et confondre les deux ferait taire chaque
+    // livraison sans rien casser de visible.
+    let event = payload
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !SMARTLEAD_UNSUBSCRIBED.contains(&event) {
+        return Ok(false);
+    }
+
+    let Some(address) = payload.get(SMARTLEAD_LEAD_EMAIL).and_then(Value::as_str) else {
+        return Err(InboundError::BadNotice(
+            "a Smartlead unsubscribe carried no `sl_lead_email`; nobody can be suppressed from it",
+        ));
+    };
+
+    match crate::queue::record_platform_opt_out(tx, address, now).await {
+        // L'adresse est là et `suppressions` ne peut pas la porter. Pas un
+        // `Ok` : quelqu'un a demandé à ne plus être écrit et on n'a pas su
+        // l'inscrire, ce qui doit se voir.
+        Ok(false) => Err(InboundError::BadNotice(
+            "a Smartlead unsubscribe named an address `suppressions` cannot store",
+        )),
+        Ok(true) => Ok(true),
+        Err(revenue_store::RevenueError::Store(err)) => Err(InboundError::Store(err)),
+        Err(_) => Err(InboundError::Store(StoreError::conflict(
+            "the unsubscribe could not be recorded",
+        ))),
+    }
 }
 
 /// The two numbers a telephony delivery is routed by.
@@ -8520,5 +8871,210 @@ mod tests {
             "a call status was landed as a message on the counterparty's thread"
         );
         assert_eq!(call_rows(&db, tenant).await.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Smartlead
+    // -----------------------------------------------------------------------
+
+    /// La clé partagée d'un endpoint Smartlead. Ni un `whsec_…` ni un jeton
+    /// Twilio : les trois schémas prennent leur secret dans trois tableaux de
+    /// bord différents, et un endpoint en porte un.
+    const SMARTLEAD_SECRET: &str = "a-smartlead-shared-secret-that-is-not-the-others";
+
+    fn unsubscribe(address: &str) -> Vec<u8> {
+        format!(
+            "{{\"event_type\":\"EMAIL_UNSUBSCRIBED\",\"sl_lead_email\":\"{address}\",\
+              \"campaign_id\":91125,\"secret_key\":\"unused-here\"}}"
+        )
+        .into_bytes()
+    }
+
+    /// Le témoin signé correctement, un octet retourné, un secret voisin, et
+    /// rien du tout — dans un seul arrangement, parce que la propriété est
+    /// « la signature couvre exactement ces octets-là » et qu'un seul de ces
+    /// quatre cas passe.
+    #[test]
+    fn a_smartlead_signature_covers_exactly_the_bytes_it_was_made_over() {
+        let secret = Secret::new(SMARTLEAD_SECRET);
+        let body = unsubscribe("quiet@prospect.example");
+        let signature = sign_smartlead_webhook(&secret, &body);
+
+        let id = verify_smartlead_webhook(&secret, &signature, &body).expect("le témoin vérifie");
+        assert_eq!(
+            id,
+            verify_smartlead_webhook(&secret, &signature, &body).expect("verifies"),
+            "un rejeu doit rendre le même identifiant, ou il ferait une seconde ligne"
+        );
+
+        // Un octet. `sl_lead_email` devient une autre personne et la signature
+        // ne bouge pas : c'est exactement la falsification qui compte ici.
+        let mut tampered = body.clone();
+        let target = tampered
+            .iter()
+            .position(|byte| *byte == b'q')
+            .expect("l'adresse est dans le corps");
+        tampered[target] = b'Q';
+        assert!(
+            verify_smartlead_webhook(&secret, &signature, &tampered).is_err(),
+            "un corps modifié d'un octet a été accepté"
+        );
+
+        // La signature de quelqu'un d'autre, sur les mêmes octets.
+        assert!(
+            verify_smartlead_webhook(&Secret::new("another-tenants-secret"), &signature, &body)
+                .is_err()
+        );
+        // Et l'en-tête absent, qui est le cas ordinaire tant que personne ne
+        // sait quel en-tête lire.
+        assert!(matches!(
+            verify_smartlead_webhook(&secret, "", &body),
+            Err(SigError::MissingHeader)
+        ));
+        // La casse n'est pas une falsification : `hexdigest()` rend des
+        // minuscules et une plateforme qui crierait les mêmes octets dirait la
+        // même chose.
+        assert!(verify_smartlead_webhook(&secret, &signature.to_ascii_uppercase(), &body).is_ok());
+    }
+
+    /// Un compte, un contact actif, et son adresse.
+    async fn seed_contact(db: &Db, tenant: TenantId, email: &str) -> Uuid {
+        let (account, contact) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Prospect plc', $3, 'airline', 'FR')",
+        )
+        .bind(account)
+        .bind(tenant.as_uuid())
+        .bind(format!("prospect-{}.example", account.simple()))
+        .execute(&mut *tx)
+        .await
+        .expect("insert account");
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email, phone) \
+             VALUES ($1, $2, $3, 'Someone', $4, $5)",
+        )
+        .bind(contact)
+        .bind(tenant.as_uuid())
+        .bind(account)
+        .bind(email)
+        .bind("+33600000077")
+        .execute(&mut *tx)
+        .await
+        .expect("insert contact");
+        tx.commit().await.expect("commit contact");
+        contact
+    }
+
+    async fn suppression_rows(db: &Db, tenant: TenantId, address: &str) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let count = sqlx::query_scalar("SELECT count(*) FROM suppressions WHERE address = $1")
+            .bind(address)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count");
+        tx.commit().await.expect("commit");
+        count
+    }
+
+    async fn contact_is_active(db: &Db, tenant: TenantId, contact: Uuid) -> bool {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let active = sqlx::query_scalar("SELECT active FROM contacts WHERE id = $1")
+            .bind(contact)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read contact");
+        tx.commit().await.expect("commit");
+        active
+    }
+
+    /// Le désabonnement désactive le contact — donc le téléphone tombe avec le
+    /// mail — et un rejeu n'écrit pas une seconde ligne.
+    ///
+    /// Un seul arrangement pour les deux, parce que le rejeu n'est intéressant
+    /// qu'après une première écriture réussie, et parce que le contact
+    /// désactivé est ce qui rend la ligne de `suppressions` autre chose qu'une
+    /// entrée dans un journal.
+    #[tokio::test]
+    async fn a_pushed_unsubscribe_deactivates_the_contact_and_a_replay_adds_nothing() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let address = format!("quiet-{}@prospect.example", Uuid::now_v7().simple());
+        let contact = seed_contact(&db, tenant, &address).await;
+        assert!(
+            contact_is_active(&db, tenant, contact).await,
+            "le témoin : ce contact est joignable avant le désabonnement"
+        );
+
+        let body = unsubscribe(&address);
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let suppressed = record_smartlead_unsubscribe(&mut tx, &body, Utc::now())
+            .await
+            .expect("le désabonnement est enregistré");
+        tx.commit().await.expect("commit");
+        assert!(suppressed);
+
+        assert_eq!(suppression_rows(&db, tenant, &address).await, 1);
+        assert!(
+            !contact_is_active(&db, tenant, contact).await,
+            "le contact est resté actif : le téléphone de cette personne est encore joignable"
+        );
+
+        // Le rejeu. Smartlead redélivre ce qu'il n'a pas vu accepter, et
+        // `suppressions` n'accepte ni UPDATE ni DELETE — une seconde ligne
+        // serait une seconde histoire sur la même personne.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        record_smartlead_unsubscribe(&mut tx, &body, Utc::now())
+            .await
+            .expect("un rejeu n'est pas une erreur");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            suppression_rows(&db, tenant, &address).await,
+            1,
+            "un rejeu a écrit une seconde ligne"
+        );
+    }
+
+    /// Et l'inverse, qui est le garde-fou : les autres événements de la même
+    /// plateforme ne touchent personne.
+    ///
+    /// `EMAIL_SENT` arrive à chaque message envoyé. Le lire comme un
+    /// désabonnement supprimerait tout le monde à qui on écrit, dans une table
+    /// sans DELETE.
+    #[tokio::test]
+    async fn a_smartlead_delivery_that_is_not_an_unsubscribe_suppresses_nobody() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let address = format!("sent-{}@prospect.example", Uuid::now_v7().simple());
+        let contact = seed_contact(&db, tenant, &address).await;
+
+        let body = format!("{{\"event_type\":\"EMAIL_SENT\",\"sl_lead_email\":\"{address}\"}}")
+            .into_bytes();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let suppressed = record_smartlead_unsubscribe(&mut tx, &body, Utc::now())
+            .await
+            .expect("un envoi n'est pas une erreur");
+        tx.commit().await.expect("commit");
+
+        assert!(!suppressed);
+        assert_eq!(suppression_rows(&db, tenant, &address).await, 0);
+        assert!(contact_is_active(&db, tenant, contact).await);
+
+        // Et un désabonnement sans adresse est terminal plutôt que silencieux :
+        // quelqu'un a demandé qu'on arrête et on n'a pas su l'inscrire.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let err = record_smartlead_unsubscribe(
+            &mut tx,
+            br#"{"event_type":"LEAD_UNSUBSCRIBED","campaign_id":1}"#,
+            Utc::now(),
+        )
+        .await
+        .expect_err("un désabonnement anonyme doit se voir");
+        tx.commit().await.expect("commit");
+        assert!(
+            !err.is_retryable(),
+            "huit tentatives ne feront pas apparaître une adresse"
+        );
     }
 }

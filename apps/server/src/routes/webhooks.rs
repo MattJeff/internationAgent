@@ -60,7 +60,15 @@
 //! operator who registers a row on a legacy path finds that mail keeps arriving
 //! where it always did, rather than finding out that it silently moved.
 //!
-//! # Two signature schemes, and the endpoint's `provider` is what picks
+//! # Three signature schemes, and the endpoint's `provider` is what picks
+//!
+//! Le troisième est arrivé avec `0077` : Smartlead pousse ses désabonnements et
+//! signe en HMAC-SHA256 hexadécimal sur le corps brut. C'est aussi le seul des
+//! trois qui refuse **toutes** les livraisons aujourd'hui, et délibérément —
+//! le nom de l'en-tête où cette plateforme met sa signature n'a jamais été lu
+//! sur une livraison réelle, `agentos_app::inbound::SMARTLEAD_SIGNATURE_HEADER`
+//! vaut `None`, et un vérificateur qui devine son en-tête accepte ou refuse au
+//! hasard. La suite de ce paragraphe vaut pour les deux premiers.
 //!
 //! This file used to carry a note saying there was one — the Standard Webhooks
 //! / Svix scheme, which is what `agentos_providers::email` signs and what Resend
@@ -104,7 +112,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agentos_app::inbound::{
-    TELEPHONY_SIGNATURE_HEADER, WebhookHeaders, callback_origin, verify_signature,
+    SMARTLEAD_SIGNATURE_HEADER, TELEPHONY_SIGNATURE_HEADER, WebhookHeaders, callback_origin,
+    verify_signature, verify_smartlead_secret_key, verify_smartlead_webhook,
     verify_telephony_webhook,
 };
 use agentos_app::mcp::Credentials;
@@ -139,6 +148,14 @@ pub const RAW_AGGREGATE: &str = "webhook";
 /// registration, and `0069`'s widened
 /// `webhook_endpoints_provider_is_wired` — and two of them are compiled.
 pub use agentos_app::inbound::TELEPHONY_PROVIDER;
+
+/// The endpoint `provider` whose deliveries are verified with Smartlead's
+/// scheme and read by `main::on_smartlead_webhook`.
+///
+/// Re-exported for the reason above it, and with the same three places that
+/// have to agree: this file's `match`, `main::handlers`, and `0077`'s widened
+/// `webhook_endpoints_provider_is_wired`.
+pub use agentos_app::inbound::SMARTLEAD_PROVIDER;
 
 /// The `event_type` a stored delivery from `provider` is filed under.
 ///
@@ -364,6 +381,55 @@ async fn ingest(
             tracing::warn!(%provider, %url, error = %err, "telephony signature rejected");
             unverified()
         })?
+    } else if provider == SMARTLEAD_PROVIDER {
+        // **Le troisième schéma, et le seul qui refuse tout aujourd'hui.**
+        // `agentos_app::webhooks::register` ferme déjà la porte de la table ;
+        // celle-ci est l'autre registre — `AGENTOS_WEBHOOK_SECRETS`, qui est lu
+        // en premier et ne passe par aucun `register`. Une entrée
+        // `smartlead:<tenant>:<secret>` dans une variable d'environnement est
+        // légale à écrire, donc le refus doit exister ici aussi ou il n'existe
+        // pas.
+        //
+        // Deviner le nom de l'en-tête serait pire que refuser : voir
+        // `agentos_app::inbound::SMARTLEAD_SIGNATURE_HEADER`, qui porte les
+        // trois lignes d'évidence et le rapport de production de quelqu'un qui
+        // a répondu `401` à toutes ses livraisons authentiques pendant des
+        // semaines pour l'avoir deviné.
+        //
+        // **Deux schémas, et le second est celui qui marche aujourd'hui.** Si
+        // quelqu'un finit par lire un en-tête de signature sur une livraison
+        // réelle et le pose dans `SMARTLEAD_SIGNATURE_HEADER`, c'est lui qu'on
+        // prend : un MAC sur le corps authentifie le corps, ce qu'un secret
+        // dans le corps ne fait pas. Tant que le const vaut `None` — et la
+        // recherche prédit qu'il le restera — on vérifie ce que la plateforme
+        // envoie vraiment : son `secret_key`, dans le JSON.
+        //
+        // L'ordre compte et n'est pas une préférence de style : le jour où
+        // l'en-tête existe, une livraison qui ne le porte pas doit être
+        // refusée, pas rattrapée par le chemin d'en dessous.
+        match SMARTLEAD_SIGNATURE_HEADER {
+            Some(header) => {
+                let signature = parts
+                    .headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+
+                verify_smartlead_webhook(&endpoint.secret, signature, &raw).map_err(|err| {
+                    tracing::warn!(%provider, error = %err, "smartlead signature rejected");
+                    unverified()
+                })?
+            }
+            None => verify_smartlead_secret_key(&endpoint.secret, &raw).map_err(|err| {
+                // Pas de `%url` ici, contrairement au schéma téléphonie : rien
+                // dans cette vérification ne dépend d'une adresse configurée,
+                // donc il n'y a pas de désaccord de configuration à nommer. Le
+                // seul dépannage utile est « le secret enregistré n'est pas
+                // celui que Smartlead renvoie », et la variante le dit.
+                tracing::warn!(%provider, error = %err, "smartlead secret_key rejected");
+                unverified()
+            })?,
+        }
     } else {
         // The signature covers `id . timestamp . raw`, so the id and timestamp
         // are authenticated too — which is what makes the id safe to dedupe on.
@@ -615,6 +681,125 @@ mod tests {
             ORIGIN,
         );
         Some((db, tenant, router))
+    }
+
+    // -- the smartlead scheme -----------------------------------------------
+
+    /// La clé partagée d'un endpoint Smartlead — ni un `whsec_…`, ni un jeton
+    /// Twilio. Trois schémas, trois tableaux de bord, un secret par endpoint.
+    const SMARTLEAD_SECRET: &str = "a-smartlead-shared-secret-that-is-not-the-others";
+
+    /// Un tenant dont l'endpoint est un endpoint Smartlead, et la route devant.
+    async fn smartlead_harness() -> Option<(Db, TenantId, Router)> {
+        let db = connect().await?;
+        let tenant = seed_tenant(&db).await;
+        let endpoints = HashMap::from([(
+            SMARTLEAD_PROVIDER.to_owned(),
+            Endpoint {
+                tenant_id: tenant,
+                provider: SMARTLEAD_PROVIDER.to_owned(),
+                secret: Secret::new(SMARTLEAD_SECRET),
+            },
+        )]);
+        let router = router(
+            db.clone(),
+            Credentials::from_master_key(MASTER),
+            Webhooks::new(endpoints),
+            ORIGIN,
+        );
+        Some((db, tenant, router))
+    }
+
+    /// La paire qui prouve que le schéma réel est vivant : le bon secret passe,
+    /// un secret voisin ne passe pas.
+    ///
+    /// Ce test s'appelait `a_correctly_signed_smartlead_delivery_is_refused_while_its_header_is_unposed`
+    /// et il affirmait qu'une livraison correctement signée était refusée quand
+    /// même, faute de savoir dans quel en-tête regarder. Sa dernière ligne de
+    /// documentation disait : « le jour où quelqu'un pose l'en-tête, ce test
+    /// devient rouge, et c'est voulu ». Ce jour est arrivé par l'autre bout —
+    /// il n'y a pas d'en-tête à poser, Smartlead renvoie son secret dans le
+    /// corps, et c'est ce schéma-là qui est câblé.
+    ///
+    /// Les deux moitiés sont dans le même test à dessein. Un témoin qui passe
+    /// sans falsification à côté prouverait seulement qu'on accepte ; une
+    /// falsification refusée sans témoin prouverait seulement qu'on refuse. Ce
+    /// qu'on veut savoir est que la comparaison **discrimine**.
+    #[tokio::test]
+    async fn the_body_secret_is_what_lets_a_smartlead_delivery_through() {
+        let Some((db, tenant, router)) = smartlead_harness().await else {
+            return;
+        };
+
+        // Une falsification d'abord, sur la même adresse et le même corps à un
+        // caractère près. Elle passe en premier pour que le témoin ne puisse
+        // pas être expliqué par un état laissé derrière.
+        let faux = format!(
+            r#"{{"event_type":"EMAIL_UNSUBSCRIBED","sl_lead_email":"quiet@prospect.example","secret_key":"{SMARTLEAD_SECRET}x"}}"#
+        );
+        let request = HttpRequest::post(format!("/v1/webhooks/{SMARTLEAD_PROVIDER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(faux))
+            .expect("request");
+        let (status, _) = call(&router, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "un secret voisin a été accepté : la comparaison ne compare rien"
+        );
+        assert!(
+            stored(&db, tenant).await.is_empty(),
+            "une livraison non vérifiée a été mise en file"
+        );
+
+        // Et le témoin : exactement le même corps, avec le secret que
+        // l'opérateur a enregistré.
+        let vrai = format!(
+            r#"{{"event_type":"EMAIL_UNSUBSCRIBED","sl_lead_email":"quiet@prospect.example","secret_key":"{SMARTLEAD_SECRET}"}}"#
+        );
+        let request = HttpRequest::post(format!("/v1/webhooks/{SMARTLEAD_PROVIDER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(vrai))
+            .expect("request");
+        let (status, _) = call(&router, request).await;
+        // 202 et non 204 : la route met en file et rend la main. Le fournisseur
+        // n'attend pas que le désabonnement soit écrit — c'est ce que dit
+        // l'en-tête de ce module sur la boucle d'ingestion.
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "une livraison portant le bon secret a été refusée"
+        );
+        assert!(
+            !stored(&db, tenant).await.is_empty(),
+            "une livraison vérifiée n'a rien mis en file"
+        );
+    }
+
+    /// Un corps sans `secret_key` du tout est refusé, et pas par accident.
+    ///
+    /// C'est le cas qu'un attaquant essaie en premier — poster un JSON valide à
+    /// une adresse devinée — et c'est aussi ce qui arriverait si Smartlead
+    /// changeait le nom du champ sans le dire. Les deux se réparent
+    /// différemment mais se refusent pareil.
+    #[tokio::test]
+    async fn a_smartlead_body_without_its_secret_is_refused() {
+        let Some((db, tenant, router)) = smartlead_harness().await else {
+            return;
+        };
+        let body =
+            br#"{"event_type":"EMAIL_UNSUBSCRIBED","sl_lead_email":"quiet@prospect.example"}"#;
+        let request = HttpRequest::post(format!("/v1/webhooks/{SMARTLEAD_PROVIDER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_vec()))
+            .expect("request");
+
+        let (status, _) = call(&router, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            stored(&db, tenant).await.is_empty(),
+            "une livraison sans credential a été mise en file"
+        );
     }
 
     fn payload(email_id: &str) -> Vec<u8> {
