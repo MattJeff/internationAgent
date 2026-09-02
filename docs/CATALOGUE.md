@@ -116,7 +116,7 @@ restaient s'est révélée fermée à la mesure.
 | **Netlify** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue** (2026-09-02). Reste l'app OAuth |
 | **Vercel** | — | — | ❌ **IMPOSSIBLE.** `token_endpoint_auth_methods_supported: ["none"]` — client public seulement, mur n°3 |
 | **Docker Hub** | — | — | ⏳ **TRAVAIL PRODUIT.** Serveur officiel réel, mais ni endpoint hébergé ni paquet publié : on clone et on compile |
-| **Smartlead** | — | — | ⏳ **TRAVAIL PRODUIT.** Bloqué par `OptOuts` : le serveur expose `unsubscribe_lead_globally` (écriture) **sans lecture en face** |
+| **Smartlead** | — | — | ⏳ **TRAVAIL PRODUIT.** `OptOuts::Pushed` — l'événement `EMAIL_UNSUBSCRIBED` existe. Manque le nom de l'en-tête de signature |
 | **Gmail** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste le client OAuth Web dans la Google Cloud Console |
 | **Google Drive** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Le même client Google |
 | **Google Calendar** | `Dial` + OAuth | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠ voir plus bas |
@@ -496,14 +496,8 @@ dans le commentaire de leur entrée, et se rejouent en deux `curl` :
   tourner ce serveur sur sa machine et branche son adresse — ce qui est
   exactement l'argument « SSH est un déploiement, pas un connecteur ».
 * **Smartlead** — bloqué par `OptOuts`, et c'est le cas d'école que le test
-  `a_sender` décrit depuis le début. Il faut `OptOuts::Pulled { from }` nommant
-  la lecture qui ramène les désabonnements. La clé du compte répond `401`, la
-  référence publique ne nomme aucun point d'entrée de liste de blocage, et la
-  liste d'outils du serveur MCP expose `unsubscribe_lead_globally` — une
-  **écriture, sans lecture en face**. On pourrait retirer quelqu'un de la liste
-  et ne jamais rapatrier ceux qui s'en sont retirés eux-mêmes.
-  **Ce qui débloque : une clé valide, un appel, et le nom du champ ou du chemin
-  qui liste les désabonnés.** Une ligne de code après ça.
+  `a_sender` décrit depuis le début. **La première lecture était fausse et elle
+  est corrigée ci-dessous.**
 
 ### Et « connecter un serveur » ?
 
@@ -514,3 +508,50 @@ catalogue refuse, c'est une variante `Ssh`, et l'argument tient en une phrase :
 une clé SSH est un droit d'exécuter *ce que le porteur décide*, il n'y a pas de
 serveur MCP au bout, et un programme que personne n'a écrit n'a aucune propriété
 vérifiable. Un allowlist d'un côté, un interpréteur de l'autre.
+
+
+---
+
+## Smartlead, la correction du 2026-09-02
+
+> « En abonnement payant Smartlead on a une API, c'est pas utilisable ? »
+
+Si, et la première conclusion écrite plus haut était fausse. Elle disait « une
+écriture sans lecture en face », parce que le serveur MCP expose
+`unsubscribe_lead_globally` sans rien qui liste les désabonnés, et parce que la
+référence publique ne documente aucun point d'entrée de liste de blocage.
+
+**Smartlead ne se tire pas, il pousse.** `api.smartlead.ai/core/webhooks` sert
+un catalogue d'événements qui contient **`EMAIL_UNSUBSCRIBED`** — à côté de
+`EMAIL_BOUNCED`, `EMAIL_REPLIED`, `EMAIL_OPENED`, `EMAIL_SENT`, `EMAIL_CLICKED`
+— enregistrables par `POST /webhooks`. C'est donc `OptOuts::Pushed { at }` et
+non `OptOuts::Pulled { from }` : la catégorie était la mauvaise, pas la
+plateforme.
+
+La même page documente la vérification : un **HMAC-SHA256 sur le corps brut**,
+comparé en temps constant (`hmac.compare_digest`). C'est le bon niveau
+d'exigence, et c'est ce que `routes::webhooks` sait déjà faire pour deux autres
+schémas.
+
+### Ce qui manque, et ce n'est plus une catégorie mais un nom
+
+1. **Le nom de l'en-tête de signature.** Le `provider` d'un endpoint choisit le
+   schéma dans `routes::webhooks`, et la page ne dit pas quel en-tête Smartlead
+   envoie. L'écrire au jugé donnerait soit des livraisons authentiques répondues
+   `401`, soit — bien pire — un vérificateur qui accepte ce qu'il ne devrait pas.
+2. **Une migration.** `webhook_endpoints_provider_is_wired` est contraint à
+   `('email', 'twilio')` ; la CHECK existe précisément pour qu'on ne puisse pas
+   enregistrer un handle qu'aucune ingestion ne lit.
+3. **L'ingestion** qui transforme un `EMAIL_UNSUBSCRIBED` en une ligne de
+   `suppressions` — laquelle désactive le **contact**, donc le téléphone tombe
+   avec le mail (`0011_revenue.sql`, `suppressions_deactivate_contacts`).
+
+### Ce qui débloque, dans l'ordre
+
+1. Une **clé d'API valide** — celle configurée répond `401`.
+2. **Une livraison réelle** vers une URL qu'on contrôle, et le nom de l'en-tête
+   lu dessus. C'est le seul fait qui ne s'obtient pas en lisant.
+3. Puis : la migration, le troisième schéma de signature, l'ingestion, l'entrée.
+   **Rien dans cette liste n'est incertain.**
+
+C'est un après-midi de travail, pas un mur. Le mur était une phrase fausse.

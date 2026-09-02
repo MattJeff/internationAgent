@@ -592,26 +592,86 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///
 /// * **Smartlead** — bloqué par [`OptOuts`], et c'est le cas d'école que le
 ///   test `a_sender` décrit. Ce serveur poste au nom du client vers des gens qui
-///   n'ont rien demandé, donc il lui faut `OptOuts::Pulled { from }` nommant la
-///   lecture qui ramène les désabonnements. Or : la clé d'API du compte répond
-///   `401` (donc pas de sondage en direct), la référence publique
-///   (`api.smartlead.ai/llms.txt`, `/core/leads`) ne nomme aucun point d'entrée
-///   de liste de blocage, et la liste d'outils du serveur MCP expose
-///   `unsubscribe_lead_globally` — **une écriture, sans lecture en face**. On
-///   pourrait donc retirer quelqu'un de la liste et jamais rapatrier ceux qui
-///   s'en sont retirés eux-mêmes. Ce qui débloque : une clé valide, un appel, et
-///   le nom du champ ou du chemin qui liste les désabonnés.
+///   n'ont rien demandé, donc il lui faut une variante d'[`OptOuts`] qui nomme
+///   par où les désabonnements rentrent.
+///
+///   **Première lecture, et elle était fausse.** On avait conclu « une écriture
+///   sans lecture en face » parce que la liste d'outils du serveur MCP expose
+///   `unsubscribe_lead_globally` sans rien qui liste les désabonnés, et parce
+///   que la référence publique ne documente aucun point d'entrée de liste de
+///   blocage. La conclusion ne tenait pas : Smartlead ne se **tire** pas, il
+///   **pousse**.
+///
+///   `api.smartlead.ai/core/webhooks` sert un catalogue d'événements qui
+///   contient `EMAIL_UNSUBSCRIBED` — à côté de `EMAIL_BOUNCED`, `EMAIL_REPLIED`,
+///   `EMAIL_SENT` — enregistrables par `POST /webhooks`. C'est donc
+///   [`OptOuts::Pushed`] et pas [`OptOuts::Pulled`], et la même page montre la
+///   vérification : un HMAC-SHA256 sur le corps brut, comparé en temps constant.
+///
+///   Ce qui manque n'est plus une catégorie, c'est **un nom** : le
+///   `provider` d'un endpoint choisit le schéma de signature dans
+///   `routes::webhooks`, et le nom de l'en-tête que Smartlead envoie n'est
+///   documenté nulle part sur cette page. L'écrire au jugé, ce serait soit des
+///   livraisons authentiques répondues `401`, soit — bien pire — un
+///   vérificateur qui accepte ce qu'il ne devrait pas.
+///
+///   Il reste aussi une migration : `webhook_endpoints_provider_is_wired` est
+///   contraint à `('email', 'twilio')`, et cette CHECK existe précisément pour
+///   qu'on ne puisse pas enregistrer un handle qu'aucune ingestion ne lit.
+///
+///   **Ce qui débloque, dans l'ordre : une clé d'API valide (celle du compte
+///   répond `401`), une livraison réelle vers une URL qu'on contrôle, et le nom
+///   de l'en-tête lu dessus.** Après ça : la migration, le troisième schéma de
+///   signature, l'ingestion qui écrit une ligne de `suppressions`, et l'entrée.
+///   Rien dans cette liste n'est incertain.
 ///
 /// * **Docker** — le serveur officiel (`github.com/docker/hub-mcp`) existe, mais
 ///   il n'a **ni endpoint hébergé ni paquet publié** : on clone et on compile.
 ///   `mcp.docker.com/.well-known/oauth-authorization-server` rend 404,
 ///   `hub-mcp.docker.com` ne résout pas. [`Provision::Host`] veut un
 ///   [`Package::spec`] que *ce binaire* nomme et qu'on accepte de faire tourner ;
-///   « clonez et compilez » n'est pas un spec, c'est un chantier. Ce qui
-///   débloque : Docker publie le paquet, ou nous en publions un et l'assumons.
-///   En attendant, le chemin qui marche aujourd'hui est [`CUSTOM`] — le client
-///   fait tourner ce serveur sur sa machine et branche son adresse, ce qui est
-///   exactement l'argument « SSH est un déploiement, pas un connecteur ».
+///   « clonez et compilez » n'est pas un spec, c'est un chantier.
+///
+///   **Rien ne nous empêche de le publier nous-mêmes** : `docker/hub-mcp` est
+///   sous Apache 2.0 (Docker, Inc., 2025), et le moteur lui-même est sous la
+///   même licence. La licence n'est pas le mur ; le mur est qu'on n'a encore
+///   rien publié. Et il faut distinguer les deux Docker qu'on nous demande :
+///
+///   1. **Docker Hub** — des dépôts d'images, des tags, des vulnérabilités.
+///      C'est ce que sert `hub-mcp`, et c'est une entrée `Host` ordinaire le
+///      jour où un paquet épinglé existe : `env: Some("HUB_PAT_TOKEN")`, rien
+///      de neuf sous le soleil.
+///   2. **Le démon Docker d'un serveur** — « est-ce que ça tourne, pourquoi
+///      c'est tombé, redémarre-le ». C'est ça qu'on veut vraiment dire par
+///      « connecter un serveur », et **c'est là que se pose la seule question
+///      qui compte.**
+///
+///   L'API du moteur est documentée et ouverte ; écrire un serveur MCP qui la
+///   parle est une journée de travail. Le piège est qu'un `POST
+///   /containers/{id}/exec`, ou un `run` sur une image que le client choisit,
+///   **est exactement l'interpréteur que [`Credential`] passe quatre-vingt-dix
+///   lignes à refuser sous le nom de SSH** — `docker run -v /:/host alpine sh`
+///   est root sur la machine, avec un autre chapeau. Un connecteur Docker qui
+///   expose `exec` n'est pas un connecteur, c'est une session.
+///
+///   Donc la décision, et elle est nôtre et pas celle de Docker : **on expose
+///   la moitié qui est une liste, jamais celle qui est un interpréteur.**
+///
+///   | Exposé | Refusé |
+///   |---|---|
+///   | lister les conteneurs, leur état, leurs journaux | `exec` sous toutes ses formes |
+///   | inspecter, lire les statistiques, suivre les événements | `create`/`run` avec une image que le client nomme |
+///   | démarrer, arrêter, redémarrer **un conteneur qui existe déjà, par son id** | tout montage hôte, `--privileged`, `network: host` |
+///   | lister les images présentes | `commit`, `push`, la suppression de volumes |
+///
+///   Cette moitié-là répond à ce qu'une équipe demande dix fois par jour et ne
+///   contient aucun verbe qui invente un programme. `floor` serait `Write` : un
+///   redémarrage se refait, il ne se perd pas.
+///
+///   En attendant qu'un paquet existe, le chemin qui marche **aujourd'hui** est
+///   [`CUSTOM`] — le client fait tourner ce serveur sur sa machine et branche
+///   son adresse, ce qui est exactement l'argument « SSH est un déploiement,
+///   pas un connecteur ».
 ///
 /// * **Vercel** — sondé, et refusé pour une raison mesurée :
 ///   `mcp.vercel.com/.well-known/oauth-authorization-server` annonce
