@@ -16,9 +16,14 @@ pub struct Compte {
 
 /// Un compte tel que `post_publish` en a besoin : avec son enveloppe.
 pub struct CompteScelle {
+    pub id: Uuid,
     pub platform: String,
     pub handle: String,
     pub sealed_token: Option<Vec<u8>>,
+    /// Le refresh token scellé, quand la plateforme en a émis un (X avec
+    /// `offline.access`). C'est lui qui permet au chemin de publication de
+    /// survivre à l'expiration du jeton d'accès sans re-consentement humain.
+    pub sealed_refresh: Option<Vec<u8>>,
 }
 
 /// Une ligne de social_posts, telle que les outils la rendent.
@@ -69,7 +74,7 @@ pub async fn compte_scelle(
     compte: Uuid,
 ) -> sqlx::Result<Option<CompteScelle>> {
     let ligne = sqlx::query(
-        "SELECT platform, handle, sealed_token FROM social_accounts \
+        "SELECT id, platform, handle, sealed_token, sealed_refresh FROM social_accounts \
          WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
@@ -77,9 +82,11 @@ pub async fn compte_scelle(
     .fetch_optional(pool)
     .await?;
     Ok(ligne.map(|l| CompteScelle {
+        id: l.get("id"),
         platform: l.get("platform"),
         handle: l.get("handle"),
         sealed_token: l.get("sealed_token"),
+        sealed_refresh: l.get("sealed_refresh"),
     }))
 }
 
@@ -110,6 +117,33 @@ pub async fn connecter_compte(
     .fetch_one(pool)
     .await?;
     Ok(ligne.get("id"))
+}
+
+/// Rescelle les jetons d'un compte après un rafraîchissement réussi.
+///
+/// `sealed_refresh` n'écrase l'ancien que s'il est `Some` : X fait tourner ses
+/// refresh tokens (la réponse en porte un nouveau) mais rien ne garantit qu'il
+/// en porte un à chaque fois — et perdre celui qu'on a contre un `NULL`
+/// coûterait un re-consentement humain. `COALESCE` dit exactement ça en SQL.
+pub async fn resceller_jetons(
+    pool: &PgPool,
+    tenant: Uuid,
+    compte: Uuid,
+    sealed_token: &[u8],
+    sealed_refresh: Option<&[u8]>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE social_accounts \
+         SET sealed_token = $3, sealed_refresh = COALESCE($4, sealed_refresh) \
+         WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(compte)
+    .bind(tenant)
+    .bind(sealed_token)
+    .bind(sealed_refresh)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Ce que la reclamation d'une cle d'idempotence peut donner.

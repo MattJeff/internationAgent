@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::adapters::Plateforme;
+use crate::adapters::{ErreurPlateforme, Plateforme};
 use crate::oauth_flux::{self, PlateformeOauth};
 use crate::store::{self, Reclamation};
 
@@ -428,7 +428,28 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
         }
     };
 
-    match adaptateur.publier(&jeton, &compte.handle, texte).await {
+    // Premier essai, puis UN rejeu si — et seulement si — la plateforme a dit
+    // 401 et qu'on tient de quoi rafraîchir. Un jeton d'accès X meurt en deux
+    // heures : sans ce chemin, chaque initiative quotidienne finirait en
+    // `plateforme_refus` et en re-consentement humain, alors que le refresh
+    // token dort scellé en base depuis la connexion. Un seul rejeu, jamais de
+    // boucle : si le jeton frais prend aussi un 401, le problème n'est pas
+    // l'expiration et le dire vaut mieux que retenter.
+    let resultat = adaptateur.publier(&jeton, &compte.handle, texte).await;
+    let resultat = match resultat {
+        Err(ErreurPlateforme::Refus { statut: 401 }) => {
+            match jeton_rafraichi(etat, tenant, &compte).await {
+                Some(frais) => adaptateur.publier(&frais, &compte.handle, texte).await,
+                // Rien à rafraîchir (pas de refresh token, pas de credentials
+                // client, ou la plateforme refuse le grant) : le 401 d'origine
+                // est la vérité, on le rend tel quel.
+                None => Err(ErreurPlateforme::Refus { statut: 401 }),
+            }
+        }
+        autre => autre,
+    };
+
+    match resultat {
         Ok(publie) => {
             store::marquer_publie(&etat.pool, id, &publie.id_plateforme, Some(&publie.url)).await?;
             Ok(json!({
@@ -441,6 +462,80 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
             Err(Erreur::nouvelle(e.code(), e.to_string()))
         }
     }
+}
+
+/// Tente un rafraîchissement et rend le jeton d'accès frais, ou `None` si le
+/// chemin n'existe pas pour ce compte. `None` et pas une erreur : l'appelant
+/// tient déjà la bonne erreur — le 401 d'origine — et rien ici ne doit la
+/// maquiller en autre chose.
+///
+/// Le nouveau jeton est rescellé AVANT d'être rendu : si l'écriture échoue, on
+/// préfère rendre `None` et laisser le 401 d'origine sortir plutôt que publier
+/// avec un jeton que la base ne connaît pas — au tour suivant, le jeton scellé
+/// serait redevenu le mort, et le symptôme un 401 sur deux, indiagnosticable.
+async fn jeton_rafraichi(
+    etat: &Etat,
+    tenant: Uuid,
+    compte: &store::CompteScelle,
+) -> Option<Secret> {
+    let scelle = compte.sealed_refresh.as_deref()?;
+    let (plateforme, credentiels) = etat.oauth(&compte.platform)?;
+    let tenant_id = TenantId::from_uuid(tenant);
+
+    let rafraichissement = oauth_flux::ouvrir_rafraichissement(
+        &etat.chiffreur,
+        tenant_id,
+        &compte.platform,
+        &compte.handle,
+        scelle,
+    )
+    .ok()?;
+
+    let emis = oauth_flux::rafraichir(
+        plateforme,
+        &credentiels.client_id,
+        &credentiels.client_secret,
+        &rafraichissement,
+    )
+    .await
+    .ok()?;
+
+    let sealed_token = oauth_flux::sceller_jeton(
+        &etat.chiffreur,
+        tenant_id,
+        &compte.platform,
+        &compte.handle,
+        &emis.acces,
+    )
+    .ok()?;
+    // X fait tourner ses refresh tokens : quand la réponse en porte un
+    // nouveau, l'ancien est dépensé et le garder serait garder un mort.
+    // Quand elle n'en porte pas, `resceller_jetons` conserve l'existant
+    // (COALESCE) — on ne troque jamais un jeton vivant contre un NULL.
+    let sealed_refresh = match &emis.rafraichissement {
+        Some(neuf) => Some(
+            oauth_flux::sceller_rafraichissement(
+                &etat.chiffreur,
+                tenant_id,
+                &compte.platform,
+                &compte.handle,
+                neuf,
+            )
+            .ok()?,
+        ),
+        None => None,
+    };
+    store::resceller_jetons(
+        &etat.pool,
+        tenant,
+        compte.id,
+        &sealed_token,
+        sealed_refresh.as_deref(),
+    )
+    .await
+    .ok()?;
+
+    Some(emis.acces)
 }
 
 async fn metriques(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
@@ -626,6 +721,8 @@ mod tests {
     /// compteur le dit.
     struct Faux {
         publications: Arc<AtomicUsize>,
+        /// `true` : chaque `publier` rend un 401, comme un jeton d'accès mort.
+        jeton_mort: bool,
     }
 
     #[async_trait]
@@ -654,6 +751,9 @@ mod tests {
             );
             assert_eq!(handle, "agent_test", "le handle du compte doit voyager");
             self.publications.fetch_add(1, Ordering::SeqCst);
+            if self.jeton_mort {
+                return Err(ErreurPlateforme::Refus { statut: 401 });
+            }
             Ok(Publication {
                 id_plateforme: "faux-123".into(),
                 url: "https://x.com/agent_test/status/faux-123".into(),
@@ -704,6 +804,7 @@ mod tests {
             chiffreur,
             adaptateurs: vec![Box::new(Faux {
                 publications: publications.clone(),
+                jeton_mort: false,
             })],
             url_publique: "http://127.0.0.1:0".into(),
             oauth_x: None,
@@ -766,6 +867,47 @@ mod tests {
         assert!(err3, "{trois}");
         assert_eq!(trois["erreur"], "cle_reutilisee");
         assert_eq!(publications.load(Ordering::SeqCst), 1);
+    }
+
+    /// Le 401 sans matériel de rafraîchissement : la vérité sort telle quelle.
+    ///
+    /// Le compte n'a pas de refresh token et l'Etat n'a pas de credentials
+    /// client — les deux raisons pour lesquelles `jeton_rafraichi` rend `None`.
+    /// Ce qui se vérifie : l'erreur rendue est bien le `plateforme_refus`
+    /// d'origine (pas un `descellement` ni un mot inventé par le chemin de
+    /// refresh), il n'y a eu qu'UN appel plateforme (pas de rejeu aveugle ni de
+    /// boucle), et le post est `failed` — donc la clé d'idempotence est
+    /// re-réclamable, ce que le second appel prouve en repartant de zéro.
+    #[tokio::test]
+    async fn un_401_sans_refresh_rend_le_refus_d_origine_et_un_seul_appel() {
+        let Some((mut etat, tenant, compte, publications)) = etat_de_test().await else {
+            return;
+        };
+        etat.adaptateurs = vec![Box::new(Faux {
+            publications: publications.clone(),
+            jeton_mort: true,
+        })];
+        let args = json!({
+            "idempotency_key": "tour-mort",
+            "account_id": compte.to_string(),
+            "text": "Bonjour le monde"
+        });
+
+        let (err, corps) = appel(&etat, tenant, "post_publish", args.clone()).await;
+        assert!(err, "{corps}");
+        // Le champ s'appelle `erreur` dans le corps rendu — c'est la forme
+        // que `Erreur` serialise, pas une convention a moi.
+        assert_eq!(corps["erreur"], "plateforme_refus", "{corps}");
+        assert_eq!(
+            publications.load(Ordering::SeqCst),
+            1,
+            "un 401 sans refresh ne doit produire aucun rejeu"
+        );
+
+        // La clé se re-réclame : l'échec a marqué 'failed', pas 'en vol'.
+        let (err2, corps2) = appel(&etat, tenant, "post_publish", args).await;
+        assert!(err2, "{corps2}");
+        assert_eq!(publications.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

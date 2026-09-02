@@ -172,10 +172,9 @@ pub fn sceller_jeton(
         .map(|env| env.to_bytes())
 }
 
-/// Scelle le refresh token de X sous son AAD propre. Pas d'ouvreur encore :
-/// il naîtra avec le câblage de [`rafraichir`] dans le chemin de publication
-/// — on garde le jeton (le perdre coûterait un re-consentement humain), on ne
-/// prétend pas déjà s'en servir.
+/// Scelle le refresh token de X sous son AAD propre. L'ouvreur est
+/// [`ouvrir_rafraichissement`], et le seul appelant des deux est le chemin de
+/// publication : perdre ce jeton coûterait un re-consentement humain.
 pub fn sceller_rafraichissement(
     chiffre: &LocalEnvelopeSecretStore,
     tenant: TenantId,
@@ -190,6 +189,23 @@ pub fn sceller_rafraichissement(
             jeton,
         )
         .map(|env| env.to_bytes())
+}
+
+/// L'autre moitié de [`sceller_rafraichissement`]. AAD séparée exprès : un
+/// refresh token déplacé dans la case d'un jeton d'accès ne s'ouvre pas.
+pub fn ouvrir_rafraichissement(
+    chiffre: &LocalEnvelopeSecretStore,
+    tenant: TenantId,
+    plateforme: &str,
+    compte: &str,
+    scelle: &[u8],
+) -> Result<Secret, ProviderError> {
+    let envelope = Envelope::from_bytes(scelle)?;
+    chiffre.open_in(
+        tenant,
+        &contexte_rafraichissement(tenant, plateforme, compte),
+        &envelope,
+    )
 }
 
 /// L'autre moitié de [`sceller_jeton`].
@@ -728,5 +744,28 @@ mod tests {
             sceller_rafraichissement(&chiffre, tenant(), "x", "orizn", &Secret::new("refresh"))
                 .expect("scellement");
         assert!(ouvrir_jeton(&chiffre, tenant(), "x", "orizn", &scelle).is_err());
+    }
+
+    /// Les deux AAD sont des cases étanches : un refresh token scellé ne
+    /// s'ouvre pas comme un jeton d'accès, et réciproquement. C'est la
+    /// propriété qui rend `sceller_rafraichissement`/`ouvrir_rafraichissement`
+    /// sûrs à câbler dans le chemin de publication — un octet rangé dans la
+    /// mauvaise colonne échoue bruyamment au lieu de servir.
+    #[test]
+    fn le_refresh_scelle_ne_s_ouvre_que_dans_sa_case() {
+        let chiffre = LocalEnvelopeSecretStore::new(Sha256::digest("clef-de-test").into());
+        let tenant = TenantId::from_uuid(uuid::Uuid::now_v7());
+        let secret = Secret::new("refresh-vivant");
+
+        let scelle =
+            sceller_rafraichissement(&chiffre, tenant, "x", "agent_test", &secret).unwrap();
+
+        let ouvert = ouvrir_rafraichissement(&chiffre, tenant, "x", "agent_test", &scelle).unwrap();
+        assert_eq!(ouvert.expose_for_transport(), "refresh-vivant");
+
+        // La case d'a cote refuse.
+        assert!(ouvrir_jeton(&chiffre, tenant, "x", "agent_test", &scelle).is_err());
+        // Et un autre compte du meme tenant refuse aussi : le handle est dans l'AAD.
+        assert!(ouvrir_rafraichissement(&chiffre, tenant, "x", "autre", &scelle).is_err());
     }
 }
