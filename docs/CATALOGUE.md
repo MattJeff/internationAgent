@@ -112,6 +112,11 @@ restaient s'est révélée fermée à la mesure.
 | Connecteur | Forme | Plancher | État |
 |---|---|---|---|
 | **GitHub** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste à créer l'OAuth App et poser `AGENTOS_OAUTH_CLIENTS` |
+| **Sentry** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue** (2026-09-02). Reste l'app OAuth. ⚠ pas de portée en lecture seule — voir plus bas |
+| **Netlify** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue** (2026-09-02). Reste l'app OAuth |
+| **Vercel** | — | — | ❌ **IMPOSSIBLE.** `token_endpoint_auth_methods_supported: ["none"]` — client public seulement, mur n°3 |
+| **Docker Hub** | — | — | ⏳ **TRAVAIL PRODUIT.** Serveur officiel réel, mais ni endpoint hébergé ni paquet publié : on clone et on compile |
+| **Smartlead** | — | — | ⏳ **TRAVAIL PRODUIT.** Bloqué par `OptOuts` : le serveur expose `unsubscribe_lead_globally` (écriture) **sans lecture en face** |
 | **Gmail** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Reste le client OAuth Web dans la Google Cloud Console |
 | **Google Drive** | `Dial` + OAuth | `Write` | ✅ **dans le catalogue.** Le même client Google |
 | **Google Calendar** | `Dial` + OAuth | `Destructive` | ✅ **dans le catalogue**, débloqué par `OptOuts::HeldHere` — ⚠ voir plus bas |
@@ -452,3 +457,60 @@ Elles ne bloquent rien d'urgent, mais elles reviendront.
    n'est pas une table par outil ici — l'argument contre est dans les docs du
    module — c'est une **seconde entrée sur un endpoint en lecture seule**, comme
    `linear-readonly`, quand le fournisseur en publie un.
+
+
+---
+
+## L'ajout du 2026-09-02 — deux entrées, trois refus
+
+Demande : Smartlead, plus « un GitHub, un serveur et un Docker » pour qu'une
+équipe de développeurs puisse travailler.
+
+**GitHub y était déjà**, avec ses portées choisies et non recopiées : `repo`,
+`read:org`, `read:user`, et ni `delete_repo` ni `workflow`.
+
+**Deux sont entrés**, tous deux sondés en direct — les requêtes sont recopiées
+dans le commentaire de leur entrée, et se rejouent en deux `curl` :
+
+* **Sentry** — `https://mcp.sentry.dev/mcp`. Les erreurs en production : ce qui
+  casse, où, depuis quand. Un point désagréable est écrit dans l'entrée plutôt
+  qu'annoncé plus doucement : Sentry n'expose **aucune portée de lecture seule pour un projet**
+  (`org:read` est la seule lecture pure), donc on ne peut pas promettre un
+  employé qui regarde sans toucher. Le plancher est `Write` en conséquence.
+* **Netlify** — `https://mcp.netlify.com/mcp`. Les sites, les déploiements et
+  leurs variables. Trois portées sur quatre : `claudeai` est écartée parce que
+  c'est une portée nommée d'après un client et non d'après un droit, et qu'une
+  limite dont on ne sait pas dire ce qu'elle autorise n'est pas une limite.
+
+**Trois sont refusés, et la raison de chacun est un fait, pas un avis :**
+
+* **Vercel** — le mur n°3, mesuré. Son document RFC 8414 annonce
+  `token_endpoint_auth_methods_supported: ["none"]` et rien d'autre : client
+  public, PKCE seul. Netlify annonce `client_secret_post` en plus ; c'est toute
+  la différence entre les deux, et c'est pour ça qu'il y en a un dans la liste.
+* **Docker Hub** — `github.com/docker/hub-mcp` est bien le serveur officiel,
+  mais il n'a ni endpoint hébergé (`mcp.docker.com` → 404, `hub-mcp.docker.com`
+  ne résout pas) ni paquet publié : on clone et on compile. `Provision::Host`
+  veut un `Package::spec` que le binaire nomme ; « clonez et compilez » n'est pas
+  un spec. **Le chemin qui marche aujourd'hui est `CUSTOM`** : le client fait
+  tourner ce serveur sur sa machine et branche son adresse — ce qui est
+  exactement l'argument « SSH est un déploiement, pas un connecteur ».
+* **Smartlead** — bloqué par `OptOuts`, et c'est le cas d'école que le test
+  `a_sender` décrit depuis le début. Il faut `OptOuts::Pulled { from }` nommant
+  la lecture qui ramène les désabonnements. La clé du compte répond `401`, la
+  référence publique ne nomme aucun point d'entrée de liste de blocage, et la
+  liste d'outils du serveur MCP expose `unsubscribe_lead_globally` — une
+  **écriture, sans lecture en face**. On pourrait retirer quelqu'un de la liste
+  et ne jamais rapatrier ceux qui s'en sont retirés eux-mêmes.
+  **Ce qui débloque : une clé valide, un appel, et le nom du champ ou du chemin
+  qui liste les désabonnés.** Une ligne de code après ça.
+
+### Et « connecter un serveur » ?
+
+C'est déjà là, et ça s'appelle `CUSTOM`. Le client fait tourner un serveur MCP
+sur sa machine — la sienne, ou l'une des nombreuses qui en hébergent — et colle
+son adresse ; `Reach::Private` existe pour le cas du sidecar. Ce que le
+catalogue refuse, c'est une variante `Ssh`, et l'argument tient en une phrase :
+une clé SSH est un droit d'exécuter *ce que le porteur décide*, il n'y a pas de
+serveur MCP au bout, et un programme que personne n'a écrit n'a aucune propriété
+vérifiable. Un allowlist d'un côté, un interpréteur de l'autre.
