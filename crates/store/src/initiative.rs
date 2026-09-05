@@ -591,6 +591,30 @@ pub async fn record_outcome(
     Ok(())
 }
 
+/// Every seat of this tenant sleeps until `until`, unless it was already going
+/// to sleep longer.
+///
+/// The subscription's ceiling is the tenant's, not the seat's: the first seat to
+/// hit it would otherwise be followed by every other one, each spawning a CLI to
+/// be told the same hour. `GREATEST` keeps a later cadence where there is one,
+/// and the tenant is the transaction's own, by RLS. Returns how many seats moved.
+pub async fn sleep_until(
+    tx: &mut TenantTx<'_>,
+    until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    let moved = sqlx::query(
+        "UPDATE employee_initiative \
+            SET next_at = $1, updated_at = $2 \
+          WHERE next_at < $1",
+    )
+    .bind(until)
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(moved.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -746,6 +770,39 @@ mod tests {
             .expect("set");
         tx.commit().await.expect("commit");
         id
+    }
+
+    // -- sleep_until -------------------------------------------------------
+
+    /// The ceiling is the tenant's: both of its seats sleep until the hour,
+    /// a third tenant's seat does not, and a second call moves nothing.
+    #[tokio::test]
+    async fn a_ceiling_puts_every_seat_of_the_tenant_to_sleep_and_only_delays() {
+        let Some(db) = db().await else { return };
+        let _guard = INITIATIVE_LOCK.lock().await;
+        let tenant = seed_tenant(&db, "ceiling").await;
+        let other = seed_tenant(&db, "ceiling-other").await;
+        let a = seed_due(&db, tenant, "a", Lifecycle::Active).await;
+        let b = seed_due(&db, tenant, "b", Lifecycle::Active).await;
+        let c = seed_due(&db, other, "c", Lifecycle::Active).await;
+        let until = at(T0 + 5 * HOUR as i64);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert_eq!(sleep_until(&mut tx, until, at(T0)).await.expect("sleep"), 2);
+        assert_eq!(sleep_until(&mut tx, until, at(T0)).await.expect("sleep"), 0);
+        assert_eq!(get(&mut tx, a).await.expect("get").next_at, until);
+        assert_eq!(get(&mut tx, b).await.expect("get").next_at, until);
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(other).await.expect("tenant tx");
+        assert!(
+            get(&mut tx, c).await.expect("get").next_at < until,
+            "another tenant's seat is not asleep"
+        );
+        tx.commit().await.expect("commit");
+
+        drop_tenant(&db, tenant).await;
+        drop_tenant(&db, other).await;
     }
 
     // -- set and get -------------------------------------------------------

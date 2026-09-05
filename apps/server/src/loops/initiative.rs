@@ -165,7 +165,7 @@ use agentos_store::model_access::Connection;
 use agentos_store::model_usage::{self, Consumed};
 use agentos_store::policy as policy_store;
 use agentos_store::turns;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -1351,6 +1351,42 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
                 tx.commit()
                     .await
                     .map_err(|err| format!("could not commit the failed turn's tokens: {err}"))?;
+            }
+            // The subscription's ceiling is the company's, and the CLI said
+            // when it lifts. Every seat of this tenant sleeps until then:
+            // otherwise each cadence tick spawns a binary to be told the same
+            // hour, and the diary fills with `error`. Nothing is lost by
+            // sleeping — a seat's work lives on the board and in its threads,
+            // so the first tick after the reset picks it up where the ceiling
+            // stopped it. The hour goes in the detail, which is what the
+            // founder's diary reads.
+            if let Some(retry_after) = failed.error.retry_after() {
+                let until = Utc::now()
+                    + TimeDelta::from_std(retry_after).unwrap_or_else(|_| TimeDelta::hours(5));
+                let slept = async {
+                    let mut tx = db.tenant_tx(due.tenant_id).await?;
+                    let seats = initiative::sleep_until(&mut tx, until, Utc::now()).await?;
+                    tx.commit().await?;
+                    Ok::<u64, StoreError>(seats)
+                }
+                .await;
+                match slept {
+                    Ok(seats) => tracing::warn!(
+                        tenant_id = %due.tenant_id.as_uuid(),
+                        seats,
+                        %until,
+                        "the subscription's ceiling: every seat sleeps until it lifts"
+                    ),
+                    Err(err) => tracing::error!(
+                        error = %err,
+                        "the subscription's ceiling, and the seats could not be put to sleep"
+                    ),
+                }
+                return Err(format!(
+                    "rate limited by the subscription until {}; every seat of this company \
+                     sleeps until then",
+                    until.to_rfc3339_opts(SecondsFormat::Secs, true)
+                ));
             }
             return Err(failed.error.code().to_owned());
         }
