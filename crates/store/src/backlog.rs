@@ -32,7 +32,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 
-use agentos_domain::ids::{EmployeeId, WorkItemId};
+use agentos_domain::ids::{ConversationId, EmployeeId, WorkItemId};
 
 use crate::db::{StoreError, TenantTx};
 
@@ -56,6 +56,10 @@ pub struct Item {
     /// `migrations/0064_work_items_posted_by.sql` for why that is the honest
     /// value rather than a uuid somebody invented.
     pub posted_by: Option<EmployeeId>,
+    /// The thread that opened it, when a third party's message did. `None` is
+    /// an item somebody typed — see `migrations/0080` for why this column is
+    /// also the record of that.
+    pub conversation_id: Option<ConversationId>,
     /// When it stopped being work. `None` is open.
     pub closed_at: Option<DateTime<Utc>>,
     /// When it was written down.
@@ -81,7 +85,8 @@ pub const MAX_TITLE: usize = 200;
 /// constants of this module. Nothing a caller passes reaches the string — every
 /// value is a bind parameter — so there is no input for an injection to arrive
 /// on.
-const COLUMNS: &str = "id, title, assignee_id, ordinal, posted_by, closed_at, created_at";
+const COLUMNS: &str =
+    "id, title, assignee_id, ordinal, posted_by, conversation_id, closed_at, created_at";
 
 /// The founder's ranking. See the module docs for why it is written once.
 const ORDER: &str = "ORDER BY ordinal ASC NULLS LAST, created_at ASC";
@@ -98,6 +103,9 @@ fn row_of(row: &sqlx::postgres::PgRow) -> Item {
         posted_by: row
             .get::<Option<uuid::Uuid>, _>("posted_by")
             .map(EmployeeId::from_uuid),
+        conversation_id: row
+            .get::<Option<uuid::Uuid>, _>("conversation_id")
+            .map(ConversationId::from_uuid),
         closed_at: row.get("closed_at"),
         created_at: row.get("created_at"),
     }
@@ -161,6 +169,49 @@ pub async fn post(
     .await?
     .ok_or(StoreError::NotFound)?;
     Ok(row_of(&row))
+}
+
+/// Open one item for a thread a third party wrote in on, unless one is open.
+///
+/// `None` is "the thread already has an open item, the message joins it" —
+/// not an error, the mechanism working. `Some` is the item this call opened,
+/// which is also what a thread whose last item was closed gets: "dealt with"
+/// was said about the thread as it was then, and a new message is new work.
+///
+/// Both answers come from `work_items_one_open_per_conversation`
+/// (`migrations/0080`) and not from a `SELECT` before the `INSERT`, because
+/// two pollers landing two messages of one thread at once would both pass the
+/// `SELECT`; `ON CONFLICT … DO NOTHING` serialises on the index instead.
+///
+/// `posted_by` is null: no employee took a turn to file this. `0080` says why
+/// the thread is the honest author and how a reader tells the two nulls apart.
+///
+/// `EXISTS` on the assignee for [`post`]'s reason. Its silence is folded into
+/// `None` — an assignee that is not this company's does not get a ticket
+/// either — which is right for the one caller, `inbound::land`, whose
+/// employee was resolved inside this same tenant transaction.
+pub async fn open_ticket(
+    tx: &mut TenantTx<'_>,
+    id: WorkItemId,
+    title: &str,
+    assignee: EmployeeId,
+    conversation: ConversationId,
+) -> Result<Option<Item>, StoreError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO work_items (id, tenant_id, title, assignee_id, conversation_id) \
+         SELECT $1, $2, $3, $4, $5 \
+          WHERE EXISTS (SELECT 1 FROM employees WHERE id = $4) \
+         ON CONFLICT (tenant_id, conversation_id) WHERE closed_at IS NULL DO NOTHING \
+         RETURNING {COLUMNS}"
+    )))
+    .bind(id.as_uuid())
+    .bind(tx.tenant_id().as_uuid())
+    .bind(title)
+    .bind(assignee.as_uuid())
+    .bind(conversation.as_uuid())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    Ok(row.as_ref().map(row_of))
 }
 
 /// Every item on this company's board, open and closed, in the founder's order.
@@ -1146,6 +1197,58 @@ mod tests {
         assert!(
             !claim(&mut tx, item.id, bob).await.expect("claim"),
             "nor claimable: `closed_at IS NULL` is in the claim's WHERE beside the assignee"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// `work_items_one_open_per_conversation` (0080), through the one function
+    /// that writes against it: a thread opens one item, keeps one while it is
+    /// open, and gets a fresh one once the first is closed.
+    #[tokio::test]
+    async fn a_thread_holds_one_open_ticket_at_a_time() {
+        let Some((db, tenant, _)) = fixture().await else {
+            return;
+        };
+        let ada = seed_employee(&db, tenant, "ada-ticket").await;
+        let now = Utc::now().trunc_subsecs(6);
+        let thread = ConversationId::new_v7(now);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO conversations (id, tenant_id, employee_id, channel, external_ref) \
+             VALUES ($1, $2, $3, 'email', 'ap@supplier.example')",
+        )
+        .bind(thread.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(ada.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("a thread");
+
+        let first = open_ticket(&mut tx, WorkItemId::new_v7(now), "email · a…", ada, thread)
+            .await
+            .expect("open")
+            .expect("the first message opens a ticket");
+        assert_eq!(first.conversation_id, Some(thread));
+        assert_eq!(first.assignee_id, Some(ada));
+        assert_eq!(first.posted_by, None, "no employee filed this");
+        assert!(
+            open_ticket(&mut tx, WorkItemId::new_v7(now), "email · a…", ada, thread)
+                .await
+                .expect("open")
+                .is_none(),
+            "the second message joins the open ticket"
+        );
+        assert!(close(&mut tx, first.id, ada, now).await.expect("close"));
+        let again = open_ticket(&mut tx, WorkItemId::new_v7(now), "email · a…", ada, thread)
+            .await
+            .expect("open")
+            .expect("a message after the close is new work");
+        assert_ne!(again.id, first.id);
+        assert_eq!(
+            open_for(&mut tx, ada).await.expect("board").len(),
+            1,
+            "one open, one closed, on the same thread"
         );
         tx.rollback().await.expect("rollback");
     }

@@ -363,7 +363,7 @@ use std::collections::HashSet;
 
 use agentos_domain::action::{ActionKind, E164, EmailAddress};
 use agentos_domain::employee::Step;
-use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, TenantId};
+use agentos_domain::ids::{ConversationId, EmployeeId, IdempotencyKey, Slug, TenantId, WorkItemId};
 use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
@@ -372,6 +372,7 @@ use agentos_providers::email::{
 };
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
+use agentos_store::backlog;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::org;
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
@@ -2016,6 +2017,43 @@ pub fn contact_of(from: &Untrusted<String>) -> String {
         .collect()
 }
 
+/// The one line a ticket opened by [`land`] carries onto the board.
+///
+/// `email · a…@supplier.example · 2026-09-05`, or `sms · +336…678 · …`. The
+/// channel and the date are ours; the contact is [`contact_of`]'s parsed
+/// identifier, masked so that the part a stranger chooses freely — a local
+/// part, the middle of a number — never reaches the board whole. Never the
+/// subject and never the body: those are the sender's words, and this title is
+/// read by a human on `GET /v1/work` and by a model in a brief.
+///
+/// Bounded to [`backlog::MAX_TITLE`] characters, because a contact may be
+/// [`MAX_CONTACT`] and the CHECK is on characters; control characters are
+/// dropped because a title is one line by definition.
+pub fn ticket_title(channel: Channel, contact: &str, now: DateTime<Utc>) -> String {
+    let masked = match contact.split_once('@') {
+        Some((local, domain)) => {
+            let first: String = local.chars().take(1).collect();
+            format!("{first}…@{domain}")
+        }
+        None => {
+            let chars: Vec<char> = contact.chars().collect();
+            match chars.len() > 6 {
+                true => format!(
+                    "{}…{}",
+                    chars[..3].iter().collect::<String>(),
+                    chars[chars.len() - 3..].iter().collect::<String>()
+                ),
+                false => contact.to_owned(),
+            }
+        }
+    };
+    format!("{channel} · {masked} · {}", now.format("%Y-%m-%d"))
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(backlog::MAX_TITLE)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
@@ -2545,6 +2583,43 @@ pub async fn land(
     )
     .await?;
 
+    // **Where a message becomes a ticket.** A third party wrote to this
+    // employee, so something is on its board until it says the thread is dealt
+    // with — in this transaction, so the message and the ticket commit
+    // together, which is the whole of "no inbound message is lost". One open
+    // item per thread, by the index `migrations/0080` adds and not by a
+    // `SELECT`: `None` is the message joining the item already open.
+    //
+    // Third parties only. The internal channel never reaches `land` — `send`
+    // is its own path — and an A2A peer or the console is a colleague or an
+    // operator, not a customer waiting on an answer. `Voice` is listed because
+    // a call from a stranger is the same promise, the day one lands here.
+    //
+    // The title carries nothing the sender chose whole: the channel, the
+    // counterparty masked to a first character and a domain, and the date.
+    // `Untrusted` has no `Display` for the reason this line respects it — a
+    // subject is the sender's words, and a title goes into a brief.
+    let ticket = match (message.direction, message.channel) {
+        (
+            Direction::Inbound,
+            Channel::Email | Channel::Sms | Channel::Whatsapp | Channel::Voice,
+        ) => {
+            backlog::open_ticket(
+                tx,
+                WorkItemId::new_v7(now),
+                &ticket_title(message.channel, &contact_of(&message.from), now),
+                message.employee_id,
+                message.conversation_id,
+            )
+            .await?
+        }
+        _ => None,
+    };
+
+    // `work_item` rides on the receipt rather than on a row of its own:
+    // nothing ruled on anything (`0064` refuses an audit row for a post), and
+    // the actor stays `system`, so `routes::autonomy` counts a ticket the
+    // landing opened against nobody's initiative.
     audit::append(
         tx,
         &AuditEvent {
@@ -2554,6 +2629,7 @@ pub async fn land(
                 "channel": message.channel.as_str(),
                 "message_id": message_id,
                 "from": contact_of(&message.from),
+                "work_item": ticket.as_ref().map(|item| item.id.as_uuid()),
             }),
             ..AuditEvent::new(AuditActor::System, AuditKind::MessageReceived, now)
         },
@@ -5622,6 +5698,145 @@ mod tests {
             "two contacts, two threads"
         );
         assert_eq!(turns(&db, tenant).await, 3);
+    }
+
+    // -- the ticket ---------------------------------------------------------
+
+    /// The board as one company sees it, every row.
+    async fn board_of(db: &Db, tenant: TenantId) -> Vec<agentos_store::backlog::Item> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let all = backlog::board(&mut tx).await.expect("board");
+        tx.rollback().await.expect("rollback");
+        all
+    }
+
+    /// A stranger's email is a ticket on the employee's board; the thread holds
+    /// one open ticket however many messages arrive; a ticket the employee
+    /// closed is reopened by the next message; and nothing the sender wrote is
+    /// in the title.
+    #[tokio::test]
+    async fn an_inbound_email_is_one_open_ticket_per_thread() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        /// One more email from the same supplier, landed.
+        async fn send(
+            db: &Db,
+            email: &MockEmailProvider,
+            tenant: TenantId,
+            id: &str,
+            now: DateTime<Utc>,
+        ) -> Landed {
+            email.seed_inbound(raw(id, now, Duration::hours(1)), []);
+            deliver(db, email, tenant, &notice(id, now), now)
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e}"))
+        }
+
+        let first = send(&db, &email, tenant, "tkt_1", now).await;
+        let items = board_of(&db, tenant).await;
+        assert_eq!(items.len(), 1, "one email, one ticket: {items:?}");
+        let ticket = &items[0];
+        assert_eq!(ticket.assignee_id, Some(lena));
+        assert_eq!(ticket.conversation_id, Some(first.conversation_id));
+        assert_eq!(ticket.posted_by, None, "no employee took a turn to file it");
+        assert_eq!(
+            ticket.title,
+            format!("email · a…@supplier.example · {}", now.format("%Y-%m-%d")),
+            "channel, masked contact, date — and not one word of the sender's"
+        );
+        assert!(!ticket.title.contains("PO-4471") && !ticket.title.contains("wire"));
+
+        let second = send(&db, &email, tenant, "tkt_2", now).await;
+        assert_eq!(second.conversation_id, first.conversation_id);
+        assert_eq!(
+            board_of(&db, tenant).await.len(),
+            1,
+            "the second message joins the open ticket"
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            backlog::close(&mut tx, ticket.id, lena, now)
+                .await
+                .expect("close")
+        );
+        tx.commit().await.expect("commit the close");
+
+        send(&db, &email, tenant, "tkt_3", now).await;
+        let items = board_of(&db, tenant).await;
+        assert_eq!(
+            items.len(),
+            2,
+            "a closed thread that is written to again is new work"
+        );
+        assert_eq!(
+            items.iter().filter(|i| i.closed_at.is_none()).count(),
+            1,
+            "…and still one open"
+        );
+
+        // The receipt names the ticket, under a `system` actor — never the
+        // employee's own initiative.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let trail = agentos_store::audit::trail_for_employee(&mut tx, lena, 100)
+            .await
+            .expect("trail");
+        tx.rollback().await.expect("rollback");
+        let receipts: Vec<_> = trail
+            .iter()
+            .filter(|row| row.action_kind == "message_received")
+            .collect();
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts.iter().all(|row| row.actor == "system"));
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|row| !row.payload["work_item"].is_null())
+                .count(),
+            2,
+            "two receipts opened a ticket, the middle one joined: {receipts:?}"
+        );
+    }
+
+    /// A colleague's message is not a customer waiting, and a tenant's tickets
+    /// are its own.
+    #[tokio::test]
+    async fn an_internal_message_opens_no_ticket_and_another_tenant_sees_none() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, _bruno) = company(&db, 5).await;
+        say(
+            &db,
+            tenant,
+            lena,
+            "bruno",
+            Errand::Order,
+            "chase the tariff code",
+            TrustLabel::Trusted,
+            None,
+            "no-ticket",
+        )
+        .await
+        .expect("an order lands");
+        assert!(
+            board_of(&db, tenant).await.is_empty(),
+            "an internal message is not a ticket"
+        );
+
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        email.seed_inbound(raw("tkt_b", now, Duration::hours(1)), []);
+        deliver(&db, &email, tenant, &notice("tkt_b", now), now)
+            .await
+            .expect("lands");
+        assert_eq!(board_of(&db, tenant).await.len(), 1);
+
+        let (other, _) = seed(&db).await;
+        assert!(
+            board_of(&db, other).await.is_empty(),
+            "tenant B's board has none of A's tickets"
+        );
     }
 
     /// A webhook for an address nobody owns is refused before anything is
