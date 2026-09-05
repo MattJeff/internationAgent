@@ -193,7 +193,14 @@ You are not deciding anything. Every value you write is checked against the \
 same parsers the person's own typing would go through, and one they refuse \
 throws away the whole object and puts the question back to them. A country is \
 a two-letter ISO-3166 code, a currency a three-letter ISO-4217 code, a price \
-is minor units plus that currency, and a count is a positive whole number.";
+is minor units plus that currency, and a count is a positive whole number.
+
+Whether the answer is a good one is not your call either: whether the named \
+accounts fit the segment, whether the number is realistic, whether the plan \
+makes sense — the person who employs you decided that, and leaving a key out \
+because you disagree is inventing a refusal. The only thing you may leave out \
+is a value that is not an answer to the question at all. Never reply with \
+prose instead of the object.";
 
 /// Everything this route needs beyond the database.
 ///
@@ -496,6 +503,16 @@ fn apply(
             (None, refused)
         }
     }
+}
+
+/// The first 300 characters of what the model said, for a refusal the founder
+/// reads. Whole characters, not bytes: a cut inside an accent is a panic.
+fn excerpt(reply: &str) -> String {
+    let mut out: String = reply.chars().take(300).collect();
+    if reply.chars().count() > 300 {
+        out.push('…');
+    }
+    out
 }
 
 /// The model's reply as a JSON object, or `None`.
@@ -880,9 +897,13 @@ async fn answer(
             filled: Vec::new(),
             refused: vec![Refusal {
                 field: String::new(),
-                why: "the model did not answer with a JSON object, so there was nothing to read \
-                      an objective out of; say it again"
-                    .to_owned(),
+                // The model's own words, because the founder is the one who
+                // can tell whether it misread them or overstepped.
+                why: format!(
+                    "the model did not answer with a JSON object, so there was nothing to \
+                     read an objective out of; say it again. It said: \"{}\"",
+                    excerpt(&finished.reply)
+                ),
             }],
             questions,
             objective: Value::Object(base),
@@ -904,11 +925,20 @@ async fn answer(
             reply = %finished.reply.chars().take(300).collect::<String>(),
             "the interview's proposal was empty"
         );
+        let said = finished.reply.trim();
+        let why = if said == "{}" {
+            "the employee found nothing in that answer that fits the question, so it wrote \
+             nothing; answer the question as it is asked"
+                .to_owned()
+        } else {
+            format!(
+                "the employee wrote nothing, and said why: \"{}\"",
+                excerpt(said.trim_start_matches("{}").trim())
+            )
+        };
         refused.push(Refusal {
             field: String::new(),
-            why: "the employee found nothing in that answer that fits the question, so it \
-                  wrote nothing; answer the question as it is asked"
-                .to_owned(),
+            why,
         });
     }
     let Some((charter, filled)) = built else {
