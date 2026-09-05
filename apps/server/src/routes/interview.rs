@@ -789,11 +789,11 @@ async fn answer(
             asked.join("\n- "),
         ),
         (None, Some(question)) => format!(
-            "The question they were answering — they typed their answer into the field for \
-             this question, so it is the answer to it unless it is plainly about something \
-             else; a short answer (\"month\", \"EUR\", one name) is still an \
-             answer:\n\n- {}\n\nThe other open questions, for context — fill one only if \
-             the answer plainly says so:\n\n- {}",
+            "The question they were answering:\n\n- {}\n\nThey typed their answer into the \
+             field for that question, so it is the answer to it unless it is plainly about \
+             something else; a short answer (\"month\", \"EUR\", one name) is still an \
+             answer.\n\nThe other open questions, for context — fill one only if the answer \
+             plainly says so:\n\n- {}",
             question.ask,
             asked.join("\n- "),
         ),
