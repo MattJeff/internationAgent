@@ -157,7 +157,11 @@ struct RegisterView {
 /// Le second critère n'est pas cosmétique : deux motifs à égalité doivent sortir
 /// dans le même ordre à chaque appel, sinon un tableau public qui n'a pas bougé
 /// a l'air d'avoir bougé.
-fn ranked<T>(mut lines: Vec<T>, count: impl Fn(&T) -> i64, key: impl Fn(&T) -> String) -> Vec<T> {
+pub(super) fn ranked<T>(
+    mut lines: Vec<T>,
+    count: impl Fn(&T) -> i64,
+    key: impl Fn(&T) -> String,
+) -> Vec<T> {
     lines.sort_by(|a, b| count(b).cmp(&count(a)).then_with(|| key(a).cmp(&key(b))));
     lines
 }

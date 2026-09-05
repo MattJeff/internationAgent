@@ -42,6 +42,7 @@ pub mod pool;
 // lecture est montée hors de toute clé; sa bascule est un acte de locataire.
 pub mod public_register;
 pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
+pub mod refusals; // ce que la gate a refusé, lu dans le journal
 pub mod reports; // the manager's view of its own line
 pub mod spend;
 pub mod teams;
