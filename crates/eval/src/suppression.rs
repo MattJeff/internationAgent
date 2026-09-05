@@ -99,9 +99,10 @@ struct Case {
     expect: (&'static str, Option<&'static str>),
 }
 
-/// A panel that states a requirement, of the shape a real widget renders.
+/// A panel that states a requirement, of the shape a real widget renders — and
+/// a complete one: it attributes its fee, so no category is missing from it.
 const AGREES_TEXT: &str = "Entry requirements: a visa is required for this destination. \
-                           Apply before you travel.";
+                           Government fee USD 80. Apply before you travel.";
 /// The same widget, wrong.
 const WRONG_TEXT: &str = "Entry requirements: no visa is required for this destination. \
                           Travel with a valid passport.";
@@ -236,17 +237,19 @@ const CASES: &[Case] = &[
         expect: ("unreadable", None),
     },
     Case {
+        // Complete on the fee, so the value duel is what is left — and it is
+        // filed, not sent.
         name: "visa on arrival, against an e-visa authority",
-        first: "You may obtain a visa on arrival at the airport.",
-        second: "You may obtain a visa on arrival at the airport.",
+        first: "You may obtain a visa on arrival at the airport. Government fee USD 25.",
+        second: "You may obtain a visa on arrival at the airport. Government fee USD 25.",
         authority: Claim::EVisa,
         expect: ("evidence", Some("contradicts")),
     },
     // --- the categorical findings ------------------------------------------
-    // The three that stand on the prospect's own page, and the two negatives
-    // that keep them sendable. Without these the row above measures two of the
-    // five findings the module has and reports the number as if it were all of
-    // them.
+    // The findings that name a category the prospect's page does not display,
+    // and the negatives that keep them sendable. Without these the rows above
+    // measure two of the five findings the module has and report the number as
+    // if it were all of them.
     Case {
         // Category 1. A price with no side named — iVisa's "from $69.99" is its
         // own commission presented as the visa's cost.
@@ -255,6 +258,22 @@ const CASES: &[Case] = &[
         second: "Visa required. Fee from $69.99 per traveller.",
         authority: Claim::VisaRequired,
         expect: ("evidence", Some("unattributed_fee")),
+    },
+    Case {
+        // Category 1, the other way: a visa and no fee line at all.
+        name: "a visa with no fee line",
+        first: "Entry requirements: a visa is required for this destination.",
+        second: "Entry requirements: a visa is required for this destination.",
+        authority: Claim::VisaRequired,
+        expect: ("evidence", Some("unattributed_fee")),
+    },
+    Case {
+        // Category 3, in the exact words the sales axis is about.
+        name: "a free visa on arrival never distinguished from an exemption",
+        first: "Visa on arrival, free.",
+        second: "Visa on arrival, free.",
+        authority: Claim::VisaOnArrival,
+        expect: ("evidence", Some("conflates")),
     },
     Case {
         // The same page, attributed. It agrees with the authority and it says

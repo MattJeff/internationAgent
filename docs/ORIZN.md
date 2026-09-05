@@ -432,6 +432,27 @@ about another company's booking flow is the one mistake in this job that cannot
 be walked back. Ten findings a day is already more than one founder can follow
 up on. The pack's default is 40; Orizn has one seller and no pipeline yet.
 
+**What a finding is, since 2026-09-05: a missing category, never a wrong
+value.** Orizn's own measurement of 2026-08-26 — ten regulatory cases against
+the four queryable sources: Wikipedia 78 %, Sherpa 57 %, VisaHQ 0 %, iVisa 0 %,
+and on the Croatian case Wikipedia and Sherpa right while Orizn's row was wrong
+— makes "we are more current than you" indefensible: the prospect opens
+Wikipedia and the argument dies, or worse, the seller has asserted our own
+error in writing. So the seller never tells a prospect a value is wrong. It
+shows that one of four categories does not exist on their page, and what the
+absence costs (carrier fine, refund, chargeback): the **official consular fee**,
+which nobody publishes; the **legal uncertainty** of a regime resting on a
+revocable unilateral tolerance (Mali/Niger outside ECOWAS — no detector yet, a
+human's call); a **free visa on arrival that is not a visa exemption**; and the
+**quiet bilateral agreement** (India↔Maldives, 90 days since 2019 where Sherpa
+and VisaHQ say 30). The value duel appears only as the illustration of that last
+category, beside its source and date. A page that displays all four is not
+approached at all, whatever we think of its numbers. `proof_of_need::
+MissingCategory` is the list, `Finding::citable` the send bar, and
+`MAX_TRUTH_AGE` the per-category age of the fact behind each — years for a
+treaty, a quarter for a fee schedule, never the old twenty-four hours, which
+protected an argument Orizn no longer makes. The double run is unchanged.
+
 #### `customer-success` — 20 turns, 20 new contacts, `{email,internal,web}`, `orizn.app`
 
 **Twenty new contacts, not zero, and the reason is a subtlety worth knowing.**

@@ -2130,16 +2130,18 @@ async fn open_the_round(
 ///
 /// # And the half of the bar a type could not hold on its own
 ///
-/// **Not every reproduced finding may be sent.** Two of the five rest entirely
+/// **Not every reproduced finding may be sent.** One of the five rests entirely
 /// on Orizn's row being right about the pair —
-/// [`Finding::Contradicts`](crate::proof_of_need::Finding) and
-/// [`Finding::StayLength`](crate::proof_of_need::Finding) — and free Wikipedia
-/// scored 78% against the ten cases our own row got the Croatian one wrong on.
-/// Asserting one of those to a prospect is betting the account on a database
-/// that has been beaten by a free source. So [`Approach::new`] returns nothing
-/// for them: they are evidence, they are filed, and a human reads them.
-/// [`Finding::stands_on_their_page`](crate::proof_of_need::Finding::stands_on_their_page)
-/// is the predicate and this is its only enforcement point.
+/// [`Finding::Contradicts`](crate::proof_of_need::Finding), the value duel — and
+/// free Wikipedia scored 78% against the ten cases our own row got the Croatian
+/// one wrong on. Asserting it to a prospect is betting the account on a
+/// database that has been beaten by a free source. So [`Approach::new`] returns
+/// nothing for it: it is evidence, it is filed, and a human reads it. Every
+/// other finding names a category their page does not display —
+/// [`Finding::missing`](crate::proof_of_need::Finding::missing) — or a page
+/// that displays nothing, and
+/// [`Finding::citable`](crate::proof_of_need::Finding::citable) is the
+/// predicate; this is its only enforcement point.
 ///
 /// # And a claim that *was* reproducible, once
 ///
@@ -2190,7 +2192,7 @@ impl Approach {
     /// `opt_out` is the plain way out that every approach carries — an
     /// operator's sentence, not a model's.
     pub fn new(evidence: &Evidence, opt_out: &str) -> Option<Self> {
-        if !evidence.finding().stands_on_their_page() {
+        if !evidence.finding().citable() {
             return None;
         }
 
@@ -2313,14 +2315,13 @@ pub enum Sold {
     NoFinding(Checked),
     /// A reproduced finding that this system may not assert.
     ///
-    /// [`Finding::Contradicts`](crate::proof_of_need::Finding) or
-    /// [`Finding::StayLength`](crate::proof_of_need::Finding) : réelle, classée,
-    /// et reposant entièrement sur le fait qu'une ligne à nous ait raison sur
-    /// cette paire. Elle part vers
+    /// [`Finding::Contradicts`](crate::proof_of_need::Finding) : réelle, classée,
+    /// ne nommant aucune catégorie absente et reposant entièrement sur le fait
+    /// qu'une ligne à nous ait raison sur cette paire. Elle part vers
     /// [`Stage::Handoff`](crate::rolepack_sales::Stage) avec un humain au bout.
     /// **Aucun mail n'est envoyé.**
     ///
-    /// **Sans producteur aujourd'hui.** Ces deux constatations demandent une
+    /// **Sans producteur aujourd'hui.** Cette constatation demande une
     /// [`Answer`](crate::proof_of_need::Answer), et aucune source d'autorité
     /// n'est branchée sur ce déploiement — voir la doc de module de
     /// `proof_of_need`. La variante reste, et elle reste une valeur qu'un
