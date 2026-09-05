@@ -60,7 +60,13 @@
 //! operator who registers a row on a legacy path finds that mail keeps arriving
 //! where it always did, rather than finding out that it silently moved.
 //!
-//! # Three signature schemes, and the endpoint's `provider` is what picks
+//! # Four signature schemes, and the endpoint's `provider` is what picks
+//!
+//! Le quatrième est arrivé avec `0081` : Stripe signe `t=<unix>,v1=<hex>` en
+//! HMAC-SHA256 sur `"<unix>.<corps>"`, et sa livraison est la première qui fait
+//! *entrer* de l'argent — `agentos_app::stripe` porte ce que le lecteur en
+//! fait. Le paragraphe qui suit décrit le troisième, et vaut pour les deux
+//! premiers.
 //!
 //! Le troisième est arrivé avec `0077` : Smartlead pousse ses désabonnements et
 //! signe en HMAC-SHA256 hexadécimal sur le corps brut. C'est aussi le seul des
@@ -117,6 +123,7 @@ use agentos_app::inbound::{
     verify_telephony_webhook,
 };
 use agentos_app::mcp::Credentials;
+use agentos_app::stripe::{STRIPE_SIGNATURE_HEADER, verify_stripe_webhook};
 use agentos_app::webhooks::{self, Endpoint};
 use agentos_domain::untrusted::Untrusted;
 use agentos_store::db::Db;
@@ -156,6 +163,11 @@ pub use agentos_app::inbound::TELEPHONY_PROVIDER;
 /// have to agree: this file's `match`, `main::handlers`, and `0077`'s widened
 /// `webhook_endpoints_provider_is_wired`.
 pub use agentos_app::inbound::SMARTLEAD_PROVIDER;
+
+/// The endpoint `provider` whose deliveries are verified with Stripe's scheme
+/// and read by `main::on_stripe_webhook`. Same three places as the two above,
+/// with `0081` as the widened CHECK.
+pub use agentos_app::stripe::STRIPE_PROVIDER;
 
 /// The `event_type` a stored delivery from `provider` is filed under.
 ///
@@ -430,6 +442,21 @@ async fn ingest(
                 unverified()
             })?,
         }
+    } else if provider == STRIPE_PROVIDER {
+        // The fourth scheme: `Stripe-Signature: t=<unix>,v1=<hex>`, an
+        // HMAC-SHA256 over `"<unix>.<raw>"`, a five-minute window. The event
+        // id is read off the body *after* the MAC over it passed, so it is as
+        // authenticated as a header would be. `agentos_app::stripe` carries
+        // what the stored row is then read for.
+        let signature = parts
+            .headers
+            .get(STRIPE_SIGNATURE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        verify_stripe_webhook(&endpoint.secret, signature, &raw, now).map_err(|err| {
+            tracing::warn!(%provider, error = %err, "stripe signature rejected");
+            unverified()
+        })?
     } else {
         // The signature covers `id . timestamp . raw`, so the id and timestamp
         // are authenticated too — which is what makes the id safe to dedupe on.
@@ -518,6 +545,7 @@ fn signature_headers(headers: &HeaderMap) -> WebhookHeaders {
 #[cfg(test)]
 mod tests {
     use agentos_app::inbound::{Secret, sign_telephony_webhook, sign_webhook};
+    use agentos_app::stripe::sign_stripe_webhook;
     use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
@@ -800,6 +828,86 @@ mod tests {
             stored(&db, tenant).await.is_empty(),
             "une livraison sans credential a été mise en file"
         );
+    }
+
+    // -- the stripe scheme ---------------------------------------------------
+
+    const STRIPE_SECRET: &str = "whsec_a_stripe_signing_secret_that_is_none_of_the_others";
+
+    /// A tenant whose endpoint is a Stripe one, and the router in front of it.
+    async fn stripe_harness() -> Option<(Db, TenantId, Router)> {
+        let db = connect().await?;
+        let tenant = seed_tenant(&db).await;
+        let endpoints = HashMap::from([(
+            STRIPE_PROVIDER.to_owned(),
+            Endpoint {
+                tenant_id: tenant,
+                provider: STRIPE_PROVIDER.to_owned(),
+                secret: Secret::new(STRIPE_SECRET),
+            },
+        )]);
+        let router = router(
+            db.clone(),
+            Credentials::from_master_key(MASTER),
+            Webhooks::new(endpoints),
+            ORIGIN,
+        );
+        Some((db, tenant, router))
+    }
+
+    const STRIPE_BODY: &[u8] = br#"{"id":"evt_42","type":"checkout.session.completed","data":{"object":{"payment_status":"paid","amount_total":120000,"currency":"eur","metadata":{"invoice_number":"1"}}}}"#;
+
+    fn stripe_signed(secret: &str, body: &[u8]) -> HttpRequest<Body> {
+        let signature = sign_stripe_webhook(&Secret::new(secret), Utc::now().timestamp(), body);
+        HttpRequest::post(format!("/v1/webhooks/{STRIPE_PROVIDER}"))
+            .header("stripe-signature", signature)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_vec()))
+            .expect("request")
+    }
+
+    /// The pair again: a delivery under the registered secret is stored under
+    /// its own event id, the same bytes under a neighbouring secret are not.
+    #[tokio::test]
+    async fn a_stripe_delivery_is_stored_under_its_event_id_only_when_its_secret_signed_it() {
+        let Some((db, tenant, router)) = stripe_harness().await else {
+            return;
+        };
+
+        let (status, _) = call(&router, stripe_signed("whsec_someone_else", STRIPE_BODY)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(stored(&db, tenant).await.is_empty(), "a forgery was queued");
+
+        let (status, _) = call(&router, stripe_signed(STRIPE_SECRET, STRIPE_BODY)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // Redelivered: answered 202 and collapsed onto the first row.
+        let (status, _) = call(&router, stripe_signed(STRIPE_SECRET, STRIPE_BODY)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let rows = stored(&db, tenant).await;
+        assert_eq!(rows.len(), 1, "a replay must not be a second row");
+        assert_eq!(rows[0].0, received_event(STRIPE_PROVIDER));
+        assert_eq!(rows[0].1["provider"], STRIPE_PROVIDER);
+        assert_eq!(rows[0].1["event_id"], "evt_42");
+        assert_eq!(
+            rows[0].1["body"].as_str().map(str::as_bytes),
+            Some(STRIPE_BODY),
+            "the bytes the signature covered, verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_stripe_delivery_is_refused() {
+        let Some((db, tenant, router)) = stripe_harness().await else {
+            return;
+        };
+        let request = HttpRequest::post(format!("/v1/webhooks/{STRIPE_PROVIDER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(STRIPE_BODY.to_vec()))
+            .expect("request");
+        let (status, _) = call(&router, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(stored(&db, tenant).await.is_empty());
     }
 
     fn payload(email_id: &str) -> Vec<u8> {
@@ -1644,13 +1752,14 @@ mod tests {
         .expect("a telephony endpoint must be registrable once its ingest exists");
 
         // Still a fence, not a formality: a provider nothing reads is refused
-        // by the table.
+        // by the table. This line used to name `stripe`, until `0081` gave it
+        // a reader.
         assert!(
             agentos_app::webhooks::register(
                 &db,
                 &credentials,
                 seed_tenant(&db).await,
-                "stripe",
+                "paypal",
                 "sk_whatever".to_owned(),
                 &agentos_store::audit::AuditActor::Operator("platform".to_owned()),
                 Utc::now(),

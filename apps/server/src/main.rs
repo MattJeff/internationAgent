@@ -976,8 +976,72 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on(
             routes::webhooks::received_event(routes::webhooks::SMARTLEAD_PROVIDER),
             Arc::new(on_smartlead_webhook),
+        )
+        // Le quatrième, pour la même raison : `0081` a élargi la CHECK à
+        // `'stripe'`, et cette ligne est ce que la CHECK affirme.
+        .on(
+            routes::webhooks::received_event(routes::webhooks::STRIPE_PROVIDER),
+            Arc::new(on_stripe_webhook),
         );
     handlers
+}
+
+/// `webhook.stripe.received` : une session Checkout payée règle la facture
+/// qu'elle nomme.
+///
+/// La quatrième jointure, et la première qui fait entrer de l'argent. Comme
+/// celle de Smartlead, elle n'a rien à aller chercher : les octets vérifiés
+/// portent tout, et `agentos_app::stripe::record_stripe_payment` fait le
+/// reste dans la transaction qui retire la livraison de la file — le
+/// `paid_at`, et la ligne d'audit qui porte l'identifiant Stripe. Le tenant
+/// est celui de l'endpoint, donc celui de `tx` ; une facture d'une autre
+/// entreprise est invisible d'ici.
+///
+/// Ce qui est terminal : un corps qui n'est pas du JSON. Ce qui ne l'est pas
+/// et n'est pas une erreur non plus : un montant qui ne colle pas — une ligne
+/// `invoice_payment_mismatch` est écrite et la facture reste due, ce qui est
+/// exactement ce qu'une personne doit voir.
+fn on_stripe_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
+        let event_id = event
+            .payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let settled =
+            agentos_app::stripe::record_stripe_payment(tx, body.as_bytes(), event_id, Utc::now())
+                .await
+                .map_err(|err| {
+                    let why = format!("{}: {err}", err.code());
+                    if err.is_retryable() {
+                        Failure::Retry(why)
+                    } else {
+                        Failure::Terminal(why)
+                    }
+                })?;
+
+        use agentos_app::stripe::Settlement;
+        match settled {
+            Settlement::Paid(id) => {
+                tracing::info!(invoice = %id, "an invoice was settled by stripe")
+            }
+            Settlement::Mismatch(id) => tracing::warn!(
+                invoice = %id,
+                "a stripe payment does not match the invoice it names; nothing was marked paid"
+            ),
+            Settlement::AlreadySettled(id) => {
+                tracing::debug!(invoice = %id, "a stripe payment for an invoice already settled");
+            }
+            Settlement::NotOurs => tracing::debug!("a stripe delivery that settles nothing here"),
+        }
+        Ok(())
+    })
 }
 
 /// `webhook.smartlead.received` : un désabonnement poussé devient une ligne de

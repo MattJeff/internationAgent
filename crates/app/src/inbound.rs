@@ -1177,7 +1177,7 @@ const SMARTLEAD_LEAD_EMAIL: &str = "sl_lead_email";
 /// dédoublonnent sur le même digest, et deux orthographes de ce digest seraient
 /// deux réponses à « est-ce la même livraison ». L'argument long est au-dessus
 /// de [`verify_telephony_webhook`].
-fn body_digest(raw_body: &[u8]) -> String {
+pub(crate) fn body_digest(raw_body: &[u8]) -> String {
     use sha2::Digest as _;
 
     body_hex(&sha2::Sha256::digest(raw_body))
@@ -1209,7 +1209,7 @@ pub fn sign_smartlead_webhook(secret: &Secret, raw_body: &[u8]) -> String {
 }
 
 /// L'hexadécimal minuscule de n'importe quel tableau d'octets.
-fn body_hex(bytes: &[u8]) -> String {
+pub(crate) fn body_hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(64), |mut out, byte| {
@@ -1337,7 +1337,7 @@ pub fn verify_smartlead_secret_key(secret: &Secret, raw_body: &[u8]) -> Result<S
 /// qu'aucun des trois n'ait de sortie anticipée, pas qu'ils partagent un
 /// symbole. La différence de longueur est mélangée dans le résultat, donc une
 /// signature tronquée est refusée sans que la boucle soit plus courte.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;

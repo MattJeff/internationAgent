@@ -51,7 +51,9 @@ use agentos_domain::ids::{AppointmentId, DecisionId, IdempotencyKey, InvoiceId, 
 use agentos_domain::money::Money;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
-use agentos_providers::email::{EmailProvider, OutboundEmail, ProviderMessageId};
+use agentos_providers::email::{
+    EmailProvider, OutboundAttachment, OutboundEmail, ProviderMessageId,
+};
 use agentos_providers::leads::{self as leads, LeadSink};
 use agentos_providers::telephony::{
     OpenWindow, OutboundCall, OutboundSms, OutboundWhatsapp, TelephonyProvider,
@@ -236,6 +238,19 @@ pub const WHATSAPP_WINDOW_NOT_THEIRS: &str = "whatsapp_window_mismatch";
 /// working. `migrations/0066_invoices.sql` argues why that ceiling is the
 /// structural one.
 pub const NO_WON_DEAL: &str = "no_won_deal";
+
+/// The invoice to send is not one of this company's. [`NO_WON_DEAL`]'s
+/// silence, one act later: the register's not-found and RLS's are one answer.
+pub const NO_SUCH_INVOICE: &str = "no_such_invoice";
+
+/// The address the gate ruled on is not the billed account's contact. See
+/// [`Effects::send_invoice`]: an email ruling says the seat may write there,
+/// not that this document is that address's business.
+pub const NOT_THE_ACCOUNTS_CONTACT: &str = "not_the_accounts_contact";
+
+/// The filed document no longer matches its own digest. Not sent; the same
+/// refusal [`crate::files::FilesError::Corrupt`] makes on the read side.
+pub const INVOICE_DOCUMENT_CORRUPT: &str = "invoice_document_corrupt";
 
 /// The zone a moment was promised in is not a name any tzdata knows.
 ///
@@ -1055,14 +1070,148 @@ impl Effects {
             subject: body.subject,
             body_text: body.body_text,
             in_reply_to: body.in_reply_to,
+            attachments: Vec::new(),
         };
+        self.dispatch_email(ok, email, Map::new()).await
+    }
 
+    /// Put an issued invoice in front of the customer: the document
+    /// [`Effects::issue_invoice`] filed, attached to an email to the address on
+    /// the token.
+    ///
+    /// # A second act, on a second token — deliberately
+    ///
+    /// `issue_invoice` records the demand and sends nothing, and its docs say
+    /// why: an invoice recorded and not sent is a mistake somebody can see. The
+    /// sending is this method, and it takes an `Authorized<EmailSend>` of its
+    /// own rather than deriving one from the `InvoiceIssue` ruling, because no
+    /// such derivation exists: [`Authorized`] is sealed, the gate is the only
+    /// mint, and the gate's rules for an email — the channel, the denylist,
+    /// `max_new_contacts_per_day` — are not the rules it applied to the
+    /// invoice. The employee that issued proposes the send as its next action,
+    /// and the gate rules on the address.
+    ///
+    /// # What is checked here that the gate cannot
+    ///
+    /// The address on the token must be the billed account's contact —
+    /// [`agentos_store::invoices::parties`]'s answer — or this refuses with
+    /// [`NOT_THE_ACCOUNTS_CONTACT`]. The gate ruled that this seat may email
+    /// that address; it did not rule that this document is that address's
+    /// business, and a customer's invoice reaching a stranger is the one
+    /// outcome an `EmailSend` ruling was never asked about.
+    ///
+    /// The bytes go out exactly as filed: the digest is re-derived before the
+    /// send, as [`crate::files::Files::get`] does, and a document that does not
+    /// match its own digest is refused rather than sent.
+    ///
+    /// `from` is the seat's own address, off configuration — the same value
+    /// `RenderedEmail::from` carries — because an employee does not choose who
+    /// it is.
+    pub async fn send_invoice<A: Subject<Of = EmailSend>>(
+        &self,
+        ok: Authorized<A>,
+        invoice: InvoiceId,
+        from: &str,
+    ) -> Result<ProviderMessageId, EffectError> {
+        let to = ok.action().subject().to.to_string();
+        let (email, extra) =
+            self.invoice_email(invoice, from, &to)
+                .await
+                .map_err(|err| match err {
+                    StoreError::NotFound => EffectError::Refused(NO_SUCH_INVOICE),
+                    other => EffectError::Unavailable(other),
+                })??;
+        self.dispatch_email(ok, email, extra).await
+    }
+
+    /// The invoice, its document and its recipient, read in one transaction.
+    ///
+    /// `Ok(Err(_))` is a refusal with the invoice found; `Err(NotFound)` is the
+    /// register's silence for "not this company's". Read-only, and rolled back.
+    async fn invoice_email(
+        &self,
+        id: InvoiceId,
+        from: &str,
+        to: &str,
+    ) -> Result<Result<(OutboundEmail, Map<String, Value>), EffectError>, StoreError> {
+        let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
+        let invoice = invoices::find(&mut tx, id)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let parties = invoices::parties(&mut tx, invoice.opportunity_id).await?;
+        let name = crate::invoice_document::file_name(&invoice);
+        let held = agentos_store::files::fetch(&mut tx, &name).await?;
+        let _ = tx.rollback().await;
+
+        if !parties
+            .contact_email
+            .as_deref()
+            .is_some_and(|contact| contact.eq_ignore_ascii_case(to))
+        {
+            return Ok(Err(EffectError::Refused(NOT_THE_ACCOUNTS_CONTACT)));
+        }
+        let digest = crate::files::digest_of(&held.content);
+        if held.digest != digest {
+            return Ok(Err(EffectError::Refused(INVOICE_DOCUMENT_CORRUPT)));
+        }
+
+        let kind = if invoice.corrects_invoice_id.is_some() {
+            "Avoir"
+        } else {
+            "Facture"
+        };
+        let email = OutboundEmail {
+            from: from.to_owned(),
+            to: vec![to.to_owned()],
+            subject: format!("{kind} n° {} — {}", invoice.number, parties.issuer),
+            body_text: format!(
+                "Bonjour,\n\nVeuillez trouver ci-joint {} n° {} ({}).\n\n{}",
+                if kind == "Avoir" {
+                    "l'avoir"
+                } else {
+                    "la facture"
+                },
+                invoice.number,
+                invoice.amount,
+                parties.issuer
+            ),
+            in_reply_to: None,
+            attachments: vec![OutboundAttachment {
+                filename: name,
+                content_type: held.content_type,
+                content: held.content,
+            }],
+        };
+        let extra = Map::from_iter([
+            ("invoice_id".to_owned(), json!(invoice.id.to_string())),
+            ("number".to_owned(), json!(invoice.number)),
+            (
+                "attachment_sha256".to_owned(),
+                json!(
+                    digest
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ),
+            ),
+        ]);
+        Ok(Ok((email, extra)))
+    }
+
+    /// The one road out for email: the write-ahead row, the port, the closing
+    /// row. [`Effects::send_email`] and [`Effects::send_invoice`] both end here.
+    async fn dispatch_email<A: Subject<Of = EmailSend>>(
+        &self,
+        ok: Authorized<A>,
+        email: OutboundEmail,
+        extra: Map<String, Value>,
+    ) -> Result<ProviderMessageId, EffectError> {
         // `?`, and no audit row on this arm: the only way this fails is the
         // database being unreachable, at which point `record` cannot write one
         // either. Nothing has been sent, which is the state the failure leaves.
         self.begin_send(&ok, EMAIL_PORT).await?;
         let sent = self.ports.email.send(&self.key_for(&ok), &email).await;
-        self.record_sent(&ok, sent, Map::new()).await
+        self.record_sent(&ok, sent, extra).await
     }
 
     /// Put the prospect on the token onto the sending platform's list.
@@ -2218,10 +2367,12 @@ impl Effects {
     /// makes the same move for the same reason ("the provider here is our own
     /// database") and this is that argument with the network removed entirely.
     ///
-    /// **Nothing is sent.** Putting the demand in front of the customer is an
-    /// [`Effects::send_email`], gated and audited as one, deliberately not
-    /// folded in here: an invoice recorded and not sent is a mistake somebody
-    /// can see, and one sent and not recorded is not.
+    /// **Nothing is sent, but the document exists.** The row and its PDF —
+    /// `crate::invoice_document`, filed as `invoice-<number>.pdf` — commit
+    /// together. Putting the demand in front of the customer is
+    /// [`Effects::send_invoice`], gated and audited as an `EmailSend`,
+    /// deliberately not folded in here: an invoice recorded and not sent is a
+    /// mistake somebody can see, and one sent and not recorded is not.
     ///
     /// # Why the bound is `Authorized<InvoiceIssue>` and not `A: Subject<Of = …>`
     ///
@@ -2315,8 +2466,18 @@ impl Effects {
             },
         )
         .await;
-        match written {
-            Ok(_) => {
+        // The document, in the same transaction as the number it carries: a
+        // register row with no PDF, or a PDF whose number was rolled back, are
+        // the two halves of one lie and this is where they are made
+        // unrepresentable. See `crate::invoice_document`.
+        let filed = match written {
+            Ok(invoice) => crate::invoice_document::file(&mut tx, &invoice)
+                .await
+                .map(|_| ()),
+            Err(err) => Err(err),
+        };
+        match filed {
+            Ok(()) => {
                 tx.commit().await?;
                 Ok(())
             }
@@ -4922,6 +5083,176 @@ mod tests {
         assert_eq!(
             rows[0].1["detail"]["opportunity_id"],
             json!(opportunity.to_string())
+        );
+    }
+
+    /// The document is filed under its number in the same commit as the row:
+    /// a PDF whose digest is the bytes', whose bytes are a PDF, and whose text
+    /// carries the number the customer will quote.
+    #[tokio::test]
+    async fn an_issued_invoice_is_filed_as_a_pdf_under_its_number() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = won_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let token = gate(&db)
+            .authorize(&principal, billed(120_000))
+            .await
+            .expect("authorised");
+        let id = effects
+            .issue_invoice(token, &draft(opportunity))
+            .await
+            .expect("issued");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let invoice = invoices::find(&mut tx, id)
+            .await
+            .expect("read")
+            .expect("in the register");
+        let name = crate::invoice_document::file_name(&invoice);
+        let held = agentos_store::files::fetch(&mut tx, &name)
+            .await
+            .expect("the document is filed");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(name, format!("invoice-{}.pdf", invoice.number));
+        assert_eq!(held.content_type, "application/pdf");
+        assert_eq!(
+            held.digest,
+            crate::files::digest_of(&held.content).to_vec(),
+            "the digest describes the bytes"
+        );
+        assert!(held.content.starts_with(b"%PDF-"));
+        let text = String::from_utf8_lossy(&held.content);
+        assert!(
+            text.contains(&format!("(Facture n\\260 {}) Tj", invoice.number)),
+            "the number is in the document: {text}"
+        );
+        assert!(text.contains("(Destinataire : Buyer plc) Tj"));
+    }
+
+    /// The second act: the issued document leaves for the account's contact,
+    /// on an `EmailSend` ruling, byte for byte what was filed — and to nobody
+    /// else.
+    #[tokio::test]
+    async fn an_issued_invoice_leaves_with_its_pdf_attached_to_the_accounts_contact() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = won_deal(&db, &principal).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email, is_primary) \
+             SELECT $1, $2, account_id, 'Accounts Payable', 'ap@buyer.example', true \
+               FROM opportunities WHERE id = $3",
+        )
+        .bind(Uuid::now_v7())
+        .bind(principal.tenant_id.as_uuid())
+        .bind(opportunity)
+        .execute(&mut **tx)
+        .await
+        .expect("contact");
+        tx.commit().await.expect("commit");
+
+        // A handle on the mock is kept: `Ports` takes an `Arc<dyn
+        // EmailProvider>` and gives nothing back, and what this test asserts
+        // is the bytes that reached it.
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+            }),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, billed(120_000))
+            .await
+            .expect("authorised");
+        let id = effects
+            .issue_invoice(token, &draft(opportunity))
+            .await
+            .expect("issued");
+
+        // Wrong address first: ruled on, and still not this document's.
+        let stranger = gate(&db)
+            .authorize(&principal, to("someone@else.example"))
+            .await
+            .expect("the policy opens email");
+        let refused = effects
+            .send_invoice(stranger, id, "lena@acme.example")
+            .await
+            .expect_err("a stranger does not get the invoice");
+        assert_eq!(refused.code(), NOT_THE_ACCOUNTS_CONTACT);
+        assert_eq!(email.sent_count(), 0);
+
+        let ok = gate(&db)
+            .authorize(&principal, to("ap@buyer.example"))
+            .await
+            .expect("the policy opens email");
+        let decision_id = ok.decision_id();
+        effects
+            .send_invoice(ok, id, "lena@acme.example")
+            .await
+            .expect("sent");
+
+        let sent = email.sent_emails();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].to, vec!["ap@buyer.example".to_owned()]);
+        assert_eq!(sent[0].from, "lena@acme.example");
+        assert_eq!(sent[0].attachments.len(), 1);
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let invoice = invoices::find(&mut tx, id)
+            .await
+            .expect("read")
+            .expect("in the register");
+        let held =
+            agentos_store::files::fetch(&mut tx, &crate::invoice_document::file_name(&invoice))
+                .await
+                .expect("filed");
+        tx.rollback().await.expect("rollback");
+        let attachment = &sent[0].attachments[0];
+        assert_eq!(
+            attachment.filename,
+            format!("invoice-{}.pdf", invoice.number)
+        );
+        assert_eq!(attachment.content_type, "application/pdf");
+        assert_eq!(
+            crate::files::digest_of(&attachment.content).to_vec(),
+            held.digest,
+            "what left is what was filed"
+        );
+        assert!(sent[0].subject.contains(&format!("n° {}", invoice.number)));
+
+        // The trail: the send is a provider call under the email ruling, and
+        // it names the document it carried.
+        let rows = effect_rows(&db, &principal).await;
+        let send = rows
+            .iter()
+            .find(|(decision, _)| *decision == Some(decision_id.as_uuid()))
+            .expect("the send's row");
+        assert_eq!(send.1["effect"], json!("email_send"));
+        assert_eq!(send.1["outcome"], json!("ok"));
+        assert_eq!(send.1["detail"]["invoice_id"], json!(id.to_string()));
+        assert_eq!(send.1["detail"]["number"], json!(invoice.number));
+        assert_eq!(
+            send.1["detail"]["attachment_sha256"],
+            json!(
+                held.digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
         );
     }
 

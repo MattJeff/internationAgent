@@ -323,6 +323,16 @@ async fn credit(
         memo,
     )
     .await;
+    // The document, in the same transaction as the number — the invoice's own
+    // rule (`Effects::issue_invoice`), and a credit note is a document the
+    // customer receives too: `credit-note-<number>.pdf`, saying which invoice
+    // it corrects.
+    let written = match written {
+        Ok(issued) => agentos_app::invoice_document::file(&mut tx, &issued)
+            .await
+            .map(|_| issued),
+        Err(err) => Err(err),
+    };
     match written {
         Ok(issued) => {
             tx.commit().await?;

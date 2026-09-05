@@ -76,6 +76,26 @@ pub struct OutboundEmail {
     pub body_text: String,
     /// The message we are replying to, for threading.
     pub in_reply_to: Option<ProviderMessageId>,
+    /// Documents that travel with it. Empty for every send but an invoice
+    /// today; see [`OutboundAttachment`].
+    pub attachments: Vec<OutboundAttachment>,
+}
+
+/// One file going out with an email.
+///
+/// The bytes are ours — a document this workspace rendered and filed — so
+/// nothing here is [`Untrusted`]: the trust boundary on the *inbound* side
+/// ([`RawAttachment`]) is about what a stranger chose, and an outbound one is
+/// chosen by us. The provider receives them base64-encoded inside JSON, which is
+/// the adapter's business and not this type's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    /// The name the recipient sees.
+    pub filename: String,
+    /// Media type, e.g. `application/pdf`.
+    pub content_type: String,
+    /// The bytes.
+    pub content: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +821,9 @@ struct MockState {
     identities: HashMap<String, String>,
     /// idempotency key -> message id.
     sent: HashMap<String, ProviderMessageId>,
+    /// What actually went out, in order. A test that asserts on an attachment
+    /// needs the bytes, and a count cannot carry them.
+    outbox: Vec<OutboundEmail>,
     /// message id -> the fetched message.
     inbound: HashMap<String, RawInbound>,
     /// (message id, attachment id) -> bytes.
@@ -909,6 +932,16 @@ impl MockEmailProvider {
     pub fn sent_count(&self) -> usize {
         self.state.lock().expect("mock state poisoned").sent.len()
     }
+
+    /// Every distinct message that went out, in the order it did — with its
+    /// attachments, which is what [`Self::sent_count`] cannot show.
+    pub fn sent_emails(&self) -> Vec<OutboundEmail> {
+        self.state
+            .lock()
+            .expect("mock state poisoned")
+            .outbox
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -951,7 +984,7 @@ impl EmailProvider for MockEmailProvider {
     async fn send(
         &self,
         key: &IdempotencyKey,
-        _email: &OutboundEmail,
+        email: &OutboundEmail,
     ) -> Result<ProviderMessageId, ProviderError> {
         self.fault.check_before()?;
         let mut state = self.state.lock().expect("mock state poisoned");
@@ -961,6 +994,7 @@ impl EmailProvider for MockEmailProvider {
         }
         let id = ProviderMessageId::new(Self::next_id(&mut state, "msg_"));
         state.sent.insert(key.as_str().to_owned(), id.clone());
+        state.outbox.push(email.clone());
         drop(state);
 
         self.fault.check_after()?;
@@ -1111,12 +1145,20 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
     }
 
     // -- send is idempotent on the key -------------------------------------
+    // With a document on it: the invoice path is the one caller that sends
+    // bytes, and an adapter that dropped or mangled the attachment field would
+    // still return an id, so the suite has to put one through.
     let email = OutboundEmail {
         from: "lena@agents.example.com".to_owned(),
         to: vec!["ap@supplier.example".to_owned()],
         subject: "PO-4471".to_owned(),
         body_text: "Attached.".to_owned(),
         in_reply_to: None,
+        attachments: vec![OutboundAttachment {
+            filename: "po-4471.pdf".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            content: b"%PDF-1.4\n%contract\n".to_vec(),
+        }],
     };
     let key = IdempotencyKey::for_step(employee_id, "send:po-4471");
     let sent = p.send(&key, &email).await.expect("first send");
@@ -1530,11 +1572,13 @@ mod tests {
             subject: "PO-1".to_owned(),
             body_text: "hi".to_owned(),
             in_reply_to: None,
+            attachments: Vec::new(),
         };
         for _ in 0..5 {
             p.send(&key, &email).await.expect("send");
         }
         assert_eq!(p.sent_count(), 1);
+        assert_eq!(p.sent_emails(), vec![email]);
     }
 
     #[test]

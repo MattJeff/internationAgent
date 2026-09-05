@@ -502,6 +502,97 @@ pub async fn register(tx: &mut TenantTx<'_>) -> Result<Vec<Invoice>, StoreError>
         .collect()
 }
 
+/// One document by id, with its lines. `None` is RLS's usual silence for "not
+/// this company's" as much as for "no such row".
+pub async fn find(tx: &mut TenantTx<'_>, id: InvoiceId) -> Result<Option<Invoice>, StoreError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM invoices WHERE id = $1"
+    )))
+    .bind(id.as_uuid())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    one(tx, row).await
+}
+
+/// One document by the number a human quotes — the one a payment carries back.
+pub async fn find_by_number(
+    tx: &mut TenantTx<'_>,
+    number: i64,
+) -> Result<Option<Invoice>, StoreError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM invoices WHERE number = $1"
+    )))
+    .bind(number)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    one(tx, row).await
+}
+
+/// The lines of one row, then the row.
+async fn one(tx: &mut TenantTx<'_>, row: Option<PgRow>) -> Result<Option<Invoice>, StoreError> {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: uuid::Uuid = row.get("id");
+    let lines = sqlx::query(
+        "SELECT description, amount_minor, tax_rate_bp FROM invoice_lines \
+          WHERE invoice_id = $1 ORDER BY position",
+    )
+    .bind(id)
+    .fetch_all(&mut ***tx)
+    .await?
+    .iter()
+    .map(line_of)
+    .collect();
+    row_of(&row, lines).map(Some)
+}
+
+/// Who a document is between.
+///
+/// Plain `String`s, wrapped by the reader that renders them (the document
+/// renderer, which escapes them into the PDF), for the module docs' reason —
+/// this crate speaks SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parties {
+    /// The company issuing it: `tenants.name`, which is the only name this
+    /// workspace holds for a tenant.
+    pub issuer: String,
+    /// The account the deal was won with: `accounts.legal_name`.
+    pub account: String,
+    /// Where the demand is sent: the account's primary active contact with an
+    /// address, else any active one with an address, else nobody.
+    pub contact_email: Option<String>,
+}
+
+/// The parties to a deal, for the document that bills it.
+///
+/// [`StoreError::NotFound`] when the opportunity is not this company's — one
+/// silence, RLS's usual.
+pub async fn parties(
+    tx: &mut TenantTx<'_>,
+    opportunity_id: uuid::Uuid,
+) -> Result<Parties, StoreError> {
+    let row = sqlx::query(
+        "SELECT t.name AS issuer, a.legal_name AS account, \
+                (SELECT c.email FROM contacts c \
+                  WHERE c.account_id = a.id AND c.active AND c.email IS NOT NULL \
+                  ORDER BY c.is_primary DESC, c.created_at ASC LIMIT 1) AS contact_email \
+           FROM opportunities o \
+           JOIN accounts a ON a.id = o.account_id \
+           JOIN tenants t ON t.id = o.tenant_id \
+          WHERE o.id = $1",
+    )
+    .bind(opportunity_id)
+    .fetch_optional(&mut ***tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    Ok(Parties {
+        issuer: row.get("issuer"),
+        account: row.get("account"),
+        contact_email: row.get("contact_email"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
