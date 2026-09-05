@@ -21,6 +21,10 @@
 //!   means "may not act until somebody says so" (README, § turn budget); a
 //!   founder should not have to know that to read it.
 //! * **the path to stop**, as a string to copy: `"stop": "POST /v1/halt"`.
+//! * **the team's ceiling.** A seat is bounded by its caps *and* by its team's
+//!   daily budget (`org::reserve` locks both). `teams[]` reads the second the
+//!   way the store reads it — `org::budget`, `org::spent` — and each seat
+//!   carries `team_budget_remaining` so one line says what stops it first.
 //!
 //! Every `levers[*].route` names a route mounted in `main.rs`, and the test
 //! below mounts those routers and asks for each path, so a lever that stops
@@ -32,9 +36,9 @@ use agentos_domain::ids::EmployeeId;
 use agentos_domain::message::Channel;
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{PolicyLimits, SpendLimits, turns_remaining};
-use agentos_store::db::{Db, StoreError};
+use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::policy::{self, Layers};
-use agentos_store::{halt, outreach, spend, turns};
+use agentos_store::{halt, org, outreach, spend, turns};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get as get_route;
@@ -66,6 +70,7 @@ const LEVERS: &[(&str, &str)] = &[
     ("allowed_channels", "PUT /v1/policy/roles/{role}"),
     ("spend_limits", "PUT /v1/policy/roles/{role}"),
     ("team.role", "PUT /v1/teams/{team_id}/policy-role"),
+    ("team.budget", "PUT /v1/teams/{team_id}/budget"),
     ("spend_caps", "PUT /v1/employees/{id}/spend-caps"),
     ("lifecycle", "POST /v1/employees/{id}/suspend"),
     ("lifecycle", "POST /v1/employees/{id}/resume"),
@@ -142,6 +147,38 @@ struct SpendCapView {
     reserved_today_minor: u64,
 }
 
+/// One team budget, in one currency, and what today has already taken from it.
+///
+/// `reserved_today_minor` is the team bucket as `org::reserve` reads it: a
+/// settled payment stays inside it (`spend::settle` — "bookkeeping, not
+/// headroom"), only a release takes it out. The bucket is per **day**, like the
+/// seat caps, so `remaining_minor` is `daily_total - reserved_today`,
+/// saturating.
+#[derive(Debug, Serialize)]
+struct TeamBudgetView {
+    currency: Currency,
+    daily_total: Money,
+    reserved_today_minor: u64,
+    remaining_minor: u64,
+    /// Always `"team"`: the budget has one layer, `PUT /v1/teams/{team_id}/budget`.
+    set_by: &'static str,
+}
+
+/// A team and its budgets. `budgets` is empty and `no_budget` is `true` for a
+/// team nobody gave one — and that is *may not spend*, not "unlimited":
+/// `org::reserve` refuses outright (`docs/TEAMS.md` § 4). Said in clear here
+/// rather than as an absent key a reader has to notice.
+#[derive(Debug, Serialize)]
+struct TeamBudgetsView {
+    id: Uuid,
+    slug: String,
+    name: String,
+    /// The bucket's period: `team_spend_buckets` is keyed by `day`.
+    period: &'static str,
+    budgets: Vec<TeamBudgetView>,
+    no_budget: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct SeatView {
     employee_id: Uuid,
@@ -149,6 +186,10 @@ struct SeatView {
     display_name: String,
     lifecycle: String,
     team: Option<TeamView>,
+    /// The team's remaining headroom today, per currency — the other bound on
+    /// this seat's spending. `None` when the seat is on no team or its team has
+    /// no budget (see [`TeamBudgetsView`]).
+    team_budget_remaining: Option<BTreeMap<Currency, u64>>,
     acts_on_its_own: bool,
     max_turns_per_day: Bound<u32>,
     turns_taken_today: u32,
@@ -160,10 +201,14 @@ struct SeatView {
     spend_caps: Vec<SpendCapView>,
 }
 
+/// Two ceilings, two names: the seat caps summed (`daily_total_minor`) and the
+/// team budgets summed (`team_daily_total_minor`). They bound different things
+/// and neither is the tenant's spend limit.
 #[derive(Debug, Default, Serialize)]
 struct Totals {
     daily_total_minor: u64,
     reserved_today_minor: u64,
+    team_daily_total_minor: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +223,7 @@ struct ControlsView {
     halt: HaltView,
     window_ends_at: Option<DateTime<Utc>>,
     seats: Vec<SeatView>,
+    teams: Vec<TeamBudgetsView>,
     totals: BTreeMap<Currency, Totals>,
     levers: Vec<Lever>,
 }
@@ -218,6 +264,45 @@ SELECT h.employee_id, h.currency, coalesce(b.reserved_minor, 0) AS reserved_mino
     ON b.employee_id = h.employee_id AND b.currency = h.currency AND b.day = $1 \
  ORDER BY h.employee_id, h.currency";
 
+const TEAMS_SQL: &str = "SELECT id, slug, name FROM teams ORDER BY id";
+
+/// Every team and its budgets, read the way `org::reserve` reads them
+/// (`org::budget`, `org::spent`) rather than by a query of this page's own.
+// ponytail: teams × Currency::ALL round-trips; one JOIN if a tenant ever has
+// enough teams for a controls page to feel it.
+async fn team_budgets(
+    tx: &mut TenantTx<'_>,
+    day: NaiveDate,
+) -> Result<Vec<TeamBudgetsView>, StoreError> {
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(TEAMS_SQL).fetch_all(&mut ***tx).await?;
+    let mut teams = Vec::with_capacity(rows.len());
+    for (id, slug, name) in rows {
+        let mut budgets = Vec::new();
+        for currency in Currency::ALL {
+            let Some(daily_total) = org::budget(tx, id, currency).await? else {
+                continue;
+            };
+            let reserved = org::spent(tx, id, day, currency).await?;
+            budgets.push(TeamBudgetView {
+                currency,
+                daily_total,
+                reserved_today_minor: reserved,
+                remaining_minor: daily_total.minor().saturating_sub(reserved),
+                set_by: "team",
+            });
+        }
+        teams.push(TeamBudgetsView {
+            id,
+            slug,
+            name,
+            period: "day",
+            no_budget: budgets.is_empty(),
+            budgets,
+        });
+    }
+    Ok(teams)
+}
+
 fn opaque(employee_id: Uuid, what: &str, err: impl std::fmt::Display) -> ApiError {
     // The detail stays server-side, as on `/v1/employees/{id}/turns`: the
     // caller gets a code, the operator gets the row.
@@ -241,8 +326,23 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         .await
         .map_err(StoreError::from)?;
 
+    let teams = team_budgets(&mut tx, day).await?;
+
     let mut seats = Vec::with_capacity(rows.len());
     let mut totals: BTreeMap<Currency, Totals> = BTreeMap::new();
+    let mut remaining_by_team: BTreeMap<Uuid, BTreeMap<Currency, u64>> = BTreeMap::new();
+    for team in &teams {
+        for b in &team.budgets {
+            let total = totals.entry(b.currency).or_default();
+            total.team_daily_total_minor = total
+                .team_daily_total_minor
+                .saturating_add(b.daily_total.minor());
+            remaining_by_team
+                .entry(team.id)
+                .or_default()
+                .insert(b.currency, b.remaining_minor);
+        }
+    }
     for row in rows {
         let id = EmployeeId::from_uuid(row.id);
         let layers = policy::load_layers(&mut tx, id)
@@ -281,6 +381,7 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
             slug: row.slug,
             display_name: row.display_name,
             lifecycle: row.lifecycle,
+            team_budget_remaining: row.team_id.and_then(|t| remaining_by_team.get(&t).cloned()),
             team: match (row.team_id, row.team_slug, row.team_name) {
                 (Some(id), Some(slug), Some(name)) => Some(TeamView { id, slug, name }),
                 _ => None,
@@ -322,6 +423,7 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         },
         window_ends_at,
         seats,
+        teams,
         totals,
         levers: LEVERS
             .iter()
@@ -340,7 +442,6 @@ mod tests {
     use std::num::NonZeroU32;
 
     use agentos_domain::ids::{Slug, TenantId};
-    use agentos_store::org;
     use agentos_store::policy::Scope;
     use agentos_store::spend::SpendCaps;
     use axum::body::{Body, to_bytes};
@@ -668,6 +769,88 @@ mod tests {
         h.teardown().await;
     }
 
+    /// Sales gets a $200 day and Lena reserves $10 of it; Ops gets nothing,
+    /// which the store spells "may not spend". The page says both, and Lena's
+    /// own line carries what her team has left.
+    #[tokio::test]
+    async fn the_team_budget_is_the_other_ceiling_and_its_absence_is_said() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let c = company(&h).await;
+        let day = Utc::now().date_naive();
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+        org::set_budget(
+            &mut tx,
+            c.sales,
+            Money::new(20_000, Currency::Usd).expect("money"),
+        )
+        .await
+        .expect("budget");
+        org::reserve(
+            &mut tx,
+            EmployeeId::from_uuid(c.lena),
+            day,
+            Money::new(10_00, Currency::Usd).expect("money"),
+        )
+        .await
+        .expect("reserve");
+        let ops = org::create_team(&mut tx, &Slug::parse("ops").expect("slug"), "Ops")
+            .await
+            .expect("team");
+        tx.commit().await.expect("commit");
+
+        let (status, body) = h.call("GET", "/v1/controls", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let teams = body["teams"].as_array().expect("teams");
+        assert_eq!(teams.len(), 2, "{body}");
+        let team = |id: Uuid| {
+            teams
+                .iter()
+                .find(|t| t["id"] == json!(id))
+                .unwrap_or_else(|| panic!("team {id} missing from {body}"))
+        };
+
+        let sales = team(c.sales);
+        assert_eq!(sales["slug"], json!("sales"));
+        assert_eq!(sales["period"], json!("day"));
+        assert_eq!(sales["no_budget"], json!(false));
+        assert_eq!(
+            sales["budgets"],
+            json!([{
+                "currency": "USD",
+                "daily_total": {"minor": 20_000, "currency": "USD"},
+                "reserved_today_minor": 10_00,
+                "remaining_minor": 19_000,
+                "set_by": "team",
+            }]),
+            "{sales}"
+        );
+
+        let ops = team(ops);
+        assert_eq!(ops["no_budget"], json!(true), "{ops}");
+        assert_eq!(ops["budgets"], json!([]));
+
+        let lena = seat(&body, c.lena);
+        assert_eq!(
+            lena["team_budget_remaining"],
+            json!({"USD": 19_000}),
+            "{lena}"
+        );
+        assert_eq!(lena["spend_caps"][0]["reserved_today_minor"], json!(10_00));
+        let marc = seat(&body, c.marc);
+        assert_eq!(marc["team_budget_remaining"], Value::Null);
+
+        assert_eq!(body["totals"]["USD"]["daily_total_minor"], json!(50_00));
+        assert_eq!(
+            body["totals"]["USD"]["team_daily_total_minor"],
+            json!(20_000)
+        );
+        assert_eq!(body["totals"]["USD"]["reserved_today_minor"], json!(10_00));
+
+        h.teardown().await;
+    }
+
     #[tokio::test]
     async fn another_tenant_sees_none_of_it() {
         let Some(h) = Harness::new().await else {
@@ -678,6 +861,7 @@ mod tests {
         let (status, body) = h.call("GET", "/v1/controls", SECRET_B, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["seats"], json!([]));
+        assert_eq!(body["teams"], json!([]));
         assert_eq!(body["totals"], json!({}));
         assert_eq!(body["halt"]["halted"], json!(false));
 
