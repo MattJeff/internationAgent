@@ -847,7 +847,18 @@ async fn answer(
         .into_response());
     };
 
-    let (built, refused) = apply(role, &base, proposal);
+    let (built, mut refused) = apply(role, &base, proposal);
+    // `{}` is the model obeying "omit anything they did not say": the answer
+    // did not answer the question. Nothing was refused, so without this line
+    // the founder would read "nothing was written" and no reason.
+    if built.is_none() && refused.is_empty() {
+        refused.push(Refusal {
+            field: String::new(),
+            why: "the employee found nothing in that answer that fits the question, so it \
+                  wrote nothing; answer the question as it is asked"
+                .to_owned(),
+        });
+    }
     let Some((charter, filled)) = built else {
         tracing::info!(
             %id,
