@@ -90,9 +90,6 @@ branche n'est pas poussée.
 
 ### Coutures laissées par la vague 3, à reprendre
 
-- Une réservation publique réveille le siège avec le sujet masqué, mais le
-  motif du tiers n'est pas dans le brief du réveil (`follow_up::brief` rend
-  `None` sur un fil sans sortant) : une ligne dans `initiative.rs`.
 ## Deux décisions prises le 2026-09-05, pour ne pas les reprendre
 
 - **`rate_card` reste.** C'est la seule façon de mettre un dollar sur la
