@@ -284,6 +284,14 @@ struct SeatView {
     /// What is still missing, in `gaps()` order. Empty means this seat can be
     /// planned.
     questions: Vec<Question>,
+    /// The objective as it stands, through its constructors —
+    /// [`Charter::objective_json`], the same shape `POST` echoes back. What
+    /// the founder has already said, so an answered question does not simply
+    /// vanish from the screen on the next reload: the value it produced is
+    /// here to read back. Absent for a seat with no charter or an unreadable
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<Value>,
     /// Set when the stored objective does not read back through its
     /// constructors, in which case there are no questions to ask about it and
     /// the remedy is a `PUT` to `/initiative`. `CharterError::code`.
@@ -546,6 +554,7 @@ async fn questionnaire(
                     slug,
                     role: None,
                     questions: vec![NO_CHARTER],
+                    objective: None,
                     unreadable: None,
                 };
             };
@@ -558,6 +567,7 @@ async fn questionnaire(
                     slug,
                     role: Some(role),
                     questions: charter.open_questions(),
+                    objective: Some(charter.objective_json()),
                     unreadable: None,
                 },
                 Err(err) => {
@@ -567,6 +577,7 @@ async fn questionnaire(
                         slug,
                         role: Some(role),
                         questions: Vec::new(),
+                        objective: None,
                         unreadable: Some(err.code()),
                     }
                 }
@@ -836,7 +847,18 @@ async fn answer(
         .into_response());
     };
 
-    let (built, refused) = apply(role, &base, proposal);
+    let (built, mut refused) = apply(role, &base, proposal);
+    // `{}` is the model obeying "omit anything they did not say": the answer
+    // did not answer the question. Nothing was refused, so without this line
+    // the founder would read "nothing was written" and no reason.
+    if built.is_none() && refused.is_empty() {
+        refused.push(Refusal {
+            field: String::new(),
+            why: "the employee found nothing in that answer that fits the question, so it \
+                  wrote nothing; answer the question as it is asked"
+                .to_owned(),
+        });
+    }
     let Some((charter, filled)) = built else {
         tracing::info!(
             %id,
@@ -1950,6 +1972,14 @@ mod tests {
         // --- and the questionnaire agrees -----------------------------------
         let (_, seen) = h.send("GET", "/v1/interview", SECRET_A, None).await;
         assert_eq!(seen["seats"][1]["questions"], json!([]), "{seen}");
+        assert_eq!(
+            seen["seats"][1]["objective"], done["objective"],
+            "what was answered is read back, so a reload does not lose it: {seen}"
+        );
+        assert!(
+            seen["seats"][0]["objective"].is_null(),
+            "a seat with no charter has no objective to show: {seen}"
+        );
 
         // --- one audit row, for the one answer that was written -------------
         //

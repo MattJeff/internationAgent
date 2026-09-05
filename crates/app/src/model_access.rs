@@ -102,6 +102,7 @@ use agentos_domain::policy::ModelId;
 use agentos_providers::Secret;
 use agentos_providers::llm::{Llm, LlmRequest, Message};
 use agentos_providers::llm_anthropic::AnthropicLlm;
+use agentos_providers::llm_cli::CliLlm;
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{StoreError, TenantTx};
 use agentos_store::model_access::Connection;
@@ -376,14 +377,22 @@ pub async fn connect(
             let key = key.ok_or(ConnectError::NoKey)?;
             (probe(&client(&key, api_base), model).await, Some(key))
         }
-        ModelPath::Cli => {
-            if backend.pays_with_our_key() {
-                return Err(ConnectError::HostModelIsNotYours);
+        ModelPath::Cli => match key {
+            // Their own subscription: `claude setup-token`, pasted in the
+            // console. The binary on this box runs under it, so what the host
+            // pays for is not in question and the host's own login is not
+            // consulted. Proven the same way a key is — a call, here, now.
+            Some(key) => (
+                probe(&CliLlm::new().with_oauth_token(&key), model).await,
+                Some(key),
+            ),
+            None => {
+                if backend.pays_with_our_key() {
+                    return Err(ConnectError::HostModelIsNotYours);
+                }
+                (probe(host.as_ref(), model).await, None)
             }
-            // Dropped, whatever the caller sent. The host's model was proven and
-            // a credential is not part of that proof.
-            (probe(host.as_ref(), model).await, None)
-        }
+        },
     };
 
     if !verdict.is_connected() {
@@ -623,6 +632,15 @@ pub async fn llm_for(
 ) -> Result<Arc<dyn Llm>, NoModel> {
     match connection.access.path {
         ModelPath::Cli => {
+            // A sealed token on the cli path is the tenant's subscription
+            // (`0084`): a fresh `CliLlm` under it, per call, and the host's
+            // login is never touched. No token is the host's own session.
+            if let Some(sealed) = connection.sealed_key.as_deref() {
+                let token = credentials
+                    .open_as(tenant_id, &model_context(tenant_id), sealed)
+                    .map_err(|_| NoModel::KeyMissing)?;
+                return Ok(Arc::new(CliLlm::new().with_oauth_token(&token)));
+            }
             // The founder's rule at the spending end. `connect` refuses this
             // path on a host whose model is a key of ours; `AGENTOS_LLM` can
             // change after a tenant connected, so it is checked again here —
@@ -946,12 +964,15 @@ mod tests {
 
     /// **What is stored is what was proven, and nothing else.**
     ///
-    /// A `cli` connection that also carries a key proves the *host's* model. The
-    /// key was never tried, so it must not be sealed into the row — otherwise "a
-    /// stored credential is always one that answered" is a sentence in a doc
-    /// comment rather than a property.
+    /// Since `0084` a `cli` connection carrying a token is the tenant's own
+    /// subscription, and the token is what gets proven: a fresh `CliLlm` runs
+    /// under it. A token nobody could authenticate with is therefore refused
+    /// — nothing stored, no row — whether the box has a `claude` binary (the
+    /// CLI answers 401 and a `<synthetic>` message, `cli_not_logged_in`) or
+    /// not (`cli_failed`). Both are "not connected", and both leave the tenant
+    /// exactly as they were.
     #[tokio::test]
-    async fn a_cli_connection_does_not_store_a_key_it_never_tried() {
+    async fn a_cli_connection_with_a_token_nobody_can_use_stores_nothing() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
@@ -962,31 +983,29 @@ mod tests {
             &mut tx,
             &cipher(),
             &host,
-            LlmBackend::Cli,
+            // The host paying with its own key does not matter here: the
+            // tenant brought a credential, and that is what runs.
+            LlmBackend::Anthropic,
             ModelPath::Cli,
             ModelId::Opus5,
-            // Never tried: the probe above went to the host, not to this.
-            Some(Secret::new("sk-ant-never-tried")),
+            Some(Secret::new("sk-ant-oat01-nobody-issued-this")),
             None,
             AuditActor::Operator("founder@example.com".to_owned()),
             Utc::now(),
         )
         .await
-        .expect("connect");
-        assert_eq!(outcome.verdict, Verdict::Connected);
-        assert_eq!(outcome.access.expect("stored").path, ModelPath::Cli);
+        .expect("a refused token is an outcome, not an error");
+        assert!(!outcome.verdict.is_connected(), "{:?}", outcome.verdict);
+        assert!(outcome.access.is_none());
         tx.commit().await.expect("commit");
 
-        // Two steps, so the failure names the fact rather than printing
-        // `unwrap_err() on an Ok value` at whoever broke it.
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
-        let stored = agentos_store::model_access::load(&mut tx)
-            .await
-            .expect("load")
-            .expect("connected");
         assert!(
-            stored.sealed_key.is_none(),
-            "the row holds a key that was never proven against anything"
+            agentos_store::model_access::load(&mut tx)
+                .await
+                .expect("load")
+                .is_none(),
+            "a token that never answered must not be on the row"
         );
         tx.commit().await.expect("commit");
     }

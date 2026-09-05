@@ -201,12 +201,14 @@ pub struct Connection {
     /// What the verification call proved: the path, the model and the moment.
     /// Safe to serialize; there is no credential field on it.
     pub access: ModelAccess,
-    /// The sealed credential, or `None` on [`ModelPath::Cli`], which has none.
+    /// The sealed credential. On [`ModelPath::ApiKey`] always present; on
+    /// [`ModelPath::Cli`] it is the tenant's own subscription token
+    /// (`claude setup-token`) when they pasted one, and `None` for the host's
+    /// own login — `0084` relaxed `0050`'s biconditional exactly that far.
     ///
     /// The envelope from `agentos_providers::secrets::Envelope::to_bytes`, under
-    /// AAD `model://<tenant>`. `0050`'s CHECK constraint makes this a
-    /// biconditional with `path`: an `api_key` row always has one and a `cli`
-    /// row never does, so the `None` arm below the `ApiKey` match in
+    /// AAD `model://<tenant>`. An `api_key` row without one is still a failed
+    /// statement, so the `None` arm below the `ApiKey` match in
     /// `agentos_app::model_access::llm_for` is a database corruption and not an
     /// ordinary state.
     pub sealed_key: Option<Vec<u8>>,
@@ -271,10 +273,10 @@ pub async fn load(tx: &mut TenantTx<'_>) -> Result<Option<Connection>, StoreErro
 ///
 /// # `sealed_key` is not optional in the sense the type suggests
 ///
-/// It is `Option` because [`ModelPath::Cli`] genuinely has no credential, not
-/// because an `api_key` connection may omit one. `0050`'s CHECK constraint makes
-/// the pairing a biconditional, so the wrong combination is a failed statement
-/// and not a row somebody discovers a week later:
+/// It is `Option` because [`ModelPath::Cli`] may run on the host's own login,
+/// not because an `api_key` connection may omit one. `0050`'s CHECK constraint,
+/// as `0084` left it, makes the wrong combination a failed statement and not a
+/// row somebody discovers a week later:
 ///
 /// ```text
 /// new row for relation "tenant_model_access" violates check constraint
@@ -438,21 +440,36 @@ mod tests {
     /// the process holding the other half restarted. A constraint has no other
     /// half.
     ///
-    /// Both directions, and the second is not decoration: a `cli` row carrying a
-    /// credential is a key nothing will ever read and nobody can ever see, which
-    /// is the shape `connect`'s narrowing exists to prevent and which only the
-    /// table can enforce against a `psql` session.
+    /// A `cli` row carrying a credential used to be refused too; since `0084`
+    /// it is a tenant's own subscription token and it must round-trip.
     #[tokio::test]
-    async fn the_table_refuses_an_api_key_row_with_no_key_and_a_cli_row_with_one() {
+    async fn the_table_refuses_an_api_key_row_with_no_key_and_keeps_a_cli_rows_token() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
         let now = Utc::now();
 
+        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        let access = ModelAccess {
+            path: ModelPath::Cli,
+            model: ModelId::Opus5,
+            verified_at: now,
+        };
+        save(&mut tx, &access, Some(b"sealed-subscription"), now)
+            .await
+            .expect("a cli row may carry the tenant's subscription token");
+        let back = load(&mut tx).await.expect("load").expect("a row");
+        assert_eq!(
+            back.sealed_key.as_deref(),
+            Some(&b"sealed-subscription"[..])
+        );
+        assert_eq!(back.access.path, ModelPath::Cli);
+        tx.commit().await.expect("commit");
+
         for (path, sealed, what) in [
             (ModelPath::ApiKey, None, "api_key with no credential"),
-            (ModelPath::Cli, Some(&b"x"[..]), "cli carrying a credential"),
             (ModelPath::ApiKey, Some(&b""[..]), "an empty envelope"),
+            (ModelPath::Cli, Some(&b""[..]), "an empty envelope on cli"),
         ] {
             let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
             let refused = save(
