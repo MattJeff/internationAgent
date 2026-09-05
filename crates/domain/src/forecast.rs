@@ -87,9 +87,12 @@ pub const fn rate_card(model: ModelId) -> (f64, f64) {
 
 /// Days in a billed month. A month, rounded the way an operator budgets one.
 ///
-/// Only `agentos_eval::cost` uses it: a monthly headline is a monthly headline.
-/// `/v1/forecast` takes its window from the caller and never touches this — the
-/// founder who asks for two days must not be answered in thirtieths.
+/// `agentos_eval::cost` uses it for its monthly headline. `/v1/forecast` takes
+/// its *window* from the caller and never stretches tokens to thirtieths — the
+/// founder who asks for two days is answered in two days — but the one figure
+/// that is monthly by contract, the infrastructure price the caller passes as
+/// `infra_usd_per_month`, is prorated over the window through this constant,
+/// because a monthly price has no other honest reading in a two-day window.
 pub const MONTH_DAYS: f64 = 30.0;
 
 /// The floor: every reserved turn answered in a single round trip.
@@ -141,7 +144,17 @@ impl Sample {
     /// days of a turn budget for `agentos_eval::cost`, a founder's two days for
     /// `/v1/forecast`. The function does not know which and does not need to.
     pub fn usd(self, model: ModelId, calls_per_turn: f64, turns: f64) -> f64 {
-        let (per_m_in, per_m_out) = rate_card(model);
+        self.usd_at(rate_card(model), calls_per_turn, turns)
+    }
+
+    /// The same multiplication at rates the caller names — `(USD per million
+    /// in, USD per million out)` — rather than the rate card's.
+    ///
+    /// This is where [`Sample::usd`] lands, and it is public for one caller:
+    /// `/v1/forecast` pricing a window at the tariff the tenant declared on
+    /// their own Anthropic contract, which primes the rate card. The arithmetic
+    /// is not repeated there; only the pair of rates changes.
+    pub fn usd_at(self, (per_m_in, per_m_out): (f64, f64), calls_per_turn: f64, turns: f64) -> f64 {
         let calls = calls_per_turn * turns;
         calls * (self.input_tokens_per_call * per_m_in + self.output_tokens_per_call * per_m_out)
             / 1_000_000.0
@@ -247,6 +260,17 @@ mod tests {
         // a seat that never wakes contribute a real zero to a company's bill
         // rather than a rounding artefact.
         assert_eq!(round.usd(ModelId::Opus5, 1.7, 0.0), 0.0);
+
+        // A declared pair of rates goes through the same multiplication: $7 a
+        // million in, on a million in, is $7 — and the rate card is not consulted.
+        assert!((round.usd_at((7.0, 0.0), 1.0, 1.0) - 7.0).abs() < 1e-9);
+        assert!(
+            (round.usd(ModelId::Opus5, 1.0, 1.0)
+                - round.usd_at(rate_card(ModelId::Opus5), 1.0, 1.0))
+            .abs()
+                < 1e-9,
+            "`usd` is `usd_at` at the rate card, not a second copy"
+        );
     }
 
     /// **The per-seat claim.** The same seat, the same turns, the same sample,

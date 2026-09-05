@@ -76,7 +76,7 @@ expensive defect available in this product.
 | Connect tools (MCP) | built | `/v1/mcp/*`, `catalog.rs`, `mcp.rs` |
 | Budget and caps | built | `/v1/employees/{id}/spend-caps`, `/v1/billing`, `/v1/usage` |
 | Declared tariff → P&L per seat | built | `POST /v1/model` carries `usd_per_mtok_*`; `GET /v1/pnl?days=N`, `pnl.rs` |
-| Duration → forecast | built | `/v1/forecast`, `forecast.rs` |
+| Duration → forecast, and the point mort | built | `/v1/forecast?days=N&infra_usd_per_month=M`, `forecast.rs` — tokens at the declared tariff (else the rate card, `cost_source` says which) + our contract prorated, ÷ the mean collected invoice = `break_even.invoices_to_break_even`; `null` with its reason, never a conversion |
 | Duration → enforced stop | built | `company_windows` (0054), `halt.rs`, `PUT /v1/window` |
 | A new company gets one | built, **required** | `POST /v1/companies` refuses without `window_ends_at` |
 | Hiring into a company with no window | allowed, on purpose | hiring is not acting: the seat is inert until a window exists |

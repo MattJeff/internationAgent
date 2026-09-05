@@ -65,6 +65,38 @@
 //! `cost_usd` is `null` on that path and the model-call figure is what a plan is
 //! sized against. `rate_card`'s own docs carry the argument.
 //!
+//! # Two prices coexist, and this is the rule between them
+//!
+//! `rate_card` is a published list price with a date on it, and it is the one
+//! price this repository holds. `usage.rs` and `pnl.rs` argue that no price in a
+//! repository can be trusted — a contract the schema has never seen decides the
+//! real one — and `0079` lets the tenant declare that contract on `POST
+//! /v1/model`. Both exist today, so the priority is stated here rather than
+//! left to whichever file a reader opens first: **a complete declared tariff
+//! primes the rate card.** `cost_source` says which one priced the window —
+//! `declared_tariff` or `rate_card` — beside the figure, and `null` on the CLI
+//! path where there is no figure. A partial tariff (a component left unknown)
+//! does not prime: the rate card is a whole price and a tariff missing its
+//! output rate is not, and mixing the two would be a bill from two contracts.
+//! The multiplication is still the one in `Sample::usd_at`; only the pair of
+//! rates changes.
+//!
+//! # The point mort, and why it is a division rather than a percentage
+//!
+//! A buyer at $5k a month does not want a probability; he wants to know how
+//! much he must collect to be level. `break_even` is that: the window's cost —
+//! tokens at the rule above plus, when the caller passes
+//! `infra_usd_per_month`, our own contract prorated over the window — divided
+//! by the mean of the invoices this tenant has **collected**, over its whole
+//! register. Three numbers with their sources named in `basis`, and a
+//! `ceil`. The infrastructure price comes from the caller and never from the
+//! repository, for `billing.rs`'s reason: a price is not a measurement. When a
+//! number is missing the quotient is `null` and `basis` says which one — no
+//! paid invoice yet, or invoices in a currency the cost is not in. **No
+//! conversion**: `sourcing.rs` refuses an exchange rate the caller did not
+//! supply, and a break-even that silently converted EUR invoices into USD cost
+//! would be a stale constant deciding whether a company is viable.
+//!
 //! # What is deliberately not here
 //!
 //! Anything a caller could aim at another tenant. There is no employee id in the
@@ -75,11 +107,14 @@
 //! [`ModelPath::ApiKey`]: agentos_domain::model_access::ModelPath::ApiKey
 //! [`ModelPath::Cli`]: agentos_domain::model_access::ModelPath::Cli
 
+use std::collections::BTreeMap;
+
 use agentos_app::vertical::Charter;
 use agentos_domain::employee::Lifecycle;
-use agentos_domain::forecast::{FLOOR_CALLS_PER_TURN, Sample, spread};
+use agentos_domain::forecast::{FLOOR_CALLS_PER_TURN, MONTH_DAYS, Sample, rate_card, spread};
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::model_access::ModelPath;
+use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{ModelId, model_for};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::{model_access, policy as policy_store};
@@ -125,13 +160,18 @@ const SECONDS_PER_DAY: u64 = 86_400;
 /// month.
 const MAX_DAYS: u32 = 90;
 
-/// `?days=`.
+/// `?days=&infra_usd_per_month=`.
 #[derive(Debug, Deserialize)]
 pub struct ForecastQuery {
     /// How long the company runs. Required, and deliberately: there is no
     /// honest default. Substituting thirty would answer a question the caller
     /// did not ask with a number they would read as theirs.
     days: Option<u32>,
+    /// What our contract costs this tenant a month, in USD. Optional, and from
+    /// the caller only: the repository holds no price for its own seat
+    /// (`billing.rs`), so absent means the break-even counts tokens alone and
+    /// says so.
+    infra_usd_per_month: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +241,11 @@ struct Forecast {
     /// per-token invoice to compute and a number would be a fiction with a
     /// currency symbol on it.
     cost_usd: Option<Range>,
+    /// Which price `cost_usd` was computed at. `null` exactly when `cost_usd`
+    /// is. See the module docs for the rule between the two.
+    cost_source: Option<CostSource>,
+    /// How many collected invoices cover the window. See the module docs.
+    break_even: BreakEven,
     /// The most people this company may approach for the first time over the
     /// window, summed over the seats that can act.
     ///
@@ -213,6 +258,51 @@ struct Forecast {
     seats: Vec<Seat>,
     /// **What this forecast does not know.** Read before quoting anything above.
     bounds: Vec<&'static str>,
+}
+
+/// Which price a window was billed at.
+///
+/// Not `agentos_store::model_access::CostSource`: that one names where a
+/// *measured* token count's price came from, and has no arm for a list price
+/// because the P&L never uses one. This forecast does, and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CostSource {
+    /// The complete tariff the tenant declared on `POST /v1/model`.
+    DeclaredTariff,
+    /// `agentos_domain::forecast::rate_card`, the published list price.
+    RateCard,
+}
+
+/// The mean collected invoice in one currency, and how many it is the mean of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct AverageInvoice {
+    count: i64,
+    average: Money,
+}
+
+/// The break-even: what the window costs, what an invoice brings, and the
+/// quotient. Every `Option` is a number this deployment does not have, and
+/// `basis` names which.
+#[derive(Debug, Serialize)]
+struct BreakEven {
+    /// The high end of `cost_usd` — the largest recorded run — not the
+    /// structural ceiling and not the floor. `null` under `cli`.
+    tokens_usd: Option<f64>,
+    /// `infra_usd_per_month × days / 30`. `null` when the caller passed none.
+    infra_usd: Option<f64>,
+    /// The two above, summed. `null` when neither exists.
+    window_cost_usd: Option<f64>,
+    /// Mean of the invoices this tenant has collected, per currency, over its
+    /// whole register. `null` when it has collected none.
+    average_invoice: Option<BTreeMap<Currency, AverageInvoice>>,
+    /// `ceil(window_cost_usd / average_invoice[USD])`. `null` with the reason
+    /// in `basis`.
+    invoices_to_break_even: Option<u64>,
+    /// Where the quotient comes from, or why there is none.
+    basis: &'static str,
+    /// Where each number above comes from, in one sentence each.
+    sources: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,15 +374,22 @@ async fn get(
             )));
         }
     };
+    let infra_usd_per_month = query.infra_usd_per_month;
+    if infra_usd_per_month.is_some_and(|usd| !(usd >= 0.0 && usd.is_finite())) {
+        return Err(ApiError::bad_request(
+            "`infra_usd_per_month` must be a non-negative number: it is what our contract costs \
+             you a month, and a negative or infinite one is not a price",
+        ));
+    }
 
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
 
     // Whose credential a turn would be billed to, and by what path. Before the
     // seats, because it decides whether any of them can take a turn at all.
-    // `.access`: the proof half. The sealed credential comes back in the same
-    // row and is dropped here — a forecast reads which path pays, never what
+    // The sealed credential comes back in the same row and is dropped here — a
+    // forecast reads which path pays and at what declared rate, never what
     // pays.
-    let Some(access) = model_access::load(&mut tx).await?.map(|c| c.access) else {
+    let Some(connection) = model_access::load(&mut tx).await? else {
         tx.rollback().await?;
         return Err(ApiError::not_found().with_detail(
             "no model is connected for this tenant, so none of its employees can take a turn and \
@@ -300,6 +397,43 @@ async fn get(
              this host's claude CLI",
         ));
     };
+    let access = connection.access;
+    // A complete declared tariff primes the rate card; a partial one does not
+    // (module docs). Cache reads are not priced here — see BOUNDS — so only
+    // the in/out pair travels.
+    let declared = connection
+        .tariff
+        .filter(|t| t.is_complete())
+        .and_then(|t| Some((t.usd_per_mtok_input?, t.usd_per_mtok_output?)));
+
+    // The invoices this tenant has collected, per currency, over its whole
+    // register. Credit notes excluded (`corrects_invoice_id IS NULL`), as
+    // `pnl.rs` excludes them. No `WHERE tenant_id`: RLS. `round(avg)` in SQL
+    // so the mean is cents before it is a `Money`, never a float amount.
+    let paid: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT currency, count(*)::bigint, round(avg(amount_minor))::bigint \
+           FROM invoices \
+          WHERE paid_at IS NOT NULL AND corrects_invoice_id IS NULL \
+          GROUP BY currency",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(StoreError::from)?;
+    let mut average_invoice = BTreeMap::new();
+    for (code, count, minor) in paid {
+        let currency: Currency =
+            code.parse()
+                .map_err(|err: agentos_domain::money::MoneyError| {
+                    StoreError::conflict(err.to_string())
+                })?;
+        let average = u64::try_from(minor)
+            .ok()
+            .and_then(|minor| Money::new(minor, currency).ok())
+            .ok_or_else(|| {
+                StoreError::conflict("a collected invoice averages to nothing".to_owned())
+            })?;
+        average_invoice.insert(currency, AverageInvoice { count, average });
+    }
 
     // Terminated employees are left out: that lifecycle is absorbing, so they
     // are gone rather than idle, and listing them forever is noise on a screen
@@ -335,7 +469,15 @@ async fn get(
     // back deliberately.
     tx.rollback().await?;
 
-    Ok(axum::Json(assemble(days, access.path, seats)).into_response())
+    Ok(axum::Json(assemble(
+        days,
+        access.path,
+        seats,
+        declared,
+        infra_usd_per_month,
+        average_invoice,
+    ))
+    .into_response())
 }
 
 /// One seat, resolved exactly as `loops::initiative` resolves it before a turn.
@@ -499,7 +641,14 @@ async fn seat(
 /// `the_bill_is_the_sum_of_the_seats_and_the_cli_gets_no_bill` can put a company
 /// through it without a database, which is what lets the money be checked by
 /// hand against the rate card rather than only end to end.
-fn assemble(days: u32, path: ModelPath, seats: Vec<Seat>) -> Forecast {
+fn assemble(
+    days: u32,
+    path: ModelPath,
+    seats: Vec<Seat>,
+    declared: Option<(f64, f64)>,
+    infra_usd_per_month: Option<f64>,
+    average_invoice: BTreeMap<Currency, AverageInvoice>,
+) -> Forecast {
     let turns: u64 = seats.iter().map(|seat| seat.turns).sum();
     let ceiling_calls_per_turn = f64::from(agentos_app::turn::Budgets::default().max_turns);
 
@@ -519,12 +668,16 @@ fn assemble(days: u32, path: ModelPath, seats: Vec<Seat>) -> Forecast {
     // turn count multiplied once — that was right while one model served every
     // seat and is a category error now, and it is the mistake
     // `agentos_eval::cost::company_usd` was rewritten to stop making.
+    //
+    // The rates: the tenant's complete declared tariff for every seat, or the
+    // rate card per model. One multiplication either way — `Sample::usd_at`.
+    let rates = |model: ModelId| declared.unwrap_or_else(|| rate_card(model));
     let company = |sample: Sample, rate: f64| {
         cents(
             seats
                 .iter()
                 .filter_map(|seat| Some((seat.model?, seat.turns)))
-                .map(|(model, turns)| sample.usd(model, rate, turns as f64))
+                .map(|(model, turns)| sample.usd_at(rates(model), rate, turns as f64))
                 .sum(),
         )
     };
@@ -540,21 +693,37 @@ fn assemble(days: u32, path: ModelPath, seats: Vec<Seat>) -> Forecast {
             ceiling: spread(|s| company(s, ceiling_calls_per_turn)).1,
         }
     });
+    let cost_source = cost_usd.as_ref().map(|_| match declared {
+        Some(_) => CostSource::DeclaredTariff,
+        None => CostSource::RateCard,
+    });
 
     let mut bounds = BOUNDS.to_vec();
     if path.is_host() {
         bounds.push(SUBSCRIPTION_BOUND);
     }
 
+    let break_even = break_even(
+        days,
+        cost_usd.as_ref().map(|range| range.high),
+        cost_source,
+        infra_usd_per_month,
+        average_invoice,
+    );
+
     Forecast {
         days,
         regime: path,
-        regime_note: match path {
-            ModelPath::ApiKey => {
+        regime_note: match (path, declared) {
+            (ModelPath::ApiKey, Some(_)) => {
+                "every token below is billed to the key this tenant connected, at the tariff \
+                 this tenant declared"
+            }
+            (ModelPath::ApiKey, None) => {
                 "every token below is billed to the key this tenant connected, at published list \
                  prices"
             }
-            ModelPath::Cli => {
+            (ModelPath::Cli, _) => {
                 "this tenant runs the host's claude CLI on a subscription, so the unit is \
                  throughput and not money"
             }
@@ -562,9 +731,96 @@ fn assemble(days: u32, path: ModelPath, seats: Vec<Seat>) -> Forecast {
         turns,
         model_calls,
         cost_usd,
+        cost_source,
+        break_even,
         new_contacts_ceiling: seats.iter().map(|seat| seat.new_contacts_ceiling).sum(),
         seats,
         bounds,
+    }
+}
+
+/// The division, and every reason it may not happen.
+///
+/// Pure, for the reason [`assemble`] is: the arithmetic is small enough to
+/// redo by hand and a test does. `tokens_usd` is the high end of `cost_usd`
+/// (the largest recorded run), `None` under `cli`.
+fn break_even(
+    days: u32,
+    tokens_usd: Option<f64>,
+    cost_source: Option<CostSource>,
+    infra_usd_per_month: Option<f64>,
+    average_invoice: BTreeMap<Currency, AverageInvoice>,
+) -> BreakEven {
+    let mut sources = Vec::with_capacity(3);
+    sources.push(match cost_source {
+        Some(CostSource::DeclaredTariff) => {
+            "tokens: the high end of cost_usd — the largest recorded run — at the tariff this \
+             tenant declared on POST /v1/model"
+                .to_owned()
+        }
+        Some(CostSource::RateCard) => {
+            "tokens: the high end of cost_usd — the largest recorded run — at the published rate \
+             card, because this tenant declared no complete tariff"
+                .to_owned()
+        }
+        None => "tokens: not priced, this tenant runs on a subscription (see cost_usd)".to_owned(),
+    });
+
+    let infra_usd =
+        infra_usd_per_month.map(|monthly| cents(monthly * f64::from(days) / MONTH_DAYS));
+    sources.push(match infra_usd_per_month {
+        Some(monthly) => format!(
+            "infra: {monthly} USD a month as the caller passed it in infra_usd_per_month, \
+             prorated {days}/{MONTH_DAYS} over the window"
+        ),
+        None => "infra: not counted — the caller passed no infra_usd_per_month, so the \
+                 window cost is tokens alone"
+            .to_owned(),
+    });
+
+    let window_cost_usd = match (tokens_usd, infra_usd) {
+        (None, None) => None,
+        (tokens, infra) => Some(cents(tokens.unwrap_or(0.0) + infra.unwrap_or(0.0))),
+    };
+
+    sources.push(if average_invoice.is_empty() {
+        "average invoice: none — this tenant has not collected an invoice yet".to_owned()
+    } else {
+        let per_currency: Vec<String> = average_invoice
+            .values()
+            .map(|avg| format!("{} ({} collected)", avg.average, avg.count))
+            .collect();
+        format!(
+            "average invoice: the mean of every invoice this tenant has collected, over its \
+             whole register, per currency: {}",
+            per_currency.join(", ")
+        )
+    });
+
+    // The cost is in USD, so only a USD mean divides it. Anything else is a
+    // conversion the caller did not supply a rate for.
+    let (invoices_to_break_even, basis) =
+        match (window_cost_usd, average_invoice.get(&Currency::Usd)) {
+            (None, _) => (None, "no_priced_cost_in_window"),
+            (Some(_), None) if average_invoice.is_empty() => (None, "no_paid_invoice_yet"),
+            (Some(_), None) => (None, "currency_mismatch"),
+            (Some(cost), Some(usd)) => {
+                let average = usd.average.minor() as f64 / Currency::Usd.minor_per_major() as f64;
+                (
+                    Some((cost / average).ceil() as u64),
+                    "ceil_of_window_cost_over_average_paid_invoice",
+                )
+            }
+        };
+
+    BreakEven {
+        tokens_usd,
+        infra_usd,
+        window_cost_usd,
+        average_invoice: (!average_invoice.is_empty()).then_some(average_invoice),
+        invoices_to_break_even,
+        basis,
+        sources,
     }
 }
 
@@ -587,11 +843,12 @@ mod tests {
 
     use agentos_app::rolepack_service;
     use agentos_domain::forecast::{RECORDED, rate_card};
-    use agentos_domain::ids::TenantId;
+    use agentos_domain::ids::{InvoiceId, TenantId};
     use agentos_domain::initiative::Cadence;
     use agentos_domain::model_access::ModelAccess;
     use agentos_domain::policy::PolicyLimits;
     use agentos_store::initiative as initiative_store;
+    use agentos_store::invoices::{self, Draft};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, StatusCode, header};
     use chrono::Utc;
@@ -616,6 +873,176 @@ mod tests {
         }
     }
 
+    /// [`assemble`] with no declared tariff, no infra and no collected invoice:
+    /// the forecast as it was before the break-even existed.
+    fn plain(days: u32, path: ModelPath, seats: Vec<Seat>) -> Forecast {
+        assemble(days, path, seats, None, None, BTreeMap::new())
+    }
+
+    fn usd_average(count: i64, major: u64) -> BTreeMap<Currency, AverageInvoice> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            Currency::Usd,
+            AverageInvoice {
+                count,
+                average: Money::from_major(major, Currency::Usd).expect("nonzero"),
+            },
+        );
+        map
+    }
+
+    /// **A complete declared tariff primes the rate card, and a partial one
+    /// does not.** Same seats, same samples, the one multiplication at the
+    /// tenant's own rates.
+    #[test]
+    fn a_complete_declared_tariff_primes_the_rate_card() {
+        let seats = || vec![working("sdr", ModelId::Haiku45, 100, 5)];
+        let listed = plain(7, ModelPath::ApiKey, seats());
+        assert_eq!(listed.cost_source, Some(CostSource::RateCard));
+
+        // Ten times Haiku's list price, in and out.
+        let declared = assemble(
+            7,
+            ModelPath::ApiKey,
+            seats(),
+            Some((10.0, 50.0)),
+            None,
+            BTreeMap::new(),
+        );
+        assert_eq!(declared.cost_source, Some(CostSource::DeclaredTariff));
+        let (list, own) = (
+            listed.cost_usd.expect("metered"),
+            declared.cost_usd.expect("metered"),
+        );
+        assert!(
+            (own.high - list.high * 10.0).abs() < 0.05,
+            "the declared rate did not price the window: {own:?} vs {list:?}"
+        );
+        assert!(
+            declared.regime_note.contains("declared"),
+            "{}",
+            declared.regime_note
+        );
+        assert!(declared.break_even.sources[0].contains("tariff this tenant declared"));
+
+        // The subscription is still not priced, at anybody's rate.
+        let cli = assemble(
+            7,
+            ModelPath::Cli,
+            seats(),
+            Some((10.0, 50.0)),
+            None,
+            BTreeMap::new(),
+        );
+        assert!(cli.cost_usd.is_none());
+        assert_eq!(cli.cost_source, None);
+    }
+
+    /// **The point mort is a division, and every missing operand is named.**
+    /// By hand: no seats, 2 500 USD of infra over a 30-day window, two
+    /// collected invoices of 1 000 USD — three invoices to be level.
+    #[test]
+    fn the_break_even_is_a_ceil_and_every_missing_operand_is_named() {
+        let level = assemble(
+            30,
+            ModelPath::ApiKey,
+            vec![],
+            None,
+            Some(2_500.0),
+            usd_average(2, 1_000),
+        );
+        let be = &level.break_even;
+        assert_eq!(be.tokens_usd, Some(0.0));
+        assert_eq!(be.infra_usd, Some(2_500.0));
+        assert_eq!(be.window_cost_usd, Some(2_500.0));
+        assert_eq!(be.invoices_to_break_even, Some(3));
+        assert_eq!(be.basis, "ceil_of_window_cost_over_average_paid_invoice");
+        assert_eq!(be.sources.len(), 3, "{:?}", be.sources);
+
+        // Prorated: the same contract over two days is a fifteenth of it.
+        let two_days = assemble(
+            2,
+            ModelPath::ApiKey,
+            vec![],
+            None,
+            Some(2_500.0),
+            usd_average(2, 1_000),
+        );
+        assert!((two_days.break_even.infra_usd.expect("infra") - 166.67).abs() < 1e-9);
+        assert_eq!(two_days.break_even.invoices_to_break_even, Some(1));
+
+        // No collected invoice: the cost stands, the quotient does not.
+        let unpaid = assemble(
+            30,
+            ModelPath::ApiKey,
+            vec![],
+            None,
+            Some(2_500.0),
+            BTreeMap::new(),
+        );
+        assert_eq!(unpaid.break_even.window_cost_usd, Some(2_500.0));
+        assert!(unpaid.break_even.average_invoice.is_none());
+        assert_eq!(unpaid.break_even.invoices_to_break_even, None);
+        assert_eq!(unpaid.break_even.basis, "no_paid_invoice_yet");
+
+        // Invoices in EUR against a cost in USD: both are shown, nothing is
+        // converted, and the quotient says why it is missing.
+        let mut eur = BTreeMap::new();
+        eur.insert(
+            Currency::Eur,
+            AverageInvoice {
+                count: 2,
+                average: Money::from_major(1_000, Currency::Eur).expect("nonzero"),
+            },
+        );
+        let abroad = assemble(30, ModelPath::ApiKey, vec![], None, Some(2_500.0), eur);
+        assert_eq!(abroad.break_even.window_cost_usd, Some(2_500.0));
+        assert!(abroad.break_even.average_invoice.is_some());
+        assert_eq!(abroad.break_even.invoices_to_break_even, None);
+        assert_eq!(abroad.break_even.basis, "currency_mismatch");
+
+        // No infra passed: tokens alone, and the sentence says so.
+        let tokens_only = assemble(
+            7,
+            ModelPath::ApiKey,
+            vec![working("sdr", ModelId::Haiku45, 100, 5)],
+            None,
+            None,
+            usd_average(1, 1),
+        );
+        let be = &tokens_only.break_even;
+        assert_eq!(be.infra_usd, None);
+        assert_eq!(be.window_cost_usd, be.tokens_usd);
+        assert_eq!(
+            be.tokens_usd,
+            tokens_only.cost_usd.as_ref().map(|r| r.high),
+            "the token operand is the high end of the bill"
+        );
+        assert!(be.sources[1].contains("tokens alone"), "{:?}", be.sources);
+        assert!(be.invoices_to_break_even.is_some());
+
+        // A subscription with no infra has no priced cost at all.
+        let cli = plain(
+            7,
+            ModelPath::Cli,
+            vec![working("sdr", ModelId::Haiku45, 100, 5)],
+        );
+        assert_eq!(cli.break_even.window_cost_usd, None);
+        assert_eq!(cli.break_even.basis, "no_priced_cost_in_window");
+        // And with infra, the infra is the whole cost.
+        let cli_infra = assemble(
+            30,
+            ModelPath::Cli,
+            vec![],
+            None,
+            Some(5_000.0),
+            usd_average(1, 2_000),
+        );
+        assert_eq!(cli_infra.break_even.tokens_usd, None);
+        assert_eq!(cli_infra.break_even.window_cost_usd, Some(5_000.0));
+        assert_eq!(cli_infra.break_even.invoices_to_break_even, Some(3));
+    }
+
     /// **The bill is a sum over seats at their own models, and a subscription
     /// gets none at all.**
     ///
@@ -628,7 +1055,7 @@ mod tests {
             working("sdr", ModelId::Haiku45, 100, 5),
             working("books", ModelId::Opus5, 10, 0),
         ];
-        let metered = assemble(7, ModelPath::ApiKey, seats);
+        let metered = plain(7, ModelPath::ApiKey, seats);
 
         assert_eq!(metered.turns, 110);
         assert_eq!(metered.new_contacts_ceiling, 5);
@@ -664,7 +1091,7 @@ mod tests {
         );
 
         // The same company on a subscription: same work, no invoice.
-        let subscribed = assemble(
+        let subscribed = plain(
             7,
             ModelPath::Cli,
             vec![
@@ -698,7 +1125,7 @@ mod tests {
             no_turns_because: Some("no cadence".to_owned()),
             ..working("idle", ModelId::Fable5, 0, 0)
         };
-        let alone = assemble(7, ModelPath::ApiKey, vec![stopped]);
+        let alone = plain(7, ModelPath::ApiKey, vec![stopped]);
 
         assert_eq!(alone.turns, 0);
         assert_eq!(alone.new_contacts_ceiling, 0);
@@ -707,12 +1134,12 @@ mod tests {
         assert_eq!(bill.high, 0.0, "an idle company bills nothing");
 
         // And adding it to a working company changes no figure at all.
-        let busy = assemble(
+        let busy = plain(
             7,
             ModelPath::ApiKey,
             vec![working("sdr", ModelId::Opus5, 50, 3)],
         );
-        let both = assemble(
+        let both = plain(
             7,
             ModelPath::ApiKey,
             vec![
@@ -741,7 +1168,7 @@ mod tests {
     /// be a tidier version of the same lie.
     #[test]
     fn the_answer_carries_what_it_does_not_know() {
-        let forecast = assemble(
+        let forecast = plain(
             2,
             ModelPath::ApiKey,
             vec![working("sdr", ModelId::Opus5, 8, 2)],
@@ -760,9 +1187,24 @@ mod tests {
             forecast.bounds.iter().any(|bound| bound.contains("±20%")),
             "the estimator's bound is not declared"
         );
-        // And nothing anywhere claims a chance of success.
+        // And nothing anywhere claims a chance of success — the break-even
+        // included, which is a division and never a percentage.
+        let forecast = assemble(
+            2,
+            ModelPath::ApiKey,
+            vec![working("sdr", ModelId::Opus5, 8, 2)],
+            Some((3.0, 15.0)),
+            Some(5_000.0),
+            usd_average(2, 1_000),
+        );
         let body = serde_json::to_string(&forecast).expect("serialize");
-        for banned in ["success", "probability", "likelihood", "confidence"] {
+        for banned in [
+            "success",
+            "probability",
+            "likelihood",
+            "confidence",
+            "percent",
+        ] {
             assert!(
                 !body.contains(banned),
                 "this endpoint published a `{banned}` figure, which nobody has measured"
@@ -1199,6 +1641,9 @@ mod tests {
             "/v1/forecast?days=0",
             "/v1/forecast?days=91",
             "/v1/forecast?days=a-week",
+            "/v1/forecast?days=7&infra_usd_per_month=-1",
+            "/v1/forecast?days=7&infra_usd_per_month=inf",
+            "/v1/forecast?days=7&infra_usd_per_month=five",
         ] {
             let (status, body) = h.get(uri, SECRET_A).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} answered {body}");
@@ -1210,6 +1655,188 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["days"], days);
         }
+
+        h.teardown().await;
+    }
+
+    /// A won deal to invoice against — `invoices::issue` refuses any other.
+    async fn won_deal(db: &Db, tenant: TenantId) -> Uuid {
+        let account = Uuid::now_v7();
+        let opportunity = Uuid::now_v7();
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Buyer plc', $3, 'airline', 'FR')",
+        )
+        .bind(account)
+        .bind(tenant.as_uuid())
+        .bind(format!("buyer-{}.example", account.simple()))
+        .execute(&mut *tx)
+        .await
+        .expect("account");
+        sqlx::query(
+            "INSERT INTO opportunities \
+                 (id, tenant_id, account_id, stage, currency, value_minor, approval_id, closed_at) \
+             VALUES ($1, $2, $3, 'closed_won', 'EUR', 120000, $4, now())",
+        )
+        .bind(opportunity)
+        .bind(tenant.as_uuid())
+        .bind(account)
+        .bind(Uuid::now_v7())
+        .execute(&mut *tx)
+        .await
+        .expect("opportunity");
+        tx.commit().await.expect("commit");
+        opportunity
+    }
+
+    /// One invoice through the real writer, collected or left outstanding.
+    async fn invoice(db: &Db, tenant: TenantId, seat: Uuid, deal: Uuid, amount: Money, paid: bool) {
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let issued = invoices::issue(
+            &mut tx,
+            Draft {
+                id: InvoiceId::new_v7(now),
+                opportunity_id: deal,
+                issued_by: EmployeeId::from_uuid(seat),
+                amount,
+                memo: "onboarding",
+                due_at: None,
+                lines: &[],
+            },
+        )
+        .await
+        .expect("issue");
+        if paid {
+            assert!(
+                invoices::declare_paid(&mut tx, issued.id, issued.issued_at)
+                    .await
+                    .expect("declare paid")
+            );
+        }
+        tx.commit().await.expect("commit");
+    }
+
+    /// **The point mort, end to end.** A declared tariff prices the window
+    /// instead of the rate card; the invoices a tenant has collected — and
+    /// only those, and only its own — divide it.
+    #[tokio::test]
+    async fn a_declared_tariff_prices_the_window_and_collected_invoices_divide_it() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        h.connect(h.a, ModelPath::ApiKey).await;
+        h.connect(h.b, ModelPath::ApiKey).await;
+        h.limits(h.a, 24, 5).await;
+        let seat = h
+            .hire(
+                h.a,
+                "sdr",
+                Lifecycle::Active,
+                Some(answered()),
+                Some(HOURLY),
+            )
+            .await;
+
+        // No tariff: the rate card, and no invoice collected yet.
+        let (status, listed) = h.get("/v1/forecast?days=2", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["cost_source"], "rate_card");
+        let list_high = listed["cost_usd"]["high"].as_f64().expect("a bill");
+        assert!(list_high > 0.0);
+        assert_eq!(listed["break_even"]["invoices_to_break_even"], Value::Null);
+        assert_eq!(listed["break_even"]["basis"], "no_paid_invoice_yet");
+        assert_eq!(listed["break_even"]["average_invoice"], Value::Null);
+        assert_eq!(listed["break_even"]["window_cost_usd"], list_high);
+
+        // A partial tariff does not prime; a complete one, ten times the list
+        // price of the model the seat actually runs, does — and the figure
+        // moves by that factor.
+        let model = ModelId::parse(listed["seats"][0]["model"].as_str().expect("a model"))
+            .expect("a model this build knows");
+        let (list_in, list_out) = rate_card(model);
+        let declare = |tariff: model_access::Tariff| {
+            let db = h.db.clone();
+            async move {
+                let mut tx = db.tenant_tx(h.a).await.expect("tenant tx");
+                assert!(
+                    model_access::set_tariff(&mut tx, tariff)
+                        .await
+                        .expect("set tariff")
+                );
+                tx.commit().await.expect("commit");
+            }
+        };
+        declare(model_access::Tariff {
+            usd_per_mtok_input: Some(list_in * 10.0),
+            ..model_access::Tariff::default()
+        })
+        .await;
+        let (_, partial) = h.get("/v1/forecast?days=2", SECRET_A).await;
+        assert_eq!(partial["cost_source"], "rate_card", "{partial}");
+        assert_eq!(partial["cost_usd"]["high"], list_high);
+
+        declare(model_access::Tariff {
+            usd_per_mtok_input: Some(list_in * 10.0),
+            usd_per_mtok_output: Some(list_out * 10.0),
+            usd_per_mtok_cache_read: Some(0.3),
+        })
+        .await;
+        let (status, own) = h.get("/v1/forecast?days=2", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{own}");
+        assert_eq!(own["cost_source"], "declared_tariff", "{own}");
+        let own_high = own["cost_usd"]["high"].as_f64().expect("a bill");
+        assert!(
+            (own_high - list_high * 10.0).abs() < 0.05,
+            "declared {own_high} vs list {list_high}"
+        );
+
+        // Two collected EUR invoices and an outstanding one on A; two
+        // collected USD invoices on B. The cost is in USD, so A gets the two
+        // figures and no quotient, and B — with no seat, so no token cost —
+        // gets ceil(2 500 / 1 000).
+        let deal_a = won_deal(&h.db, h.a).await;
+        let eur = |major| Money::from_major(major, Currency::Eur).expect("nonzero");
+        let usd = |major| Money::from_major(major, Currency::Usd).expect("nonzero");
+        invoice(&h.db, h.a, seat, deal_a, eur(800), true).await;
+        invoice(&h.db, h.a, seat, deal_a, eur(1_200), true).await;
+        invoice(&h.db, h.a, seat, deal_a, eur(9_000), false).await;
+        let (status, abroad) = h
+            .get("/v1/forecast?days=30&infra_usd_per_month=2500", SECRET_A)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{abroad}");
+        let be = &abroad["break_even"];
+        assert_eq!(be["infra_usd"], 2_500.0);
+        assert_eq!(
+            be["average_invoice"]["EUR"],
+            serde_json::json!({"count": 2, "average": {"minor": 100_000, "currency": "EUR"}}),
+            "the outstanding invoice is not collected: {be}"
+        );
+        assert_eq!(be["invoices_to_break_even"], Value::Null);
+        assert_eq!(be["basis"], "currency_mismatch");
+        assert!(
+            be["sources"].as_array().expect("sources").len() == 3,
+            "{be}"
+        );
+
+        let seat_b = h.hire(h.b, "books", Lifecycle::Draft, None, None).await;
+        let deal_b = won_deal(&h.db, h.b).await;
+        invoice(&h.db, h.b, seat_b, deal_b, usd(1_000), true).await;
+        invoice(&h.db, h.b, seat_b, deal_b, usd(1_000), true).await;
+        let (status, level) = h
+            .get("/v1/forecast?days=30&infra_usd_per_month=2500", SECRET_B)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{level}");
+        let be = &level["break_even"];
+        assert_eq!(be["tokens_usd"], 0.0);
+        assert_eq!(be["window_cost_usd"], 2_500.0);
+        assert_eq!(be["invoices_to_break_even"], 3, "{be}");
+        assert_eq!(be["basis"], "ceil_of_window_cost_over_average_paid_invoice");
+        assert!(
+            be["average_invoice"].get("EUR").is_none(),
+            "A's collected invoices leaked into B's mean: {be}"
+        );
 
         h.teardown().await;
     }
