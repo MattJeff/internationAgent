@@ -694,6 +694,10 @@ fn app(
             // Le même journal, lu pour un seul locataire : ce que la gate lui
             // a refusé, par motif, par verbe, par siège.
             .merge(routes::refusals::router(db.clone()))
+            // And the third reading, beside the two it reconciles: what the
+            // seats consumed at the tenant's declared rate, against what they
+            // invoiced, collected and spent. Same window parser again.
+            .merge(routes::pnl::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))

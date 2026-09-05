@@ -35,6 +35,7 @@ pub mod model; // wave H: the tenant connects the model their employees think wi
 // where none exists; this one replaces one, and can only tighten — see its
 // module docs for the invariant and the three mechanisms that hold it.
 pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
+pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money it moved
 pub mod policy;
 pub mod pool;
 // le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
