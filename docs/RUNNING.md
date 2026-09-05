@@ -94,6 +94,7 @@ expensive defect available in this product.
 | New turns | built | `turn.rs` |
 | Human requests | built | `/v1/capability-requests`, `/v1/approvals` |
 | Emergency halt | built | `/v1/halt`, `halt.rs` |
+| Caps and the stop button, one read | built | `GET /v1/controls`, `controls.rs` — per seat the effective `max_turns_per_day`, `max_new_contacts_per_day`, channels, spend limits and caps with today's consumption, the layer that set each, `acts_on_its_own`; the halt with `stop: POST /v1/halt`; the window; the route that moves each limit |
 | What the gate refused | built | `/v1/refusals`, `refusals.rs` — one audit read, no table |
 
 ## The gaps, stated plainly

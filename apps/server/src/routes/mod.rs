@@ -11,6 +11,7 @@ pub mod billing;
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
+pub mod controls; // tâche K: ce qui borne chaque siège et le bouton d'arrêt, en une lecture
 // le fil: the person reads what landed on a seat's desk and writes back from it.
 // No table and no port — `0028`'s internal channel already is the thread; see
 // `agentos_app::inbound`'s desk section and `migrations/0065`.

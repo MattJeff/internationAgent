@@ -280,6 +280,52 @@ pub async fn load(
     tx: &mut TenantTx<'_>,
     employee_id: EmployeeId,
 ) -> Result<EffectivePolicy, PolicyLoadError> {
+    load_layers(tx, employee_id).await?.effective()
+}
+
+/// The four layers [`load`] intersects, **before** the intersection — so a
+/// reader can say which one set each cap. `None` is a layer nobody wrote,
+/// which [`Layers::effective`] fills from the one above, exactly as `load`
+/// always has: this is `load` with the last line left off, not a second loader.
+#[derive(Debug, Clone)]
+pub struct Layers {
+    pub platform: PolicyLimits,
+    pub tenant: Option<PolicyLimits>,
+    pub role: Option<PolicyLimits>,
+    pub employee: Option<PolicyLimits>,
+}
+
+impl Layers {
+    /// The layers somebody actually wrote, top down. An inherited layer is
+    /// deliberately absent: it did not *set* anything.
+    pub fn written(&self) -> impl Iterator<Item = (PolicyLayer, &PolicyLimits)> {
+        [
+            (PolicyLayer::Platform, Some(&self.platform)),
+            (PolicyLayer::Tenant, self.tenant.as_ref()),
+            (PolicyLayer::Role, self.role.as_ref()),
+            (PolicyLayer::Employee, self.employee.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(layer, limits)| limits.map(|l| (layer, l)))
+    }
+
+    pub fn effective(&self) -> Result<EffectivePolicy, PolicyLoadError> {
+        // Inheritance: an absent layer is the layer above, not the empty layer.
+        // `PolicyLimits::default()` grants nothing, so using it here would turn
+        // a tenant that never wrote a role layer into a tenant that can do
+        // nothing.
+        let tenant = self.tenant.as_ref().unwrap_or(&self.platform);
+        let role = self.role.as_ref().unwrap_or(tenant);
+        let employee = self.employee.as_ref().unwrap_or(role);
+        EffectivePolicy::try_new(&self.platform, tenant, role, employee)
+            .map_err(|source| PolicyLoadError::Irreconcilable { source })
+    }
+}
+
+pub async fn load_layers(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+) -> Result<Layers, PolicyLoadError> {
     let rows: Vec<LayerRow> = sqlx::query_as(SELECT_ACTIVE_LAYERS)
         .bind(tx.tenant_id().as_uuid())
         .bind(employee_id.as_uuid())
@@ -293,18 +339,14 @@ pub async fn load(
         let (layer, limits) = row.into_limits()?;
         found[layer as usize] = Some(limits);
     }
-    let [platform, tenant, role_layer, employee] = found;
+    let [platform, tenant, role, employee] = found;
 
-    // Inheritance: an absent layer is the layer above, not the empty layer.
-    // `PolicyLimits::default()` grants nothing, so using it here would turn a
-    // tenant that never wrote a role layer into a tenant that can do nothing.
-    let platform = platform.ok_or(PolicyLoadError::NoPlatformLayer)?;
-    let tenant = tenant.unwrap_or_else(|| platform.clone());
-    let role_layer = role_layer.unwrap_or_else(|| tenant.clone());
-    let employee = employee.unwrap_or_else(|| role_layer.clone());
-
-    EffectivePolicy::try_new(&platform, &tenant, &role_layer, &employee)
-        .map_err(|source| PolicyLoadError::Irreconcilable { source })
+    Ok(Layers {
+        platform: platform.ok_or(PolicyLoadError::NoPlatformLayer)?,
+        tenant,
+        role,
+        employee,
+    })
 }
 
 /// The intersected `max_turns_per_day` of **many** employees, in one statement.
