@@ -57,6 +57,23 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
 - [ ] **H. Export comptable** — CSV `invoices` + `spend` sur une fenêtre, pack
       finance.
 
+### Coutures laissées par la vague 2, à reprendre
+
+- `Effects::send_invoice` existe et **aucun tour ne le propose** : c'est une
+  treizième ligne de catalogue, donc ~1,4k tokens par appel et une re-mesure
+  de plus. À décider avec le re-pin du digest, pas avant.
+- `POST /v1/invoices/{id}/paid` (encaissement déclaré à la main) n'écrit pas
+  de ligne d'audit ; le chemin Stripe écrit `invoice_paid`. Asymétrie, petite.
+- `crates/domain/src/forecast.rs::rate_card` contient des prix par modèle
+  codés en dur, alors que `billing`, `usage` et `pnl` refusent tout prix dans
+  le dépôt. E fait primer le tarif déclaré ; supprimer `rate_card` est une
+  décision du fondateur.
+- Un envoi fait par `Seller::touch` (vertical) ou `sourcing` n'est pas relancé
+  par G : ces chemins ont leur propre espacement (`contacts.next_follow_up_at`).
+  Deux mécanismes pour une même idée ; en garder un.
+- Le webhook Stripe ne lit que `checkout.session.completed` ; `invoice.paid`
+  et `payment_intent.succeeded` ne paient rien.
+
 ## Vague 3 — ce qu'une entreprise paie ailleurs
 
 - [ ] **I. Page publique de réservation** sur `AppointmentBook` (remplace
