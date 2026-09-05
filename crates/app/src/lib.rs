@@ -15,6 +15,7 @@ pub mod catalog; // the connectors we wrote down, so a customer clicks instead o
 pub mod effects; // U21
 pub mod files; // le classeur: the port a company's documents are kept behind, ours or the customer's
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them
+pub mod follow_up; // la relance: an unanswered email is a calendar promise, and a reply calls it off
 pub mod gate; // U20
 pub mod hosted; // running somebody else's stdio server, outside our process tree
 pub mod http_signature;

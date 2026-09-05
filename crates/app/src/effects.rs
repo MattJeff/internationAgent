@@ -80,6 +80,7 @@ use crate::calendar::{Calendar, CalendarError, PgCalendar};
 // type, so without this line a caller outside this crate could hold the token
 // and not the words. Re-exported under its own name: two names for one type is
 // two things to keep in step.
+use crate::follow_up;
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
 use crate::turn::WHOLE_PAGE;
@@ -2922,6 +2923,62 @@ impl Effects {
             "appointment_id": booked.as_ref().ok().map(AppointmentId::as_uuid),
         }));
         self.record(&ok, detail, booked).await
+    }
+
+    /// Record an email that just went out on its thread, and promise to chase
+    /// it — see [`crate::follow_up`].
+    ///
+    /// Called by `Turn::perform` right after [`Effects::send_email`] answered
+    /// with a provider id, and only there: the seller's and the buyer's own
+    /// senders space their touches on `contacts.next_follow_up_at` and would
+    /// otherwise chase twice. Both writes are one transaction, so a thread
+    /// cannot carry a promise about a message it does not hold.
+    ///
+    /// # Why it takes an [`AppointmentBook`] token and not the email's
+    ///
+    /// The promise spends a turn of this seat's day at an hour nobody chose,
+    /// which is exactly what `ActionKind::AppointmentBook` was minted to let a
+    /// policy layer refuse — see [`crate::calendar`]'s module docs. So the turn
+    /// puts the kind to the gate in the same breath as the send; a seat that
+    /// may not promise an hour sends the email and is not chased for it, and
+    /// the refusal is on the record. The token is never built here or
+    /// anywhere else outside the gate.
+    ///
+    /// `None` is not a failure: a thread they have already answered on, or one
+    /// that has had its `MAX_FOLLOW_UPS`, is recorded and not chased.
+    pub async fn chase<A: Subject<Of = AppointmentBook>>(
+        &self,
+        ok: Authorized<A>,
+        to: &EmailAddress,
+        subject: &str,
+        sent: &ProviderMessageId,
+    ) -> Result<Option<AppointmentId>, EffectError> {
+        let now = Utc::now();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let employee = self.principal.employee_id;
+        let promised = async {
+            let thread =
+                follow_up::sent(&mut tx, employee, to, Some(subject), sent.as_str(), now).await?;
+            follow_up::schedule(&mut tx, employee, thread, to, now).await
+        }
+        .await
+        .map_err(EffectError::Unavailable);
+        // Ours, all of it: the instant is a sum and the id is one we minted.
+        let detail = Some(json!({
+            "at": (now + follow_up::FOLLOW_UP_AFTER).to_rfc3339(),
+            "appointment_id": promised
+                .as_ref()
+                .ok()
+                .and_then(|id| id.as_ref().map(AppointmentId::as_uuid)),
+        }));
+        self.book_effect(&mut tx, &ok, detail, &promised, now)
+            .await?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        promised
     }
 
     /// The de-duplication token for one authorised effect.

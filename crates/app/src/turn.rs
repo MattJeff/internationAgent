@@ -2459,13 +2459,58 @@ impl Turn {
     ) -> Result<Reply, TurnError> {
         match proposal {
             Proposal::Email(subject, body) => {
+                let to = subject.to.clone();
+                let line = body.subject.clone();
                 let sent = gated!(self, trust, origin, subject, |ok| self
                     .effects
                     .send_email(ok, body)
                     .await);
-                performed(sent, |id: ProviderMessageId| {
-                    Reply::Ok(format!("sent, provider message id {}", id.as_str()))
-                })
+                let id = match sent {
+                    Ok(id) => id,
+                    Err(EffectError::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
+                    Err(err) => return Ok(Reply::Error(format!("failed ({}): {err}", err.code()))),
+                };
+                // **The follow-up, and it is a rule rather than a tool.** An
+                // email to somebody outside the company is chased in three days
+                // unless they answer — `crate::follow_up` — and the promise it
+                // books is an `AppointmentBook`, so the kind goes to the gate
+                // here, in the same turn, under the same label. Not `gated!`,
+                // because its refusal arm would tell the model the *email* was
+                // denied: a seat that may not promise an hour has still sent
+                // it, the refusal is on the record like any other, and only
+                // the database being away ends the run.
+                let principal = self.effects.principal();
+                let chased = match trust {
+                    TrustLabel::Trusted => {
+                        match self.gate.authorize(principal, AppointmentBook).await {
+                            Ok(ok) => self.effects.chase(ok, &to, &line, &id).await,
+                            Err(Denied::Unavailable(err)) => {
+                                return Err(TurnError::Unavailable(err));
+                            }
+                            Err(_) => Ok(None),
+                        }
+                    }
+                    TrustLabel::Untrusted => match self
+                        .gate
+                        .authorize_from(principal, Untrusted::new(AppointmentBook), origin)
+                        .await
+                    {
+                        Ok(ok) => self.effects.chase(ok, &to, &line, &id).await,
+                        Err(Denied::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
+                        Err(_) => Ok(None),
+                    },
+                };
+                let chase = match chased {
+                    Ok(Some(_)) => {
+                        "; if nothing comes back you will be woken in three days to follow up"
+                    }
+                    Err(EffectError::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
+                    Ok(None) | Err(_) => "",
+                };
+                Ok(Reply::Ok(format!(
+                    "sent, provider message id {}{chase}",
+                    id.as_str()
+                )))
             }
             Proposal::Read(subject, url, selector) => {
                 let read = gated!(self, trust, origin, subject, |ok| self

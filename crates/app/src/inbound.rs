@@ -373,6 +373,7 @@ use agentos_providers::email::{
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::backlog;
+use agentos_store::calendar;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::org;
 use agentos_store::outbox::{self, NewEvent, OutboxEvent};
@@ -2628,6 +2629,16 @@ pub async fn land(
         }
         _ => None,
     };
+
+    // **Where a reply calls the chase off.** A follow-up promised on this
+    // thread by `crate::follow_up` is settled here, in the transaction that
+    // lands the answer, so the employee is never woken to chase somebody who
+    // has already written back. Zero rows is the ordinary case.
+    if message.direction == Direction::Inbound {
+        calendar::cancel_for_conversation(tx, message.conversation_id, now)
+            .await
+            .map_err(InboundError::Store)?;
+    }
 
     // `work_item` rides on the receipt rather than on a row of its own:
     // nothing ruled on anything (`0064` refuses an audit row for a post), and

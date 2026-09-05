@@ -37,7 +37,7 @@ use sqlx::PgConnection;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
-use agentos_domain::ids::{AppointmentId, EmployeeId, TenantId};
+use agentos_domain::ids::{AppointmentId, ConversationId, EmployeeId, TenantId};
 
 use crate::db::{StoreError, TenantTx};
 
@@ -95,6 +95,11 @@ pub struct Appointment {
     /// success: `"turn"` is written explicitly, so no failure to write can be
     /// mistaken for one.
     pub outcome: Option<String>,
+    /// The thread this promise is about, when it is about one: a follow-up
+    /// booked by `agentos_app::follow_up` names the conversation it chases, so
+    /// a reply on it can settle the promise (see `0082`). `None` for an hour a
+    /// person or a turn promised about nothing on any thread.
+    pub conversation_id: Option<ConversationId>,
     /// When it was written down.
     pub created_at: DateTime<Utc>,
 }
@@ -125,6 +130,9 @@ pub struct Kept {
     /// What was promised, in the words of whoever promised it. Wrapped in
     /// [`Untrusted`](agentos_domain::untrusted::Untrusted) by its reader.
     pub subject: String,
+    /// The thread a follow-up is about — see [`Appointment::conversation_id`].
+    /// What lets the wake say *who* has not answered and since when.
+    pub conversation_id: Option<ConversationId>,
 }
 
 /// The columns, in one spelling, so the statements below cannot disagree about
@@ -137,7 +145,7 @@ pub struct Kept {
 /// input for an injection to arrive on.
 const COLUMNS: &str = "id, employee_id, at, at_zone, \
                        to_char(at AT TIME ZONE at_zone, 'YYYY-MM-DD HH24:MI') AS local_time, \
-                       subject, rang_at, outcome, created_at";
+                       subject, rang_at, outcome, conversation_id, created_at";
 
 /// One row, decoded. By reference so both reads can name it in a `map`.
 fn row_of(row: &PgRow) -> Appointment {
@@ -150,6 +158,9 @@ fn row_of(row: &PgRow) -> Appointment {
         subject: row.get("subject"),
         rang_at: row.get("rang_at"),
         outcome: row.get("outcome"),
+        conversation_id: row
+            .get::<Option<uuid::Uuid>, _>("conversation_id")
+            .map(ConversationId::from_uuid),
         created_at: row.get("created_at"),
     }
 }
@@ -217,9 +228,29 @@ pub async fn book(
     zone: &str,
     subject: &str,
 ) -> Result<Appointment, StoreError> {
+    book_on(tx, id, employee, at, zone, subject, None).await
+}
+
+/// [`book`], with the thread the promise is about.
+///
+/// The one writer of `appointments.conversation_id` (`0082`), and it is
+/// `agentos_app::follow_up`. The conversation is not checked against
+/// `conversations` here beyond the foreign key: that table is under the same
+/// policy as this one, so an id from another company is unreachable to the
+/// caller in the first place, and the FK refuses an id that names nothing.
+pub async fn book_on(
+    tx: &mut TenantTx<'_>,
+    id: AppointmentId,
+    employee: EmployeeId,
+    at: DateTime<Utc>,
+    zone: &str,
+    subject: &str,
+    conversation: Option<ConversationId>,
+) -> Result<Appointment, StoreError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO appointments (id, tenant_id, employee_id, at, at_zone, subject) \
-         SELECT $1, $2, $3, $4, $5, $6 \
+        "INSERT INTO appointments (id, tenant_id, employee_id, at, at_zone, subject, \
+                                   conversation_id) \
+         SELECT $1, $2, $3, $4, $5, $6, $7 \
           WHERE EXISTS (SELECT 1 FROM employees WHERE id = $3) \
          RETURNING {COLUMNS}"
     )))
@@ -229,6 +260,7 @@ pub async fn book(
     .bind(at)
     .bind(zone)
     .bind(subject)
+    .bind(conversation.map(|c| c.as_uuid()))
     .fetch_optional(&mut ***tx)
     .await?
     .ok_or(StoreError::NotFound)?;
@@ -363,7 +395,7 @@ pub async fn claim_due(
           WHERE a.id = d.id \
         RETURNING a.id, a.tenant_id, a.employee_id, a.at, a.at_zone, \
                   to_char(a.at AT TIME ZONE a.at_zone, 'YYYY-MM-DD HH24:MI') AS local_time, \
-                  a.subject",
+                  a.subject, a.conversation_id",
     ))
     .bind(now)
     .bind(limit)
@@ -385,6 +417,9 @@ pub async fn claim_due(
             zone: row.get("at_zone"),
             local_time: row.get("local_time"),
             subject: row.get("subject"),
+            conversation_id: row
+                .get::<Option<uuid::Uuid>, _>("conversation_id")
+                .map(ConversationId::from_uuid),
         })
         .collect())
 }
@@ -447,6 +482,34 @@ pub async fn cancel_outstanding(
           WHERE employee_id = $1 AND rang_at IS NULL AND at > $2",
     )
     .bind(employee.as_uuid())
+    .bind(now)
+    .bind(CANCELLED)
+    .execute(&mut ***tx)
+    .await?
+    .rows_affected();
+    Ok(settled)
+}
+
+/// Settle every promise still ahead on one thread: the reply came, so the
+/// follow-up it was waiting for is not owed any more.
+///
+/// [`cancel_outstanding`]'s statement with the thread as the key instead of
+/// the seat, and the same two conjuncts for the same two reasons — `rang_at IS
+/// NULL` so a promise that already rang is left as the record it is, `at > now`
+/// so nothing manufactures a *kept* out of an hour that went by. Called from
+/// `agentos_app::inbound::land`, in the transaction that lands the reply, so
+/// the answer and the cancellation commit together. Returns how many rows were
+/// settled: zero is the ordinary case, a reply on a thread nobody was chasing.
+pub async fn cancel_for_conversation(
+    tx: &mut TenantTx<'_>,
+    conversation: ConversationId,
+    now: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    let settled = sqlx::query(
+        "UPDATE appointments SET rang_at = $2, outcome = $3 \
+          WHERE conversation_id = $1 AND rang_at IS NULL AND at > $2",
+    )
+    .bind(conversation.as_uuid())
     .bind(now)
     .bind(CANCELLED)
     .execute(&mut ***tx)
@@ -1474,5 +1537,122 @@ mod tests {
         }
 
         clear_diaries(&db).await;
+    }
+
+    /// A thread row for a follow-up to name. Written as the owner, the way the
+    /// tenant and the seat are: `conversations` is under the same policy as
+    /// the diary and the test wants a row, not the landing path.
+    async fn seed_conversation(db: &Db, tenant: TenantId, employee: EmployeeId) -> ConversationId {
+        let id = ConversationId::new_v7(Utc::now());
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query(
+            "INSERT INTO conversations (id, tenant_id, employee_id, channel, external_ref) \
+             VALUES ($1, $2, $3, 'email', 'p@prospect.example')",
+        )
+        .bind(id.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(employee.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("insert conversation");
+        admin.commit().await.expect("commit");
+        id
+    }
+
+    /// **A follow-up is a promise about a thread, and the thread is what a
+    /// reply settles it by.** Booked with `0082`'s column, read back with it,
+    /// settled by the conversation rather than by the seat — leaving the
+    /// seat's other promise alone — invisible and unsettleable from another
+    /// company, and carried into the claim so the wake can say whose silence
+    /// it is chasing.
+    #[tokio::test]
+    async fn a_follow_up_names_its_thread_and_a_reply_on_that_thread_settles_it() {
+        let Some((db, tenant, other)) = fixture().await else {
+            return;
+        };
+        let ada = seed_employee(&db, tenant, "ada-chase").await;
+        let thread = seed_conversation(&db, tenant, ada).await;
+        let now = Utc::now().trunc_subsecs(6);
+        let later = now + TimeDelta::days(3);
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let chase = book_on(
+            &mut tx,
+            AppointmentId::new_v7(now),
+            ada,
+            later,
+            "UTC",
+            "follow up · p…@prospect.example",
+            Some(thread),
+        )
+        .await
+        .expect("book the follow-up");
+        assert_eq!(chase.conversation_id, Some(thread));
+        let unrelated = book(
+            &mut tx,
+            AppointmentId::new_v7(now + TimeDelta::milliseconds(1)),
+            ada,
+            later,
+            "UTC",
+            "an hour about nothing on any thread",
+        )
+        .await
+        .expect("book");
+        assert_eq!(unrelated.conversation_id, None);
+        tx.commit().await.expect("commit");
+
+        // Another company cannot see the thread, so it cannot settle what is
+        // promised about it: zero rows, and the promise is still ahead.
+        let mut theirs = db.tenant_tx(other).await.expect("tx");
+        assert_eq!(
+            cancel_for_conversation(&mut theirs, thread, now)
+                .await
+                .expect("their statement runs and finds nothing"),
+            0
+        );
+        theirs.rollback().await.expect("rollback");
+
+        // The reply lands: the follow-up is settled, the unrelated hour is not.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert_eq!(
+            cancel_for_conversation(&mut tx, thread, now)
+                .await
+                .expect("settle"),
+            1
+        );
+        // And a second reply on the same thread has nothing left to settle.
+        assert_eq!(
+            cancel_for_conversation(&mut tx, thread, now)
+                .await
+                .expect("settle again"),
+            0
+        );
+        let all = diary(&mut tx).await.expect("diary");
+        tx.commit().await.expect("commit");
+        let settled = all.iter().find(|a| a.id == chase.id).expect("still a row");
+        assert_eq!(settled.outcome.as_deref(), Some(CANCELLED));
+        assert!(settled.rang_at.expect("settled") < settled.at);
+        let kept = all.iter().find(|a| a.id == unrelated.id).expect("row");
+        assert_eq!(kept.rang_at, None, "the seat's other promise is untouched");
+
+        // A follow-up that nobody answered rings with its thread on it.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let due = book_on(
+            &mut tx,
+            AppointmentId::new_v7(now + TimeDelta::milliseconds(2)),
+            ada,
+            now - TimeDelta::minutes(1),
+            "UTC",
+            "follow up · p…@prospect.example",
+            Some(thread),
+        )
+        .await
+        .expect("book a due follow-up");
+        tx.commit().await.expect("commit");
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        let rung = claim_due(&mut admin, 8, now).await.expect("claim");
+        admin.commit().await.expect("commit");
+        let woke = rung.iter().find(|k| k.id == due.id).expect("rung");
+        assert_eq!(woke.conversation_id, Some(thread));
     }
 }
