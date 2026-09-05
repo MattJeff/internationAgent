@@ -58,6 +58,15 @@ pub type ProviderMessageId = ProviderRef;
 // Outbound
 // ---------------------------------------------------------------------------
 
+/// Le chemin public sous lequel un jeton de désinscription est réclamé.
+///
+/// Ici, et pas dans `agentos_app`, parce que c'est [`crate::email_resend`] qui
+/// imprime l'URL dans un en-tête partant chez des milliers de gens : deux
+/// épellations de ce chemin veulent dire des liens morts qu'on ne peut plus
+/// rattraper. `apps/server`, qui monte la route, le lit re-exporté par
+/// `agentos_app::inbound`.
+pub const UNSUBSCRIBE_PATH: &str = "/unsubscribe/";
+
 /// One email we are about to send.
 ///
 /// Everything here is ours: we built the body, so nothing is `Untrusted`. If a
@@ -76,6 +85,21 @@ pub struct OutboundEmail {
     pub body_text: String,
     /// The message we are replying to, for threading.
     pub in_reply_to: Option<ProviderMessageId>,
+    /// This recipient's own unsubscribe token, or `None` for a send that
+    /// carries no way out.
+    ///
+    /// **A token and not a URL**, because the origin is the adapter's business
+    /// and not the caller's: the app layer holds the database that mints the
+    /// token and knows nothing about where this deployment is reachable, while
+    /// an adapter knows the domain it sends from. See
+    /// [`crate::email_resend::ResendEmailProvider`]'s `unsubscribe_origin` for
+    /// what that costs and how to widen it.
+    ///
+    /// `None` is a real state and not a bug to assert away: a recipient whose
+    /// address the domain refuses to normalise has no row to hang a token on,
+    /// and the mail still goes — one header missing is a deliverability
+    /// problem, one mail unsent is a customer problem.
+    pub unsubscribe_token: Option<String>,
     /// Documents that travel with it. Empty for every send but an invoice
     /// today; see [`OutboundAttachment`].
     pub attachments: Vec<OutboundAttachment>,
@@ -1154,6 +1178,7 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
         subject: "PO-4471".to_owned(),
         body_text: "Attached.".to_owned(),
         in_reply_to: None,
+        unsubscribe_token: None,
         attachments: vec![OutboundAttachment {
             filename: "po-4471.pdf".to_owned(),
             content_type: "application/pdf".to_owned(),
@@ -1572,6 +1597,7 @@ mod tests {
             subject: "PO-1".to_owned(),
             body_text: "hi".to_owned(),
             in_reply_to: None,
+            unsubscribe_token: None,
             attachments: Vec::new(),
         };
         for _ in 0..5 {

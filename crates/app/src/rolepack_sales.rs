@@ -30,6 +30,32 @@
 //!   business address is already processing their personal data, and the lawful
 //!   basis is recorded per person in `contacts.lawful_basis` at the moment the
 //!   row is written, not at the moment it is mailed.
+//!
+//!   **Decided rather than inherited, and it stays at zero.** The zero is a
+//!   real cost — a seller provisioned this morning cannot do the job it was
+//!   provisioned for, and its first turn ends in `NoBudget` — so the ramp
+//!   default was weighed against it: ship `1` or `2`, let the seat work, let an
+//!   operator raise it. It is refused, and for one reason rather than a list.
+//!   The lawful basis for approaching a stranger is *per person and per
+//!   operator*; a pack shipped identically to every tenant cannot hold one, and
+//!   `2` is two strangers a day mailed by a company that never decided to mail
+//!   anybody. That is the same compliance incident as `20`, at a smaller
+//!   number, and a smaller number is worse rather than better here: it is small
+//!   enough to go unnoticed for the weeks it takes to matter. A ceiling of zero
+//!   is also the only value that keeps `prospects::discover` from writing
+//!   personal data about people nobody has taken a basis for.
+//!
+//!   **What was wrong was not the zero, it was the silence.** A seller refused
+//!   at zero said only "no contact budget", which reads as a defect and sends
+//!   nobody anywhere. It now names the one gesture that lifts it — `PUT
+//!   /v1/policy/roles/{role}` with `max_new_contacts_per_day` — in three
+//!   places, once each for the three readers: in the refusal itself
+//!   ([`ContactBudgetError::NoBudget`](agentos_store::outreach::ContactBudgetError::NoBudget)),
+//!   for whoever reads a log; in the approach task of the plan below, for the
+//!   employee, so it asks instead of stalling; and on `GET /v1/controls`, which
+//!   shows the zero beside what would be released and names it
+//!   `no_contact_budget`, for the founder. Zero that says how to stop being
+//!   zero is a default. Zero that says nothing is a dead seat nobody diagnoses.
 //! * **The evidence comes first.** The plan puts finding and *reproducing* a
 //!   verifiable defect in the prospect's own booking flow before it puts
 //!   contacting anyone. An unreproduced finding is a false statement about
@@ -585,9 +611,14 @@ impl RolePack {
     /// before — including when it may not.
     fn outreach_budget(&self) -> String {
         match self.limits.max_new_contacts_per_day {
+            // Names the gesture, not just the wall. A plan that says "you may
+            // not" and stops is a plan that produces a stalled seat and a
+            // founder who finds out in week three; the operator's own words for
+            // the lever are what a human needs to hear back.
             0 => "Cold outreach is switched off for this employee: approach only contacts already \
-                  known to us, and ask an operator to raise the daily new-contact limit before \
-                  approaching anyone new."
+                  known to us. To lift it, an operator raises `max_new_contacts_per_day` above \
+                  zero on this role's policy layer (PUT /v1/policy/roles/{role}) — say so, with \
+                  the findings that are waiting on it, rather than stopping silently."
                 .to_owned(),
             budget => format!("Approach at most {budget} new contacts per day."),
         }

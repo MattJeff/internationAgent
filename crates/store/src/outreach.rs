@@ -80,6 +80,36 @@
 //! that switched on for everybody the afternoon it landed would cut a running
 //! business to one stranger a day with nobody having asked.
 //!
+//! ## The state of the ramp, said out loud: wired, and enrolled by nobody
+//!
+//! `outreach_warmup` has **no production writer, by design**. `0070` revokes
+//! `insert` from `app_role` and says why in as many words — "no route today,
+//! deliberately … enrolling a tenant is a deployment decision an operator makes
+//! once, in `admin_tx_bypassing_rls`" — and the only `INSERT` anywhere in this
+//! tree outside the migration is under `#[cfg(test)]`, here and in `app::gate`.
+//! So [`warmup_release`] reads `None` for every tenant and every seat takes
+//! exactly the number an operator wrote.
+//!
+//! Read the direction before reading it as a bug: an unenrolled tenant is
+//! **unnarrowed**, not held at one stranger a day. What is absent is the
+//! enrolment, which is three lines of SQL in a runbook. What is *not* absent is
+//! the measurement it feeds: the numerator (`audit_log` rows of kind
+//! `mail_refused`) is written in production by `app::inbound::record_refusal`
+//! on every verified provider refusal, and the denominator by [`reserve`]
+//! itself. The ramp is plumbed; nobody is plugged into it.
+//!
+//! The half that was genuinely invisible is the enrolled one, and it is the
+//! reason [`ceiling`] exists. For a tenant an operator does enrol,
+//! `Deliverability::Unknown` holds every seat at `WARMUP_FLOOR` — one stranger
+//! a day, follow-ups included — **indefinitely**, because the only thing that
+//! lifts `Unknown` without an operator is an observed refusal and whether the
+//! provider endpoint is subscribed to `email.bounced` is a checkbox no code
+//! here can read. Until [`ceiling`] there was no way to ask that question
+//! without attempting a send: the only page that answers "what bounds this
+//! seat" showed the number an operator wrote, so a seller releasing one of five
+//! looked exactly like a seller allowed five. A founder at 5 000 $/month found
+//! out on the ninth day, by counting nine emails.
+//!
 //! # Which day
 //!
 //! UTC, `now.date_naive()`, the same day the other two ledgers key on. The
@@ -125,7 +155,18 @@ pub enum ContactBudgetError {
     /// not true of any version of this tree: two of the five do (`direction`,
     /// `growth`), two ship `5` and one ships `20`. The default is what fails
     /// closed; the packs are an operator's answer and they vary.
-    #[error("no contact budget: the effective policy allows 0 new contacts per day")]
+    ///
+    /// The message names the **one gesture that lifts it**, because a refusal
+    /// that only states its own existence is how a seat stays dead for a week.
+    /// The route is the one `/v1/controls` lists as this limit's lever; the
+    /// clause after it is not decoration, it is who is allowed to make the
+    /// gesture — see `app::rolepack_sales`, which ships this zero on purpose.
+    #[error(
+        "no contact budget: the effective policy allows 0 new contacts per day. \
+         To lift it: PUT /v1/policy/roles/{{role}} with `max_new_contacts_per_day` \
+         above zero, by somebody who can answer for the lawful basis of \
+         approaching a stranger"
+    )]
     NoBudget,
 
     /// Today's strangers are used up. It resumes on its own at UTC midnight.
@@ -297,26 +338,21 @@ pub async fn reserve(
     }
 
     if granted == 0 {
-        // Which of the two refused. `<` and not `<=`, and that is the whole of
-        // it: when the schedule released everything the operator wrote, the
-        // operator's number is genuinely the wall and raising it genuinely
-        // helps, so this must stay `Exhausted`. `<=` here swallows the ordinary
-        // refusal whole — including for tenants that are not enrolled, where
-        // `allowed` is `limit` by construction — and
-        // `a_tenant_with_no_warmup_row_has_exactly_the_day_it_had_before` is the
-        // line that catches it.
-        if allowed < limit {
-            // The log for this is the one above, which has already fired:
-            // `granted == 0` is `granted < want` for every `want >= 1`, and
-            // `want == 0` returned at the top of the function. A second line
-            // here would double-log the same event.
-            return Err(ContactBudgetError::Warming {
-                allowed,
-                written: limit,
-                taken,
-            });
-        }
-        return Err(ContactBudgetError::Exhausted { limit, taken });
+        // Which of the two refused is [`why`]'s question and not this
+        // function's — the page that displays the wall asks the same function,
+        // so the refusal and the display cannot come to disagree.
+        //
+        // `want >= 1` here (`want == 0` returned at the top), so `granted == 0`
+        // means `taken >= allowed` and `why` is never `None`. `unwrap_or` and
+        // not a panic: the fallback is the refusal this branch used to build by
+        // hand.
+        //
+        // The log for this is the one above, which has already fired:
+        // `granted == 0` is `granted < want` for every `want >= 1`. A second
+        // line here would double-log the same event.
+        return Err(
+            why(limit, allowed, taken).unwrap_or(ContactBudgetError::Exhausted { limit, taken })
+        );
     }
 
     sqlx::query(
@@ -331,6 +367,121 @@ pub async fn reserve(
     .await?;
 
     Ok(granted)
+}
+
+/// Which wall this seat is against today, or `None` when a stranger still fits
+/// under the number an operator wrote.
+///
+/// **One classifier, two readers.** [`reserve`] raises what it returns and
+/// [`ceiling`] displays it without taking anything, so `GET /v1/controls` and
+/// the gate's own refusal cannot come to name different walls for the same
+/// seat. A limit enforced in one spelling and displayed in another is the
+/// failure this workspace keeps closing; this is that closure for the third
+/// ledger.
+///
+/// The order of the arms is the order of the remedies, and each is a different
+/// human doing a different thing:
+///
+/// 1. **nothing written** — an operator raises `max_new_contacts_per_day`, and
+///    [`ContactBudgetError::NoBudget`]'s own message names the route;
+/// 2. **written but not released** — nobody raises anything; the sending domain
+///    is young, or its deliverability cannot be read, and the answer is a
+///    dashboard or a wait. `<` and not `<=`, and that is the whole of it: when
+///    the schedule released everything the operator wrote, the operator's
+///    number is genuinely the wall and raising it genuinely helps, so that case
+///    must fall through to the third arm. `<=` here swallows the ordinary
+///    refusal whole — including for the tenants that are not enrolled, where
+///    `effective` is `written` by construction — and
+///    `a_tenant_with_no_warmup_row_has_exactly_the_day_it_had_before` is the
+///    line that catches it;
+/// 3. **released and used up** — it resumes on its own at UTC midnight.
+const fn why(written: u32, effective: u32, taken: u32) -> Option<ContactBudgetError> {
+    if written == 0 {
+        Some(ContactBudgetError::NoBudget)
+    } else if effective < written {
+        Some(ContactBudgetError::Warming {
+            allowed: effective,
+            written,
+            taken,
+        })
+    } else if taken >= effective {
+        Some(ContactBudgetError::Exhausted {
+            limit: written,
+            taken,
+        })
+    } else {
+        None
+    }
+}
+
+/// Today's ceiling for one seat, read rather than taken.
+#[derive(Debug)]
+pub struct ContactCeiling {
+    /// What today releases: `min(max_new_contacts_per_day, warmup_release)`,
+    /// and exactly the written number for a tenant with no `outreach_warmup`
+    /// row. Never more than the written number — see
+    /// `agentos_domain::policy::warmup_allowance`.
+    pub effective: u32,
+    /// Why [`Self::effective`] is not the written number, or why today is used
+    /// up under it. [`None`] when a stranger still fits.
+    pub why: Option<ContactBudgetError>,
+}
+
+/// What [`reserve`] would answer right now, without reserving anything.
+///
+/// **The read half of the ledger.** A ceiling nobody can read is a ceiling a
+/// founder discovers on the ninth day by counting nine emails, and until this
+/// existed the only page that answers "what bounds this seat" could show the
+/// number an operator *wrote* and had no way to show that the warming schedule
+/// releases one of it.
+///
+/// `taken` is passed in rather than read here: the caller already has it from
+/// [`taken_today`], and a second query for the same number is a second chance
+/// for a page to disagree with itself.
+///
+/// **It takes no lock and must not decide a send.** [`reserve`] is the only
+/// thing that may, and it re-reads all of this under the bucket's row lock —
+/// what this returns is a photograph, true when it was taken.
+pub async fn ceiling(
+    tx: &mut TenantTx<'_>,
+    day: NaiveDate,
+    policy: &EffectivePolicy,
+    taken: u32,
+) -> Result<ContactCeiling, StoreError> {
+    let written = policy.limits().max_new_contacts_per_day;
+    // Nothing written releases nothing, whatever the two counts under
+    // `warmup_release` say. `reserve` short-circuits on the same line.
+    if written == 0 {
+        return Ok(ContactCeiling {
+            effective: 0,
+            why: why(0, 0, taken),
+        });
+    }
+    let effective = match warmup_release(tx, day, policy).await? {
+        None => written,
+        Some(release) => release.min(written),
+    };
+    Ok(ContactCeiling {
+        effective,
+        why: why(written, effective, taken),
+    })
+}
+
+/// When this tenant's sending domain started warming, or [`None`] for a tenant
+/// the schedule is not installed for.
+///
+/// **[`None`] is the answer for every tenant in this deployment**, and it is a
+/// fact about the schedule rather than about the tenant — see the module
+/// header. A reader needs it because "the ramp released everything" and "there
+/// is no ramp" are otherwise the same silence: both leave [`ContactCeiling`]'s
+/// `why` empty, and only one of them is a promise that the number an operator
+/// wrote is the number that applies.
+pub async fn warming_since(tx: &mut TenantTx<'_>) -> Result<Option<NaiveDate>, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT warming_started_on FROM outreach_warmup")
+            .fetch_optional(&mut ***tx)
+            .await?,
+    )
 }
 
 /// What the warming schedule releases for this tenant on `day`, or `None` when

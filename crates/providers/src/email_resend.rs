@@ -72,7 +72,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::email::{
     EmailProvider, OptOuts, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
-    WebhookHeaders, verify_signature,
+    UNSUBSCRIBE_PATH, WebhookHeaders, verify_signature,
 };
 use crate::{
     EnsureCtx, ProviderBinding, ProviderError, Provisioned, RELEASE_NOT_SUPPORTED, Secret,
@@ -93,6 +93,7 @@ pub struct ResendEmailProvider {
     api_key: Secret,
     webhook_secret: Secret,
     domain: String,
+    unsubscribe_origin: String,
 }
 
 impl ResendEmailProvider {
@@ -162,6 +163,7 @@ impl ResendEmailProvider {
     /// `webhook_secret` is the `whsec_…` signing secret from the Resend
     /// webhook page, not the API key.
     pub fn new(api_key: Secret, webhook_secret: Secret, domain: impl Into<String>) -> Self {
+        let domain = domain.into();
         Self {
             // Built rather than `new()`: see `REQUEST_TIMEOUT`. `build` fails
             // only if the TLS backend cannot be initialised, at which point
@@ -173,8 +175,37 @@ impl ResendEmailProvider {
             base_url: API_BASE.to_owned(),
             api_key,
             webhook_secret,
-            domain: domain.into(),
+            unsubscribe_origin: format!("https://{domain}"),
+            domain,
         }
+    }
+
+    /// Point the unsubscribe link at another origin.
+    ///
+    /// ponytail: the default is `https://{sending domain}`, which is right for
+    /// a deployment that serves the app on the same registrable domain it mails
+    /// from — and that is the alignment Google and Yahoo want anyway, since a
+    /// `List-Unsubscribe` host on a stranger's domain is one more reason to
+    /// distrust the mail. The ceiling is honest: a deployment whose
+    /// `PUBLIC_HOST` differs from `AGENT_EMAIL_DOMAIN` prints a link that
+    /// resolves nowhere, and a link that goes nowhere is worse than no link
+    /// (`agentos_app::vertical::OPT_OUT` says so in as many words).
+    ///
+    /// The upgrade is one line and it is not in this crate: `mocks::ports_for`
+    /// already carries `PUBLIC_HOST` for the telephony adapter's status
+    /// callback and already normalises it with `inbound::callback_origin` —
+    /// `mocks::email_provider` has only to take the same argument and end with
+    /// `.with_unsubscribe_origin(&inbound::callback_origin(host))`. Until it
+    /// does, the default above is what ships.
+    ///
+    /// Takes an origin that is already an origin — that normaliser lives in
+    /// `agentos_app`, one crate up, and this one cannot reach it. All this does
+    /// is refuse a trailing slash, so that the one place the path is joined
+    /// cannot produce `//unsubscribe/`.
+    #[must_use]
+    pub fn with_unsubscribe_origin(mut self, origin: &str) -> Self {
+        self.unsubscribe_origin = origin.trim_end_matches('/').to_owned();
+        self
     }
 
     /// Point the adapter at another origin. For hermetic tests.
@@ -408,13 +439,49 @@ impl EmailProvider for ResendEmailProvider {
             "subject": email.subject,
             "text": email.body_text,
         });
+        // `headers` is Resend's one door to RFC-5322, and two unrelated things
+        // need it — threading and the way out. One map built here rather than
+        // two assignments to `body["headers"]`, because the second assignment
+        // silently ate the first: an email that both replied to somebody and
+        // offered an unsubscribe would have lost whichever branch ran earlier.
+        let mut headers = serde_json::Map::new();
         if let Some(parent) = &email.in_reply_to {
             // Threading lives in the RFC-5322 headers, not in a Resend field.
-            let reference = format!("<{}>", parent.as_str());
-            body["headers"] = serde_json::json!({
-                "In-Reply-To": reference,
-                "References": reference,
-            });
+            let reference = serde_json::json!(format!("<{}>", parent.as_str()));
+            headers.insert("In-Reply-To".to_owned(), reference.clone());
+            headers.insert("References".to_owned(), reference);
+        }
+        if let Some(token) = &email.unsubscribe_token {
+            // **Les deux, ou aucun.** Google et Yahoo exigent depuis février
+            // 2024 que tout envoi en volume porte `List-Unsubscribe` ET
+            // `List-Unsubscribe-Post` (RFC 8058) ; `List-Unsubscribe` seul est
+            // l'en-tête d'avant, il ne vaut pas un clic, et un domaine qui n'en
+            // porte aucun est classé en spam dès les premières centaines
+            // d'envois. Le dépôt connaissait déjà l'autre moitié du même
+            // document — `agentos_domain::policy::Deliverability::MAX_REFUSALS_PER_MILLE`
+            // cite ses 0,3 % de plaintes — et n'appliquait que celle-là.
+            //
+            // La valeur de `List-Unsubscribe-Post` est littérale : RFC 8058 §3.1
+            // n'en admet aucune autre, et un client qui lit autre chose ne
+            // poste rien.
+            //
+            // Les chevrons ne sont pas décoratifs : RFC 2369 fait de l'URI un
+            // `<…>`, et un client qui ne trouve pas le chevron ne trouve pas de
+            // lien du tout.
+            headers.insert(
+                "List-Unsubscribe".to_owned(),
+                serde_json::json!(format!(
+                    "<{}{UNSUBSCRIBE_PATH}{token}>",
+                    self.unsubscribe_origin
+                )),
+            );
+            headers.insert(
+                "List-Unsubscribe-Post".to_owned(),
+                serde_json::json!("List-Unsubscribe=One-Click"),
+            );
+        }
+        if !headers.is_empty() {
+            body["headers"] = serde_json::Value::Object(headers);
         }
         if !email.attachments.is_empty() {
             // `POST /emails` takes `attachments: [{filename, content}]` with
@@ -1088,6 +1155,7 @@ mod tests {
             subject: "PO-4471".to_owned(),
             body_text: "Attached.".to_owned(),
             in_reply_to: Some(ProviderMessageId::new("email_1")),
+            unsubscribe_token: None,
             attachments: Vec::new(),
         };
         let key = IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:po-4471");
@@ -1135,6 +1203,7 @@ mod tests {
                     subject: "PO-1".to_owned(),
                     body_text: "hi".to_owned(),
                     in_reply_to: None,
+                    unsubscribe_token: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1148,6 +1217,106 @@ mod tests {
                 .get("attachments")
                 .is_none(),
             "no attachments means no field, not an empty list"
+        );
+    }
+
+    /// **Les deux en-têtes que Google et Yahoo exigent depuis février 2024**,
+    /// dans le corps réellement posté, et bien formés.
+    ///
+    /// Sans eux le domaine de l'entreprise est classé en spam au bout de
+    /// quelques centaines d'envois, et le seul bouton qu'un destinataire a sous
+    /// la main est « spam » — ce qui fait monter le taux de plainte que
+    /// `agentos_domain::policy::Deliverability` mesure, par la porte que le même
+    /// document demandait d'ouvrir.
+    ///
+    /// Trois choses vérifiées et aucune n'est décorative : les chevrons (RFC
+    /// 2369 — un client qui ne les trouve pas ne trouve pas de lien), la valeur
+    /// littérale du `-Post` (RFC 8058 §3.1 n'en admet aucune autre), et le fait
+    /// que le fil survive au voisinage — l'ancien code écrasait `body["headers"]`
+    /// et un mail qui répond ET propose une sortie aurait perdu l'un des deux.
+    #[tokio::test]
+    async fn a_send_carries_list_unsubscribe_and_the_one_click_post() {
+        let fake = FakeResend::start().await;
+        let key = IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:cold-1");
+        fake.provider()
+            .send(
+                &key,
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@supplier.example".to_owned()],
+                    subject: "hello".to_owned(),
+                    body_text: "…".to_owned(),
+                    in_reply_to: Some(ProviderMessageId::new("email_parent")),
+                    unsubscribe_token: Some("unsub_AAAABBBBCCCCDDDD".to_owned()),
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send");
+        let body = fake.last_sent().expect("a body");
+
+        assert_eq!(
+            body["headers"]["List-Unsubscribe"],
+            "<https://agents.example.com/unsubscribe/unsub_AAAABBBBCCCCDDDD>",
+            "the URI is bracketed and sits on the sending domain"
+        );
+        assert_eq!(
+            body["headers"]["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click",
+            "RFC 8058 admits exactly this string"
+        );
+        assert_eq!(
+            body["headers"]["In-Reply-To"], "<email_parent>",
+            "the way out must not have eaten the thread"
+        );
+
+        // Rien à offrir, rien à promettre : un mail sans jeton ne porte aucun
+        // des deux, plutôt qu'un `List-Unsubscribe` qui ne mène nulle part.
+        fake.provider()
+            .send(
+                &IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:cold-2"),
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@supplier.example".to_owned()],
+                    subject: "hello".to_owned(),
+                    body_text: "…".to_owned(),
+                    in_reply_to: None,
+                    unsubscribe_token: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send");
+        assert!(
+            fake.last_sent().expect("a body").get("headers").is_none(),
+            "no thread and no way out means no headers field at all"
+        );
+    }
+
+    /// L'origine par défaut est le domaine d'envoi, et un déploiement qui sert
+    /// sa console ailleurs la déplace en un appel.
+    #[tokio::test]
+    async fn the_unsubscribe_origin_is_the_sending_domain_until_it_is_told_otherwise() {
+        let fake = FakeResend::start().await;
+        fake.provider()
+            .with_unsubscribe_origin("https://console.siglair.com/")
+            .send(
+                &IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:cold-3"),
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@supplier.example".to_owned()],
+                    subject: "hello".to_owned(),
+                    body_text: "…".to_owned(),
+                    in_reply_to: None,
+                    unsubscribe_token: Some("unsub_ZZZZ".to_owned()),
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send");
+        assert_eq!(
+            fake.last_sent().expect("a body")["headers"]["List-Unsubscribe"],
+            "<https://console.siglair.com/unsubscribe/unsub_ZZZZ>",
+            "one slash, not two"
         );
     }
 
@@ -1166,6 +1335,7 @@ mod tests {
                     subject: "Invoice 7".to_owned(),
                     body_text: "Attached.".to_owned(),
                     in_reply_to: None,
+                    unsubscribe_token: None,
                     attachments: vec![OutboundAttachment {
                         filename: "invoice-7.pdf".to_owned(),
                         content_type: "application/pdf".to_owned(),

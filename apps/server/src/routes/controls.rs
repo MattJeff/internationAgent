@@ -21,6 +21,17 @@
 //!   means "may not act until somebody says so" (README, § turn budget); a
 //!   founder should not have to know that to read it.
 //! * **the path to stop**, as a string to copy: `"stop": "POST /v1/halt"`.
+//! * **what the cap actually releases today.** `max_new_contacts_per_day` is
+//!   the number an operator wrote; `contacts_released_today` is how much of it
+//!   this seat may take, after the sending-domain warming schedule of
+//!   `migrations/0070_outreach_warmup.sql` has narrowed it — and
+//!   `contacts_held_back` names the wall in one sentence whenever the two
+//!   differ or the day is used up. Both numbers, side by side, because the
+//!   conversation this page exists to prevent is not "who set this" but "the
+//!   seller I pay 5 000 $/month for sent nine emails in nine days and nothing
+//!   told me it was capped at one". `warming_schedule` at the root says whether
+//!   the schedule is installed for this company at all — "it released
+//!   everything" and "there is no schedule" are otherwise the same silence.
 //! * **the team's ceiling.** A seat is bounded by its caps *and* by its team's
 //!   daily budget (`org::reserve` locks both). `teams[]` reads the second the
 //!   way the store reads it — `org::budget`, `org::spent` — and each seat
@@ -37,6 +48,7 @@ use agentos_domain::message::Channel;
 use agentos_domain::money::{Currency, Money};
 use agentos_domain::policy::{PolicyLimits, SpendLimits, turns_remaining};
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::outreach::ContactBudgetError;
 use agentos_store::policy::{self, Layers};
 use agentos_store::{halt, org, outreach, spend, turns};
 use axum::extract::State;
@@ -138,6 +150,59 @@ struct TeamView {
     name: String,
 }
 
+/// Why a seat's released ceiling is not the number an operator wrote — or why
+/// today is used up under it.
+///
+/// **The vocabulary is [`ContactBudgetError`]'s and no wider.** `reason` is that
+/// error's [`code`](ContactBudgetError::code), the same closed word the gate
+/// refuses a send with, and `detail` is its own sentence. Three words, and each
+/// is a different human doing a different thing: `no_contact_budget` (an
+/// operator raises the number, and the sentence names the route),
+/// `sending_domain_warming` (nobody raises anything — the domain is young or
+/// unmeasurable), `contact_budget_exhausted` (it comes back at UTC midnight).
+/// A page that invented its own words here would be the second spelling of a
+/// refusal, and the two would disagree the first week.
+#[derive(Debug, Serialize)]
+struct HeldBack {
+    reason: &'static str,
+    detail: String,
+}
+
+impl From<ContactBudgetError> for HeldBack {
+    fn from(err: ContactBudgetError) -> Self {
+        Self {
+            reason: err.code(),
+            detail: err.to_string(),
+        }
+    }
+}
+
+/// Whether the sending-domain warming schedule is installed for this company.
+///
+/// **`enrolled: false` is the state of every company in this deployment, and it
+/// means *unnarrowed*, not "healthy".** `outreach_warmup` has no production
+/// writer — `0070` revokes `insert` from `app_role` deliberately and leaves
+/// enrolment to an operator's runbook — so every seat takes the whole number an
+/// operator wrote, and `contacts_released_today` equals it everywhere. Said in
+/// clear rather than left as an absent `contacts_held_back`, for
+/// [`SeatView::acts_on_its_own`]'s reason: a founder should not have to know
+/// which silence they are reading.
+#[derive(Debug, Serialize)]
+struct WarmupView {
+    enrolled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warming_started_on: Option<NaiveDate>,
+    detail: &'static str,
+}
+
+const NOT_ENROLLED: &str = "this company is not enrolled in the sending-domain warming schedule, \
+     so each seat may take the whole number an operator wrote. Enrolment is an operator's INSERT \
+     into `outreach_warmup`; no route writes it";
+const ENROLLED: &str = "this company's sending domain is warming: each seat releases the smaller \
+     of the number an operator wrote and what the domain's age and measured deliverability allow \
+     today. An unreadable deliverability holds it at one a day until a refusal is observed or an \
+     operator sets `outreach_warmup.refusal_events_confirmed_at`";
+
 #[derive(Debug, Serialize)]
 struct SpendCapView {
     currency: Currency,
@@ -194,8 +259,17 @@ struct SeatView {
     max_turns_per_day: Bound<u32>,
     turns_taken_today: u32,
     turns_remaining: u32,
+    /// What an operator wrote, and which layer wrote it.
     max_new_contacts_per_day: Bound<u32>,
+    /// What today releases of it: the same number for a company the warming
+    /// schedule is not installed for, less for one it is. Never more — the
+    /// `min` is `agentos_store::outreach`'s and this page only reads it.
+    contacts_released_today: u32,
     contacts_taken_today: u32,
+    /// Absent when the two numbers above are equal and the day still has room
+    /// under them. Present, with a sentence, whenever they are not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contacts_held_back: Option<HeldBack>,
     allowed_channels: Bound<BTreeSet<Channel>>,
     spend_limits: Bound<Option<SpendLimits>>,
     spend_caps: Vec<SpendCapView>,
@@ -223,6 +297,7 @@ struct ControlsView {
     halt: HaltView,
     window_ends_at: Option<DateTime<Utc>>,
     seats: Vec<SeatView>,
+    warming_schedule: WarmupView,
     teams: Vec<TeamBudgetsView>,
     totals: BTreeMap<Currency, Totals>,
     levers: Vec<Lever>,
@@ -327,6 +402,8 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         .map_err(StoreError::from)?;
 
     let teams = team_budgets(&mut tx, day).await?;
+    // One row per tenant, so once per request and not once per seat.
+    let warming_started_on = outreach::warming_since(&mut tx).await?;
 
     let mut seats = Vec::with_capacity(rows.len());
     let mut totals: BTreeMap<Currency, Totals> = BTreeMap::new();
@@ -354,6 +431,12 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         let limits = effective.limits();
         let turns_taken = turns::taken_today(&mut tx, id, day).await?;
         let contacts_taken = outreach::taken_today(&mut tx, id, day).await?;
+        // ponytail: three more round-trips per seat, and it is this page's own
+        // idiom — `load_layers`, `taken_today` and `spend::caps` are already
+        // per-seat. `outreach::ceiling` is asked rather than recomputed here on
+        // purpose: the `min` that makes the warming schedule safe has exactly
+        // one spelling, and a page that re-derived it would be the second.
+        let ceiling = outreach::ceiling(&mut tx, day, &effective, contacts_taken).await?;
 
         let mut spend_caps = Vec::new();
         for (_, code, reserved) in held.iter().filter(|(who, _, _)| *who == row.id) {
@@ -393,7 +476,9 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
             max_new_contacts_per_day: bound(&layers, &limits.max_new_contacts_per_day, |l| {
                 &l.max_new_contacts_per_day
             }),
+            contacts_released_today: ceiling.effective,
             contacts_taken_today: contacts_taken,
+            contacts_held_back: ceiling.why.map(HeldBack::from),
             allowed_channels: bound(&layers, &limits.allowed_channels, |l| &l.allowed_channels),
             spend_limits: bound(&layers, &limits.spend, |l| &l.spend),
             spend_caps,
@@ -423,6 +508,15 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         },
         window_ends_at,
         seats,
+        warming_schedule: WarmupView {
+            enrolled: warming_started_on.is_some(),
+            warming_started_on,
+            detail: if warming_started_on.is_some() {
+                ENROLLED
+            } else {
+                NOT_ENROLLED
+            },
+        },
         teams,
         totals,
         levers: LEVERS
@@ -864,6 +958,120 @@ mod tests {
         assert_eq!(body["teams"], json!([]));
         assert_eq!(body["totals"], json!({}));
         assert_eq!(body["halt"]["halted"], json!(false));
+
+        h.teardown().await;
+    }
+
+    /// **The nine-emails-in-nine-days conversation, on the page that exists to
+    /// prevent it.** Four written, one released, and the difference said in a
+    /// sentence a founder can read — rather than a `4` that is a lie by
+    /// omission and a seller that quietly stops after one.
+    ///
+    /// The company is enrolled, its domain is four hundred days old, and
+    /// nothing can measure it: `refusal_events_confirmed_at` is NULL and no
+    /// `mail_refused` row was ever written. That is `Deliverability::Unknown`,
+    /// which is `WARMUP_FLOOR` **forever** and not just for a while, which is
+    /// exactly why it has to appear on this page.
+    #[tokio::test]
+    async fn a_warming_domain_shows_what_it_releases_and_not_what_was_written() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let c = company(&h).await;
+
+        // Enrolment is an operator's write: `app_role` has no `insert` on this
+        // table (`0070`), which is the same admin path a runbook would take.
+        let mut tx = h.db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO outreach_warmup (tenant_id, warming_started_on) \
+             VALUES ($1, current_date - 400)",
+        )
+        .bind(h.a.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("enrol");
+        tx.commit().await.expect("commit enrolment");
+
+        let (status, body) = h.call("GET", "/v1/controls", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warming_schedule"]["enrolled"], json!(true), "{body}");
+
+        let lena = seat(&body, c.lena);
+        assert_eq!(lena["max_new_contacts_per_day"]["value"], json!(4));
+        assert_eq!(
+            lena["contacts_released_today"],
+            json!(1),
+            "an unreadable domain releases the floor and nothing more: {lena}"
+        );
+        assert_eq!(
+            lena["contacts_held_back"]["reason"],
+            json!("sending_domain_warming"),
+            "not `contact_budget_exhausted`: raising the four would change \
+             nothing, and sending somebody to raise it is the wrong remedy: {lena}"
+        );
+        let detail = lena["contacts_held_back"]["detail"]
+            .as_str()
+            .expect("a sentence");
+        assert!(
+            detail.contains("warming") && detail.contains('1') && detail.contains('4'),
+            "the sentence carries both numbers: {detail}"
+        );
+
+        h.teardown().await;
+    }
+
+    /// The nominal half, and it is the one that must not become noisy: with no
+    /// warming row the released ceiling **is** the written one and the page
+    /// says nothing extra about it.
+    ///
+    /// The third seat is the other end of the same field — a seat written down
+    /// as zero, which is what `app::rolepack_sales` ships. Zero is kept there
+    /// on purpose, so this asserts the only thing that makes it defensible: the
+    /// page names the gesture that lifts it.
+    #[tokio::test]
+    async fn an_unenrolled_company_releases_exactly_what_was_written() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let c = company(&h).await;
+        let fresh = employee(&h.db, h.a, "fresh-seller").await;
+        policy::install(
+            &h.db,
+            h.a,
+            Scope::Employee(EmployeeId::from_uuid(fresh)),
+            &limits(10, 0),
+        )
+        .await
+        .expect("a seller shipped at zero");
+
+        let (status, body) = h.call("GET", "/v1/controls", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warming_schedule"]["enrolled"], json!(false), "{body}");
+        assert_eq!(body["warming_schedule"]["warming_started_on"], Value::Null);
+
+        let lena = seat(&body, c.lena);
+        assert_eq!(lena["max_new_contacts_per_day"]["value"], json!(4));
+        assert_eq!(lena["contacts_released_today"], json!(4));
+        assert_eq!(
+            lena["contacts_held_back"],
+            Value::Null,
+            "two equal ceilings have nothing to explain: {lena}"
+        );
+
+        let fresh = seat(&body, fresh);
+        assert_eq!(fresh["contacts_released_today"], json!(0));
+        assert_eq!(
+            fresh["contacts_held_back"]["reason"],
+            json!("no_contact_budget"),
+            "{fresh}"
+        );
+        let detail = fresh["contacts_held_back"]["detail"]
+            .as_str()
+            .expect("a sentence");
+        assert!(
+            detail.contains("/v1/policy/roles/"),
+            "a zero that does not say how to stop being zero is a dead seat: {detail}"
+        );
 
         h.teardown().await;
     }

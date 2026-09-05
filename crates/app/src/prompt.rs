@@ -544,11 +544,12 @@ impl SystemPrompt {
     ///   `put`, `get` and `delete_prefix`; there is no verb that answers "which
     ///   refs does this employee hold", so a caller would have to guess names —
     ///   which is the failure this whole file is about, one level down.
-    /// * **The store is a permanent mock.** `config::PERMANENT_MOCKS` says
-    ///   `secrets=MOCK(in-memory)`, and the only ref production ever writes for
-    ///   an employee is `provisioning::VAULT_CANARY` — an infrastructure probe.
-    ///   Naming that to every employee on every turn would be paying tokens
-    ///   forever to announce a canary.
+    /// * **There is nothing worth naming in it.** The store is no longer a mock
+    ///   — `config::SECRETS_ADAPTER` says `local-envelope(aes-256-gcm)` — but the
+    ///   only ref production ever writes for an employee is
+    ///   `provisioning::VAULT_CANARY`, an infrastructure probe. Naming that to
+    ///   every employee on every turn would be paying tokens forever to announce
+    ///   a canary.
     ///
     /// It stays because it is the *shape* the answer will take, it is tested
     /// here, and `SafeForPrompt` is the type-level rule it enforces —

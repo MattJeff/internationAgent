@@ -273,15 +273,19 @@ ni l'un ni l'autre n'a de variable propre.
 | `MCP_BRIDGES_PER_TENANT` | `0` | Sans effet tant que `MCP_BRIDGE_BIND` est vide |
 | `MCP_BRIDGE_IMAGE` | `node:22-alpine` | Idem |
 
-Le coffre à secrets d'employé (`secrets=MOCK(in-memory)`) est un mock permanent
-qu'aucune variable ne corrige. Il est nommé dans **chaque** ligne de boot, pour
-qu'une ligne sans `MOCK` ne puisse pas être fabriquée par omission.
+Le coffre à secrets d'employé chiffre sous `AGENTOS_MASTER_KEY`
+(`secrets=local-envelope(aes-256-gcm)`), le même cipher que les identités — donc
+un déploiement sans clé maîtresse ne démarre pas, et il n'existe pas de repli en
+clair. Ce que le chiffrement ne corrige pas : les lignes vivent dans la mémoire
+du processus, un redémarrage vide le coffre. C'est pourquoi la clé modèle a été
+sortie en colonne scellée (`0050`) et pourquoi il ne reste ici que le canari de
+provisionnement.
 
 ### Ce que le boot dit de lui-même
 
 ```
 adapters: email=MOCK telephony=MOCK browser=MOCK embedder=MOCK
-          llm=MOCK(mock) secrets=MOCK(in-memory)
+          llm=MOCK(mock) secrets=local-envelope(aes-256-gcm)
 ```
 
 `/readyz` republie la même chose sous `mock_adapters`, pour que la question

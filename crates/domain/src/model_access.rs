@@ -68,9 +68,12 @@ pub enum ModelPath {
     /// The tenant pasted an Anthropic API key. **Their key pays**, which is the
     /// whole commercial promise, so this is the path production is about.
     ApiKey,
-    /// The tenant runs the model through the local `claude` CLI — under their
-    /// own subscription when they pasted a `claude setup-token` (sealed on the
-    /// row, `0084`), or logged in as them on the host when they did not.
+    /// The tenant runs the model through the local `claude` CLI, **on the
+    /// host's own session**. A tenant subscription sealed on the row is no
+    /// longer a way in: `model_access::connect` refuses it before the probe and
+    /// `llm_for` refuses to spend it, because Anthropic forbids a developer to
+    /// collect, store or intermediate Claude.ai credentials or session tokens.
+    /// The `0084` column stays, unread — see `NoModel::SubscriptionIsNotOursToHold`.
     ///
     /// See [`ModelPath::is_host`]: this path spends *whatever the host has*, so
     /// a deployment whose own backend is an API key we pay for must refuse it.

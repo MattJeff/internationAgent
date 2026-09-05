@@ -56,7 +56,7 @@ use agentos_providers::embedder::Embedder;
 use agentos_providers::embedder_openai::OpenAiEmbedder;
 use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
-use agentos_providers::secrets::MemorySecretStore;
+use agentos_providers::secrets::LocalEnvelopeSecretStore;
 use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
 use agentos_providers::telephony_twilio::TwilioTelephony;
 use async_trait::async_trait;
@@ -107,8 +107,12 @@ pub use agentos_providers::email::ProviderMessageId;
 
 // And the vault, for the fourth time and the same reason: the provisioner's
 // identity canary is written and read from the binary, which may not name
-// `agentos-providers`. Only the trait — the concrete stores stay behind
-// `secret_store`, so the binary cannot pick one.
+// `agentos-providers`. Only the trait — the choice of store stays behind
+// `secret_store`, so the binary cannot pick one. (That function returns the
+// concrete `LocalEnvelopeSecretStore` now, for the reason its own docs give;
+// the binary holds it by inference and coerces to this trait at the one
+// argument that wants it, so it still names nothing and still chooses
+// nothing.)
 //
 // It no longer carries a tenant's model credential. That moved to
 // `tenant_model_access.sealed_key` in `0050_tenant_model_key`, because every
@@ -208,13 +212,29 @@ impl fmt::Debug for Credentials {
 
 /// The mailbox: Resend when there is a key, the in-memory fake when there is
 /// not.
-fn email_provider(credentials: &Credentials) -> Arc<dyn EmailProvider> {
+/// `public_host` is where an unsubscribe link points, and it is not the sending
+/// domain: mail leaves as `agents.example.com` while the page that honours a
+/// one-click POST is served by the API on the console's host. `None` — the
+/// provisioning engine, which sends nothing — leaves the adapter on its own
+/// default, the sending domain, which is the honest guess for a deployment that
+/// never says otherwise. `callback_origin` is the same normalisation Twilio's
+/// callbacks go through, so one deployment cannot end up with two spellings of
+/// its own address.
+fn email_provider(credentials: &Credentials, public_host: Option<&str>) -> Arc<dyn EmailProvider> {
     match &credentials.email {
-        Some(email) => Arc::new(ResendEmailProvider::new(
-            Secret::new(email.api_key.clone()),
-            Secret::new(email.webhook_secret.clone()),
-            email.domain.clone(),
-        )),
+        Some(email) => {
+            let provider = ResendEmailProvider::new(
+                Secret::new(email.api_key.clone()),
+                Secret::new(email.webhook_secret.clone()),
+                email.domain.clone(),
+            );
+            Arc::new(match public_host {
+                Some(host) => {
+                    provider.with_unsubscribe_origin(&crate::inbound::callback_origin(host))
+                }
+                None => provider,
+            })
+        }
         None => Arc::new(MockEmailProvider::new()),
     }
 }
@@ -318,45 +338,83 @@ pub fn embedder(credentials: &Credentials) -> Embedder {
 /// process cannot open. A mock provider that invents a phone number costs
 /// nothing; a mock cipher costs an identity.
 ///
-/// The vault (`secrets`) is still a plaintext map, and that is still fine: it
-/// holds a provisioning canary and nothing else — in a mock deployment or a real
-/// one, since 0050 took the tenant's model key out of it.
+/// The vault (`secrets`) is the same cipher as `envelope`, over the same
+/// `master_key`: see [`secret_store`].
 pub fn adapters(master_key: &str) -> Adapters {
-    adapters_for(master_key, &Credentials::default(), secret_store())
+    adapters_for(
+        master_key,
+        &Credentials::default(),
+        secret_store(master_key),
+    )
 }
 
 /// The vault this deployment stores its provisioning canary in.
 ///
-/// **In memory, and that is now the whole story.** It used to hold the tenant's
-/// model credential too — written by `POST /v1/model`, read by every turn — and
-/// the argument here used to be that the binary must call this *once* so both
-/// readers saw one map. That argument was true and insufficient: one map per
-/// process is still one map per process, so a restart, a crash or a second
-/// replica lost the key while the `tenant_model_access` row went on saying
-/// "connected", and every employee then spent its whole daily turn budget
-/// discovering it. `0050_tenant_model_key` moved that credential into the row
-/// that claims it, sealed. What is left here is a canary
-/// [`crate::provisioning`] writes and reads inside one step.
+/// **AES-256-GCM envelope encryption, never the plaintext map.**
+/// [`MemorySecretStore`](agentos_providers::secrets::MemorySecretStore) is what
+/// this used to return, and what it is described
+/// as in its own docs — "plaintext, in a map, on purpose" — so every secret
+/// handed to the vault sat readable in the process image, in a core dump, and
+/// in anything that could attach to the pid. `LocalEnvelopeSecretStore` was
+/// already written, already tested and already the cipher `Adapters::envelope`
+/// runs on; it was simply never the thing this function returned.
 ///
-/// Still named a permanent mock by `Config::adapter_summary`, and now honestly:
-/// nothing durable depends on it. The day it is KMS this signature does not
-/// change.
-pub fn secret_store() -> Arc<dyn SecretStore> {
-    Arc::new(MemorySecretStore::new())
+/// It is [`crate::identity::envelope`] and not a second construction, for the
+/// reason that function's callers already have: two ciphers derived from one
+/// `AGENTOS_MASTER_KEY` are one deployment where what one half sealed the other
+/// half cannot open.
+///
+/// # There is no mock branch, because there is no state that would take one
+///
+/// `config.rs` reads `AGENTOS_MASTER_KEY` with `required`, so a deployment
+/// without one does not boot — not on a mock box either, since
+/// `AGENTOS_ALLOW_MOCKS` waives credentials for *adapters* and the master key
+/// is not one. A plaintext fallback here would therefore be a fallback for a
+/// state the process cannot reach, and the one thing it would reliably do is
+/// give a future refactor somewhere to fail open to. Tests that want a bare map
+/// name `MemorySecretStore` themselves.
+///
+/// What this still is **not** is durable: the envelope rows live in a
+/// `HashMap`, so a restart empties the vault exactly as before. That is why
+/// `0050_tenant_model_key` moved the tenant's model credential out to a
+/// database column, and why what is left here is a canary
+/// [`crate::provisioning`] writes and reads inside one step. Encrypting a
+/// process-local map fixes the disclosure, not the lifetime. The day it is KMS
+/// this signature does not change.
+///
+/// # Why the return type is concrete
+///
+/// `Arc<dyn SecretStore>` is what this used to be, and it made the wiring
+/// untestable: both implementations satisfy the trait, both round-trip a value
+/// unchanged through `put`/`get`, and nothing a caller can reach through the
+/// trait tells them apart. A test written against `dyn SecretStore` therefore
+/// passes just as green on the plaintext map — which is the state this change
+/// exists to end. Naming the type is what makes
+/// [`the_vault_stores_ciphertext_and_returns_the_plaintext`] a test of *this
+/// function* rather than of the cipher beside it: it calls `seal`, which the
+/// map does not have, so putting `MemorySecretStore` back here is a compile
+/// error rather than a silent regression.
+///
+/// The binary still cannot *name* this type — `apps/server` does not depend on
+/// `agentos-providers` — and still cannot pick a different one, which is what
+/// the re-export note above is about. It holds the value by inference and
+/// coerces at the `adapters_for` argument that wants the trait.
+pub fn secret_store(master_key: &str) -> Arc<LocalEnvelopeSecretStore> {
+    crate::identity::envelope(master_key)
 }
 
 /// The adapters this deployment's credentials actually select.
 ///
 /// Real client per `Some` field, mock per `None`. Every other field is what
-/// [`adapters`] always gave: `secrets` is still a plaintext map, and `envelope`
-/// is still real crypto over the deployment's own master key.
+/// [`adapters`] always gave: `secrets` and `envelope` are both real crypto over
+/// the deployment's own master key — see [`secret_store`].
 pub fn adapters_for(
     master_key: &str,
     credentials: &Credentials,
     secrets: Arc<dyn SecretStore>,
 ) -> Adapters {
     Adapters {
-        email: email_provider(credentials),
+        email: email_provider(credentials, None),
         // `None`: the provisioner buys and releases numbers and never places a
         // call, so there is no outcome for a carrier to report back.
         telephony: telephony_provider(credentials, None),
@@ -400,7 +458,7 @@ pub fn ports() -> Ports {
 /// only reader and which gives it to the real adapter only.
 pub fn ports_for(credentials: &Credentials, public_host: &str) -> Ports {
     Ports {
-        email: email_provider(credentials),
+        email: email_provider(credentials, Some(public_host)),
         telephony: telephony_provider(credentials, Some(public_host)),
         browser: browser_provider(credentials),
         mcp: Arc::new(NotConfigured),
@@ -848,6 +906,58 @@ mod tests {
             "retrying a missing adapter never helps"
         );
         assert_eq!(err.code(), "not_configured");
+    }
+
+    /// The vault this deployment actually gets is the cipher, not the map.
+    ///
+    /// Two halves, and the second is the one that catches the old wiring: a
+    /// round trip through `MemorySecretStore` also returns the value unchanged,
+    /// so "it comes back identical" proves nothing on its own. What separates
+    /// them is what the store puts in its rows, so the second half seals
+    /// through the very store the first half wrote to and reads the bytes.
+    #[tokio::test]
+    async fn the_vault_stores_ciphertext_and_returns_the_plaintext() {
+        const MASTER: &str = "mocks-test-master-key";
+        const VALUE: &str = "hunter2-portal-password";
+
+        let secret_ref = agentos_domain::ids::SecretRef::new(
+            agentos_domain::ids::TenantId::new_v7(Utc::now()),
+            agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
+            "portal-password",
+        )
+        .expect("a well-formed name");
+
+        let vault = secret_store(MASTER);
+        vault
+            .put(&secret_ref, &Secret::new(VALUE))
+            .await
+            .expect("the vault accepts a secret");
+        assert_eq!(
+            vault
+                .get(&secret_ref)
+                .await
+                .expect("what was written is readable")
+                .expose_for_transport(),
+            VALUE,
+            "the envelope store must hand back exactly what it was given"
+        );
+
+        // The bytes the rows hold. `seal` is called on the *same* store the
+        // round trip above went through — not on a second envelope store built
+        // beside it — because a second one would prove only that the cipher
+        // encrypts, which was never in doubt. What is in doubt is which store
+        // this function returns, and `seal` is a method the plaintext map does
+        // not have: swapping `MemorySecretStore` back in stops this compiling.
+        let sealed = vault
+            .seal(&secret_ref, &Secret::new(VALUE))
+            .expect("sealing under this deployment's master key")
+            .to_bytes();
+        assert!(
+            !sealed
+                .windows(VALUE.len())
+                .any(|window| window == VALUE.as_bytes()),
+            "the stored form contains the plaintext, so this is not the cipher"
+        );
     }
 
     #[test]

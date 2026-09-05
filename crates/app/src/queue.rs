@@ -815,7 +815,7 @@ pub async fn reconcile_opt_outs(
         // poussée (`inbound::record_smartlead_unsubscribe`) lit le même `false`
         // et en fait une erreur terminale, parce qu'elle n'a qu'une personne
         // dans la livraison et que la perdre serait perdre le tout.
-        if record_platform_opt_out(&mut tx, raw, now).await? {
+        if record_platform_opt_out(&mut tx, raw, PLATFORM_NOTE, now).await? {
             recorded += 1;
         }
     }
@@ -828,6 +828,15 @@ pub async fn reconcile_opt_outs(
     );
     Ok(recorded)
 }
+
+/// Provenance d'un opt-out lu sur la plateforme d'envoi — le tirage
+/// (`reconcile_opt_outs`) comme la poussée (`inbound::record_smartlead_unsubscribe`).
+pub const PLATFORM_NOTE: &str = "unsubscribed on the outbound sending platform";
+
+/// Provenance d'un clic sur `List-Unsubscribe` dans un mail que ce produit a
+/// envoyé lui-même. Une porte différente de [`PLATFORM_NOTE`] : personne
+/// d'autre n'a tenu le stylo.
+pub const ONE_CLICK_NOTE: &str = "clicked the List-Unsubscribe link in our own mail";
 
 /// Écrire l'opt-out d'une personne que la plateforme d'envoi nomme.
 ///
@@ -853,6 +862,7 @@ pub async fn reconcile_opt_outs(
 pub async fn record_platform_opt_out(
     tx: &mut TenantTx<'_>,
     raw: &str,
+    note: &'static str,
     now: DateTime<Utc>,
 ) -> Result<bool, RevenueError> {
     let Ok(address) = EmailAddress::parse(raw) else {
@@ -878,7 +888,16 @@ pub async fn record_platform_opt_out(
             // The legal record of where this came from. This row is the
             // audit line for `Effects::opted_out`, which writes none of its
             // own; see that method.
-            note: Some("unsubscribed on the outbound sending platform"),
+            //
+            // Un paramètre depuis qu'il y a trois portes — le tirage
+            // Smartlead, la poussée Smartlead, et le clic sur
+            // `List-Unsubscribe` dans un mail qu'on a envoyé nous-mêmes. Une
+            // seule fonction écrit toujours la ligne, pour la raison écrite
+            // au-dessus de `inbound::record_refusal` ; ce qui diffère est la
+            // provenance, et une provenance fausse dans un registre légal est
+            // pire que pas de provenance. `&'static str` et pas `String` : la
+            // phrase est la nôtre, jamais celle d'un tiers.
+            note: Some(note),
             suppressed_at: now,
         },
     )

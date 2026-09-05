@@ -160,9 +160,17 @@ fn a_partly_real_deployment_says_so_in_one_line_at_boot() {
     // Including the one whose credential used to be able to quiet the guard
     // while selecting nothing. It selects something now, and the line says so.
     assert!(logged.contains("embedder=openai"), "{logged}");
-    // The port no credential can make real is on the same line, so a line with
-    // no MOCK in it cannot be produced by leaving something out.
-    assert!(logged.contains("secrets=MOCK"), "{logged}");
+    // And the vault, on the same line, so a line with no MOCK in it cannot be
+    // produced by leaving something out. It used to read `secrets=MOCK`, which
+    // was true of the plaintext map the binary wired; it is the AES-256-GCM
+    // envelope store now, and an operator reading this line has to be told
+    // which — a summary that under-claims is as misleading as one that
+    // over-claims.
+    assert!(
+        logged.contains("secrets=local-envelope(aes-256-gcm)"),
+        "{logged}"
+    );
+    assert!(!logged.contains("secrets=MOCK"), "{logged}");
 }
 
 #[test]
