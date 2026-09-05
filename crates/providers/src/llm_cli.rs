@@ -26,7 +26,10 @@
 //!   can cover several real calls. `llm_anthropic` puts the same number in the
 //!   body, where it is a hard stop and a `max_tokens` stop reason. It is passed
 //!   anyway, because dropping a field of the request was the previous behaviour
-//!   and it is worse.
+//!   and it is worse. **Floored at [`MIN_OUTPUT_TOKENS`]**: the CLI does not
+//!   truncate at the cap, it *fails* the turn — `<synthetic>` message, `result.error:
+//!   "max_output_tokens"` — and `model_access::probe` asks for one token. On this
+//!   path a one-token probe read as "not logged in" for a morning, 2026-09-05.
 //!
 //! # Extended thinking is off, because production has none
 //!
@@ -291,6 +294,10 @@ impl Default for CliLlm {
     }
 }
 
+/// The least `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is ever set to. See the module
+/// header: below the cap the CLI fails rather than truncates.
+pub const MIN_OUTPUT_TOKENS: u32 = 1_024;
+
 impl CliLlm {
     /// How long one turn may take before the child is killed.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -373,7 +380,10 @@ impl CliLlm {
             // adapter used to drop it on the floor. There is no `--max-tokens`,
             // so this is the closest the CLI has — and it is not the same
             // thing, which the module header now says out loud.
-            .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", max_tokens.to_string())
+            .env(
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                max_tokens.max(MIN_OUTPUT_TOKENS).to_string(),
+            )
             // The production path sends no `thinking` field, so production has
             // extended thinking OFF. The CLI turns it on. See the module header.
             .env("MAX_THINKING_TOKENS", "0")
@@ -754,8 +764,13 @@ fn parse_stream(stdout: &str) -> Result<LlmResponse, ProviderError> {
             .iter()
             .any(|e| e["type"] == "assistant" && e["message"]["model"] == "<synthetic>")
     {
+        // The CLI's own failures travel the same road, and `result.error` is
+        // what tells them apart. One is named because one has been met.
         return Err(ProviderError::Terminal {
-            code: "cli_not_logged_in",
+            code: match result["error"].as_str() {
+                Some("max_output_tokens") => "cli_max_output_tokens",
+                _ => "cli_not_logged_in",
+            },
         });
     }
 
@@ -1069,6 +1084,33 @@ mod tests {
             ),
             other => panic!("a ceiling is a wait, not a reply: {other:?}"),
         }
+    }
+
+    /// Captured in the container, 2026-09-05, under `CLAUDE_CODE_MAX_OUTPUT_TOKENS=1`:
+    /// the CLI's own error, dressed as the same `<synthetic>` message a missing
+    /// login sends. It has its own name, and `run` no longer lets it happen.
+    #[test]
+    fn the_clis_output_cap_error_is_not_a_missing_login() {
+        let stream = r#"{"type":"assistant","message":{"id":"1","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: Claude's response exceeded the 1 output token maximum."}]}}
+{"type":"result","is_error":true,"error":"max_output_tokens","stop_reason":"stop_sequence","subtype":"success","result":"API Error: Claude's response exceeded the 1 output token maximum."}"#;
+        match parse_stream(stream) {
+            Err(ProviderError::Terminal { code }) => assert_eq!(code, "cli_max_output_tokens"),
+            other => panic!("the cap is the CLI's failure, not a reply: {other:?}"),
+        }
+    }
+
+    /// The probe asks for one token; the CLI is handed the floor instead.
+    #[tokio::test]
+    async fn a_one_token_request_reaches_the_cli_as_the_floor() {
+        let fake = recording();
+        let req =
+            LlmRequest::new("claude-opus-5", "you are lena", 1).with_message(Message::user("hi"));
+        fake.llm().complete(req).await.unwrap();
+        let env = fs::read_to_string(fake.path("env")).unwrap();
+        assert!(
+            env.contains(&format!("MAX_OUTPUT={MIN_OUTPUT_TOKENS}\n")),
+            "{env}"
+        );
     }
 
     #[test]
