@@ -1071,6 +1071,9 @@ impl Effects {
             subject: body.subject,
             body_text: body.body_text,
             in_reply_to: body.in_reply_to,
+            // Rempli par `dispatch_email`, la seule route sortante, pour que
+            // les deux appelants ne puissent pas en oublier un.
+            unsubscribe_token: None,
             attachments: Vec::new(),
         };
         self.dispatch_email(ok, email, Map::new()).await
@@ -1222,6 +1225,7 @@ impl Effects {
                 parties.issuer
             ),
             in_reply_to: None,
+            unsubscribe_token: None,
             attachments: vec![OutboundAttachment {
                 filename: name,
                 content_type: held.content_type,
@@ -1252,12 +1256,75 @@ impl Effects {
         email: OutboundEmail,
         extra: Map<String, Value>,
     ) -> Result<ProviderMessageId, EffectError> {
+        // La porte de sortie, mintée ici et nulle part ailleurs — parce que
+        // c'est ici que passe *tout* mail sortant, invoice comprise. Google et
+        // Yahoo n'exigent les deux en-têtes que sur l'envoi en volume, et le
+        // reste du produit n'a aucun moyen de distinguer un mail « en volume »
+        // d'un autre : la même façade envoie une approche à froid et une
+        // facture. Alors les deux les portent. Le coût est qu'un client qui se
+        // désabonne ne reçoit plus ses factures par mail — c'est son droit, la
+        // ligne de `suppressions` le dit, et personne ne peut la lui retirer.
+        //
+        // Avant le `begin_send` : le mint est une écriture de base, et la
+        // laisser échouer *après* la ligne d'intention laisserait une
+        // réservation ouverte pour un envoi qui n'a pas eu lieu.
+        let mut email = email;
+        email.unsubscribe_token = self.unsubscribe_token_for(&ok).await?;
+
         // `?`, and no audit row on this arm: the only way this fails is the
         // database being unreachable, at which point `record` cannot write one
         // either. Nothing has been sent, which is the state the failure leaves.
         self.begin_send(&ok, EMAIL_PORT).await?;
         let sent = self.ports.email.send(&self.key_for(&ok), &email).await;
         self.record_sent(&ok, sent, extra).await
+    }
+
+    /// L'identifiant fournisseur du message auquel une réponse à `to` répond,
+    /// ou `None` quand il n'y en a pas.
+    ///
+    /// Une lecture de nos propres tables et pas un effet : elle est ici parce
+    /// que c'est ici que vivent le pool et le locataire acteur, et parce que
+    /// l'alternative — un second `Db` dans `Turn` — serait une seconde façon
+    /// d'atteindre la base depuis un tour. Rien n'est écrit et rien n'est
+    /// gaté ; voir [`crate::inbound::reply_target`] pour les trois conditions
+    /// que la requête impose.
+    pub async fn reply_target(
+        &self,
+        message_id: uuid::Uuid,
+        to: &EmailAddress,
+    ) -> Result<Option<ProviderMessageId>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let found = crate::inbound::reply_target(&mut tx, message_id, to)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let _ = tx.rollback().await;
+        Ok(found)
+    }
+
+    /// Le jeton de désinscription du destinataire **réglé par la décision**.
+    ///
+    /// Pris sur le token comme `to` l'est, et pour la même raison exactement :
+    /// un lien minté pour une adresse que le rendu a choisie serait un lien qui
+    /// désabonne quelqu'un d'autre que celui à qui le mail part.
+    async fn unsubscribe_token_for<A: Subject<Of = EmailSend>>(
+        &self,
+        ok: &Authorized<A>,
+    ) -> Result<Option<String>, EffectError> {
+        let to = ok.action().subject().to.to_string();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let token = crate::inbound::unsubscribe_token(&mut tx, &to, Utc::now())
+            .await
+            .map_err(EffectError::Unavailable)?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        Ok(token)
     }
 
     /// Put the prospect on the token onto the sending platform's list.

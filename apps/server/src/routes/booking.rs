@@ -151,10 +151,29 @@ impl Booking {
     }
 }
 
-/// The public pair. Sans credential — see the module docs.
+/// The public pair, plus the way out. Sans credential — see the module docs.
+///
+/// # Pourquoi la désinscription est ici, et pourquoi elle est publique
+///
+/// Ici parce que c'est le fichier de routes qui porte déjà des chemins publics,
+/// et publique pour la raison la plus bête et la plus définitive : **personne ne
+/// s'authentifie pour se désinscrire.** Un `POST` en un clic (RFC 8058) est
+/// émis par le client mail du destinataire, sans interaction, sans cookie et
+/// sans clé — Gmail poste le lien lui-même. Une porte derrière `with_api_stack`
+/// serait une porte que le mécanisme exigé par Google et Yahoo ne peut pas
+/// franchir, donc pas une porte.
+///
+/// Ce qui remplace le credential est le jeton : `unsub_` + 128 bits de CSPRNG,
+/// `unsubscribe_links` (0085), résolu par `admin_tx_bypassing_rls` parce que la
+/// recherche précède le fait de savoir de quel locataire il s'agit — le même
+/// argument que la résolution `(domain, slug)` au-dessus.
 pub fn public_router(db: Db) -> Router {
     Router::new()
         .route("/book/{domain}/{slug}", get(page).post(submit))
+        .route(
+            &format!("{}{{token}}", inbound::UNSUBSCRIBE_PATH),
+            get(unsubscribe_page).post(unsubscribe),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(Booking {
             db,
@@ -167,6 +186,71 @@ pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/employees/{id}/booking", put(set_open))
         .with_state(db)
+}
+
+// ---------------------------------------------------------------------------
+// La désinscription
+// ---------------------------------------------------------------------------
+
+/// La page rendue dans les deux cas, et c'est délibéré.
+///
+/// Jeton inconnu et jeton honoré rendent exactement la même phrase et le même
+/// 200. La seule défense d'un lien qu'on ne peut pas deviner est qu'on ne peut
+/// pas le deviner ; une page qui dirait « ce lien n'existe pas » transformerait
+/// l'essai à l'aveugle en oracle. C'est l'argument que `booking` fait déjà pour
+/// un siège fermé et un siège absent.
+const UNSUBSCRIBED: &str = "<!doctype html><meta charset=utf-8>\
+<title>Unsubscribed</title>\
+<p>You will not be written to again.";
+
+/// `GET` : un bouton, et rien d'écrit.
+///
+/// **Le `GET` ne supprime pas.** Un lien dans un mail est suivi par les
+/// antivirus, les pré-chargeurs et les scanners de sécurité des messageries
+/// d'entreprise avant qu'un humain ne l'ait vu ; faire écrire le `GET`
+/// désabonnerait des gens qui n'ont rien demandé, dans une table sans DELETE.
+/// Le clic humain poste le formulaire, et le clic *automatique* de Gmail poste
+/// directement (RFC 8058) — les deux arrivent sur le `POST`, qui est le seul à
+/// écrire.
+async fn unsubscribe_page(Path(token): Path<String>) -> Response {
+    Html(format!(
+        "<!doctype html><meta charset=utf-8><title>Unsubscribe</title>\
+         <form method=\"post\" action=\"{}{}\">\
+         <p>Stop receiving email from this company?\
+         <p><button type=\"submit\">Unsubscribe</button></form>",
+        inbound::UNSUBSCRIBE_PATH,
+        // Le jeton revient dans un attribut HTML : c'est du texte d'un tiers
+        // tant qu'il n'a pas été résolu, et il ne l'est pas encore ici. Il ne
+        // peut porter que l'alphabet base64url, tout le reste est jeté — la
+        // page reste alors un bouton qui ne mène nulle part, ce qui est
+        // exactement ce que mérite un jeton inventé.
+        token
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(80)
+            .collect::<String>()
+    ))
+    .into_response()
+}
+
+/// `POST` : la suppression, par la porte que tout le monde emprunte.
+///
+/// [`agentos_app::inbound::record_unsubscribe`] passe par
+/// `queue::record_platform_opt_out`, l'unique écrivain d'un opt-out — une
+/// désinscription et une plainte sont la même chose vue de deux côtés, et le
+/// trigger `suppressions_deactivate_contacts` désactive le contact, donc le
+/// téléphone tombe avec le mail.
+///
+/// 200 même quand rien n'a été écrit : voir [`UNSUBSCRIBED`]. Le seul 5xx est
+/// une base absente, parce que celui-là, le client mail doit le réessayer.
+async fn unsubscribe(State(state): State<Booking>, Path(token): Path<String>) -> Response {
+    match inbound::record_unsubscribe(&state.db, &token, Utc::now()).await {
+        Ok(_) => Html(UNSUBSCRIBED).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "an unsubscribe could not be recorded");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// The one line the promise carries: our word and the masked address.

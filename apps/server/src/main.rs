@@ -27,7 +27,10 @@
 //!
 //! `/livez` and `/readyz` sit outside the API stack: a probe that needs a
 //! credential is a probe that reports an outage the day the keyring is
-//! misconfigured.
+//! misconfigured. `/metrics` is mounted beside them and is **not** open — it
+//! carries the deny-reason mix and the approval-queue depth, so it takes
+//! `AGENTOS_METRICS_KEY` and answers 401 without it. Outside the API stack is
+//! not the same as unauthenticated; see `app` and `metrics.rs`.
 
 mod auth; // U30
 mod bridge; // the container runtime `agentos_app::hosted` describes and does not contain
@@ -337,7 +340,13 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // restart emptied it while the `tenant_model_access` row went on reporting a
     // connection, and the employees of that tenant then burned a whole day's
     // turn budget on a key that was not there.
-    let secrets = agentos_app::mocks::secret_store();
+    //
+    // It takes the master key now because it is no longer a plaintext map: what
+    // comes back is the AES-256-GCM envelope store, over the same 32 bytes
+    // `credentials` below derives, so nothing in this process holds a vault
+    // secret in the clear. `mocks::secret_store` carries the argument for why
+    // there is no plaintext branch left to select.
+    let secrets = agentos_app::mocks::secret_store(&config.master_key);
     // No blob store is built here any more, and the deletion is the fix. This
     // line used to construct a `HashMap` behind a trait whose only method was
     // `put`: a customer's attachments were unreadable through the trait and
@@ -821,21 +830,29 @@ fn app(
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
     // and that is a deliberate reading of the two tiers above rather than the
-    // easy option. A scraper holds no API key, and the only credential this
-    // server understands is a tenant's — so putting `/metrics` behind auth
-    // would mean handing one tenant a set of cross-tenant aggregates, plus a
-    // rate limiter and an idempotency layer on a once-a-minute scrape. Every
-    // number it exposes is aggregate by construction (see `metrics.rs` on
+    // easy option. A scraper holds no API key, and every credential the API
+    // stack understands names a tenant — so putting `/metrics` inside it would
+    // mean handing one tenant a set of cross-tenant aggregates,
+    // plus a rate limiter and an idempotency layer on a once-a-minute scrape.
+    // Every number it exposes is aggregate by construction (see `metrics.rs` on
     // cardinality): deny codes, step codes, token totals, three queue depths.
     // No tenant id, no employee id, no url.
     //
-    // What that leaves is real and worth saying out loud: **the listener must
-    // not be publicly routable.** `/metrics` tells a stranger the deny-reason
-    // mix and the size of the approval queue, and `/readyz` next to it already
-    // publishes the outbox lag. The ingress is the thing that can see a client
-    // address (the same reason the rate limiter is not on this tier), so the
-    // ingress is where `/metrics`, `/livez` and `/readyz` get restricted to the
-    // scrape network. Prometheus is the expected reader; nothing else.
+    // **Outside the API stack is not the same as open, and it used to be.**
+    // This comment said the listener must not be publicly routable and left it
+    // there — a requirement in a runbook, enforced by whatever the ingress
+    // happened to publish, on a deployment where the API also answers on the
+    // container network. `metrics::router` now takes `AGENTOS_METRICS_KEY` and
+    // answers 401 without it, including when the variable is unset; the page
+    // tells a stranger the deny-reason mix and the depth of the approval queue,
+    // which is what the company tried to do and what it was refused.
+    //
+    // `/livez` and `/readyz` stay open, deliberately: a probe that
+    // authenticates reports the process dead when the credential is wrong,
+    // which inverts what it is for, and between them they publish a boolean,
+    // the mock adapter list and the outbox lag. Restricting all three to the
+    // scrape network at the ingress is still worth doing — it is just no
+    // longer the only thing standing in front of the interesting one.
     let health = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -846,7 +863,7 @@ fn app(
             // about it.
             payment_rail: ports.payments.configured(),
         })
-        .merge(metrics::router(db));
+        .merge(metrics::router(db, config.metrics_key.clone()));
 
     with_outer_stack(health.merge(public).merge(platform).merge(api))
 }
@@ -5368,6 +5385,8 @@ mod tests {
             // Empty: this config exists for `handlers`, which is the termination
             // path, and no platform route is mounted from it.
             platform_keys: crate::auth::PlatformKeys::default(),
+            // Same reason: `/metrics` is not mounted from this config either.
+            metrics_key: None,
             mock_adapters: Vec::new(),
             // Every adapter a mock, which is what this test's engine is built
             // with anyway.

@@ -345,7 +345,7 @@ every boot logs one line saying which is which:
 
 ```
 adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
-          llm=anthropic secrets=MOCK(in-memory)
+          llm=anthropic secrets=local-envelope(aes-256-gcm)
 ```
 
 `/readyz` publishes the same inventory as `mock_adapters`, because "the mail

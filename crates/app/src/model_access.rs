@@ -102,7 +102,6 @@ use agentos_domain::policy::ModelId;
 use agentos_providers::Secret;
 use agentos_providers::llm::{Llm, LlmRequest, Message};
 use agentos_providers::llm_anthropic::AnthropicLlm;
-use agentos_providers::llm_cli::CliLlm;
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::db::{StoreError, TenantTx};
 use agentos_store::model_access::Connection;
@@ -283,6 +282,37 @@ pub enum ConnectError {
     )]
     HostModelIsNotYours,
 
+    /// [`ModelPath::Cli`] with a Claude subscription token attached.
+    ///
+    /// **The door 0084 opened, closed on 2026-09-06.** Anthropic's terms
+    /// (`code.claude.com/docs/en/legal-and-compliance`) say developers "may not
+    /// collect, store, or intermediate Claude.ai credentials or session
+    /// tokens — sign-in to a Claude account must complete through Anthropic's
+    /// own flow", and that customers "may not pay for, resell, or intermediate
+    /// Claude usage on their end users' behalf. Each end user must authenticate
+    /// with their own Anthropic API key, Claude subscription plan credentials,
+    /// or 3P inference provider credential."
+    ///
+    /// Taking a tenant's `claude setup-token`, sealing it into
+    /// `tenant_model_access.sealed_key` and exporting it as
+    /// `CLAUDE_CODE_OAUTH_TOKEN` for the binary was all three forbidden verbs at
+    /// once — collect, store, intermediate. It is refused here and not only at
+    /// the HTTP edge because `connect` is the only door into that column, and a
+    /// second caller (a CLI, a test, a future route) must meet the same wall.
+    ///
+    /// **The two paths that stay open are untouched:** [`ModelPath::ApiKey`],
+    /// where the tenant authenticates with their own key, and [`ModelPath::Cli`]
+    /// with *no* token, which is this host's own session and belongs to whoever
+    /// runs the deployment.
+    #[error(
+        "a Claude subscription token is not ours to hold: Anthropic's terms forbid a developer to \
+         collect, store or intermediate Claude.ai credentials or session tokens, and require each \
+         end user to authenticate with their own credential. Connect an Anthropic API key \
+         instead — or a Bedrock, Vertex or Foundry credential — and note that the cli path with \
+         no token still runs on this host's own session"
+    )]
+    SubscriptionIsNotOursToHold,
+
     /// The credential could not be sealed, so nothing was written at all —
     /// the row carries the ciphertext, so there is no half of this to fail
     /// separately any more.
@@ -378,14 +408,20 @@ pub async fn connect(
             (probe(&client(&key, api_base), model).await, Some(key))
         }
         ModelPath::Cli => match key {
-            // Their own subscription: `claude setup-token`, pasted in the
-            // console. The binary on this box runs under it, so what the host
-            // pays for is not in question and the host's own login is not
-            // consulted. Proven the same way a key is — a call, here, now.
-            Some(key) => (
-                probe(&CliLlm::new().with_oauth_token(&key), model).await,
-                Some(key),
-            ),
+            // **This used to be the tenant's own `claude setup-token`, proven
+            // and then sealed. It is refused, and the refusal is the point.**
+            // Anthropic's terms: developers "may not collect, store, or
+            // intermediate Claude.ai credentials or session tokens", and each
+            // end user "must authenticate with their own Anthropic API key,
+            // Claude subscription plan credentials, or 3P inference provider
+            // credential". A token that never reaches a probe is a token this
+            // process never held — the refusal is before the call, not after
+            // it, because proving it would already be intermediating it.
+            //
+            // Whoever reopens this: the whole of the argument is on
+            // [`ConnectError::SubscriptionIsNotOursToHold`], and reopening it
+            // is a licence breach, not a feature.
+            Some(_) => return Err(ConnectError::SubscriptionIsNotOursToHold),
             None => {
                 if backend.pays_with_our_key() {
                     return Err(ConnectError::HostModelIsNotYours);
@@ -506,6 +542,33 @@ pub enum NoModel {
          credential nobody is billed for"
     )]
     HostModelIsNotTheirs,
+
+    /// The row says [`ModelPath::Cli`] **and** carries a sealed credential —
+    /// a Claude subscription token stored while `0084` was open.
+    ///
+    /// The spending end of [`ConnectError::SubscriptionIsNotOursToHold`]. No
+    /// new row can be in this state since 2026-09-06, so this variant exists for
+    /// the rows written before it: a deployment that upgrades must stop
+    /// exporting those tokens on its very next turn, not on whatever day the
+    /// tenant happens to reconnect.
+    ///
+    /// **It refuses rather than falling back to the host's session**, which is
+    /// the fallback sitting three lines below it. A tenant who pasted a token
+    /// asked to spend *their* subscription; silently moving their whole fleet
+    /// onto this host's login would be a bill changing hands without anybody
+    /// saying so, and this module's rule is that a missing credential never
+    /// quietly becomes somebody else's bill.
+    ///
+    /// The column and `migrations/0084` are deliberately left in place: an
+    /// unread column harms nobody, and a destructive migration over a
+    /// production credential column is a risk with no reader left to justify it.
+    #[error(
+        "this tenant's model connection carries a Claude subscription token, which this \
+         deployment may no longer run on: Anthropic's terms forbid intermediating Claude usage on \
+         an end user's behalf. Reconnect with POST /v1/model and an Anthropic API key of their \
+         own. Nothing about this is a provider failure and retrying will not fix it"
+    )]
+    SubscriptionIsNotOursToHold,
 
     /// The row says [`ModelPath::ApiKey`] and its sealed credential will not
     /// open.
@@ -632,14 +695,19 @@ pub async fn llm_for(
 ) -> Result<Arc<dyn Llm>, NoModel> {
     match connection.access.path {
         ModelPath::Cli => {
-            // A sealed token on the cli path is the tenant's subscription
-            // (`0084`): a fresh `CliLlm` under it, per call, and the host's
-            // login is never touched. No token is the host's own session.
-            if let Some(sealed) = connection.sealed_key.as_deref() {
-                let token = credentials
-                    .open_as(tenant_id, &model_context(tenant_id), sealed)
-                    .map_err(|_| NoModel::KeyMissing)?;
-                return Ok(Arc::new(CliLlm::new().with_oauth_token(&token)));
+            // A sealed token on the cli path is a tenant's Claude subscription,
+            // stored while `0084` was open. **It is never unsealed and never
+            // handed to the binary**: Anthropic's terms forbid a developer to
+            // "collect, store, or intermediate Claude.ai credentials or session
+            // tokens", and exporting one as `CLAUDE_CODE_OAUTH_TOKEN` per call
+            // is the intermediating. `connect` no longer writes such a row; this
+            // is what happens to the ones already written, and it refuses
+            // rather than falling through to the host's session below — see
+            // [`NoModel::SubscriptionIsNotOursToHold`] for why silence would be
+            // worse than a refusal. `credentials` is still this arm's business
+            // on the api_key path; nothing here opens an envelope.
+            if connection.sealed_key.is_some() {
+                return Err(NoModel::SubscriptionIsNotOursToHold);
             }
             // The founder's rule at the spending end. `connect` refuses this
             // path on a host whose model is a key of ours; `AGENTOS_LLM` can
@@ -962,51 +1030,86 @@ mod tests {
         tx.commit().await.expect("commit");
     }
 
-    /// **What is stored is what was proven, and nothing else.**
+    /// **A tenant's Claude subscription is not a credential this product may
+    /// hold**, at either end of its life.
     ///
-    /// Since `0084` a `cli` connection carrying a token is the tenant's own
-    /// subscription, and the token is what gets proven: a fresh `CliLlm` runs
-    /// under it. A token nobody could authenticate with is therefore refused
-    /// — nothing stored, no row — whether the box has a `claude` binary (the
-    /// CLI answers 401 and a `<synthetic>` message, `cli_not_logged_in`) or
-    /// not (`cli_failed`). Both are "not connected", and both leave the tenant
-    /// exactly as they were.
+    /// [`connect`] refuses the token *before* the probe, so it is never
+    /// collected, never proven and never sealed — the row stays absent. And
+    /// [`llm_for`] refuses a row that already carries one, which is every `cli`
+    /// row written while `0084` was open: those must stop reaching the binary
+    /// on the first turn after the upgrade, not on the day their tenant happens
+    /// to reconnect. Both sentences name an Anthropic API key, because the
+    /// person reading them is deciding what to paste next.
     #[tokio::test]
-    async fn a_cli_connection_with_a_token_nobody_can_use_stores_nothing() {
+    async fn a_claude_subscription_token_is_refused_at_both_ends() {
         let Some((db, tenant_id)) = fixture().await else {
             return;
         };
         let host = host();
+        let now = Utc::now();
 
         let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
-        let outcome = connect(
+        let err = connect(
             &mut tx,
             &cipher(),
             &host,
-            // The host paying with its own key does not matter here: the
-            // tenant brought a credential, and that is what runs.
-            LlmBackend::Anthropic,
+            // `Cli` rather than `Anthropic`: the refusal is about the token and
+            // not about whose model the host runs, so the one arrangement that
+            // *would* otherwise have been legal is the one tested.
+            LlmBackend::Cli,
             ModelPath::Cli,
             ModelId::Opus5,
             Some(Secret::new("sk-ant-oat01-nobody-issued-this")),
             None,
             AuditActor::Operator("founder@example.com".to_owned()),
-            Utc::now(),
+            now,
         )
         .await
-        .expect("a refused token is an outcome, not an error");
-        assert!(!outcome.verdict.is_connected(), "{:?}", outcome.verdict);
-        assert!(outcome.access.is_none());
-        tx.commit().await.expect("commit");
-
-        let mut tx = db.tenant_tx(tenant_id).await.expect("tx");
+        .expect_err("a subscription token must not be connectable");
+        assert!(
+            matches!(err, ConnectError::SubscriptionIsNotOursToHold),
+            "{err}"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("Anthropic API key"), "{rendered}");
         assert!(
             agentos_store::model_access::load(&mut tx)
                 .await
                 .expect("load")
                 .is_none(),
-            "a token that never answered must not be on the row"
+            "a token that was never proven must not be on the row"
         );
+
+        // A row from before the door closed: `cli` path, sealed token, exactly
+        // what `0084` permits the schema to hold. It takes no turn — and it does
+        // not quietly fall back to this host's own session, which is the arm
+        // three lines below the refusal.
+        let sealed = cipher()
+            .seal_as(
+                tenant_id,
+                &model_context(tenant_id),
+                &Secret::new("sk-ant-oat01-stored-while-0084-was-open"),
+            )
+            .expect("seal");
+        agentos_store::model_access::save(
+            &mut tx,
+            &ModelAccess {
+                path: ModelPath::Cli,
+                model: ModelId::Opus5,
+                verified_at: now,
+            },
+            Some(&sealed),
+            now,
+        )
+        .await
+        .expect("save");
+        let Err(err) = for_turn(&mut tx, &cipher(), &host, LlmBackend::Cli, None).await else {
+            panic!("a stored subscription token must not be handed to the binary");
+        };
+        assert!(matches!(err, NoModel::SubscriptionIsNotOursToHold), "{err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("Anthropic API key"), "{rendered}");
+        assert!(rendered.contains("retrying will not fix it"), "{rendered}");
         tx.commit().await.expect("commit");
     }
 

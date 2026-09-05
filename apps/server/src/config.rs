@@ -73,11 +73,11 @@ const DEFAULT_RUST_LOG: &str = "info,agentos_server=debug";
 ///   rather than by whether a credential happens to be exported;
 ///   [`LlmBackend::mock_label`] answers "is this one real?". A second variable
 ///   meaning the same thing would be the two lists this module exists to avoid.
-/// * The **secret vault**, which has no real implementation in this workspace
-///   at all. It is named as a permanent mock by [`Config::adapter_summary`]
-///   instead, which is honest and does not make `AGENTOS_ALLOW_MOCKS` mandatory
-///   for every deployment forever — a flag everybody must set is a flag that
-///   means nothing.
+/// * The **secret vault**, which has no credential to select on because it is
+///   selected by `AGENTOS_MASTER_KEY` — a variable that is `required`, so the
+///   vault is real on every deployment that boots at all. It is still named in
+///   every summary, as [`SECRETS_ADAPTER`], so that a line with no `MOCK` in it
+///   is a line that accounted for the vault rather than one that omitted it.
 ///
 /// # `EMBEDDER_API_KEY` is a row again, and the argument that removed it is
 /// answered rather than forgotten
@@ -110,13 +110,26 @@ const PROVIDER_CREDENTIALS: [(&str, &str, &str); 4] = [
     ("embedder", "EMBEDDER_API_KEY", "openai"),
 ];
 
-/// The adapters no credential can make real, named in every boot summary so a
-/// green line is not read as "all of this is live".
+/// The vault, named in every boot summary beside the adapters a credential
+/// selects — because it is the line an operator reads to find out what is real,
+/// and a name that is missing from it is a question nobody thought to ask.
 ///
-/// One left. The embedder was the other, and it moved into
-/// [`PROVIDER_CREDENTIALS`] when it stopped being unfixable — see that
-/// constant's docs, which carry the argument for both directions.
-const PERMANENT_MOCKS: &str = "secrets=MOCK(in-memory)";
+/// **It used to say `secrets=MOCK(in-memory)`, and that was true.**
+/// `agentos_app::mocks::secret_store` returned `MemorySecretStore`, whose own
+/// documentation reads "plaintext, in a map, on purpose", so every secret the
+/// vault held sat readable in the process image. It now returns the
+/// AES-256-GCM envelope store that was already in the tree, and this constant
+/// says so.
+///
+/// It is a constant and not a branch for the same reason the vault has no mock
+/// branch: [`Config::parse`] takes `AGENTOS_MASTER_KEY` through `required`, so
+/// **a deployment without a master key does not start at all** — it gets
+/// [`ConfigError::Missing`] before any of this is reached, and that refusal is
+/// the answer to "what if the key is absent". `AGENTOS_ALLOW_MOCKS` does not
+/// reach it either: that flag waives *provider credentials*, and the master key
+/// is not one. So there is exactly one vault this binary can boot with, this
+/// line is what it is, and the summary cannot lie in either direction.
+const SECRETS_ADAPTER: &str = "secrets=local-envelope(aes-256-gcm)";
 
 /// Why the process cannot start.
 #[derive(Debug, thiserror::Error)]
@@ -268,6 +281,25 @@ pub struct Config {
     /// plane. See [`crate::auth`] for why this one credential stays in the
     /// environment while every customer's moved into the database.
     pub platform_keys: PlatformKeys,
+    /// `AGENTOS_METRICS_KEY` — the bearer token `GET /metrics` demands, as one
+    /// bare secret.
+    ///
+    /// **A third credential rather than one of the two above, and the third one
+    /// is the smallest.** A scraper is not a tenant, so [`Config::api_keys`] is
+    /// the wrong shape: its entries name a tenant and `/metrics` is
+    /// cross-tenant by construction, which would mean handing one customer's
+    /// key the aggregates of every other. And it is not the control plane
+    /// either, so [`Config::platform_keys`] is the wrong *authority*:
+    /// `crate::auth` argues at length that the credential which can mint and
+    /// revoke a tenant's keys must not be spendable for anything else, and a
+    /// Prometheus job's configuration file is the last place to put it.
+    ///
+    /// `None` is the default and it means 401 for everybody, including a
+    /// scraper that presents nothing — closed by default, because the state
+    /// this variable exists to end is exactly "nobody set anything and the page
+    /// was open". Set it and the scrape works; the operator learns which it is
+    /// from one `warn` at boot.
+    pub metrics_key: Option<String>,
     /// Adapters that will run as mocks in this process, derived from
     /// [`PROVIDER_CREDENTIALS`].
     pub mock_adapters: Vec<&'static str>,
@@ -393,6 +425,8 @@ impl fmt::Debug for Config {
                 "platform_keys",
                 &format_args!("{} configured", self.platform_keys.len()),
             )
+            // Whether the scrape is closed, never with what.
+            .field("metrics_key", &self.metrics_key.is_some())
             .field("mock_adapters", &self.mock_adapters)
             // Its own Debug prints which adapters are configured, never with
             // what.
@@ -462,6 +496,25 @@ impl Config {
                 var: "AGENTOS_PLATFORM_KEYS",
                 detail: err.to_string(),
             })?;
+
+        // One bare secret, so there is no shape to get wrong — but the same
+        // floor the two keyrings hold their entries to. A short metrics token
+        // is a guessable one, and this endpoint is reachable from wherever the
+        // ingress happens to be pointed today.
+        let metrics_key = get("AGENTOS_METRICS_KEY");
+        if let Some(key) = &metrics_key
+            && key.len() < ApiKeys::MIN_SECRET_LEN
+        {
+            return Err(ConfigError::Invalid {
+                var: "AGENTOS_METRICS_KEY",
+                // Never the value, and never its length either: half a
+                // credential is still half a credential.
+                detail: format!(
+                    "the secret is shorter than {} characters, which is guessable",
+                    ApiKeys::MIN_SECRET_LEN
+                ),
+            });
+        }
 
         // The model, before the mock guard: a typo'd backend name is a more
         // useful message than "the llm would run as a mock".
@@ -617,6 +670,7 @@ impl Config {
             rust_log: get("RUST_LOG").unwrap_or_else(|| DEFAULT_RUST_LOG.to_owned()),
             api_keys,
             platform_keys,
+            metrics_key,
             mock_adapters,
             credentials,
             webhooks,
@@ -630,8 +684,8 @@ impl Config {
     /// The line a partial deployment is legible from: `email=resend
     /// telephony=MOCK …` is the difference between "we integrated Twilio last
     /// week" and "we integrated Twilio last week and the variable has a typo in
-    /// it". Names the adapters no credential can fix as well, so that a line
-    /// with no `MOCK` in it cannot be manufactured by omission.
+    /// it". Names the vault as well, so that a line with no `MOCK` in it
+    /// cannot be manufactured by omission.
     pub fn adapter_summary(&self) -> String {
         summarize(&self.mock_adapters, self.llm)
     }
@@ -669,6 +723,17 @@ impl Config {
                  to `label:secret` and sign a tenant up through POST /v1/platform/tenants."
             );
         }
+        if self.metrics_key.is_none() {
+            // Not an alarm about an open door — the door is shut, which is the
+            // new part. It is an alarm about a scrape that will 401 forever
+            // until somebody notices the dashboard went flat.
+            tracing::warn!(
+                "AGENTOS_METRICS_KEY is unset: GET /metrics answers 401 to everybody, including \
+                 Prometheus. Set it to a secret of at least {} characters and put the same value \
+                 in the scrape job's bearer_token.",
+                ApiKeys::MIN_SECRET_LEN
+            );
+        }
         if self.webhooks.is_empty() {
             tracing::warn!(
                 "AGENTOS_WEBHOOK_SECRETS is empty: no provider callback is registered in the \
@@ -703,7 +768,7 @@ fn summarize(mock_adapters: &[&'static str], llm: LlmBackend) -> String {
         Some(_) => format!("llm=MOCK({})", llm.name()),
         None => format!("llm={}", llm.name()),
     });
-    parts.push(PERMANENT_MOCKS.to_owned());
+    parts.push(SECRETS_ADAPTER.to_owned());
     parts.join(" ")
 }
 
@@ -1015,7 +1080,7 @@ mod tests {
             parse(&env).expect("valid").adapter_summary(),
             format!(
                 "email=resend telephony=twilio browser=browserbase embedder=openai \
-                 llm=anthropic {PERMANENT_MOCKS}"
+                 llm=anthropic {SECRETS_ADAPTER}"
             ),
         );
 
@@ -1026,11 +1091,49 @@ mod tests {
             config.adapter_summary(),
             format!(
                 "email=resend telephony=MOCK browser=browserbase embedder=openai \
-                 llm=anthropic {PERMANENT_MOCKS}"
+                 llm=anthropic {SECRETS_ADAPTER}"
             ),
             "one real adapter missing must not read the same as all of them present"
         );
         config.warn_about_mocks();
+    }
+
+    /// `/metrics` is the one page with operational intelligence on it, so the
+    /// variable that closes it has to behave like a credential and not like a
+    /// feature flag: absent is closed, short is refused by name, and the value
+    /// never appears in `Debug`.
+    #[test]
+    fn the_metrics_key_is_absent_by_default_and_refuses_a_guessable_one() {
+        let mut env = complete();
+        assert!(
+            parse(&env).expect("valid").metrics_key.is_none(),
+            "nothing sets this by accident"
+        );
+
+        env.insert("AGENTOS_METRICS_KEY", "half-a-live-credential".to_owned());
+        let err = parse(&env).expect_err("a guessable metrics key must not start");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    var: "AGENTOS_METRICS_KEY",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            !err.to_string().contains("half-a-live-credential"),
+            "the refusal echoed the secret: {err}"
+        );
+
+        env.insert("AGENTOS_METRICS_KEY", SECRET.to_owned());
+        let config = parse(&env).expect("valid");
+        assert_eq!(config.metrics_key.as_deref(), Some(SECRET));
+        assert!(
+            !format!("{config:?}").contains(SECRET),
+            "Debug printed the metrics key"
+        );
     }
 
     /// The refusal carries the same inventory, because the boot that does not
@@ -1049,23 +1152,28 @@ mod tests {
         assert!(err.to_string().contains("email=resend"), "{err}");
     }
 
-    /// The adapters no credential can fix are named every time, so a summary
-    /// with no `MOCK` in it cannot be produced by leaving something out.
+    /// The vault is named every time, so a summary with no `MOCK` in it is a
+    /// summary that accounted for it rather than one that left it out.
     ///
-    /// One left. The embedder was the other and it is a credential now, which
-    /// is what [`the_embedder_credential_is_a_selection_and_not_a_silencer`]
-    /// below is about.
+    /// **And the name it is given has to be the truth.** This assertion used to
+    /// read `contains("secrets=MOCK")`, which was correct while
+    /// `agentos_app::mocks::secret_store` handed back a plaintext `HashMap`. It
+    /// hands back the AES-256-GCM envelope store now, so the summary that said
+    /// `MOCK` would be an operator reading "the vault is fake" off a vault that
+    /// is not — a line that lies in the reassuring direction is no better than
+    /// one that lies in the alarming one.
     #[test]
-    fn the_permanent_mocks_are_named_even_on_a_fully_credentialed_deployment() {
+    fn the_vault_is_named_on_a_fully_credentialed_deployment_and_is_not_a_mock() {
         let config = parse(&complete()).expect("valid");
         assert!(
             config.mock_adapters.is_empty(),
             "nothing selectable is fake"
         );
+        let summary = config.adapter_summary();
+        assert!(summary.contains(SECRETS_ADAPTER), "{summary}");
         assert!(
-            config.adapter_summary().contains("secrets=MOCK"),
-            "{}",
-            config.adapter_summary()
+            !summary.contains("secrets=MOCK"),
+            "the vault is real crypto; the boot line must not call it a mock: {summary}"
         );
     }
 

@@ -19,21 +19,35 @@
 //! time bound on the label set. There is deliberately no `record(name, label)`
 //! taking a `&str`: if it existed, someone would eventually pass an id to it.
 //!
-//! # No credential, and therefore no tenant
+//! # One operator credential, and still no tenant
 //!
-//! Scrapers do not hold API keys, so this endpoint is mounted outside the API
-//! stack next to `/livez` and `/readyz`. That makes every number here readable
-//! by anything that can reach the port, which is exactly why nothing here is
-//! per-tenant. [`record_llm_usage`] takes the tenant and drops it on the floor
-//! (into a debug span, which is authenticated by being a log) — per-tenant
-//! spend is the ledger's job, behind a key. The aggregate is what an operator
-//! pages on anyway: "the token spend rate doubled", not "which tenant".
+//! **This page used to be open, and the ingress was the only thing in front of
+//! it.** That was written down as a deployment requirement — the listener must
+//! not be publicly routable — and on this deployment the ingress publishes four
+//! paths that do not include this one, while the API also listens on the
+//! container network. A requirement that lives in a runbook is not a control,
+//! and the page tells a stranger the deny-reason mix and the depth of the
+//! approval queue: what the company tried to do, and what it was refused.
 //!
-//! The corollary is a deployment requirement, not a code one: **the listener
-//! must not be publicly routable.** The deny-reason mix and the approval-queue
-//! depth are operational intelligence, and `/readyz` beside it already
-//! publishes the outbox lag. `app()` in `main.rs` carries the argument for why
-//! authentication is the wrong tool here and the ingress is the right one.
+//! So [`router`] now sits behind `AGENTOS_METRICS_KEY`, one bare secret in a
+//! bearer header, checked by [`require_metrics_key`] — which carries the
+//! argument for why it is a third variable rather than either keyring this
+//! server already has. Unset means 401 for everybody: the unconfigured case has
+//! to be the shut one.
+//!
+//! `/livez` and `/readyz` are **not** behind it, and that asymmetry is the
+//! point rather than an oversight. A health probe that authenticates reports
+//! the process dead whenever the credential is wrong, which is the opposite of
+//! what a probe is for, and neither one leaks anything to plan with — `/livez`
+//! is a constant string and `/readyz` is a boolean, the mock list and the
+//! outbox lag. This page is the one with the intelligence on it.
+//!
+//! The tenant is still absent and that has not changed: [`record_llm_usage`]
+//! takes one and drops it on the floor (into a debug span, which is
+//! authenticated by being a log). Per-tenant spend is the ledger's job, behind
+//! a tenant's key. The aggregate is what an operator pages on anyway: "the
+//! token spend rate doubled", not "which tenant" — which is also why the
+//! credential above cannot be a tenant's.
 //!
 //! # Where the numbers come from
 //!
@@ -63,7 +77,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agentos_app::gate::Denied;
 use agentos_app::mocks::Usage;
@@ -73,10 +87,13 @@ use agentos_domain::ids::TenantId;
 use agentos_store::db::{Db, StoreError};
 use agentos_store::outbox;
 use axum::Router;
-use axum::extract::State;
-use axum::http::header;
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+
+use crate::error::ApiError;
 
 /// The exposition format Prometheus negotiates by default.
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -164,9 +181,79 @@ struct Gauges {
     outbox_dead_letters: i64,
 }
 
-/// The scrape endpoint. No auth layer, by design — see the module docs.
-pub fn router(db: Db) -> Router {
-    Router::new().route("/metrics", get(scrape)).with_state(db)
+/// The scrape endpoint, behind [`AGENTOS_METRICS_KEY`](crate::config::Config::metrics_key).
+///
+/// `key` is `None` on a deployment that has not set the variable, and the
+/// endpoint then answers 401 to everybody. That is the fail-closed direction
+/// and it is deliberate: the state this layer exists to end is "nobody
+/// configured anything and the page was readable", so the unconfigured case
+/// must not be the open one. `config::warn_about_mocks` says so at boot, once.
+pub fn router(db: Db, key: Option<String>) -> Router {
+    Router::new()
+        .route("/metrics", get(scrape))
+        .with_state(db)
+        // On the router and not inside `scrape`, so a second route added here
+        // later is behind the same door by construction rather than by
+        // remembering.
+        .layer(middleware::from_fn_with_state(
+            key.map(Arc::<str>::from),
+            require_metrics_key,
+        ))
+}
+
+/// 401 unless the request carries the operator's bearer token.
+///
+/// Deliberately **not** `auth::require_api_key`: that middleware resolves a
+/// tenant and inserts a `Principal`, and there is no tenant here — every number
+/// on this page is a cross-tenant aggregate, so authenticating as one customer
+/// to read all of them is the wrong shape rather than a stricter one. And
+/// deliberately not `auth::require_platform_key` either: that credential mints
+/// and revokes a tenant's API keys, and a scrape job's configuration file is
+/// not where that authority belongs. Hence the third variable, which buys
+/// exactly one page.
+///
+/// `/livez` and `/readyz` stay open and are mounted separately in `main.rs`.
+/// A liveness probe that has to authenticate is a probe that reports the
+/// deployment dead when the credential is wrong, which inverts what it is for —
+/// and neither answers anything an attacker can plan with: `/livez` is a
+/// constant, and `/readyz` is a boolean plus the outbox lag.
+async fn require_metrics_key(
+    State(key): State<Option<Arc<str>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    let allowed = match (&key, presented) {
+        (Some(expected), Some(presented)) => ct_eq(expected.as_bytes(), presented.as_bytes()),
+        // No key configured is not "no door": it is a door nobody has been
+        // given a key to.
+        _ => false,
+    };
+    if !allowed {
+        let mut response = ApiError::unauthorized().into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"agentos\""),
+        );
+        return response;
+    }
+    next.run(req).await
+}
+
+/// Compare without an early exit. The length is allowed to leak — the secret's
+/// length is not the secret.
+///
+/// A copy of `auth::ct_eq`, which is private to that module. Three lines and a
+/// comment beats widening a keyring module's surface for one caller; if a
+/// fourth credential ever needs it, that is the moment to move it.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn scrape(State(db): State<Db>) -> Response {
@@ -517,25 +604,112 @@ mod tests {
         assert_eq!(llm_series(&render(None)), 3);
     }
 
-    /// Scrapers do not have an API key. Needs a real Postgres because the
-    /// gauges are real queries — but note the endpoint answers even when they
-    /// fail, which is the other half of the point.
+    /// The operator's key, in the shape `config.rs` insists on: at least
+    /// `ApiKeys::MIN_SECRET_LEN` characters.
+    const METRICS_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Connect to the test database, or say why the test did not run.
+    async fn database() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the metrics gauges need a real Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
+    }
+
+    /// **The door, and the two things that must be on opposite sides of it.**
+    ///
+    /// `/metrics` publishes the deny-reason mix and the approval-queue depth,
+    /// so a stranger who can reach the port must get nothing; `/livez` is a
+    /// liveness probe, and a probe that can fail on a credential reports the
+    /// process dead for a reason that has nothing to do with the process. Both
+    /// halves are asserted here because either one alone is satisfiable by the
+    /// wrong fix: shutting everything, or shutting nothing.
     #[tokio::test]
-    async fn the_endpoint_answers_without_a_credential() {
+    async fn the_scrape_refuses_without_the_key_and_the_liveness_probe_does_not() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let Some(db) = database().await else { return };
+
+        let app = || {
+            Router::new()
+                .route("/livez", get(crate::livez))
+                .merge(router(db.clone(), Some(METRICS_KEY.to_owned())))
+        };
+
+        let status = |path: &'static str, bearer: Option<&'static str>| {
+            let app = app();
+            async move {
+                let mut request = Request::get(path);
+                if let Some(bearer) = bearer {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+                }
+                app.oneshot(request.body(Body::empty()).expect("request"))
+                    .await
+                    .expect("service")
+                    .status()
+            }
+        };
+
+        assert_eq!(
+            status("/metrics", None).await,
+            StatusCode::UNAUTHORIZED,
+            "an anonymous scrape must not read the deny mix or the queue depth"
+        );
+        assert_eq!(
+            status("/metrics", Some("not-the-operators-key-0123456789")).await,
+            StatusCode::UNAUTHORIZED,
+            "a wrong key is the same answer as no key"
+        );
+        assert_eq!(
+            status("/livez", None).await,
+            StatusCode::OK,
+            "a health check does not authenticate"
+        );
+        assert_eq!(
+            status("/metrics", Some(METRICS_KEY)).await,
+            StatusCode::OK,
+            "the operator's own key has to still work, or this is not a door"
+        );
+
+        // And the unconfigured deployment is shut, not open: this is the case
+        // the whole layer exists for.
+        let closed = Router::new()
+            .merge(router(db, None))
+            .oneshot(
+                Request::get("/metrics")
+                    .header(header::AUTHORIZATION, format!("Bearer {METRICS_KEY}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("service");
+        assert_eq!(
+            closed.status(),
+            StatusCode::UNAUTHORIZED,
+            "no AGENTOS_METRICS_KEY must mean no reader, not any reader"
+        );
+    }
+
+    /// What the scrape actually says, once it is past the door. Needs a real
+    /// Postgres because the gauges are real queries — but note the endpoint
+    /// answers even when they fail, which is the other half of the point.
+    #[tokio::test]
+    async fn the_endpoint_answers_the_operators_key() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt as _;
 
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("SKIP: DATABASE_URL is unset; the metrics gauges need a real Postgres");
-            return;
-        };
-        let db = Db::connect(&url).await.expect("connect");
-        db.migrate().await.expect("migrate");
+        let Some(db) = database().await else { return };
 
-        let response = router(db)
+        let response = router(db, Some(METRICS_KEY.to_owned()))
             .oneshot(
                 Request::get("/metrics")
+                    .header(header::AUTHORIZATION, format!("Bearer {METRICS_KEY}"))
                     .body(Body::empty())
                     .expect("request"),
             )

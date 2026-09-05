@@ -469,6 +469,7 @@ That is deliberate.
 | `AGENTOS_ALLOW_MOCKS` | unset (false) | `1` / `true` / `yes` permits mock adapters. Anything else, plus any mock, is `refusing to start`. |
 | `AGENTOS_API_KEYS` | empty | The operators' keyring, consulted **before** the `api_keys` table so a row cannot shadow it. Empty is fine when `AGENTOS_PLATFORM_KEYS` is set; empty *and* no platform key means every request is 401 and nothing can issue one, which the server warns about at boot. Format: `label:tenant-uuid:secret[,…]`. The label becomes the audit actor and — see [§7](#7-approvals) — the caller's *role*. Secret ≥ 32 chars. |
 | `AGENTOS_PLATFORM_KEYS` | empty | **`/v1/platform/*` is 401 to everybody**, so nobody can sign up and no key can be issued or revoked without a redeploy. Format: `label:secret[,…]` — no tenant uuid, deliberately. Secret ≥ 32 chars. |
+| `AGENTOS_METRICS_KEY` | empty | **`GET /metrics` is 401 to everybody**, Prometheus included — the fail-closed default, because the page publishes the deny-reason mix and the approval-queue depth. One bare secret, no label and no tenant: it is neither of the two keyrings above, and deliberately not the platform key, which mints and revokes tenant credentials. Present it as `Authorization: Bearer <secret>`; secret ≥ 32 chars or it is a boot failure. `/livez` and `/readyz` are unaffected and stay open. |
 | `AGENTOS_WEBHOOK_SECRETS` | empty | Empty **and** an empty `webhook_endpoints` table means every `/v1/webhooks/{path}` is a 404 and no inbound message can ever arrive. The server warns when the variable is empty. Format: `provider:tenant-uuid:signing-secret[,…]`; the secret may contain colons (`whsec_…` ones do). Consulted **before** the table so a row cannot shadow it. Holds **one tenant per provider** — two entries on one path is a boot failure; register the second customer with `POST /v1/platform/webhooks`. |
 | `AGENTOS_OAUTH_CLIENTS` | empty | **No connector is advertised by `GET /v1/mcp/catalog`**, so nobody can start an OAuth flow and nobody clicks a button that cannot work. Deployment scope and never tenant scope: a `client_secret` identifies *this product* to a provider, so it is the same value for every customer. Format: `connector:client_id:client_secret[,…]`; a malformed entry is a boot failure naming the position and never the value. This table said it was every variable while this one was missing from it. |
 | `MCP_BRIDGE_BIND` | unset | **Hosted MCP is off**: no bridge runtime is built and every binding on a hosted connector refuses with `hosting_unavailable`, while `POST /v1/mcp/connect` answers 503 for one. Set it to the address bridges publish on — `127.0.0.1` on a development box, the host's address on your bridge subnet in production. The network `accept` admits is **derived** from it as its own `/32` (or `/128`), so there is no second variable to disagree with this one. |
@@ -495,7 +496,8 @@ real client now — `OpenAiEmbedder`, on the customer's own key,
 `text-embedding-3-small` — so the alarm it quiets is an alarm about something
 that became real. One value, not a pair: the model name is a constant of the
 adapter, because the HNSW index is partial on it. The employee secret vault is
-the only permanent mock left in the boot line.
+no longer a mock at all: it is `secrets=local-envelope(aes-256-gcm)` in the boot
+line, selected by `AGENTOS_MASTER_KEY` like every other use of that key.
 
 **Setting it does not re-embed what is already stored.** Every chunk records the
 model it was embedded under and every search binds one model, so a corpus
@@ -510,7 +512,7 @@ Every boot, real or not, logs one line:
 
 ```
 adapters: email=resend telephony=MOCK browser=browserbase embedder=openai
-          llm=anthropic secrets=MOCK(in-memory)
+          llm=anthropic secrets=local-envelope(aes-256-gcm)
 ```
 
 `/readyz` publishes the same thing as `mock_adapters`, so the question survives
@@ -535,7 +537,7 @@ agentos-server: refusing to start: email, browser would run as mocks and do
 nothing real, and nobody said that was acceptable (set EMAIL_API_KEY,
 BROWSER_API_KEY for the real thing, or AGENTOS_ALLOW_MOCKS=1 to accept exactly
 these). Adapters would be: email=MOCK telephony=twilio browser=MOCK
-embedder=openai llm=anthropic secrets=MOCK(in-memory)
+embedder=openai llm=anthropic secrets=local-envelope(aes-256-gcm)
 ```
 
 The inventory is in the refusal as well as in a successful boot, because the
@@ -1569,14 +1571,30 @@ behind `AGENTOS_PLATFORM_KEYS` — this entry named it as missing alongside the
 others. What has no route, and cannot have one, is a tenant creating a tenant:
 every route on the tenant surface derives its tenant from the API key.
 
-**`/metrics` is mounted, and unauthenticated by design.** `apps/server/src/metrics.rs`
-builds a Prometheus router with six families and `app()` merges it beside
-`/livez` and `/readyz`, outside the API auth stack — a scraper holds no tenant
-credential, and every number it exposes is a cross-tenant aggregate.
-**So the listener must not be publicly routable**: restrict `/metrics`,
-`/livez` and `/readyz` to the scrape network at the ingress, which is the only
-tier that can see a client address. `/metrics` tells a stranger the
-deny-reason mix and the depth of the approval queue.
+**`/metrics` is mounted, and it is behind `AGENTOS_METRICS_KEY`.**
+`apps/server/src/metrics.rs` builds a Prometheus router with six families and
+`app()` merges it beside `/livez` and `/readyz`, outside the API auth stack —
+a scraper holds no tenant credential, and every number it exposes is a
+cross-tenant aggregate, so neither the tenant keyring nor
+`AGENTOS_PLATFORM_KEYS` is the right credential for it. What it takes instead is
+one bare secret of at least 32 characters, presented as `Authorization: Bearer
+…`; put the same value in the scrape job's `bearer_token`. **Unset means 401 for
+everybody, Prometheus included** — the flat dashboard is the intended symptom,
+and the boot log warns about it once.
+
+This entry read "unauthenticated by design" until the door was fitted, with the
+ingress named as the only control. That was a requirement in a runbook rather
+than something the process enforced, and on a deployment whose ingress publishes
+four paths — none of them this one — while the API also answers on the container
+network, the page was reachable by anything on that network. It tells a stranger
+the deny-reason mix and the depth of the approval queue: what the company tried
+to do, and what it was refused.
+
+`/livez` and `/readyz` stay open on purpose. A probe that authenticates reports
+the process dead whenever the credential is wrong, which inverts what a probe is
+for, and between them they publish a boolean, the mock adapter list and the
+outbox lag. Restricting all three to the scrape network at the ingress is still
+worth doing — it is no longer the only thing in front of the interesting one.
 
 All six carry live numbers. `agentos_llm_tokens_total` was the last to:
 `metrics::record_llm_usage` is called from `main.rs`'s turn handler on both its

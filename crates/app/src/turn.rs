@@ -2555,9 +2555,28 @@ impl Turn {
         origin: Option<&TaintOrigin>,
     ) -> Result<Reply, TurnError> {
         match proposal {
-            Proposal::Email(subject, body) => {
+            Proposal::Email(subject, mut body) => {
                 let to = subject.to.clone();
                 let line = body.subject.clone();
+                // **Une réponse répond.** Le tour s'est réveillé sur un fil
+                // (`on_thread`), le message entrant est en base avec son
+                // identifiant fournisseur, et sans cette ligne la réponse
+                // partait en message neuf : le prospect ne voyait pas une
+                // réponse, il voyait un inconnu qui écrit deux fois.
+                //
+                // `to` vient de la décision et pas du modèle, et
+                // `inbound::reply_target` exige que le fil soit celui de cette
+                // adresse — donc un employé réveillé par Alice qui écrit
+                // ensuite à Bob n'attache pas le fil d'Alice à la lettre de
+                // Bob. Une base absente ne fait pas échouer le mail : elle le
+                // fait partir hors fil, ce qu'il faisait déjà hier.
+                if let Some(thread) = self.thread {
+                    body.in_reply_to = self
+                        .effects
+                        .reply_target(thread.message_id, &to)
+                        .await
+                        .unwrap_or_default();
+                }
                 let sent = gated!(self, trust, origin, subject, |ok| self
                     .effects
                     .send_email(ok, body)

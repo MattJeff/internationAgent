@@ -277,7 +277,7 @@ up:
 
 ```
 adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
-          llm=anthropic secrets=MOCK(in-memory)
+          llm=anthropic secrets=local-envelope(aes-256-gcm)
 ```
 
 The **model is the exception**: `mocks::llm` selects `AnthropicLlm`, `CliLlm` or

@@ -396,7 +396,9 @@ use crate::turn::Context;
 // before any of that machinery exists, so it is re-exported here rather than
 // duplicated or reached for directly.
 pub use agentos_providers::Secret;
-pub use agentos_providers::email::{SigError, WebhookHeaders, sign_webhook, verify_signature};
+pub use agentos_providers::email::{
+    SigError, UNSUBSCRIBE_PATH, WebhookHeaders, sign_webhook, verify_signature,
+};
 pub use agentos_providers::telephony::{
     CallOutcome, CallStatus, PROVIDER as TELEPHONY_PROVIDER, SigError as TelephonySigError,
     TWILIO_SIGNATURE_HEADER as TELEPHONY_SIGNATURE_HEADER,
@@ -1413,7 +1415,8 @@ pub async fn record_smartlead_unsubscribe(
         ));
     };
 
-    match crate::queue::record_platform_opt_out(tx, address, now).await {
+    match crate::queue::record_platform_opt_out(tx, address, crate::queue::PLATFORM_NOTE, now).await
+    {
         // L'adresse est là et `suppressions` ne peut pas la porter. Pas un
         // `Ok` : quelqu'un a demandé à ne plus être écrit et on n'a pas su
         // l'inscrire, ce qui doit se voir.
@@ -1426,6 +1429,195 @@ pub async fn record_smartlead_unsubscribe(
             "the unsubscribe could not be recorded",
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Le désabonnement en un clic
+// ---------------------------------------------------------------------------
+
+/// Préfixe du jeton porté par `List-Unsubscribe`.
+///
+/// Même forme que [`crate::webhooks::PATH_PREFIX`] et pour une raison plus
+/// forte : là-bas le chemin n'est pas un credential parce qu'une signature suit,
+/// ici il n'y en a pas — un `POST` en un clic n'a par construction personne à
+/// authentifier — donc le jeton EST le credential. `suppressions` n'accepte
+/// aucun DELETE, si bien qu'une désinscription forgée est définitive : c'est la
+/// seule écriture qu'un inconnu puisse provoquer sans retour possible, et les
+/// 128 bits ci-dessous sont tout ce qui la tient.
+pub const UNSUBSCRIBE_PREFIX: &str = "unsub_";
+
+/// Octets de CSPRNG dans un jeton. Le même 16 que `webhooks::mint_path`.
+const UNSUBSCRIBE_BYTES: usize = 16;
+
+/// Mint : `unsub_` + 16 octets de CSPRNG en base64url.
+///
+/// Recopié de [`crate::webhooks::mint_path`] plutôt que partagé, et c'est
+/// visible : les deux tables ont des CHECK sur des préfixes différents, donc un
+/// symbole commun voudrait dire un paramètre de préfixe pour quatre lignes. Ce
+/// qui compte est que la source d'entropie soit la même — `rand::rng()`, le
+/// CSPRNG de l'OS — pas que le `format!` soit partagé.
+fn mint_unsubscribe_token() -> String {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+
+    let mut bytes = [0u8; UNSUBSCRIBE_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    format!(
+        "{UNSUBSCRIBE_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
+/// Le jeton de désinscription de cette adresse chez ce locataire, minté au
+/// premier envoi et rendu tel quel ensuite.
+///
+/// Appelé sur le chemin d'envoi — [`crate::effects::Effects::send_email`] et sa
+/// voisine passent toutes deux par `dispatch_email`, qui est la seule route
+/// sortante — donc une fois par mail. C'est un aller-retour de base par mail,
+/// et c'est le prix de la seule chose qui rende le lien invérifiable de
+/// l'extérieur : voir 0085.
+///
+/// `raw` est l'adresse telle que la décision l'a réglée ; elle est repassée par
+/// [`EmailAddress::parse`] parce que `unsubscribe_links` et `suppressions`
+/// exigent la même orthographe et qu'un lien stocké dans une autre est un lien
+/// qui ne désabonne personne. Une adresse que le domaine refuse rend `None` :
+/// un mail sans en-tête de désinscription est un problème de délivrabilité, un
+/// `Err` ici serait un mail non envoyé.
+pub async fn unsubscribe_token(
+    tx: &mut TenantTx<'_>,
+    raw: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, StoreError> {
+    let Ok(address) = EmailAddress::parse(raw) else {
+        tracing::warn!(
+            "an outbound recipient could not be normalised; that mail carries no \
+             List-Unsubscribe header"
+        );
+        return Ok(None);
+    };
+    let token =
+        revenue_store::unsubscribe_link(tx, &mint_unsubscribe_token(), &address.to_string(), now)
+            .await?;
+    Ok(Some(token))
+}
+
+/// L'identifiant fournisseur du message auquel une réponse répond.
+///
+/// # Le défaut que ça ferme
+///
+/// [`crate::turn::Turn`] compose la réponse d'un employé à un mail reçu, et
+/// jusqu'ici elle partait avec `in_reply_to: None` — donc sans `In-Reply-To` ni
+/// `References`, donc **hors du fil**. Le prospect ne voit pas une réponse à sa
+/// question, il voit un inconnu qui écrit deux fois. Le message entrant était
+/// pourtant déjà en base avec son `provider_message_id` ; il ne manquait que
+/// cette lecture.
+///
+/// # Les trois conditions, et pourquoi aucune n'est de la prudence décorative
+///
+/// * **`direction = 'inbound'`.** Répondre à notre propre message enfilerait la
+///   réponse sur elle-même.
+/// * **`channel = 'email'`.** Un `provider_message_id` de SMS ou de WhatsApp
+///   dans un `In-Reply-To` est un identifiant d'un autre espace de noms ; au
+///   mieux il ne correspond à rien.
+/// * **`conversations.external_ref = $2`.** La condition qui compte. `to` est
+///   l'adresse que la *décision* a réglée, pas celle que le modèle a écrite, et
+///   le fil est celui sur lequel le tour s'est réveillé : sans cette égalité, un
+///   employé réveillé par le mail d'Alice et qui écrit ensuite à Bob attacherait
+///   à la lettre de Bob l'identifiant du message d'Alice — le fil d'Alice chez
+///   Bob, dans son client mail, avec le sujet d'Alice. `external_ref` est
+///   [`contact_of`], donc minuscule et sans nom d'affichage, la même
+///   orthographe que `EmailAddress::to_string`.
+///
+/// `Ok(None)` quand rien de tout ça ne tient : la réponse part comme un message
+/// neuf, ce qui est exactement ce qu'elle est.
+pub async fn reply_target(
+    tx: &mut TenantTx<'_>,
+    message_id: Uuid,
+    to: &EmailAddress,
+) -> Result<Option<ProviderRef>, StoreError> {
+    let found: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT m.provider_message_id \
+           FROM messages m \
+           JOIN conversations c ON c.id = m.conversation_id \
+          WHERE m.id = $1 \
+            AND m.direction = 'inbound' \
+            AND m.channel = 'email' \
+            AND c.external_ref = $2",
+    )
+    .bind(message_id)
+    .bind(to.to_string())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    // Deux `Option` : pas de ligne, ou une ligne dont la colonne est NULL — un
+    // message atterri par une porte qui n'a pas d'identifiant fournisseur. Les
+    // deux veulent dire « rien à quoi répondre ».
+    Ok(found.flatten().map(ProviderRef::new))
+}
+
+/// Un clic sur `List-Unsubscribe` devient une ligne de `suppressions`.
+///
+/// Rend `false` quand le jeton ne désigne personne — jeton inconnu, expiré avec
+/// son locataire, adresse que `suppressions` ne sait pas porter. La route répond
+/// la même page dans les deux cas : distinguer « ce jeton n'existe pas » de « tu
+/// es désabonné » est un oracle d'existence sur des liens dont la seule défense
+/// est qu'on ne peut pas les deviner.
+///
+/// # Pourquoi ça n'écrit pas la ligne soi-même
+///
+/// Le même argument que [`record_smartlead_unsubscribe`], qui est déjà celui de
+/// [`record_refusal`] : [`crate::queue::record_platform_opt_out`] est l'unique
+/// écrivain d'un opt-out, et une désinscription et une plainte sont la même
+/// chose vue de deux côtés. Trois portes, un écrivain, donc la même personne
+/// arrivant par un clic, par une plainte Resend et par le tirage Smartlead est
+/// une ligne et pas trois — `suppressions_address_key` porte la même
+/// orthographe des trois côtés, et le trigger `suppressions_deactivate_contacts`
+/// désactive le CONTACT, si bien que le téléphone tombe avec le mail.
+///
+/// # Deux transactions, et l'ordre est le bon
+///
+/// La résolution traverse les locataires (`admin_tx_bypassing_rls`) parce
+/// qu'elle PRÉCÈDE le fait de savoir de quel locataire il s'agit — l'argument de
+/// `webhook_endpoints` (0053) et de `routes::booking`. Elle ne lit qu'une paire
+/// et n'écrit rien. L'écriture, elle, repasse par `Db::tenant_tx`, donc la RLS
+/// est en vigueur pour la seule instruction qui laisse une trace.
+pub async fn record_unsubscribe(
+    db: &Db,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, InboundError> {
+    let mut lookup = db
+        .admin_tx_bypassing_rls()
+        .await
+        .map_err(InboundError::Store)?;
+    let holder = revenue_store::unsubscribe_link_holder(&mut lookup, token)
+        .await
+        .map_err(InboundError::Store)?;
+    // Une lecture, rien à valider.
+    let _ = lookup.rollback().await;
+
+    let Some((tenant, address)) = holder else {
+        return Ok(false);
+    };
+
+    let mut tx = db.tenant_tx(tenant).await.map_err(InboundError::Store)?;
+    let recorded = match crate::queue::record_platform_opt_out(
+        &mut tx,
+        &address,
+        crate::queue::ONE_CLICK_NOTE,
+        now,
+    )
+    .await
+    {
+        Ok(recorded) => recorded,
+        Err(revenue_store::RevenueError::Store(err)) => return Err(InboundError::Store(err)),
+        Err(_) => {
+            return Err(InboundError::Store(StoreError::conflict(
+                "the unsubscribe could not be recorded",
+            )));
+        }
+    };
+    tx.commit().await.map_err(InboundError::Store)?;
+    Ok(recorded)
 }
 
 /// The two numbers a telephony delivery is routed by.
@@ -5612,6 +5804,162 @@ mod tests {
             "the notice is settled, not retried for ever"
         );
         assert_eq!(again.message_id, landed.message_id);
+    }
+
+    /// **Un clic sur `List-Unsubscribe` écrit une suppression, et le
+    /// destinataire n'est plus joignable ensuite.**
+    ///
+    /// Les deux moitiés comptent. Écrire la ligne sans que personne ne la lise
+    /// serait un registre décoratif ; ce qui rend la désinscription réelle est
+    /// `revenue_suppression_of`, la fonction `SECURITY DEFINER` que la gate
+    /// consulte avant chaque `EmailSend`, et le trigger
+    /// `suppressions_deactivate_contacts` derrière elle.
+    ///
+    /// Et un jeton inventé n'écrit rien : c'est la seule écriture qu'un inconnu
+    /// puisse provoquer dans une table sans DELETE.
+    #[tokio::test]
+    async fn a_one_click_unsubscribe_writes_a_suppression_and_the_address_goes_quiet() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let address = "AP@Supplier.example";
+
+        // Le mint, tel que `Effects::dispatch_email` l'appelle avant chaque
+        // envoi. Deux mails au même prospect ne mintent qu'un jeton : le lien
+        // d'un vieux mail doit encore désabonner.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let token = unsubscribe_token(&mut tx, address, now)
+            .await
+            .expect("mint")
+            .expect("a normalisable address has a token");
+        let again = unsubscribe_token(&mut tx, "ap@supplier.example", now)
+            .await
+            .expect("mint")
+            .expect("token");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            token, again,
+            "one token per person per company, not per send"
+        );
+        assert!(token.starts_with(UNSUBSCRIBE_PREFIX), "{token}");
+
+        // Personne n'est encore supprimé.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert_eq!(
+            revenue_store::suppression_of(&mut tx, Some("ap@supplier.example"), None)
+                .await
+                .expect("read"),
+            None
+        );
+        tx.rollback().await.expect("rollback");
+
+        // Un jeton inventé ne touche rien, et se répond comme un vrai.
+        assert!(
+            !record_unsubscribe(&db, "unsub_nobodyhasthisone", now)
+                .await
+                .expect("an unknown token is not an error")
+        );
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM suppressions").await,
+            0
+        );
+
+        // Le clic.
+        assert!(
+            record_unsubscribe(&db, &token, now)
+                .await
+                .expect("recorded")
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (reason, note): (String, Option<String>) =
+            sqlx::query_as("SELECT reason, note FROM suppressions WHERE address = $1")
+                .bind("ap@supplier.example")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("one row");
+        assert_eq!(reason, "opt_out");
+        assert_eq!(note.as_deref(), Some(crate::queue::ONE_CLICK_NOTE));
+        // La lecture que la gate fait, pas une relecture de la table : c'est
+        // celle-là qui décide si un mail part.
+        assert!(
+            revenue_store::suppression_of(&mut tx, Some("ap@supplier.example"), None)
+                .await
+                .expect("read")
+                .is_some(),
+            "the address the gate asks about is the one that went quiet"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // Rejouer le même lien — un client mail qui poste deux fois, un
+        // pré-chargeur qui suit le formulaire — n'est ni une erreur ni une
+        // seconde ligne.
+        assert!(record_unsubscribe(&db, &token, now).await.expect("replay"));
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM suppressions").await,
+            1
+        );
+    }
+
+    /// **Une réponse porte l'identifiant du message auquel elle répond**, et
+    /// seulement quand c'est vrai.
+    ///
+    /// Le fil d'Alice ne s'attache pas à une lettre pour Bob : c'est la
+    /// condition qui empêche un employé réveillé par l'un de répondre à l'autre
+    /// dans le fil du premier.
+    #[tokio::test]
+    async fn a_reply_carries_the_id_of_the_message_it_answers_and_no_other() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        let raw = raw("email_thread_1", now, Duration::hours(1));
+
+        let message = email
+            .normalize(
+                &raw,
+                &Route {
+                    tenant_id: tenant,
+                    employee_id: employee,
+                    conversation_id: ConversationId::new_v7(now),
+                },
+            )
+            .expect("normalize");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let conversation_id = conversation_for(
+            &mut tx,
+            employee,
+            Channel::Email,
+            &contact_of(&message.from),
+            None,
+            now,
+        )
+        .await
+        .expect("conversation");
+        let message = CanonicalMessage {
+            conversation_id,
+            ..message
+        };
+        let landed = land(&mut tx, &message, now).await.expect("land");
+        let message_id = landed.message_id;
+
+        let them: EmailAddress = "ap@supplier.example".parse().expect("address");
+        assert_eq!(
+            reply_target(&mut tx, message_id, &them)
+                .await
+                .expect("read"),
+            Some(ProviderRef::new("email_thread_1")),
+            "the reply threads onto the message that woke the seat"
+        );
+
+        // Quelqu'un d'autre, même tour : rien.
+        let bob: EmailAddress = "bob@elsewhere.example".parse().expect("address");
+        assert_eq!(
+            reply_target(&mut tx, message_id, &bob).await.expect("read"),
+            None,
+            "Alice's thread must not ride on a letter to Bob"
+        );
+        tx.rollback().await.expect("rollback");
     }
 
     /// The trust boundary, on the object the agent loop actually receives.

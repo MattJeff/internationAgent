@@ -69,6 +69,8 @@ use agentos_domain::money::{Currency, Money, MoneyError};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
+use sqlx::{Postgres, Transaction};
+
 use crate::db::{Db, StoreError, TenantTx};
 
 /// SQLSTATE raised by the suppression triggers in `0011_revenue.sql`. Nothing
@@ -2236,6 +2238,69 @@ pub async fn suppress(
     .execute(&mut ***tx)
     .await?;
     Ok(())
+}
+
+/// Le lien de désinscription de cette adresse chez ce locataire, minté au
+/// premier envoi et rendu tel quel ensuite.
+///
+/// `ON CONFLICT DO NOTHING` puis relecture inconditionnelle : deux envois
+/// simultanés au même prospect ne peuvent pas produire deux jetons, et celui
+/// qui perd la course rend celui qui a gagné. Un jeton par personne et par
+/// entreprise est ce que `unsubscribe_links_tenant_address_key` impose, pour la
+/// raison que 0085 écrit en entier — un second jeton est un vieux mail dont le
+/// lien ne désabonne plus.
+///
+/// `address` doit déjà être normalisée (`EmailAddress::parse().to_string()`) :
+/// la CHECK de la table exige la même orthographe que `suppressions.address`,
+/// parce que c'est dans `suppressions` que ce lien finit.
+pub async fn unsubscribe_link(
+    tx: &mut TenantTx<'_>,
+    token: &str,
+    address: &str,
+    now: DateTime<Utc>,
+) -> Result<String, StoreError> {
+    sqlx::query(
+        "INSERT INTO unsubscribe_links (token, tenant_id, address, created_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT ON CONSTRAINT unsubscribe_links_tenant_address_key DO NOTHING",
+    )
+    .bind(token)
+    .bind(tx.tenant_id().as_uuid())
+    .bind(address)
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(
+        sqlx::query_scalar("SELECT token FROM unsubscribe_links WHERE address = $1")
+            .bind(address)
+            .fetch_one(&mut ***tx)
+            .await?,
+    )
+}
+
+/// Qui se cache derrière un jeton de désinscription — **à travers les
+/// locataires**.
+///
+/// Prend une transaction sans locataire, et c'est la même exception que
+/// `webhook_endpoints` (0053) et que `routes::booking` : la recherche PRÉCÈDE
+/// le fait de savoir de quel locataire il s'agit. Un inconnu qui clique n'a pas
+/// de clé, ne s'authentifie pas, et ne porte que le jeton. Une fois la paire
+/// rendue, l'écriture de la suppression repasse par `Db::tenant_tx`.
+///
+/// `Ok(None)` est « pas de tel jeton », que la route répond de la même façon
+/// qu'un jeton valide : une page qui distinguerait les deux est un oracle
+/// d'existence sur des liens qu'on ne peut deviner qu'en les essayant.
+pub async fn unsubscribe_link_holder(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &str,
+) -> Result<Option<(TenantId, String)>, StoreError> {
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT tenant_id, address FROM unsubscribe_links WHERE token = $1")
+            .bind(token)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.map(|(tenant, address)| (TenantId::from_uuid(tenant), address)))
 }
 
 #[cfg(test)]

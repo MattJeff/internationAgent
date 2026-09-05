@@ -73,7 +73,7 @@ the same inventory as `mock_adapters` for as long as the replica is up:
 
 ```
 adapters: email=resend telephony=MOCK browser=browserbase embedder=openai \
-          llm=anthropic secrets=MOCK(in-memory)
+          llm=anthropic secrets=local-envelope(aes-256-gcm)
 ```
 
 Adding a new provider is a change to `crates/app/src/mocks.rs`, plus a row in

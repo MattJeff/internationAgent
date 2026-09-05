@@ -868,8 +868,14 @@ async fn answer(
         // The code is a closed vocabulary and the founder is the one reading
         // this; the two they can act on get a sentence, the rest get the word.
         let detail = match code {
-            "cli_not_logged_in" => "the claude binary behind this company's connection has no \
-                                    session: paste the token from `claude setup-token` at step 1"
+            // Never "paste a setup-token": that is the one answer this
+            // deployment must not accept — Anthropic forbids a developer to
+            // collect, store or intermediate Claude.ai session tokens, and
+            // `POST /v1/model` refuses it. The founder's own move is an API
+            // key; the host's login is the operator's.
+            "cli_not_logged_in" => "this company runs on the host's own `claude` session and that \
+                                    session is not logged in. Connect your own Anthropic API key \
+                                    at step 1, or ask the operator to log the host in"
                 .to_owned(),
             "rate_limited" => match failed.error.retry_after() {
                 Some(after) => format!(
