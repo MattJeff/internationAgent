@@ -213,7 +213,13 @@ pub const RECORDED: &[Sample] = &[
 /// a headline and a route that disagreed about which end of the spread they were
 /// quoting would be two different claims wearing one number.
 pub fn spread(of: impl Fn(Sample) -> f64) -> (f64, f64) {
-    RECORDED.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &s| {
+    spread_of(RECORDED, of)
+}
+
+/// [`spread`] over any samples — split out so the fold can be tested on data
+/// whose extremes are not at the ends, whatever shape [`RECORDED`] has today.
+fn spread_of(samples: &[Sample], of: impl Fn(Sample) -> f64) -> (f64, f64) {
+    samples.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &s| {
         (lo.min(of(s)), hi.max(of(s)))
     })
 }
@@ -312,16 +318,17 @@ mod tests {
         for sample in RECORDED {
             assert!(sample.calls_per_turn >= lo && sample.calls_per_turn <= hi);
         }
-        // `RECORDED` happens to end on its smallest calls_per_turn, so a
-        // first/last implementation would return a reversed range here.
-        assert!(
-            lo < RECORDED[0].calls_per_turn,
-            "the smallest calls-per-turn is not the first sample, so this test can see \
-             a fold that only looks at the ends"
-        );
-        assert!((hi - RECORDED[0].calls_per_turn).abs() < 1e-9);
-
         // And no recorded turn claims fewer model calls than the floor.
         assert!(lo >= FLOOR_CALLS_PER_TURN);
+
+        // The fold itself, on data whose extremes sit in the middle: a
+        // first/last implementation returns (3.0, 4.0) here and is wrong twice.
+        let sample = |calls_per_turn| Sample {
+            calls_per_turn,
+            input_tokens_per_call: 1.0,
+            output_tokens_per_call: 1.0,
+        };
+        let middle = [sample(3.0), sample(1.0), sample(9.0), sample(4.0)];
+        assert_eq!(spread_of(&middle, |s| s.calls_per_turn), (1.0, 9.0));
     }
 }
