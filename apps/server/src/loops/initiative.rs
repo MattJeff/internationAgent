@@ -141,10 +141,10 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use agentos_app::backlog::{Backlog, BacklogError, Held, PgBacklog};
-use agentos_app::brief::{BOARD_BRIEF, DIARY_BRIEF, TURN_BRIEF};
+use agentos_app::brief::{BOARD_BRIEF, BOOKING_BRIEF, DIARY_BRIEF, TURN_BRIEF};
 use agentos_app::calendar::{Calendar, PgCalendar};
 use agentos_app::effects::{Effects, Ports};
-use agentos_app::gate::Principal as ActingAs;
+use agentos_app::gate::{Principal as ActingAs, TaintOrigin};
 use agentos_app::inbound;
 use agentos_app::prompt::Relation;
 use agentos_app::proof_of_need::Prober;
@@ -153,7 +153,8 @@ use agentos_app::sourcing::Buyer;
 use agentos_app::turn::{Context, Turn};
 use agentos_app::vertical::{self, Charter};
 use agentos_app::{rolepack, rolepack_sales, rolepack_service};
-use agentos_domain::ids::{EmployeeId, Slug, TenantId};
+use agentos_domain::ids::{ConversationId, EmployeeId, Slug, TenantId};
+use agentos_domain::message::Channel;
 use agentos_domain::policy::{EffectivePolicy, ModelId, model_for};
 use agentos_domain::untrusted::Untrusted;
 use agentos_store::calendar::{self, Kept};
@@ -1240,10 +1241,29 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // booked, and the turn is told so in our voice — the date of the message
     // nobody answered — beside the frame that carries the masked address. The
     // model then proposes an ordinary `send_email`, and the gate does the rest.
-    if let Some(thread) = due.kept.as_ref().and_then(|kept| kept.conversation_id)
-        && let Some(brief) = agentos_app::follow_up::brief(&agent.db, due.tenant_id, thread).await
-    {
-        context = context.with_task(brief);
+    //
+    // A thread with no outbound at all is not a follow-up but a booking: the
+    // only thing on it is what a stranger typed through the public page, and
+    // that reason is the whole of why this turn is awake. It goes in by the
+    // path an ordinary inbound takes — fenced, with the masked sender as the
+    // origin — so the turn is untrusted from here on, which is right: it is
+    // the text of somebody nobody here has met.
+    if let Some(thread) = due.kept.as_ref().and_then(|kept| kept.conversation_id) {
+        match agentos_app::follow_up::brief(&agent.db, due.tenant_id, thread).await {
+            Some(brief) => context = context.with_task(brief),
+            None => {
+                if let Some((id, sender, reason)) =
+                    booked_reason(&agent.db, due.tenant_id, thread).await
+                {
+                    let sender = inbound::contact_of(&Untrusted::new(sender));
+                    context = context.with_task(BOOKING_BRIEF).with_untrusted_from(
+                        &Untrusted::new(reason),
+                        &format!("message-{id}"),
+                        TaintOrigin::message(Channel::Web.as_str(), &sender),
+                    );
+                }
+            }
+        }
     }
     context = context.with_task(charter.brief());
     if let Some(note) = done {
@@ -2263,6 +2283,35 @@ fn brief_with(brief: &str, cut: Option<&str>) -> String {
 /// The `source_id` the frame of a moment that has just come round carries.
 const APPOINTMENT: &str = "appointment";
 
+/// The last thing a stranger wrote on a thread nobody here has written on —
+/// the shape `routes::booking` leaves: one inbound `web` message, no outbound.
+///
+/// The message id, the sender as stored, and the body. `None` on a thread with
+/// any outbound (a follow-up, which `follow_up::brief` already says in our
+/// voice), on an empty thread, and when the thread cannot be read — the turn
+/// then runs on the frame alone, as before.
+async fn booked_reason(
+    db: &Db,
+    tenant: TenantId,
+    conversation: ConversationId,
+) -> Option<(uuid::Uuid, String, String)> {
+    let mut tx = db.tenant_tx(tenant).await.ok()?;
+    let row = sqlx::query_as(
+        "SELECT id, sender, body FROM messages \
+          WHERE conversation_id = $1 AND direction = 'inbound' \
+            AND NOT EXISTS (SELECT 1 FROM messages \
+                             WHERE conversation_id = $1 AND direction = 'outbound') \
+          ORDER BY received_at DESC, id DESC \
+          LIMIT 1",
+    )
+    .bind(conversation.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .ok()?;
+    let _ = tx.rollback().await;
+    row
+}
+
 /// The `source_id` every diary frame carries.
 const DIARY: &str = "diary";
 
@@ -3149,6 +3198,113 @@ pub(crate) mod tests {
             "an appointment that rang does not ring again, and the far-off one is \
              not due"
         );
+        assert!(
+            !sent.contains(BOOKING_BRIEF),
+            "a thread with a send on it is a follow-up and is not told it was booked: {sent}"
+        );
+
+        // --- A booking. Bea has no cadence either, and the only thing on her
+        // thread is what a stranger typed through the public page: one inbound,
+        // no outbound. `place` refuses an hour already past, so the promise is
+        // moved back after the fact — the wake needs it due.
+        let bea = seed_due(&db, tenant, "diary-bea", Some(supporting())).await;
+        unschedule(&db, bea).await;
+        let reason = "we need pricing for forty seats before the board meets";
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        assert!(
+            crate::routes::booking::place(
+                &mut tx,
+                bea,
+                (now + chrono::TimeDelta::hours(2)).naive_utc(),
+                "UTC",
+                "Paul Prospect",
+                "paul@prospect.example",
+                reason,
+                now,
+            )
+            .await
+            .is_ok(),
+            "the public page books the hour"
+        );
+        sqlx::query("UPDATE appointments SET at = $2 WHERE employee_id = $1")
+            .bind(bea.as_uuid())
+            .bind(past)
+            .execute(&mut **tx)
+            .await
+            .expect("move the promise back");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1,
+            "the booked seat took its turn"
+        );
+        let (sent, offered) = {
+            let seen = recorder.seen.lock().expect("not poisoned");
+            let request = seen.get(1).expect("the booked turn reached the model");
+            let offered: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+            (format!("{:?}", request.messages), offered)
+        };
+        assert!(
+            sent.contains(BOOKING_BRIEF),
+            "the turn is told, in our voice, that a stranger booked it: {sent}"
+        );
+        assert!(
+            sent.contains("BEGIN source=message-") && sent.contains(reason),
+            "the stranger's reason reached the model inside a fence: {sent}"
+        );
+        assert!(
+            sent.contains("booking · p…@prospect.example") && !sent.contains("paul@"),
+            "the frame carries the masked address and nothing carries it whole: {sent}"
+        );
+        assert!(
+            !sent.contains("This hour is a follow-up"),
+            "a booking is not a follow-up: {sent}"
+        );
+        assert!(
+            !offered.contains(&"pay".to_owned()) && !offered.contains(&"issue_invoice".to_owned()),
+            "a turn that read a stranger's reason is untrusted, and the high-risk \
+             schemas are withheld from it: {offered:?}"
+        );
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            0,
+            "the booking rang once"
+        );
+
+        // The other company reads nothing of the thread — RLS, at this seam.
+        let thread = thread_of(&db, tenant, bea).await;
+        assert!(
+            booked_reason(&db, tenant, thread).await.is_some(),
+            "the reason reads under its own tenant"
+        );
+        let other = seed_tenant(&db).await;
+        assert!(
+            booked_reason(&db, other, thread).await.is_none(),
+            "tenant B reads nothing of A's booking"
+        );
+        assert!(
+            booked_reason(&db, tenant, thread_of(&db, tenant, ada).await)
+                .await
+                .is_none(),
+            "a thread with a send on it is not a booking"
+        );
+        drop_tenant(&db, other).await;
+    }
+
+    /// The thread a seat's rung promise names.
+    async fn thread_of(db: &Db, tenant: TenantId, employee: EmployeeId) -> ConversationId {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let thread: Uuid = sqlx::query_scalar(
+            "SELECT conversation_id FROM appointments \
+              WHERE employee_id = $1 AND conversation_id IS NOT NULL",
+        )
+        .bind(employee.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the promise names its thread");
+        tx.rollback().await.expect("rollback");
+        ConversationId::from_uuid(thread)
     }
 
     /// **One [`BATCH`] shared between two claims, which nothing tested.**

@@ -220,7 +220,7 @@ async fn set_open(
 /// Every variant is our words. Nothing the stranger typed is ever echoed, so
 /// there is no HTML to escape here — that is a property of the pages, not of a
 /// helper.
-enum Refused {
+pub(crate) enum Refused {
     /// No such page: unknown couple, or a seat that has not opened.
     NotFound,
     /// A field is missing or misshapen. Names the field, never the diary.
@@ -448,7 +448,7 @@ async fn book(
 /// The checks that need the database, then the three writes. One transaction,
 /// the caller's.
 #[allow(clippy::too_many_arguments)]
-async fn place(
+pub(crate) async fn place(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
     local: NaiveDateTime,

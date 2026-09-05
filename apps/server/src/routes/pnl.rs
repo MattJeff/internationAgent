@@ -3,17 +3,18 @@
 //!
 //! # Why this endpoint exists, given `/v1/usage` and `/v1/billing`
 //!
-//! [`super::usage`] reports tokens and stops, on the argument that no price in
-//! this repository could be trusted. [`super::billing`] reports what *we*
+//! [`super::usage`] reports tokens and stops, on the argument that no price a
+//! customer did not declare could be trusted on their bill. [`super::billing`] reports what *we*
 //! charge for the seat. Neither answers the founder's question, which is "is
 //! this employee worth what it burns" — and neither can, because the one
 //! number that question needs is the rate on the tenant's own Anthropic
 //! contract, which only the tenant knows. `migrations/0079_tenant_model_tariff.sql`
 //! lets them declare it on `POST /v1/model`; this endpoint multiplies.
 //!
-//! **The repository still contains no price.** `cost_usd` is
+//! **No price here but the declared one.** `cost_usd` is
 //! `tokens × the declared rate / 1e6`, and `cost_source` says so beside every
-//! figure. No tariff, no figure: `null`, never zero, for the reason `0024` gave
+//! figure; `agentos_domain::forecast::rate_card` — the dated list price the
+//! eval and `/v1/forecast`'s fallback use — is never consulted on this route. No tariff, no figure: `null`, never zero, for the reason `0024` gave
 //! for tokens — unknown is not free.
 //!
 //! # What is in a block, and what a block is

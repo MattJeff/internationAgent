@@ -61,13 +61,22 @@ branche n'est pas poussée.
 
 ### Coutures laissées par la vague 2, à reprendre
 
-- `crates/domain/src/forecast.rs::rate_card` contient des prix par modèle
-  codés en dur, alors que `billing`, `usage` et `pnl` refusent tout prix dans
-  le dépôt. E fait primer le tarif déclaré ; supprimer `rate_card` est une
-  décision du fondateur.
-- Un envoi fait par `Seller::touch` (vertical) ou `sourcing` n'est pas relancé
-  par G : ces chemins ont leur propre espacement (`contacts.next_follow_up_at`).
-  Deux mécanismes pour une même idée ; en garder un.
+- Un envoi fait par `Seller::touch` (vertical) n'est pas relancé par G : le
+  vertical a son propre espacement (`contacts.next_follow_up_at`, écrit par
+  `mark_contacted`, lu par `due_chase`). **Décidé** (en-tête de
+  `crates/app/src/follow_up.rs`) : la promesse calendrier survit, la colonne
+  disparaît. Les deux sont disjoints par construction et `inbound::land`
+  annule les deux sur réponse, donc rien ne se contredit aujourd'hui. **Pas
+  fait** parce que la colonne n'a pas qu'un lecteur : `due_chase` est piloté
+  par `loops::initiative::sales_work_for` et par le dry run de l'eval (digest
+  gelé, la branche chase changerait de sortie) ; `queueable` la lit pour
+  `routes::queue` ; `0011_revenue.sql` l'efface par trigger sur opt-out et
+  l'indexe ; `prospects::import` et `queue::record_queued` l'écrivent. Le
+  déplacement est une vague à lui seul : `Seller::touch` → `follow_up::sent` +
+  `schedule` sous un `AppointmentBook` évalué, `due_chase` retiré du loop et
+  du dry run avec son digest régénéré, `queueable` sur `last_contacted_at`,
+  puis une migration pour la colonne et son trigger. `sourcing` n'écrit pas
+  cette colonne (il ne relance pas).
 
 ## Vague 3 — ce qu'une entreprise paie ailleurs
 
@@ -79,18 +88,19 @@ branche n'est pas poussée.
       `max_new_contacts_per_day`, plafonds de dépense, `/v1/halt` — au même
       endroit que le P&L.
 
-### Coutures laissées par la vague 3, à reprendre
+## Deux décisions prises le 2026-09-05, pour ne pas les reprendre
 
-- Une réservation publique réveille le siège avec le sujet masqué, mais le
-  motif du tiers n'est pas dans le brief du réveil (`follow_up::brief` rend
-  `None` sur un fil sans sortant) : une ligne dans `initiative.rs`.
-- `GET /v1/controls` ne montre pas le budget d'équipe
-  (`PUT /v1/teams/{team_id}/budget`) — un plafond de plus quand quelqu'un le
-  demande.
-- `send_invoice` est `Risk::Low`, comme l'`EmailSend` qu'il est : un tour
-  taché le voit, et l'adresse est relue en base, donc un texte étranger ne
-  peut qu'envoyer une facture émise à son propre client. Si le fondateur
-  veut High, c'est une ligne et un test inversé.
+- **`rate_card` reste.** C'est la seule façon de mettre un dollar sur la
+  mesure d'Orizn (`docs/ORIZN.md`) et le repli de `/v1/forecast` quand rien
+  n'est déclaré, étiqueté `cost_source: "rate_card"`. Le tarif déclaré prime
+  toujours. Les en-têtes de `usage.rs` et `pnl.rs` qui disaient « aucun prix
+  dans le dépôt » sont corrigés : la règle vraie est « aucun prix appliqué au
+  client qu'il n'ait déclaré ».
+- **`send_invoice` reste `Risk::Low`.** Le catalogue doit porter le risque du
+  domaine pour son `ActionKind` (un test l'exige), et c'est un `EmailSend` ;
+  le passer High casserait cet invariant pour un gain nul : l'adresse est
+  relue en base, un texte étranger ne peut qu'envoyer une facture émise à son
+  propre client.
 
 ## Ce qu'on ne fait pas, et pourquoi
 

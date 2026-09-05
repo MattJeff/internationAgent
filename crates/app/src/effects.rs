@@ -2974,9 +2974,12 @@ impl Effects {
     /// it — see [`crate::follow_up`].
     ///
     /// Called by `Turn::perform` right after [`Effects::send_email`] answered
-    /// with a provider id, and only there: the seller's and the buyer's own
-    /// senders space their touches on `contacts.next_follow_up_at` and would
-    /// otherwise chase twice. Both writes are one transaction, so a thread
+    /// with a provider id, and only there: the seller's own sender spaces its
+    /// touches on `contacts.next_follow_up_at` and `vertical::due_chase` polls
+    /// that column, so a call from `Seller::touch` would chase twice. The
+    /// promise is the one that survives when the two are merged; the column
+    /// has readers that keep the merge out of one wave — see the module docs
+    /// of [`crate::follow_up`]. Both writes are one transaction, so a thread
     /// cannot carry a promise about a message it does not hold.
     ///
     /// # Why it takes an [`AppointmentBook`] token and not the email's

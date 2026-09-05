@@ -12,12 +12,23 @@
 //!
 //! # The three disciplines this surface inherits
 //!
-//! **Tokens, not money.** There is no cost figure here and no price anywhere in
-//! this repository. A price per million tokens is a fact with a source and a
-//! date; a price table in a repository is stale the day after it is written, and
-//! the real number depends on a contract this schema has never seen. A cost
-//! nobody can trace is worse than a missing one, so this endpoint reports the
-//! measurement and stops. The migration's last section is the full argument.
+//! **Tokens, not money.** There is no cost figure here, and no price is ever
+//! applied to a customer that the customer did not declare. A price per million
+//! tokens is a fact with a source and a date; a price table in a repository is
+//! stale the day after it is written, and the real number depends on a contract
+//! this schema has never seen. A cost nobody can trace is worse than a missing
+//! one, so this endpoint reports the measurement and stops. The migration's
+//! last section is the full argument.
+//!
+//! The one price table this repository does hold is
+//! `agentos_domain::forecast::rate_card` — list prices read on a named day,
+//! used to put a dollar sign on the *measured* Orizn run in `docs/ORIZN.md` and
+//! as `/v1/forecast`'s fallback when a tenant has declared nothing, labelled
+//! `cost_source: "rate_card"` so nobody mistakes it for their contract. A
+//! declared tariff always wins over it. This paragraph used to say "no price
+//! anywhere in this repository", which was false for as long as `rate_card`
+//! existed, and a sentence a `grep` refutes is the kind this file exists to
+//! avoid.
 //!
 //! **Unknown is not zero.** A call the provider did not meter is counted in
 //! `calls` and in `calls_unmetered`, and contributes nothing to the token
