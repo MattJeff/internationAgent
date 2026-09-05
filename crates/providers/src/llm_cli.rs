@@ -252,7 +252,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::extract::State;
@@ -469,8 +469,14 @@ impl Llm for CliLlm {
         match parse_stream(&stdout) {
             Ok(response) => Ok(response),
             // Nothing usable came back *and* the process failed: the exit
-            // status is the more honest thing to report.
-            Err(_) if !exited_clean => Err(ProviderError::Terminal { code: "cli_failed" }),
+            // status is the more honest thing to report. A verdict the stream
+            // itself carried — no session, the subscription's ceiling — is not
+            // "nothing usable", and the CLI exits 1 on both: masking those
+            // behind the status is how a missing login read `cli_failed` on
+            // the box for a morning.
+            Err(ProviderError::Terminal {
+                code: "cli_bad_output" | "cli_no_result",
+            }) if !exited_clean => Err(ProviderError::Terminal { code: "cli_failed" }),
             Err(e) => Err(e),
         }
     }
@@ -713,6 +719,29 @@ fn parse_stream(stdout: &str) -> Result<LlmResponse, ProviderError> {
             .ok_or(ProviderError::Terminal {
                 code: "cli_no_result",
             })?;
+
+    // The subscription's own ceiling. The CLI says so structurally — the last
+    // `rate_limit_event` has `status: "rejected"`, a `rateLimitType` of
+    // `five_hour` or `seven_day`, and `resetsAt` in unix seconds — and then, like
+    // a missing login, an assistant message from `<synthetic>`. Read *first*, or
+    // the hour it lifts would be thrown away as "not logged in".
+    if let Some(info) = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "rate_limit_event")
+        .map(|e| &e["rate_limit_info"])
+        .filter(|info| info["status"] == "rejected")
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let resets_at = info["resetsAt"].as_u64().unwrap_or(0);
+        // ponytail: a minute floor — a `resetsAt` already past, or absent, is
+        // still a ceiling, and a zero wait would be the crash loop.
+        return Err(ProviderError::RateLimited {
+            retry_after: Duration::from_secs(resets_at.saturating_sub(now).max(60)),
+        });
+    }
 
     // A CLI with no session does not fail: it exits 0 and prints an assistant
     // message with `model: "<synthetic>"` whose text is `Not logged in · Please
@@ -1013,6 +1042,35 @@ mod tests {
     /// 2026-09-05: exit 0, an assistant message from `<synthetic>`, a result
     /// with `is_error: true` and `terminal_reason: "api_error"`. The sentence
     /// reached a founder as the employee's own answer.
+    /// The subscription's ceiling. Shape from the CLI's own source (2.1.261):
+    /// a `rate_limit_event` whose `rate_limit_info` carries `status:
+    /// "rejected"`, `rateLimitType` and `resetsAt` in unix seconds, then the
+    /// same `<synthetic>` message a missing login sends. The hour is the whole
+    /// point: it is what the initiative loop puts the tenant's seats to sleep
+    /// until.
+    #[test]
+    fn a_rejected_rate_limit_is_the_hour_it_lifts_and_not_a_missing_login() {
+        let resets_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let stream = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed"}}}}
+{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}
+{{"type":"assistant","message":{{"id":"1","model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"You've hit your usage limit."}}]}}}}
+{{"type":"result","is_error":true,"subtype":"success","result":"You've hit your usage limit."}}"#
+        );
+        match parse_stream(&stream) {
+            Err(ProviderError::RateLimited { retry_after }) => assert!(
+                retry_after > Duration::from_secs(3_500)
+                    && retry_after <= Duration::from_secs(3_600),
+                "{retry_after:?}"
+            ),
+            other => panic!("a ceiling is a wait, not a reply: {other:?}"),
+        }
+    }
+
     #[test]
     fn a_cli_with_no_session_is_an_error_and_not_a_reply() {
         let stream = r#"{"type":"system","subtype":"init","apiKeySource":"none","model":"claude-opus-5"}
@@ -1030,6 +1088,22 @@ mod tests {
         let response = parse_stream(stream).unwrap();
         // cache_creation is not ours to bill; cache_read is.
         assert_eq!(response.usage, Usage::new(2, 4, 18736));
+    }
+
+    /// The container's own shape, 2026-09-05: the no-session stream *and*
+    /// exit 1. The verdict is the stream's, not the status's.
+    #[tokio::test]
+    async fn a_missing_login_keeps_its_name_when_the_cli_also_exits_one() {
+        let fake = Fake::new(
+            r#"printf '%s\n' '{"type":"assistant","message":{"id":"1","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]}}' '{"type":"result","is_error":true,"subtype":"success","result":"Not logged in · Please run /login"}'
+exit 1"#,
+        );
+        assert_eq!(
+            fake.llm().complete(req()).await,
+            Err(ProviderError::Terminal {
+                code: "cli_not_logged_in"
+            })
+        );
     }
 
     #[tokio::test]

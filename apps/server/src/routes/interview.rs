@@ -820,12 +820,29 @@ async fn answer(
     }
 
     let finished = outcome.map_err(|failed| {
-        tracing::warn!(%id, role, code = failed.error.code(), "the interview turn did not finish");
+        let code = failed.error.code();
+        tracing::warn!(%id, role, code, "the interview turn did not finish");
+        // The code is a closed vocabulary and the founder is the one reading
+        // this; the two they can act on get a sentence, the rest get the word.
+        let detail = match code {
+            "cli_not_logged_in" => "the claude binary behind this company's connection has no \
+                                    session: paste the token from `claude setup-token` at step 1"
+                .to_owned(),
+            "rate_limited" => match failed.error.retry_after() {
+                Some(after) => format!(
+                    "the subscription's ceiling; it lifts in {} minutes",
+                    after.as_secs().div_ceil(60)
+                ),
+                None => code.to_owned(),
+            },
+            other => other.to_owned(),
+        };
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             "interview_turn_failed",
             "this employee's model did not answer",
         )
+        .with_detail(detail)
     })?;
 
     // --- The model proposed. Now the constructors decide. ------------------

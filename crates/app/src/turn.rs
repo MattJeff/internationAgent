@@ -1697,6 +1697,17 @@ impl TurnError {
             TurnError::Unavailable(_) => "unavailable",
         }
     }
+
+    /// When the provider said to come back, and not before: a `429`, or the
+    /// subscription's ceiling with the hour it lifts. `None` for everything
+    /// else, which is not a wait. Here so the server can ask without naming a
+    /// provider type, which its `Cargo.toml` forbids it to.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            TurnError::Llm(ProviderError::RateLimited { retry_after }) => Some(*retry_after),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
