@@ -407,6 +407,7 @@ fn unset(value: &Value) -> bool {
 fn candidate(
     base: &Map<String, Value>,
     proposal: Map<String, Value>,
+    rewriting: Option<&str>,
 ) -> (Vec<(String, Value)>, Vec<Refusal>) {
     let mut kept = Vec::new();
     let mut refused = Vec::new();
@@ -419,13 +420,16 @@ fn candidate(
                 ),
                 field: key,
             }),
-            Some(stored) if !unset(stored) => refused.push(Refusal {
-                why: format!(
-                    "`{key}` was already answered, and this interview only asks about what is \
-                     missing; change it with PUT /v1/employees/{{id}}/initiative"
-                ),
-                field: key,
-            }),
+            // The one key the console named as being changed goes through set.
+            Some(stored) if !unset(stored) && rewriting != Some(key.as_str()) => {
+                refused.push(Refusal {
+                    why: format!(
+                        "`{key}` was already answered, and this interview only asks about what \
+                         is missing; name it as the question to change it"
+                    ),
+                    field: key,
+                });
+            }
             Some(_) => kept.push((key, value)),
         }
     }
@@ -457,8 +461,9 @@ fn apply(
     role: &'static str,
     base: &Map<String, Value>,
     proposal: Map<String, Value>,
+    rewriting: Option<&str>,
 ) -> (Option<(Charter, Vec<String>)>, Vec<Refusal>) {
-    let (kept, mut refused) = candidate(base, proposal);
+    let (kept, mut refused) = candidate(base, proposal, rewriting);
     if kept.is_empty() {
         return (None, refused);
     }
@@ -646,11 +651,20 @@ async fn answer(
         }
     };
 
+    // A key already answered, named by the console: the founder is changing
+    // it, in the same words and through the same constructors. This is the one
+    // case `candidate` lets a set key through — without it, "change it with
+    // PUT /initiative" meant rewriting the whole objective to fix one word.
+    let rewriting: Option<&str> = body
+        .question
+        .as_deref()
+        .filter(|key| base.get(*key).is_some_and(|value| !unset(value)));
+
     // Nothing to ask is not an error, and answering it is not a turn. A founder
     // who sends one answer too many gets the finished objective back and pays
-    // nothing for it.
+    // nothing for it. Unless they are changing a value, which is a turn.
     let questions = charter.open_questions();
-    if !questions.iter().any(|question| question.answerable) {
+    if rewriting.is_none() && !questions.iter().any(|question| question.answerable) {
         return Ok(Json(AnswerView {
             employee_id: id,
             role,
@@ -764,14 +778,21 @@ async fn answer(
     // The question on screen first and alone, when the console says which one
     // it was; the rest stay listed because an answer can close two at once
     // ("5,000 units at 2 euros") and the model may only fill what was said.
-    let questions_task = match answering {
-        Some(question) => format!(
+    let questions_task = match (rewriting, answering) {
+        (Some(key), _) => format!(
+            "The value they are changing — this once, give `{key}` its new value even though \
+             it is already set, and only that key:\n\n- `{key}`, currently {}\n\nThe open \
+             questions, for context — fill one only if the answer plainly says so:\n\n- {}",
+            base[key],
+            asked.join("\n- "),
+        ),
+        (None, Some(question)) => format!(
             "The question they were answering:\n\n- {}\n\nThe other open questions, for \
              context — fill one only if the answer plainly says so:\n\n- {}",
             question.ask,
             asked.join("\n- "),
         ),
-        None => format!("The questions they were asked:\n\n- {}", asked.join("\n- ")),
+        (None, None) => format!("The questions they were asked:\n\n- {}", asked.join("\n- ")),
     };
     let context = Context::new()
         .with_task(INTERVIEW_BRIEF)
@@ -864,7 +885,7 @@ async fn answer(
         .into_response());
     };
 
-    let (built, mut refused) = apply(role, &base, proposal);
+    let (built, mut refused) = apply(role, &base, proposal, rewriting);
     // `{}` is the model obeying "omit anything they did not say": the answer
     // did not answer the question. Nothing was refused, so without this line
     // the founder would read "nothing was written" and no reason.
@@ -1200,6 +1221,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(
             built.is_none(),
@@ -1208,6 +1230,33 @@ mod tests {
         assert_eq!(refused.len(), 2, "{refused:?}");
         for refusal in &refused {
             assert!(refusal.why.contains("already answered"), "{}", refusal.why);
+        }
+
+        // Unless the console named the key being changed: that one goes
+        // through set, and only that one — through the same constructor, so
+        // "Germanie" is refused here exactly as it is on an open question.
+        let (built, refused) = apply(
+            charter.role(),
+            &base,
+            json!({"market": "fr", "target_accounts": ["Air France"]})
+                .as_object()
+                .expect("an object")
+                .clone(),
+            Some("market"),
+        );
+        let (rewritten, filled) = built.expect("the named key is rewritten");
+        assert_eq!(filled, vec!["market".to_owned()]);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].field, "target_accounts");
+        match rewritten {
+            Charter::Sales { objective, .. } => {
+                assert_eq!(
+                    objective.market.map(|c| c.to_string()),
+                    Some("FR".to_owned())
+                );
+                assert_eq!(objective.target_accounts, vec!["Lufthansa".to_owned()]);
+            }
+            other => panic!("the role is ours, not the model's: {other:?}"),
         }
     }
 
@@ -1243,6 +1292,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
 
         assert!(
@@ -1268,6 +1318,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(refused.is_empty(), "{refused:?}");
         let (built, filled) = built.expect("a charter");
@@ -1291,6 +1342,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(built.is_none(), "zero is not a ceiling per unit");
         assert!(
@@ -1310,6 +1362,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         let (built, _) = built.expect("a charter");
         assert_eq!(
@@ -1340,6 +1393,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(built.is_none());
         assert!(
@@ -1392,6 +1446,7 @@ mod tests {
             .as_object()
             .expect("an object")
             .clone(),
+            None,
         );
 
         let (built, filled) = built.expect("the one real answer still lands");
@@ -1440,6 +1495,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(built.is_none());
         assert_eq!(refused.len(), 1);
@@ -1487,6 +1543,7 @@ mod tests {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            None,
         );
         assert!(built.is_none());
         assert_eq!(refused.len(), 1);
