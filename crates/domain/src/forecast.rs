@@ -191,19 +191,19 @@ impl Sample {
 /// states it to the caller in as many words rather than burying it here.
 pub const RECORDED: &[Sample] = &[
     Sample {
-        calls_per_turn: 2.00,
-        input_tokens_per_call: 6110.7,
-        output_tokens_per_call: 416.3,
+        calls_per_turn: 8.00,
+        input_tokens_per_call: 7109.5,
+        output_tokens_per_call: 372.9,
     },
     Sample {
-        calls_per_turn: 2.00,
-        input_tokens_per_call: 6134.3,
-        output_tokens_per_call: 442.0,
+        calls_per_turn: 8.00,
+        input_tokens_per_call: 7068.6,
+        output_tokens_per_call: 361.0,
     },
     Sample {
-        calls_per_turn: 1.67,
-        input_tokens_per_call: 5901.2,
-        output_tokens_per_call: 477.8,
+        calls_per_turn: 8.33,
+        input_tokens_per_call: 7310.4,
+        output_tokens_per_call: 411.7,
     },
 ];
 

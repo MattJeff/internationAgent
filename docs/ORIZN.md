@@ -649,7 +649,21 @@ database credential because `app_role` may not write `prospect_flows` — and th
 seller probes it twice, files a finding, and has its approach refused by
 `max_new_contacts_per_day`, which this deployment ships at `0`.
 
-> ### $87–$105 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $52 floor at 1.00 model calls per turn, $526 ceiling at 10.00
+> ### $447–$492 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $56 floor at 1.00 model calls per turn, $590 ceiling at 10.00
+>
+> **Re-measured 2026-09-05, and it went up more than fourfold.** Between the two
+> measurements the company gained `issue_invoice` and `send_invoice` in the
+> catalogue, a ticket on the board for every inbound message, a follow-up
+> promise on every outbound one, a public booking page and a rewritten sales
+> briefing. Input tokens per model call moved from ~6.0k to ~7.1k, which is the
+> schema rent again — but the figure that moved the bill is **model calls per
+> turn: 2.00 → 8.00–8.33**. A seat that finds tickets on its board, promises on
+> its calendar and deals it may invoice works the whole round rather than the
+> first one. That is a company doing more, not a prompt getting heavier, and
+> the reader deciding whether $450 a month of the customer's own model key is
+> worth it should read it beside `/v1/pnl`, which is what the same month
+> invoiced. Tool choice did not move: 4/5, the same failing case, zero
+> violations.
 >
 > **Re-measured 2026-08-28, and it went up about a quarter.** The company gained
 > three catalogue tools in one day — the work board's two and the calendar's one
