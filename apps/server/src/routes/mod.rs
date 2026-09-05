@@ -1,4 +1,7 @@
 pub mod a2a; // U34
+// l'export comptable: the same books as `pnl`, one CSV line per movement, for
+// a human accountant's tool. Its totals foot to `/v1/pnl` by construction.
+pub mod accounting;
 pub mod approvals;
 pub mod autonomy;
 // wave M: what we may charge for — seats and connectors, by the day, derived

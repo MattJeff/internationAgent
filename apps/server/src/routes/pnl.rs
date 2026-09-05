@@ -80,16 +80,19 @@ pub fn router(db: Db) -> Router {
 // ---------------------------------------------------------------------------
 
 /// `?days=N`, or `?from=&to=` as [`super::autonomy`] takes them.
+///
+/// `pub(super)` for [`super::accounting`], which exports the same books line
+/// by line and must mean the same thing by "the last 30 days".
 #[derive(Debug, Deserialize)]
-struct PnlQuery {
-    days: Option<i64>,
-    from: Option<NaiveDate>,
-    to: Option<NaiveDate>,
+pub(super) struct PnlQuery {
+    pub(super) days: Option<i64>,
+    pub(super) from: Option<NaiveDate>,
+    pub(super) to: Option<NaiveDate>,
 }
 
 impl PnlQuery {
     /// `days` is sugar for `from = to - (days - 1)`; the rest is [`Window`]'s.
-    fn resolve(&self) -> Result<Window, ApiError> {
+    pub(super) fn resolve(&self) -> Result<Window, ApiError> {
         let from = match (self.days, self.from) {
             (Some(_), Some(_)) => {
                 return Err(ApiError::bad_request(
@@ -419,12 +422,14 @@ fn block_for<'a>(
     }
 }
 
-fn money(row: &LedgerRow) -> Result<Money, StoreError> {
-    let currency: Currency = row
-        .currency
+/// A ledger figure as the table holds it — an ISO code and a bigint of minor
+/// units — as [`Money`], refusing a currency the domain does not know or a
+/// figure the ledger cannot have. Shared with [`super::accounting`].
+pub(super) fn money(currency: &str, minor: i64) -> Result<Money, StoreError> {
+    let currency: Currency = currency
         .parse()
         .map_err(|err: MoneyError| StoreError::conflict(err.to_string()))?;
-    let minor = u64::try_from(row.minor)
+    let minor = u64::try_from(minor)
         .map_err(|_| StoreError::conflict("a ledger sum is negative".to_owned()))?;
     Money::new(minor, currency).map_err(|err| StoreError::conflict(err.to_string()))
 }
@@ -514,7 +519,7 @@ async fn get(
         }
         let rows = query.fetch_all(&mut **tx).await.map_err(StoreError::from)?;
         for row in rows {
-            let amount = money(&row)?;
+            let amount = money(&row.currency, row.minor)?;
             field(block_for(&mut seats, &mut orphans, row.employee_id))
                 .add(row.n, amount)
                 .map_err(arithmetic)?;
@@ -558,8 +563,10 @@ async fn get(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// `pub(super)`: [`super::accounting`]'s tests seed the same books and read
+/// them back as CSV, so they borrow this harness rather than copy it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::num::NonZeroU32;
 
     use agentos_app::mcp::Credentials;
@@ -574,7 +581,7 @@ mod tests {
     use agentos_store::spend::{self, SpendCaps};
     use agentos_store::{backlog, model_access};
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request as HttpRequest, StatusCode, header};
+    use axum::http::{HeaderMap, Request as HttpRequest, StatusCode, header};
     use chrono::Utc;
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -582,20 +589,21 @@ mod tests {
     use super::*;
     use crate::auth::ApiKeys;
 
-    const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    pub(crate) const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    pub(crate) const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    struct Harness {
+    pub(crate) struct Harness {
         app: Router,
-        db: Db,
-        a: TenantId,
-        b: TenantId,
+        pub(crate) db: Db,
+        pub(crate) a: TenantId,
+        pub(crate) b: TenantId,
     }
 
     impl Harness {
         /// This router plus `/v1/model` on the mock backend, so the tariff
-        /// goes in the way a tenant puts it in.
-        async fn new() -> Option<Self> {
+        /// goes in the way a tenant puts it in, plus `/v1/accounting/export`,
+        /// which must foot to this one.
+        pub(crate) async fn new() -> Option<Self> {
             let Ok(url) = std::env::var("DATABASE_URL") else {
                 eprintln!("SKIP: DATABASE_URL is unset; pnl routes need a real Postgres");
                 return None;
@@ -612,12 +620,14 @@ mod tests {
             ))
             .expect("keyring");
 
-            let routes = router(db.clone()).merge(super::super::model::router(
-                db.clone(),
-                mocks::llm(LlmBackend::Mock, None).expect("mock"),
-                LlmBackend::Mock,
-                Credentials::from_master_key(crate::auth::TEST_MASTER_KEY),
-            ));
+            let routes = router(db.clone())
+                .merge(super::super::accounting::router(db.clone()))
+                .merge(super::super::model::router(
+                    db.clone(),
+                    mocks::llm(LlmBackend::Mock, None).expect("mock"),
+                    LlmBackend::Mock,
+                    Credentials::from_master_key(crate::auth::TEST_MASTER_KEY),
+                ));
             Some(Self {
                 app: crate::with_api_stack(
                     routes,
@@ -630,7 +640,7 @@ mod tests {
             })
         }
 
-        async fn call(
+        pub(crate) async fn call(
             &self,
             method: &str,
             uri: &str,
@@ -664,7 +674,32 @@ mod tests {
             )
         }
 
-        async fn teardown(self) {
+        /// A GET whose body is not JSON: status, headers and the bytes as text.
+        pub(crate) async fn get_raw(
+            &self,
+            uri: &str,
+            secret: &str,
+        ) -> (StatusCode, HeaderMap, String) {
+            let req = HttpRequest::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .body(Body::empty())
+                .expect("request");
+            let response = self.app.clone().oneshot(req).await.expect("service");
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (
+                status,
+                headers,
+                String::from_utf8(bytes.to_vec()).expect("utf-8"),
+            )
+        }
+
+        pub(crate) async fn teardown(self) {
             for tenant in [self.a, self.b] {
                 let mut tx = self.db.admin_tx_bypassing_rls().await.expect("admin tx");
                 sqlx::query("DELETE FROM tenants WHERE id = $1")
@@ -677,7 +712,7 @@ mod tests {
         }
     }
 
-    async fn new_tenant(db: &Db) -> TenantId {
+    pub(crate) async fn new_tenant(db: &Db) -> TenantId {
         let tenant = TenantId::new_v7(Utc::now());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'pnl-test')")
@@ -690,7 +725,7 @@ mod tests {
         tenant
     }
 
-    async fn employee(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
+    pub(crate) async fn employee(db: &Db, tenant: TenantId, slug: &str) -> EmployeeId {
         let id = EmployeeId::new_v7(Utc::now());
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         sqlx::query(
@@ -708,17 +743,20 @@ mod tests {
     }
 
     /// A won deal to invoice against — `invoices::issue` refuses any other.
-    async fn won_deal(db: &Db, tenant: TenantId) -> Uuid {
+    /// `legal_name` is the buyer's, i.e. third-party text: the export's tests
+    /// put a hostile one in.
+    pub(crate) async fn won_deal(db: &Db, tenant: TenantId, legal_name: &str) -> Uuid {
         let account = Uuid::now_v7();
         let opportunity = Uuid::now_v7();
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
         sqlx::query(
             "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
-             VALUES ($1, $2, 'Buyer plc', $3, 'airline', 'FR')",
+             VALUES ($1, $2, $4, $3, 'airline', 'FR')",
         )
         .bind(account)
         .bind(tenant.as_uuid())
         .bind(format!("buyer-{}.example", account.simple()))
+        .bind(legal_name)
         .execute(&mut *tx)
         .await
         .expect("account");
@@ -738,7 +776,7 @@ mod tests {
         opportunity
     }
 
-    fn eur(minor: u64) -> Money {
+    pub(crate) fn eur(minor: u64) -> Money {
         Money::new(minor, Currency::Eur).expect("nonzero")
     }
 
@@ -761,7 +799,7 @@ mod tests {
         };
         let lena = employee(&h.db, h.a, "lena").await;
         let idle = employee(&h.db, h.a, "idle").await;
-        let deal = won_deal(&h.db, h.a).await;
+        let deal = won_deal(&h.db, h.a, "Buyer plc").await;
         let now = Utc::now();
         let today = now.date_naive();
 
@@ -1103,7 +1141,7 @@ mod tests {
             return;
         };
         let lena = employee(&h.db, h.a, "lena").await;
-        let deal = won_deal(&h.db, h.a).await;
+        let deal = won_deal(&h.db, h.a, "Buyer plc").await;
         let now = Utc::now();
 
         let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
