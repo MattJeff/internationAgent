@@ -216,7 +216,7 @@ pub async fn brief(db: &Db, tenant: TenantId, conversation: ConversationId) -> O
 mod tests {
     use agentos_domain::message::{CanonicalMessage, Direction, ProviderRef};
     use agentos_domain::untrusted::Untrusted;
-    use chrono::TimeDelta;
+    use chrono::{SubsecRound, TimeDelta};
 
     use super::*;
 
@@ -233,7 +233,7 @@ mod tests {
     }
 
     async fn seed(db: &Db) -> (TenantId, EmployeeId) {
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
         let tenant = TenantId::new_v7(now);
         let employee = EmployeeId::new_v7(now);
         let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
@@ -338,7 +338,7 @@ mod tests {
         let Some((db, tenant, lena, other)) = fixture().await else {
             return;
         };
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
 
         let (thread, promised) = send(&db, tenant, lena, "msg-1", now).await;
         let promised = promised.expect("a first email to a stranger is chased");
@@ -425,7 +425,7 @@ mod tests {
                 tx.commit().await.expect("commit");
             }
         };
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
         let (_, first) = send(&db, tenant, lena, "t-1", now).await;
         assert!(first.is_some(), "approach → chase 1 promised");
         let day_three = now + FOLLOW_UP_AFTER;
