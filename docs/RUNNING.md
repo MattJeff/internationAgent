@@ -1,8 +1,9 @@
 # The company, running
 
-*Last walked: 2026-08-29 (seventh pass, after waves F through N. All five
-internal tools are in, and the sweep that followed them found the most serious
-defect of the programme — see "What the sweep found", below.)*
+*Last walked: 2026-09-05 (eighth pass. Invoicing became reachable from a turn;
+the seventh pass, after waves F through N, is when all five internal tools came
+in and the sweep that followed them found the most serious defect of the
+programme — see "What the sweep found", below.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -291,16 +292,21 @@ customer brings their own, the adapter has to have somewhere to plug in.
 | 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. |
 | 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. |
 | 3 | **A thread with a human** | **Built, and it needed no table.** Half the mechanism was already here: a zero-turn seat is delivered to without being woken, which is the founder's own seat, so escalations already landed on a real desk. What was missing was a window and a pen — nothing read `messages.body`, and `GET /v1/employees/{id}/reports` gave a *count* of questions owed rather than a sentence. `GET`/`POST /v1/employees/{id}/desk` reads it and writes back; 0065 is one partial index. |
-| 4 | **Invoicing** | **Built.** `invoices` (0066), a seventeenth `ActionKind::InvoiceIssue`, `/v1/invoices`. No invoice can exist against a deal nobody won, and 0011 already refused `closed_won` without an approval — so the ceiling needed no invented number. **0071 makes the document issuable:** a gap-free number per company (a counter row, never a sequence — a sequence is exempt from rollback and therefore full of holes), line items that must total the head, a due date with no default term, and a credit note, because "corrected by a credit note" was 0066's argument for immutability and the remedy did not exist. **No tax rate, no PDF, nothing sent** — a rate is the founder's jurisdiction and the lines can carry one; the other two are still not built. |
-| 5 | **A file store** | **Built.** `files` (0067), `bytea` under the same RLS policy as the name beside it, `digest = sha256(content)` as a CHECK. No DELETE and no UPDATE grant — an UPDATE on `content` would swap a contract while leaving a row that looks untouched. |
+| 4 | **Invoicing** | **Built.** `invoices` (0066), a seventeenth `ActionKind::InvoiceIssue`, `/v1/invoices`. No invoice can exist against a deal nobody won, and 0011 already refused `closed_won` without an approval — so the ceiling needed no invented number. **0071 makes the document issuable:** a gap-free number per company (a counter row, never a sequence — a sequence is exempt from rollback and therefore full of holes), line items that must total the head, a due date with no default term, and a credit note, because "corrected by a credit note" was 0066's argument for immutability and the remedy did not exist. **No tax rate, no PDF, nothing sent** — a rate is the founder's jurisdiction and the lines can carry one; the other two are still not built. **Reachable from a turn:** `issue_invoice`, the twelfth row of `turn.rs::catalogue()`, proposed by the finance pack and no other, `Risk::High` so a turn that has read anything from outside is never shown it. The store's `closed_won` refusal comes back to the model as one sentence (`failed (no_won_deal): …`) rather than as the end of the run. |
+| 5 | **A file store** | **Built.** `files` (0067), `bytea` under the same RLS policy as the name beside it, `digest = sha256(content)` as a CHECK. No DELETE and no UPDATE grant — an UPDATE on `content` would swap a contract while leaving a row that looks untouched. **Not reachable from a turn, by design** — `files.rs`'s module docs carry the argument: a turn produces text and not bytes, the reader that most wants a contract is the one that must not then pay it, and `knowledge` already puts the *text* in front of a turn. |
 
 **The catalogue rows for tools 1 and 2 have landed and been measured.**
 `turn.rs::catalogue()` went from eight rows to eleven, both toolchoice pins
 moved, and so did a third nobody had planned for — `cost::digest` hashes the
 tool schemas too. Tool 3 needed no row at all: the verb an employee uses to
-answer the founder is `InternalSend`, already in the vocabulary. Tool 4's row is
-written out in place and deliberately unapplied, and tool 5 has no turn surface
-by design.
+answer the founder is `InternalSend`, already in the vocabulary. **Tool 4's row
+is applied now** — `issue_invoice`, the twelfth — and it moved exactly one pin:
+the toolchoice fixture wears the buyer's pack, which does not propose
+`InvoiceIssue`, so `TRUSTED_PROMPT` and `UNTRUSTED_PROMPT` stood still, while
+`cost::DIGEST` moved because Orizn's finance seat now carries a twelfth schema
+on every call. That digest is red until the re-measure is bought (`cargo run -p
+agentos-eval -- --live`, then `--dry-run 3`), which no agent may run. Tool 5 has
+no turn surface by design.
 
 **What the measurement said, and it is the reason to be slow about a twelfth
 row.** Tool choice did not move: 4/5 before and after, the same failing case,

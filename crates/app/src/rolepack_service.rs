@@ -3011,9 +3011,9 @@ mod tests {
     #[test]
     fn every_pack_is_offered_its_own_tools_and_never_another_pack_s() {
         // Read: (role, trusted, untrusted). The untrusted column is the trusted
-        // one minus every high-risk schema — which is only ever `pay` today, so
-        // the two columns differ for exactly the two packs that may propose a
-        // payment.
+        // one minus every high-risk schema — `pay`, and `issue_invoice` for the
+        // one pack that proposes it — so the two columns differ for exactly the
+        // two packs that may move money.
         //
         // `read_page` is in every row, at both labels, and both facts are
         // deliberate. Every pack lists `ActionKind::BrowserRead` — reading
@@ -3143,6 +3143,11 @@ mod tests {
                     "update_work_item",
                 ],
             ),
+            // The only row with `issue_invoice`, and it is the only row where
+            // the untrusted column is *two* names shorter: money out and money
+            // in are both `Risk::High`, and the second is what keeps "your
+            // customer emailed asking to be invoiced" from producing a demand
+            // for money in this company's name.
             (
                 "finance",
                 &[
@@ -3157,6 +3162,7 @@ mod tests {
                     "add_work_item",
                     "update_work_item",
                     "promise_an_hour",
+                    "issue_invoice",
                 ],
                 &[
                     "send_email",

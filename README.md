@@ -233,9 +233,12 @@ Postgres sequence has holes by construction. *A file store* that keeps the
 signed contract as it is, with `digest = sha256(content)` as a CHECK rather than
 a convention.
 
-Two of the five are reachable from a turn today. The others are built and
-deliberately out of reach: a catalogue row costs input tokens on **every** model
-call whether anybody uses it or not, so each verb has to argue for its rent.
+Three of the five are reachable from a turn today — the board, the calendar,
+and the register through `issue_invoice`, which only the finance pack proposes
+and which a turn that has read anything from outside is never shown. The desk
+needed no verb of its own, and the file store is built and deliberately out of
+reach: a catalogue row costs input tokens on **every** model call whether
+anybody uses it or not, so each verb has to argue for its rent.
 
 **A phone pool, not one number each.** Numbers are tenant-owned with a capacity;
 allocation picks the least-loaded and counts occupancy under a lock rather than
