@@ -36,10 +36,44 @@
 //! column that lets a reply find the promise. **No text of theirs.** The
 //! subject line is our word and a masked address, and the brief carries a
 //! date; the address the model needs is inside the frame the wake already
-//! shows it. **No opinion about the vertical's own chase.** `crate::vertical`
-//! spaces its touches on `contacts.next_follow_up_at` with the same
-//! [`FOLLOW_UP_AFTER`], through its own sender rather than through a turn's
-//! `send_email`, so the two never meet on one thread.
+//! shows it.
+//!
+//! # The vertical's own chase, and which of the two survives
+//!
+//! `crate::vertical` chases too, and not through here: `selling_turn` and
+//! `chasing_turn` write `contacts.next_follow_up_at = now + FOLLOW_UP_AFTER`
+//! through `store::revenue::mark_contacted`, `due_chase` reads the column back
+//! through `contacts_due_for_follow_up`, and the chase is `chase_message`
+//! through `Seller::touch` — no model, no wake. Two mechanisms for "write
+//! again in three days if nothing comes back", disjoint by construction: a
+//! turn's `send_email` books a promise and writes no column; the vertical's
+//! sender writes the column and books no promise; so no thread ever holds
+//! both, and `inbound::land` settles both in the transaction that lands the
+//! reply (`cancel_for_conversation` beside `stop_follow_up`). They do not
+//! contradict each other today. They would the day somebody wires
+//! [`Effects::chase`](crate::effects::Effects::chase) into `Seller::touch`
+//! without also silencing `due_chase`: two chases on day three, one by the
+//! wake and one by the queue.
+//!
+//! **Decision: the promise is the source of truth, and the column goes.** The
+//! promise is what a reply cancels in the landing transaction, what the
+//! ceiling is counted against off the thread's own rows, and what wakes the
+//! seat with the thread in hand; the column is a date on a contact that a
+//! queue polls. When the vertical's chase moves, it moves here — `Seller::touch`
+//! records its send with [`sent`] and books with [`schedule`] under an
+//! `AppointmentBook` the gate ruled on, `due_chase` stops reading the column,
+//! and `next_follow_up_at` is written by nobody. **Not done in the wave that
+//! wrote this paragraph, on purpose**, because the column is not one reader:
+//! `due_chase` is driven by `loops::initiative::sales_work_for` and by the
+//! eval's dry run, whose digest is frozen and whose chase branch would change
+//! outcome; `store::revenue::queueable` reads it for `routes::queue`;
+//! `0011_revenue.sql` clears it by trigger on an opt-out and indexes it;
+//! `prospects::import` and `queue::record_queued` write it. Silencing
+//! `due_chase` alone would leave a queue that never fires behind a route and
+//! an eval that still ask it, and wiring `chase` alone would chase twice.
+//! Until the move, the rule is the one above: **a send is chased by exactly one
+//! of the two, chosen by which sender made it, and `Effects::chase` is called
+//! from `Turn::perform` only.**
 
 use agentos_domain::action::EmailAddress;
 use agentos_domain::ids::{AppointmentId, ConversationId, EmployeeId, TenantId};

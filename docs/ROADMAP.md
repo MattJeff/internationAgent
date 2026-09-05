@@ -61,9 +61,22 @@ branche n'est pas poussée.
 
 ### Coutures laissées par la vague 2, à reprendre
 
-- Un envoi fait par `Seller::touch` (vertical) ou `sourcing` n'est pas relancé
-  par G : ces chemins ont leur propre espacement (`contacts.next_follow_up_at`).
-  Deux mécanismes pour une même idée ; en garder un.
+- Un envoi fait par `Seller::touch` (vertical) n'est pas relancé par G : le
+  vertical a son propre espacement (`contacts.next_follow_up_at`, écrit par
+  `mark_contacted`, lu par `due_chase`). **Décidé** (en-tête de
+  `crates/app/src/follow_up.rs`) : la promesse calendrier survit, la colonne
+  disparaît. Les deux sont disjoints par construction et `inbound::land`
+  annule les deux sur réponse, donc rien ne se contredit aujourd'hui. **Pas
+  fait** parce que la colonne n'a pas qu'un lecteur : `due_chase` est piloté
+  par `loops::initiative::sales_work_for` et par le dry run de l'eval (digest
+  gelé, la branche chase changerait de sortie) ; `queueable` la lit pour
+  `routes::queue` ; `0011_revenue.sql` l'efface par trigger sur opt-out et
+  l'indexe ; `prospects::import` et `queue::record_queued` l'écrivent. Le
+  déplacement est une vague à lui seul : `Seller::touch` → `follow_up::sent` +
+  `schedule` sous un `AppointmentBook` évalué, `due_chase` retiré du loop et
+  du dry run avec son digest régénéré, `queueable` sur `last_contacted_at`,
+  puis une migration pour la colonne et son trigger. `sourcing` n'écrit pas
+  cette colonne (il ne relance pas).
 
 ## Vague 3 — ce qu'une entreprise paie ailleurs
 

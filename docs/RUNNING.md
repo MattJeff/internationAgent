@@ -90,7 +90,7 @@ expensive defect available in this product.
 | Inbound STOP → suppression | built | `inbound.rs::land`, and the quote is cut first |
 | Provider refusal → suppression | built | `inbound.rs::record_refusal`, gated on `permanent` |
 | Work queues | built | `outbox.rs`, `queue.rs` |
-| Chases (follow-ups) | built | `vertical.rs`, `due_chase` |
+| Chases (follow-ups) | built, twice | a turn's send: `follow_up.rs`, a calendar promise on the thread; the vertical's send: `vertical.rs`, `due_chase` on `contacts.next_follow_up_at`. Disjoint by sender, both settled by `inbound::land`; the promise is the one that survives the merge (`follow_up.rs` module docs) |
 | New turns | built | `turn.rs` |
 | Human requests | built | `/v1/capability-requests`, `/v1/approvals` |
 | Public booking page | built | `GET`/`POST /book/{domain}/{slug}` (no key; 404 unless `PUT /v1/employees/{id}/booking` opened the seat), `booking.rs`, 0083 — a promise on the stranger's thread, the reason as an untrusted message |
