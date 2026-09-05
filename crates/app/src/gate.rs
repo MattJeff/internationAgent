@@ -769,10 +769,14 @@ impl PolicyGate {
                 // deadline are all fine — the action is one the policy refuses.
                 // And refused, not burned: the approval is still pending, like
                 // the halt's refusal above.
-                Some(Lifecycle::Active) if action.trust().is_untrusted() => {
+                Some(Lifecycle::Active | Lifecycle::Draft) if action.trust().is_untrusted() => {
                     Outcome::Deny(DenyReason::UntrustedInput)
                 }
-                Some(Lifecycle::Active) => {
+                // `Draft` beside `Active` for the reason `decide` states at
+                // length: the one approval a draft seat can carry is the
+                // reconciliation its own provisioning filed, and refusing to
+                // redeem it strands the seat in `draft` forever.
+                Some(Lifecycle::Active | Lifecycle::Draft) => {
                     // The fifth thing a human decision cannot substitute for,
                     // and the only one of the five that is not about us. An
                     // approval is a bearer token filed at 09:00 and spent at
@@ -877,8 +881,26 @@ impl PolicyGate {
         // 1. Lifecycle, before anything else is read. A suspended employee
         //    must not be able to act through a permission somebody forgot to
         //    revoke.
+        //
+        //    **`Draft` passes, and that is not a hole.** This check exists to
+        //    stop a seat somebody *stopped* — suspended, terminated — from
+        //    acting through a permission nobody revoked. A draft seat has not
+        //    been stopped: it is being set up, and the only thing that can act
+        //    for one is its own provisioning. Refusing it here was a deadlock
+        //    with no way out, met on 2026-09-05: a worker died mid-call, the
+        //    engine parked the step behind `file_reconciliation`'s approval —
+        //    "check at the provider before retrying, a blind retry is how you
+        //    pay twice" — and redeeming that approval answered
+        //    `employee_not_active`. The seat becomes active only when
+        //    provisioning finishes, and provisioning could only finish if this
+        //    ran. No new seat could be created on that deployment again.
+        //
+        //    Nothing else reaches the gate as a draft seat: `initiative` claims
+        //    `lifecycle = 'active'`, `inbound::directs` and `same_team` join on
+        //    it, and a draft seat has no charter and takes no turn. What passes
+        //    here is the provisioning of a seat nobody has finished hiring.
         match self.lifecycle(tx, principal).await? {
-            Some(Lifecycle::Active) => {}
+            Some(Lifecycle::Active | Lifecycle::Draft) => {}
             Some(other) => return Ok(Outcome::NotActive(other)),
             None => return Ok(Outcome::UnknownEmployee),
         }
@@ -2692,6 +2714,42 @@ mod tests {
         assert_eq!(rows.len(), 1, "exactly one audit row");
         assert_eq!(rows[0].2[DENIED_KEY], json!("employee_not_active"));
         assert_eq!(rows[0].2["lifecycle"], json!("suspended"));
+    }
+
+    /// **The deadlock this fixes, as a test.** A seat is `draft` until its
+    /// provisioning finishes; when a worker dies mid-call the engine parks the
+    /// step behind a reconciliation approval, and redeeming it used to answer
+    /// `employee_not_active` — so the seat could never leave `draft`, and no
+    /// new seat could be hired on that deployment again. Met in production on
+    /// 2026-09-05, on the first seat created since MCP servers were connected.
+    ///
+    /// The same policy as the suspended test above: what differs is only the
+    /// lifecycle, so an allow here and a refusal there is the whole claim.
+    #[tokio::test]
+    async fn a_draft_employee_may_act_because_it_is_being_set_up_and_not_stopped() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "draft").await;
+
+        let gate = gate(&db, &principal).await;
+        gate.authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect("a draft seat is mid-hire, not stopped");
+    }
+
+    /// And the other three still are what they were: only `draft` moved.
+    #[tokio::test]
+    async fn a_terminated_employee_is_still_denied() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "terminated").await;
+
+        let err = gate(&db, &principal)
+            .await
+            .authorize(&principal, email("supplier@example.com"))
+            .await
+            .expect_err("terminated employees may not act");
+
+        assert!(matches!(err, Denied::NotActive(Lifecycle::Terminated)));
+        assert_eq!(err.code(), "employee_not_active");
     }
 
     #[tokio::test]
