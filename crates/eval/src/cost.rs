@@ -175,7 +175,7 @@ pub fn ceiling_calls_per_turn() -> f64 {
 /// ±20 %. Elles restent des mesures d'une entreprise qui n'existe plus
 /// exactement, et c'est précisément ce que ce pin sert à rendre impossible à
 /// oublier.
-pub const DIGEST: &str = "cf858d4d0b3d5f43";
+pub const DIGEST: &str = "59b3aab00d125758";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
