@@ -211,7 +211,9 @@ impl Verdict {
     /// spellings still mean [`Verdict::Unreachable`].
     pub fn from_provider_code(code: &str) -> Self {
         match code {
-            "unauthorized" | "forbidden" => Verdict::KeyRefused,
+            // `cli_not_logged_in` is the CLI path's spelling of the same
+            // thing: no credential behind the call.
+            "unauthorized" | "forbidden" | "cli_not_logged_in" => Verdict::KeyRefused,
             "not_found" => Verdict::ModelNotAccessible,
             "retryable" | "rate_limited" => Verdict::Unreachable,
             _ => Verdict::Unusable,

@@ -684,6 +684,22 @@ fn parse_stream(stdout: &str) -> Result<LlmResponse, ProviderError> {
                 code: "cli_no_result",
             })?;
 
+    // A CLI with no session does not fail: it exits 0 and prints an assistant
+    // message with `model: "<synthetic>"` whose text is `Not logged in · Please
+    // run /login`, then a result with `terminal_reason: "api_error"`. Read as
+    // content, that sentence became an employee's answer — and `probe` called
+    // the tenant connected. It is nobody's words, so it is an error, and the
+    // one thing `POST /v1/model` on the CLI path exists to catch.
+    if result["terminal_reason"] == "api_error"
+        || events
+            .iter()
+            .any(|e| e["type"] == "assistant" && e["message"]["model"] == "<synthetic>")
+    {
+        return Err(ProviderError::Terminal {
+            code: "cli_not_logged_in",
+        });
+    }
+
     let mut content = Vec::new();
     let mut turn: Option<&Value> = None;
     for message in events
@@ -937,6 +953,21 @@ mod tests {
     /// `cache_read_input_tokens` maps to [`Usage::cache_read_tokens`], and the
     /// budget counter silently stops enforcing if it does not. The numbers are
     /// from the 2026-08-26 capture, the one session in hand that read a cache.
+    /// Captured from a container whose `claude` had never run `/login`,
+    /// 2026-09-05: exit 0, an assistant message from `<synthetic>`, a result
+    /// with `is_error: true` and `terminal_reason: "api_error"`. The sentence
+    /// reached a founder as the employee's own answer.
+    #[test]
+    fn a_cli_with_no_session_is_an_error_and_not_a_reply() {
+        let stream = r#"{"type":"system","subtype":"init","apiKeySource":"none","model":"claude-opus-5"}
+{"type":"assistant","message":{"id":"29817993","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"Not logged in · Please run /login"}]}}
+{"type":"result","is_error":true,"stop_reason":"stop_sequence","terminal_reason":"api_error","subtype":"success","result":"Not logged in · Please run /login"}"#;
+        match parse_stream(stream) {
+            Err(ProviderError::Terminal { code }) => assert_eq!(code, "cli_not_logged_in"),
+            other => panic!("a synthetic message is not a reply: {other:?}"),
+        }
+    }
+
     #[test]
     fn the_cache_read_count_reaches_the_budget() {
         let stream = r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":"OK","usage":{"input_tokens":2,"output_tokens":4,"cache_creation_input_tokens":10348,"cache_read_input_tokens":18736}}"#;
