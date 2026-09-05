@@ -59,11 +59,6 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
 
 ### Coutures laissées par la vague 2, à reprendre
 
-- `Effects::send_invoice` existe et **aucun tour ne le propose** : c'est une
-  treizième ligne de catalogue, donc ~1,4k tokens par appel et une re-mesure
-  de plus. À décider avec le re-pin du digest, pas avant.
-- `POST /v1/invoices/{id}/paid` (encaissement déclaré à la main) n'écrit pas
-  de ligne d'audit ; le chemin Stripe écrit `invoice_paid`. Asymétrie, petite.
 - `crates/domain/src/forecast.rs::rate_card` contient des prix par modèle
   codés en dur, alors que `billing`, `usage` et `pnl` refusent tout prix dans
   le dépôt. E fait primer le tarif déclaré ; supprimer `rate_card` est une
@@ -71,8 +66,6 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
 - Un envoi fait par `Seller::touch` (vertical) ou `sourcing` n'est pas relancé
   par G : ces chemins ont leur propre espacement (`contacts.next_follow_up_at`).
   Deux mécanismes pour une même idée ; en garder un.
-- Le webhook Stripe ne lit que `checkout.session.completed` ; `invoice.paid`
-  et `payment_intent.succeeded` ne paient rien.
 
 ## Vague 3 — ce qu'une entreprise paie ailleurs
 
@@ -83,6 +76,19 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
 - [ ] **K. Un écran « caps + bouton d'arrêt »** : `max_turns_per_day`,
       `max_new_contacts_per_day`, plafonds de dépense, `/v1/halt` — au même
       endroit que le P&L.
+
+### Coutures laissées par la vague 3, à reprendre
+
+- Une réservation publique réveille le siège avec le sujet masqué, mais le
+  motif du tiers n'est pas dans le brief du réveil (`follow_up::brief` rend
+  `None` sur un fil sans sortant) : une ligne dans `initiative.rs`.
+- `GET /v1/controls` ne montre pas le budget d'équipe
+  (`PUT /v1/teams/{team_id}/budget`) — un plafond de plus quand quelqu'un le
+  demande.
+- `send_invoice` est `Risk::Low`, comme l'`EmailSend` qu'il est : un tour
+  taché le voit, et l'adresse est relue en base, donc un texte étranger ne
+  peut qu'envoyer une facture émise à son propre client. Si le fondateur
+  veut High, c'est une ligne et un test inversé.
 
 ## Ce qu'on ne fait pas, et pourquoi
 
