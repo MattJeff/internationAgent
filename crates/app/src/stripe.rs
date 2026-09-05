@@ -17,17 +17,25 @@
 //! nothing. That is the whole of the cross-tenant argument, and
 //! `tenant_b_cannot_settle_tenant_a_s_invoice` is the test.
 //!
-//! # Which event, and why only one
+//! # Which events
 //!
-//! `checkout.session.completed` with `payment_status = "paid"`. A Checkout
-//! Session is the one Stripe object a company can create with a plain link,
-//! attach `metadata.invoice_number` to, and hand a customer — no Stripe
-//! invoice, no customer object, no subscription. Its `amount_total` and
-//! `currency` are the figures to compare against ours. `invoice.paid` is
-//! Stripe's *own* invoicing product, which this register replaces;
-//! `payment_intent.succeeded` fires for every Checkout too but carries the
-//! session's metadata only if somebody copied it there. One event, one field
-//! ([`INVOICE_NUMBER_KEY`]), documented in `docs/RUNNING.md`.
+//! Three, one per Stripe object a company might take money through, and the
+//! same demand of each: `metadata.invoice_number` names our invoice, the
+//! object says it is paid, and its amount and currency equal the demand.
+//! [`FORMS`] is the table — where the paid flag and the amount live in each
+//! object; the currency and the metadata sit at the same place in all three.
+//! One read, three shapes, not three copies of the read.
+//!
+//! `checkout.session.completed` is the first and the one to prefer: a Checkout
+//! Session is the object a company creates with a plain link, attaches the
+//! metadata to, and hands a customer. `invoice.paid` is Stripe's own invoicing
+//! product — a company that already bills there and mirrors the numbers in
+//! this register gets settled too. `payment_intent.succeeded` is the intent
+//! under either, and carries the metadata only if somebody put it there; when
+//! they did, it is the same fact. A delivery of one form for a payment already
+//! settled by another collapses on `declare_paid`'s `WHERE`, like a replay.
+//! One field ([`INVOICE_NUMBER_KEY`]) in every case, documented in
+//! `docs/RUNNING.md`.
 //!
 //! # The figure is compared, and a mismatch pays nothing
 //!
@@ -70,8 +78,30 @@ pub const STRIPE_SIGNATURE_HEADER: &str = "stripe-signature";
 /// How old a signed timestamp may be. Stripe's own default.
 pub const TOLERANCE_SECS: i64 = 300;
 
-/// The event this reader acts on.
+/// The first of the three events this reader acts on, and the one a plain
+/// payment link produces. See [`FORMS`].
 pub const PAID_EVENT: &str = "checkout.session.completed";
+
+/// The three shapes a settlement arrives in, and where each keeps what we
+/// compare. Read as `(event type, the field that says it is paid, the value
+/// that field must hold, the field that holds the amount in minor units)`;
+/// `currency` and `metadata` are at the top of `data.object` in all three.
+///
+/// | event                       | paid when                     | amount            |
+/// |-----------------------------|-------------------------------|-------------------|
+/// | `checkout.session.completed`| `payment_status == "paid"`    | `amount_total`    |
+/// | `invoice.paid`              | `status == "paid"`            | `amount_paid`     |
+/// | `payment_intent.succeeded`  | `status == "succeeded"`       | `amount_received` |
+pub const FORMS: [(&str, &str, &str, &str); 3] = [
+    (PAID_EVENT, "payment_status", "paid", "amount_total"),
+    ("invoice.paid", "status", "paid", "amount_paid"),
+    (
+        "payment_intent.succeeded",
+        "status",
+        "succeeded",
+        "amount_received",
+    ),
+];
 
 /// The metadata key a Checkout Session carries to name our invoice, as a
 /// decimal string: `metadata: { invoice_number: "42" }`.
@@ -183,14 +213,17 @@ pub async fn record_stripe_payment(
         .map_err(|_| InboundError::BadNotice("this Stripe delivery is not JSON"))?;
 
     // Third-party text, compared against constants and never rendered.
-    if payload.get("type").and_then(Value::as_str) != Some(PAID_EVENT) {
+    let event = payload.get("type").and_then(Value::as_str);
+    let Some((event, paid_field, paid_value, amount_field)) =
+        FORMS.into_iter().find(|(form, ..)| Some(*form) == event)
+    else {
+        return Ok(Settlement::NotOurs);
+    };
+    let object = &payload["data"]["object"];
+    if object.get(paid_field).and_then(Value::as_str) != Some(paid_value) {
         return Ok(Settlement::NotOurs);
     }
-    let session = &payload["data"]["object"];
-    if session.get("payment_status").and_then(Value::as_str) != Some("paid") {
-        return Ok(Settlement::NotOurs);
-    }
-    let Some(number) = session["metadata"]
+    let Some(number) = object["metadata"]
         .get(INVOICE_NUMBER_KEY)
         .and_then(Value::as_str)
         .and_then(|raw| raw.trim().parse::<i64>().ok())
@@ -201,8 +234,8 @@ pub async fn record_stripe_payment(
         return Ok(Settlement::NotOurs);
     };
 
-    let paid_minor = session.get("amount_total").and_then(Value::as_i64);
-    let paid_currency = session
+    let paid_minor = object.get(amount_field).and_then(Value::as_i64);
+    let paid_currency = object
         .get("currency")
         .and_then(Value::as_str)
         .unwrap_or_default();
@@ -215,7 +248,12 @@ pub async fn record_stripe_payment(
     row.payload = json!({
         "invoice_id": invoice.id.to_string(),
         "number": invoice.number,
+        // `source` is what tells this row from an operator's — see
+        // `routes::invoices::paid`, which writes the same kind with
+        // `"operator"` and no event.
+        "source": "stripe",
         "stripe_event_id": event_id,
+        "stripe_event": event,
         "expected_minor": invoice.amount.minor(),
         "currency": invoice.amount.currency().code(),
         "paid_minor": paid_minor,
@@ -249,6 +287,23 @@ mod tests {
     fn body(number: &str, amount: i64, currency: &str) -> Vec<u8> {
         format!(
             r#"{{"id":"evt_1","type":"checkout.session.completed","data":{{"object":{{"payment_status":"paid","amount_total":{amount},"currency":"{currency}","metadata":{{"invoice_number":"{number}"}}}}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// The other two forms, in each object's own field names — a Stripe
+    /// invoice says `status`/`amount_paid`, a payment intent
+    /// `status`/`amount_received`.
+    fn stripe_invoice_body(number: &str, amount: i64, currency: &str) -> Vec<u8> {
+        format!(
+            r#"{{"id":"evt_2","type":"invoice.paid","data":{{"object":{{"status":"paid","amount_paid":{amount},"amount_due":{amount},"currency":"{currency}","metadata":{{"invoice_number":"{number}"}}}}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn payment_intent_body(number: &str, amount: i64, currency: &str) -> Vec<u8> {
+        format!(
+            r#"{{"id":"evt_3","type":"payment_intent.succeeded","data":{{"object":{{"status":"succeeded","amount":{amount},"amount_received":{amount},"currency":"{currency}","metadata":{{"invoice_number":"{number}"}}}}}}}}"#
         )
         .into_bytes()
     }
@@ -439,7 +494,66 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "invoice_paid");
         assert_eq!(rows[0].1["stripe_event_id"], json!("evt_1"));
+        assert_eq!(rows[0].1["stripe_event"], json!(PAID_EVENT));
+        assert_eq!(rows[0].1["source"], json!("stripe"));
         assert_eq!(rows[0].1["number"], json!(invoice.number));
+    }
+
+    /// The second form: Stripe's own invoice, `status`/`amount_paid`.
+    #[tokio::test]
+    async fn a_paid_stripe_invoice_naming_the_number_settles_it() {
+        let Some(db) = db().await else { return };
+        let (tenant, invoice) = invoiced_tenant(&db).await;
+        let number = invoice.number.to_string();
+
+        assert_eq!(
+            settle(&db, tenant, &stripe_invoice_body(&number, 100_000, "eur")).await,
+            Settlement::Mismatch(invoice.id),
+            "the same figure rule applies to this form"
+        );
+        assert_eq!(
+            settle(&db, tenant, &stripe_invoice_body(&number, 120_000, "eur")).await,
+            Settlement::Paid(invoice.id)
+        );
+        assert!(paid_at(&db, tenant, invoice.id).await.is_some());
+        let rows = trail(&db, tenant).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "invoice_paid");
+        assert_eq!(rows[1].1["stripe_event"], json!("invoice.paid"));
+        assert_eq!(rows[1].1["paid_minor"], json!(120_000));
+    }
+
+    /// The third form: the intent, `status == succeeded`/`amount_received`.
+    /// An intent still `processing` is not money.
+    #[tokio::test]
+    async fn a_succeeded_payment_intent_naming_the_number_settles_it() {
+        let Some(db) = db().await else { return };
+        let (tenant, invoice) = invoiced_tenant(&db).await;
+        let number = invoice.number.to_string();
+
+        let processing = String::from_utf8(payment_intent_body(&number, 120_000, "eur"))
+            .expect("utf-8")
+            .replace(r#""status":"succeeded""#, r#""status":"processing""#);
+        assert_eq!(
+            settle(&db, tenant, processing.as_bytes()).await,
+            Settlement::NotOurs
+        );
+        assert_eq!(
+            settle(&db, tenant, &payment_intent_body(&number, 120_000, "eur")).await,
+            Settlement::Paid(invoice.id)
+        );
+        assert!(paid_at(&db, tenant, invoice.id).await.is_some());
+        let rows = trail(&db, tenant).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["stripe_event"], json!("payment_intent.succeeded"));
+
+        // The intent under a Checkout already settled by its session is the
+        // same money twice: the register does not move again.
+        assert_eq!(
+            settle(&db, tenant, &body(&number, 120_000, "eur")).await,
+            Settlement::AlreadySettled(invoice.id)
+        );
+        assert_eq!(trail(&db, tenant).await.len(), 1);
     }
 
     #[tokio::test]
@@ -502,9 +616,11 @@ mod tests {
             settle(&db, tenant, unpaid.as_bytes()).await,
             Settlement::NotOurs
         );
+        // An event outside `FORMS`, with every field a paid session would
+        // carry: nothing happens and nothing breaks.
         let other = String::from_utf8(body(&number, 120_000, "eur"))
             .expect("utf-8")
-            .replace("checkout.session.completed", "payment_intent.succeeded");
+            .replace("checkout.session.completed", "charge.refunded");
         assert_eq!(
             settle(&db, tenant, other.as_bytes()).await,
             Settlement::NotOurs

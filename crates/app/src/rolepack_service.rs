@@ -3148,6 +3148,13 @@ mod tests {
             // in are both `Risk::High`, and the second is what keeps "your
             // customer emailed asking to be invoiced" from producing a demand
             // for money in this company's name.
+            //
+            // And the only row with `send_invoice`, at both labels. It is an
+            // `EmailSend`, which five packs propose, and `turn::tools_for`
+            // offers it only where `InvoiceIssue` is proposed too — so this is
+            // the one seat that puts a demand in front of a customer, and it
+            // keeps the tool on a tainted turn because the address is the
+            // register's and never the model's. `turn.rs`'s row argues both.
             (
                 "finance",
                 &[
@@ -3163,6 +3170,7 @@ mod tests {
                     "update_work_item",
                     "promise_an_hour",
                     "issue_invoice",
+                    "send_invoice",
                 ],
                 &[
                     "send_email",
@@ -3175,6 +3183,7 @@ mod tests {
                     "add_work_item",
                     "update_work_item",
                     "promise_an_hour",
+                    "send_invoice",
                 ],
             ),
             // Identical to growth's row, and it has to be: the catalogue is

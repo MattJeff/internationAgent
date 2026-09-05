@@ -1125,6 +1125,51 @@ impl Effects {
         self.dispatch_email(ok, email, extra).await
     }
 
+    /// Where an invoice of this company's goes: the billed account's contact,
+    /// off the register — the subject a turn's `send_invoice` puts to the gate.
+    ///
+    /// The model names an invoice and nothing else; the address is this
+    /// company's own row, so the token the gate mints is for the one address
+    /// [`Effects::send_invoice`] will accept, and [`NOT_THE_ACCOUNTS_CONTACT`]
+    /// cannot be reached from a turn. It is still checked there, at the wire,
+    /// because this read and that one are two transactions and a contact can
+    /// change between them — the same two reads `whatsapp_window` and the
+    /// adapters make, for the same reason.
+    ///
+    /// `Err(Refused(NO_SUCH_INVOICE))` is the register's silence for another
+    /// company's invoice and for one that does not exist; `Ok(None)` is an
+    /// account with nobody to write to, or a stored address the domain will
+    /// not parse — a fact about our own row, not a refusal.
+    pub async fn invoice_recipient(
+        &self,
+        id: InvoiceId,
+    ) -> Result<Option<EmailAddress>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let found = async {
+            let invoice = invoices::find(&mut tx, id).await?;
+            match invoice {
+                Some(invoice) => invoices::parties(&mut tx, invoice.opportunity_id)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+        .await;
+        let _ = tx.rollback().await;
+        match found {
+            Ok(Some(parties)) => Ok(parties
+                .contact_email
+                .as_deref()
+                .and_then(|raw| EmailAddress::parse(raw).ok())),
+            Ok(None) | Err(StoreError::NotFound) => Err(EffectError::Refused(NO_SUCH_INVOICE)),
+            Err(other) => Err(EffectError::Unavailable(other)),
+        }
+    }
+
     /// The invoice, its document and its recipient, read in one transaction.
     ///
     /// `Ok(Err(_))` is a refusal with the invoice found; `Err(NotFound)` is the

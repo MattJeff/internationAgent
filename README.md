@@ -235,7 +235,10 @@ a convention.
 
 Three of the five are reachable from a turn today — the board, the calendar,
 and the register through `issue_invoice`, which only the finance pack proposes
-and which a turn that has read anything from outside is never shown. The desk
+and which a turn that has read anything from outside is never shown, and
+`send_invoice`, which puts the filed PDF in front of the billed account's
+contact of record — an address read from the register, never one the model
+wrote — and which the same one pack is offered. The desk
 needed no verb of its own, and the file store is built and deliberately out of
 reach: a catalogue row costs input tokens on **every** model call whether
 anybody uses it or not, so each verb has to argue for its rent.
