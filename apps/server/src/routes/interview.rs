@@ -781,14 +781,19 @@ async fn answer(
     let questions_task = match (rewriting, answering) {
         (Some(key), _) => format!(
             "The value they are changing — this once, give `{key}` its new value even though \
-             it is already set, and only that key:\n\n- `{key}`, currently {}\n\nThe open \
-             questions, for context — fill one only if the answer plainly says so:\n\n- {}",
+             it is already set, and only that key. They typed their answer into the field \
+             for `{key}`, so it is the new value unless it is plainly about something \
+             else:\n\n- `{key}`, currently {}\n\nThe open questions, for context — fill \
+             one only if the answer plainly says so:\n\n- {}",
             base[key],
             asked.join("\n- "),
         ),
         (None, Some(question)) => format!(
-            "The question they were answering:\n\n- {}\n\nThe other open questions, for \
-             context — fill one only if the answer plainly says so:\n\n- {}",
+            "The question they were answering — they typed their answer into the field for \
+             this question, so it is the answer to it unless it is plainly about something \
+             else; a short answer (\"month\", \"EUR\", one name) is still an \
+             answer:\n\n- {}\n\nThe other open questions, for context — fill one only if \
+             the answer plainly says so:\n\n- {}",
             question.ask,
             asked.join("\n- "),
         ),
@@ -890,6 +895,15 @@ async fn answer(
     // did not answer the question. Nothing was refused, so without this line
     // the founder would read "nothing was written" and no reason.
     if built.is_none() && refused.is_empty() {
+        // The founder retries and the diary says nothing; this is the one
+        // place the reply itself is worth a debug line, and truncated.
+        tracing::debug!(
+            %id,
+            role,
+            question = ?body.question,
+            reply = %finished.reply.chars().take(300).collect::<String>(),
+            "the interview's proposal was empty"
+        );
         refused.push(Refusal {
             field: String::new(),
             why: "the employee found nothing in that answer that fits the question, so it \
