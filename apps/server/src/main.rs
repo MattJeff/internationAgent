@@ -654,6 +654,9 @@ fn app(
             // answer — *when*. Before it, nothing in this product could name an
             // hour.
             .merge(routes::calendar::router(db.clone()))
+            // The switch that opens a seat's public booking page. Beside the
+            // calendar it writes into; the page itself is on the tier below.
+            .merge(routes::booking::router(db.clone()))
             // The one the others were workarounds for: *say something*. `work`
             // and `calendar` put a sentence in front of an employee and neither
             // can be replied to; `approvals` below is a button. This is a
@@ -806,6 +809,10 @@ fn app(
     // `routes::mcp::public_router` is where that argument lives.
     .merge(routes::mcp::public_router(mcp_state))
     .merge(routes::well_known::router(db.clone()))
+    // La page de réservation : un prospect n'a pas de clé. Une lecture par
+    // `(domain, slug)` qui répond 404 à tout siège qui n'a pas ouvert, et un
+    // formulaire borné — `routes::booking` porte l'argument.
+    .merge(routes::booking::public_router(db.clone()))
     // Sans credential, et délibérément pas derrière `platform/*`: cet étage-là
     // protège l'émission de clés, c'est-à-dire un pouvoir, et ceci est une
     // lecture agrégée d'un consentement déjà donné. Le module dit pourquoi

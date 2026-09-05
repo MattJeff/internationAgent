@@ -7,6 +7,9 @@ pub mod autonomy;
 // wave M: what we may charge for — seats and connectors, by the day, derived
 // from the trail. The counter, deliberately not the collection.
 pub mod billing;
+// la page de réservation: a stranger picks an hour on a seat that opened its
+// door, and the seat is woken by it. Public pair + one private switch.
+pub mod booking;
 // le calendrier: the founder promises a moment and sees what has been promised.
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;

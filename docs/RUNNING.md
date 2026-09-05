@@ -93,6 +93,7 @@ expensive defect available in this product.
 | Chases (follow-ups) | built | `vertical.rs`, `due_chase` |
 | New turns | built | `turn.rs` |
 | Human requests | built | `/v1/capability-requests`, `/v1/approvals` |
+| Public booking page | built | `GET`/`POST /book/{domain}/{slug}` (no key; 404 unless `PUT /v1/employees/{id}/booking` opened the seat), `booking.rs`, 0083 — a promise on the stranger's thread, the reason as an untrusted message |
 | Emergency halt | built | `/v1/halt`, `halt.rs` |
 | Caps and the stop button, one read | built | `GET /v1/controls`, `controls.rs` — per seat the effective `max_turns_per_day`, `max_new_contacts_per_day`, channels, spend limits and caps with today's consumption, the layer that set each, `acts_on_its_own`; the halt with `stop: POST /v1/halt`; the window; the route that moves each limit |
 | What the gate refused | built | `/v1/refusals`, `refusals.rs` — one audit read, no table |
