@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use agentos_app::brief::INBOUND_BRIEF;
 use agentos_app::effects::{Effects, Ports};
-use agentos_app::gate::{PolicyGate, Principal as ActingAs};
+use agentos_app::gate::{PolicyGate, Principal as ActingAs, TaintOrigin};
 use agentos_app::inbound::{
     self, Errand, Recorded, Secret, TelephonyLanding, Thread, record_raw_email_delivery,
 };
@@ -2050,9 +2050,11 @@ impl Agent {
                         &knowledge::Recall::new(&inbound, Some(employee_id)),
                     )
                     .await;
-                    recalled.into_context(
-                        context.with_untrusted(&inbound, &format!("message-{message_id}")),
-                    )
+                    recalled.into_context(context.with_untrusted_from(
+                        &inbound,
+                        &format!("message-{message_id}"),
+                        TaintOrigin::message(&channel, &sender),
+                    ))
                 }
             };
 

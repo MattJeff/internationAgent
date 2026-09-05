@@ -40,9 +40,6 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
 
 ### Coutures laissées par la vague 1, à reprendre
 
-- `GET /v1/refusals.recent[].source` est vide : `gate::audit_event` n'écrit ni
-  label de confiance, ni canal, ni expéditeur, ni hôte. Le jour où `turn.rs`
-  les pose dans le payload, la route se remplit sans changer.
 - Le brief finance n'imprime pas les opportunités `closed_won` ; un tour
   finance ne peut facturer qu'un deal qu'un collègue lui a nommé.
 

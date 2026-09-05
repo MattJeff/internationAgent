@@ -729,7 +729,11 @@ impl Recalled {
             // frame flattens and defuses it anyway, because a source id that
             // could carry a newline could forge a marker line.
             let source = format!("knowledge:{}#{}", hit.source_id, hit.ordinal);
-            context = context.with_untrusted(&hit.content, &source);
+            context = context.with_untrusted_from(
+                &hit.content,
+                &source,
+                crate::gate::TaintOrigin::channel("knowledge", None),
+            );
         }
         context
     }

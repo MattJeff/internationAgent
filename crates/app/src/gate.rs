@@ -276,6 +276,100 @@ impl Authorizable for Untrusted<Action> {
     }
 }
 
+/// Where the text that tainted a turn came from — **never the text itself**.
+///
+/// A refusal row that says `untrusted_input` tells an operator the turn was
+/// tainted and nothing about by whom. This is the "by whom": the channel, the
+/// masked sender ([`crate::inbound::masked_contact`]) or the host of a page.
+/// Not the subject, not the body, not an excerpt — `Untrusted<String>` has no
+/// `Display`, and nothing here takes one, so a source cannot carry the
+/// injection it is describing into `GET /v1/refusals`.
+///
+/// Built by `turn.rs` at the moment the label flips and handed to
+/// [`PolicyGate::authorize_from`] with the action. When several sources taint
+/// one turn the first is kept and `count` says how many there were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintOrigin {
+    /// `email`, `sms`, `web`, `a2a`, `knowledge`, `mcp`, `internal`…
+    pub channel: String,
+    /// The sender, masked. Absent for a page or a document.
+    pub from: Option<String>,
+    /// The host of a page read, or the MCP server. Absent for a message.
+    pub host: Option<String>,
+    /// How many untrusted sources reached this turn, this one included.
+    pub count: u32,
+}
+
+impl TaintOrigin {
+    /// A message from outside: the channel it came on and who sent it. The
+    /// sender is masked here, on the way in, so no caller has to remember.
+    pub fn message(channel: &str, sender: &str) -> Self {
+        Self {
+            channel: channel.to_owned(),
+            from: Some(crate::inbound::masked_contact(sender)),
+            host: None,
+            count: 1,
+        }
+    }
+
+    /// A page read by the employee's browser.
+    pub fn page(host: &str) -> Self {
+        Self {
+            channel: "web".to_owned(),
+            from: None,
+            host: Some(host.to_owned()),
+            count: 1,
+        }
+    }
+
+    /// A source with a channel and nothing else worth naming: a recalled
+    /// document, an MCP server's answer.
+    pub fn channel(channel: &str, host: Option<&str>) -> Self {
+        Self {
+            channel: channel.to_owned(),
+            from: None,
+            host: host.map(str::to_owned),
+            count: 1,
+        }
+    }
+
+    /// Record one more source on a turn: the first named one stays, the
+    /// count grows. One function so `Context` and the run loop cannot fold
+    /// differently.
+    pub fn record(slot: &mut Option<Self>, next: Option<Self>) {
+        match (slot.as_mut(), next) {
+            (Some(first), _) => first.count = first.count.saturating_add(1),
+            (None, next) => *slot = next,
+        }
+    }
+
+    /// The payload keys `routes::refusals` reads — spelled there, so the
+    /// route did not have to change when this started being written.
+    fn write(&self, payload: &mut Map<String, Value>) {
+        payload.insert("channel".to_owned(), json!(self.channel));
+        if let Some(from) = &self.from {
+            payload.insert("from".to_owned(), json!(from));
+        }
+        if let Some(host) = &self.host {
+            payload.insert("host".to_owned(), json!(host));
+        }
+        payload.insert("taint_sources".to_owned(), json!(self.count));
+    }
+}
+
+/// The trust keys on a ruling's audit row: `trust_label` whenever the action
+/// came from untrusted text, plus the origin when the caller knows it. A
+/// trusted action writes nothing, so `source` on `/v1/refusals` means
+/// "tainted" and never "here is every row".
+fn provenance(payload: &mut Map<String, Value>, trust: TrustLabel, origin: Option<&TaintOrigin>) {
+    if trust.is_untrusted() {
+        payload.insert("trust_label".to_owned(), json!(trust));
+    }
+    if let Some(origin) = origin {
+        origin.write(payload);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Principal
 // ---------------------------------------------------------------------------
@@ -518,6 +612,22 @@ impl PolicyGate {
         principal: &Principal,
         action: A,
     ) -> Result<Authorized<A>, Denied> {
+        self.authorize_from(principal, action, None).await
+    }
+
+    /// [`Self::authorize`], told where the taint came from.
+    ///
+    /// The origin changes no verdict — the label on the type does that — it
+    /// is written on the audit row so a refusal can say *an email from
+    /// `a…@supplier.example` asked for this* rather than only *the text was
+    /// tainted*. `None` when the caller does not know, which is every caller
+    /// but the turn loop.
+    pub async fn authorize_from<A: Authorizable>(
+        &self,
+        principal: &Principal,
+        action: A,
+        origin: Option<&TaintOrigin>,
+    ) -> Result<Authorized<A>, Denied> {
         let now = Utc::now();
         let subject = action.to_action();
         let mut tx = self
@@ -534,7 +644,9 @@ impl PolicyGate {
             .decide(&mut tx, principal, &subject, action.trust(), now)
             .await?;
 
-        self.finish(tx, principal, &subject, action, outcome, now, Map::new())
+        let mut extra = Map::new();
+        provenance(&mut extra, action.trust(), origin);
+        self.finish(tx, principal, &subject, action, outcome, now, extra)
             .await
     }
 
@@ -608,6 +720,7 @@ impl PolicyGate {
             "approval_id".to_owned(),
             json!(approval_id.as_uuid().to_string()),
         );
+        provenance(&mut extra, action.trust(), None);
 
         // The company, before the seat and before the human's click is spent.
         //

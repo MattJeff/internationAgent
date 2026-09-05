@@ -65,12 +65,11 @@
 //! `detail` — parce qu'une route qui recopie une injection de prompt dans un
 //! tableau de bord est une route qui la fait relire à un humain.
 //!
-//! Aujourd'hui `gate::audit_event` n'écrit aucune de ces quatre clés : une ligne
-//! `untrusted_input` dit que le texte était taché, pas d'où il venait. Le champ
-//! `source` est donc absent de la plupart des entrées, et il se remplira le jour
-//! où l'appelant de la gate (`turn.rs`) posera ces clés dans le payload. Lire
-//! des clés qui n'existent pas encore est le prix d'une route qui n'a pas à
-//! changer quand l'écrivain s'améliore.
+//! La gate écrit `trust_label` dès que l'action vient d'un texte non fiable, et
+//! les trois autres quand l'appelant lui a dit d'où venait la tache
+//! (`gate::TaintOrigin`, posé par `turn.rs` au moment où le label bascule :
+//! message entrant, page lue, document rappelé). Un refus d'un tour propre ne
+//! porte donc aucune de ces clés, et `source` est absent de son entrée.
 //!
 //! # Le locataire
 //!
@@ -414,7 +413,7 @@ async fn get(
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::gate::{Denied, PolicyGate, Principal as GatePrincipal};
+    use agentos_app::gate::{Denied, PolicyGate, Principal as GatePrincipal, TaintOrigin};
     use agentos_domain::action::{Action, Channel, E164, EmailAddress};
     use agentos_domain::ids::{EmployeeId, TenantId};
     use agentos_domain::policy::{DenyReason, PolicyLimits};
@@ -614,6 +613,19 @@ mod tests {
             .await
             .expect_err("a contract from untrusted text is refused");
         assert_eq!(err.code(), DenyReason::UntrustedInput.code());
+        // The same refusal, from a turn that knew who tainted it: the origin
+        // is what `turn.rs` hands the gate, and the sender is masked on the
+        // way in.
+        let err = h
+            .gate
+            .authorize_from(
+                &as_lena,
+                Untrusted::new(contract()),
+                Some(&TaintOrigin::message("email", "alice@supplier.example")),
+            )
+            .await
+            .expect_err("a contract from an untrusted email is refused");
+        assert_eq!(err.code(), DenyReason::UntrustedInput.code());
         match h
             .gate
             .authorize(&GatePrincipal::employee(h.a, mo), email())
@@ -642,13 +654,13 @@ mod tests {
 
         let (status, body) = h.refusals("/v1/refusals?days=7", SECRET_A).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["total"], 3, "{body}");
+        assert_eq!(body["total"], 4, "{body}");
 
         assert_eq!(
             count_of(&body, "by_reason", "reason", "channel_not_allowed"),
             1
         );
-        assert_eq!(count_of(&body, "by_reason", "reason", "untrusted_input"), 1);
+        assert_eq!(count_of(&body, "by_reason", "reason", "untrusted_input"), 2);
         assert_eq!(
             count_of(&body, "by_reason", "reason", "employee_not_active"),
             1
@@ -661,14 +673,14 @@ mod tests {
         );
         assert_eq!(
             count_of(&body, "by_action_kind", "action_kind", "contract_sign"),
-            1
+            2
         );
         assert_eq!(
             count_of(&body, "by_action_kind", "action_kind", "email_send"),
             1
         );
 
-        assert_eq!(count_of(&body, "by_employee", "slug", "lena"), 2);
+        assert_eq!(count_of(&body, "by_employee", "slug", "lena"), 3);
         assert_eq!(count_of(&body, "by_employee", "slug", "mo"), 1);
         assert_eq!(
             body["by_employee"][0]["slug"], "lena",
@@ -677,24 +689,44 @@ mod tests {
         assert_eq!(body["by_employee"][0]["display_name"], "lena");
 
         let recent = body["recent"].as_array().expect("recent");
-        assert_eq!(recent.len(), 3, "{body}");
+        assert_eq!(recent.len(), 4, "{body}");
         // Le plus récent d'abord : le siège suspendu est le dernier refus.
         assert_eq!(recent[0]["employee"]["slug"], "mo");
         assert_eq!(recent[0]["reason"], "employee_not_active");
         assert_eq!(recent[0]["action_kind"], "email_send");
         assert_eq!(recent[1]["reason"], "untrusted_input");
-        assert_eq!(recent[2]["reason"], "channel_not_allowed");
+        assert_eq!(recent[2]["reason"], "untrusted_input");
+        assert_eq!(recent[3]["reason"], "channel_not_allowed");
         for entry in recent {
             assert!(entry["at"].is_string(), "{entry}");
-            assert!(
-                entry.get("source").is_none(),
-                "the gate writes no source today; a source that appears from nowhere is a leak: {entry}"
-            );
         }
-        // Le texte d'un payload ne sort pas, et le destinataire non plus.
+        // La source, telle que la gate l'écrit : le refus d'un tour qui savait
+        // d'où venait sa tache porte le canal et l'expéditeur masqué ; celui
+        // d'un `Untrusted<Action>` sans origine ne porte que le label ; un
+        // refus d'un tour propre n'en porte aucune — une source venue de nulle
+        // part serait une fuite.
+        assert_eq!(
+            recent[1]["source"],
+            json!({
+                "trust_label": "untrusted",
+                "channel": "email",
+                "sender": "a…@supplier.example",
+            }),
+            "{body}"
+        );
+        assert_eq!(
+            recent[2]["source"],
+            json!({ "trust_label": "untrusted" }),
+            "{body}"
+        );
+        assert!(recent[0].get("source").is_none(), "{body}");
+        assert!(recent[3].get("source").is_none(), "{body}");
+        // Le texte d'un payload ne sort pas, ni le destinataire, ni
+        // l'expéditeur en clair.
         let rendered = body.to_string();
         assert!(!rendered.contains("prospect@example.com"), "{body}");
         assert!(!rendered.contains("supply agreement"), "{body}");
+        assert!(!rendered.contains("alice@"), "{body}");
 
         // La fenêtre est bornée comme celle de `/v1/usage`.
         for bad in ["/v1/refusals?days=0", "/v1/refusals?days=400"] {

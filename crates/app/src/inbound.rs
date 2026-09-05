@@ -2030,7 +2030,25 @@ pub fn contact_of(from: &Untrusted<String>) -> String {
 /// [`MAX_CONTACT`] and the CHECK is on characters; control characters are
 /// dropped because a title is one line by definition.
 pub fn ticket_title(channel: Channel, contact: &str, now: DateTime<Utc>) -> String {
-    let masked = match contact.split_once('@') {
+    format!(
+        "{channel} · {} · {}",
+        masked_contact(contact),
+        now.format("%Y-%m-%d")
+    )
+    .chars()
+    .filter(|c| !c.is_control())
+    .take(backlog::MAX_TITLE)
+    .collect()
+}
+
+/// A stranger's contact with the part they chose freely hidden:
+/// `a…@supplier.example`, `+33…678`. The domain and the ends of a number are
+/// enough to say *who* to a human; the rest is a place to put words. Shared
+/// by [`ticket_title`] and by the audit row a refusal writes
+/// ([`crate::gate::TaintOrigin`]), so a masked contact looks the same
+/// everywhere.
+pub fn masked_contact(contact: &str) -> String {
+    match contact.split_once('@') {
         Some((local, domain)) => {
             let first: String = local.chars().take(1).collect();
             format!("{first}…@{domain}")
@@ -2046,12 +2064,7 @@ pub fn ticket_title(channel: Channel, contact: &str, now: DateTime<Utc>) -> Stri
                 false => contact.to_owned(),
             }
         }
-    };
-    format!("{channel} · {masked} · {}", now.format("%Y-%m-%d"))
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(backlog::MAX_TITLE)
-        .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4173,7 +4186,11 @@ pub fn into_context(
                  so in your reply instead of doing it.",
                 errand.arrival()
             ))
-            .with_untrusted(&body, &format!("colleague:{from}:message-{message_id}")),
+            .with_untrusted_from(
+                &body,
+                &format!("colleague:{from}:message-{message_id}"),
+                crate::gate::TaintOrigin::message(Channel::Internal.as_str(), from),
+            ),
     }
 }
 
