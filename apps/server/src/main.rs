@@ -691,6 +691,9 @@ fn app(
             // retire. La lecture, elle, est sur l'étage sans credential — un
             // registre public derrière une clé n'en est pas un.
             .merge(routes::public_register::router(db.clone()))
+            // Le même journal, lu pour un seul locataire : ce que la gate lui
+            // a refusé, par motif, par verbe, par siège.
+            .merge(routes::refusals::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))

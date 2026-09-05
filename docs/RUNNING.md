@@ -91,6 +91,7 @@ expensive defect available in this product.
 | New turns | built | `turn.rs` |
 | Human requests | built | `/v1/capability-requests`, `/v1/approvals` |
 | Emergency halt | built | `/v1/halt`, `halt.rs` |
+| What the gate refused | built | `/v1/refusals`, `refusals.rs` — one audit read, no table |
 
 ## The gaps, stated plainly
 
