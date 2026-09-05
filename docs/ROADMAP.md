@@ -24,16 +24,27 @@ et CI vert — pas un `tests_passing: true` rapporté par un agent.
       d'audit `decision = 'deny'` par motif, par verbe, par siège, avec la
       source non fiable quand le payload la nomme. Aucune table : c'est une
       lecture de l'audit.
-- [ ] **C. `invoice_issue` et le file store atteignables depuis un tour** —
-      les lignes de catalogue écrites en commentaire dans `turn.rs` sont
-      appliquées ; `InvoiceIssue` reste haut risque donc invisible sur un tour
-      taché ; les packs qui peuvent le proposer sont nommés. Le re-pin de
-      `cost::DIGEST` et du tool-choice est fait à la main après fusion (deux
-      runs `--live`, jamais par un agent).
+- [ ] **C. `invoice_issue` atteignable depuis un tour** — la douzième ligne
+      de catalogue, écrite en commentaire dans `turn.rs`, est appliquée ;
+      `InvoiceIssue` reste haut risque donc invisible sur un tour taché ; seul
+      le pack finance le propose. **Pas de verbe file store** : `files.rs`
+      argumente qu'un tour produit du texte, pas des octets, et que le lecteur
+      du contrat est celui qui ne doit plus payer de tokens — on le garde.
+      Le re-pin de `cost::DIGEST` est fait à la main après fusion (deux runs
+      `--live`, jamais par un agent) ; tant qu'il n'est pas fait,
+      `every_correctness_check_passes` est rouge et c'est attendu.
 - [ ] **D. Un message entrant devient un ticket** — un inbound (email ou SMS)
       d'un tiers qui atterrit chez un employé ouvre un item sur le work board,
       un seul par conversation tant qu'il est ouvert. Migration 0080 si un
       lien conversation ↔ item est nécessaire.
+
+### Coutures laissées par la vague 1, à reprendre
+
+- `GET /v1/refusals.recent[].source` est vide : `gate::audit_event` n'écrit ni
+  label de confiance, ni canal, ni expéditeur, ni hôte. Le jour où `turn.rs`
+  les pose dans le payload, la route se remplit sans changer.
+- Le brief finance n'imprime pas les opportunités `closed_won` ; un tour
+  finance ne peut facturer qu'un deal qu'un collègue lui a nommé.
 
 ## Vague 2 — la boucle argent se ferme sans rail de paiement
 
