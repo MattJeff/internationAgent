@@ -68,8 +68,9 @@ pub enum ModelPath {
     /// The tenant pasted an Anthropic API key. **Their key pays**, which is the
     /// whole commercial promise, so this is the path production is about.
     ApiKey,
-    /// The tenant runs the model from the host this deployment sits on — the
-    /// local `claude` CLI, logged in as them.
+    /// The tenant runs the model through the local `claude` CLI — under their
+    /// own subscription when they pasted a `claude setup-token` (sealed on the
+    /// row, `0084`), or logged in as them on the host when they did not.
     ///
     /// See [`ModelPath::is_host`]: this path spends *whatever the host has*, so
     /// a deployment whose own backend is an API key we pay for must refuse it.

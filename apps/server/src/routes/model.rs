@@ -134,6 +134,13 @@ pub struct ConnectRequest {
     /// line of the handler and never copied.
     #[serde(default)]
     api_key: Option<String>,
+    /// The tenant's Claude subscription, as `claude setup-token` prints it —
+    /// read on the `cli` path only, where it is optional: absent means the
+    /// host's own login, which a deployment paying with its own key refuses.
+    /// Same handling as `api_key` in every other respect: never echoed, never
+    /// logged, sealed on the row.
+    #[serde(default)]
+    oauth_token: Option<String>,
     /// Which model to prove. Defaults to [`ModelId::default`], which is what an
     /// unnarrowed fleet runs.
     ///
@@ -199,6 +206,10 @@ impl From<Outcome> for ConnectResponse {
 struct StatusResponse {
     #[serde(flatten)]
     access: ModelAccess,
+    /// Whether a credential of the tenant's own is sealed on the row: always on
+    /// `api_key`; on `cli`, a pasted subscription token rather than the host's
+    /// login. Never the credential, not even its shape.
+    own_credential: bool,
     /// Null until the tenant declares one.
     tariff: Option<Tariff>,
     cost_source: CostSource,
@@ -230,8 +241,11 @@ async fn connect(
             "usd_per_mtok_*: a rate is a finite number of dollars per million tokens, zero or more",
         ));
     }
-    let key = request
-        .api_key
+    let raw = match request.path {
+        ModelPath::ApiKey => request.api_key,
+        ModelPath::Cli => request.oauth_token,
+    };
+    let key = raw
         .map(|raw| raw.trim().to_owned())
         .filter(|raw| !raw.is_empty())
         .map(agentos_app::inbound::Secret::new);
@@ -306,13 +320,15 @@ async fn status(
     match connection {
         Some(connection) => Ok(Json(StatusResponse {
             cost_source: CostSource::of(Some(&connection)),
+            own_credential: connection.sealed_key.is_some(),
             access: connection.access,
             tariff: connection.tariff,
         })
         .into_response()),
         None => Err(ApiError::not_found().with_detail(
             "no model is connected for this tenant, so none of its employees can take a turn. \
-             POST /v1/model with an Anthropic API key, or with this host's claude CLI",
+             POST /v1/model with an Anthropic API key, with a `claude setup-token`, or with \
+             this host's claude CLI",
         )),
     }
 }
