@@ -88,8 +88,6 @@ branche n'est pas poussée.
       `max_new_contacts_per_day`, plafonds de dépense, `/v1/halt` — au même
       endroit que le P&L.
 
-### Coutures laissées par la vague 3, à reprendre
-
 ## Deux décisions prises le 2026-09-05, pour ne pas les reprendre
 
 - **`rate_card` reste.** C'est la seule façon de mettre un dollar sur la
