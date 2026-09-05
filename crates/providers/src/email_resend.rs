@@ -67,6 +67,9 @@ use serde::de::DeserializeOwned;
 /// directory is on a request path and this is not.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+
 use crate::email::{
     EmailProvider, OptOuts, OutboundEmail, ProviderMessageId, RawAttachment, RawInbound, SigError,
     WebhookHeaders, verify_signature,
@@ -413,6 +416,22 @@ impl EmailProvider for ResendEmailProvider {
                 "References": reference,
             });
         }
+        if !email.attachments.is_empty() {
+            // `POST /emails` takes `attachments: [{filename, content}]` with
+            // `content` base64 (<https://resend.com/docs/api-reference/emails/send-email>);
+            // `content_type` is optional there and sent because we know it.
+            body["attachments"] = email
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    serde_json::json!({
+                        "filename": attachment.filename,
+                        "content_type": attachment.content_type,
+                        "content": B64.encode(&attachment.content),
+                    })
+                })
+                .collect();
+        }
 
         let sent: Created = self
             .call_json(
@@ -520,14 +539,12 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as B64;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
-    use crate::email::{REPLAY_WINDOW_SECS, sign_webhook};
+    use crate::email::{OutboundAttachment, REPLAY_WINDOW_SECS, sign_webhook};
     use agentos_domain::ids::EmployeeId;
 
     const WEBHOOK_SECRET: &str = "whsec_cmVzZW5kLXRlc3Qtc2VjcmV0";
@@ -541,6 +558,9 @@ mod tests {
         domains: Vec<Value>,
         /// `Idempotency-Key` -> the id the first send under it was given.
         sent: std::collections::BTreeMap<String, String>,
+        /// The last `POST /emails` body, as JSON, so a test can read what the
+        /// adapter put on the wire.
+        last_sent: Option<Value>,
         next: u64,
         /// When set, every route answers with this status instead.
         force_status: Option<u16>,
@@ -594,6 +614,10 @@ mod tests {
 
         fn seen(&self) -> Vec<String> {
             self.state.lock().expect("not poisoned").seen.clone()
+        }
+
+        fn last_sent(&self) -> Option<Value> {
+            self.state.lock().expect("not poisoned").last_sent.clone()
         }
 
         fn domain_count(&self) -> usize {
@@ -680,6 +704,7 @@ mod tests {
             // first message's id back and nothing is sent again. Without this
             // the fake would accept an adapter that dropped the header.
             "POST /emails" => {
+                state.last_sent = serde_json::from_slice(body).ok();
                 let id = match state.sent.get(idempotency_key) {
                     Some(already) => already.clone(),
                     None => {
@@ -1063,6 +1088,7 @@ mod tests {
             subject: "PO-4471".to_owned(),
             body_text: "Attached.".to_owned(),
             in_reply_to: Some(ProviderMessageId::new("email_1")),
+            attachments: Vec::new(),
         };
         let key = IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:po-4471");
 
@@ -1109,12 +1135,53 @@ mod tests {
                     subject: "PO-1".to_owned(),
                     body_text: "hi".to_owned(),
                     in_reply_to: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
             .expect("send");
         assert_eq!(sent.as_str(), "email_sent_0001");
         assert_eq!(fake.seen(), vec!["POST /emails".to_owned()]);
+        assert!(
+            fake.last_sent()
+                .expect("a body")
+                .get("attachments")
+                .is_none(),
+            "no attachments means no field, not an empty list"
+        );
+    }
+
+    /// The bytes reach the wire base64-encoded under the field Resend reads,
+    /// with the name the recipient will see.
+    #[tokio::test]
+    async fn an_attachment_travels_as_base64_under_its_filename() {
+        let fake = FakeResend::start().await;
+        let key = IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:inv-7");
+        fake.provider()
+            .send(
+                &key,
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@customer.example".to_owned()],
+                    subject: "Invoice 7".to_owned(),
+                    body_text: "Attached.".to_owned(),
+                    in_reply_to: None,
+                    attachments: vec![OutboundAttachment {
+                        filename: "invoice-7.pdf".to_owned(),
+                        content_type: "application/pdf".to_owned(),
+                        content: b"%PDF-1.4 seven".to_vec(),
+                    }],
+                },
+            )
+            .await
+            .expect("send");
+        let body = fake.last_sent().expect("a body");
+        assert_eq!(body["attachments"][0]["filename"], "invoice-7.pdf");
+        assert_eq!(body["attachments"][0]["content_type"], "application/pdf");
+        assert_eq!(
+            body["attachments"][0]["content"],
+            B64.encode(b"%PDF-1.4 seven")
+        );
     }
 
     #[tokio::test]

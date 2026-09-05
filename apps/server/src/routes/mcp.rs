@@ -4501,10 +4501,13 @@ mod tests {
 
     /// A connector this deployment has not registered is not on the menu.
     ///
-    /// The predicate directly, because `CATALOG` has no OAuth entry to filter —
-    /// see its own docs. This is the rule that makes adding one safe: it is
-    /// invisible until an application is registered, so nobody ever clicks a
-    /// button that cannot work.
+    /// The synthetic entry first, because it can be registered under a key a
+    /// test owns. Then the real array, which is now the interesting half: the
+    /// three Google entries are `Credential::OAuth` and a deployment that has
+    /// registered nothing must not advertise any of them, while every bearer
+    /// and hosted entry beside them stays on the menu. That is the rule that
+    /// made adding them safe — an unregistered OAuth connector is invisible
+    /// rather than broken, so nobody ever clicks a button that cannot work.
     #[test]
     fn an_unregistered_oauth_connector_is_not_offered() {
         const ENDPOINTS: catalog::OAuth = catalog::OAuth {
@@ -4522,15 +4525,30 @@ mod tests {
 
         assert!(offered(&entry, &registered));
         assert!(!offered(&entry, &OauthClients::default()));
-        // A connector that needs no registration is always offered — including
-        // in a deployment that has registered nothing at all.
+        // And over the shipped array, both ways round, in a deployment that has
+        // registered nothing at all.
+        let mut filtered = 0;
         for connector in catalog::CATALOG {
-            assert!(
-                offered(connector, &OauthClients::default()),
-                "{}",
-                connector.key
-            );
+            let on_the_menu = offered(connector, &OauthClients::default());
+            if connector.credential.oauth().is_some() {
+                assert!(
+                    !on_the_menu,
+                    "{}: an OAuth entry with no client registration is a dead button",
+                    connector.key
+                );
+                filtered += 1;
+            } else {
+                assert!(
+                    on_the_menu,
+                    "{}: a connector that needs no registration is always offered",
+                    connector.key
+                );
+            }
         }
+        assert!(
+            filtered > 0,
+            "no OAuth entry in CATALOG, so the branch above proved nothing"
+        );
     }
 
     /// The route is on the tier a browser can reach, and only that one.

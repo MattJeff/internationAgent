@@ -248,7 +248,7 @@ call $API/v1/teams
 ]}
 ```
 
-## 2. Write the limits — and **changing** one is not an HTTP call
+## 2. Write the limits — and **widening** one is not an HTTP call
 
 The limits live in `policy_layers`, under the `role_name` the team points at, in
 the tenant's **active** `policy_versions` row. No endpoint on *this* surface
@@ -269,9 +269,25 @@ below.
 > place to write a limit, it is the place a company is *born*. An absent layer
 > inherits the layer above, so installing where none existed is `above ∧ new`
 > against `above ∧ above` and cannot widen any field; replacing one is not
-> intersected with what it displaces and can. So creation is a route and every
-> **edit** is still the command above, which is what the sentence in the heading
-> is protecting. See `docs/ORIZN.md`, "The whole company, in one call".
+> intersected with what it displaces and can. So creation is a route, and every
+> **widening** is still the command above — which is what the sentence in the
+> heading is protecting, and what the exception below narrows it to. See `docs/ORIZN.md`, "The whole company, in one call".
+
+> **The second exception, which is where the heading stops being literal.**
+> `PUT /v1/policy/roles/{role}` replaces a layer over HTTP — and it may only
+> **tighten**. It reads the layer that is there and refuses, `409
+> policy_widens`, anything not contained in it: every cap must be no higher,
+> every allowlist no wider, every permission no more permissive, and
+> `denied_domains` no *shorter*, because that is the one field that unions. The
+> comparison is the loader's own `intersect`, so a limit added tomorrow is
+> covered without anybody remembering this paragraph. It refuses to create — a
+> role with no layer is a `404` — so `POST /v1/companies` is still the only door
+> a first layer comes through.
+>
+> So the heading now reads: **lowering** a limit is an HTTP call, **raising** one
+> is still the command above, and the platform ceiling is still the command above
+> and nothing else. That asymmetry is the whole design: a route authorised by a
+> tenant's API key must not be able to grant its own employees anything.
 
 ```json
 {

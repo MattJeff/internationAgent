@@ -44,15 +44,29 @@
 //! balance can empty and a workspace can lose a model between the proof and the
 //! read. Somebody who wants today's answer re-posts, which costs the same
 //! fraction of a cent and proves it again.
+//!
+//! # The tariff rides on the same POST
+//!
+//! Three optional body fields — `usd_per_mtok_input`, `usd_per_mtok_output`,
+//! `usd_per_mtok_cache_read` — are the rate on the tenant's own Anthropic
+//! contract, and `migrations/0079_tenant_model_tariff.sql` is why they live on
+//! the connection row. They are stored only after the credential is proven,
+//! because every refusal on this route means "nothing was stored" and a rate
+//! filed against a key that did not work would be the first exception. A
+//! `cli` connection may carry one too: the figure `GET /v1/pnl` derives from it
+//! is then labelled `declared_tariff_on_cli_path`, because nobody meters that
+//! path against this rate. Absent from the body means untouched; present means
+//! replaced, all three at once — see `agentos_store::model_access::set_tariff`.
 
 use std::sync::Arc;
 
 use agentos_app::mcp::Credentials;
 use agentos_app::mocks::{Llm, LlmBackend};
 use agentos_app::model_access::{self, ConnectError, Outcome};
-use agentos_domain::model_access::ModelPath;
+use agentos_domain::model_access::{ModelAccess, ModelPath};
 use agentos_domain::policy::ModelId;
 use agentos_store::db::Db;
+use agentos_store::model_access::{CostSource, Tariff};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::response::{IntoResponse, Response};
@@ -128,6 +142,27 @@ pub struct ConnectRequest {
     /// this module's docs and `agentos_domain::model_access::ModelAccess::model`.
     #[serde(default)]
     model: Option<ModelId>,
+    /// The tenant's own rate, USD per million tokens, all three optional. Not
+    /// `flatten`ed: `Option<Tariff>` under `flatten` would always be `Some`,
+    /// and "absent" has to stay distinguishable from "declared nothing".
+    #[serde(default)]
+    usd_per_mtok_input: Option<f64>,
+    #[serde(default)]
+    usd_per_mtok_output: Option<f64>,
+    #[serde(default)]
+    usd_per_mtok_cache_read: Option<f64>,
+}
+
+impl ConnectRequest {
+    /// The tariff, if the body named any component of one.
+    fn tariff(&self) -> Option<Tariff> {
+        Tariff {
+            usd_per_mtok_input: self.usd_per_mtok_input,
+            usd_per_mtok_output: self.usd_per_mtok_output,
+            usd_per_mtok_cache_read: self.usd_per_mtok_cache_read,
+        }
+        .declared()
+    }
 }
 
 /// What a connection attempt answers with.
@@ -155,6 +190,20 @@ impl From<Outcome> for ConnectResponse {
     }
 }
 
+/// What `GET` answers: the proof, the declared rate, and what a cost built
+/// from that rate would be called.
+///
+/// `ModelAccess` flattened rather than nested, so the fields a client read
+/// before the tariff existed are where they were.
+#[derive(Serialize)]
+struct StatusResponse {
+    #[serde(flatten)]
+    access: ModelAccess,
+    /// Null until the tenant declares one.
+    tariff: Option<Tariff>,
+    cost_source: CostSource,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -175,6 +224,12 @@ async fn connect(
     // Trimmed and emptied here rather than deep inside `connect`, because
     // "you sent whitespace" is something the caller got wrong and belongs in a
     // 400 with a `detail`. The key itself never appears in that detail.
+    let tariff = request.tariff();
+    if tariff.is_some_and(Tariff::is_malformed) {
+        return Err(ApiError::bad_request(
+            "usd_per_mtok_*: a rate is a finite number of dollars per million tokens, zero or more",
+        ));
+    }
     let key = request
         .api_key
         .map(|raw| raw.trim().to_owned())
@@ -207,6 +262,13 @@ async fn connect(
     )
     .await
     .map_err(connect_error)?;
+
+    // Only after the proof, and in the same transaction: a refusal stores
+    // nothing, the tariff included. `set_tariff` finds the row `connect` just
+    // wrote, so `false` here would be a bug and not a state.
+    if let (Some(tariff), true) = (tariff, outcome.verdict.is_connected()) {
+        agentos_store::model_access::set_tariff(&mut tx, tariff).await?;
+    }
     tx.commit().await?;
 
     // A refused key is a 200. See the module docs: the request was well formed
@@ -242,7 +304,12 @@ async fn status(
     tx.commit().await?;
 
     match connection {
-        Some(connection) => Ok(Json(connection.access).into_response()),
+        Some(connection) => Ok(Json(StatusResponse {
+            cost_source: CostSource::of(Some(&connection)),
+            access: connection.access,
+            tariff: connection.tariff,
+        })
+        .into_response()),
         None => Err(ApiError::not_found().with_detail(
             "no model is connected for this tenant, so none of its employees can take a turn. \
              POST /v1/model with an Anthropic API key, or with this host's claude CLI",
@@ -358,6 +425,29 @@ mod tests {
         assert_eq!(cli.path, ModelPath::Cli);
         assert_eq!(cli.model, Some(ModelId::Haiku45));
         assert!(cli.api_key.is_none());
+        assert_eq!(
+            cli.tariff(),
+            None,
+            "no rate named is no tariff, not a zero one"
+        );
+
+        // A rate on the CLI path is accepted by the parser; what it is worth is
+        // `cost_source`'s business. A component left out is unknown.
+        let priced = serde_json::from_str::<ConnectRequest>(
+            r#"{"path":"cli","usd_per_mtok_input":3,"usd_per_mtok_output":15}"#,
+        )
+        .expect("parses");
+        let tariff = priced.tariff().expect("declared");
+        assert_eq!(tariff.usd_per_mtok_input, Some(3.0));
+        assert_eq!(tariff.usd_per_mtok_cache_read, None);
+        assert!(!tariff.is_complete());
+        assert!(!tariff.is_malformed());
+        assert!(
+            serde_json::from_str::<ConnectRequest>(r#"{"path":"cli","usd_per_mtok_input":-1}"#)
+                .expect("parses")
+                .tariff()
+                .is_some_and(Tariff::is_malformed)
+        );
 
         assert!(serde_json::from_str::<ConnectRequest>(r#"{"path":"bedrock"}"#).is_err());
         assert!(

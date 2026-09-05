@@ -116,6 +116,9 @@ struct ItemView {
     /// indistinguishable, and nothing else anywhere records the difference —
     /// posting is not an `Action`, so there is no audit row to cross-check.
     posted_by: Option<Uuid>,
+    /// The thread a third party's message opened it from, or null for an item
+    /// somebody typed — `migrations/0080` is where that distinction lives.
+    conversation_id: Option<Uuid>,
     closed_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
 }
@@ -128,6 +131,7 @@ impl From<backlog::Item> for ItemView {
             assignee_id: item.assignee_id.map(|e| e.as_uuid()),
             ordinal: item.ordinal,
             posted_by: item.posted_by.map(|e| e.as_uuid()),
+            conversation_id: item.conversation_id.map(|c| c.as_uuid()),
             closed_at: item.closed_at,
             created_at: item.created_at,
         }

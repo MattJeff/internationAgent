@@ -56,7 +56,13 @@ HOST=${PGHOST:-localhost}
 PORT=${PGPORT:-5442}
 USER=${PGUSER:-postgres}
 PASS=${PGPASSWORD:-postgres}
-PACKAGES=(agentos-domain agentos-providers agentos-store agentos-app agentos-server)
+# agentos-social est dans la liste depuis le 2026-09-02, et la raison mérite sa
+# ligne : ses tests lisent SOCIAL_DATABASE_URL — pas DATABASE_URL — parce que
+# le service a sa base à lui (c'est un produit vendable seul). Sans l'export
+# ci-dessous, ses dix tests base-dépendants impriment « SKIP: » et le garde 2
+# arrête tout ; avant cet export, lancé à la main sans l'env, ils skippaient
+# et le vert paraissait plus large qu'il n'était.
+PACKAGES=(agentos-domain agentos-providers agentos-store agentos-app agentos-server agentos-social)
 
 psql_admin() { PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -q "$@"; }
 
@@ -239,6 +245,7 @@ for pkg in "${PACKAGES[@]}"; do
   # `create or replace` fail with 42P16 on the second pass — an error about a
   # migration nobody edited.
   DATABASE_URL="postgres://$USER:$PASS@$HOST:$PORT/$db" \
+    SOCIAL_DATABASE_URL="postgres://$USER:$PASS@$HOST:$PORT/$db" \
     cargo test -p "$pkg" -- --nocapture 2>&1 | tee "$log"
 
   # --- guard 2: "ok" is only ok if nothing opted out ------------------------
@@ -281,12 +288,12 @@ cargo clippy --workspace --all-targets -- -D warnings \
 # it. Keeping those tests out of a default *run* is right — they want `npx`, the
 # open internet, a logged-in `claude` binary and ten minutes — but the price
 # nobody meant to pay was that `cargo` never so much as parsed them. There are
-# five `#[cfg(feature = "live-orizn")]` sites, and behind them:
-# `crates/eval/src/dryrun.rs` (2 280 lines that stand Orizn up against the real
-# model — the only end-to-end measurement of this product there is, gated at
-# `crates/eval/src/lib.rs`), the `--dry-run` arm of `crates/eval/src/main.rs`,
-# `crates/app/tests/orizn.rs`'s `mod live`, and `crates/app/src/orizn.rs`'s one
-# live test plus the `mod live` it dials through.
+# deux `#[cfg(feature = "live-orizn")]` sites, and behind them:
+# `crates/eval/src/dryrun.rs` (2 280 lines that stand a tenant up against the
+# real model — the only end-to-end measurement of this product there is, gated
+# at `crates/eval/src/lib.rs`), and the `--dry-run` arm of
+# `crates/eval/src/main.rs`. There were three more, in `agentos-app`; they
+# dialled the real Orizn MCP server and went with it.
 # `dryrun.rs` used to say so about itself, in the comment above the finance caps
 # it reads out of `docs/orizn-roles/finance.json` — that this script "compiles
 # neither `cargo test -p agentos-eval` nor `cargo clippy --all-targets` with

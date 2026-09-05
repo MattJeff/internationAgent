@@ -108,6 +108,26 @@ nothing otherwise, which on an inbound email is most of the time. Set EMBEDDER_A
 real thing — and note that documents already ingested keep the model they were embedded under, \
 so they have to be ingested again to be findable.";
 
+/// The port with no adapter, said out loud once per report.
+///
+/// Not a [`PROVIDERS`] row: those have a credential that makes them real and a
+/// mock that answers meanwhile, and this has neither — there is no
+/// `PaymentProvider` in this workspace to configure, so there is no variable to
+/// name and nothing an operator can set. That is why the status is OK rather
+/// than MISSING: MISSING means *you can fix this*, and a line that says "fix
+/// the unfixable" on every report forever is a line operators learn to skip.
+///
+/// It is here at all because the absence is now observable from outside — an
+/// approved `payment_create` answers `501 no_payment_rail` — and a diagnostic
+/// that cannot explain an error code the server actually returns is a
+/// diagnostic somebody debugs around.
+const NO_PAYMENT_RAIL_DETAIL: &str = "\
+NONE — no payment provider is bound (`NotConfigured`), and no credential binds one: this \
+workspace has not chosen a PSP, which is SPEC §13's open decision. Everything up to the money is \
+live — the gate rules, the approval queues, a human approves — and `POST /v1/approvals/{id}/\
+approve` on a payment then answers `501 no_payment_rail` and leaves the approval PENDING, so it \
+is still spendable the day a rail exists. /readyz reports the same fact as `payment_rail: false`.";
+
 /// Every migration this binary carries, so "are the migrations applied?" is
 /// answered against the build rather than against a directory listing that may
 /// not be next to the binary.
@@ -487,6 +507,10 @@ fn providers(
             report.push(adapter, status, format!("REAL — {var} is set; {detail}"));
         }
     }
+
+    // Unconditional, and independent of `blessed`: this one is not a mock and
+    // no credential moves it. See the constant.
+    report.push("payments", Status::Ok, NO_PAYMENT_RAIL_DETAIL);
 }
 
 /// A live check that costs nothing and changes nothing: one authenticated GET
@@ -917,13 +941,20 @@ mod tests {
         let report = inspect(&lookup(HashMap::new()));
 
         assert!(!report.checks.is_empty());
-        // No exemptions left. The embedder used to be one — `Status::Missing`
-        // means "the operator has to set or fix something" and there was
-        // nothing to set, so reporting it missing would have sent somebody
-        // looking for a variable that did not exist. `EMBEDDER_API_KEY` exists
-        // and selects a real client, so the embedder is now an ordinary row and
-        // an unconfigured one is ordinary MISSING.
-        for check in &report.checks {
+        // One exemption, and it is the one the rule was always about.
+        // `Status::Missing` means "the operator has to set or fix something",
+        // and `payments` has nothing to set: no `PaymentProvider` exists in
+        // this workspace and no variable binds one, so MISSING would send
+        // somebody looking for a credential that has not been invented. That
+        // is the exact argument that used to exempt the embedder — until
+        // `EMBEDDER_API_KEY` started selecting a real client, at which point it
+        // became an ordinary row and an unconfigured one ordinary MISSING. The
+        // day a PSP is chosen, `payments` makes the same move.
+        for check in report
+            .checks
+            .iter()
+            .filter(|check| check.name != "payments")
+        {
             assert_eq!(
                 check.status,
                 Status::Missing,
@@ -986,6 +1017,21 @@ mod tests {
         assert!(report.ok(), "{rendered}");
         // And the boot verdict is the one the operator asked for.
         assert!(rendered.contains("AGENTOS_ALLOW_MOCKS=1"), "{rendered}");
+
+        // The port that is not a mock and not fixable, named anyway: an
+        // operator who reads `no_payment_rail` off an approval must be able to
+        // find out here what it means, without it failing the run.
+        let payments = report
+            .checks
+            .iter()
+            .find(|check| check.name == "payments")
+            .unwrap_or_else(|| panic!("no payments check in\n{rendered}"));
+        assert_eq!(payments.status, Status::Ok, "{rendered}");
+        assert!(
+            payments.detail.contains("no_payment_rail"),
+            "the doctor must name the code the API returns: {:?}",
+            payments.detail
+        );
     }
 
     #[test]

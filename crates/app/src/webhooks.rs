@@ -106,6 +106,31 @@ pub enum EndpointError {
         /// `envelope_malformed` or `secret_decrypt_failed`.
         code: &'static str,
     },
+
+    /// Ce fournisseur a un ingest qui lit ses livraisons et personne ne sait
+    /// encore les authentifier : le nom de l'en-tête où il met sa signature n'a
+    /// jamais été lu sur une livraison réelle.
+    ///
+    /// **Refuser l'enregistrement est le seul résultat qui ne mente pas.** Un
+    /// en-tête deviné a deux issues et les deux sont pires : soit il ne
+    /// correspond à rien et 100 % des livraisons authentiques repartent en
+    /// `401` — c'est arrivé à quelqu'un d'autre sur ce fournisseur précis, voir
+    /// [`crate::inbound::SMARTLEAD_SIGNATURE_HEADER`] — soit il correspond à un
+    /// en-tête que n'importe qui peut poser, et le vérificateur accepte ce
+    /// qu'il ne devrait pas. Un endpoint qui ne s'enregistre pas est seulement
+    /// un connecteur pas fini ; un endpoint qui accepte n'importe quoi est une
+    /// file d'attente ouverte sur la boîte d'un client.
+    ///
+    /// Porte le `provider`, qui est un const de ce dépôt et jamais du texte
+    /// tiers : c'est l'endroit où un opérateur ira lire quoi poser.
+    #[error(
+        "no signature header has ever been observed for `{provider}`, so a delivery could not \
+         be verified; the endpoint is refused rather than registered"
+    )]
+    SignatureHeaderUnposed {
+        /// `smartlead` aujourd'hui, et rien d'autre.
+        provider: &'static str,
+    },
 }
 
 impl EndpointError {
@@ -114,6 +139,7 @@ impl EndpointError {
         match self {
             EndpointError::Store(_) => "store",
             EndpointError::Cipher { code } => code,
+            EndpointError::SignatureHeaderUnposed { .. } => "signature_header_unposed",
         }
     }
 }
@@ -183,6 +209,17 @@ pub async fn register(
     actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<(String, bool), EndpointError> {
+    // Cette porte a été fermée pendant une demi-journée, et sa réouverture vaut
+    // d'être racontée : elle refusait `smartlead` tant que
+    // `SMARTLEAD_SIGNATURE_HEADER` valait `None`, en supposant qu'un en-tête de
+    // signature finirait par être lu. La recherche a conclu l'inverse — il n'y
+    // en a pas, et Smartlead renvoie son propre secret dans le corps. Attendre
+    // un en-tête qui n'existe pas n'est pas de la prudence, c'est un connecteur
+    // qui ne s'enregistrera jamais. `crate::inbound::verify_smartlead_secret_key`
+    // est le schéma réel et il est câblé ; la CHECK
+    // `webhook_endpoints_provider_is_wired` (0077) dit qu'un ingest lit ces
+    // livraisons, et il n'y a plus de seconde moitié qui manque.
+
     // Sealed before the transaction opens, so a cipher failure is an error with
     // nothing written — and sealed under the tenant alone, which is why a
     // rotation that discards this freshly minted path in favour of the stored
@@ -213,6 +250,89 @@ mod tests {
 
     fn credentials() -> Credentials {
         Credentials::from_master_key(MASTER)
+    }
+
+    /// Smartlead s'enregistre, et c'est un revirement qui mérite son test.
+    ///
+    /// Ce test s'appelait `smartlead_cannot_be_registered_until_its_signature_header_is_posed`
+    /// et il vérifiait le contraire. La porte a été fermée une demi-journée, en
+    /// supposant qu'un en-tête de signature finirait par être lu sur une
+    /// livraison réelle. La recherche a conclu l'inverse : il n'y en a pas, et
+    /// Smartlead renvoie son propre secret dans le corps. Attendre un en-tête
+    /// qui n'existe pas n'est pas de la prudence — c'est un connecteur qui ne
+    /// s'enregistrera jamais.
+    ///
+    /// Ce qui se teste maintenant est la paire : la ligne s'écrit, **et** le
+    /// secret qu'elle scelle est celui contre lequel
+    /// [`crate::inbound::verify_smartlead_secret_key`] compare. Un
+    /// enregistrement qui réussit sans que la vérification suive serait le pire
+    /// des deux mondes.
+    #[tokio::test]
+    async fn smartlead_registers_and_the_sealed_secret_is_what_verifies_a_delivery() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; registering an endpoint needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let tenant = TenantId::new_v7(Utc::now());
+        let label = format!("whe-{}", tenant.as_uuid().simple());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+
+        let actor = AuditActor::Operator("tests".to_owned());
+        let now = Utc::now();
+
+        let (path, _) = register(
+            &db,
+            &credentials(),
+            tenant,
+            crate::inbound::SMARTLEAD_PROVIDER,
+            SECRET.to_owned(),
+            &actor,
+            now,
+        )
+        .await
+        .expect("smartlead s'enregistre depuis que son schéma réel est câblé");
+
+        // La ligne existe, et c'est la seule.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_endpoints WHERE tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count");
+        tx.commit().await.expect("commit");
+        assert_eq!(rows, 1, "un enregistrement, une ligne");
+
+        // Et le bout qui compte : on relit le secret par le chemin frappé,
+        // exactement comme la route le fait, et on vérifie une livraison avec.
+        // Sceller une valeur qu'aucune vérification ne reconnaîtrait laisserait
+        // un endpoint qui s'enregistre et refuse tout.
+        let endpoint = resolve(&db, &credentials(), &path)
+            .await
+            .expect("le chemin frappé se résout")
+            .expect("il désigne bien une ligne");
+
+        let corps = format!(r#"{{"event_type":"EMAIL_UNSUBSCRIBED","secret_key":"{SECRET}"}}"#);
+        crate::inbound::verify_smartlead_secret_key(&endpoint.secret, corps.as_bytes())
+            .expect("le secret scellé est celui que la vérification attend");
+
+        // Et le même corps avec un secret d'un caractère près est refusé — sans
+        // quoi l'assertion du dessus passerait aussi sur une comparaison qui ne
+        // compare rien.
+        let faux = format!(r#"{{"event_type":"EMAIL_UNSUBSCRIBED","secret_key":"{SECRET}x"}}"#);
+        crate::inbound::verify_smartlead_secret_key(&endpoint.secret, faux.as_bytes())
+            .expect_err("un secret voisin doit être refusé");
     }
 
     #[test]

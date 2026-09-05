@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use agentos_app::brief::INBOUND_BRIEF;
 use agentos_app::effects::{Effects, Ports};
-use agentos_app::gate::{PolicyGate, Principal as ActingAs};
+use agentos_app::gate::{PolicyGate, Principal as ActingAs, TaintOrigin};
 use agentos_app::inbound::{
     self, Errand, Recorded, Secret, TelephonyLanding, Thread, record_raw_email_delivery,
 };
@@ -654,6 +654,9 @@ fn app(
             // answer — *when*. Before it, nothing in this product could name an
             // hour.
             .merge(routes::calendar::router(db.clone()))
+            // The switch that opens a seat's public booking page. Beside the
+            // calendar it writes into; the page itself is on the tier below.
+            .merge(routes::booking::router(db.clone()))
             // The one the others were workarounds for: *say something*. `work`
             // and `calendar` put a sentence in front of an employee and neither
             // can be replied to; `approvals` below is a button. This is a
@@ -687,6 +690,19 @@ fn app(
             // customer's bill from Anthropic, this one is ours. Keeping them
             // adjacent is what stops the two ever being folded into one number.
             .merge(routes::billing::router(db.clone()))
+            // La moitié à clé du registre public: l'entreprise dit oui, ou se
+            // retire. La lecture, elle, est sur l'étage sans credential — un
+            // registre public derrière une clé n'en est pas un.
+            .merge(routes::public_register::router(db.clone()))
+            // Le même journal, lu pour un seul locataire : ce que la gate lui
+            // a refusé, par motif, par verbe, par siège.
+            .merge(routes::refusals::router(db.clone()))
+            // And the third reading, beside the two it reconciles: what the
+            // seats consumed at the tenant's declared rate, against what they
+            // invoiced, collected and spent. Same window parser again.
+            .merge(routes::pnl::router(db.clone()))
+            .merge(routes::controls::router(db.clone()))
+            .merge(routes::accounting::router(db.clone()))
             .merge(routes::teams::router(db.clone()))
             .merge(routes::companies::router(db.clone()))
             .merge(routes::turns::router(db.clone()))
@@ -703,6 +719,11 @@ fn app(
             // mounted the table was empty in every deployment, which the
             // ledger reads as "may not spend" — safe, and unusable.
             .merge(routes::spend::router(db.clone()))
+            // Beside `spend`, which is the same act one table over: an
+            // operator's key lowering a ceiling, audited in the write's own
+            // transaction. The only route that can change a `policy_layers`
+            // row, and it can only ever narrow one.
+            .merge(routes::policy::router(db.clone()))
             .merge(routes::inventory::router(db.clone()))
             // The only caller of `agentos_app::queue`, which had ten unit tests,
             // a compile-fail case and nothing calling it. The export has to be a
@@ -787,7 +808,16 @@ fn app(
     // stands in for the credential is the `state` parameter, and
     // `routes::mcp::public_router` is where that argument lives.
     .merge(routes::mcp::public_router(mcp_state))
-    .merge(routes::well_known::router(db.clone()));
+    .merge(routes::well_known::router(db.clone()))
+    // La page de réservation : un prospect n'a pas de clé. Une lecture par
+    // `(domain, slug)` qui répond 404 à tout siège qui n'a pas ouvert, et un
+    // formulaire borné — `routes::booking` porte l'argument.
+    .merge(routes::booking::public_router(db.clone()))
+    // Sans credential, et délibérément pas derrière `platform/*`: cet étage-là
+    // protège l'émission de clés, c'est-à-dire un pouvoir, et ceci est une
+    // lecture agrégée d'un consentement déjà donné. Le module dit pourquoi
+    // l'anonymat tient sans porte.
+    .merge(routes::public_register::public_router(db.clone()));
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
     // and that is a deliberate reading of the two tiers above rather than the
@@ -812,6 +842,9 @@ fn app(
         .with_state(Health {
             db: db.clone(),
             mocks: config.mock_adapters.clone().into(),
+            // The port `routes::approvals` refuses on, not a second opinion
+            // about it.
+            payment_rail: ports.payments.configured(),
         })
         .merge(metrics::router(db));
 
@@ -878,6 +911,10 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
             Arc::new(on_suspended),
         )
         .on(
+            routes::employees::lifecycle_event(Lifecycle::Active),
+            Arc::new(on_resumed),
+        )
+        .on(
             routes::employees::lifecycle_event(Lifecycle::Terminated),
             Arc::new(move |event, tx| on_terminated(engine.clone(), event, tx)),
         )
@@ -932,8 +969,154 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on(
             routes::webhooks::received_event(routes::webhooks::TELEPHONY_PROVIDER),
             Arc::new(move |event, tx| on_telephony_webhook(ports.clone(), event, tx)),
+        )
+        // Le troisième, et il est enregistré ici pour la même raison que les
+        // deux autres : `0077` a élargi `webhook_endpoints_provider_is_wired` à
+        // `'smartlead'`, et cette CHECK est exactement l'affirmation que cette
+        // ligne existe. Sans condition, comme les deux au-dessus : une ligne
+        // `webhook_endpoints` n'est pas visible au démarrage.
+        //
+        // Aucune livraison ne l'atteint aujourd'hui — le schéma de signature la
+        // refuse tant que personne n'a lu l'en-tête de Smartlead sur une vraie
+        // livraison — et c'est la bonne moitié à poser en premier : le jour où
+        // l'en-tête est posé, un désabonnement qui arrive trouve son lecteur au
+        // lieu d'être réessayé huit fois puis mis en lettre morte.
+        .on(
+            routes::webhooks::received_event(routes::webhooks::SMARTLEAD_PROVIDER),
+            Arc::new(on_smartlead_webhook),
+        )
+        // Le quatrième, pour la même raison : `0081` a élargi la CHECK à
+        // `'stripe'`, et cette ligne est ce que la CHECK affirme.
+        .on(
+            routes::webhooks::received_event(routes::webhooks::STRIPE_PROVIDER),
+            Arc::new(on_stripe_webhook),
         );
     handlers
+}
+
+/// `webhook.stripe.received` : une session Checkout payée règle la facture
+/// qu'elle nomme.
+///
+/// La quatrième jointure, et la première qui fait entrer de l'argent. Comme
+/// celle de Smartlead, elle n'a rien à aller chercher : les octets vérifiés
+/// portent tout, et `agentos_app::stripe::record_stripe_payment` fait le
+/// reste dans la transaction qui retire la livraison de la file — le
+/// `paid_at`, et la ligne d'audit qui porte l'identifiant Stripe. Le tenant
+/// est celui de l'endpoint, donc celui de `tx` ; une facture d'une autre
+/// entreprise est invisible d'ici.
+///
+/// Ce qui est terminal : un corps qui n'est pas du JSON. Ce qui ne l'est pas
+/// et n'est pas une erreur non plus : un montant qui ne colle pas — une ligne
+/// `invoice_payment_mismatch` est écrite et la facture reste due, ce qui est
+/// exactement ce qu'une personne doit voir.
+fn on_stripe_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
+        let event_id = event
+            .payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let settled =
+            agentos_app::stripe::record_stripe_payment(tx, body.as_bytes(), event_id, Utc::now())
+                .await
+                .map_err(|err| {
+                    let why = format!("{}: {err}", err.code());
+                    if err.is_retryable() {
+                        Failure::Retry(why)
+                    } else {
+                        Failure::Terminal(why)
+                    }
+                })?;
+
+        use agentos_app::stripe::Settlement;
+        match settled {
+            Settlement::Paid(id) => {
+                tracing::info!(invoice = %id, "an invoice was settled by stripe")
+            }
+            Settlement::Mismatch(id) => tracing::warn!(
+                invoice = %id,
+                "a stripe payment does not match the invoice it names; nothing was marked paid"
+            ),
+            Settlement::AlreadySettled(id) => {
+                tracing::debug!(invoice = %id, "a stripe payment for an invoice already settled");
+            }
+            Settlement::NotOurs => tracing::debug!("a stripe delivery that settles nothing here"),
+        }
+        Ok(())
+    })
+}
+
+/// `webhook.smartlead.received` : un désabonnement poussé devient une ligne de
+/// `suppressions`, et le contact tombe avec elle.
+///
+/// La troisième jointure, et la plus courte des trois. Elle n'a ni port ni
+/// fournisseur à joindre : tout ce dont elle a besoin est dans les octets que
+/// l'edge a vérifiés, et l'écriture est celle que
+/// [`agentos_app::queue::record_platform_opt_out`] fait déjà pour la porte
+/// tirée — donc la même personne, arrivée par la poussée ou par le tirage, est
+/// une ligne et pas deux.
+///
+/// # Une phase, pas deux
+///
+/// Pour la raison de `on_telephony_webhook` : la livraison **porte** le corps.
+/// Il n'y a rien à aller chercher chez la plateforme, donc aucune notice
+/// intermédiaire à écrire, et la suppression commet dans la transaction qui
+/// retire la livraison de la file.
+///
+/// # Ce qui est terminal
+///
+/// `InboundError::is_retryable` décide, exactement comme pour les deux autres.
+/// Ce qui est terminal ici — un corps qui n'est pas du JSON, un désabonnement
+/// sans adresse lisible — ne devient pas autre chose à la huitième tentative,
+/// et une lettre morte est visible là où un `Ok` silencieux ne l'est pas.
+/// `outbox::requeue_dead_letters` est le chemin du retour.
+fn on_smartlead_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        // Terminal, pour la raison de `on_webhook` : ce payload est écrit une
+        // fois, par la route, et une livraison stockée sans corps n'en fera pas
+        // pousser un.
+        let body = event
+            .payload
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::Terminal("this stored delivery has no body".to_owned()))?;
+
+        // Exactement les octets sur lesquels la signature a été vérifiée.
+        let suppressed =
+            agentos_app::inbound::record_smartlead_unsubscribe(tx, body.as_bytes(), Utc::now())
+                .await
+                .map_err(|err| {
+                    // Jamais le payload et jamais le texte de la plateforme :
+                    // `code()` est une étiquette fixe, chaque `InboundError` se
+                    // rend depuis une phrase écrite ici, et cette chaîne part
+                    // dans `last_error`.
+                    let why = format!("{}: {err}", err.code());
+                    if err.is_retryable() {
+                        Failure::Retry(why)
+                    } else {
+                        Failure::Terminal(why)
+                    }
+                })?;
+
+        // Pas d'adresse dans la ligne : qui c'était est dans `suppressions`,
+        // derrière la RLS. `false` est le cas ordinaire — la plateforme pousse
+        // aussi les envois et les ouvertures, et aucun de ces événements ne doit
+        // toucher une ligne.
+        match suppressed {
+            true => tracing::info!(
+                "a lead unsubscribed on the sending platform; they are suppressed and their \
+                 contact is deactivated on every channel"
+            ),
+            false => tracing::debug!("a smartlead delivery that is not an unsubscribe"),
+        }
+        Ok(())
+    })
 }
 
 /// `employee.created`: confirm the provisioner actually has a job.
@@ -1129,6 +1312,29 @@ fn on_suspended<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handle
         tracing::info!(
             employee_id = %event.aggregate_id,
             "employee suspended; resources deliberately kept so a resume is free"
+        );
+        Ok(())
+    })
+}
+
+/// `employee.active`: recorded, and nothing else.
+///
+/// The mirror of [`on_suspended`], and empty for the same reason it is: a
+/// suspension released nothing, so a resume has nothing to re-acquire. What
+/// stopped, stopped because the gate and a handful of `lifecycle = 'active'`
+/// filters read the column; they read it again on the next tick and the seat is
+/// simply back.
+///
+/// Registered rather than omitted because `handlers` fails an event it has no
+/// entry for, retries it eight times and dead-letters it: leaving this line out
+/// would turn every resume into a permanent error about a side effect that was
+/// never wanted. `routes::employees::resume` is the only producer —
+/// `on_step_ready` moves `draft → active` without an outbox event.
+fn on_resumed<'a>(event: &'a OutboxEvent, _tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        tracing::info!(
+            employee_id = %event.aggregate_id,
+            "employee resumed; nothing to restore because suspension released nothing"
         );
         Ok(())
     })
@@ -1916,9 +2122,11 @@ impl Agent {
                         &knowledge::Recall::new(&inbound, Some(employee_id)),
                     )
                     .await;
-                    recalled.into_context(
-                        context.with_untrusted(&inbound, &format!("message-{message_id}")),
-                    )
+                    recalled.into_context(context.with_untrusted_from(
+                        &inbound,
+                        &format!("message-{message_id}"),
+                        TaintOrigin::message(&channel, &sender),
+                    ))
                 }
             };
 
@@ -2356,6 +2564,17 @@ struct Health {
     db: Db,
     /// Exactly [`Config::mock_adapters`], no second opinion.
     mocks: Arc<[&'static str]>,
+    /// Whether anything is bound behind `Ports::payments`, read off the port
+    /// itself rather than off the environment.
+    ///
+    /// Not a row in `mock_adapters` and deliberately not: those adapters have a
+    /// credential that makes them real and a fake that answers meanwhile, and
+    /// this one has neither — no `PaymentProvider` exists in this workspace to
+    /// configure. Filing it there would say "set the variable"; there is no
+    /// variable. It is its own field so that a replica can be asked, rather
+    /// than an operator inferring it from a `502` — which is the shape of the
+    /// question this struct exists to answer on demand.
+    payment_rail: bool,
 }
 
 /// Readiness: this replica can usefully take traffic *right now*.
@@ -2386,6 +2605,13 @@ struct Health {
 /// be able to come up, so `mock_adapters` is reported and never fails the
 /// probe — an always-present field, empty on a fully real deployment, so an
 /// operator can diff two replicas rather than infer from a silence.
+///
+/// `payment_rail` is reported on the same terms and for the same reason: a
+/// deployment with no `PaymentProvider` is a legitimate deployment — every
+/// build in this workspace is one — that simply refuses `payment_create` at
+/// the approval, with `no_payment_rail`. Failing readiness on it would take
+/// every replica out of the load balancer over a capability most tenants never
+/// use. Reported, never fatal.
 async fn readyz(State(health): State<Health>) -> Response {
     match agentos_store::policy::platform_ceiling_installed(&health.db).await {
         Ok(true) => {}
@@ -2422,6 +2648,9 @@ async fn readyz(State(health): State<Health>) -> Response {
             "ready": true,
             "outbox_lag_secs": lag,
             "mock_adapters": &*health.mocks,
+            // False on every build today. The route that reads the same port
+            // answers `501 no_payment_rail` and leaves the approval pending.
+            "payment_rail": health.payment_rail,
         })),
     )
         .into_response()
@@ -2863,6 +3092,7 @@ mod tests {
                 .with_state(Health {
                     db,
                     mocks: Vec::new().into(),
+                    payment_rail: false,
                 })
                 .oneshot(
                     HttpRequest::get("/readyz")

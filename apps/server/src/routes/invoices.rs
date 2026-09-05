@@ -40,20 +40,26 @@
 //! from the same authority that writes charters and cadences: an API key, not a
 //! principal the gate rules on.
 //!
-//! That is also why there is no `ActionKind::InvoicePaid`. The day a PSP webhook
-//! writes it (`routes::webhooks` already verifies signatures and stores raw
-//! deliveries) the writer is still not an employee.
+//! That is also why there is no `ActionKind::InvoicePaid`. The Stripe webhook
+//! writes `paid_at` now (`agentos_app::stripe`), and the writer is still not an
+//! employee.
 //!
-//! # No `paid_by` and no audit row
+//! # No `paid_by`, and an audit row after all
 //!
-//! `routes::work`'s reason before `0064`, and here it has not stopped being
-//! true: every writer of `paid_at` holds an operator key, so the answer would be
-//! the same string on every row, and `AuditKind` is a closed vocabulary of
-//! *rulings* — a row there for something no gate ruled on would be a decision
-//! with no decision in it. The record that survives is the column itself, which
-//! `0066`'s trigger makes unwithdrawable.
+//! No column: `routes::work`'s reason before `0064` holds for the column, since
+//! every writer of `paid_at` holds an operator key or is the webhook. The audit
+//! row is the thing this module used to refuse and now writes, because the
+//! argument for refusing it stopped being true the day Stripe wrote one:
+//! `AuditKind::InvoicePaid` exists, the Stripe path files it with the event id,
+//! and a register with two ways to be settled and a trail that shows only one
+//! of them answers "who said this was paid" with a shrug for exactly the
+//! settlements a person asserted by hand. So `paid` writes the same kind, with
+//! the key's principal as actor and `"source": "operator"` in the payload
+//! where Stripe's says `"stripe"` — and only on the call that settled, so a
+//! replay that `declare_paid` reports as `false` leaves no second row.
 
 use agentos_domain::ids::InvoiceId;
+use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::Db;
 use agentos_store::invoices;
 use axum::extract::{Path, State};
@@ -230,8 +236,9 @@ async fn paid(
     principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
+    let now = Utc::now();
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    let settled = invoices::declare_paid(&mut tx, InvoiceId::from_uuid(id), Utc::now()).await?;
+    let settled = invoices::declare_paid(&mut tx, InvoiceId::from_uuid(id), now).await?;
     if !settled {
         // Rolled back rather than committed: nothing was written, and a pooled
         // connection goes back deliberately.
@@ -240,6 +247,11 @@ async fn paid(
             ApiError::not_found().with_detail("no outstanding invoice by that id in this company")
         );
     }
+    // The same kind and the same transaction as the Stripe path's row, so the
+    // trail and the column cannot disagree about whether this settled.
+    let mut row = AuditEvent::new(principal.actor.clone(), AuditKind::InvoicePaid, now);
+    row.payload = json!({ "invoice_id": id, "source": "operator" });
+    audit::append(&mut tx, &row).await?;
     tx.commit().await?;
 
     Ok(Json(json!({ "id": id, "state": "paid" })).into_response())
@@ -323,6 +335,16 @@ async fn credit(
         memo,
     )
     .await;
+    // The document, in the same transaction as the number — the invoice's own
+    // rule (`Effects::issue_invoice`), and a credit note is a document the
+    // customer receives too: `credit-note-<number>.pdf`, saying which invoice
+    // it corrects.
+    let written = match written {
+        Ok(issued) => agentos_app::invoice_document::file(&mut tx, &issued)
+            .await
+            .map(|_| issued),
+        Err(err) => Err(err),
+    };
     match written {
         Ok(issued) => {
             tx.commit().await?;
@@ -553,6 +575,23 @@ mod tests {
         // purpose: both mean "there is no outstanding invoice here to settle".
         let (status, _) = h.send("POST", &uri, SECRET_A).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // One `invoice_paid` row, from the key that settled it, naming the
+        // operator as its source — and one after the replay, because the row
+        // rides the call `declare_paid` answered `true` to and no other.
+        let mut tx = db.tenant_tx(h.a).await.expect("tx");
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT actor, payload FROM audit_log WHERE action_kind = 'invoice_paid' \
+             ORDER BY occurred_at, id",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .expect("read the trail");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "operator:ops-a");
+        assert_eq!(rows[0].1["source"], json!("operator"));
+        assert_eq!(rows[0].1["invoice_id"], json!(invoice.as_uuid()));
 
         let (_, body) = h.send("GET", "/v1/invoices", SECRET_A).await;
         assert_ne!(body["invoices"][0]["paid_at"], Value::Null);

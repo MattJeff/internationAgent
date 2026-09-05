@@ -604,6 +604,28 @@ fn registration_refused(err: agentos_app::webhooks::EndpointError, tenant_id: Uu
             )
         }
         EndpointError::Store(err) => err.into(),
+        // Le fournisseur est câblé côté base — sa CHECK l'accepte — et
+        // personne ne sait encore authentifier ses livraisons. C'est un 400 et
+        // pas un 500 : rien n'est cassé chez nous, et l'appelant peut agir, mais
+        // pas en corrigeant sa requête. D'où un `code` à lui : un script de
+        // signup qui réessaie `provider_not_wired` ne s'arrête jamais, et il
+        // doit pouvoir distinguer « ce build ne lit pas ce fournisseur » de
+        // « ce build ne sait pas vérifier ce fournisseur », qui se réparent par
+        // deux actes différents.
+        //
+        // Le détail dit quoi faire et ne dit rien de la construction du
+        // déploiement : ni nom de contrainte, ni chemin de fichier — la règle 1
+        // de `error.rs`.
+        EndpointError::SignatureHeaderUnposed { provider } => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "provider_signature_unknown",
+            "this build cannot verify this provider's deliveries",
+        )
+        .with_detail(format!(
+            "provider: no signature header has ever been observed for `{provider}`, so every \
+             delivery would be either refused or accepted on a guess. Registering it is refused \
+             until one is read off a real delivery."
+        )),
         // Ours, not theirs: the master key. The cipher's code goes to the log
         // and never into the body.
         EndpointError::Cipher { code } => {

@@ -1236,6 +1236,15 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
             .with_untrusted(&Untrusted::new(kept.subject.clone()), APPOINTMENT),
         None => context.with_task(TURN_BRIEF),
     };
+    // A promise that names a thread is a follow-up `agentos_app::follow_up`
+    // booked, and the turn is told so in our voice — the date of the message
+    // nobody answered — beside the frame that carries the masked address. The
+    // model then proposes an ordinary `send_email`, and the gate does the rest.
+    if let Some(thread) = due.kept.as_ref().and_then(|kept| kept.conversation_id)
+        && let Some(brief) = agentos_app::follow_up::brief(&agent.db, due.tenant_id, thread).await
+    {
+        context = context.with_task(brief);
+    }
     context = context.with_task(charter.brief());
     if let Some(note) = done {
         context = context.with_task(note);
@@ -1592,7 +1601,6 @@ async fn selling_step(
         &agent.db,
         &prober,
         &seller,
-        &vertical::orizn_binding(),
         principal,
         pack,
         objective,
@@ -3001,13 +3009,23 @@ pub(crate) mod tests {
             .with_timezone(&Utc);
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        diary_store::book(
+        // The moment that has come round is a follow-up: an email Ada sent on
+        // the day, recorded on its thread, and the promise `follow_up` books
+        // beside it — so the wake has to say whose silence this is, and since
+        // when, in our voice and outside the frame.
+        let gruber = "frau.gruber@zoll.example".parse().expect("address");
+        let thread =
+            agentos_app::follow_up::sent(&mut tx, ada, &gruber, Some("hello"), "msg_1", past)
+                .await
+                .expect("record the send on its thread");
+        diary_store::book_on(
             &mut tx,
             AppointmentId::new_v7(now),
             ada,
             past,
             "Europe/Vienna",
-            "call Frau Gruber back about the tariff code",
+            &agentos_app::follow_up::subject(&gruber.to_string()),
+            Some(thread),
         )
         .await
         .expect("book the moment that has come round");
@@ -3086,6 +3104,18 @@ pub(crate) mod tests {
             sent.contains("BEGIN source=appointment"),
             "the subject reached the model inside a fence: a stranger who books \
              an hour writes data, never an instruction: {sent}"
+        );
+        assert!(
+            sent.contains(
+                "This hour is a follow-up. You wrote to the contact named in the frame below on \
+                 2020-08-04 and nothing has come back since"
+            ),
+            "a promise that names a thread is a follow-up, and the turn is told since \
+             when — in our voice, with the address left inside the frame: {sent}"
+        );
+        assert!(
+            sent.contains("follow up · f…@zoll.example") && !sent.contains("frau.gruber@"),
+            "the frame carries the masked address and nothing carries it whole: {sent}"
         );
         assert!(
             sent.contains("BEGIN source=diary"),

@@ -41,28 +41,6 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
-[features]
-# `tests/orizn.rs`'s live tests: they start a stdio→HTTP MCP bridge in front of
-# the real `orizn-visa-mcp` server and dial it through `mcp::McpServer::bind`.
-#
-# One of them, `the_keyed_tool_prices_a_visa_…`, also needs **`ORIZN_API_KEY` in
-# the environment**. `check_visa_requirement` is advertised keyless and fails at
-# call time, and the hosted HTTP endpoint ignores the key in every header form —
-# the key works on the stdio package, which is what the bridge wraps and what
-# `supergateway` inherits this process's environment for. So the bridge is not
-# an operator's convenience for that tool; it is the only path to it. The test
-# asserts the variable is *set* and never reads or prints its value.
-#
-# A feature and not a runtime skip, and the difference is `scripts/test.sh`. That
-# script fails the build when a test prints `SKIP:` — because ~34 tests in this
-# workspace skip themselves without a database and a green run of nothing is the
-# one failure mode nobody notices. A test that needs `npx` and the open internet
-# cannot satisfy that guard by being satisfiable, so it opts out of the default
-# build entirely: `#[cfg(feature = "live-orizn")]` means the test is *absent*
-# from a normal run rather than present and quietly passing. Run it with
-# `cargo test -p agentos-app --features live-orizn`.
-live-orizn = []
-
 [dev-dependencies]
 trybuild.workspace = true
 # Tests only, and for one test: `model_access` must prove a customer's API key

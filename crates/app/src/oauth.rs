@@ -894,7 +894,19 @@ async fn post_token(
     form: &[(&str, &str)],
 ) -> Result<Issued, OauthError> {
     let mut body: Vec<(&str, &str)> = form.to_vec();
-    let mut request = http_client().post(endpoints.token);
+    // **`Accept: application/json`, et sans lui GitHub ne marche pas une seule
+    // fois.** Son point de jeton rend `application/x-www-form-urlencoded` en
+    // `text/plain` par défaut et du JSON uniquement si on le demande — mesuré
+    // le 2026-08-31 contre `https://github.com/login/oauth/access_token`.
+    // `parse_issued` fait `serde_json::from_slice`, donc l'échange échouerait
+    // en `unparseable` à chaque tentative, pour tous les tenants, sans qu'aucun
+    // test hors ligne ne puisse le voir.
+    //
+    // Inoffensif partout ailleurs : c'est ce que RFC 6749 §5.1 impose déjà comme
+    // type de réponse, on ne fait que le demander à voix haute.
+    let mut request = http_client()
+        .post(endpoints.token)
+        .header("Accept", "application/json");
     match endpoints.auth {
         // RFC 6749 §2.3.1's mandatory scheme, and the one that keeps the secret
         // out of a body some providers log.
@@ -945,7 +957,44 @@ async fn post_token(
         });
     }
 
-    parse_issued(&bounded_body(response).await?)
+    let body = bounded_body(response).await?;
+
+    // **Un 200 qui porte `error` est un refus, pas une réponse illisible.**
+    //
+    // GitHub et Slack répondent tous deux `200 OK` avec `{"error": "..."}` —
+    // `bad_verification_code` chez l'un, `{"ok":false,"error":"invalid_code"}`
+    // chez l'autre, mesurés le 2026-08-31. Sans ce test, le corps tombe dans
+    // `parse_issued`, ressort en `no_access_token`, et `no_access_token` n'est
+    // pas [`REJECTED`] : `refresh_due` ne met donc jamais au repos un jeton de
+    // rafraîchissement révoqué et le représente toutes les cinq minutes, pour
+    // toujours. C'est exactement la panne que la doc de `refresh_due` décrit et
+    // croit avoir fermée.
+    //
+    // Le corps n'est pas rendu, seulement sa présence : il échoue le même mot
+    // que le 4xx du dessus, parce que c'est la même chose — la partie d'en face
+    // a dit non.
+    if annonce_un_refus(&body) {
+        return Err(OauthError::Endpoint { code: REJECTED });
+    }
+
+    parse_issued(&body)
+}
+
+/// Ce corps de 200 dit-il non ?
+///
+/// Sorti de [`post_token`] pour une raison et une seule : à l'intérieur, il ne
+/// serait vérifiable qu'avec un vrai serveur d'autorisation en face. Ici, c'est
+/// une fonction d'octets vers booléen, et les deux formes mesurées chez les
+/// fournisseurs sont dans le test d'à côté.
+///
+/// Un corps illisible n'est **pas** un refus : c'est [`parse_issued`] qui le
+/// dira, en `unparseable`, et confondre les deux ferait mettre au repos une
+/// liaison que personne n'a révoquée.
+fn annonce_un_refus(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|document| document.get("error").cloned())
+        .is_some_and(|value| !value.is_null())
 }
 
 /// The response body, refused **while it streams** if it is too large.
@@ -1120,6 +1169,47 @@ fn random_b64url(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **Les deux fournisseurs qui refusent sous un 200.**
+    ///
+    /// Mesuré le 2026-08-31 : GitHub rend `{"error":"bad_verification_code"}` et
+    /// Slack `{"ok":false,"error":"invalid_code"}`, tous deux en `200 OK`. Sans
+    /// ce prédicat, le corps ressortait en `no_access_token`, qui n'est pas
+    /// `REJECTED` — donc `refresh_due` représentait un jeton révoqué toutes les
+    /// cinq minutes, pour toujours.
+    #[test]
+    fn un_deux_cents_qui_porte_une_erreur_est_un_refus() {
+        for corps in [
+            br#"{"error":"bad_verification_code"}"#.as_slice(),
+            br#"{"ok":false,"error":"invalid_code"}"#.as_slice(),
+            br#"{"error":"invalid_grant","error_description":"expired"}"#.as_slice(),
+        ] {
+            assert!(
+                super::annonce_un_refus(corps),
+                "{}",
+                String::from_utf8_lossy(corps)
+            );
+        }
+    }
+
+    /// Une vraie réponse de jeton n'est pas un refus, et un corps illisible non
+    /// plus : celui-là est `unparseable`, et le confondre avec un refus mettrait
+    /// au repos une liaison que personne n'a révoquée.
+    #[test]
+    fn ni_un_jeton_ni_un_corps_illisible_ne_sont_des_refus() {
+        for corps in [
+            br#"{"access_token":"gho_x","token_type":"bearer","scope":"repo"}"#.as_slice(),
+            br#"{"error":null,"access_token":"gho_x"}"#.as_slice(),
+            b"access_token=gho_x&scope=repo&token_type=bearer".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(
+                !super::annonce_un_refus(corps),
+                "{}",
+                String::from_utf8_lossy(corps)
+            );
+        }
+    }
+
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
@@ -1396,6 +1486,45 @@ mod tests {
     }
 
     // -- the flow ------------------------------------------------------------
+    /// A provider's own query parameters survive the ones `start` appends.
+    ///
+    /// `google-gmail`'s `authorize` is not a bare path: it carries
+    /// `access_type=offline&prompt=consent`, and without the first of them
+    /// Google issues no refresh token at all — a binding that works for one hour
+    /// and then has nothing for `refresh_due` to renew. The whole of that
+    /// depends on `Url::query_pairs_mut` *appending* rather than replacing, which
+    /// is a property of a dependency and therefore exactly the kind of thing to
+    /// assert instead of remember. This drives the real catalogue literal, so it
+    /// also fails if somebody edits the two parameters out of it.
+    #[test]
+    fn a_providers_own_authorize_query_survives_what_start_appends() {
+        let connector = catalog::find("google-gmail").expect("google-gmail is catalogued");
+        let clients =
+            OauthClients::parse("google-gmail:our-client-id:our-client-secret").expect("clients");
+        let started = start(
+            &clients,
+            &credentials(),
+            tenant(),
+            connector,
+            REDIRECT,
+            Utc::now(),
+        )
+        .expect("start");
+
+        assert_eq!(
+            param(&started.authorize_url, "access_type"),
+            "offline",
+            "no refresh token without it, and the binding dies in an hour"
+        );
+        assert_eq!(param(&started.authorize_url, "prompt"), "consent");
+        // And what `start` adds is still all there, on the same URL.
+        assert_eq!(param(&started.authorize_url, "response_type"), "code");
+        assert_eq!(param(&started.authorize_url, "client_id"), "our-client-id");
+        assert_eq!(
+            param(&started.authorize_url, "code_challenge_method"),
+            "S256"
+        );
+    }
 
     /// The whole path, against a provider that checks PKCE itself.
     #[tokio::test]

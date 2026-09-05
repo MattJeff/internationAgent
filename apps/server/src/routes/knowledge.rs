@@ -1,7 +1,16 @@
-//! `POST /v1/knowledge/documents`: put a document where the employee can find
-//! it.
+//! `/v1/knowledge`: put a document where the employee can find it, then read
+//! back what was put there.
 //!
-//! # The one thing this route is really for
+//! Three routes and one asymmetry worth naming up front. `POST
+//! /v1/knowledge/documents` writes; `GET /v1/knowledge/documents` lists what was
+//! written; `GET /v1/knowledge/search` runs the *same* retrieval a turn runs.
+//! For a long time only the first existed, which meant a document filed under a
+//! scope nobody queries — a team the employee is not on, an employee that is not
+//! the one asking — was stored, indexed, billed for and never retrieved, and the
+//! only evidence of any of it was a `source_id` in a response body. The two
+//! reads are what make that visible.
+//!
+//! # The one thing the ingest route is really for
 //!
 //! It is a small handler — parse, chunk, embed, insert — and the only line in
 //! it that matters is `trust: TrustLabel::Untrusted`.
@@ -40,25 +49,86 @@
 //! keyed on the content rather than on the client remembering a header, and it
 //! is answered 200 rather than 201 so a caller can tell.
 //!
-//! # No search endpoint
+//! # The search endpoint is `recall`, not a second retrieval
 //!
-//! ponytail: retrieval happens on the turn, from `knowledge::recall`, and there
-//! is no customer asking to run a query by hand. `GET /v1/knowledge/search`
-//! when somebody needs to debug what an employee can see — it is ten lines and
-//! the store already does the work.
+//! [`search`] calls `agentos_app::knowledge::recall` — the identical function
+//! the turn loop calls, with the identical bounds — and does nothing else. That
+//! is the point of the route rather than an implementation detail: the question
+//! it answers is *what would this employee actually retrieve*, and an answer
+//! computed by a second query is an answer that stops matching the first one at
+//! the next fix to either. Same scope predicate, same one-model binding, same
+//! word-only leg when the embedder is a hash, same two-second budget.
+//!
+//! It follows that this route inherits `recall`'s honesty problem and has to
+//! pass it on. On a deployment with no `EMBEDDER_API_KEY` the vector leg is not
+//! run at all, so an empty result means *no document contained these words* and
+//! not *the company has nothing on this* — `RECALLED_BRIEF` says exactly that to
+//! the model, and `ranked_by` in the response body says it to the person.
+//!
+//! # Two rules the reads do not get to bend
+//!
+//! **Retrieved text is `Untrusted`, and the wire says so on every passage.**
+//! A person reading a search result is not a prompt, so the content comes back
+//! in clear — the same call `routes::desk` makes for a colleague's message. What
+//! travels with it is the label: `trust` on every hit, hard-coded rather than
+//! read off `knowledge_sources.trust_label`, because retrieval is untrusted for
+//! a reason no column can answer. `crates/app/src/knowledge.rs` has the
+//! argument; briefly, the *selection* is steered by whoever wrote the query. The
+//! listing's `trust` is the opposite kind of value — it is the column, the audit
+//! record of what arrived — and the two are deliberately not the same field
+//! computed twice.
+//!
+//! **Another tenant's row is invisible, not forbidden.** RLS supplies that for
+//! the listing and the search without either writing a `tenant_id` predicate. It
+//! is only spelled out for `employee_id` on [`search`], which is an id a caller
+//! hands us: one belonging to somebody else is a 404, exactly as it is on the
+//! ingest path, and never a 403 that would confirm the id exists.
+//!
+//! # What is deliberately not here
+//!
+//! **No `DELETE`.** `routes::files` refuses the same verb for the same reason
+//! and `0067` writes the argument out; the knowledge tables add one of their
+//! own. A chunk that has been retrieved is quoted, by `chunk_id` and `ordinal`,
+//! in the context of turns that are already recorded — deleting the row turns
+//! those citations into dangling references and makes an audit of what an
+//! employee was told unreadable. So erasure here is a retention decision (hard
+//! delete or tombstone? what happens to the turns that cite it? who may ask?)
+//! and not a handler, and a document filed under the wrong scope is fixed by
+//! filing it under the right one: the dedupe key includes the scope, so the
+//! re-ingest creates rather than reuses. The stale row costs storage until
+//! somebody at a psql prompt removes it, which is the honest price of not
+//! guessing at the four questions above.
+//!
+//! **No `GET /v1/knowledge/documents/{id}` returning the text.** Getting the
+//! exact bytes back is `routes::files` — *le classeur* keeps, this unit indexes
+//! in order to find again, and a second full-text read here would be a second
+//! answer to "what did we file". The listing carries a chunk count so the
+//! founder can see a document is there and how much of it there is; the passages
+//! themselves come back from [`search`], which is where the trust label and the
+//! scope are enforced.
+//!
+//! **No pagination on [`search`].** It is a top-k over a fused ranking, and an
+//! `after` cursor over one is a promise the ranking cannot keep — page two of a
+//! score-ordered result is not stable across the ingest that happens between the
+//! two requests. `limit` is the whole control, capped at [`MAX_HITS`], and the
+//! default is [`RECALL_LIMIT`] because five is what the employee gets.
 
-use agentos_app::knowledge::{Document, Embedder, Format, KnowledgeError, Scope, ingest};
+use agentos_app::knowledge::{
+    Document, Embedder, Format, KnowledgeError, RECALL_LIMIT, RECALL_TIMEOUT, Recall, Scope,
+    ingest, recall,
+};
 use agentos_domain::ids::EmployeeId;
-use agentos_domain::untrusted::TrustLabel;
+use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use serde::Deserialize;
+use axum::routing::{get, post};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -85,9 +155,28 @@ pub struct KnowledgeState {
 /// the 1 MB body cap comes from `with_outer_stack` outside that.
 pub fn router(db: Db, embedder: Embedder) -> Router {
     Router::new()
-        .route("/v1/knowledge/documents", post(create_document))
+        .route(
+            "/v1/knowledge/documents",
+            post(create_document).get(list_documents),
+        )
+        .route("/v1/knowledge/search", get(search))
         .with_state(KnowledgeState { db, embedder })
 }
+
+/// Page size when the caller does not ask for one. Same numbers as
+/// `routes::employees`, because a founder walking two listings should not have
+/// to learn two page sizes.
+const DEFAULT_LIMIT: i64 = 50;
+
+/// Largest page we will build, however big a `limit` the caller sends.
+const MAX_LIMIT: i64 = 200;
+
+/// Largest top-k [`search`] will ask `recall` for.
+///
+/// Ten times what a turn takes, and bounded for the same reason the turn's is:
+/// every hit is a chunk of document text on the wire, and the useful operator
+/// question ("would this employee find it?") is answered by the first few.
+const MAX_HITS: i64 = 50;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -129,8 +218,114 @@ struct NewDocument {
     text: String,
 }
 
+/// One `knowledge_sources` row as [`list_documents`] selects it: id,
+/// employee_id, team_id, title, uri, kind, trust_label, chunk count, created_at.
+type SummaryRow = (
+    Uuid,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    DateTime<Utc>,
+);
+
+/// Keyset pagination, spelled exactly as `routes::employees` spells it. Ids are
+/// UUIDv7, so `id > after` is "filed after".
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Page {
+    /// The last id of the previous page.
+    #[serde(default)]
+    after: Option<Uuid>,
+    /// How many rows to return, capped at [`MAX_LIMIT`].
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// One filed document, **without its text**.
+///
+/// The omission is the design. A listing is a screen a founder scrolls, and a
+/// knowledge source is a whole handbook; returning the content would put
+/// megabytes of third-party text on a route whose job is to say what exists.
+/// `chunks` is the honest stand-in — it is what the document cost to index and
+/// what it can contribute to a turn — and the passages themselves come back one
+/// query at a time from [`search`], where the trust label travels with them.
+#[derive(Debug, Serialize)]
+struct DocumentSummary {
+    id: Uuid,
+    /// `company`, `team` or `employee`, derived from the two columns below so a
+    /// reader does not have to know that "both NULL" is the company.
+    scope: &'static str,
+    /// Set when `scope` is `employee`; the same field the ingest body takes, so
+    /// a listing row round-trips into a re-file.
+    employee_id: Option<Uuid>,
+    /// Set when `scope` is `team`.
+    team_id: Option<Uuid>,
+    title: Option<String>,
+    uri: Option<String>,
+    /// The `kind` column, which is what `POST`'s `format` recorded.
+    format: String,
+    /// How many chunks this document was split into — how much of a turn it can
+    /// occupy, and a zero here would mean a source that can never be retrieved.
+    chunks: i64,
+    /// **Off the `trust_label` column**, not a constant: this is the provenance
+    /// record `0017` exists for, and reading it back is the point. Every row
+    /// says `untrusted` today because no ingest path in this workspace writes
+    /// anything else — which is a fact about the code, and this field is where a
+    /// reader would see it stop being true.
+    trust: String,
+    created_at: DateTime<Utc>,
+}
+
+/// The [`search`] query string. `deny_unknown_fields` for the ingest body's
+/// reason: a misspelled `employee_id` would silently widen the scope of the
+/// search rather than narrow it, which is the one mistake this route exists to
+/// make visible.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchQuery {
+    /// What to look for. Passed to `recall` as the counterparty's words are —
+    /// it truncates, parses it into a `tsquery` and embeds it, and nothing here
+    /// renders it.
+    q: String,
+    /// **Whose eyes.** Absent is the operator-side "everything this tenant has",
+    /// which is the widest scope and answers a different question; an employee
+    /// id answers *would this seat find it*, which is the question a document
+    /// filed under the wrong scope fails.
+    #[serde(default)]
+    employee_id: Option<Uuid>,
+    /// Top-k, defaulting to [`RECALL_LIMIT`] and capped at [`MAX_HITS`].
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// One retrieved passage, as a person reads it.
+#[derive(Debug, Serialize)]
+struct HitView {
+    /// The document. Matches a `DocumentSummary::id` from the listing, which is
+    /// how "why did it not find my file" gets answered.
+    source_id: Uuid,
+    chunk_id: Uuid,
+    /// Position in the document. `knowledge:<source_id>#<ordinal>` is the
+    /// citation a turn carries for this exact passage.
+    ordinal: i32,
+    /// Comparable within this result set and meaningless outside it.
+    score: f64,
+    /// The passage. In clear, because the reader is a person and not a prompt —
+    /// `Untrusted` serialises transparently, exactly as `routes::desk` sends a
+    /// colleague's message.
+    content: Untrusted<String>,
+    /// Always `untrusted`, and **not** read off the source row. See the module
+    /// docs: a passage is chosen by whoever wrote `q`, so no column can make it
+    /// trusted. Do not feed it back into a prompt.
+    trust: &'static str,
+}
+
 // ---------------------------------------------------------------------------
-// Handler
+// Handlers
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/knowledge/documents` — chunk, embed and store one document.
@@ -199,6 +394,181 @@ async fn create_document(
         })),
     )
         .into_response())
+}
+
+/// `GET /v1/knowledge/documents` — what this tenant has filed, oldest first.
+///
+/// **No text, and paged.** See [`DocumentSummary`] for the first and
+/// `routes::employees` for the second: same `after`/`limit`/`next_after`
+/// vocabulary, same "only a full page can have a successor" rule, so a founder
+/// who has walked one listing has walked this one.
+///
+/// The question it is really answering is *what did I file and who can read
+/// it*. Before this route the answer lived in a `source_id` the client may not
+/// have kept, and a document scoped to a team nobody is on looked exactly like
+/// one the whole company reads.
+async fn list_documents(
+    State(KnowledgeState { db, .. }): State<KnowledgeState>,
+    principal: Principal,
+    page: Result<Query<Page>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(page) = page.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let limit = page.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    // No `WHERE tenant_id`, and that is not an oversight: RLS adds it, and a
+    // hand-written filter here would be a second place for it to be forgotten.
+    // Another tenant's document is absent from this page rather than refused.
+    //
+    // The chunk count is a correlated subquery rather than a `GROUP BY`, and it
+    // is cheap for the same reason: `knowledge_chunks_source_idx` is
+    // `(source_id, ordinal)`, so it is one index-only count per row of a page
+    // that is at most `MAX_LIMIT` long, and a `LEFT JOIN ... GROUP BY` would
+    // have to aggregate before it could apply the keyset limit.
+    let rows: Vec<SummaryRow> = sqlx::query_as(
+        "SELECT s.id, s.employee_id, s.team_id, s.title, s.uri, s.kind, s.trust_label, \
+                (SELECT count(*) FROM knowledge_chunks c WHERE c.source_id = s.id), \
+                s.created_at \
+           FROM knowledge_sources s \
+          WHERE ($1::uuid IS NULL OR s.id > $1) \
+          ORDER BY s.id \
+          LIMIT $2",
+    )
+    .bind(page.after)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(StoreError::from)?;
+    tx.rollback().await?;
+
+    let documents: Vec<DocumentSummary> = rows
+        .into_iter()
+        .map(
+            |(id, employee_id, team_id, title, uri, format, trust, chunks, created_at)| {
+                DocumentSummary {
+                    id,
+                    scope: match (employee_id, team_id) {
+                        (Some(_), _) => "employee",
+                        (None, Some(_)) => "team",
+                        (None, None) => "company",
+                    },
+                    employee_id,
+                    team_id,
+                    title,
+                    uri,
+                    format,
+                    chunks,
+                    trust,
+                    created_at,
+                }
+            },
+        )
+        .collect();
+
+    let next_after = (documents.len() as i64 == limit)
+        .then(|| documents.last().map(|last| last.id))
+        .flatten();
+
+    Ok(Json(json!({ "documents": documents, "next_after": next_after })).into_response())
+}
+
+/// `GET /v1/knowledge/search` — run the employee's own retrieval, by hand.
+///
+/// One call to `agentos_app::knowledge::recall` and nothing else, which is the
+/// whole design: see the module docs for why a second implementation would be
+/// two answers to one question. What that inherits, and what a caller has to
+/// know:
+///
+/// * **The scope is `employee_id`'s, resolved now.** Which team a seat is on is
+///   read out of `team_memberships` by the query itself, so this says what that
+///   seat would retrieve *this minute* rather than what it was entitled to when
+///   the document was filed.
+/// * **`ranked_by` is not decoration.** Without an embedding credential the
+///   vector leg is not run, so an empty `hits` means no document contained these
+///   words — not that the company has nothing on the subject. A person reading
+///   an empty result needs told which of those two it is.
+/// * **503, never an empty 200, when the store could not be searched.** `recall`
+///   is infallible by signature and folds a dead database, a timeout and a
+///   refused embedding call into one `unavailable` flag — deliberately, because
+///   a turn must answer the customer either way. A person asking "can my
+///   employee find this?" must not be told "no" by a failure, so the flag
+///   becomes a status code here. It is `knowledge_unavailable` and not the
+///   ingest path's `embedder_unavailable` because at this point nobody knows
+///   which leg failed, and a code that named the embedder would be inventing
+///   that detail.
+async fn search(
+    State(KnowledgeState { db, embedder }): State<KnowledgeState>,
+    principal: Principal,
+    query: Result<Query<SearchQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    if query.q.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "q: a search needs something to search for",
+        ));
+    }
+    let limit = query.limit.unwrap_or(RECALL_LIMIT).clamp(1, MAX_HITS);
+
+    // An employee id from another tenant is a 404 and not an empty result set,
+    // for `scope_of`'s reason pointed the other way: an unknown id would
+    // silently mean "no documents", which is indistinguishable from the answer
+    // a correct id gives when the scope is wrong — and telling those two apart
+    // is the entire reason this route exists.
+    let employee_id = match query.employee_id {
+        None => None,
+        Some(id) => {
+            let mut tx = db.tenant_tx(principal.tenant_id).await?;
+            let found = known(&mut tx, "SELECT id FROM employees WHERE id = $1", id).await;
+            tx.rollback().await?;
+            Some(EmployeeId::from_uuid(found?))
+        }
+    };
+
+    // Untrusted because it is: the words are the caller's, and `recall` parses
+    // them rather than rendering them. The wrapper costs nothing and keeps this
+    // call site identical to the turn's.
+    let question = Untrusted::new(query.q);
+    let recalled = recall(
+        &db,
+        &embedder,
+        principal.tenant_id,
+        &Recall {
+            question: &question,
+            employee_id,
+            limit,
+            timeout: RECALL_TIMEOUT,
+        },
+    )
+    .await;
+
+    if recalled.unavailable() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "knowledge_unavailable",
+            "the document store could not be searched; retry",
+        ));
+    }
+
+    let hits: Vec<HitView> = recalled
+        .hits()
+        .iter()
+        .map(|hit| HitView {
+            source_id: hit.source_id,
+            chunk_id: hit.chunk_id,
+            ordinal: hit.ordinal,
+            score: hit.score,
+            content: hit.content.clone(),
+            // A constant, not a column. The module docs argue it.
+            trust: "untrusted",
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "hits": hits,
+        // What actually ranked these, from the one function that knows.
+        "ranked_by": if embedder.is_semantic() { "words_and_meaning" } else { "words" },
+    }))
+    .into_response())
 }
 
 /// Turn the body's two optional ids into the one scope the document gets.
@@ -275,9 +645,7 @@ fn ingest_failed(err: KnowledgeError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use agentos_app::knowledge::{Recall, recall};
     use agentos_domain::ids::TenantId;
-    use agentos_domain::untrusted::Untrusted;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, header};
     use chrono::Utc;
@@ -346,6 +714,26 @@ mod tests {
                 req = req.header(header::AUTHORIZATION, format!("Bearer {secret}"));
             }
             let req = req.body(Body::from(body.to_string())).expect("request");
+
+            let response = self.app.clone().oneshot(req).await.expect("service");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+
+        /// GET `uri` as `secret`'s tenant.
+        async fn get(&self, uri: &str, secret: &str) -> (StatusCode, Value) {
+            let req = HttpRequest::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .body(Body::empty())
+                .expect("request");
 
             let response = self.app.clone().oneshot(req).await.expect("service");
             let status = response.status();
@@ -431,6 +819,23 @@ mod tests {
             .expect("insert team");
         tx.commit().await.expect("commit");
         id
+    }
+
+    /// Put `employee` on `team`. The retrieval predicate reads this table at
+    /// query time, so a team-scoped document is only reachable through a row
+    /// here.
+    async fn join_team(db: &Db, tenant: TenantId, employee: Uuid, team: Uuid) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO team_memberships (tenant_id, employee_id, team_id) VALUES ($1, $2, $3)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(employee)
+        .bind(team)
+        .execute(&mut **tx)
+        .await
+        .expect("insert membership");
+        tx.commit().await.expect("commit");
     }
 
     fn handbook(whose: &str) -> Value {
@@ -717,6 +1122,282 @@ mod tests {
             assert_eq!(problem["code"], "bad_request");
         }
 
+        h.teardown().await;
+    }
+
+    // -- reading it back ----------------------------------------------------
+
+    /// The listing walks by cursor and never carries a document's text.
+    ///
+    /// Both halves matter. The paging is `routes::employees`' contract — a full
+    /// page has a successor, a short one ends the walk — and the absence of the
+    /// content is what keeps a screen listing a hundred handbooks from being a
+    /// hundred handbooks on the wire.
+    #[tokio::test]
+    async fn the_listing_pages_by_cursor_and_never_carries_the_text() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        for whose in ["alpha one", "alpha two", "alpha three"] {
+            let (status, _) = h.post(handbook(whose), Some(SECRET_A)).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut uri = "/v1/knowledge/documents?limit=2".to_owned();
+        for _ in 0..4 {
+            let (status, page) = h.get(&uri, SECRET_A).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let documents = page["documents"].as_array().expect("documents").clone();
+
+            for document in &documents {
+                // Never the text, on any row, at any page size.
+                assert_eq!(document["text"], Value::Null, "{document}");
+                assert_eq!(document["content"], Value::Null, "{document}");
+                // What a founder needs instead: what it is, who it is for, how
+                // much of it there is, and where it came from.
+                assert_eq!(document["scope"], json!("company"));
+                assert_eq!(document["format"], json!("markdown"));
+                assert_eq!(document["title"], json!("Handbook"));
+                assert_eq!(document["uri"], json!("https://example.test/handbook.md"));
+                assert!(document["chunks"].as_i64().expect("chunks") >= 1);
+                assert!(document["created_at"].is_string());
+                seen.push(document["id"].as_str().expect("id").to_owned());
+            }
+
+            match page["next_after"].as_str() {
+                Some(after) => {
+                    assert_eq!(documents.len(), 2, "a cursor on a short page: {page}");
+                    uri = format!("/v1/knowledge/documents?limit=2&after={after}");
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            3,
+            "the walk did not see every document: {seen:?}"
+        );
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "a document was returned twice: {seen:?}");
+
+        let (status, problem) = h.get("/v1/knowledge/documents?limit=abc", SECRET_A).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+        h.teardown().await;
+    }
+
+    /// The trust label a founder reads off the listing is the column, and the
+    /// column is `untrusted` — for a document this tenant's own operator filed
+    /// with a valid key.
+    #[tokio::test]
+    async fn the_listing_reports_the_trust_label_that_was_recorded() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, created) = h.post(handbook("alpha"), Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, page) = h.get("/v1/knowledge/documents", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        let documents = page["documents"].as_array().expect("documents");
+        assert_eq!(documents.len(), 1, "{page}");
+        assert_eq!(documents[0]["id"], created["source_id"]);
+        assert_eq!(documents[0]["trust"], json!("untrusted"));
+
+        h.teardown().await;
+    }
+
+    /// A search finds the document that was just filed, says the passage is not
+    /// to be trusted, and says what ranked it.
+    ///
+    /// The last field is the one that is easy to leave out: this build has no
+    /// embedding credential, so an empty result means *no document contained
+    /// these words* rather than *the company has nothing on this*, and a person
+    /// reading the result has to be told which.
+    #[tokio::test]
+    async fn a_search_finds_a_filed_document_and_flags_it_untrusted() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, created) = h.post(handbook("alpha"), Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, found) = h
+            .get(&format!("/v1/knowledge/search?q={SKU}"), SECRET_A)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["ranked_by"], json!("words"));
+
+        let hits = found["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{found}");
+        assert_eq!(hits[0]["source_id"], created["source_id"]);
+        assert_eq!(hits[0]["trust"], json!("untrusted"));
+        assert_eq!(hits[0]["ordinal"], json!(0));
+        assert!(
+            hits[0]["content"].as_str().expect("content").contains(SKU),
+            "{found}"
+        );
+
+        // The same search from the other tenant, on the same words, comes back
+        // empty rather than refused: another tenant's document is invisible.
+        let (status, none) = h
+            .get(&format!("/v1/knowledge/search?q={SKU}"), SECRET_B)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(none["hits"].as_array().expect("hits").is_empty(), "{none}");
+
+        // A search for nothing is the caller's mistake, not an empty page.
+        let (status, problem) = h.get("/v1/knowledge/search?q=%20", SECRET_A).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+        h.teardown().await;
+    }
+
+    /// **The bug this pair of routes exists for.** A document filed to one team
+    /// is stored, indexed and billed for, and the employee on another team never
+    /// sees it — which used to be invisible from outside and is now two calls.
+    #[tokio::test]
+    async fn a_team_document_does_not_come_back_for_another_teams_employee() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let engineering = team(&h.db, h.a, "engineering").await;
+        let sales = team(&h.db, h.a, "sales").await;
+        let ada = employee(&h.db, h.a, "ada").await;
+        let raj = employee(&h.db, h.a, "raj").await;
+        join_team(&h.db, h.a, ada, engineering).await;
+        join_team(&h.db, h.a, raj, sales).await;
+
+        let mut body = handbook("alpha");
+        body["team_id"] = json!(engineering.to_string());
+        let (status, created) = h.post(body, Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+
+        // It is on file, plainly, and the listing says whose it is.
+        let (status, page) = h.get("/v1/knowledge/documents", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        let documents = page["documents"].as_array().expect("documents");
+        assert_eq!(documents[0]["scope"], json!("team"));
+        assert_eq!(documents[0]["team_id"], json!(engineering.to_string()));
+
+        // Engineering finds it; sales does not; the operator-wide search does.
+        for (who, expected) in [(ada, 1), (raj, 0)] {
+            let (status, found) = h
+                .get(
+                    &format!("/v1/knowledge/search?q={SKU}&employee_id={who}"),
+                    SECRET_A,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{found}");
+            assert_eq!(
+                found["hits"].as_array().expect("hits").len(),
+                expected,
+                "employee {who} saw the wrong thing: {found}"
+            );
+        }
+
+        let (status, found) = h
+            .get(&format!("/v1/knowledge/search?q={SKU}"), SECRET_A)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            found["hits"].as_array().expect("hits").len(),
+            1,
+            "the tenant-wide search lost a document it is entitled to: {found}"
+        );
+
+        h.teardown().await;
+    }
+
+    /// Searching as somebody else's employee is a 404, not a 403 and not an
+    /// empty result — an empty result is what a *correct* id gives when the
+    /// scope is wrong, and telling those two apart is the point of the route.
+    #[tokio::test]
+    async fn searching_as_another_tenants_employee_is_a_404() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, _) = h.post(handbook("alpha"), Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let theirs = employee(&h.db, h.b, "raj").await;
+        let (status, problem) = h
+            .get(
+                &format!("/v1/knowledge/search?q={SKU}&employee_id={theirs}"),
+                SECRET_A,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+        assert_eq!(problem["code"], json!("not_found"));
+
+        // And a misspelled parameter is refused rather than silently widening
+        // the search to the whole tenant.
+        let (status, problem) = h
+            .get(
+                &format!("/v1/knowledge/search?q={SKU}&employe_id={theirs}"),
+                SECRET_A,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+        h.teardown().await;
+    }
+
+    /// A search that could not reach the store is a 503, and the listing beside
+    /// it is unaffected.
+    ///
+    /// `recall` is infallible by signature: it folds a dead database, a timeout
+    /// and a refused embedding call into one `unavailable` flag, because a turn
+    /// must answer the customer either way. A person asking "can my employee
+    /// find this?" must not be told "no" by a failure, so the flag has to become
+    /// a status code — this asserts that it does.
+    ///
+    /// The failure is manufactured by holding every connection in the pool,
+    /// which is what a database having a bad minute looks like from inside this
+    /// process. It costs `RECALL_TIMEOUT` in wall clock and needs no provider
+    /// dependency — `agentos-providers` is deliberately absent from this crate,
+    /// so a failing embedder cannot be constructed here at all.
+    #[tokio::test]
+    async fn a_search_that_cannot_reach_the_store_is_a_503_and_not_an_empty_page() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+
+        let (status, _) = h.post(handbook("alpha"), Some(SECRET_A)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Every connection `Db::connect` allows, held open. `recall` opens its
+        // own and waits; the listing is asked before the pool is taken.
+        let (status, page) = h.get("/v1/knowledge/documents", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(h.db.tenant_tx(h.a).await.expect("tenant tx"));
+        }
+
+        let (status, problem) = h
+            .get(&format!("/v1/knowledge/search?q={SKU}"), SECRET_A)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed search answered as if the store were empty: {problem}"
+        );
+        assert_eq!(problem["code"], json!("knowledge_unavailable"));
+
+        for tx in held {
+            tx.rollback().await.expect("rollback");
+        }
         h.teardown().await;
     }
 }

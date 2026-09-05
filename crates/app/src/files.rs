@@ -448,7 +448,7 @@ impl Files for PgFiles {
 /// A free function rather than a method so that the deposit and the verification
 /// cannot drift into two different hashes — which would make every stored digest
 /// describe nothing and every verification pass.
-fn digest_of(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn digest_of(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 

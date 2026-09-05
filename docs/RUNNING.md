@@ -1,8 +1,9 @@
 # The company, running
 
-*Last walked: 2026-08-29 (seventh pass, after waves F through N. All five
-internal tools are in, and the sweep that followed them found the most serious
-defect of the programme — see "What the sweep found", below.)*
+*Last walked: 2026-09-05 (eighth pass. Invoicing became reachable from a turn;
+the seventh pass, after waves F through N, is when all five internal tools came
+in and the sweep that followed them found the most serious defect of the
+programme — see "What the sweep found", below.)*
 
 This is the map of what a company does once it is live, and how much of it is
 built. It exists because the shape is easy to draw and easy to get wrong in two
@@ -74,7 +75,9 @@ expensive defect available in this product.
 | Guided objectives interview | built | `/v1/interview`, `/v1/employees/{id}/interview` |
 | Connect tools (MCP) | built | `/v1/mcp/*`, `catalog.rs`, `mcp.rs` |
 | Budget and caps | built | `/v1/employees/{id}/spend-caps`, `/v1/billing`, `/v1/usage` |
-| Duration → forecast | built | `/v1/forecast`, `forecast.rs` |
+| Declared tariff → P&L per seat | built | `POST /v1/model` carries `usd_per_mtok_*`; `GET /v1/pnl?days=N`, `pnl.rs` |
+| Accounting export | built | `GET /v1/accounting/export?days=N&journal=invoices\|spend\|usage`, one CSV line per movement, foots to `/v1/pnl`; `accounting.rs` |
+| Duration → forecast, and the point mort | built | `/v1/forecast?days=N&infra_usd_per_month=M`, `forecast.rs` — tokens at the declared tariff (else the rate card, `cost_source` says which) + our contract prorated, ÷ the mean collected invoice = `break_even.invoices_to_break_even`; `null` with its reason, never a conversion |
 | Duration → enforced stop | built | `company_windows` (0054), `halt.rs`, `PUT /v1/window` |
 | A new company gets one | built, **required** | `POST /v1/companies` refuses without `window_ends_at` |
 | Hiring into a company with no window | allowed, on purpose | hiring is not acting: the seat is inert until a window exists |
@@ -90,7 +93,10 @@ expensive defect available in this product.
 | Chases (follow-ups) | built | `vertical.rs`, `due_chase` |
 | New turns | built | `turn.rs` |
 | Human requests | built | `/v1/capability-requests`, `/v1/approvals` |
+| Public booking page | built | `GET`/`POST /book/{domain}/{slug}` (no key; 404 unless `PUT /v1/employees/{id}/booking` opened the seat), `booking.rs`, 0083 — a promise on the stranger's thread, the reason as an untrusted message |
 | Emergency halt | built | `/v1/halt`, `halt.rs` |
+| Caps and the stop button, one read | built | `GET /v1/controls`, `controls.rs` — per seat the effective `max_turns_per_day`, `max_new_contacts_per_day`, channels, spend limits and caps with today's consumption, the layer that set each, `acts_on_its_own`; the halt with `stop: POST /v1/halt`; the window; the route that moves each limit |
+| What the gate refused | built | `/v1/refusals`, `refusals.rs` — one audit read, no table |
 
 ## The gaps, stated plainly
 
@@ -287,19 +293,25 @@ customer brings their own, the adapter has to have somewhere to plug in.
 
 | # | Tool | State on the date above |
 |---|---|---|
-| 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. |
-| 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. |
+| 1 | **A shared work queue** | **Built, and the loop closes.** `work_items` (0061, `posted_by` in 0064), `Backlog` port, `/v1/work`. An employee posts, another claims, works, closes — `propose`/`perform` carry it, and the brief carries the pool and the seat's own items with the id on each line. **And a stranger's message is a ticket:** `inbound::land` opens one item per thread on the addressed employee's board in the transaction that lands an email or a text — one open item per conversation by a partial unique index (0080), the title carrying channel, masked contact and date and never the sender's words — so no inbound message is off the board until the employee closes it. |
+| 2 | **A calendar** | **Built.** `appointments` (0063), `Calendar` port, `/v1/calendar`. An hour is promised, claimed when it comes round, and consumed. **And it replaces the sequencer:** a turn's `send_email` to somebody outside the company books a promise three days out on the thread (`follow_up`, 0082), a reply landing on that thread settles it in the same transaction, the wake tells the turn whose silence it is chasing and since when, and the chase is an ordinary `send_email` through the gate — at most two per thread, refused outright once the address is on the suppression list. |
 | 3 | **A thread with a human** | **Built, and it needed no table.** Half the mechanism was already here: a zero-turn seat is delivered to without being woken, which is the founder's own seat, so escalations already landed on a real desk. What was missing was a window and a pen — nothing read `messages.body`, and `GET /v1/employees/{id}/reports` gave a *count* of questions owed rather than a sentence. `GET`/`POST /v1/employees/{id}/desk` reads it and writes back; 0065 is one partial index. |
-| 4 | **Invoicing** | **Built.** `invoices` (0066), a seventeenth `ActionKind::InvoiceIssue`, `/v1/invoices`. No invoice can exist against a deal nobody won, and 0011 already refused `closed_won` without an approval — so the ceiling needed no invented number. **0071 makes the document issuable:** a gap-free number per company (a counter row, never a sequence — a sequence is exempt from rollback and therefore full of holes), line items that must total the head, a due date with no default term, and a credit note, because "corrected by a credit note" was 0066's argument for immutability and the remedy did not exist. **No tax rate, no PDF, nothing sent** — a rate is the founder's jurisdiction and the lines can carry one; the other two are still not built. |
-| 5 | **A file store** | **Built.** `files` (0067), `bytea` under the same RLS policy as the name beside it, `digest = sha256(content)` as a CHECK. No DELETE and no UPDATE grant — an UPDATE on `content` would swap a contract while leaving a row that looks untouched. |
+| 4 | **Invoicing** | **Built.** `invoices` (0066), a seventeenth `ActionKind::InvoiceIssue`, `/v1/invoices`. No invoice can exist against a deal nobody won, and 0011 already refused `closed_won` without an approval — so the ceiling needed no invented number. **0071 makes the document issuable:** a gap-free number per company (a counter row, never a sequence — a sequence is exempt from rollback and therefore full of holes), line items that must total the head, a due date with no default term, and a credit note, because "corrected by a credit note" was 0066's argument for immutability and the remedy did not exist. **No tax rate** — a rate is the founder's jurisdiction and the lines can carry one. **The document exists and leaves:** at issue, `invoice_document` renders the row as a one-page PDF written by hand (no PDF crate; `(`, `)` and `\` in any customer-typed text are escaped at the single exit from `Untrusted`) and files it as `invoice-<number>.pdf` in `files` in the same transaction as the number — a credit note gets `credit-note-<number>.pdf` naming the invoice it corrects. `Effects::send_invoice` puts it in front of the account's contact as an email attachment (`OutboundEmail.attachments`, base64 to Resend) on an `EmailSend` ruling of its own — a distinct act after the issue, because the gate's rules for an address are not its rules for a demand, and the address must be the billed account's contact or the send is refused (`not_the_accounts_contact`). **And the money comes back by itself:** a `stripe` webhook endpoint (0081, `Stripe-Signature` HMAC-SHA256 with a five-minute window) stores the raw delivery like the other three; `on_stripe_webhook` reads one of three events — `checkout.session.completed` (`payment_status = paid`, `amount_total`), `invoice.paid` (`status = paid`, `amount_paid`), `payment_intent.succeeded` (`status = succeeded`, `amount_received`); `stripe::FORMS` is the table — whose `metadata.invoice_number` names one of *this* tenant's invoices, compares the amount and `currency` with the demand, and calls `declare_paid` — an `invoice_paid` audit row carries the Stripe event id and `"source": "stripe"`; a different figure marks nothing and writes `invoice_payment_mismatch` instead. Replays collapse three times over (outbox dedupe on the event id, `paid_at IS NULL`, audit only on the settling call). An operator's `POST /v1/invoices/{id}/paid` writes the same `invoice_paid` row with the key as actor and `"source": "operator"`, and none on a replay. **Reachable from a turn:** `issue_invoice`, the twelfth row of `turn.rs::catalogue()`, proposed by the finance pack and no other, `Risk::High` so a turn that has read anything from outside is never shown it; and `send_invoice`, the thirteenth — an `EmailSend` whose address is the billed account's contact read from the register, never the model's, offered only where `InvoiceIssue` is (finance), `Risk::Low` like any email so a seat that has just read the customer asking for a copy can send one. The store's `closed_won` refusal comes back to the model as one sentence (`failed (no_won_deal): …`) rather than as the end of the run. |
+| 5 | **A file store** | **Built.** `files` (0067), `bytea` under the same RLS policy as the name beside it, `digest = sha256(content)` as a CHECK. No DELETE and no UPDATE grant — an UPDATE on `content` would swap a contract while leaving a row that looks untouched. **Not reachable from a turn, by design** — `files.rs`'s module docs carry the argument: a turn produces text and not bytes, the reader that most wants a contract is the one that must not then pay it, and `knowledge` already puts the *text* in front of a turn. |
 
 **The catalogue rows for tools 1 and 2 have landed and been measured.**
 `turn.rs::catalogue()` went from eight rows to eleven, both toolchoice pins
 moved, and so did a third nobody had planned for — `cost::digest` hashes the
 tool schemas too. Tool 3 needed no row at all: the verb an employee uses to
-answer the founder is `InternalSend`, already in the vocabulary. Tool 4's row is
-written out in place and deliberately unapplied, and tool 5 has no turn surface
-by design.
+answer the founder is `InternalSend`, already in the vocabulary. **Tool 4's row
+is applied now** — `issue_invoice`, the twelfth — and it moved exactly one pin:
+the toolchoice fixture wears the buyer's pack, which does not propose
+`InvoiceIssue`, so `TRUSTED_PROMPT` and `UNTRUSTED_PROMPT` stood still, while
+`cost::DIGEST` moved because Orizn's finance seat now carries a twelfth schema
+on every call. `send_invoice`, the thirteenth, moved the same one pin for the
+same reason — it is offered only where `InvoiceIssue` is. That digest is red
+until the re-measure is bought (`cargo run -p agentos-eval -- --live`, then
+`--dry-run 3`), which no agent may run. Tool 5 has no turn surface by design.
 
 **What the measurement said, and it is the reason to be slow about a twelfth
 row.** Tool choice did not move: 4/5 before and after, the same failing case,

@@ -1010,7 +1010,6 @@ async fn vertical(
         &company.db,
         &prober,
         &seller,
-        &vertical::orizn_binding(),
         principal,
         pack,
         objective,

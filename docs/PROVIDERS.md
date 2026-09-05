@@ -652,8 +652,11 @@ seeing `not_configured`, the system is working.
 
 **The payment port is now reached from a human's click**, not only from a turn:
 `POST /v1/approvals/{id}/approve` on a `payment_create` redeems the approval into
-a typed subject and calls `Effects::pay`, which answers `502
-payment_not_performed` with `payment_error: not_configured`. Writing an adapter
+a typed subject and calls `Effects::pay`. Until an adapter exists it does not get
+that far — the route asks `PaymentProvider::configured()` first and answers `501
+no_payment_rail` with the approval left `pending`, because redeeming into a port
+that cannot pay burns a human's decision for nothing. Bind an adapter and the
+same button pays. Writing an adapter
 for this port therefore has a live call site waiting for it — and two obligations
 beyond the trait, both in this file's next section: **reconcile before you
 create** (the `IdempotencyKey` the port is handed is derived from the Policy Gate

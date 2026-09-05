@@ -15,17 +15,18 @@ pub mod catalog; // the connectors we wrote down, so a customer clicks instead o
 pub mod effects; // U21
 pub mod files; // le classeur: the port a company's documents are kept behind, ours or the customer's
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them
+pub mod follow_up; // la relance: an unanswered email is a calendar promise, and a reply calls it off
 pub mod gate; // U20
 pub mod hosted; // running somebody else's stdio server, outside our process tree
 pub mod http_signature;
 pub mod identity;
 pub mod inbound; // U29
+pub mod invoice_document; // la facture comme document : un PDF écrit à la main, classé sous son numéro
 pub mod knowledge; // U26
 pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod model_access; // wave H: the tenant's own model, connected and proven
 pub mod oauth; // wave I: a consent page instead of a pasted token
-pub mod orizn; // wave 4 — the authoritative half of proof_of_need
 pub mod peer_keys;
 pub mod pool_ops;
 pub mod prompt; // U23
@@ -40,6 +41,7 @@ pub mod rolepack_sales; // wave 12
 pub mod rolepack_service; // customer success, growth, finance
 pub mod secrets; // U22
 pub mod sourcing;
+pub mod stripe; // une livraison Stripe encaisse une facture : le quatrième schéma de webhook
 pub mod turn; // U25
 pub mod vertical; // le fil du pack de rôle vers une verticale
 pub mod webhooks; // wave M: whose provider callback this is, when there is more than one customer

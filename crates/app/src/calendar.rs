@@ -46,12 +46,16 @@
 //! # What this port deliberately does not carry
 //!
 //! **Cancelling.** `appointments.rang_at` written before the instant is a
-//! cancellation — see `migrations/0063_appointments.sql` — and nothing has asked
-//! for one. When something does, it is `PUT /v1/calendar/{id}` writing our own
-//! table and it is **not** a trait method, for the reason [`crate::backlog`]
-//! keeps ranking and assignment off its trait: a company on Google Calendar
-//! cancels *in Google Calendar*, and a port verb for it would be a second,
-//! losing cancellation beside the customer's real one.
+//! cancellation — see `migrations/0063_appointments.sql` — and the one thing
+//! that asks for it today does it as a store write and **not** as a trait
+//! method: a reply landing on a thread settles the follow-up
+//! [`crate::follow_up`] promised on it, from `inbound::land`, through
+//! `agentos_store::calendar::cancel_for_conversation`. That stays off this
+//! trait for the reason [`crate::backlog`] keeps ranking and assignment off
+//! its trait: a company on Google Calendar cancels *in Google Calendar*, and a
+//! port verb for it would be a second, losing cancellation beside the
+//! customer's real one. An operator's cancel, the day one is asked for, is
+//! `PUT /v1/calendar/{id}` writing our own table the same way.
 //!
 //! **Whose diary it is.** [`Calendar::book`] has no employee argument, and that
 //! absence is a security property rather than an ergonomic one — see the

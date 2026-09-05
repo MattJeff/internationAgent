@@ -94,7 +94,7 @@ work. Do not embellish it, do not extrapolate one wrong pair into a claim \
 about their whole catalogue, and do not imply you have audited more than you \
 ran.
 
-# Never open on being more up to date
+# The gap is categorical, not temporal
 
 Ten regulatory cases were put through the four sources anyone can query. Free \
 Wikipedia answered 78% of them correctly, Sherpa 57%, VisaHQ and iVisa none. \
@@ -102,47 +102,65 @@ Wikipedia beats every paid provider that was tested — and on the Croatian \
 case, Wikipedia and Sherpa were both right while Orizn's own database was \
 wrong.
 
-So \"your data is stale and ours is fresh\" is an argument you lose in one \
-click, in front of the person you are trying to sell to, and the worst version \
-of losing it is having asserted our own error in writing. Do not open on it. \
-Do not imply it. If a prospect raises freshness, agree that a free source is \
-often current and move to what a free source does not have.
+So you never tell a prospect that a value on their page is wrong. Not the \
+requirement, not the stay length, not the fee. A sentence of that shape is an \
+argument you lose in one click, in front of the person you are trying to sell \
+to, and the worst version of losing it is having asserted our own error in \
+writing. Do not open on freshness. Do not imply it. If a prospect raises it, \
+agree that a free source is often current and move to what a free source does \
+not have.
 
-The four cases where every single source failed are what to open on:
+What you show instead is that a category does not exist on their page, and \
+what its absence costs them. Four categories, the four where every single \
+source failed:
 
 1. **The official consular fee.** Nobody publishes it. A page showing \"from \
-$69.99\" is showing a commission with the government's fee left out, and the \
-traveller cannot tell which is which.
+$69.99\" is showing a commission with the government's fee left out, and a \
+page showing a visa with no fee at all is showing the traveller nothing to \
+budget; either way they cannot tell what the state charges.
 2. **A regime resting on a revocable unilateral tolerance** rather than on a \
-treaty. Not one source in four flags it. We cannot detect this from a page \
-either — if you believe you have found one, it goes to a human.
+treaty. Mali and Niger outside ECOWAS enter on a tolerance that can be \
+withdrawn overnight, and not one source in four flags it. We cannot detect \
+this from a page either — if you believe you have found one, it goes to a \
+human.
 3. **A free visa on arrival read as a visa exemption.** Three sources in four \
 conflate them. They are not the same: on arrival a border officer can refuse, \
-and the carrier that boarded the passenger pays for the refusal.
+and the carrier that boarded the passenger as exempt pays for the refusal. A \
+page that says \"visa on arrival, free\" and never says it is not an \
+exemption is missing this category.
 4. **A quiet bilateral agreement.** India and the Maldives have been 90 days \
-since 2019; two paid sources still say 30.
+since 2019; two paid sources still say 30, because nobody tracks the \
+agreement. A page that states a stay length and nothing about what it rests \
+on is missing this category, and the number under the agreement is the \
+illustration of what that line would have said.
 
-The gap is not that they are behind. It is that a category is missing.
+Each has a price the prospect already pays: the fine and the return flight for \
+a passenger boarded on the wrong category, the refund and the chargeback for a \
+booking that could not be flown, the support ticket for a traveller who paid \
+for what they did not need. Name the category, name the cost, and let the \
+fact do the work.
 
 # What you may put in writing, and what stops in the building
 
-Before you send any sentence about somebody's product, delete every clause in \
-it that states what the entry rule actually is. If the finding still stands, \
-send it. If nothing is left, it does not go out — it goes to a human, with the \
-evidence and the source.
+Before you send any sentence about somebody's product, ask which of the four \
+categories their page does not display at all. If you can name one, send it, \
+with what their page shows instead quoted as data. If you cannot, it does not \
+go out — it goes to a human, with the evidence and the source.
 
-Stands on its own, because the evidence is their own page and a screenshot \
-settles it: their flow shows nothing at all for this pair; their flow prices \
-the visa and never says whether that price is the consular fee or their own \
-service fee; their flow says both that no visa is required and that a visa is \
-issued on arrival.
+Sendable, because the evidence is their own page and a screenshot settles it: \
+their flow shows nothing at all for this pair; a visa with no line for the \
+official consular fee, or a price that never says whose fee it is; a visa on \
+arrival that reads as an exemption and is never distinguished from one; a stay \
+length with nothing about the agreement it rests on. In that last case, and \
+only there, the entitlement under the agreement is quoted beside its source \
+and its date as the illustration of the missing line — never as a correction.
 
-Does not stand on its own, because it is made of nothing but our database: \
-their stated requirement differs from ours; their stay length is shorter than \
-the entitlement we hold. Both are worth finding and worth handing over. Neither \
-is yours to assert, for the reason above — our database has been wrong, and a \
-prospect who checks and finds we were wrong is a prospect who is finished with \
-us.
+Not sendable, ever: that their stated requirement differs from ours. That \
+finding is real and it is filed; it goes to a human, because it is made of \
+nothing but our own database, and our database has been wrong. It cannot be \
+produced today — this deployment has no authoritative source wired — and the \
+rule stands for the day one is: a prospect who checks and finds we were wrong \
+is a prospect who is finished with us.
 
 # What you may say about Orizn
 
@@ -521,13 +539,14 @@ impl RolePack {
                 Stage::Evidence,
                 "For each account, run a specific passport and destination pair through that \
                  flow yourself and record exactly what it showed: the pair, the page or step, \
-                 the date and the wording. Look for the categorical defects, not for a stale \
-                 value: a flow that shows nothing at all for the pair, a flow that prices the \
-                 visa without saying whether that is the consular fee or its own, a flow that \
-                 says both that no visa is required and that a visa is issued on arrival. \
-                 Reproduce every finding a second time before it leaves this machine. An \
-                 account you cannot reproduce a finding for gets no approach — report it as no \
-                 finding.",
+                 the date and the wording. Look for a category the flow does not display, \
+                 never for a wrong value: a flow that shows nothing at all for the pair, a \
+                 visa with no line for the official consular fee or a price that never says \
+                 whose fee it is, a visa on arrival that reads as an exemption and is never \
+                 distinguished from one, a stay length with nothing about the agreement it \
+                 rests on. Reproduce every finding a second time before it leaves this \
+                 machine. An account you cannot reproduce a finding for, or whose flow shows \
+                 every category, gets no approach — report it as no finding.",
             ),
             Task::new(
                 Stage::Contact,
@@ -555,9 +574,9 @@ impl RolePack {
                 Stage::Handoff,
                 "Hand each qualified account to a human with the finding, its reproduction \
                  steps and the qualification answers. Hand over the findings you were not \
-                 allowed to send as well — a requirement or a stay length that differs from \
-                 ours is worth a human's judgement and was never yours to assert. Pricing, \
-                 SLAs and contract terms are theirs to give: quote no price and sign nothing.",
+                 allowed to send as well — a requirement that differs from ours is worth a \
+                 human's judgement and was never yours to assert. Pricing, SLAs and contract \
+                 terms are theirs to give: quote no price and sign nothing.",
             ),
         ]
     }
@@ -1270,12 +1289,18 @@ mod tests {
             // The criterion. Every one of these is a sentence the seller would
             // otherwise get wrong in the direction that cannot be walked back.
             "Wikipedia", // the argument we lose in one click
-            "Do not open on it",
-            "consular fee",         // category 1
-            "unilateral tolerance", // category 2, and that we cannot detect it
-            "visa on arrival",      // category 3
-            "bilateral agreement",  // category 4
-            "delete every clause",  // the test a claim has to pass
+            "Do not open on freshness",
+            "never tell a prospect that a value on their page is wrong",
+            "consular fee",            // category 1
+            "unilateral tolerance",    // category 2, and that we cannot detect it
+            "Mali and Niger",          // its example
+            "visa on arrival",         // category 3
+            "bilateral agreement",     // category 4
+            "India and the Maldives",  // its example
+            "does not display at all", // the test a claim has to pass
+            // What a missing category costs, in the prospect's currency.
+            "fine and the return flight",
+            "refund and the chargeback",
         ] {
             assert!(
                 briefing.contains(topic),
@@ -1285,11 +1310,21 @@ mod tests {
 
         // And it no longer briefs the criterion the measurement killed: the
         // seller's advantage was "when the answer is wrong, stale or missing",
-        // and free Wikipedia is more accurate than every paid source tested.
-        assert!(
-            !briefing.contains("wrong, stale or missing"),
-            "the briefing still sells on being more accurate than the market"
-        );
+        // and free Wikipedia beat every paid source tested. The words below are
+        // the temporal argument in every language it has been made in, and none
+        // of them may appear.
+        for temporal in [
+            "wrong, stale or missing",
+            "plus à jour",
+            "more accurate",
+            "fresher",
+            "more up to date",
+        ] {
+            assert!(
+                !briefing.contains(temporal),
+                "the briefing still sells on {temporal:?}"
+            );
+        }
     }
 
     // -- the plan ----------------------------------------------------------

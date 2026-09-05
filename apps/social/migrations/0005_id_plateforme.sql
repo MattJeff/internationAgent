@@ -1,0 +1,13 @@
+-- 0005_id_plateforme : l'id numerique du compte chez la plateforme.
+--
+-- Le handle de social_accounts porte le username X (data.username de
+-- /2/users/me) — mais les chemins /2/users/{id}/likes, /bookmarks, /retweets
+-- et /mentions exigent l'ID NUMERIQUE, que la meme reponse /2/users/me donne
+-- (data.id) et que l'on jetait. On le garde ici. Chez LinkedIn l'URN d'auteur
+-- sert deja d'identifiant partout : handle et platform_user_id sont le meme.
+--
+-- NULL = compte connecte avant cette colonne : la messagerie refuse alors par
+-- une erreur nommee (compte_sans_id_plateforme) qui renvoie vers
+-- account_connect_url — le meme re-consentement que pour les scopes dm.*
+-- ajoutes en meme temps, donc un seul geste humain repare les deux.
+ALTER TABLE social_accounts ADD COLUMN platform_user_id text;

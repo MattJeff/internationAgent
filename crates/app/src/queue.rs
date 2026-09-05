@@ -809,42 +809,15 @@ pub async fn reconcile_opt_outs(
     let mut tx = db.tenant_tx(tenant).await?;
     let mut recorded = 0;
     for raw in &addresses {
-        // Parsed rather than trusted: `suppressions_address_normalised` CHECKs
-        // the shape, so an address the platform spells differently would fail
-        // the INSERT and take the whole reconcile — and everybody else's
-        // opt-out — down with it. `EmailAddress::parse` lower-cases both
-        // halves, which is the spelling the column and the lookup agree on.
-        let Ok(address) = EmailAddress::parse(raw) else {
-            // Not fatal, and loud. One unparseable entry must not cost the
-            // other opt-outs their row; it also must not pass silently, because
-            // the person behind it is still on the platform's list and no
-            // longer on ours.
-            tracing::error!(
-                "the sending platform named an address we cannot parse; it is NOT suppressed \
-                 here and must be recorded by hand"
-            );
-            continue;
-        };
-        revenue_store::suppress(
-            &mut tx,
-            Uuid::now_v7(),
-            &revenue_store::NewSuppression {
-                scope: revenue_store::Scope::Tenant,
-                channel: revenue_store::Channel::Email,
-                address: &address.to_string(),
-                reason: "opt_out",
-                // We know the address, not which `contacts` row it was — and
-                // the trigger does not need one: it matches on the address.
-                contact_id: None,
-                // The legal record of where this came from. This row is the
-                // audit line for `Effects::opted_out`, which writes none of its
-                // own; see that method.
-                note: Some("unsubscribed on the outbound sending platform"),
-                suppressed_at: now,
-            },
-        )
-        .await?;
-        recorded += 1;
+        // Une entrée illisible ne doit pas coûter leur ligne aux autres
+        // opt-outs du lot, et elle ne doit pas passer en silence non plus :
+        // `record_platform_opt_out` journalise et rend `false`. La porte
+        // poussée (`inbound::record_smartlead_unsubscribe`) lit le même `false`
+        // et en fait une erreur terminale, parce qu'elle n'a qu'une personne
+        // dans la livraison et que la perdre serait perdre le tout.
+        if record_platform_opt_out(&mut tx, raw, now).await? {
+            recorded += 1;
+        }
     }
     tx.commit().await?;
 
@@ -854,6 +827,63 @@ pub async fn reconcile_opt_outs(
          on every channel"
     );
     Ok(recorded)
+}
+
+/// Écrire l'opt-out d'une personne que la plateforme d'envoi nomme.
+///
+/// **Un seul écrivain pour les deux portes**, et c'est la raison d'être de
+/// cette fonction. [`reconcile_opt_outs`] *tire* la liste de la plateforme ;
+/// `inbound::record_smartlead_unsubscribe` reçoit ce que Smartlead *pousse*.
+/// Deux écrivains sur une table append-only depuis deux côtés est exactement la
+/// couture qui fabrique un bug — `inbound::record_refusal` a payé pour
+/// l'apprendre et le raconte au-dessus de lui. Ici, la conséquence concrète est
+/// que la même personne arrivant par les deux portes est une ligne et pas deux :
+/// même orthographe de l'adresse, donc même clé `suppressions_address_key`, donc
+/// `ON CONFLICT DO NOTHING`.
+///
+/// Rend `false` quand l'adresse n'est pas stockable et que rien n'a été écrit.
+/// Ce n'est pas une erreur ici : c'est l'appelant qui sait ce que ça lui coûte —
+/// une entrée d'un lot pour le tirage, toute la livraison pour la poussée.
+///
+/// `EmailAddress::parse` plutôt que la chaîne brute : `suppressions_address_normalised`
+/// CHECKe la forme, donc une adresse que la plateforme épelle autrement ferait
+/// échouer l'INSERT et emporterait la transaction avec elle. Le parseur
+/// minuscule les deux moitiés, ce qui est l'orthographe sur laquelle la colonne
+/// et `revenue_suppression_of` s'accordent.
+pub async fn record_platform_opt_out(
+    tx: &mut TenantTx<'_>,
+    raw: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, RevenueError> {
+    let Ok(address) = EmailAddress::parse(raw) else {
+        // Sans l'adresse dans la ligne : elle est dans le lot, et une adresse
+        // qu'on n'a pas su stocker reste une personne.
+        tracing::error!(
+            "the sending platform named an address we cannot parse; it is NOT suppressed \
+             here and must be recorded by hand"
+        );
+        return Ok(false);
+    };
+    revenue_store::suppress(
+        tx,
+        Uuid::now_v7(),
+        &revenue_store::NewSuppression {
+            scope: revenue_store::Scope::Tenant,
+            channel: revenue_store::Channel::Email,
+            address: &address.to_string(),
+            reason: "opt_out",
+            // We know the address, not which `contacts` row it was — and
+            // the trigger does not need one: it matches on the address.
+            contact_id: None,
+            // The legal record of where this came from. This row is the
+            // audit line for `Effects::opted_out`, which writes none of its
+            // own; see that method.
+            note: Some("unsubscribed on the outbound sending platform"),
+            suppressed_at: now,
+        },
+    )
+    .await?;
+    Ok(true)
 }
 
 fn push_row<'a>(out: &mut String, fields: impl Iterator<Item = &'a str>) {

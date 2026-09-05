@@ -1,0 +1,35 @@
+-- 0082_une_relance_est_une_promesse_sur_un_fil: a follow-up is a promise the
+-- calendar already knows how to keep, and the thread it is about is a column.
+--
+-- A company pays a sequencer for one thing: a prospect who did not answer is
+-- written to again without anybody remembering to. The employee could already
+-- promise an hour and be woken by it (0063); what it lacked was the reflex.
+-- `agentos_app::follow_up` supplies it — a `send_email` to somebody outside
+-- the company books a promise three days out, in the transaction that records
+-- the send on the thread — and the promise has to name the thread, for two
+-- reads that have no other key:
+--
+--   * **A reply cancels it.** `inbound::land` settles the outstanding promise
+--     on the conversation the reply landed on, in the same transaction, using
+--     0068's spelling (`rang_at` before `at`, `outcome = 'cancelled'`). Nothing
+--     else on the row can say which promise a reply answers; `subject` is a
+--     line for a person and the employee, never a join key.
+--   * **The wake says what to do.** When the hour comes round the turn is told
+--     "follow up with a…@their.example, no reply since <date>", and both halves
+--     of that sentence are read off the conversation and its last outbound
+--     message.
+--
+-- The shape is 0080's, for 0080's reasons: nullable, because an hour a person
+-- promised through `POST /v1/calendar` or a turn's `promise_an_hour` is about
+-- nothing on any thread; `on delete set null` and not `cascade`, so a future
+-- `DELETE` on a thread cannot silently erase the record that a promise was
+-- made about it. No index: the reads that filter on it are one conversation's
+-- outstanding promises, in a table 0063 describes as holding a handful a day,
+-- and `appointments_due_idx` still serves the claim untouched.
+--
+-- No RLS or grant change, checked rather than assumed: 0063's policy carries
+-- `using` and `with check` on `tenant_id`, both table-wide, so the column is
+-- inside them from the moment it exists.
+
+alter table appointments
+  add column if not exists conversation_id uuid references conversations (id) on delete set null;

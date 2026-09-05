@@ -2873,7 +2873,23 @@ mod tests {
             db.clone(),
             adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
             EngineConfig {
-                call_timeout: Duration::from_millis(50),
+                // **Not 50ms, and the difference is a CI runner.** This bound
+                // applies to *every* step's call, not only the hanging one —
+                // `converge` wraps each in `tokio::time::timeout(call_timeout,
+                // …)`. `identity` generates an Ed25519 key and seals it under
+                // an envelope, which is real CPU, and on a two-core runner it
+                // exceeded 50ms: identity failed, and `Step::Phone` came back
+                // `Blocked { on: Identity }` instead of the timeout this test
+                // is about. It passed 5/5 locally in 0.12s, which is the shape
+                // of a bound that measures the machine rather than the claim.
+                //
+                // Nothing is weakened by the larger number. `HangingTelephony`
+                // blocks **forever**, so any finite timeout fails it — 50ms was
+                // never what this test proved — and the `elapsed() < 5s`
+                // assertion below still bounds the whole run, which is the
+                // property that would actually break if the timeout stopped
+                // firing.
+                call_timeout: Duration::from_millis(500),
                 ..cfg()
             },
         );

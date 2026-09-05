@@ -159,7 +159,23 @@ pub fn ceiling_calls_per_turn() -> f64 {
 
 /// Digest of everything the recorded runs were measured against. See
 /// [`digest`], and the module docs for why this is the load-bearing part.
-pub const DIGEST: &str = "e52428c12582296e";
+///
+/// # Déplacé le 2026-09-01, et voici de combien les chiffres sont périmés
+///
+/// Le briefing du rôle commercial a perdu deux paragraphes : ceux qui
+/// décrivaient les deux constats reposant sur une ligne à nous, devenus
+/// inatteignables quand le client MCP de l'API visa d'Orizn est sorti du
+/// produit — voir la doc de module de `vertical`. Ce texte est du **prompt**,
+/// donc du jeton, donc `digest` a bougé et il devait bouger.
+///
+/// Ce que cela dit des figures ci-dessous : elles ont été échantillonnées
+/// contre un préfixe légèrement plus long. L'écart est un paragraphe sur un
+/// briefing, à la baisse, sur un seul des six sièges — assez pour que le pin
+/// refuse de se taire, pas assez pour invalider un ordre de grandeur affiché à
+/// ±20 %. Elles restent des mesures d'une entreprise qui n'existe plus
+/// exactement, et c'est précisément ce que ce pin sert à rendre impossible à
+/// oublier.
+pub const DIGEST: &str = "cf858d4d0b3d5f43";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
@@ -432,10 +448,10 @@ pub fn charters() -> Vec<(&'static str, Charter)> {
 ///
 /// Two incompatible sentences about one trip is
 /// `proof_of_need::Finding::Conflates` — one of the three findings that stand on
-/// the prospect's own page alone. `allowed_mcp_tools` is empty in both operator
-/// documents, so `vertical::orizn_binding`'s lookup is refused by name and
-/// `sell` runs with no authority; the two findings that need Orizn's own row are
-/// unavailable on this surface. A panel that produced one of those would file
+/// the prospect's own page alone. `sell` tourne sans autorité — aucune source
+/// n'est branchée sur ce déploiement, voir la doc de module de
+/// `proof_of_need` — donc les deux constatations qui demandent une ligne à nous
+/// sont indisponibles sur cette surface. A panel that produced one of those would file
 /// evidence no employee may send, which measures a different path.
 pub struct Prospect {
     /// `accounts.legal_name`. Ours, and the only name in the vertical's note.

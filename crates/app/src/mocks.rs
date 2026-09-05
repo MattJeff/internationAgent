@@ -50,7 +50,7 @@ use agentos_providers::Secret;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
 use agentos_providers::cdp::CdpWebsocket;
-use agentos_providers::email::{EmailProvider, MockEmailProvider, ProviderMessageId};
+use agentos_providers::email::{EmailProvider, MockEmailProvider};
 use agentos_providers::email_resend::ResendEmailProvider;
 use agentos_providers::embedder::Embedder;
 use agentos_providers::embedder_openai::OpenAiEmbedder;
@@ -97,6 +97,13 @@ pub use agentos_providers::browser::MockBrowser;
 // send-path tests could construct the `Ports` but never read what reached the
 // platform — which is the only thing those tests are about.
 pub use agentos_providers::leads::MockLeadSink;
+
+// And a receipt, for the fourth time and the same reason: `routes::approvals`
+// is the only caller of `Effects::pay`, and the test that has to prove a
+// *configured* rail still pays — the one case the route's new upfront refusal
+// must not swallow — has to implement `PaymentProvider` in the binary, which
+// means naming what `pay` returns.
+pub use agentos_providers::email::ProviderMessageId;
 
 // And the vault, for the fourth time and the same reason: the provisioner's
 // identity canary is written and read from the binary, which may not name
@@ -800,6 +807,12 @@ impl PaymentProvider for NotConfigured {
     ) -> Result<ProviderMessageId, ProviderError> {
         tracing::error!(%amount, "payment refused: this build has no payment adapter");
         Err(refuse())
+    }
+
+    /// No rail, and every caller that can act on that before spending
+    /// something should. See [`PaymentProvider::configured`].
+    fn configured(&self) -> bool {
+        false
     }
 }
 

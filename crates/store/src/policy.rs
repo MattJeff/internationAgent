@@ -280,6 +280,52 @@ pub async fn load(
     tx: &mut TenantTx<'_>,
     employee_id: EmployeeId,
 ) -> Result<EffectivePolicy, PolicyLoadError> {
+    load_layers(tx, employee_id).await?.effective()
+}
+
+/// The four layers [`load`] intersects, **before** the intersection — so a
+/// reader can say which one set each cap. `None` is a layer nobody wrote,
+/// which [`Layers::effective`] fills from the one above, exactly as `load`
+/// always has: this is `load` with the last line left off, not a second loader.
+#[derive(Debug, Clone)]
+pub struct Layers {
+    pub platform: PolicyLimits,
+    pub tenant: Option<PolicyLimits>,
+    pub role: Option<PolicyLimits>,
+    pub employee: Option<PolicyLimits>,
+}
+
+impl Layers {
+    /// The layers somebody actually wrote, top down. An inherited layer is
+    /// deliberately absent: it did not *set* anything.
+    pub fn written(&self) -> impl Iterator<Item = (PolicyLayer, &PolicyLimits)> {
+        [
+            (PolicyLayer::Platform, Some(&self.platform)),
+            (PolicyLayer::Tenant, self.tenant.as_ref()),
+            (PolicyLayer::Role, self.role.as_ref()),
+            (PolicyLayer::Employee, self.employee.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(layer, limits)| limits.map(|l| (layer, l)))
+    }
+
+    pub fn effective(&self) -> Result<EffectivePolicy, PolicyLoadError> {
+        // Inheritance: an absent layer is the layer above, not the empty layer.
+        // `PolicyLimits::default()` grants nothing, so using it here would turn
+        // a tenant that never wrote a role layer into a tenant that can do
+        // nothing.
+        let tenant = self.tenant.as_ref().unwrap_or(&self.platform);
+        let role = self.role.as_ref().unwrap_or(tenant);
+        let employee = self.employee.as_ref().unwrap_or(role);
+        EffectivePolicy::try_new(&self.platform, tenant, role, employee)
+            .map_err(|source| PolicyLoadError::Irreconcilable { source })
+    }
+}
+
+pub async fn load_layers(
+    tx: &mut TenantTx<'_>,
+    employee_id: EmployeeId,
+) -> Result<Layers, PolicyLoadError> {
     let rows: Vec<LayerRow> = sqlx::query_as(SELECT_ACTIVE_LAYERS)
         .bind(tx.tenant_id().as_uuid())
         .bind(employee_id.as_uuid())
@@ -293,18 +339,14 @@ pub async fn load(
         let (layer, limits) = row.into_limits()?;
         found[layer as usize] = Some(limits);
     }
-    let [platform, tenant, role_layer, employee] = found;
+    let [platform, tenant, role, employee] = found;
 
-    // Inheritance: an absent layer is the layer above, not the empty layer.
-    // `PolicyLimits::default()` grants nothing, so using it here would turn a
-    // tenant that never wrote a role layer into a tenant that can do nothing.
-    let platform = platform.ok_or(PolicyLoadError::NoPlatformLayer)?;
-    let tenant = tenant.unwrap_or_else(|| platform.clone());
-    let role_layer = role_layer.unwrap_or_else(|| tenant.clone());
-    let employee = employee.unwrap_or_else(|| role_layer.clone());
-
-    EffectivePolicy::try_new(&platform, &tenant, &role_layer, &employee)
-        .map_err(|source| PolicyLoadError::Irreconcilable { source })
+    Ok(Layers {
+        platform: platform.ok_or(PolicyLoadError::NoPlatformLayer)?,
+        tenant,
+        role,
+        employee,
+    })
 }
 
 /// The intersected `max_turns_per_day` of **many** employees, in one statement.
@@ -1284,6 +1326,55 @@ pub async fn create_tenant(
     Ok(version)
 }
 
+/// Serialise every writer of **this tenant's** policy, for the length of the
+/// transaction.
+///
+/// # What it is for, and why a row lock is not what is wanted
+///
+/// [`install_layer_tx`] is read-then-write twice over: it reads the active
+/// version, reads the layer it is about to displace, and only then writes a new
+/// version carrying every *other* layer forward. Two of those running at once
+/// both read version `V`, both build a successor from `V`, and the one that
+/// commits second silently drops the first one's layer — a lost update whose
+/// symptom is a limit an operator watched succeed and that is not there.
+///
+/// A caller that decides something from the old layer — `routes::policy`, which
+/// refuses a replacement that is not contained in it — has the same race one
+/// level up and a worse outcome: two writers both compare against `V`'s layer,
+/// so the second can install something the first had just tightened away.
+/// Nothing about that is visible in either request.
+///
+/// A `SELECT … FOR UPDATE` on the active `policy_versions` row is the obvious
+/// lock and it is the wrong one. Under READ COMMITTED a locking read re-checks
+/// its `WHERE` after the lock is granted, and the predicate is `active` — which
+/// the writer ahead of us has just set to `false`. The second transaction would
+/// see **no rows**, conclude the tenant has no active version, and take
+/// [`active_version`]'s repair path: a fresh version with no layers at all. The
+/// lock intended to prevent a lost update would erase the whole policy instead.
+///
+/// So: a transaction-scoped advisory lock keyed on the tenant. It is one line,
+/// it is released by `COMMIT` or `ROLLBACK` whatever happens, it takes no
+/// privilege on any table and it locks a *name* rather than a row, so no
+/// predicate can move out from under it. `crates/app/src/inbound.rs` reaches for
+/// the same primitive for the same shape of problem.
+///
+/// It is `pub` because the check that must happen under it does not live here:
+/// a route reads the layer, decides, and writes, and all three have to be inside
+/// one hold. Taking it twice in one transaction is free — advisory locks are
+/// re-entrant within a session — so [`install_layer_tx`] takes it for itself as
+/// well and a caller cannot forget on its behalf.
+///
+/// ponytail: the key is the tenant, so it serialises a tenant's policy writes
+/// with each other and with nothing else. `hashtextextended` collisions across
+/// tenants cost an occasional wait and can cost nothing else.
+pub async fn lock_for_write(tx: &mut TenantTx<'_>) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("policy:{}", tx.tenant_id().as_uuid()))
+        .execute(&mut ***tx)
+        .await?;
+    Ok(())
+}
+
 /// This tenant's active policy version, created if the tenant has none.
 ///
 /// The creation is the second half of [`create_tenant`]'s invariant, from the
@@ -1387,9 +1478,6 @@ pub async fn install_layer(
     limits: &PolicyLimits,
     label: &str,
 ) -> Result<Installed, StoreError> {
-    let (layer, role_name, employee_id) = scope.columns();
-    let columns = Columns::from(limits);
-
     // A tenant transaction, not an admin one — unlike [`install_ceiling`], whose
     // row belongs to no tenant and is therefore unwritable under RLS. Here the
     // rows do belong to a tenant, `0006_policy.sql`'s WITH CHECK pins every
@@ -1397,7 +1485,47 @@ pub async fn install_layer(
     // cannot write into somebody else's policy: it addresses a tenant that is
     // simply not there.
     let mut tx = db.tenant_tx(tenant_id).await?;
-    let version = active_version(&mut tx).await?;
+    let installed = install_layer_tx(&mut tx, scope, limits, label).await?;
+    match installed {
+        // Nothing was written, so there is nothing to keep — and a commit here
+        // would still leave [`active_version`]'s repair row behind for a tenant
+        // that had none.
+        Installed::Unchanged(_) => tx.rollback().await?,
+        Installed::Version(_) => tx.commit().await?,
+    }
+    Ok(installed)
+}
+
+/// [`install_layer`] in a transaction the caller owns, so a decision taken from
+/// the old layer and the write that replaces it can be one atomic act.
+///
+/// Every word of [`install_layer`]'s documentation is about this function; what
+/// the wrapper adds is the transaction and the commit. This form exists because
+/// two things have to happen inside the same hold and neither belongs in this
+/// crate: the audit row that says a limit changed — `routes::policy` appends it,
+/// so a limit changed without a trail is a limit that was not changed — and the
+/// containment check that makes an HTTP replacement safe, which needs the layer
+/// this call is about to displace and needs it to still be there when the write
+/// lands.
+///
+/// It takes [`lock_for_write`] for itself. A caller that read something it is
+/// about to decide from must take it *before* that read; taking it twice in one
+/// transaction costs nothing.
+///
+/// The tenant comes from `tx` rather than from an argument, which is one fewer
+/// way for a write to name a tenant that row-level security is not pinned to.
+pub async fn install_layer_tx(
+    tx: &mut TenantTx<'_>,
+    scope: Scope<'_>,
+    limits: &PolicyLimits,
+    label: &str,
+) -> Result<Installed, StoreError> {
+    let tenant_id = tx.tenant_id();
+    let (layer, role_name, employee_id) = scope.columns();
+    let columns = Columns::from(limits);
+
+    lock_for_write(tx).await?;
+    let version = active_version(tx).await?;
 
     // The currency guard, before anything is written and against every layer
     // this one will be intersected with — the platform ceiling (visible through
@@ -1423,7 +1551,7 @@ pub async fn install_layer(
         .bind(layer.as_str())
         .bind(role_name)
         .bind(employee_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut ***tx)
         .await?;
         if let Some(clash) = clash {
             return Err(StoreError::conflict(format!(
@@ -1447,14 +1575,13 @@ pub async fn install_layer(
     .bind(layer.as_str())
     .bind(role_name)
     .bind(employee_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await?;
     // A row that does not parse is not "different", it is broken, and replacing
     // it is the repair — so it falls through to the write, like the ceiling's.
     if let Some(Ok((_, stored))) = current.map(LayerRow::into_limits)
         && stored == *limits
     {
-        tx.rollback().await?;
         return Ok(Installed::Unchanged(version));
     }
 
@@ -1466,7 +1593,7 @@ pub async fn install_layer(
     .bind(next)
     .bind(tenant_id.as_uuid())
     .bind(label)
-    .execute(&mut **tx)
+    .execute(&mut ***tx)
     .await?;
 
     // **Carry every other layer forward.** A tenant version holds all of this
@@ -1501,7 +1628,7 @@ pub async fn install_layer(
     .bind(layer.as_str())
     .bind(role_name)
     .bind(employee_id)
-    .execute(&mut **tx)
+    .execute(&mut ***tx)
     .await?;
 
     let insert = columns.bind_to(
@@ -1524,12 +1651,11 @@ pub async fn install_layer(
         .bind(role_name)
         .bind(employee_id),
     );
-    insert.execute(&mut **tx).await?;
+    insert.execute(&mut ***tx).await?;
 
     // Deactivate then activate, never one statement — `activate` is that rule,
     // and it is the same rule `install_ceiling` restates for the platform half.
-    activate(&mut tx, next).await?;
-    tx.commit().await?;
+    activate(tx, next).await?;
     Ok(Installed::Version(next))
 }
 

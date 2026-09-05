@@ -581,8 +581,8 @@ fn bearer(secret: Option<&str>) -> Vec<(&'static str, String)> {
 /// `Arc<dyn Llm>` inside a process this test only has a socket to, and there is
 /// no route that hands a prompt back.
 ///
-/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude` and reads a JSON
-/// event array back. The **conversation** goes to its stdin — never argv,
+/// `AGENTOS_LLM=cli` selects [`CliLlm`], which spawns `claude` and reads
+/// JSON Lines back — one event per line, `--output-format stream-json`. The **conversation** goes to its stdin — never argv,
 /// deliberately, because a conversation carries a counterparty's words — and
 /// the **system prompt** goes to `--system-prompt`, which is where it has to be
 /// for it to be the model's system prompt rather than a user message. So the
@@ -594,9 +594,14 @@ fn bearer(secret: Option<&str>) -> Vec<(&'static str, String)> {
 /// below are the bytes the running server produced, not a rendering this test
 /// asked a library for. What it costs is that the CLI backend flattens the
 /// structured request into one string — the system prompt, then the
-/// conversation, then the tool schemas as text — so the assertions are on
-/// substrings of a prompt rather than on typed fields. That is the same
-/// information; `llm_cli::render_prompt` is the only thing between them.
+/// conversation — so the assertions are on substrings of a prompt rather than
+/// on typed fields. That is the same information; `llm_cli::render_prompt` is
+/// the only thing between them.
+///
+/// The tools are the exception: they no longer travel in the prompt at all,
+/// they are declared over MCP. The script below asks that server for them and
+/// appends the names to the capture, which is why a `## tools` section still
+/// exists to assert on.
 struct FakeModel {
     dir: PathBuf,
 }
@@ -626,6 +631,23 @@ p="$(mktemp "$d/prompt.XXXXXXXX")"
 # every `prompt.*` a reader can see is either empty or whole.
 staging="$d/partial.$$"
 { printf '%s\n' "$@"; cat; } > "$staging"
+
+# Les schemas d'outils ne sont plus dans le prompt : ils partent par MCP, sur un
+# serveur de boucle locale que `--mcp-config` nomme — et cette valeur-la EST sur
+# argv, donc dans la capture. On lit `tools/list` exactement comme le vrai CLI
+# le lit, et on ecrit les noms dans la capture sous `## tools`. Sans ca ce
+# harnais ne peut plus rien affirmer sur ce que le tour a offert, et les
+# assertions du filtre de politique — la preuve de bout en bout qu'un outil
+# refuse n'est pas propose — n'auraient plus de source.
+url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/mcp' "$staging" | head -1)
+if [ -n "$url" ]; then
+  { printf '\n## tools\n'
+    curl -s -m 5 -H 'content-type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$url" \
+      | jq -r '.result.tools[]?.name | "- name: " + .'
+  } >> "$staging"
+fi
+
 mv "$staging" "$p"
 
 # Whose turn this is comes out of the prompt itself — the identity line the
@@ -648,7 +670,25 @@ if grep -q '^\[tool ' "$p"; then
   r="$d/reply.default"
 fi
 
-printf '[{"type":"result","result":%s,"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}]' "$(cat "$r")"
+# UNE LIGNE, pas un tableau : `--output-format stream-json` est du JSON Lines
+# et `llm_cli::parse_stream` lit `stdout.lines()`. Un tableau sur une ligne se
+# parse, mais `e["type"]` d'un tableau vaut null, donc aucun evenement `result`
+# n'est trouve — `cli_no_result`, que le probe de /v1/model rend en « la cle a
+# ete refusee ». C'est ce qui a casse ce test quand le parseur a change.
+# Un appel d'outil revient maintenant en bloc `tool_use` d'un evenement
+# `assistant`, prefixe `mcp__agentos__` par le CLI — `parse_stream` ne
+# re-gonfle plus une reponse en JSON strict. Les fichiers `reply.*` gardent
+# leur forme `{"tool": …, "input": …}` : c'est ici qu'on traduit.
+inner=$(jq -r . "$r")
+name=$(printf '%s' "$inner" | jq -r '.tool // empty')
+if [ -n "$name" ]; then
+  printf '{"type":"assistant","message":{"id":"msg_%s","content":[{"type":"tool_use","id":"toolu_%s","name":"mcp__agentos__%s","input":%s}]}}\n' \
+    "$$" "$$" "$name" "$(printf '%s' "$inner" | jq -c '.input // {}')"
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}\n'
+else
+  printf '{"type":"result","subtype":"success","is_error":false,"result":%s,"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}\n' \
+    "$(printf '%s' "$inner" | jq -c 'if .text then .text else tojson end')"
+fi
 "#;
 
 impl FakeModel {
@@ -1252,10 +1292,14 @@ const CHART: [(&str, &str, &str, &str, &str, &str); 7] = [
 ///
 /// * **A payment reaches the port and no further.** `mocks::ports_for` binds
 ///   `payments` to `NotConfigured`, which refuses by design — this build has no
-///   payment rail and picking one is SPEC §13's open decision. The approval
-///   route does now call `Effects::pay` (link eight), so what is asserted past
-///   the ruling is the two things that *are* observable: the refusal comes back
-///   as a `502` naming `not_configured`, and the ledger *gives the money back*.
+///   payment rail and picking one is SPEC §13's open decision. Two observable
+///   things are asserted past the ruling, and they are on two different paths.
+///   A payment an employee is *allowed* to make goes through `Effects::pay`,
+///   reaches the port, is refused, and the ledger *gives the money back*. A
+///   payment a **human approves** never reaches the port at all: the route asks
+///   the port whether this deployment can pay before it redeems, so the answer
+///   is `501 no_payment_rail` and the approval is left `pending` — spendable
+///   the day a rail exists, where it used to be burned for nothing.
 /// * **A webhook cannot start a turn on a deployment running mocks.** The
 ///   route stores a notice, the inbound loop then asks the provider for the
 ///   body, and `MockEmailProvider`'s inbox is filled by `seed_inbound` — an
@@ -1847,27 +1891,37 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         // difference between the 403 and this 502 is which credential sent it.
         Some(approve_body),
     );
-    // **502 and not 200, and the difference is link eight.** This route used to
-    // mint an `Authorized<Action>` and drop it, so a redeemed payment was a 200
-    // that had performed nothing. It now redeems into a typed
-    // `effects::PaymentCreate` and calls `Effects::pay` — which reaches
-    // `NotConfigured`, because this build has no payment rail and choosing one
-    // is SPEC §13's open decision. Both facts come back: the approval *was*
-    // spent, and the money did not move.
-    assert_eq!(status, 502, "the approval could not be spent: {redeemed:#}");
-    assert_eq!(redeemed["state"], "redeemed", "{redeemed:#}");
+    // **501, and the approval survives it.** This route used to mint an
+    // `Authorized<Action>` and drop it, so a redeemed payment was a 200 that had
+    // performed nothing. Then it redeemed and called `Effects::pay`, which
+    // reached `NotConfigured` — and answered `502` with `state: "redeemed"`: the
+    // human's decision spent, the money not moved, and `approvals::redeem`
+    // requiring `pending` so there was no second attempt to make. It now asks
+    // the port *first*. This build has no payment rail and choosing one is
+    // SPEC §13's open decision, so the answer is that sentence and not a
+    // failure report, and the row is still there to spend.
     assert_eq!(
-        redeemed["payment_error"], "not_configured",
-        "a build with no payment adapter must say so rather than report a \
-         payment: {redeemed:#}"
+        status, 501,
+        "an approval was spent on a deployment that cannot pay: {redeemed:#}"
     );
-    // **And the headroom comes back**, which is the half of link eight that is
-    // not about the money. The reservation `redeem_approval` took is released by
-    // `Effects::book_effect` because the payment failed — the same rule the
-    // refusal one band up follows. Before the bridge existed nothing on this
-    // path reached that code, so this number was 25 000: an approved payment
-    // holding the seat's day, and its team's, until midnight, for money that
-    // never moved.
+    assert_eq!(redeemed["code"], "no_payment_rail", "{redeemed:#}");
+    assert_eq!(redeemed["state"], "pending", "{redeemed:#}");
+    let (status, queued) = server.get(
+        &format!("/v1/approvals/{}", approval.as_uuid()),
+        Some(SECRET),
+    );
+    assert_eq!(status, 200, "{queued:#}");
+    assert_eq!(
+        queued["state"], "pending",
+        "the deployment could not pay and burned the approval anyway: {queued:#}"
+    );
+    // **And no headroom was taken**, which is the half of link eight that is not
+    // about the money. `redeem_approval` is what takes the reservation and it
+    // was never reached; on a deployment that *does* have a rail and fails, the
+    // release is `Effects::book_effect`'s and `routes::approvals` proves it
+    // against a rail that declines. Either way this number is not 25 000, which
+    // is what it was before link eight: an approved payment holding the seat's
+    // day, and its team's, until midnight.
     assert_eq!(
         server.count(held).await,
         0,

@@ -344,6 +344,17 @@ pub enum AuditKind {
     /// names the path and the provider, never the secret and nothing derived
     /// from one; see `webhooks::the_trail_names_the_path_and_never_the_secret`.
     WebhookEndpointRegistered,
+    /// The money arrived. Two writers, told apart by the payload's `source`:
+    /// a payment provider's delivery (`"stripe"`, with the provider's event
+    /// id, `AuditActor::System`) and an operator's `POST /v1/invoices/{id}/paid`
+    /// (`"operator"`, the key's principal as actor). Either way the payload
+    /// names the invoice, and the row is written only on the call that
+    /// settled — a replay leaves none.
+    InvoicePaid,
+    /// A payment provider reported a settlement for one of our invoices and
+    /// the figure did not match the demand. Nothing was marked paid; the
+    /// payload carries both amounts so a person can decide.
+    InvoicePaymentMismatch,
 }
 
 impl AuditKind {
@@ -368,6 +379,8 @@ impl AuditKind {
             AuditKind::ApiKeyIssued => "api_key_issued",
             AuditKind::ApiKeyRevoked => "api_key_revoked",
             AuditKind::WebhookEndpointRegistered => "webhook_endpoint_registered",
+            AuditKind::InvoicePaid => "invoice_paid",
+            AuditKind::InvoicePaymentMismatch => "invoice_payment_mismatch",
         }
     }
 }

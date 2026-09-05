@@ -7,6 +7,33 @@
 //! about their product. This module produces the second thing, or it produces
 //! nothing.
 //!
+//! # Il n'y a plus de producteur d'`Answer` branché
+//!
+//! Ce module compare ce que dit la page d'un prospect à une [`Answer`], et
+//! l'`Answer` est **passée par l'appelant**. Le seul producteur qui ait existé
+//! était un client MCP de l'API visa d'Orizn : la vérification de bout en bout
+//! du produit contre un vrai SaaS, et non un morceau du produit. Il est parti
+//! avec ce qu'il était.
+//!
+//! Rien de ce fichier n'a changé pour autant, parce que rien n'avait à changer :
+//! [`Prober::check`] prend `Option<&Answer>` et le `None` est un chemin écrit,
+//! testé et voulu. Les constatations qui nomment une catégorie absente de la
+//! page — [`Finding::missing`] — ou une page muette tiennent sans autorité, et
+//! ce sont **exactement** celles qu'un mail sortant a le droit de citer, celles
+//! pour lesquelles [`Finding::citable`] rend `true`. Deux demandent une
+//! `Answer` : [`Finding::StayLength`], qui illustre la catégorie 4 avec le
+//! nombre qu'elle tient de nous, et [`Finding::Contradicts`], qui n'a jamais
+//! été envoyée et ne le sera pas. Sans producteur, les deux sont inatteignables.
+//!
+//! Ce qui change vraiment, et qu'un opérateur doit savoir : une page complète —
+//! qui énonce une exigence lisible, attribue ses frais et distingue ses régimes
+//! — tombe désormais sur [`Checked::TruthStale`]. Ce n'est plus un incident,
+//! c'est l'état ordinaire — n'allez pas chercher une panne de provisioning
+//! derrière ce taux.
+//!
+//! Rebrancher une source est un module à écrire, pas une réécriture : [`Answer`]
+//! a cinq champs publics et [`ConsularFee::new`] est public. Le socle est ouvert.
+//!
 //! # The criterion is a missing category, not a wrong value
 //!
 //! This module used to compare one value — what their page says the requirement
@@ -35,37 +62,41 @@
 //!
 //! ## The test a claim has to pass before it may be sent
 //!
-//! **Delete every sentence about what the rule is. Does the finding still
-//! stand?**
+//! **Which of the four categories does their page not display at all?** A
+//! finding names a [`MissingCategory`] and the [`Evidence`] carries what the
+//! page showed instead, verbatim and [`Untrusted`]. A wrong *value* is never a
+//! finding on its own — it is at most the illustration of a missing category.
 //!
 //! * "Your checkout shows nothing about entry requirements for this pair" —
-//!   stands. [`Finding::SaysNothing`].
-//! * "Your page shows a price for the visa and never says whose fee it is" —
-//!   stands. [`Finding::UnattributedFee`], category 1.
-//! * "Your page says no visa is required *and* that a visa is issued on
-//!   arrival" — stands; the evidence is their own two sentences.
-//!   [`Finding::Conflates`], category 3.
-//! * "You say 30 days, the entitlement is 90" — nothing left.
-//!   [`Finding::StayLength`], category 4.
-//! * "You say no visa, a visa is required" — nothing left.
-//!   [`Finding::Contradicts`], the old accuracy path.
+//!   [`Finding::SaysNothing`]; every category at once.
+//! * "Your page shows a visa and no line for the official consular fee — or a
+//!   price with no side named" — [`Finding::UnattributedFee`], category 1.
+//! * "Your page says a visa is issued on arrival, free, and never says that this
+//!   is not an exemption" — [`Finding::Conflates`], category 3.
+//! * "Your page states a stay of 30 days and nothing about the bilateral
+//!   agreement the entitlement rests on; the agreement gives 90" —
+//!   [`Finding::StayLength`], category 4 **illustrated**. The two numbers exist
+//!   only inside this variant: there is no way to spell the value duel without
+//!   naming the category it illustrates.
+//! * "You say no visa, a visa is required" — [`Finding::Contradicts`], the old
+//!   accuracy path. Names no category, and is never sent.
 //!
-//! The first three rest on the prospect's own page, and a screenshot settles
-//! them: there is no external fact in dispute, so there is no free source to
-//! lose to. The last two rest on Orizn's row being right about this pair, which
-//! is exactly what Croatia says we may not assume. [`Finding::stands_on_their_page`]
-//! is that line, and [`Approach::new`](crate::vertical::Approach::new) is where
-//! it is enforced: a finding that rests on our row is filed and handed to a
-//! human, and never becomes an automated sentence.
+//! [`Finding::citable`] is that line, and
+//! [`Approach::new`](crate::vertical::Approach::new) is where it is enforced: a
+//! finding that names no missing category is filed and handed to a human, and
+//! never becomes an automated sentence. The seller never tells a prospect they
+//! are wrong about a value; it shows them a category their page does not have,
+//! and what that category costs.
 //!
-//! Category 2 — a regime resting on a revocable unilateral tolerance — has no
-//! detector here and must not get one. It is not a property of the page, and the
-//! authority has no field for it: `quick_visa_check` answers a requirement code
-//! and a date, and reading `partial_restrictions` or `special` as "this is a
-//! tolerance" is the same fabrication [`crate::orizn`] already refuses when it
-//! declines to map those codes onto a [`Claim`]. The day the surface carries the
-//! legal basis, it becomes the strongest finding in this file; until then it is
-//! a sentence with nothing behind it.
+//! Category 2 — a regime resting on a revocable unilateral tolerance (Mali and
+//! Niger outside ECOWAS) — is in [`MissingCategory`] and has no detector here,
+//! and must not get one. It is not a property of the page, and the authority
+//! has no field for it: `quick_visa_check` answers a requirement code and a
+//! date, and reading `partial_restrictions` or `special` as "this is a
+//! tolerance" is the same fabrication le producteur d'`Answer` already refuses
+//! when it declines to map those codes onto a [`Claim`]. The day the surface
+//! carries the legal basis, it becomes the strongest finding in this file;
+//! until then it is a sentence with nothing behind it.
 //!
 //! # Reproducibility is the contract, and it is enforced by running twice
 //!
@@ -195,13 +226,13 @@
 //! The three findings that stand on the prospect's page need no authority at
 //! all, so a lookup that produced nothing no longer costs the seller every
 //! finding it could have made. Orizn's keyless surface answers
-//! `last_verified: null`, which [`crate::orizn`] correctly refuses to turn into
+//! `last_verified: null`, which le producteur d'`Answer` correctly refuses to turn into
 //! an [`Answer`] — and under the old criterion that meant **no finding could be
 //! produced at all**, because every claim shape needed a requirement to compare
 //! against. Now it means the two findings that rest on our row are not made, and
 //! the three that rest on their page are.
 //!
-//! [`crate::orizn`] is what builds one in the running system: a gated
+//! le producteur d'`Answer` is what builds one in the running system: a gated
 //! [`Action::McpCall`] against Orizn's own MCP surface, whose result stays
 //! [`Untrusted`] and reaches this module as an enum, a day count and a date.
 //! [`Answer::retrieved_at`] carries the argument about *whose* clock
@@ -375,6 +406,7 @@ use agentos_domain::action::{Action, Domain};
 use agentos_domain::policy::{Decision, DenyReason, evaluate_browser_read};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserSession, BrowserStep};
+use agentos_providers::llm::Message;
 use agentos_store::db::Db;
 use agentos_store::revenue::{NewAttempt, RevenueError, record_attempt};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -383,6 +415,7 @@ use uuid::Uuid;
 
 use crate::effects::{BrowserWrite, EffectError, Effects, Subject};
 use crate::gate::{Authorizable, Authorized, Denied, PolicyGate, Principal};
+use crate::prompt::render_fenced;
 use crate::rolepack::CountryCode;
 
 /// How old our **observation of their page** may be and still be re-asserted
@@ -392,10 +425,11 @@ use crate::rolepack::CountryCode;
 /// subject as well as its length, because the criterion changed under it.
 /// Twenty-four hours on the *authority* existed to protect a sentence of the
 /// form "your requirement is wrong and ours is right". No such sentence goes
-/// out any more — [`Finding::stands_on_their_page`] is the gate — so the bar has
-/// nothing left to protect on that clock and a real thing to protect on this
-/// one: every sendable finding asserts *"on this date your page did this"*, and
-/// pages get deployed.
+/// out any more — [`Finding::citable`] is the gate — so the bar has nothing
+/// left to protect on that clock and a real thing to protect on this one: every
+/// sendable finding asserts *"on this date your page did this"*, and pages get
+/// deployed. What the authority's clock still guards, per category, is
+/// [`MAX_TRUTH_AGE`].
 ///
 /// Seven days, derived rather than picked. [`FOLLOW_UP_AFTER`](crate::revenue::FOLLOW_UP_AFTER)
 /// is 72 hours, so an approach followed up on its own cadence lands on day 3 and
@@ -406,38 +440,108 @@ use crate::rolepack::CountryCode;
 /// a screenshot from last month.
 pub const MAX_FINDING_AGE: TimeDelta = TimeDelta::days(7);
 
-/// How old an [`Answer`] may be and still be worth a human's attention on a
-/// finding that rests on it.
+/// One of the four categories where every source tested — Wikipedia, Sherpa,
+/// VisaHQ, iVisa — failed at once. A finding names the one the prospect's page
+/// does not display at all.
 ///
-/// A year, and the asymmetry with [`MAX_FINDING_AGE`] is the whole point.
-/// The facts the categorical axis stands on move on the scale of years — a
-/// consular fee schedule, a bilateral agreement in force since 2019, a stay
-/// entitlement. What has a half-life in days is our look at somebody's booking
-/// page, not the rule.
-///
-/// It is a long bar because it is guarding a weak thing: nothing that rests on
-/// this clock is ever asserted to a prospect. A [`Finding::Contradicts`] or a
-/// [`Finding::StayLength`] is filed and handed to a human with
-/// [`Answer::retrieved_at`] printed beside it, and a human can weigh a
-/// four-month-old row. What the bar still stops is the case where weighing is
-/// impossible: an answer so old that it is evidence about our pipeline rather
-/// than about a government, and an answer dated in the *future*, which is a
-/// broken clock and makes [`RuleAge`] arithmetic meaningless.
-///
-/// ponytail: two constants, not a policy field, and they are two rather than one
-/// because they measure two different clocks. Make either configurable when an
-/// operator asks, not before.
-pub const MAX_AUTHORITY_AGE: TimeDelta = TimeDelta::days(365);
+/// The list is closed and it is the sales argument: "the gap is not temporal,
+/// it is categorical". The order is the index into [`MAX_TRUTH_AGE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MissingCategory {
+    /// 1. The official consular fee. Nobody publishes it; iVisa shows its own
+    ///    commission as "from $69.99".
+    OfficialFee,
+    /// 2. A regime resting on a revocable unilateral tolerance rather than on a
+    ///    treaty — Mali and Niger outside ECOWAS. Zero sources in four flag it,
+    ///    and **no detector here does either**: see the module docs. In the
+    ///    enum so that the table below has a row for it and a briefing can name
+    ///    it; produced by nothing.
+    LegalUncertainty,
+    /// 3. A free visa on arrival read as a visa exemption. Three sources in four
+    ///    conflate them.
+    FreeVoaVersusExemption,
+    /// 4. A quiet bilateral agreement. India↔Maldives has been 90 days since
+    ///    2019; Sherpa and VisaHQ say 30.
+    BilateralAgreement,
+}
 
-/// How old a [`ConsularFee`] may be and still be **quoted at a prospect**.
+impl MissingCategory {
+    /// Stable, low-cardinality metric label.
+    pub const fn code(self) -> &'static str {
+        match self {
+            MissingCategory::OfficialFee => "official_fee",
+            MissingCategory::LegalUncertainty => "legal_uncertainty",
+            MissingCategory::FreeVoaVersusExemption => "voa_vs_exemption",
+            MissingCategory::BilateralAgreement => "bilateral_agreement",
+        }
+    }
+
+    /// How old the authority's fact behind this category may be and still be
+    /// used — the row of [`MAX_TRUTH_AGE`] for it.
+    pub const fn max_truth_age(self) -> TimeDelta {
+        MAX_TRUTH_AGE[self as usize].1
+    }
+}
+
+/// How old the authority's fact behind each category may be, per category.
 ///
-/// A third clock, and it is a third constant for the reason the note on
-/// [`MAX_AUTHORITY_AGE`] gives: it measures a third thing. [`MAX_FINDING_AGE`]
-/// dates our look at their page. `MAX_AUTHORITY_AGE` dates the authority's
-/// *rule*, and it is long because nothing resting on it is ever asserted. This
-/// one dates the authority's *fee schedule*, and a number off it goes into an
-/// email — so it is the one authority clock guarding something that leaves the
-/// building, and it cannot borrow either of the other two.
+/// This is what replaced the single `MAX_TRUTH_AGE` of twenty-four hours. That
+/// bar protected "we are fresher than you", an argument Orizn no longer makes;
+/// the facts the categorical axis stands on move in **years**, not hours, and a
+/// bar that refuses a four-month-old consular schedule refuses the whole
+/// dataset for nothing. One row per category, because they are four different
+/// clocks:
+///
+/// * **Official fee — 90 days.** The one authority number that leaves the
+///   building, so the tightest bar. Japan's schedule moved on 1 July 2026 and
+///   Orizn's row caught up forty-two days later; a quarter is that curation lag
+///   doubled. Thirteen of fifteen destinations sampled on 2026-08-26 carry a
+///   bulk `as_of: 2026-05-27` and are refused by it, which is the bar working.
+/// * **Legal uncertainty — 30 days.** A tolerance is revoked overnight and
+///   without a treaty to amend, so anything we held about one would be the
+///   most perishable fact in the file. Nothing reads this row today — there is
+///   no detector — and the number is here so that the day one exists it does
+///   not inherit a year from the row below it.
+/// * **Free VoA vs exemption — 7 days.** Decided on the page alone; the only
+///   fact that ages is our look at their page, which is [`MAX_FINDING_AGE`].
+/// * **Bilateral agreement — 365 days.** A treaty in force since 2019 does not
+///   move in a quarter, and the number it contributes is an *illustration*
+///   printed beside its source and its date — a human can weigh a
+///   four-month-old row. What the bar still refuses is an answer so old it is
+///   evidence about our pipeline, and one dated in the future, which is a
+///   broken clock.
+///
+/// The double run is untouched by any of this: a page that answers two ways
+/// still proves nothing, whatever the age of the fact behind it.
+///
+/// ponytail: a const table indexed by the enum, not a policy field. Make a row
+/// configurable when an operator asks, not before.
+pub const MAX_TRUTH_AGE: [(MissingCategory, TimeDelta); 4] = [
+    (MissingCategory::OfficialFee, TimeDelta::days(90)),
+    (MissingCategory::LegalUncertainty, TimeDelta::days(30)),
+    (MissingCategory::FreeVoaVersusExemption, MAX_FINDING_AGE),
+    (MissingCategory::BilateralAgreement, TimeDelta::days(365)),
+];
+
+/// How old an [`Answer`] may be and still be used — the
+/// [`MissingCategory::BilateralAgreement`] row of [`MAX_TRUTH_AGE`], because the
+/// stay entitlement behind category 4 is the only thing an `Answer` contributes
+/// to a sentence that goes out, and [`Finding::Contradicts`] never does.
+///
+/// It is a long bar because it is guarding a weak thing: the number it admits
+/// is printed as an illustration beside [`Answer::retrieved_at`], never as the
+/// finding. What the bar still stops is the case where weighing is impossible:
+/// an answer so old that it is evidence about our pipeline rather than about a
+/// government, and an answer dated in the *future*, which is a broken clock and
+/// makes [`RuleAge`] arithmetic meaningless.
+pub const MAX_AUTHORITY_AGE: TimeDelta = MissingCategory::BilateralAgreement.max_truth_age();
+
+/// How old a [`ConsularFee`] may be and still be **quoted at a prospect** — the
+/// [`MissingCategory::OfficialFee`] row of [`MAX_TRUTH_AGE`].
+///
+/// A separate clock from [`MAX_AUTHORITY_AGE`] because it dates a separate
+/// thing: the authority's *fee schedule*, not its rule, and a number off it
+/// goes into an email.
 ///
 /// # Ninety days, derived from how a fee actually moves
 ///
@@ -466,7 +570,7 @@ pub const MAX_AUTHORITY_AGE: TimeDelta = TimeDelta::days(365);
 /// bar working rather than a bug in it, exactly as the old twenty-four-hour
 /// authority bar refusing every keyless answer was, and it is a fact about how
 /// much of the fee data is hand-curated rather than about this code.
-pub const MAX_FEE_AGE: TimeDelta = TimeDelta::days(90);
+pub const MAX_FEE_AGE: TimeDelta = MissingCategory::OfficialFee.max_truth_age();
 
 // ---------------------------------------------------------------------------
 // A read-only browse
@@ -755,38 +859,34 @@ fn has_price(hay: &str) -> bool {
     })
 }
 
-/// Whether the panel states an exemption **and** a border visa for the same
-/// trip — category 3.
+/// Whether the panel shows a border visa that reads like an exemption and never
+/// draws the distinction — category 3.
 ///
 /// A free visa on arrival is not a visa exemption, and three of the four
 /// sources tested conflate them. The difference is the whole product: on
 /// arrival the traveller presents documents to a border officer who may refuse
 /// them, and the airline that boarded them carries the return flight. "No visa
-/// required" tells them none of that.
+/// required" tells them none of that, and "visa on arrival, free" tells them
+/// the same thing in fewer words.
+///
+/// So the category is *missing* when the panel says a visa is issued at the
+/// border, makes it sound like nothing ("free", or an exemption phrase beside
+/// it), and nowhere says what an exemption is not: that it is obtained in
+/// advance, that a border officer decides, that it is not an exemption. A panel
+/// that says any of those has the category, whatever else it gets wrong.
 ///
 /// Detected on the page alone rather than against the authority, deliberately.
 /// The page-versus-authority version of this ("you say no visa, Orizn says on
 /// arrival") is [`Finding::Contradicts`] wearing a better word: it rests on our
-/// row, and Croatia is what our row is worth. This one rests on the prospect
-/// having written both sentences themselves.
+/// row, and Croatia is what our row is worth. This one rests on what the
+/// prospect wrote and did not write.
 ///
-/// # The sentence that is not a conflation
-///
-/// "No visa is required **in advance** — a visa is issued on arrival" is
-/// correct, precise, and exactly what we would want them to say. So an
-/// exemption phrase counts only when *the sentence it sits in* does not qualify
-/// it. Sentence, because that is the unit a reader takes the claim from, and
-/// because a fixed character window is a number nobody can defend.
-fn conflates(hay: &str) -> bool {
-    const EXEMPTION: [&str; 7] = [
-        "no visa",
-        "visa-free",
-        "visa free",
-        "visa not required",
-        "visa is not required",
-        "not need a visa",
-        "without a visa",
-    ];
+/// ponytail: page-level presence of a distinction phrase, not per-sentence
+/// qualification — "no visa is required in advance; issued on arrival" is
+/// precise and this reads it as precise. The ceiling is a page that qualifies
+/// one sentence and conflates in another; point [`Flow::panel`] at the answer
+/// widget.
+fn lacks_voa_distinction(hay: &str) -> bool {
     const BORDER: [&str; 4] = [
         "visa on arrival",
         "visa upon arrival",
@@ -797,22 +897,63 @@ fn conflates(hay: &str) -> bool {
         // word "visa" already having put us in this function.
         "issued on arrival",
     ];
-    const QUALIFIED: [&str; 5] = [
+    /// What makes a border visa read as nothing at all.
+    const LOOKS_EXEMPT: [&str; 18] = [
+        "no visa",
+        "visa-free",
+        "visa free",
+        "visa not required",
+        "visa is not required",
+        "not need a visa",
+        "without a visa",
+        "free visa",
+        "is free",
+        "for free",
+        "free of charge",
+        "no fee",
+        "at no cost",
+        // "visa on arrival, free" — the exact wording the sales axis is about.
+        // Bounded to the word after "arrival" so that "free cancellation" on
+        // the same page is not read as a free visa.
+        "arrival, free",
+        "arrival - free",
+        "arrival — free",
+        "arrival (free",
+        "arrival: free",
+    ];
+    /// Any way of saying that a visa on arrival is not an exemption.
+    const DISTINCTION: [&str; 11] = [
+        "exempt", // covers "exemption", "not exempt", "visa-exempt"
         "in advance",
         "before travel",
         "before you travel",
         "beforehand",
         "prior to",
+        "border officer",
+        "may be refused",
+        "can be refused",
+        // A page that says a visa on arrival is *not* what this is has drawn
+        // the line too.
+        "not a visa on arrival",
+        "no visa on arrival",
     ];
 
-    let unqualified_exemption = EXEMPTION.iter().any(|needle| {
-        hay.match_indices(needle).any(|(at, _)| {
-            let sentence = hay[at..].split(['.', ';', '!']).next().unwrap_or_default();
-            !QUALIFIED.iter().any(|q| sentence.contains(q))
-        })
-    });
+    BORDER.iter().any(|needle| hay.contains(needle))
+        && LOOKS_EXEMPT.iter().any(|needle| hay.contains(needle))
+        && !DISTINCTION.iter().any(|needle| hay.contains(needle))
+}
 
-    unqualified_exemption && BORDER.iter().any(|needle| hay.contains(needle))
+/// Whether the panel names the instrument a stay entitlement rests on — the
+/// half of category 4 that is about their page rather than about our number.
+///
+/// A page that says "30 days under the bilateral agreement" has the category
+/// and a number we may think is wrong; that is a value dispute, and value
+/// disputes are not ours to open. A page that says "30 days" and nothing about
+/// where the number comes from does not have the category, and the number is
+/// then the illustration of what the missing category costs.
+fn names_agreement(hay: &str) -> bool {
+    const INSTRUMENT: [&str; 4] = ["agreement", "treaty", "bilateral", "reciprocal"];
+    INSTRUMENT.iter().any(|needle| hay.contains(needle))
 }
 
 /// The stay length the panel states, in days — category 4.
@@ -1265,7 +1406,7 @@ pub struct Answer {
     /// **Ours, never the source's own words.** This is the one field of an
     /// `Answer` that [`Evidence::claim_line`] interpolates into the sentence a
     /// human sends, so a value taken off a tool result would be a writable slot
-    /// in our outbound mail. [`crate::orizn::SOURCE`] is a constant for exactly
+    /// in our outbound mail. `Answer::source` is a constant for exactly
     /// that reason.
     pub source: String,
     /// How many days the exempt stay is worth, when the source says.
@@ -1284,7 +1425,7 @@ pub struct Answer {
     /// quickly, and stamping the call time here would make [`MAX_AUTHORITY_AGE`]
     /// unfalsifiable — every answer a second old, forever, on a fact about our
     /// own clock. So a caller whose source dates its own data puts the **earlier**
-    /// of the two here; see [`crate::orizn::read_answer`], which is the only
+    /// of the two here; see le producteur d'`Answer`, which is the only
     /// thing in the running system that builds one.
     pub retrieved_at: DateTime<Utc>,
     /// When the current rule took effect, when the source knows.
@@ -1342,7 +1483,7 @@ impl Answer {
 /// it is admitted only as **three upper-case ASCII letters** — an alphabet of
 /// 17,576 values, none of which is a sentence. Everything else on the wire,
 /// including the schedule's prose `notes` and its `sources` URLs, stays off this
-/// struct: see [`crate::orizn::read_fee`] for what is dropped and why.
+/// struct: see le producteur de `ConsularFee` for what is dropped and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsularFee {
     amount: u64,
@@ -1362,7 +1503,7 @@ impl ConsularFee {
     /// ponytail: three letters, not an ISO 4217 table. The table is 180 rows to
     /// stop a value that is already incapable of carrying a sentence, and a code
     /// that is well-formed but wrong is a data error rather than an injection —
-    /// `MAX_FEE_AGE` and the `sources` gate in [`crate::orizn::read_fee`] are
+    /// `MAX_FEE_AGE` and the `sources` gate in le producteur de `ConsularFee` are
     /// what stand between us and that. Add the table the day a rendered
     /// currency has to be resolved to a symbol.
     pub fn new(amount: u64, currency: &str, as_of: NaiveDate) -> Option<Self> {
@@ -1395,7 +1536,7 @@ impl ConsularFee {
     /// [`Answer::usable_at`]'s does. `as_of` is a **date**, so it is read as the
     /// start of that day: reading it as the end would borrow up to a day of
     /// freshness the authority never asserted, the same argument
-    /// [`crate::orizn::read_answer`] makes about `last_verified`.
+    /// le producteur d'`Answer` makes about `last_verified`.
     pub fn usable_at(&self, now: DateTime<Utc>) -> bool {
         // Midnight exists on every date; the fallback is unreachable and yields
         // the epoch, which reads as maximally stale rather than as fresh.
@@ -1534,17 +1675,24 @@ fn reproduction(plan: &[Plan], panel: &str) -> Vec<String> {
 /// prospect can dismiss.
 ///
 /// The order is the order [`verdict`] tries them, and it is not arbitrary — the
-/// three that stand on the prospect's page come first, so that a page exhibiting
-/// both a categorical defect and a wrong value is reported as the categorical
-/// one. See [`Finding::stands_on_their_page`].
+/// ones decided on the prospect's page alone come first, so that a page
+/// exhibiting both a categorical defect and a wrong value is reported as the
+/// categorical one. See [`Finding::citable`].
+///
+/// Every variant but [`Finding::Contradicts`] names a [`MissingCategory`] — see
+/// [`Finding::missing`] — and what the page displayed instead of it is
+/// [`Evidence::observed`], verbatim and [`Untrusted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
     /// The flow displays nothing about entry requirements for this pair.
-    SaysNothing,
-    /// The flow prices the visa and never says whose fee it is — category 1.
     ///
-    /// No fields, and the finding is still the *absence of an attribution*: it
-    /// is decided from the panel alone, by [`verdict`], with no authority in the
+    /// Every category at once, so it names none in particular.
+    SaysNothing,
+    /// The flow shows a visa and no line for the official consular fee — or a
+    /// price with no side named — [`MissingCategory::OfficialFee`].
+    ///
+    /// No fields, and the finding is still the *absence of a category*: it is
+    /// decided from the panel alone, by [`verdict`], with no authority in the
     /// room. That is what makes it sendable, and it is why the correct number is
     /// **not** a field here — a variant carrying one would be a finding that
     /// needs an authority to exist.
@@ -1556,21 +1704,29 @@ pub enum Finding {
     /// sentence is exactly what it was, and the panel text on the [`Evidence`]
     /// is the whole exhibit.
     UnattributedFee,
-    /// The flow states an exemption and a border visa for the same trip —
-    /// category 3.
+    /// The flow shows a border visa that reads like an exemption and never says
+    /// it is not one — [`MissingCategory::FreeVoaVersusExemption`].
     ///
-    /// No fields, and for the same reason: both halves are quoted in
-    /// [`Evidence::observed`], and neither of them is ours.
+    /// No fields, and for the same reason: what they wrote and what they did
+    /// not write are both in [`Evidence::observed`], and neither is ours.
     Conflates,
-    /// The flow's exempt stay is not the entitlement — category 4.
+    /// The flow states a stay length and nothing about the agreement it rests
+    /// on — [`MissingCategory::BilateralAgreement`], **illustrated**.
     ///
-    /// Found only where the requirement itself already agreed, so this is the
-    /// finding that exists exactly where the accuracy comparison says there is
-    /// nothing to see.
+    /// The one place a value duel is spelled in this file, and it cannot be
+    /// spelled anywhere else: the two numbers are fields of the variant that
+    /// names the missing category, so "they say 30, we say 90" has no
+    /// representation on its own. The sentence it renders says their page has
+    /// no line for the agreement, and gives the entitlement under it as what
+    /// that line would have said — with the source and its date beside it.
+    ///
+    /// Found only where the requirement itself already agreed and the page
+    /// names no agreement, so this is the finding that exists exactly where the
+    /// accuracy comparison says there is nothing to see.
     StayLength {
         /// The number of days their flow stated.
         shown: u32,
-        /// The number of days the authority says.
+        /// The number of days the agreement in force gives.
         correct: u32,
     },
     /// The flow states a requirement that the authority contradicts.
@@ -1602,26 +1758,38 @@ impl Finding {
         }
     }
 
-    /// Whether this finding survives deleting every sentence about what the
-    /// rule is — and therefore whether it may be the sentence that goes out.
+    /// The category the prospect's page does not display, when the finding is
+    /// about one.
     ///
-    /// The three that do rest on the prospect's own page: their checkout is
-    /// silent, or prices a visa without naming a side, or says two incompatible
-    /// things in the same panel. A screenshot settles each of them, so there is
-    /// no external fact for a prospect to open a free source and win on.
+    /// `None` for [`Finding::SaysNothing`] — every category at once — and for
+    /// [`Finding::Contradicts`], which names no category and is the reason the
+    /// question is asked: a finding with no category is a value duel.
+    pub const fn missing(&self) -> Option<MissingCategory> {
+        match self {
+            Finding::UnattributedFee => Some(MissingCategory::OfficialFee),
+            Finding::Conflates => Some(MissingCategory::FreeVoaVersusExemption),
+            Finding::StayLength { .. } => Some(MissingCategory::BilateralAgreement),
+            Finding::SaysNothing | Finding::Contradicts { .. } => None,
+        }
+    }
+
+    /// Whether this finding may be the sentence that goes out.
     ///
-    /// The two that do not rest on Orizn's row being right about this pair.
-    /// They are real, they are worth filing, and they are what a human seller
-    /// wants in front of them — but the seller who asserts one is betting the
-    /// account on a database that has been wrong.
+    /// Yes for a silent page and for every finding that names a
+    /// [`MissingCategory`]: the sentence says a category is absent from their
+    /// page, a screenshot settles that, and the one number a category-4 sentence
+    /// carries is printed as the illustration of what the absence costs, beside
+    /// its source and date — never as "you are wrong".
+    ///
+    /// No for [`Finding::Contradicts`], the only finding made of nothing but our
+    /// row being right about this pair. It is real, it is filed, and it is what
+    /// a human seller wants in front of them — but the seller who asserts it is
+    /// betting the account on a database that has been wrong.
     /// [`Approach::new`](crate::vertical::Approach::new) is where this is
     /// enforced, and it is the only place: it returns nothing for a finding that
     /// answers `false` here.
-    pub const fn stands_on_their_page(&self) -> bool {
-        match self {
-            Finding::SaysNothing | Finding::UnattributedFee | Finding::Conflates => true,
-            Finding::StayLength { .. } | Finding::Contradicts { .. } => false,
-        }
+    pub const fn citable(&self) -> bool {
+        !matches!(self, Finding::Contradicts { .. })
     }
 }
 
@@ -1692,7 +1860,7 @@ pub struct Evidence {
     /// The authoritative answer the comparison used, with its provenance.
     ///
     /// `None` when there was no usable one and the finding did not need it —
-    /// which is every [`Finding::stands_on_their_page`] finding, and is the
+    /// which is every finding decided on their page alone, and is the
     /// ordinary case on Orizn's keyless surface.
     authority: Option<Answer>,
     /// The destination's own consular fee for one entry, when the authority
@@ -1752,6 +1920,17 @@ impl Evidence {
         &self.observed
     }
 
+    /// What their page displayed instead of the missing category, as the one
+    /// shape it may take in front of a model: a fenced message, framed as a
+    /// stranger's text and labelled with their entry page.
+    ///
+    /// The sentence a human sends is [`Evidence::claim_line`] and it is made of
+    /// our words only; this is the exhibit beside it, and
+    /// [`render_fenced`] is the only exit an [`Untrusted`] has towards a prompt.
+    pub fn observed_fenced(&self) -> Message {
+        render_fenced(&self.observed, self.entry.as_str())
+    }
+
     /// The authoritative answer the comparison used, with its provenance.
     pub const fn authority(&self) -> Option<&Answer> {
         self.authority.as_ref()
@@ -1793,17 +1972,18 @@ impl Evidence {
     ///
     /// Every finding renders one, because a human taking a
     /// [`Finding::Contradicts`] at handoff needs to read it too. What decides
-    /// whether it may go to a prospect is
-    /// [`Finding::stands_on_their_page`], applied by
+    /// whether it may go to a prospect is [`Finding::citable`], applied by
     /// [`Approach::new`](crate::vertical::Approach::new), which is the only
     /// constructor of the message a send takes.
     ///
-    /// Notice what the first three do **not** contain: any statement about what
-    /// the rule is. That is not tidiness, it is the whole criterion — the
-    /// clause a prospect rebuts by opening Wikipedia is the clause that is not
-    /// there. The authority still rides on the [`Evidence`] for the human, and
-    /// the last two sentences below are made of nothing else, which is why they
-    /// stay in the building.
+    /// Notice what the sendable sentences do **not** contain: a statement that
+    /// the prospect is wrong about a value. Each says a category is absent from
+    /// their page and what that category is — the clause a prospect rebuts by
+    /// opening Wikipedia is the clause that is not there. The one number a
+    /// category-4 sentence carries is printed as the illustration, with its
+    /// source and date, of what the absent line would have said. The last
+    /// sentence below is made of nothing but our row, which is why it stays in
+    /// the building.
     pub fn claim_line(&self) -> String {
         let who = format!(
             "a {} passport holder travelling to {} on {}",
@@ -1812,11 +1992,17 @@ impl Evidence {
         let when = self.observed_at.date_naive();
         let (prospect, entry) = (&self.prospect, &self.entry);
         // Ours, never the source's own words — see `Answer::source`. Only the
-        // two findings that rest on it name it, and they are not sendable.
-        let source = self
-            .authority
-            .as_ref()
-            .map_or("no source", |answer| answer.source.as_str());
+        // two findings that rest on it name it, and one of them is sendable
+        // because it prints the source *and its date* beside the number.
+        let (source, dated) =
+            self.authority
+                .as_ref()
+                .map_or(("no source", "undated".to_owned()), |answer| {
+                    (
+                        answer.source.as_str(),
+                        answer.retrieved_at.date_naive().to_string(),
+                    )
+                });
 
         match &self.finding {
             Finding::SaysNothing => format!(
@@ -1828,13 +2014,14 @@ impl Evidence {
             // nobody publishes, and it is appended only when there is a fee this
             // traveller would actually pay, dated inside `MAX_FEE_AGE`. Three
             // bounded values — a `u64`, three upper-case letters and a date —
-            // and no URL: see `crate::orizn::read_fee` for why the authority's
+            // and no URL: see le producteur de `ConsularFee` for why the authority's
             // own `sources` gate this sentence without appearing in it.
             Finding::UnattributedFee => {
                 let mut line = format!(
-                    "On {when}, {prospect} at {entry} showed {who} a price for the visa without \
-                     saying whether it is the consular fee set by the destination or a fee of \
-                     your own."
+                    "On {when}, {prospect} at {entry} showed {who} a visa and no line for the \
+                     official consular fee, which nobody publishes: either no fee at all, or a \
+                     price without saying whether it is the consular fee set by the destination \
+                     or a fee of your own."
                 );
                 if let Some(fee) = &self.fee {
                     line.push_str(&format!(
@@ -1848,14 +2035,19 @@ impl Evidence {
                 line
             }
             Finding::Conflates => format!(
-                "On {when}, {prospect} at {entry} told {who} both that no visa is required and \
-                 that a visa is issued on arrival. Those are different regimes: a visa issued at \
-                 the border is one a border officer can refuse, and the passenger you boarded on \
-                 the first sentence is the denied boarding you carry."
+                "On {when}, {prospect} at {entry} told {who} that a visa is issued on arrival, in \
+                 words that read as an exemption, and nowhere said that it is not one. Those are \
+                 different regimes: a visa issued at the border is one a border officer can \
+                 refuse, and the passenger you boarded as exempt is the denied boarding you carry."
             ),
+            // Category 4, illustrated. The sentence is about the line their page
+            // does not have; the two numbers are what that line would have said,
+            // with the source and its date beside them — never "you are wrong".
             Finding::StayLength { shown, correct } => format!(
-                "On {when}, {prospect} at {entry} told {who} the exempt stay is {shown} days — \
-                 {source} says {correct}."
+                "On {when}, {prospect} at {entry} told {who} the stay is {shown} days and showed \
+                 nothing about the bilateral agreement the entitlement rests on. Nobody tracks \
+                 those agreements; under the one in force the stay is {correct} days ({source}, \
+                 as of {dated}), and a traveller sent home on day {shown} is your refund."
             ),
             Finding::Contradicts { shown, correct } => format!(
                 "On {when}, {prospect} at {entry} told {who} that {} — {source} says {}.",
@@ -1999,12 +2191,19 @@ pub enum Verdict {
 ///
 /// # The order is the argument
 ///
-/// The three page-only findings are tried first, so a page that both conflates
-/// two regimes and disagrees with our row is reported as the conflation — the
-/// claim we can defend — rather than as the one a prospect rebuts with a free
-/// source. [`Finding::StayLength`] is reached only after the requirement itself
-/// has matched, which is why it is the finding that exists exactly where
+/// The page-only findings are tried first, so a page that both conflates two
+/// regimes and disagrees with our row is reported as the conflation — the claim
+/// we can defend — rather than as the one a prospect rebuts with a free source.
+/// [`Finding::StayLength`] is reached only after the requirement itself has
+/// matched, which is why it is the finding that exists exactly where
 /// [`Checked::Agrees`] used to end the check.
+///
+/// **A complete page produces nothing.** One that states its requirement,
+/// attributes its fee, distinguishes its regimes and names the agreement its
+/// stay rests on comes back [`Checked::Agrees`] (or [`Checked::TruthStale`]
+/// without a row to compare against), and no outreach is made — whatever we
+/// think of its numbers. A page that carries the category and a value we
+/// dispute is a value dispute, and those are not opened from here.
 pub fn verdict(
     first: &Untrusted<String>,
     second: &Untrusted<String>,
@@ -2026,16 +2225,29 @@ pub fn verdict(
     // returns an enum of ours. Nothing from the page escapes the wrapper.
     let hay = second.expose_for_parsing().to_lowercase();
 
-    // -- the three that stand on their page --------------------------------
-    if conflates(&hay) {
+    // -- the categories decided on their page alone -------------------------
+    if lacks_voa_distinction(&hay) {
         return Verdict::Finding(Finding::Conflates);
     }
     let seen = read_claim(second);
     // `Seen::Nothing` is a panel with no visa language in it at all, so a price
     // in one is a price about something else — a bag fee, a seat. The fee
-    // finding is about *the visa's* price, so it needs the context.
-    if seen != Seen::Nothing && read_fee(&hay) == Fee::Unattributed {
-        return Verdict::Finding(Finding::UnattributedFee);
+    // finding is about *the visa's* price, so it needs the context. Category 1
+    // is missing two ways: a price with no side named, whatever the regime; or
+    // a regime that costs something — a visa, an e-visa, a border visa — with
+    // no fee line at all. An exemption has no official fee to be silent about.
+    let costs_something = matches!(
+        seen,
+        Seen::Says(Claim::VisaRequired | Claim::EVisa | Claim::VisaOnArrival)
+    );
+    match read_fee(&hay) {
+        Fee::Unattributed if seen != Seen::Nothing => {
+            return Verdict::Finding(Finding::UnattributedFee);
+        }
+        Fee::Silent if costs_something => {
+            return Verdict::Finding(Finding::UnattributedFee);
+        }
+        _ => {}
     }
 
     let Some(authority) = authority else {
@@ -2058,9 +2270,14 @@ pub fn verdict(
             // is where the quiet bilateral agreements are and where every source
             // tested was wrong while being right about the regime. Only for an
             // exemption: `visa_free_days` is the length of a stay nobody needs a
-            // visa for, and a pair that needs one has no such stay.
+            // visa for, and a pair that needs one has no such stay. And only
+            // where the page names no agreement: a page that has the category
+            // and a number we dispute is a value dispute, which is `Agrees`
+            // here on purpose — nothing categorical to send.
             match (shown, read_stay_days(&hay), authority.stay_days) {
-                (Claim::NoVisa, Some(shown), Some(correct)) if shown != correct && shown != 0 => {
+                (Claim::NoVisa, Some(shown), Some(correct))
+                    if shown != correct && shown != 0 && !names_agreement(&hay) =>
+                {
                     Verdict::Finding(Finding::StayLength { shown, correct })
                 }
                 _ => Verdict::Nothing(Checked::Agrees),
@@ -2869,10 +3086,132 @@ mod tests {
         assert!(line.contains("orizn:requirements/v1"), "{line}");
 
         // ...and it is not a sentence this system sends. Every clause that does
-        // any work in it is a claim about our own row.
+        // any work in it is a claim about our own row, and it names no category.
         assert!(
-            !evidence.finding.stands_on_their_page(),
+            !evidence.finding.citable(),
             "the accuracy path became sendable again"
+        );
+        assert_eq!(evidence.finding.missing(), None);
+    }
+
+    /// **The evidence always carries the reproduction**, whichever category the
+    /// finding names: the plan that ran, ending in the read, and the picture
+    /// from the run that confirmed it. And what their page showed instead of
+    /// the category reaches a model only fenced.
+    #[tokio::test]
+    async fn every_finding_carries_its_reproduction_and_the_page_only_fenced() {
+        let Some(db) = db().await else { return };
+
+        for (panel, want) in [
+            (format!("Baggage: 1 x 23kg. {INJECTION}"), None),
+            (
+                format!("A visa is required before travel. {INJECTION}"),
+                Some(MissingCategory::OfficialFee),
+            ),
+            (
+                format!("Visa on arrival, free. {INJECTION}"),
+                Some(MissingCategory::FreeVoaVersusExemption),
+            ),
+            (
+                format!("Visa-free entry for up to 30 days. {INJECTION}"),
+                Some(MissingCategory::BilateralAgreement),
+            ),
+        ] {
+            let h = harness(&db, &[&panel], limits()).await;
+            let evidence = h
+                .prober
+                .check(&flow(), &probe(), Some(&exempt_for_90_days()), None, now())
+                .await
+                .expect("allowed")
+                .evidence()
+                .expect("a finding")
+                .clone();
+
+            assert_eq!(evidence.finding.missing(), want, "{panel}");
+            assert!(evidence.finding.citable(), "{panel}");
+            assert_eq!(evidence.steps.len(), 6, "{panel}: {:?}", evidence.steps);
+            assert!(evidence.steps[5].ends_with("read the text of #visa-info"));
+            assert!(!evidence.screenshot.is_empty(), "{panel}");
+            assert_eq!(h.reads(), 2, "{panel}: one run is not a reproduction");
+
+            // The page, verbatim, inside a frame — and nowhere in the sentence.
+            let fenced = format!("{:?}", evidence.observed_fenced());
+            assert!(fenced.contains(INJECTION), "{panel}");
+            assert!(fenced.contains("UNTRUSTED"), "{panel}: {fenced}");
+            assert!(!evidence.claim_line().contains(INJECTION), "{panel}");
+        }
+    }
+
+    /// **The test that counts: a complete page is not approached.**
+    ///
+    /// A page that states its requirement, attributes its fee, distinguishes
+    /// its regimes and names the agreement its stay rests on has every category.
+    /// Whatever we think of its numbers, nothing is sent — a value dispute is not
+    /// a finding, and a prospect who is right is not approached with a sentence
+    /// that is wrong.
+    #[tokio::test]
+    async fn a_complete_page_produces_no_finding_and_no_outreach() {
+        let Some(db) = db().await else { return };
+
+        let complete = [
+            (
+                "A visa is required before travel. Government fee $25, our service fee $44.99. \
+                 Apply in advance.",
+                Some(authority()),
+            ),
+            (
+                "No visa is required for stays of up to 90 days under the bilateral agreement.",
+                Some(exempt_for_90_days()),
+            ),
+            // The category is there and the number is not ours to dispute.
+            (
+                "Visa-free entry for up to 30 days under the bilateral agreement in force.",
+                Some(exempt_for_90_days()),
+            ),
+        ];
+        for (panel, answer) in &complete {
+            let h = harness(&db, &[panel], limits()).await;
+            let checked = h
+                .prober
+                .check(&flow(), &probe(), answer.as_ref(), None, now())
+                .await
+                .expect("allowed");
+            assert_eq!(checked, Checked::Agrees, "{panel}");
+            assert!(checked.evidence().is_none(), "{panel}");
+        }
+
+        // And without a row to compare against, the same pages are a comparison
+        // we could not make — never a finding manufactured out of the gap.
+        let h = harness(&db, &[complete[0].0], limits()).await;
+        assert_eq!(
+            h.prober
+                .check(&flow(), &probe(), None, None, now())
+                .await
+                .expect("allowed"),
+            Checked::TruthStale
+        );
+    }
+
+    /// The four clocks, one per category, and the two named constants are rows
+    /// of the table rather than numbers of their own.
+    #[test]
+    fn the_truth_age_table_is_indexed_by_the_category() {
+        for (i, (category, _)) in MAX_TRUTH_AGE.iter().enumerate() {
+            assert_eq!(*category as usize, i, "{category:?} is out of order");
+            assert_eq!(category.max_truth_age(), MAX_TRUTH_AGE[i].1);
+        }
+        assert_eq!(MAX_FEE_AGE, TimeDelta::days(90));
+        assert_eq!(MAX_AUTHORITY_AGE, TimeDelta::days(365));
+        assert_eq!(
+            MissingCategory::FreeVoaVersusExemption.max_truth_age(),
+            MAX_FINDING_AGE,
+            "a page-only category ages with our look at the page"
+        );
+        // Years, not hours: the bar the old 24-hour constant set is gone.
+        assert!(
+            MAX_TRUTH_AGE
+                .iter()
+                .all(|(_, age)| *age >= TimeDelta::days(7))
         );
     }
 
@@ -2925,7 +3264,7 @@ mod tests {
         // No clause about what the rule is, so there is nothing here for a free
         // source to rebut — and nothing that quotes our own row at them.
         assert!(!line.contains("orizn:"), "{line}");
-        assert!(evidence.finding.stands_on_their_page());
+        assert!(evidence.finding.citable());
     }
 
     // -- the categorical findings ------------------------------------------
@@ -2933,14 +3272,15 @@ mod tests {
     /// **Category 1: the official consular fee.**
     ///
     /// Nobody publishes it. The observable property is not a wrong number — we
-    /// have no number — it is a price with no side named: their panel puts money
+    /// have no number — it is the category being absent: a visa with no fee
+    /// line at all, or a price with no side named, where their panel puts money
     /// on the screen and never says whether it goes to the destination's
     /// consulate or to them.
     ///
     /// A page that *does* attribute it produces nothing, which is the half of
     /// this that makes the other half sendable.
     #[tokio::test]
-    async fn a_price_with_no_side_named_is_a_finding_and_an_attributed_one_is_not() {
+    async fn a_visa_with_no_fee_line_or_no_side_named_is_a_finding_and_an_attributed_one_is_not() {
         let Some(db) = db().await else { return };
 
         let h = harness(
@@ -2961,7 +3301,11 @@ mod tests {
             .clone();
 
         assert_eq!(evidence.finding, Finding::UnattributedFee);
-        assert!(evidence.finding.stands_on_their_page());
+        assert_eq!(
+            evidence.finding.missing(),
+            Some(MissingCategory::OfficialFee)
+        );
+        assert!(evidence.finding.citable());
         assert_eq!(evidence.steps.len(), 6, "reproduction steps ride along");
 
         let line = evidence.claim_line();
@@ -2969,6 +3313,19 @@ mod tests {
         assert!(line.contains("a fee of your own"), "{line}");
         assert!(!line.contains("orizn:"), "{line}");
         assert!(!line.contains(INJECTION), "{line}");
+
+        // A visa with no fee line at all is the same category missing.
+        let silent = harness(&db, &["A visa is required before travel."], limits()).await;
+        assert_eq!(
+            silent
+                .prober
+                .check(&flow(), &probe(), Some(&authority()), None, now())
+                .await
+                .expect("allowed")
+                .evidence()
+                .map(|e| e.finding.clone()),
+            Some(Finding::UnattributedFee)
+        );
 
         // The same page, with the attribution their traveller needs. Nothing to
         // say — and it is `Contradicts`, because the requirement still differs;
@@ -3036,7 +3393,7 @@ mod tests {
 
         // Exactly one finding, and it is the categorical one that may be sent.
         assert_eq!(evidence.finding, Finding::UnattributedFee);
-        assert!(evidence.finding.stands_on_their_page());
+        assert!(evidence.finding.citable());
 
         let line = evidence.claim_line();
         // The first half is unchanged and stands on its own.
@@ -3067,8 +3424,8 @@ mod tests {
     /// is knowing that.
     ///
     /// The decision is made where the payload is read —
-    /// [`crate::orizn::read_fee`] returns
-    /// [`TruthError::FeeNotOwed`](crate::orizn::TruthError::FeeNotOwed) for
+    /// le producteur de `ConsularFee` returns
+    /// `FeeNotOwed` for
     /// every requirement but `visa_required`, so nothing arrives here at all.
     /// This is the assertion that the *consequence* is the right one: the
     /// finding still stands, because it never needed the number.
@@ -3243,36 +3600,60 @@ mod tests {
 
     /// **Category 3: a free visa on arrival is not a visa exemption.**
     ///
-    /// Three sources in four conflate them. Detected on the page alone — the
-    /// prospect wrote both sentences, so there is no external fact to lose on.
-    /// A page that qualifies the exemption correctly ("no visa required **in
-    /// advance** — issued on arrival") is not a conflation and produces none.
+    /// Three sources in four conflate them. Detected on the page alone — what
+    /// the prospect wrote and did not write, so there is no external fact to
+    /// lose on. A page that draws the distinction ("no visa required **in
+    /// advance** — issued on arrival"; "not an exemption") has the category and
+    /// produces nothing.
     #[tokio::test]
-    async fn a_page_saying_both_exemption_and_border_visa_is_one_finding() {
+    async fn a_free_visa_on_arrival_that_never_says_exemption_is_one_finding() {
         let Some(db) = db().await else { return };
 
-        let h = harness(
+        for panel in [
+            "No visa required for this trip. Your visa on arrival is issued at the airport.",
+            "Visa on arrival, free.",
+        ] {
+            let h = harness(&db, &[panel], limits()).await;
+            let evidence = h
+                .prober
+                .check(&flow(), &probe(), Some(&authority()), None, now())
+                .await
+                .expect("allowed")
+                .evidence()
+                .expect("a border visa read as nothing is a finding")
+                .clone();
+
+            assert_eq!(evidence.finding, Finding::Conflates, "{panel}");
+            assert_eq!(
+                evidence.finding.missing(),
+                Some(MissingCategory::FreeVoaVersusExemption)
+            );
+            assert!(evidence.finding.citable());
+
+            let line = evidence.claim_line();
+            assert!(line.contains("nowhere said that it is not one"), "{line}");
+            assert!(line.contains("denied boarding"), "{line}");
+            assert!(!line.contains("orizn:"), "{line}");
+        }
+
+        // The distinction drawn, in one word: the category is there.
+        let distinguished = harness(
             &db,
-            &["No visa required for this trip. Your visa on arrival is issued at the airport."],
+            &["Visa on arrival, free of charge. This is not a visa exemption."],
             limits(),
         )
         .await;
-        let evidence = h
-            .prober
-            .check(&flow(), &probe(), Some(&authority()), None, now())
-            .await
-            .expect("allowed")
-            .evidence()
-            .expect("two incompatible sentences is a finding")
-            .clone();
-
-        assert_eq!(evidence.finding, Finding::Conflates);
-        assert!(evidence.finding.stands_on_their_page());
-
-        let line = evidence.claim_line();
-        assert!(line.contains("both that no visa is required"), "{line}");
-        assert!(line.contains("denied boarding"), "{line}");
-        assert!(!line.contains("orizn:"), "{line}");
+        assert_ne!(
+            distinguished
+                .prober
+                .check(&flow(), &probe(), Some(&authority()), None, now())
+                .await
+                .expect("allowed")
+                .evidence()
+                .map(|e| e.finding.clone()),
+            Some(Finding::Conflates),
+            "a page that says 'exemption' was told it never does"
+        );
 
         // The sentence we would want them to write. Precise, and not a finding.
         let precise = harness(
@@ -3293,17 +3674,20 @@ mod tests {
         );
     }
 
-    /// **Category 4: the quiet bilateral agreement.**
+    /// **Category 4: the quiet bilateral agreement, illustrated.**
     ///
     /// India↔Maldives has been 90 days since 2019 and two paid sources still say
     /// 30. The finding exists exactly where the accuracy comparison ends:
     /// their page has the *regime* right, so the old criterion returned
     /// [`Checked::Agrees`] and went home.
     ///
-    /// And it is not sendable, because deleting the clause about what the rule
-    /// is leaves "your page states a 30-day stay", which is not a defect.
+    /// It is sendable as the illustration of the missing category and only as
+    /// that: the sentence says their page has no line for the agreement, and
+    /// gives the entitlement under it with its source and date. A page that
+    /// names the agreement has the category, and its number is not ours to
+    /// dispute.
     #[tokio::test]
-    async fn a_short_entitlement_on_a_page_that_agrees_is_a_finding_nobody_may_send() {
+    async fn a_stay_length_with_no_agreement_named_illustrates_the_missing_category() {
         let Some(db) = db().await else { return };
 
         let h = harness(&db, &["Visa-free entry for up to 30 days."], limits()).await;
@@ -3313,7 +3697,7 @@ mod tests {
             .await
             .expect("allowed")
             .evidence()
-            .expect("a short entitlement is a finding")
+            .expect("a stay with no agreement behind it is a finding")
             .clone();
 
         assert_eq!(
@@ -3323,11 +3707,37 @@ mod tests {
                 correct: 90
             }
         );
-        assert!(
-            !evidence.finding.stands_on_their_page(),
-            "a claim made of nothing but our own number became sendable"
+        assert_eq!(
+            evidence.finding.missing(),
+            Some(MissingCategory::BilateralAgreement)
         );
-        assert!(evidence.claim_line().contains("orizn:requirements/v1"));
+        assert!(evidence.finding.citable());
+        let line = evidence.claim_line();
+        assert!(
+            line.contains("nothing about the bilateral agreement"),
+            "{line}"
+        );
+        assert!(
+            line.contains("90 days (orizn:requirements/v1, as of 2026-08-23)"),
+            "{line}"
+        );
+        assert!(!line.contains("wrong"), "{line}");
+
+        // The category is there: the number becomes a dispute, not a finding.
+        let named = harness(
+            &db,
+            &["Visa-free entry for up to 30 days under the bilateral agreement."],
+            limits(),
+        )
+        .await;
+        assert_eq!(
+            named
+                .prober
+                .check(&flow(), &probe(), Some(&exempt_for_90_days()), None, now())
+                .await
+                .expect("allowed"),
+            Checked::Agrees
+        );
 
         // The same page against the entitlement it states: agrees, and that is
         // still a perfectly good answer.
@@ -3376,7 +3786,7 @@ mod tests {
         );
     }
 
-    /// The keyless surface answers `last_verified: null`, so `crate::orizn`
+    /// The keyless surface answers `last_verified: null`, so le producteur d'`Answer`
     /// builds no [`Answer`] at all — and under the old criterion that meant no
     /// finding could be produced, ever, because every claim shape needed a
     /// requirement to compare against.
@@ -3399,7 +3809,14 @@ mod tests {
                 "No visa required. Visa on arrival at the airport.",
                 Some(Finding::Conflates),
             ),
-            ("A visa is required before travel.", None),
+            (
+                "A visa is required before travel.",
+                Some(Finding::UnattributedFee),
+            ),
+            (
+                "A visa is required before travel. Government fee $25, our service fee $44.99.",
+                None,
+            ),
         ] {
             let h = harness(&db, &[panel], limits()).await;
             let checked = h
@@ -3418,24 +3835,36 @@ mod tests {
         }
     }
 
-    /// The five findings, their labels, and which of them may be asserted.
+    /// The five findings, their labels, the category each names, and which of
+    /// them may be asserted.
     ///
     /// The list is the send bar written out, so adding a sixth finding forces
-    /// somebody to answer the question this module is about: does it survive
-    /// deleting every sentence about what the rule is?
+    /// somebody to answer the question this module is about: which category
+    /// does their page not display?
     #[test]
-    fn only_the_findings_that_stand_on_their_page_may_be_asserted() {
-        for (finding, code, sendable) in [
-            (Finding::SaysNothing, "says_nothing", true),
-            (Finding::UnattributedFee, "unattributed_fee", true),
-            (Finding::Conflates, "conflates", true),
+    fn only_a_silent_page_or_a_missing_category_may_be_asserted() {
+        for (finding, code, missing, sendable) in [
+            (Finding::SaysNothing, "says_nothing", None, true),
+            (
+                Finding::UnattributedFee,
+                "unattributed_fee",
+                Some(MissingCategory::OfficialFee),
+                true,
+            ),
+            (
+                Finding::Conflates,
+                "conflates",
+                Some(MissingCategory::FreeVoaVersusExemption),
+                true,
+            ),
             (
                 Finding::StayLength {
                     shown: 30,
                     correct: 90,
                 },
                 "stay_length",
-                false,
+                Some(MissingCategory::BilateralAgreement),
+                true,
             ),
             (
                 Finding::Contradicts {
@@ -3443,12 +3872,21 @@ mod tests {
                     correct: Claim::VisaRequired,
                 },
                 "contradicts",
+                None,
                 false,
             ),
         ] {
             assert_eq!(finding.code(), code);
-            assert_eq!(finding.stands_on_their_page(), sendable, "{code}");
+            assert_eq!(finding.missing(), missing, "{code}");
+            assert_eq!(finding.citable(), sendable, "{code}");
         }
+        // Category 2 is in the enum and produced by nothing — see the module
+        // docs. The table has a row for it all the same.
+        assert!(
+            MAX_TRUTH_AGE
+                .iter()
+                .any(|(c, _)| *c == MissingCategory::LegalUncertainty)
+        );
     }
 
     /// The detectors, at the unit they are written in — no browser, no database,
@@ -3472,15 +3910,34 @@ mod tests {
         assert_eq!(read_fee("service fee from $69.99"), Fee::Attributed);
         assert_eq!(read_fee("no visa required"), Fee::Silent);
 
-        // Conflation is two sentences in one panel. An exemption qualified
-        // inside its own sentence is precision, not conflation.
-        assert!(conflates("no visa required. visa on arrival available."));
-        assert!(conflates("visa-free entry; your visa on arrival is free"));
-        assert!(!conflates(
+        // Category 3 is a border visa that reads as nothing, with the
+        // distinction drawn nowhere on the page. Any way of drawing it is the
+        // category being there.
+        assert!(lacks_voa_distinction(
+            "no visa required. visa on arrival available."
+        ));
+        assert!(lacks_voa_distinction(
+            "visa-free entry; your visa on arrival is free"
+        ));
+        assert!(lacks_voa_distinction("visa on arrival, free."));
+        assert!(!lacks_voa_distinction(
             "no visa is required in advance; a visa is issued on arrival"
         ));
-        assert!(!conflates("visa on arrival at the airport"));
-        assert!(!conflates("no visa required for stays under 90 days"));
+        assert!(!lacks_voa_distinction(
+            "visa on arrival, free of charge. not a visa exemption."
+        ));
+        assert!(!lacks_voa_distinction("visa on arrival at the airport"));
+        assert!(!lacks_voa_distinction(
+            "visa on arrival at the airport. free cancellation on this fare."
+        ));
+        assert!(!lacks_voa_distinction(
+            "no visa required for stays under 90 days"
+        ));
+
+        // Category 4's page half: does the page say what the stay rests on?
+        assert!(names_agreement("30 days under the bilateral agreement"));
+        assert!(names_agreement("90 days by treaty"));
+        assert!(!names_agreement("visa-free entry for up to 30 days"));
 
         // A stay length, and the first "day" wins — the named ceiling.
         assert_eq!(read_stay_days("up to 30 days"), Some(30));
@@ -3802,13 +4259,18 @@ mod tests {
         );
     }
 
-    /// A flow that is right is not a finding, and a panel we cannot read is not
-    /// a finding either. Both are silence, for different reasons.
+    /// A flow that is right and complete is not a finding, and a panel we cannot
+    /// read is not a finding either. Both are silence, for different reasons.
     #[tokio::test]
     async fn agreement_and_ambiguity_both_produce_no_evidence() {
         let Some(db) = db().await else { return };
 
-        let right = harness(&db, &["A visa is required before travel."], limits()).await;
+        let right = harness(
+            &db,
+            &["A visa is required before travel. Government fee $25, our service fee $44.99."],
+            limits(),
+        )
+        .await;
         assert_eq!(
             right
                 .prober

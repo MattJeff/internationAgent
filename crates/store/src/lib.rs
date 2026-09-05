@@ -35,6 +35,8 @@ pub mod phone_pool;
 pub mod policy; // U41
 pub mod provisioning; // U8
 pub mod psyche;
+// le registre public: ce que la gate a refusé, agrégé, sur consentement explicite
+pub mod public_register;
 pub mod revenue; // wave 12: seller vertical
 pub mod signing;
 pub mod sourcing;

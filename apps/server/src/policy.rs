@@ -8,11 +8,13 @@
 //! written no route wrote `policy_layers` at all — so a fresh install could not
 //! be made to work without hand-written SQL. This is that missing half.
 //!
-//! One route writes `policy_layers` now: `POST /v1/companies`, and only where
-//! the tenant has no such layer (`409 role_layer_exists` otherwise). "Both
-//! arguments survived, and it turned out they were about *replacing*" below is
-//! the whole story; the sentence above is kept in the past tense rather than
-//! deleted because it is why this module exists.
+//! Two routes write `policy_layers` now: `POST /v1/companies`, where the tenant
+//! has no such layer (`409 role_layer_exists` otherwise), and
+//! `PUT /v1/policy/roles/{role}`, which replaces one and can only narrow it
+//! (`409 policy_widens` otherwise). "Both arguments survived, and it turned out
+//! they were about *replacing*" below is the first half of that story and the
+//! section after it is the second; the sentence above is kept in the past tense
+//! rather than deleted because it is why this module exists.
 //!
 //! Four verbs, and each closes a step `docs/ORIZN.md` used to have to spell as
 //! `psql`:
@@ -175,11 +177,36 @@
 //!   which is the escalation this module names — and it never could, since the
 //!   *employee* scope has no door at all.
 //!
+//! # And then the reading went one step further: `PUT`, but only downwards
+//!
+//! `routes::policy` replaces a role layer over HTTP. That is the paragraph above
+//! taken at its word rather than contradicted: the objection was to a `PUT` that
+//! could raise a cap, and a `PUT` that *cannot* is a different verb. It reads the
+//! layer it would displace and answers `409 policy_widens` for anything not
+//! contained in it — compared with `PolicyLimits::narrows`, which is
+//! `old ∧ new == new` under the loader's own `intersect`, so it is the same
+//! arithmetic the gate runs and not a second opinion about it. Read, compare and
+//! write are one transaction under one advisory lock, because a comparison
+//! against a layer somebody else is mid-replacement of is no comparison at all.
+//!
+//! Both sentences above survive that, again:
+//!
+//! * **"Two places to write a limit is one place to forget to tighten."** The
+//!   failure that sentence names is a limit somebody meant to lower and did not.
+//!   A route that refuses everything except a tightening cannot produce it — the
+//!   only thing it can leave behind is a limit *lower* than the operator's file
+//!   says, which the next `policy install` corrects in the direction that needs
+//!   the credential.
+//! * **"The premise is one variable wide."** A per-seat token on that route can
+//!   take rights away from its own role and can take none. It still cannot reach
+//!   the employee scope, which has no door, nor its tenant's layer, nor the
+//!   ceiling.
+//!
 //! What is still only here: the platform ceiling (whose row belongs to no tenant
 //! and binds every other one — there is a platform principal now, and the two
 //! bullets at the top of this module are why the ceiling did not follow the
-//! keyring onto it), and every *edit* to a layer that exists. [`rollback_layer`]
-//! too:
+//! keyring onto it), every *widening* of a layer that exists, and the tenant and
+//! employee scopes, which have no route at all. [`rollback_layer`] too:
 //! a rollback removes a layer, and removing one is the one operation in this
 //! file that genuinely widens.
 

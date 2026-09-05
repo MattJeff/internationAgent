@@ -1,13 +1,20 @@
 pub mod a2a; // U34
+// l'export comptable: the same books as `pnl`, one CSV line per movement, for
+// a human accountant's tool. Its totals foot to `/v1/pnl` by construction.
+pub mod accounting;
 pub mod approvals;
 pub mod autonomy;
 // wave M: what we may charge for — seats and connectors, by the day, derived
 // from the trail. The counter, deliberately not the collection.
 pub mod billing;
+// la page de réservation: a stranger picks an hour on a seat that opened its
+// door, and the seat is woken by it. Public pair + one private switch.
+pub mod booking;
 // le calendrier: the founder promises a moment and sees what has been promised.
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
+pub mod controls; // tâche K: ce qui borne chaque siège et le bouton d'arrêt, en une lecture
 // le fil: the person reads what landed on a seat's desk and writes back from it.
 // No table and no port — `0028`'s internal channel already is the thread; see
 // `agentos_app::inbound`'s desk section and `migrations/0065`.
@@ -31,9 +38,19 @@ pub mod invoices;
 pub mod knowledge;
 pub mod mcp;
 pub mod model; // wave H: the tenant connects the model their employees think with
+// the one route that changes a limit. `POST /v1/companies` creates a role layer
+// where none exists; this one replaces one, and can only tighten — see its
+// module docs for the invariant and the three mechanisms that hold it.
 pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
+pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money it moved
+pub mod policy;
 pub mod pool;
+// le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
+// pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
+// lecture est montée hors de toute clé; sa bascule est un acte de locataire.
+pub mod public_register;
 pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
+pub mod refusals; // ce que la gate a refusé, lu dans le journal
 pub mod reports; // the manager's view of its own line
 pub mod spend;
 pub mod teams;

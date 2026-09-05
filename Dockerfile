@@ -47,11 +47,17 @@ COPY crates/store/Cargo.toml     crates/store/
 COPY crates/providers/Cargo.toml crates/providers/
 COPY crates/app/Cargo.toml       crates/app/
 COPY apps/server/Cargo.toml      apps/server/
+# `apps/social` is a workspace member too: cargo refuses to load the workspace
+# with one manifest missing, whichever package is being built. Stubbed like the
+# server, never built here.
+COPY apps/social/Cargo.toml      apps/social/
 RUN set -eux; \
     for crate in crates/domain crates/eval crates/store crates/providers crates/app; do \
       mkdir -p "$crate/src"; : > "$crate/src/lib.rs"; \
     done; \
-    mkdir -p apps/server/src; echo 'fn main() {}' > apps/server/src/main.rs; \
+    for app in apps/server apps/social; do \
+      mkdir -p "$app/src"; echo 'fn main() {}' > "$app/src/main.rs"; \
+    done; \
     cargo build --release --locked -p agentos-server --bin agentos-server; \
     rm -rf crates apps target/release/.fingerprint/agentos-*
 

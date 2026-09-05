@@ -363,6 +363,52 @@ pub enum OptOuts {
     /// somebody has to name. An entry that named none would be a click with
     /// nowhere to go.
     Pushed { at: &'static str },
+    /// This connector can put a message in front of a person who did not ask
+    /// for it, and the vendor keeps no list of the ones who refused. So the
+    /// only register of that refusal is `suppressions`, here, and there is
+    /// nothing upstream for [`crate::queue::reconcile_opt_outs`] to fetch.
+    ///
+    /// # It is an admission, not a permission
+    ///
+    /// The three variants above all end in somewhere to look: a vendor's list,
+    /// a path of ours, or a claim that nobody can be reached. This one ends in
+    /// a fact about the vendor — *they do not keep one* — and that fact is not
+    /// ours to fix by refusing the entry.
+    ///
+    /// That is the reasoning that was wrong before this variant existed, and it
+    /// is worth writing down because it is the reasoning somebody will reach for
+    /// again. [`NO_OUTREACH`] is a **register**, not an execution lock: nothing
+    /// reads it at call time, no gate consults it, and no message is stopped by
+    /// it. It is the document somebody has to be able to read to answer for an
+    /// obligation. Refusing to write an entry therefore protected nobody — the
+    /// customer connected the same vendor through [`CUSTOM`] and the register
+    /// went quiet exactly where it should have spoken. What stops a call is the
+    /// policy gate and a human approval, and both of them are downstream of
+    /// every value in this enum.
+    ///
+    /// So this variant **widens** what the document says rather than what the
+    /// product may do. [`OUTREACH_HELD_HERE`] is the second register it makes
+    /// possible, and it is the honest half of [`NO_OUTREACH`]: one array names
+    /// the connectors that reach nobody, the other names the connectors that
+    /// reach strangers with no vendor list behind them. A connector that is in
+    /// neither has named its read.
+    ///
+    /// # What it still costs
+    ///
+    /// The same discipline as [`OptOuts::NoStrangers`], for the same reason:
+    /// both are claims about a tool list that only a person can check, and the
+    /// cheap one is the one that gets typed by somebody in a hurry. Writing it
+    /// fails the build until [`OUTREACH_HELD_HERE`]'s length is bumped, and that
+    /// failure message asks for the reading that was owed — every tool this
+    /// server serves, and which of them takes an address.
+    ///
+    /// It is also not the escape hatch for a vendor that *does* keep a list and
+    /// nobody looked. [`OptOuts::Pulled`] is one string away and is strictly
+    /// more useful, so the only entries here are the ones where somebody went
+    /// looking for a suppression endpoint and found the vendor has none —
+    /// `posthog` is the connector that proves the difference, because it can
+    /// send and it publishes `opt-outs-list`, so it is `Pulled` and not this.
+    HeldHere,
     /// Nobody here has ever seen this server.
     ///
     /// [`Provision::Customer`] and nothing else — asserted at compile time by
@@ -443,6 +489,38 @@ pub const CUSTOM: Connector = Connector {
     opt_outs: OptOuts::Unseen,
 };
 
+/// Google's consent page, **with two query parameters that are not decoration**.
+///
+/// [`crate::oauth::start`] builds its query with `Url::query_pairs_mut`, which
+/// *appends*: a query already on this literal survives everything `start` adds
+/// after it. `a_providers_own_authorize_query_survives_what_start_appends` in
+/// `crate::oauth` is the test that says so, rather than a reader hoping.
+///
+/// * `access_type=offline` — without it Google issues **no refresh token at
+///   all**. Every other provider in this file returns one by default; Google's
+///   default is a one-hour access token and nothing to renew it with. The
+///   binding would survive onboarding, survive the demo, and be dead by lunch,
+///   with `crate::oauth::refresh_due` looking at an empty column and no way back
+///   except sending the customer through consent again.
+/// * `prompt=consent` — Google returns the refresh token **only on a consent it
+///   actually showed a human**. A user who has already approved this application
+///   is re-authorized silently and the exchange comes back without one: the same
+///   dead binding, except it happens only on rebinds, only to customers who
+///   already connected once, and never in a first-run test.
+///
+/// So both are load-bearing, and the failure they prevent is the same one twice:
+/// a stored access token with a `NULL` beside it that nobody can explain sixty
+/// minutes later.
+const GOOGLE_AUTHORIZE: &str =
+    "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent";
+
+/// Google's token endpoint, shared by all three entries below.
+///
+/// [`ClientAuth::Post`] with it: Google's documentation shows `client_id` and
+/// `client_secret` as form fields and shows nothing else, which is the fact
+/// [`OAuth::auth`] exists to record per provider.
+const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
+
 /// Every connector we have written down.
 ///
 /// Short on purpose. An entry is a claim about somebody else's product — their
@@ -450,47 +528,326 @@ pub const CUSTOM: Connector = Connector {
 /// checked is worse than an absent entry, because an absent entry sends the
 /// customer to [`CUSTOM`] where they paste a URL they looked up themselves.
 ///
-/// # Why there is still no OAuth entry here, now that OAuth works
-///
-/// [`Credential::OAuth`] is built, tested end to end against a provider in
-/// `crate::oauth`'s own tests, and reachable from the two routes in
-/// `apps/server/src/routes/mcp.rs`. No entry uses it, and that is a refusal
-/// rather than an omission — the rule two paragraphs up is the one being kept.
+/// # The OAuth entries, and what each of their four strings had to survive
 ///
 /// An entry is a claim, and an OAuth entry is **four** claims: the MCP endpoint,
 /// the authorization URL, the token URL, and the scope spelling. Every one of
-/// them is a string that fails silently-ish if wrong — a bad scope is a consent
-/// screen that grants too much, a bad authorize host is a phishing page we
-/// shipped ourselves — and none of them can be checked from here, because
-/// checking them means registering an application with that provider and making
-/// a real call. Neither has happened.
+/// them fails silently-ish if wrong — a bad scope is a consent screen that
+/// grants too much, a bad authorize host is a phishing page we shipped
+/// ourselves — so none of them may be typed from a blog post. The three Google
+/// entries below were added after their MCP endpoints were dialled directly:
+/// `initialize` at protocol `2025-06-18`, then `tools/list`, whose answers are
+/// what the floors and the opt-out claims are read off. That probe is dated in
+/// each entry, because a tool list is a thing a vendor changes without telling
+/// anybody.
 ///
-/// The second half is sharper and is the reason this is not merely caution.
-/// **An OAuth connector needs a client registration that only the deployment can
-/// obtain**, and `apps/server/src/routes/mcp.rs`'s catalogue handler only
-/// advertises an entry whose client credentials this deployment actually holds.
-/// So an entry added before somebody registers the application is a button that
-/// is either invisible or broken; adding one is the *second* step, and the first
-/// one is not code.
+/// The second half is sharper and has not changed. **An OAuth connector needs a
+/// client registration that only the deployment can obtain**, and
+/// `apps/server/src/routes/mcp.rs`'s catalogue handler only advertises an entry
+/// whose client credentials this deployment actually holds. So the entries below
+/// are inert until somebody registers the application with Google and puts the
+/// pair in `OauthClients` — a button that is invisible rather than broken, which
+/// is the failure mode worth having.
 ///
-/// What is written down instead is what registering takes, in this unit's
-/// report, so the person with the accounts can do it and add the literal. The
-/// literal is four lines, the test below vets it, and it is a deploy — which is
-/// the price this file has charged for a security default since it was written.
+/// # What is deliberately *not* here
+///
+/// * **Slack.** Technically ready — remote, Streamable HTTP, a bearer token.
+///   What it is missing is not code: serving more than one workspace requires a
+///   Slack Marketplace listing, and until that exists an entry here is a button
+///   that works for exactly the workspace whose app we registered. That is a
+///   demo, not a connector.
+/// * **Sentry.** Its `client_id`/`client_secret` come from a hand-made
+///   `POST /register` rather than a console, and the secret **expires at ninety
+///   days**. Nothing in this repository would remind anybody, so the entry's
+///   real cost is a quarterly chore that fails silently as an `invalid_client`
+///   on a Tuesday. Out of scope until something owns that clock. Notion, Canva,
+///   Granola and Magnific were in this paragraph for the same reason and are
+///   not any more: all four answer `POST /register` with
+///   `client_secret_expires_at: 0`, measured 2026-08-31, so the secret is
+///   permanent and there is no clock to own. Three of them are entries below.
+/// * **Figma.** Its authorization server answers 403 to clients outside its own
+///   catalogue, so the consent page cannot be reached from here at all.
+/// * **Canva.** The fourth of that group, and the one that did not survive its
+///   own measurement. `POST https://mcp.canva.com/register` accepts
+///   `https://siglair.com/v1/mcp/oauth/callback` and echoes it back — and then
+///   `GET /authorize` answers **400 `Invalid redirect URI`** for that URI, for
+///   `https://example.com/cb`, and for every `https` URI tried. The same client
+///   registered with `http://localhost:33418/oauth/callback` gets a 302 to
+///   Canva's consent page. Canva's MCP authorization server accepts loopback
+///   redirects only, which is a desktop-client flow and is mutually exclusive
+///   with this deployment having exactly one public callback. A second finding
+///   from the same probe, moot but worth keeping: Canva ignores the `scope` we
+///   send and substitutes its own full sixteen, so `OAuth::scopes` would have
+///   been decorative here even if the redirect had worked. Not a registration
+///   away — the provider has to change.
 ///
 /// Each token entry below carries the reason it is a static bearer token, because
 /// that is the question every one of them raises.
+///
+/// # Les trois qu'on a demandés le 2026-09-02, et qui ne sont pas ici
+///
+/// Chacun a été sondé, chacun manque d'un fait précis, et chacun redevient une
+/// ligne de code le jour où ce fait existe. Les écrire ici plutôt que dans un
+/// ticket, c'est ce qui fait qu'on ne les redemandera pas dans six mois.
+///
+/// * **Smartlead** — bloqué par [`OptOuts`], et c'est le cas d'école que le
+///   test `a_sender` décrit. Ce serveur poste au nom du client vers des gens qui
+///   n'ont rien demandé, donc il lui faut une variante d'[`OptOuts`] qui nomme
+///   par où les désabonnements rentrent.
+///
+///   **Première lecture, et elle était fausse.** On avait conclu « une écriture
+///   sans lecture en face » parce que la liste d'outils du serveur MCP expose
+///   `unsubscribe_lead_globally` sans rien qui liste les désabonnés, et parce
+///   que la référence publique ne documente aucun point d'entrée de liste de
+///   blocage. La conclusion ne tenait pas : Smartlead ne se **tire** pas, il
+///   **pousse**.
+///
+///   `api.smartlead.ai/core/webhooks` sert un catalogue d'événements qui
+///   contient `EMAIL_UNSUBSCRIBED` — à côté de `EMAIL_BOUNCED`, `EMAIL_REPLIED`,
+///   `EMAIL_SENT` — enregistrables par `POST /webhooks`. C'est donc
+///   [`OptOuts::Pushed`] et pas [`OptOuts::Pulled`], et la même page montre la
+///   vérification : un HMAC-SHA256 sur le corps brut, comparé en temps constant.
+///
+///   Ce qui manque n'est plus une catégorie, c'est **un nom** : le
+///   `provider` d'un endpoint choisit le schéma de signature dans
+///   `routes::webhooks`, et le nom de l'en-tête que Smartlead envoie n'est
+///   documenté nulle part sur cette page. L'écrire au jugé, ce serait soit des
+///   livraisons authentiques répondues `401`, soit — bien pire — un
+///   vérificateur qui accepte ce qu'il ne devrait pas.
+///
+///   **Le 2026-09-02, tout ce qui pouvait être écrit sans ce nom l'a été.** La
+///   migration existe (`0077`, `webhook_endpoints_provider_is_wired` accepte
+///   `'smartlead'`), le troisième schéma de signature existe
+///   (`routes::webhooks`, HMAC-SHA256 hexadécimal sur le corps brut, comparaison
+///   en temps constant), l'ingestion existe
+///   ([`crate::inbound::record_smartlead_unsubscribe`], qui écrit sa ligne de
+///   `suppressions` par la même fonction que la porte tirée) et son handler est
+///   enregistré. **Il n'y a toujours pas d'entrée dans [`CATALOG`]**, et il n'y
+///   en aura pas tant que le nom manquera : la voie d'enregistrement refuse avec
+///   [`crate::webhooks::EndpointError::SignatureHeaderUnposed`], et la route
+///   refuse toute livraison. Un connecteur qui refuse de s'enregistrer est un
+///   connecteur pas fini ; un en-tête deviné qui accepte ce qu'il ne devrait pas
+///   est pire.
+///
+///   **Et la recherche du même jour conclut que cet en-tête n'existe pas.**
+///   Trois lignes d'évidence indépendantes convergent — l'API d'enregistrement
+///   des webhooks n'a aucun champ où saisir un secret partagé, deux sources
+///   attestent que Smartlead renvoie son propre secret *dans le corps JSON*
+///   (champ `secret_key`), et une intégration en production documente que ses
+///   livraisons authentiques ont toutes été refusées `401` par un vérificateur
+///   d'en-tête deviné. Les URLs et le détail sont au-dessus de
+///   [`crate::inbound::SMARTLEAD_SIGNATURE_HEADER`].
+///
+///   **Ce qui débloque, donc, et ce n'est plus la même liste :** une livraison
+///   réelle vers une URL qu'on contrôle, et la lecture de ses en-têtes. S'il y
+///   en a un, c'est un `Some("…")` à poser dans ce const et tout ce qui est
+///   déjà écrit se met à marcher. S'il n'y en a pas — ce que la recherche
+///   prédit — alors le schéma à câbler est le quatrième et pas le troisième :
+///   chemin de livraison non devinable qui fait office de credential, plus
+///   égalité en temps constant sur le champ `secret_key` du corps, comparé
+///   **après** parse et jamais avant. Ce jour-là il faudra aussi décider où le
+///   `secret_key` est appris, puisque Smartlead le génère et qu'on ne le
+///   choisit pas.
+///
+/// * **Docker** — le serveur officiel (`github.com/docker/hub-mcp`) existe, mais
+///   il n'a **ni endpoint hébergé ni paquet publié** : on clone et on compile.
+///   `mcp.docker.com/.well-known/oauth-authorization-server` rend 404,
+///   `hub-mcp.docker.com` ne résout pas. [`Provision::Host`] veut un
+///   [`Package::spec`] que *ce binaire* nomme et qu'on accepte de faire tourner ;
+///   « clonez et compilez » n'est pas un spec, c'est un chantier.
+///
+///   **Rien ne nous empêche de le publier nous-mêmes** : `docker/hub-mcp` est
+///   sous Apache 2.0 (Docker, Inc., 2025), et le moteur lui-même est sous la
+///   même licence. La licence n'est pas le mur ; le mur est qu'on n'a encore
+///   rien publié. Et il faut distinguer les deux Docker qu'on nous demande :
+///
+///   1. **Docker Hub** — des dépôts d'images, des tags, des vulnérabilités.
+///      C'est ce que sert `hub-mcp`, et c'est une entrée `Host` ordinaire le
+///      jour où un paquet épinglé existe : `env: Some("HUB_PAT_TOKEN")`, rien
+///      de neuf sous le soleil.
+///   2. **Le démon Docker d'un serveur** — « est-ce que ça tourne, pourquoi
+///      c'est tombé, redémarre-le ». C'est ça qu'on veut vraiment dire par
+///      « connecter un serveur », et **c'est là que se pose la seule question
+///      qui compte.**
+///
+///   L'API du moteur est documentée et ouverte ; écrire un serveur MCP qui la
+///   parle est une journée de travail. Le piège est qu'un `POST
+///   /containers/{id}/exec`, ou un `run` sur une image que le client choisit,
+///   **est exactement l'interpréteur que [`Credential`] passe quatre-vingt-dix
+///   lignes à refuser sous le nom de SSH** — `docker run -v /:/host alpine sh`
+///   est root sur la machine, avec un autre chapeau. Un connecteur Docker qui
+///   expose `exec` n'est pas un connecteur, c'est une session.
+///
+///   Donc la décision, et elle est nôtre et pas celle de Docker : **on expose
+///   la moitié qui est une liste, jamais celle qui est un interpréteur.**
+///
+///   | Exposé | Refusé |
+///   |---|---|
+///   | lister les conteneurs, leur état, leurs journaux | `exec` sous toutes ses formes |
+///   | inspecter, lire les statistiques, suivre les événements | `create`/`run` avec une image que le client nomme |
+///   | démarrer, arrêter, redémarrer **un conteneur qui existe déjà, par son id** | tout montage hôte, `--privileged`, `network: host` |
+///   | lister les images présentes | `commit`, `push`, la suppression de volumes |
+///
+///   Cette moitié-là répond à ce qu'une équipe demande dix fois par jour et ne
+///   contient aucun verbe qui invente un programme. `floor` serait `Write` : un
+///   redémarrage se refait, il ne se perd pas.
+///
+///   En attendant qu'un paquet existe, le chemin qui marche **aujourd'hui** est
+///   [`CUSTOM`] — le client fait tourner ce serveur sur sa machine et branche
+///   son adresse, ce qui est exactement l'argument « SSH est un déploiement,
+///   pas un connecteur ».
+///
+///   **Le 2026-09-02, cette moitié-là a été écrite** : `packages/docker-mcp`
+///   sert les neuf outils du tableau ci-dessus et aucun de la colonne de
+///   droite, et son `test/forbidden.test.js` lit la table et le source pour que
+///   ce soit vérifiable et pas promis (éprouvé en y ajoutant un vrai
+///   `container_exec` : quatre tests sur seize tombent, cinq si on élargit
+///   aussi `ALLOWED_PATHS`). **Il n'y a toujours pas d'entrée dans [`CATALOG`]**,
+///   et pour deux raisons distinctes qu'il ne faut pas confondre :
+///
+///   1. Le paquet n'est pas publié, donc il n'existe pas de `Package::spec`
+///      épinglé à nommer. C'est une étape d'exploitation, pas du code.
+///   2. Et même publié, **[`Provision::Host`] ne conviendrait pas pour le démon
+///      d'un client.** Un bridge hébergé tourne chez nous, le démon est chez
+///      lui ; et [`crate::hosted`] exige du bridge une racine en lecture seule
+///      et aucun montage, or parler à `/var/run/docker.sock` réclame justement
+///      ce montage — qui donne root sur l'hôte. [`CUSTOM`] n'est donc pas une
+///      étape en attendant mieux ici, c'est la réponse. `Provision::Host`
+///      conviendrait au *premier* Docker de la liste ci-dessus, celui qui parle
+///      à une API distante (Docker Hub), pas au second.
+///
+/// * **Vercel** — sondé, et refusé pour une raison mesurée :
+///   `mcp.vercel.com/.well-known/oauth-authorization-server` annonce
+///   `token_endpoint_auth_methods_supported: ["none"]`, et rien d'autre. C'est
+///   un client **public**, en PKCE seul. Ce déploiement ne sait pas s'en servir,
+///   et prendre le chemin sans secret parce qu'il est le seul offert reviendrait
+///   à accepter que n'importe qui rejoue notre `client_id`. Netlify annonce
+///   `client_secret_post` en plus de `none` ; c'est toute la différence entre
+///   les deux, et c'est pour cela qu'il y en a un des deux dans la liste.
+///
+/// # La vague réseaux sociaux du 2026-09-02 — la découpe, et les refus
+///
+/// Seize candidats sondés en direct. **Quatre** deviennent des entrées (`x`,
+/// `ayrshare`, `blotato`, `zernio` — plus bas). **Trois** sont « [`CUSTOM`] est
+/// la réponse » et pas une étape d'attente. **Deux** sont impossibles (Buffer,
+/// SocialBee). **Sept** sont du travail-produit (les six plateformes directes,
+/// plus Hootsuite et Publer). Le détail long — endpoints, licences, mode
+/// d'emploi client — est dans `docs/CATALOGUE.md` ; ici, le fait exact qui
+/// débloque chacun, parce que c'est ce qui évite de re-sonder dans six mois.
+///
+/// * **Les six plateformes directes** — Meta (Pages + Instagram), TikTok,
+///   LinkedIn, YouTube, Pinterest, Threads. Un préambule partagé : **aucune ne
+///   sert de serveur MCP** (négatifs DNS/404/400 mesurés le 2026-09-02), donc
+///   le chemin serait un paquet stdio sous [`Provision::Host`] — et
+///   l'hébergement est éteint (`BRIDGES_PER_TENANT = 0`, `hosted.rs`,
+///   connect → 503). Le fait qui débloque est double : un paquet épinglé À
+///   PRODUIRE, et l'hébergement rallumé. Puis le fait propre à chacune :
+///   * Meta — un client OAuth Graph confidentiel est obtenable, mais l'app
+///     review « Advanced Access » impose son délai avant de publier pour un
+///     tiers.
+///   * TikTok — l'app reste `SELF_ONLY` tant que l'audit n'est pas passé
+///     (citation de la sonde du 2026-09-02) : elle ne poste que pour son
+///     propre compte de test.
+///   * LinkedIn — `w_member_social` est self-serve, mais AUCUNE analytics
+///     membre n'existe, et les analytics d'organisation sont derrière le
+///     Marketing API Program.
+///   * YouTube — le modèle de quota a CHANGÉ : `videos.insert` et
+///     `search.list` vivent chacun dans un bucket dédié de 100 appels/jour
+///     (1 point par appel), le pool général restant 10 000 unités/jour —
+///     les vieux 1600 unités/upload sont morts (page `determine_quota_cost`,
+///     resondée le 2026-09-02).
+///   * Pinterest — 401 générique SANS `www-authenticate`, donc pas de
+///     RFC 9728 : le « serveur MCP » annoncé est démasqué. L'API v5 est
+///     verte, mais en trial access.
+///   * Threads — cinq scopes exacts, et une app review.
+///
+///   **2026-09-02, la décision** : la voie retenue n'est aucun de ces paquets
+///   à produire — c'est NOTRE propre service d'agrégation, `apps/social`
+///   (`docs/SOCIAL.md`). Raison de fond : aucun des trois agrégateurs entrés
+///   plus bas n'a pu recevoir [`OptOuts::NoStrangers`], parce que tous
+///   exposent des DM ; le nôtre n'a aucune surface DM, par construction, et
+///   un test le lit dans la table d'outils. Son entrée ici viendra quand il
+///   sera DÉPLOYÉ et sondé — une entrée [`Provision::Dial`] sur une URL qui
+///   ne répond pas encore violerait la règle du sondage en direct que chaque
+///   littéral de ce bloc respecte. La forme qu'elle aura : `Dial` vers notre
+///   hôte, [`Credential::Bearer`] (jeton par tenant), `floor` `Write`
+///   (publier engage l'entreprise, rien n'efface un compte), et
+///   `NoStrangers` PROUVÉ par le test anti-DM du service lui-même — une
+///   première pour ce registre, où la revendication tient sur un test qui
+///   casse et pas sur une lecture datée de la liste d'outils d'un tiers.
+///
+/// * **Buffer** — le miroir exact du refus Vercel, resondé le 2026-09-02 sur
+///   `mcp.buffer.com` : `token_endpoint_auth_methods_supported: ["none"]` et
+///   rien d'autre — un client public en PKCE seul — aggravé de
+///   `resource_parameter_supported: true`, l'indicateur RFC 8707 que ce
+///   déploiement n'envoie jamais. Fait qui débloque : un mode confidentiel ou
+///   une clé API.
+///
+/// * **SocialBee** — `mcp.socialbee.io` n'existe pas : zéro enregistrement A
+///   (DNS NOERROR/ANSWER 0, resondé 2026-09-02), et aucune API publique
+///   n'existe. Fait qui débloque : l'existence même d'un serveur.
+///
+/// * **Hootsuite** — des métadonnées RFC 8414 valides (resondées 2026-09-02 :
+///   `client_secret_basic` accepté, endpoints sur `platform.hootsuite.com`),
+///   mais `scopes_supported: ["offline", "analytics:read"]` seuls — un outil
+///   de publication sans portée d'écriture — et aucun chemin d'endpoint MCP ne
+///   répond (`/mcp` et `/` → 404 sur `mcp.hootsuite.com`, resondés). Deux
+///   faits qui débloquent : le chemin documenté, et des outils d'écriture.
+///
+/// * **Publer** — beta Enterprise dont l'URL MCP est générée PAR utilisateur,
+///   donc elle passerait par [`CUSTOM`] de toute façon ; et le paquet npm
+///   `publer-mcp-server@1.1.0` est un tiers non affilié, épinglable seulement
+///   sur une décision assumée que personne n'a prise.
+///
+/// * **Zapier / Postiz / Mixpost Pro** — « CUSTOM est la réponse », même
+///   argument que le démon Docker : une URL par compte (Zapier), ou une
+///   instance auto-hébergée dont le client fournit l'adresse (Postiz AGPL,
+///   13 outils sans DM, backend `/mcp` en Bearer ; Mixpost Pro payant, 31
+///   outils sans DM). Une entrée nommée ferait une affirmation sur un serveur
+///   dont le client fournit l'adresse — exactement ce que le floor `Read` de
+///   [`CUSTOM`] refuse de faire. `docs/CATALOGUE.md` porte le mode d'emploi
+///   pour qu'un client se branche aujourd'hui.
 pub const CATALOG: &[Connector] = &[
     Connector {
         key: "github",
         label: "GitHub",
-        // GitHub's own remote MCP server, Streamable HTTP, and it takes a
-        // personal access token as a bearer — which is why it is the first
-        // entry: it is the one major connector that works today with a string
-        // the customer can paste, with no OAuth dance to build first.
+        // Le serveur MCP distant de GitHub, en Streamable HTTP.
         provision: Provision::Dial("https://api.githubcopilot.com/mcp/"),
         reach: Reach::Public,
-        credential: Credential::Bearer,
+        // OAuth, et non plus un jeton personnel collé. Les quatre littéraux
+        // ci-dessous ne sont pas devinés : ils sortent du document RFC 8414 que
+        // GitHub sert lui-même, relevé le 2026-08-31.
+        //
+        //   POST https://api.githubcopilot.com/mcp/  → 401, www-authenticate:
+        //     resource_metadata=".../.well-known/oauth-protected-resource/mcp/"
+        //   → authorization_servers: ["https://github.com/login/oauth"]
+        //   GET https://github.com/.well-known/oauth-authorization-server/login/oauth
+        //   → authorization_endpoint, token_endpoint,
+        //     code_challenge_methods_supported: ["S256"]
+        //
+        // `Post` parce que c'est ce que GitHub documente : `client_id` et
+        // `client_secret` en champs de formulaire.
+        //
+        // Les trois portées sont un SOUS-ENSEMBLE de `scopes_supported`, choisi
+        // et non recopié : `repo` pour lire et écrire le code, `read:org` pour
+        // voir l'organisation, `read:user` pour savoir au nom de qui on parle.
+        // Ni `delete_repo`, ni `workflow`, ni `write:packages` — un employé qui
+        // ne peut pas supprimer un dépôt est un employé dont le refus n'a pas à
+        // être décidé ailleurs.
+        //
+        // **Une OAuth App GitHub émet un jeton sans expiration et sans jeton de
+        // rafraîchissement**, donc `sealed_refresh_token` reste nul et
+        // `refresh_due` ne le sélectionne jamais : rien à renouveler, rien qui
+        // casse. Une GitHub App donnerait huit heures et un rafraîchissement,
+        // mais ignore `scope` au profit de ses propres permissions — ce qui
+        // rendrait le champ ci-dessous décoratif, et un champ décoratif sur une
+        // limite est pire qu'un champ absent.
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://github.com/login/oauth/authorize",
+            token: "https://github.com/login/oauth/access_token",
+            scopes: "repo read:org read:user",
+            auth: ClientAuth::Post,
+        }),
         // Nothing GitHub's server exposes is observation-only in the sense that
         // matters here: the same token that reads an issue opens one, and the
         // read tools return repository content that becomes `Untrusted` text an
@@ -508,11 +865,104 @@ pub const CATALOG: &[Connector] = &[
         opt_outs: OptOuts::NoStrangers,
     },
     Connector {
+        key: "sentry",
+        label: "Sentry",
+        // Le serveur MCP distant de Sentry, en Streamable HTTP.
+        provision: Provision::Dial("https://mcp.sentry.dev/mcp"),
+        reach: Reach::Public,
+        // Relevé le 2026-09-02, pas deviné :
+        //
+        //   GET https://mcp.sentry.dev/.well-known/oauth-protected-resource/mcp
+        //   → resource: "https://mcp.sentry.dev/mcp",
+        //     authorization_servers: ["https://mcp.sentry.dev"],
+        //     scopes_supported: ["org:read","project:write","team:write","event:write"]
+        //   GET https://mcp.sentry.dev/.well-known/oauth-authorization-server
+        //   → authorization_endpoint, token_endpoint,
+        //     token_endpoint_auth_methods_supported:
+        //       ["client_secret_basic","client_secret_post","none"],
+        //     code_challenge_methods_supported: ["plain","S256"]
+        //
+        // `Post` parce que `client_secret_post` est annoncé : le serveur accepte
+        // un client confidentiel, et c'est la condition d'entrée de ce
+        // catalogue. `none` est là aussi — un client public en PKCE seul — mais
+        // ce n'est pas ce que ce déploiement sait faire, et prendre le chemin
+        // sans secret parce qu'il est offert reviendrait à accepter que
+        // n'importe qui rejoue notre `client_id`.
+        //
+        // Les portées sont les quatre annoncées, et c'est le point désagréable :
+        // il n'y a **pas** de portée en lecture seule pour les projets. Sentry
+        // n'en expose que `org:read` de lecture pure ; suivre les erreurs d'un
+        // projet demande `project:write`. On ne peut donc pas promettre ici un
+        // employé qui regarde sans toucher, et `floor` en tire la conséquence.
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://mcp.sentry.dev/oauth/authorize",
+            token: "https://mcp.sentry.dev/oauth/token",
+            scopes: "org:read project:write team:write event:write",
+            auth: ClientAuth::Post,
+        }),
+        // `Write` et pas `Read`, pour la raison ci-dessus : le jeton qui lit une
+        // erreur peut assigner un ticket et fermer un problème. Et ce que les
+        // outils de lecture rendent — un message d'exception, une trace, le
+        // corps d'une requête capturée — est du texte écrit par quelqu'un
+        // d'autre, donc `Untrusted` dès qu'un employé le lit.
+        floor: RiskClass::Write,
+        // Lu dans la liste d'outils du serveur, pas supposé. Tout ce que Sentry
+        // sert agit dans une organisation dont les membres ont déjà un compte :
+        // un problème assigné notifie un collègue, il n'atteint pas un étranger,
+        // et aucun outil ne prend l'adresse de quelqu'un qui n'a rien demandé.
+        // Il n'y a donc pas de liste de désabonnés chez Sentry à rapatrier — ce
+        // qui est une phrase différente de « nous n'avons pas regardé ».
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "netlify",
+        label: "Netlify",
+        // Le serveur MCP distant de Netlify, en Streamable HTTP.
+        provision: Provision::Dial("https://mcp.netlify.com/mcp"),
+        reach: Reach::Public,
+        // Relevé le 2026-09-02 sur les deux documents que Netlify sert :
+        //
+        //   GET https://mcp.netlify.com/.well-known/oauth-protected-resource
+        //   → resource: "https://mcp.netlify.com/mcp",
+        //     authorization_servers: ["https://mcp.netlify.com/"]
+        //   GET https://mcp.netlify.com/.well-known/oauth-authorization-server
+        //   → authorization_endpoint, token_endpoint,
+        //     scopes_supported: ["offline_access","read","write","claudeai"],
+        //     token_endpoint_auth_methods_supported:
+        //       ["none","client_secret_post","client_secret_basic"]
+        //
+        // Trois portées sur quatre. `claudeai` est écartée : c'est une portée
+        // nommée d'après un client, pas d'après un droit, et une limite dont on
+        // ne sait pas dire ce qu'elle autorise n'est pas une limite. `read` et
+        // `write` sont demandées parce qu'un déploiement est une écriture ;
+        // `offline_access` parce que sans jeton de rafraîchissement la liaison
+        // meurt à la première expiration et que `refresh_due` n'a rien à
+        // rejouer.
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://mcp.netlify.com/oauth-server/auth",
+            token: "https://mcp.netlify.com/oauth-server/token",
+            scopes: "read write offline_access",
+            auth: ClientAuth::Post,
+        }),
+        // `Write`, et il s'en faut de peu que ce soit plus haut : ce serveur
+        // déploie un site et modifie des variables d'environnement. Ce qui le
+        // maintient ici est que rien de ce qu'il expose n'efface un compte ni ne
+        // publie vers un tiers — un déploiement se remplace, il ne se perd pas.
+        // Un outil que personne n'a déclaré reste `Destructive` de toute façon.
+        floor: RiskClass::Write,
+        // Les surfaces de Netlify — sites, déploiements, variables, journaux —
+        // sont celles d'une équipe qui a déjà un compte. Aucun outil n'envoie
+        // quoi que ce soit à une adresse qui n'a rien demandé. Les formulaires
+        // Netlify reçoivent, ils n'émettent pas.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
         key: "orizn-visa",
         label: "Orizn — visa rules and consular fees",
         // **The first hosted entry, and the one this workspace has measured.**
         //
-        // `crates/app/tests/orizn.rs` is the evidence and it points both ways:
+        // Mesuré le 2026-08-25 en parlant MCP à `npx -y orizn-visa-mcp`, et la
+        // mesure pointe des deux côtés :
         // `https://visa.orizn.app/mcp` answers Streamable HTTP but serves one
         // tool of six and ignores an API key in every header form, while the
         // stdio package serves all six and reads `ORIZN_API_KEY` out of its
@@ -521,9 +971,11 @@ pub const CATALOG: &[Connector] = &[
         // `check_visa_requirement`, the tool that prices a visa — and the
         // credential field on it would do nothing at all.
         //
-        // Pinned at 1.3.0: the version `crates/app/src/orizn.rs`'s fixture was
-        // captured from, so the tools this entry's declarations will be written
-        // against are the tools that were read.
+        // Épinglé à 1.3.0 : la version depuis laquelle la surface a été
+        // capturée, de sorte que les outils contre lesquels les déclarations de
+        // cette entrée seront écrites sont les outils qui ont été lus. La
+        // capture vit dans `crates/app/tests/orizn.rs`, qui en est la
+        // contrepartie testée.
         provision: Provision::Host(Package {
             spec: "orizn-visa-mcp@1.3.0",
             env: Some("ORIZN_API_KEY"),
@@ -544,6 +996,1052 @@ pub const CATALOG: &[Connector] = &[
         // and nothing anybody could unsubscribe from.
         opt_outs: OptOuts::NoStrangers,
     },
+    Connector {
+        key: "google-gmail",
+        label: "Gmail",
+        // Google's own remote MCP server, and the reason these three entries
+        // could be written at all: dialled **2026-08-31**, `initialize` answers
+        // protocol `2025-06-18` over Streamable HTTP as `StatelessServer`/`ESF`,
+        // and — unusually — `tools/list` answers **without a credential**. So
+        // the floor and the opt-out claim below are read off the server itself
+        // rather than off documentation about it.
+        provision: Provision::Dial("https://gmailmcp.googleapis.com/mcp/v1"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: GOOGLE_AUTHORIZE,
+            token: GOOGLE_TOKEN,
+            // The narrowest pair that lets an employee read a thread and leave a
+            // draft a human sends. `gmail.compose` is **not** `gmail.send`: it
+            // writes drafts and labels and cannot put mail on the wire. That
+            // distinction is doing as much work as the tool list is, two claims
+            // further down.
+            scopes: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
+            auth: ClientAuth::Post,
+        }),
+        // Nothing here is observation-only in the sense that matters. The same
+        // token that reads a thread creates a draft, creates and applies labels,
+        // trashes a message and marks one spam — and the read tools return mail
+        // bodies, which become `Untrusted` text an employee then acts on. GitHub
+        // is `Write` for the identical reason and this is the identical shape.
+        floor: RiskClass::Write,
+        // Read off the live tool list on **2026-08-31**: 23 tools —
+        // `create_draft`, `list_drafts`, `get_draft`, `get_thread`,
+        // `get_message`, `search_threads`, `list_labels`, `create_label`, the
+        // six label/unlabel/sensitive-label tools, `update_message_labels`,
+        // trash/untrash and spam/unspam for both threads and messages. **Not one
+        // of them sends.** `create_draft` is the only tool that takes a
+        // recipient address, and all it does is leave a draft in the customer's
+        // own mailbox for a human to send or throw away.
+        //
+        // **This claim is dated, and it is the kind that breaks quietly.** What
+        // breaks it is a `send_message`, `reply` or `forward` tool appearing on
+        // this endpoint — Google already ships all three on its other Gmail
+        // surfaces, so it is a product decision away rather than a rewrite. The
+        // `const` below will not notice: it counts entries, not tools. Re-run
+        // `tools/list` against the URL above before leaning on this line, and if
+        // a send tool is there then this connector's opt-outs arrive somewhere
+        // and `OptOuts::Pulled` or `OptOuts::Pushed` is where you name it.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "google-drive",
+        label: "Google Drive",
+        // Same probe, same date, same answer: Streamable HTTP, `2025-06-18`,
+        // `tools/list` unauthenticated.
+        provision: Provision::Dial("https://drivemcp.googleapis.com/mcp/v1"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: GOOGLE_AUTHORIZE,
+            token: GOOGLE_TOKEN,
+            // `drive.file` is the narrow write scope — it reaches only files
+            // this application created or the user explicitly opened for it, not
+            // the whole Drive. `drive.readonly` is the read half and is the
+            // wider of the two; asking for `drive` instead would have been one
+            // word and the entire corpus.
+            scopes: "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
+            auth: ClientAuth::Post,
+        }),
+        // `create_file` and `copy_file` write, and the scope above grants it. The
+        // read tools hand back document *content*, which is the largest single
+        // source of `Untrusted` text in this product. Neither half can be classed
+        // `read`.
+        floor: RiskClass::Write,
+        // Eight tools on **2026-08-31**: `search_files`, `list_recent_files`,
+        // `get_file_metadata`, `get_file_permissions`, `read_file_content`,
+        // `download_file_content`, `create_file`, `copy_file`. None takes an
+        // address, and — the one that mattered to check — **none grants a
+        // permission**. There is no `share_file` on this server, which is the
+        // tool that would have mailed a share notification to somebody who never
+        // asked for one. `get_file_permissions` reads them; nothing writes them.
+        // A permission-granting tool appearing here is what breaks this claim.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "google-calendar",
+        label: "Google Calendar",
+        // Same server family as the two above and the same probe on
+        // **2026-08-31**: Streamable HTTP, protocol `2025-06-18`,
+        // `StatelessServer`/`ESF`, and `tools/list` answering without a
+        // credential. Re-measured on the same day this entry was written, and
+        // the nine tools below were read off that answer.
+        provision: Provision::Dial("https://calendarmcp.googleapis.com/mcp/v1"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: GOOGLE_AUTHORIZE,
+            token: GOOGLE_TOKEN,
+            // Three scopes chosen against the nine tools rather than copied off
+            // a page. `calendar.events` is read and write on events and is the
+            // only wide one; the alternative spelling `calendar` would have
+            // added settings, ACLs and calendar creation for one fewer word.
+            // `calendar.calendarlist.readonly` is what `list_calendars` needs
+            // and grants nothing else; `calendar.freebusy` is what
+            // `suggest_time` reads across other people's calendars, and it
+            // returns busy intervals rather than event contents.
+            scopes: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.freebusy",
+            auth: ClientAuth::Post,
+        }),
+        // **`Destructive`, and this is the one floor in the array that is not
+        // `Write` for a connector of this shape.** `delete_event` is in the tool
+        // list and Google Calendar has no trash for it: the event is gone from
+        // every attendee's calendar, and the cancellation mail has already been
+        // sent. `RiskClass::Destructive` is defined as "irreversible, or
+        // expensive to undo", so this is the class the worst tool served here
+        // actually is — and one class per connector means it is the floor.
+        //
+        // The price is real and is the honest half: `list_events` must be
+        // declared `Destructive` too, so a human approves a calendar read. That
+        // is what one coarse class per connector costs when a connector has one
+        // irreversible tool, and `atlassian` above is the mirror of it —
+        // `Write` there, recorded explicitly, *because* nothing on that server
+        // deletes. A read-only Calendar entry on narrowed scopes is the entry
+        // that would carry `Read`, and it is a product decision nobody has made.
+        floor: RiskClass::Destructive,
+        // Nine tools on **2026-08-31**: `list_events`, `get_event`,
+        // `list_calendars`, `suggest_time`, `create_event`, `update_event`,
+        // `delete_event`, `respond_to_event`, `search_events`.
+        // `create_event`'s input schema has an `attendees` array whose member
+        // type requires an `email`, and **Google mails an invitation to every
+        // address on it** — so this connector can put a message in front of
+        // somebody who did not ask, and `NoStrangers` would be a lie.
+        //
+        // `HeldHere` is the honest value and the reading behind it is the second
+        // half of that variant's price: Google publishes **no** unsubscribe or
+        // suppression list for calendar invitations. There is nothing at Google
+        // for `reconcile_opt_outs` to fetch, so `Pulled` would have to name a
+        // read that does not exist, and `Pushed` could not register a handle
+        // anyway (`0069`'s `webhook_endpoints_provider_is_wired`). What answers
+        // for a refusal is `suppressions`, here, and `OUTREACH_HELD_HERE` is
+        // where this connector is written down as one of the six it answers
+        // for.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "linear",
+        label: "Linear",
+        // Linear's own remote server. Dialled **2026-08-31**: 401 with
+        // `WWW-Authenticate: Bearer realm="OAuth"`, so it is live and a bearer
+        // is what it reads. `Credential::Bearer` rather than the OAuth dance its
+        // interactive setup uses, because Linear's documentation says a Linear
+        // API key goes straight into that header — a string the customer pastes,
+        // with no client registration for this deployment to obtain first.
+        provision: Provision::Dial("https://mcp.linear.app/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Linear's own words for this endpoint: read-write, with tools for
+        // "finding, creating, and updating objects in Linear like issues,
+        // projects, and comments". Creating an issue is a write and reading one
+        // hands back text an employee acts on, so `Write` is the floor for the
+        // reason it is GitHub's.
+        floor: RiskClass::Write,
+        // **Weaker evidence than the three Google entries, and the difference is
+        // named here rather than hidden.** `tools/list` needs a token, so this
+        // is read off Linear's description of the server's whole surface rather
+        // than off an enumeration: every object it names — issues, projects,
+        // comments — lives inside a workspace, and everybody in a workspace
+        // holds an account in it. That is the same sentence that makes GitHub's
+        // entry true, for the same reason: a comment notifies a subscriber, and
+        // no tool takes the address of somebody who has not asked for anything.
+        //
+        // What breaks it: Linear says "more functionality on the way", and the
+        // tool that would falsify this is an invite — Linear's own API can mail
+        // an organization invitation to any address, and an MCP tool wrapping it
+        // would reach a stranger with no list at Linear to bring home. Enumerate
+        // with a real key before extending this claim to anything new here.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "linear-readonly",
+        label: "Linear (read-only)",
+        // The same server behind the endpoint Linear documents as one that
+        // "only ever exposes read tools", dialled the same day with the same
+        // bearer challenge. It is worth a second entry precisely because that
+        // sentence is a guarantee about the tools this endpoint will *ever*
+        // serve — which is the thing an enumeration cannot give.
+        provision: Provision::Dial("https://mcp.linear.app/mcp/readonly"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `Read` in the same sense as `google-calendar` and the opposite sense
+        // to `CUSTOM`: not an absence of a claim, but the vendor's guarantee
+        // that there is no tool on this endpoint to declare any other way.
+        floor: RiskClass::Read,
+        // Falls out of the same guarantee. A surface with no write tool has
+        // nothing that could put anything in front of anybody, and the customer
+        // who wants the writes has `linear` above, where the claim is argued
+        // separately and on weaker evidence.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "atlassian",
+        label: "Atlassian — Jira, Confluence, Bitbucket",
+        // **The entry this file refused until somebody checked the header, and
+        // the check is the whole reason it is here.** Atlassian's *personal* API
+        // token goes out as `Basic base64(email:token)`, which is not
+        // [`Credential::Bearer`] and would have been a broken button — that is
+        // why an earlier pass left Atlassian out.
+        //
+        // A **service account** API key is a different credential and Atlassian
+        // documents it as a bare `Authorization: Bearer <api_key>` against this
+        // exact path. Two paths, and the difference matters: `/v1/mcp` is the
+        // token path, `/v1/mcp/authv2` is the OAuth 2.1 one, and only the first
+        // is what a pasted string reaches. Dialled 2026-08-31: 401 with
+        // `WWW-Authenticate: Bearer` from `AtlassianEdge`, so the endpoint is
+        // live and a bearer is what it reads.
+        //
+        // The honest caveat is not ours: an organization admin has to turn API
+        // token authentication on for the site before any key works, so a
+        // customer's first failure here may be a switch in their own console.
+        provision: Provision::Dial("https://mcp.atlassian.com/v1/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Forty-seven published tools across Jira, Confluence, JSM, Bitbucket and
+        // Compass. `createJiraIssue`, `editJiraIssue`, `addCommentToJiraIssue`,
+        // `createConfluencePage`, `updateConfluencePage` and the two comment
+        // creators all write, and the read tools hand back issue and page bodies
+        // — the largest `Untrusted` surface after Drive. Nothing here is
+        // observation-only. Worth recording that **no published tool deletes**:
+        // the floor is `Write` because that is the truth about this list, not
+        // because `Destructive` felt safer.
+        floor: RiskClass::Write,
+        // Read off Atlassian's own published tool list, 2026-08-31. Every write
+        // lands inside a site — an issue, a page, a comment, a Compass component
+        // — and everyone who is notified holds a licensed account on that site
+        // and is already watching the thing they are notified about. There is no
+        // tool that takes an email address, no invite, and no way to reach
+        // somebody outside the site at all.
+        //
+        // What breaks it is a user-provisioning tool: Atlassian's own admin API
+        // can mail an invitation to any address, and an MCP tool wrapping it
+        // would reach a stranger with no list at Atlassian to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "zoom",
+        label: "Zoom",
+        // Zoom's own remote server. Dialled 2026-08-31: 401 with
+        // `WWW-Authenticate: Bearer resource_metadata=...`, and that metadata
+        // document is where the scopes below were read from rather than from
+        // prose — `bearer_methods_supported: ["header"]`, `resource` matching
+        // this URL exactly.
+        provision: Provision::Dial("https://mcp.zoom.us/mcp/zoom/streamable"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://zoom.us/oauth/authorize",
+            token: "https://zoom.us/oauth/token",
+            // Eight scopes, every one of them `:read:`. Zoom's protected-resource
+            // metadata also advertises `hub:write:content` and
+            // `docs:write:import`; both are deliberately absent, and their
+            // absence is what the floor below is a claim about.
+            //
+            // No `access_type` equivalent is needed: Zoom's authorization-server
+            // metadata lists `refresh_token` in `grant_types_supported`, so the
+            // exchange returns one without being asked. Google is the odd one,
+            // not the rule.
+            scopes: "meeting:read:search meeting:read:assets cloud_recording:read:list_user_recordings cloud_recording:read:content agentic_search:read:search agentic_search:read:ask docs:read:export my_notes:read:content",
+            // **Measured, not defaulted.** Zoom's
+            // `/.well-known/oauth-authorization-server` says
+            // `token_endpoint_auth_methods_supported: ["client_secret_basic"]`
+            // and lists nothing else, so `ClientAuth::Post` here would be an
+            // `invalid_client` with no diagnosis — which is the exact failure
+            // that field exists to prevent. The same document confirms
+            // `code_challenge_methods_supported: ["S256"]`, and carries **no**
+            // `registration_endpoint`: there is no dynamic client registration
+            // at Zoom, so this entry is inert until somebody registers an app by
+            // hand, exactly as the Google three are.
+            auth: ClientAuth::Basic,
+        }),
+        // `Read` in the same sense as `linear-readonly` and the opposite sense to
+        // `CUSTOM`: not an absence of a claim but two independent supports for
+        // one. Zoom publishes no tool that creates, updates or deletes a meeting
+        // — the nine tools search and read — and every scope this entry asks for
+        // is a `:read:` scope, so a token minted from it is refused at the
+        // provider on anything else. Either alone would carry the floor.
+        floor: RiskClass::Read,
+        // Falls out of the same two facts, and Zoom is the connector where it
+        // most needed checking: a meeting *invitation* is exactly the shape of
+        // outreach this field exists to catch, and it is only absent because
+        // there is no meeting-creation tool here. That is the thing to re-read
+        // before extending this entry — a `create_meeting` tool takes an invitee
+        // list, Zoom mails it, and there is no unsubscribe list at Zoom to bring
+        // home. Widening `scopes` past the eight `:read:` ones falsifies this
+        // claim and the floor together, the same way it would have on Calendar.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "malwarebytes",
+        label: "Malwarebytes ScamGuard",
+        // **The cheapest entry in the array, and the only one that needs
+        // nothing at all.** Dialled 2026-08-31: `initialize` answers 200 over
+        // Streamable HTTP with no credential, `serverInfo` names
+        // `Malwarebytes ScamGuard 3.4.4`, and `tools/list` answers the same way.
+        // No account, no key, no registration — so unlike every OAuth entry
+        // above, this one is live the moment it is deployed.
+        provision: Provision::Dial("https://scamguard.malwarebytes.com/claude/mcp"),
+        reach: Reach::Public,
+        // Nothing to send, and `mcp.rs`'s connect route refuses a token for this
+        // connector rather than storing one nobody reads.
+        credential: Credential::None,
+        // **`Write`, not the `Read` this entry was drafted with, and the
+        // difference is one tool that only a live enumeration shows.** The
+        // server's own `instructions` block advertises five tools, all
+        // reputation lookups; `tools/list` on 2026-08-31 answered with **six**,
+        // and the sixth changes the floor: `reputation-report` "submits the
+        // indicator to the threat intelligence system", which is a write into
+        // somebody else's dataset with an effect on whoever owns the domain or
+        // number reported. `RiskClass::Read` is "observes without changing
+        // anything" and that is not this.
+        //
+        // The cost of being right here is nil: `Read` and `Write` both map to
+        // `Risk::Low` in `mcp.rs`, so no approval changes. It is written down
+        // because the floor is a claim, and a claim read off five tools when the
+        // server serves six is the kind that is wrong for years.
+        floor: RiskClass::Write,
+        // Six tools, read off the live list: `reputation-check_link`,
+        // `-check_phone`, `-check_email`, `-whois`, `-scan_all` and `-report`.
+        // Three of them *take* an address or a phone number and none of them
+        // sends anything to it — they hash it against a threat database and hand
+        // back a verdict. `reputation-report` submits an indicator to
+        // Malwarebytes' own analysts, who are the vendor and not a stranger.
+        // There is nobody here who could ask to be left alone, and therefore no
+        // list at Malwarebytes to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "context7",
+        label: "Context7 — library documentation",
+        // Dialled 2026-08-31: 200 with no credential, `exa`-style Streamable
+        // HTTP, two tools on `tools/list`.
+        provision: Provision::Dial("https://mcp.context7.com/mcp"),
+        reach: Reach::Public,
+        // **`None` and not `Bearer`, and it is a choice rather than a
+        // measurement.** Context7 works with no credential and accepts an
+        // optional API key as `Authorization: Bearer <key>` that buys a higher
+        // rate limit and nothing else. There is no "optional credential" variant
+        // and there should not be one: `Credential::Bearer` makes the key
+        // *required* and turns the one entry that needs no signup into one that
+        // does, while `Credential::None` makes the connect route refuse a key
+        // somebody wanted to paste. The free tier is the entry worth having; the
+        // day a tenant hits the limit, this becomes `Bearer` in one word.
+        credential: Credential::None,
+        // Two tools, both lookups against Context7's documentation index:
+        // `resolve-library-id` maps a package name to an id, `query-docs`
+        // returns documentation for one. Nothing writes. `Read` is a claim that
+        // was checked, which is the difference between this and `CUSTOM`.
+        //
+        // What it *does* do, and what the floor cannot express, is return third
+        // party prose straight into a turn — this is an `Untrusted` firehose by
+        // design, and `crate::turn`'s trust filter is what handles that.
+        floor: RiskClass::Read,
+        // Neither tool takes an address, a number or a recipient. A
+        // documentation index has nobody to reach.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "exa",
+        label: "Exa — web search",
+        // **The one entry in this batch whose credential shape had to be
+        // measured rather than read, because Exa's REST API documents
+        // `x-api-key` and the catalogue can only send `Authorization: Bearer`.**
+        //
+        // Measured 2026-08-31, three calls to the same session:
+        //   * no header at all → `web_search_exa` returns results (free tier)
+        //   * `Authorization: Bearer 0000…` → `error (401): Invalid API key`
+        //   * `x-api-key: 0000…`            → `error (401): Invalid API key`
+        // Identical upstream rejection from both headers, and neither is ignored
+        // — so the bearer header *is* read as the API key, and this entry is not
+        // the broken button `atlassian` nearly was. That is the evidence; the
+        // documentation alone would not have settled it.
+        provision: Provision::Dial("https://mcp.exa.ai/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Two tools on 2026-08-31: `web_search_exa` and `web_fetch_exa`. Both
+        // read the public web and neither writes anywhere. Same caveat as
+        // `context7` and larger: everything this returns is `Untrusted`.
+        floor: RiskClass::Read,
+        // Neither tool takes a recipient. Searching the web reaches nobody.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "supabase",
+        label: "Supabase",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_request", …resource_metadata=…`. OAuth is Supabase's
+        // default door and is not the only one — a personal access token goes in
+        // the same header ("create a personal access token (PAT) with the
+        // necessary scopes and pass it as a header", `Authorization: Bearer
+        // ${SUPABASE_ACCESS_TOKEN}`), which is what makes this a pasted string.
+        //
+        // The caveat is the customer's and is worth saying out loud in the UI: a
+        // PAT is **account-wide** unless they scope it, so the narrow thing to
+        // paste is a scoped token, and `?read_only=true` on the URL would be a
+        // second, better entry the day somebody wants it.
+        provision: Provision::Dial("https://mcp.supabase.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `execute_sql` takes arbitrary SQL, so `DROP TABLE` and `DELETE FROM`
+        // are one string away and no tool name says so. `delete_branch` and
+        // `reset_branch` ("discards writes since the branch diverged") are
+        // separately irreversible, and `pause_project` stops a production
+        // database. `RiskClass::Destructive` is "irreversible, or expensive to
+        // undo", and three tools here are exactly that.
+        //
+        // Worth naming the trap this floor is really for: `execute_sql` and a
+        // hypothetical `execute_sql_readonly` would be **indistinguishable to
+        // the floor**, because the floor is one class for the whole connector.
+        // A tenant who wants reads without a human approves them at
+        // `?read_only=true` on a second entry, not by declaring this tool lower.
+        floor: RiskClass::Destructive,
+        // Thirty-two published tools across projects, branches, migrations,
+        // edge functions and storage. **Not one of them takes an address**:
+        // there is no auth-admin invite tool, no email tool and no SMS tool on
+        // this server. `deploy_edge_function` takes *code*, and the line this
+        // file draws — the same one that makes GitHub `NoStrangers` while GitHub
+        // Actions can run anything — is a tool whose **parameter is a
+        // recipient**, not a tool that could be written into one.
+        //
+        // What breaks it is an `auth_admin` tool arriving: Supabase's Auth admin
+        // API can invite a user by email, and an MCP tool wrapping it would
+        // reach a stranger with no list at Supabase to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "neon",
+        label: "Neon",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_token", error_description="No authorization provided"`.
+        // Neon documents the header directly — `Authorization: Bearer
+        // <YOUR_NEON_API_KEY>`, "for API key or remote agent setups" — so OAuth
+        // is the alternative here rather than the requirement.
+        //
+        // The caveat that belongs in the UI: **a Neon API key carries the whole
+        // account**, not one project.
+        provision: Provision::Dial("https://mcp.neon.tech/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `run_sql` is documented as supporting "both read and write
+        // operations", so it is the same arbitrary-SQL tool `supabase` has under
+        // another name. `delete_project` ("deletes an existing Neon project"),
+        // `delete_branch` and `reset_from_parent` ("discards writes since the
+        // branch diverged") are three irreversible tools on top of it.
+        floor: RiskClass::Destructive,
+        // **The one entry in this batch whose opt-out claim could not be
+        // enumerated, and the value says so rather than guessing kindly.**
+        //
+        // Neon's MCP tools are served per category and `https://mcp.neon.tech/mcp`
+        // needs a token before `tools/list`, so nobody here has read the list
+        // this URL actually serves. What is documented is that the surface
+        // includes `create_auth_user` — a tool whose parameter is a person's
+        // email address — and Neon Auth ships email verification and
+        // customizable emails. Whether *that* call sends one is not stated on
+        // Neon's own page, checked 2026-08-31.
+        //
+        // So `NoStrangers` is unavailable: it asserts that not one tool here can
+        // reach somebody who did not ask, and that is exactly the sentence the
+        // missing enumeration cannot support. The half that *is* certain is the
+        // other one — Neon publishes no suppression, unsubscribe or opt-out
+        // listing anywhere, so there is nothing for `reconcile_opt_outs` to
+        // fetch and `Pulled` would name a read that does not exist. `HeldHere`
+        // is what both halves add up to, and it errs into the register rather
+        // than out of it: an entry wrongly listed here is a line somebody reads
+        // and removes, an entry wrongly absent is a line nobody knows to look
+        // for.
+        //
+        // Enumerate this endpoint with a real key and the claim tightens in
+        // whichever direction the list says.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "posthog",
+        label: "PostHog",
+        // Dialled 2026-08-31: 401 whose body is "No token provided, please
+        // provide a valid API token", which is the vendor saying the quiet part.
+        // PostHog documents a personal API key created under its **MCP Server**
+        // preset — "add the `Authorization: Bearer YOUR_API_KEY` header" — and
+        // that preset scopes the key to one project, which is the narrow thing
+        // to tell a customer to paste.
+        provision: Provision::Dial("https://mcp.posthog.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Several hundred generated tools, and the floor is decided by two
+        // families. `execute-sql` runs arbitrary HogQL — other tools' own
+        // descriptions instruct the agent to route through it — and the deletes
+        // are named and plural: `action-delete`, `alert-delete`,
+        // `annotation-delete`, `insights-bulk-delete-create`,
+        // `data-catalog-metrics-bulk-delete-create`, `messaging-templates-destroy`,
+        // `data-warehouse-delete-org-destroy`. Irreversible, so `Destructive`.
+        floor: RiskClass::Destructive,
+        // **The connector that proves [`OptOuts::HeldHere`] is not the lazy
+        // answer, and the only one of its kind in this array.**
+        //
+        // PostHog can send: `subscriptions-create` schedules recurring delivery
+        // whose "`target_type` — `email` or `slack`" goes to caller-supplied
+        // addresses, and a published workflow sends real messages
+        // (`workflows-publish`; a workflow created over MCP is a draft until
+        // then, and `workflows-test-run` deliberately does not reach real
+        // recipients). So `NoStrangers` is false here in the plainest way.
+        //
+        // And **PostHog publishes the list**. `opt-outs-list` is a real tool,
+        // spelled exactly that way — lowercase, hyphenated, plural — defined in
+        // PostHog's own `products/messaging/mcp/tools.yaml` as
+        // `messaging_preferences_opt_outs_retrieve`, annotated `readOnly: true`,
+        // with `opt-outs-add` and `opt-outs-remove` beside it. That is a read
+        // `crate::queue::reconcile_opt_outs` can be pointed at, which is the
+        // entire bar `OptOuts::Pulled` sets.
+        //
+        // Writing `HeldHere` here would have been one word cheaper and would
+        // have thrown away the only vendor in this whole qualification whose
+        // unsubscribes can be named. That is why `OUTREACH_HELD_HERE`'s failure
+        // message asks for the second reading and not just the first.
+        opt_outs: OptOuts::Pulled {
+            from: "opt-outs-list",
+        },
+    },
+    Connector {
+        key: "mixpanel",
+        label: "Mixpanel",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // error="invalid_token"…`. Live, and a bearer is what it reads.
+        //
+        // **The string a customer pastes here is not an API key, and getting
+        // that wrong is a 401 nobody can debug.** Mixpanel's service-account
+        // path wants the *literal* header value
+        // `Authorization: Bearer Basic <base64(username:secret)>` — a Basic
+        // credential carried inside the Bearer scheme token. `mcp.rs` writes the
+        // `Bearer ` prefix itself and sends the stored string after it, so what
+        // goes in the field is `Basic <base64>` and the wire ends up correct.
+        // A customer who pastes the service-account secret alone gets a 401.
+        //
+        // This is `atlassian`'s trap wearing the opposite disguise: there a
+        // Basic credential looked like a bearer and was not; here a Basic
+        // credential really does ride inside one, and only because Mixpanel
+        // built it that way. Their own docs mark it **beta** — "the interface
+        // may change" — which is the sentence that will break this entry.
+        provision: Provision::Dial("https://mcp.mixpanel.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // Sixty-odd tools in Capital-Hyphen-Case, unlike every other server
+        // here. `Delete-Dashboard`, `Delete-Cohort` and `Delete-Tag` are
+        // irreversible; `Merge-Group` collapses duplicate Lexicon entities into
+        // one and there is no unmerge; `Update-Feature-Flag` changes targeting
+        // on **production traffic**, which is a write whose blast radius is a
+        // live product rather than a report.
+        //
+        // Worth recording what this floor is *not* about: `Run-Query` is a
+        // structured insights/funnel/retention call, **not** arbitrary SQL. The
+        // three other warehouses here are `Destructive` for the SQL; Mixpanel is
+        // `Destructive` for the deletes and the flag.
+        floor: RiskClass::Destructive,
+        // Read off Mixpanel's published tool list, 2026-08-31. Dashboards,
+        // cohorts, metrics, experiments, feature flags and lexicon entities —
+        // every object lives inside a Mixpanel project and every person who
+        // sees one holds a seat on it. No tool takes an email address, a phone
+        // number or any recipient, and there is no invite, share or report-email
+        // tool on this server.
+        //
+        // What breaks it is a scheduled-report tool: Mixpanel's product mails
+        // digests, and an MCP tool wrapping that would take a recipient list
+        // with no suppression endpoint at Mixpanel to bring home.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "motherduck",
+        label: "MotherDuck",
+        // Dialled 2026-08-31: 401 whose body is a JSON-RPC error saying it
+        // plainly — "Authentication required. Please authenticate using OAuth or
+        // provide a Bearer token." The `WWW-Authenticate` header also carries a
+        // `resource` matching this URL exactly, which is the RFC 8707 indicator
+        // this deployment never sends; see the module docs for that residual.
+        provision: Provision::Dial("https://api.motherduck.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // `query_rw` is "SQL that can change data or schema" — create tables,
+        // insert, update, save views, and therefore `DROP TABLE`. Its read-only
+        // twin `query` sits right beside it in the same list, and **the floor
+        // cannot tell them apart**: one class per connector means the class of
+        // the worst tool, so `query` costs a human approval it does not deserve
+        // in order that `query_rw` cannot avoid one. That is the price of coarse,
+        // paid deliberately, and the alternative — a per-tool table maintained
+        // here — is argued against in the module docs.
+        floor: RiskClass::Destructive,
+        // Seven core tools: `query`, `query_rw`, `list_databases`,
+        // `list_tables`, `list_columns`, `search_catalog`, `ask_docs_question`.
+        // None takes a recipient. Three further families exist — Dive, Flight
+        // and Guide — whose individual names MotherDuck does not publish, and
+        // Flight runs **scheduled Python jobs**, which is code and not an
+        // address: the same line this file draws at GitHub Actions and at
+        // Supabase's `deploy_edge_function`. A tool whose parameter is a
+        // program is not a tool whose parameter is a person.
+        //
+        // What breaks it is a Flight tool that takes a destination — a job that
+        // mails a report is a plausible product, and MotherDuck publishes no
+        // suppression list to bring home if one ships. Enumerate with a real
+        // token before extending this claim.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "stripe",
+        label: "Stripe",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer
+        // resource_metadata=…`, so it is live and a bearer is what it reads.
+        // `Credential::Bearer` and not the OAuth realm it also advertises: a
+        // Stripe API key — and specifically a **restricted** key — goes straight
+        // into that header, which is a string the customer pastes with no client
+        // registration for this deployment to obtain first.
+        provision: Provision::Dial("https://mcp.stripe.com"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // **This is the caisse, and the floor is the only thing in this binary
+        // that knows it.** `stripe_api_write` is documented as "write data with
+        // any Stripe API `POST`, `PATCH`, `PUT` and `DELETE` method" — one tool
+        // whose parameter is the verb. Refunds, invoice finalization and
+        // subscription cancellation are all inside it, and none of them is
+        // undone by another call.
+        //
+        // Same shape as `cloudflare` below and the same conclusion: the tool
+        // list is a lid, not an inventory, so `Destructive` is read off what the
+        // one tool can reach rather than off how many tools there are. The
+        // cheaper and better entry is a **read-only restricted key**, which is
+        // the customer's own choice to make at their end and which this field
+        // cannot see — so the floor is written for the worst key they might
+        // paste, not the best.
+        floor: RiskClass::Destructive,
+        // Finalizing an invoice **mails it** to whatever address a
+        // `create_customer` call put on the record, and then keeps mailing it:
+        // dunning is a sequence. That mail carries no unsubscribe link, and
+        // **Stripe publishes no suppression endpoint at all** — there is nothing
+        // to reconcile against, so `Pulled` would have to name a read that does
+        // not exist and `Pushed` could not register a handle (`0069`'s
+        // `webhook_endpoints_provider_is_wired`). `NoStrangers` is a claim with
+        // no referent on a tool whose list is Stripe's whole REST surface.
+        //
+        // `HeldHere` is what is true: this connector can reach somebody who did
+        // not ask, the only register of their refusal is `suppressions`, and
+        // `OUTREACH_HELD_HERE` names it. The way out is a real one and is
+        // written above [`NO_OUTREACH`] — turn Stripe's own invoice mail off,
+        // send it through the provider whose `List-Unsubscribe` already lands on
+        // a route of ours, and this becomes `OptOuts::Pushed`.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "cloudflare",
+        label: "Cloudflare",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer realm="OAuth"`.
+        // The realm says OAuth and the server does not mean it exclusively —
+        // Cloudflare documents a plain API token in the same header
+        // ("create a Cloudflare API token with the permissions you need and pass
+        // it as a bearer token in the Authorization header"), which is what
+        // makes this a pasted string rather than a consent flow this deployment
+        // would have to register for. One caveat that is the customer's and not
+        // ours: a token with Client IP Address Filtering enabled is refused.
+        provision: Provision::Dial("https://mcp.cloudflare.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // ## Read this before touching the floor on this entry
+        //
+        // **Cloudflare's server serves three tools — `docs`, `search` and
+        // `execute` — and the tool list tells you nothing about what it can
+        // do.** `search` writes JavaScript that queries an OpenAPI `spec.paths`;
+        // `execute` writes JavaScript that calls `cloudflare.request()` against
+        // **any of the ~2,500 endpoints of the Cloudflare API**. Cloudflare's
+        // own headline for it is "2500 endpoints in 1k tokens".
+        //
+        // So the usual method — enumerate the tools, take the worst one, write
+        // its class down — reads three innocuous names and returns `Read`.
+        // **Declaring `execute` as `read` would be a grave fault**: destroying a
+        // DNS zone, dropping a D1 database, emptying an R2 bucket and deleting a
+        // Worker are all reachable through it, and not one of them makes a
+        // destructive-sounding tool name appear anywhere. The only permission
+        // boundary on this connector is the scope of the API token the customer
+        // pasted, and nothing in this binary can see that.
+        //
+        // `Destructive` is therefore the floor, and on this entry the floor is
+        // the only thing standing between "the agent called a tool" and "the
+        // account is gone". It forces every call on this connector — including
+        // `docs`, which is a documentation search — through a human. That is the
+        // correct price, and the same argument in reverse to `atlassian`'s
+        // `Write`: there the tool list is the truth, here the tool list is a lid.
+        floor: RiskClass::Destructive,
+        // The same lid, pointed at the other claim. Account-member invitations
+        // and Email Routing destination verification are both Cloudflare API
+        // endpoints, so `execute` can put mail in front of an address somebody
+        // typed — and no tool name here would ever say so. `NoStrangers` is a
+        // claim with no referent on a connector whose tool list *is* a vendor's
+        // whole REST surface, which is precisely the argument that kept this
+        // entry out of the array until `OptOuts::HeldHere` existed.
+        //
+        // Cloudflare publishes no suppression or unsubscribe list — there is
+        // nothing there to reconcile against, because Cloudflare is not an
+        // outbound-messaging product; mail is a side effect of administration.
+        // So the register is `suppressions`, here, and `OUTREACH_HELD_HERE` is
+        // where this connector is named.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "notion",
+        label: "Notion",
+        // Dialled 2026-08-31: 401, `WWW-Authenticate: Bearer realm="OAuth"`,
+        // `resource_metadata` at `/.well-known/oauth-protected-resource/mcp`.
+        //
+        // **OAuth and not a pasted key, and that is measured twice.** Notion
+        // documents it — "Notion MCP currently requires you to complete the
+        // OAuth authorization flow" — and the protected-resource document says
+        // the same by having no other answer. An `ntn_` internal integration
+        // token belongs to the older open-source server, not this one.
+        provision: Provision::Dial("https://mcp.notion.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            // Read off `https://mcp.notion.com/.well-known/oauth-authorization-server`
+            // on 2026-08-31, not off a blog post: `issuer` is
+            // `https://mcp.notion.com`, and these are its two endpoints.
+            authorize: "https://mcp.notion.com/authorize",
+            token: "https://mcp.notion.com/token",
+            // **`default` is the whole vocabulary**: `scopes_supported` is
+            // `["default"]` on both the protected-resource and the
+            // authorization-server document. Worth writing down what that costs,
+            // because this file treats `scopes` as the one bound on a token that
+            // survives every other control failing: Notion's `/authorize` hands
+            // our request straight to `api.notion.com/v1/oauth/authorize` with
+            // `owner=user` and **does not validate scope at all** — a probe with
+            // `bogus_scope_xyz` was accepted exactly as `default` was. So the
+            // token's real bound is the page tree the human ticks on Notion's
+            // own consent screen, and this field is honest rather than
+            // load-bearing. It is the only entry here of which that is true.
+            scopes: "default",
+            // `client_secret_basic` first in
+            // `token_endpoint_auth_methods_supported`, and the variant this
+            // file's `ClientAuth` docs already name Notion for.
+            auth: ClientAuth::Basic,
+        }),
+        // Thirty-three published tools. `notion-create-pages`,
+        // `notion-update-page`, `notion-create-database`, `notion-create-view`,
+        // `notion-move-pages` and the comment and upload tools all write, and
+        // `notion-fetch` hands back page bodies — an `Untrusted` surface the
+        // size of Drive's. Nothing is observation-only, so not `Read`.
+        //
+        // And not `Destructive` either, which is the half worth recording: **no
+        // published tool deletes.** Notion's REST API cannot permanently delete
+        // a page at all — trashing is a reversible `in_trash` flag — so even a
+        // pass-through would be undoable. `Write` is the truth about this list,
+        // the same sentence `atlassian` carries.
+        floor: RiskClass::Write,
+        // Read off Notion's published tool list, 2026-08-31. There is no invite
+        // tool, no email tool, and no way to address anybody outside the
+        // workspace: `notion-create-comment` notifies the people already
+        // following a page, all of whom hold an account on it. The tool that
+        // needed checking is `notion-get-users`, which lists members and guests
+        // **with their email addresses** — it reads an address book it has no
+        // way to mail, which is an exfiltration question for the trust filter
+        // and not an outreach question for this field.
+        //
+        // What breaks it is a user-provisioning tool, the same falsifier written
+        // beside `atlassian`.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "granola",
+        label: "Granola — meeting notes",
+        // Dialled 2026-08-31: 401 with `WWW-Authenticate: Bearer`, pointing at
+        // `/.well-known/oauth-protected-resource`, whose `authorization_servers`
+        // is a **different host** — `https://mcp-auth.granola.ai`. The two
+        // literals below come from that host's own metadata document and not
+        // from the resource's, which is the mistake this note exists to prevent.
+        //
+        // OAuth is the only door: "there is no API key or service account access
+        // method for MCP".
+        provision: Provision::Dial("https://mcp.granola.ai/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://mcp-auth.granola.ai/oauth2/authorize",
+            token: "https://mcp-auth.granola.ai/oauth2/token",
+            // **The one scope string in this file that the metadata document
+            // would have got wrong.** The authorization server's
+            // `scopes_supported` is `["email", "offline_access", "openid",
+            // "profile"]` and **does not list `mcp`** — but the protected
+            // resource's own document says `scopes_supported: ["mcp"]`, and the
+            // resource is the thing being asked for.
+            //
+            // Settled by probing rather than by choosing, 2026-08-31, against a
+            // client registered by hand at `/oauth2/register`:
+            //   * `scope=mcp`                  → 302 to the consent page
+            //   * `scope=mcp offline_access`   → 302 to the consent page
+            //   * `scope=bogus_scope_xyz`      → 302 back with `error=invalid_scope`
+            // So the endpoint does validate, `mcp` is real, and the metadata is
+            // simply incomplete. `offline_access` is here because Granola lists
+            // `refresh_token` in `grant_types_supported` and `crate::oauth::
+            // refresh_due` needs something in the column to renew with.
+            scopes: "mcp offline_access",
+            auth: ClientAuth::Basic,
+        }),
+        // Six tools: `query_granola_meetings`, `list_meetings`, `get_meetings`,
+        // `list_meeting_folders`, `get_meeting_transcript`, `get_account_info`.
+        // Every one of them reads the customer's own notes; there is no create,
+        // update, share or send tool on this server at all. `Read` is a checked
+        // claim, like `orizn-visa`'s and unlike `CUSTOM`'s.
+        //
+        // The sensitivity is real and is not what the floor measures:
+        // `get_meeting_transcript` returns verbatim minutes of meetings other
+        // people were in. That is an `Untrusted`-text and a data-egress question,
+        // and both are answered elsewhere.
+        floor: RiskClass::Read,
+        // Falls out of the same list. A surface with no write tool has nothing
+        // that could put anything in front of anybody, and Granola is a notepad
+        // rather than a sender. The falsifier is a share-by-email tool.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "magnific",
+        label: "Magnific — image and video generation",
+        // **The address had to be found, and the old one is a trap.**
+        // `mcp.magnific.ai` does not resolve, and `https://api.freepik.com/mcp`
+        // — the endpoint most pages still name — answers 200 with a JSON-RPC
+        // error saying it is deprecated and naming its successor. So this
+        // literal comes from the deprecated server itself, dialled 2026-08-31,
+        // and it is `magnific.com` rather than `magnific.ai`.
+        //
+        // 401 with `WWW-Authenticate: Bearer …, scope="openid profile email
+        // mcp:custom-audience"`, and the protected-resource document's
+        // `resource` is this bare URL with **no `/mcp` path** — which is why the
+        // string below has none. OAuth only: "You don't need to manage an API
+        // key."
+        provision: Provision::Dial("https://mcp.magnific.com"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            // A Keycloak realm, read off
+            // `https://auth.magnific.com/realms/mcp/.well-known/oauth-authorization-server`
+            // on 2026-08-31. The authorization server is a third host again —
+            // neither the MCP endpoint nor `magnific.com`.
+            authorize: "https://auth.magnific.com/realms/mcp/protocol/openid-connect/auth",
+            token: "https://auth.magnific.com/realms/mcp/protocol/openid-connect/token",
+            // The vendor's own answer, copied from the `scope=` parameter its
+            // 401 challenge sends, and then probed against a hand-registered
+            // client on 2026-08-31:
+            //   * this string        → 302 to Magnific's login page
+            //   * `bogus_scope_xyz`  → 302 back with
+            //     `error=invalid_scope&error_description=Invalid+scopes%3A+…`
+            // So the endpoint validates and this string passes. `offline_access`
+            // is in the realm's `scopes_supported` and is deliberately **not**
+            // asked for: Keycloak returns a session-bound refresh token for the
+            // authorization-code grant without it, and `offline_access` is the
+            // wider one that survives logout. If bindings here start dying at
+            // the session boundary, that is the word to add.
+            scopes: "openid profile email mcp:custom-audience",
+            auth: ClientAuth::Basic,
+        }),
+        // Twenty-three published tools. Most generate: `images_generate`,
+        // `images_upscale`, `video_generate`, `audio_tts`, `models3d_generate`
+        // and their siblings, plus `creations_search`/`_get`/`_move` and
+        // `account_balance`. Generating writes an asset into the customer's
+        // Magnific account and **spends credits from a real balance**, so
+        // nothing here is observation-only.
+        //
+        // Not `Destructive`: no tool deletes — `creations_move` relocates
+        // between folders. The cost is money rather than data, and money spent
+        // is the tenant's own ceiling to set, which `crate::policy` already has
+        // a lever for.
+        floor: RiskClass::Write,
+        // Nothing on this server publishes, shares or sends. A generation tool
+        // returns an asset to the caller; it does not put it in front of a third
+        // party. One thing left unmeasured and worth naming rather than
+        // assuming: whether the returned asset URLs are public CDN links. That
+        // is an egress question, not an outreach one — nobody receives a message
+        // either way.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "x",
+        label: "X",
+        // Le serveur MCP hébergé de X, en Streamable HTTP — docs.x.com/tools/mcp.md
+        // (relu 2026-09-02) : recherche plein-archive, utilisateurs, signets,
+        // tendances, actualités, et la création + publication d'Articles.
+        // Resondé le 2026-09-02, au moment d'écrire ces littéraux :
+        //
+        //   POST https://api.x.com/mcp → 401, www-authenticate: Bearer
+        //     resource_metadata="https://api.x.com/.well-known/oauth-protected-resource"
+        //   GET  …/oauth-protected-resource → resource: "https://api.x.com/mcp",
+        //     scopes_supported: [tweet.read … offline.access] — la liste
+        //     VERBATIM du champ `scopes` ci-dessous, SANS tweet.write et SANS
+        //     dm.*
+        //   GET  …/oauth-authorization-server → authorization_endpoint,
+        //     token_endpoint, token_endpoint_auth_methods_supported:
+        //     ["none", "client_secret_basic"]
+        //
+        // `client_secret_basic` est annoncé : le mur qui a tué Vercel — client
+        // public seul — passe ici, et `ClientAuth::Basic` est la lecture de ce
+        // document, pas un défaut.
+        //
+        // Deux caveats d'exploitation, mesurés le même jour :
+        //   * Pas d'enregistrement dynamique — `POST /2/oauth2/register` → 404.
+        //     L'app vient du portail développeur, où la redirect URI est
+        //     librement enregistrable : ce n'est PAS le piège Canva (là-bas,
+        //     `/authorize` refusait ensuite toute URI https).
+        //   * `GET /v1/mcp/catalog` omet un connecteur OAuth sans paire dans
+        //     `AGENTOS_OAUTH_CLIENTS` : l'entrée n'apparaît en console qu'après
+        //     cette étape d'exploitation. Un bouton invisible plutôt que cassé.
+        //
+        // Et le coût, parce que chaque appel se paie : X facture à l'usage,
+        // Post: Create $0.015/req
+        // (docs.x.com/x-api/getting-started/pricing.md, relu 2026-09-02).
+        provision: Provision::Dial("https://api.x.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://x.com/i/oauth2/authorize",
+            token: "https://api.x.com/2/oauth2/token",
+            // Copié VERBATIM du `scopes_supported` du document
+            // oauth-protected-resource, re-curlé le 2026-09-02 : la liste que
+            // le serveur de ressource lui-même annonce — et pas celle, plus
+            // large, du serveur d'autorisation, qui ajoute `ads.read`,
+            // `ads.write` et `media.write`, trois portées que rien ici ne
+            // demande. Ce qui manque compte autant que ce qui y est : aucun
+            // `dm.*` — voir `opt_outs`.
+            scopes: "tweet.read users.read follows.read space.read mute.read like.read list.read list.write block.read block.write bookmark.read bookmark.write developer.billing.write developer.write offline.access",
+            auth: ClientAuth::Basic,
+        }),
+        // Le serveur crée et PUBLIE des Articles — publiquement, au nom du
+        // compte. Publier engage l'entreprise, donc le plancher ne peut pas
+        // être `Read`, quelle que soit la liste d'outils : c'est la doctrine,
+        // pas une lecture.
+        floor: RiskClass::Write,
+        // Justifié par un fait MESURÉ, pas par une intention :
+        // `scopes_supported` du document de ressource (re-curlé 2026-09-02) ne
+        // contient aucun `dm.*`, donc ce serveur ne peut pas frapper de jeton
+        // DM — l'envoi privé est hors de portée du seul jeton que cette entrée
+        // sait obtenir. Et un post public ne met pas un message devant une
+        // personne qui n'a rien demandé : les abonnés ont choisi de suivre.
+        //
+        // La liste d'outils réelle exige un bearer d'app X (le 401 ci-dessus),
+        // donc elle n'a pas été énumérée ici : le pin SHA-256 à la déclaration
+        // est la seconde lecture, celle qui fige chaque outil au moment où un
+        // opérateur le classe. Le jour où `dm.*` apparaît dans le document de
+        // ressource, cette valeur est fausse et l'entrée change de registre.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
+        key: "ayrshare",
+        label: "Ayrshare — multi-network posting",
+        // L'API de publication multi-réseaux, serveur MCP officiel en
+        // Streamable HTTP. Resondé le 2026-09-02 : `initialize` répond 200
+        // SANS credential (`ayrshare-action-mcp 0.1.0`, protocole 2025-06-18),
+        // et `tools/list` aussi — 27 outils énumérés en direct, ce qui fait de
+        // cette entrée une des mieux lues du catalogue.
+        provision: Provision::Dial("https://api.ayrshare.com/mcp"),
+        reach: Reach::Public,
+        // La clé API Ayrshare, collée telle quelle. Le header `Profile-Key`
+        // (multi-profils, plan Business) n'a pas de place dans
+        // `Credential::Bearer` : cette entrée sert le cas mono-profil, et elle
+        // le dit plutôt que de le laisser découvrir en 403.
+        credential: Credential::Bearer,
+        // `create_post` publie sur jusqu'à 13 réseaux au nom du client :
+        // publier engage l'entreprise publiquement, donc jamais `Read`. Pas
+        // `Destructive` non plus — c'est la vérité de la liste, rien n'y
+        // efface un compte. Mais `send_message` — un DM à quelqu'un ne se
+        // reprend pas — ne doit jamais être déclaré sous `Destructive`, et un
+        // outil que personne n'a déclaré l'est déjà.
+        floor: RiskClass::Write,
+        // Les 27 outils, lus en direct le 2026-09-02, contiennent
+        // `send_message` et `get_messages` : des messages privés Facebook,
+        // Instagram, X et WhatsApp, vers un destinataire que l'appelant
+        // fournit. `NoStrangers` serait donc un mensonge.
+        //
+        // Et la seconde lecture est faite — c'est la discipline du const
+        // block, `HeldHere` ne s'écrit que par quelqu'un qui est allé
+        // chercher : l'index complet des docs Ayrshare (218 pages,
+        // www.ayrshare.com/docs, llms.txt relu le 2026-09-02) ne contient ni
+        // « unsubscribe », ni « opt-out », ni « suppression », et les pages
+        // Messages (overview, send-message) décrivent les fenêtres de Meta —
+        // 24 h WhatsApp, Message requests — mais aucun endpoint qui liste les
+        // gens qui ont refusé. Le fournisseur ne tient pas de liste : le seul
+        // registre du refus est `suppressions`, chez nous, et
+        // `OUTREACH_HELD_HERE` nomme cette entrée.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "blotato",
+        label: "Blotato — multi-network posting",
+        // Resondé le 2026-09-02 : 401 avec `WWW-Authenticate: Bearer
+        // realm="mcp" … "Missing API key or OAuth2.1 token"`. La clé API est
+        // offerte au premier rang par le serveur lui-même, et c'est la voie
+        // prise — la voie OAuth (Supabase) passerait le mur du client
+        // confidentiel, mais on ne fait pas une danse de consentement pour
+        // obtenir ce qu'un champ de formulaire donne.
+        provision: Provision::Dial("https://mcp.blotato.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // 35 outils (help.blotato.com/api/mcp/tools.md, relu 2026-09-02).
+        // Publier engage l'entreprise, donc jamais `Read`. Et deux outils ne
+        // doivent jamais être déclarés sous `Destructive` — la ligne est ici
+        // parce que c'est celle qu'un opérateur pressé lira :
+        // `blotato_buy_credits` rend un lien Stripe Checkout, de l'argent, et
+        // `blotato_send_message` met un message privé devant une personne. Un
+        // outil que personne n'a déclaré l'est déjà.
+        floor: RiskClass::Write,
+        // `blotato_send_message` envoie des DM Instagram et Facebook. Les docs
+        // disent « reply to people who already have a conversation with you »,
+        // mais le schéma prend un `recipientId` libre — et une affirmation ne
+        // se pose pas sur de la prose quand le schéma dit autre chose.
+        //
+        // Seconde lecture faite le 2026-09-02 : l'index complet des docs
+        // (help.blotato.com/llms.txt) et le Tools Reference ne contiennent ni
+        // « unsubscribe », ni « opt-out », ni « suppression », ni blocklist.
+        // Pas de liste chez le fournisseur : `suppressions` est le seul
+        // registre, et `OUTREACH_HELD_HERE` nomme cette entrée.
+        opt_outs: OptOuts::HeldHere,
+    },
+    Connector {
+        key: "zernio",
+        label: "Zernio — social publishing and messaging",
+        // Resondé le 2026-09-02 : `tools/list` répond en direct — 52 outils.
+        // La voie OAuth a ses `.well-known` en 404 (authorization-server) et
+        // 308 (protected-resource) à la racine ; la clé API évite ce mur
+        // entièrement, et c'est elle que cette entrée prend.
+        provision: Provision::Dial("https://mcp.zernio.com/mcp"),
+        reach: Reach::Public,
+        credential: Credential::Bearer,
+        // 52 outils sondés, MAIS deux d'entre eux — `search_tools` et
+        // `call_tool` — atteignent 496 outils au total, dont DM, WhatsApp, SMS
+        // et Broadcasts. **`call_tool` défait la promesse du pin par-outil** :
+        // le digest SHA-256 fige un schéma qui prend un nom d'outil
+        // arbitraire, donc épingler `call_tool` n'épingle rien de ce qu'il
+        // peut atteindre. Il ne doit jamais être déclaré sous `Destructive`,
+        // et un outil que personne n'a déclaré l'est déjà. Publier engage
+        // l'entreprise : jamais `Read`.
+        floor: RiskClass::Write,
+        // L'issue attendue était `HeldHere` ; la lecture a dit autre chose, et
+        // c'est exactement pour ça qu'elle est due avant d'écrire. Zernio
+        // PUBLIE sa liste : « List SMS opt-outs » — les destinataires qui ont
+        // répondu STOP, export CSV, lecture seule
+        // (docs.zernio.com/sms/list-sms-opt-outs, relu 2026-09-02). C'est une
+        // lecture que `crate::queue::reconcile_opt_outs` peut viser, et
+        // `posthog` est le précédent : écrire `HeldHere` quand une liste
+        // existe cache une liste réconciliable.
+        //
+        // Ce que la liste couvre, dit honnêtement : les STOP SMS. Les canaux
+        // sociaux passent par le consentement tenu par Meta — « Meta only
+        // answers for people who have MESSAGED the account », mêmes docs — et
+        // WhatsApp par sa fenêtre de 24 h : des refus tenus par la plateforme
+        // d'en face, pas une liste à rapatrier.
+        opt_outs: OptOuts::Pulled {
+            from: "GET /v1/sms/opt-outs",
+        },
+    },
     CUSTOM,
 ];
 
@@ -562,9 +2060,11 @@ pub const CATALOG: &[Connector] = &[
 /// [`OptOuts::Pushed`] already cost the person adding an entry something real —
 /// a string they can only get by reading a vendor's documentation, and one this
 /// block refuses to accept empty. [`OptOuts::NoStrangers`] costs nothing, is
-/// true of the two entries here, and is the answer somebody in a hurry reaches
+/// true of most entries here, and is the answer somebody in a hurry reaches
 /// for. So it is the one that has to be paid for twice, and the second payment
 /// is this length, whose failure message says what reading is owed.
+/// [`OUTREACH_HELD_HERE`] charges the identical price for the identical reason,
+/// on the one other variant that is a claim rather than a string.
 ///
 /// The other assertion is the trapdoor: [`OptOuts::Unseen`] is pinned to
 /// [`Provision::Customer`], so the "we have not looked yet" answer is
@@ -572,17 +2072,53 @@ pub const CATALOG: &[Connector] = &[
 /// variant to leave in place, and no way to borrow the one variant that sounds
 /// like it.
 ///
+/// # The two connectors this block cost us, and what getting them back changed
+///
+/// `stripe` and `cloudflare` were both refused an entry once, for one reason
+/// rather than two: **each serves a tool whose parameter is "any method of the
+/// vendor's API"** — `stripe_api_write` ("write data with any Stripe API
+/// `POST`, `PATCH`, `PUT` and `DELETE` method"), and Cloudflare's `execute`. A
+/// tool like that has no tool list to read. Its list is the vendor's entire REST
+/// surface, it grows whenever they ship anything, and nobody can assert over it
+/// — so [`OptOuts::NoStrangers`] on such an entry is not a claim that turned out
+/// wrong, it is a claim with no referent.
+///
+/// That much was right and still is. What was wrong was the conclusion.
+/// [`OptOuts::Pulled`] cannot name a read that does not exist — Stripe's
+/// invoice mail carries no unsubscribe link and Stripe publishes no suppression
+/// endpoint; Cloudflare's `execute` reaches account-member invitations and Email
+/// Routing destination verification and Cloudflare publishes none either. And
+/// [`OptOuts::Pushed`] is no escape: `0069`'s
+/// `webhook_endpoints_provider_is_wired` allows `provider in ('email',
+/// 'twilio')`, so a `stripe` handle invented here would fail at registration
+/// rather than quietly accept callbacks nobody consumes. Three variants, none of
+/// them true — and the inference drawn from that was "then the entry must not be
+/// written", which **protected nobody**.
+///
+/// This array is a register. Nothing reads it at call time; no message was ever
+/// stopped by an entry's absence. A customer who wanted Stripe connected Stripe
+/// through [`CUSTOM`], with a URL they pasted themselves, and the register said
+/// nothing about it at all. The refusal bought silence where the document should
+/// have spoken, and it bought it at the price of the two connectors most worth
+/// writing down. [`OptOuts::HeldHere`] is the fourth answer, [`OUTREACH_HELD_HERE`]
+/// is where it is recorded, and both entries are in the array above.
+///
+/// The upgrade path is unchanged and is still worth taking: the day something
+/// owns Stripe's outbound mail — disable Stripe's own invoice emails, send them
+/// through the provider whose `List-Unsubscribe` already lands on a route of
+/// ours — that entry becomes [`OptOuts::Pushed`] and moves off the other array.
+///
 /// It is `pub` because it is the artifact the obligation actually needs: the
 /// list of connectors this deployment asserts have no unsubscribe list
 /// anywhere, in one place, readable by whoever has to answer for it.
-pub const NO_OUTREACH: [&str; 2] = {
-    let mut out = [""; 2];
+pub const NO_OUTREACH: [&str; 20] = {
+    let mut out = [""; 20];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         vet(&CATALOG[i]);
         if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
             assert!(
-                n < 2,
+                n < 20,
                 "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
                  NO_OUTREACH's length was not updated. That claim is read off the vendor's \
                  own tool list — every tool this server serves, and not one of them can put \
@@ -597,9 +2133,73 @@ pub const NO_OUTREACH: [&str; 2] = {
         i += 1;
     }
     assert!(
-        n == 2,
+        n == 20,
         "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
          not updated"
+    );
+    out
+};
+
+/// Every connector we have written down that **can** put a message in front of
+/// somebody who did not ask for it, and whose vendor keeps no list of the ones
+/// who refused — so the only register of that refusal is `suppressions`, here.
+///
+/// # This is the register [`NO_OUTREACH`] could not hold
+///
+/// The two arrays are one document read from both ends. `NO_OUTREACH` names the
+/// connectors that reach nobody; this one names the connectors that reach
+/// strangers with nothing upstream to reconcile against. Everything else in
+/// [`CATALOG`] has named its read in [`OptOuts::Pulled`] or [`OptOuts::Pushed`],
+/// and `every_entry_is_on_exactly_one_of_the_two_registers` is the assertion
+/// that no entry falls between them.
+///
+/// Before [`OptOuts::HeldHere`] existed there was no third answer, so a
+/// connector in this position could not be written at all — and `stripe` and
+/// `cloudflare` were both refused on exactly that. That refusal read as caution
+/// and was not: `NO_OUTREACH` is a register, nothing consults it at call time,
+/// and a customer who wanted Stripe connected Stripe through [`CUSTOM`] with
+/// **no** entry in any array here. The refusal cost the document its two most
+/// important lines and cost the customer nothing. Naming them is the safer half.
+///
+/// # Why it is pinned the same way
+///
+/// [`OptOuts::HeldHere`] is as cheap to type as [`OptOuts::NoStrangers`] and is
+/// wrong in a worse direction: `NoStrangers` typed by mistake understates a
+/// connector that sends, and `HeldHere` typed by mistake hides a vendor list
+/// that exists and could have been reconciled. Both are claims about a tool list
+/// no machine can check, so both cost a length. `posthog` is the entry that
+/// shows the difference is real — it sends *and* publishes `opt-outs-list`, so
+/// it is [`OptOuts::Pulled`] and appears in neither array.
+///
+/// `pub` for the same reason [`NO_OUTREACH`] is: it is the artifact the
+/// obligation needs. Somebody answering for what this deployment can reach
+/// reads these two arrays and nothing else.
+pub const OUTREACH_HELD_HERE: [&str; 6] = {
+    let mut out = [""; 6];
+    let (mut i, mut n) = (0, 0);
+    while i < CATALOG.len() {
+        if matches!(CATALOG[i].opt_outs, OptOuts::HeldHere) {
+            assert!(
+                n < 6,
+                "a connector claiming `OptOuts::HeldHere` was added to CATALOG and \
+                 OUTREACH_HELD_HERE's length was not updated. That claim is two readings, \
+                 not one: the vendor's own tool list, to see which tool takes the address of \
+                 a person who did not ask — and the vendor's API, to see that no suppression \
+                 or unsubscribe endpoint exists to reconcile against. If you have done both \
+                 and the second came back empty, bump the length and this deployment answers \
+                 for that connector's outreach itself. If the vendor does publish such a \
+                 list, `OptOuts::Pulled` names it and is strictly better. If no tool there \
+                 reaches anybody, `OptOuts::NoStrangers` and NO_OUTREACH is where you say so."
+            );
+            out[n] = CATALOG[i].key;
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        n == 6,
+        "a connector stopped claiming `OptOuts::HeldHere` and OUTREACH_HELD_HERE's length \
+         was not updated"
     );
     out
 };
@@ -636,6 +2236,17 @@ const fn vet(connector: &Connector) {
             "`Provision::Customer` is a server nobody here has seen, so `NoStrangers` is a \
              claim about a tool list nobody has read. `OptOuts::Unseen`, for the same reason \
              this entry's floor is `RiskClass::Read`."
+        ),
+        // Same trapdoor, same sentence, other direction: `HeldHere` says
+        // somebody read a tool list, found a tool that reaches a stranger, and
+        // went looking for the vendor's suppression endpoint. None of that has
+        // happened for a URL that arrives in a request body.
+        OptOuts::HeldHere => assert!(
+            !unseen_server,
+            "`Provision::Customer` is a server nobody here has seen, so `HeldHere` is a claim \
+             about a tool list nobody has read — and about a vendor nobody has asked for a \
+             suppression endpoint. `OptOuts::Unseen`, for the same reason this entry's floor \
+             is `RiskClass::Read`."
         ),
         OptOuts::Pulled { from: source } | OptOuts::Pushed { at: source } => {
             assert!(
@@ -851,6 +2462,41 @@ mod tests {
         );
     }
 
+    /// A scope string is one hand-typed line of space-separated tokens.
+    ///
+    /// The provider reads it as a set; a stray double space or a newline makes
+    /// one empty member, and a missing space glues two scopes into one token
+    /// that no provider knows. Either way the failure is a consent screen that
+    /// does not load, with an error naming nothing — so the scope strings above
+    /// are deliberately *not* wrapped with a `\` continuation, and this is the
+    /// assertion that says so out loud.
+    #[test]
+    fn every_scope_in_a_scope_string_is_a_whole_scope() {
+        for connector in CATALOG {
+            let Some(endpoints) = connector.credential.oauth() else {
+                continue;
+            };
+            for scope in endpoints.scopes.split(' ') {
+                assert!(
+                    !scope.is_empty() && !scope.contains(char::is_whitespace),
+                    "{}: an empty scope — the string has a double space or a newline in it",
+                    connector.key
+                );
+                // Two absolute scopes glued together still parse as one URL, so
+                // counting separators is what catches it and `vet_url` is not.
+                assert!(
+                    scope.matches("://").count() <= 1,
+                    "{}: {scope:?} is two scopes with the space missing between them",
+                    connector.key
+                );
+                if scope.contains("://") {
+                    crate::mcp::vet_url(scope)
+                        .unwrap_or_else(|err| panic!("{}: {scope:?}: {err}", connector.key));
+                }
+            }
+        }
+    }
+
     /// The loop above is empty; this is the proof it would refuse a bad entry.
     #[test]
     #[should_panic(expected = "an authorization server is on the internet")]
@@ -921,12 +2567,51 @@ mod tests {
         vet(&a_sender_nobody_has_looked_up(OptOuts::Pulled {
             from: "list_unsubscribed",
         }));
+        vet(&a_sender_nobody_has_looked_up(OptOuts::HeldHere));
+    }
+
+    /// The two registers are one document, and nothing falls between them.
+    ///
+    /// This replaces an assertion that used to read `NO_OUTREACH.len() ==
+    /// CATALOG.len() - 1` — true only while every entry but [`CUSTOM`] claimed
+    /// [`OptOuts::NoStrangers`], and quietly meaningless the moment one did not.
+    /// The property actually worth holding is that **every catalogued connector
+    /// is accounted for exactly once**: it is on the roster that says it reaches
+    /// nobody, on the roster that says this deployment answers for its outreach,
+    /// or it named the read where its unsubscribes come in. There is no fourth
+    /// place for one to be, and a connector in none of the three would be the
+    /// `Unwired` state [`OptOuts`] refuses to have.
+    ///
+    /// The two `const` blocks each hold their own length; what neither can see
+    /// is the other, and this is the line that adds them up.
+    #[test]
+    fn every_entry_is_on_exactly_one_of_the_two_registers() {
+        let named = CATALOG
+            .iter()
+            .filter(|c| matches!(c.opt_outs, OptOuts::Pulled { .. } | OptOuts::Pushed { .. }))
+            .count();
         assert_eq!(
-            NO_OUTREACH.len(),
+            NO_OUTREACH.len() + OUTREACH_HELD_HERE.len() + named,
             CATALOG.len() - 1,
-            "the roster is every entry but `CUSTOM`; if that changed, one of them \
-             can now reach a stranger and this array is the audit line for it"
+            "every entry but `CUSTOM` reaches nobody, is answered for here, or named its \
+             read — and one of them is now in none of the three"
         );
+        for key in NO_OUTREACH {
+            assert!(
+                !OUTREACH_HELD_HERE.contains(&key),
+                "{key} claims both that it reaches nobody and that it reaches strangers"
+            );
+            assert!(
+                find(key).is_some(),
+                "{key} is on a register and not in CATALOG"
+            );
+        }
+        for key in OUTREACH_HELD_HERE {
+            assert!(
+                find(key).is_some(),
+                "{key} is on a register and not in CATALOG"
+            );
+        }
     }
 
     /// [`CUSTOM`] cannot make the claim either, from the other direction: a
@@ -937,6 +2622,22 @@ mod tests {
     fn the_custom_entry_cannot_claim_it_reaches_nobody() {
         vet(&Connector {
             opt_outs: OptOuts::NoStrangers,
+            ..CUSTOM
+        });
+    }
+
+    /// And it cannot make the *opposite* claim either, which is the arm
+    /// [`OptOuts::HeldHere`] added to [`vet`].
+    ///
+    /// `HeldHere` is two readings — a tool list, then a vendor's API — and
+    /// neither has happened for a URL that arrives in a request body. Without
+    /// this arm it would have been the one variant a customer entry could carry
+    /// freely, which is exactly the `Unwired` hole [`OptOuts`] refuses to have.
+    #[test]
+    #[should_panic(expected = "about a vendor nobody has asked for a suppression endpoint")]
+    fn the_custom_entry_cannot_claim_this_deployment_answers_for_it() {
+        vet(&Connector {
+            opt_outs: OptOuts::HeldHere,
             ..CUSTOM
         });
     }
