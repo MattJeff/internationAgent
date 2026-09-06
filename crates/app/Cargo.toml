@@ -18,6 +18,10 @@ async-trait.workspace = true
 base64.workspace = true
 rmcp.workspace = true
 chrono.workspace = true
+# `knowledge::text_from_pdf`. The one dependency the classeur needed to stop
+# accepting bytes no employee can read — see `knowledge.rs`'s module docs for
+# why it is this crate and not a PDF library.
+pdf-extract.workspace = true
 rand.workspace = true
 # One outbound GET: a peer's JWKS. It lives here rather than behind a port in
 # `agentos-providers` because the SSRF check and the connect must be in the same

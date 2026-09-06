@@ -26,6 +26,9 @@ axum.workspace = true
 # into three other crates, so this adds nothing to the lock file.
 base64.workspace = true
 chrono.workspace = true
+# Le KDF des mots de passe, et rien d'autre — voir `routes::accounts`. Déjà lié
+# dans ce binaire par rustls, donc rien de neuf dans la lock file.
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

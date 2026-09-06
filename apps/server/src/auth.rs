@@ -62,6 +62,7 @@
 //! somewhere: whatever mints the first credential cannot itself have been
 //! minted.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use agentos_domain::ids::TenantId;
@@ -72,6 +73,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use ring::pbkdf2;
 
 use crate::error::ApiError;
 
@@ -533,8 +535,300 @@ impl<S: Send + Sync> FromRequestParts<S> for Principal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Le mot de passe d'une personne
+// ---------------------------------------------------------------------------
+//
+// **Pourquoi ceci est dans `auth.rs` et pas dans `routes::accounts`.** Deux
+// routes en ont besoin et elles sont sur deux étages différents :
+// `routes::platform::create_account` dérive une empreinte avec la clé du
+// fournisseur, `routes::accounts::open_session` en vérifie une sans credential
+// du tout. Ce module est déjà l'autorité sur « qui appelle, établi depuis le
+// credential et depuis rien d'autre » ; un troisième trousseau — celui d'une
+// personne — s'y range, et l'argument sur POURQUOI il est haché autrement que
+// les deux autres se lit à côté des deux autres.
+//
+// L'argument de bout en bout est dans
+// `migrations/0089_une_personne_ouvre_la_console.sql` ; la route qui s'en sert
+// est `apps/server/src/routes/accounts.rs`, qui porte l'argument de sécurité de
+// la session elle-même.
+//
+// L'argument « pourquoi pas le HMAC d'`api_keys` » est dans
+// `migrations/0089_une_personne_ouvre_la_console.sql`, en entier : là-bas
+// l'entrée fait 256 bits de CSPRNG et il n'y a rien à étirer ; ici elle est
+// choisie par un humain et le dictionnaire existe.
+//
+// **Pourquoi `ring` et pas un crate de plus.** Le workspace n'a ni `argon2` ni
+// `pbkdf2` ; il a `hmac`, `sha2` et — déjà dans le graphe de compilation, tiré
+// par rustls via `sqlx/tls-rustls-ring` — `ring`. Les trois options réelles
+// étaient donc : ajouter `argon2`, écrire PBKDF2 à la main sur `hmac`, ou
+// déclarer une dépendance sur une bibliothèque déjà compilée.
+//
+// Écrire PBKDF2 à la main est exclu : c'est de la cryptographie faite maison
+// pour économiser une ligne de `Cargo.toml`. Entre les deux autres, `argon2`
+// résiste mieux au GPU et c'est vrai ; il coûte un crate de plus, un choix de
+// paramètres mémoire à défendre, et il n'est pas ce qui décide de l'issue ici —
+// ce qui décide, c'est qu'un dump seul ne suffise pas à casser des mots de
+// passe en masse, et 600 000 itérations de PBKDF2-HMAC-SHA256 sont la
+// recommandation courante de l'OWASP pour exactement cette raison. `ring` est
+// donc pris : rien de neuf dans la lock file, une implémentation auditée, et
+// une vérification à temps constant fournie par la bibliothèque.
+
+/// Version d'empreinte que ce build écrit.
+///
+/// Le premier octet de la colonne. Il existe pour que le facteur de travail
+/// puisse MONTER : les itérations d'un PBKDF2 doivent suivre le matériel, et
+/// sans préfixe de version, les augmenter invaliderait toutes les lignes d'un
+/// coup. Avec, une ligne se re-dérive à la prochaine connexion réussie — quand
+/// le mot de passe en clair est là, et il n'est là qu'à ce moment.
+///
+/// ponytail : la re-dérivation n'est pas écrite. Une seule version existe, donc
+/// il n'y a rien à migrer, et un chemin de migration sans deuxième version est
+/// du code que personne n'exécute. Le jour où `KDF_VERSION` passe à 2, ce sont
+/// trois lignes dans [`open_session`] : si la ligne lue est en version 1 et que
+/// le mot de passe est bon, réécrire l'empreinte.
+const KDF_VERSION: u8 = 1;
+
+/// Itérations pour [`KDF_VERSION`] = 1. La recommandation OWASP 2023 pour
+/// PBKDF2-HMAC-SHA256.
+const KDF_V1_ITERATIONS: u32 = 600_000;
+
+/// Octets de sel, par ligne. 128 bits : de quoi rendre toute table
+/// pré-calculée inutile, et de quoi que deux personnes qui choisissent le même
+/// mot de passe n'aient pas la même empreinte.
+const SALT_LEN: usize = 16;
+
+/// Octets dérivés. La sortie native de SHA-256 ; en demander plus ferait tourner
+/// tout le PBKDF2 une deuxième fois pour rien.
+const DERIVED_LEN: usize = 32;
+
+/// `[version][sel][dérivé]` — 49 octets, ce que la CHECK d'`0089` exige.
+const HASH_LEN: usize = 1 + SALT_LEN + DERIVED_LEN;
+
+/// Le sel utilisé quand il n'y a pas de ligne à vérifier.
+///
+/// Sa valeur n'a aucune importance et son existence en a une : c'est ce qui
+/// fait qu'une adresse inconnue coûte le même temps qu'un mot de passe faux.
+const NO_ROW_SALT: &[u8; SALT_LEN] = b"agentos.no-row..";
+
+fn v1_iterations() -> NonZeroU32 {
+    NonZeroU32::new(KDF_V1_ITERATIONS).expect("600000 is not zero")
+}
+
+/// Dériver une empreinte neuve, sel compris.
+///
+/// Appelée par `routes::platform` à la création d'un compte, et par personne
+/// d'autre — un mot de passe n'entre dans ce système qu'à ce moment-là et à la
+/// connexion.
+pub(crate) fn hash_password(password: &str) -> Vec<u8> {
+    use ring::rand::SecureRandom as _;
+
+    let mut salt = [0u8; SALT_LEN];
+    ring::rand::SystemRandom::new()
+        .fill(&mut salt)
+        // Le CSPRNG du système. S'il ne répond pas, il n'y a pas de repli
+        // acceptable : un sel prévisible est un sel absent, et rendre un compte
+        // sans sel serait pire que refuser de le créer.
+        .expect("the OS CSPRNG");
+
+    let mut out = Vec::with_capacity(HASH_LEN);
+    out.push(KDF_VERSION);
+    out.extend_from_slice(&salt);
+
+    let mut derived = [0u8; DERIVED_LEN];
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        v1_iterations(),
+        &salt,
+        password.as_bytes(),
+        &mut derived,
+    );
+    out.extend_from_slice(&derived);
+    out
+}
+
+/// Vérifier un mot de passe contre une empreinte stockée.
+///
+/// **Une empreinte illisible — une tranche vide parce qu'il n'y avait pas de
+/// ligne, une version qu'on ne connaît pas, une longueur fausse — dépense quand
+/// même la dérivation** avant de refuser. C'est tout l'intérêt de la fonction :
+/// sans ça, `credentials()` rendant `None` reviendrait en une microseconde là où
+/// un mot de passe faux prend trois cents millisecondes, et la différence est
+/// lisible depuis n'importe où. Elle dirait « cette adresse est cliente chez
+/// nous », une adresse à la fois, à qui veut.
+///
+/// La comparaison finale est celle de `ring`, qui est à temps constant — même
+/// raison qu'`auth::ct_eq`, sauf qu'ici il n'y a pas à l'écrire.
+pub(crate) fn verify_password(stored: &[u8], password: &str) -> bool {
+    let Some((&KDF_VERSION, rest)) = stored.split_first() else {
+        return spend_and_refuse(password);
+    };
+    if rest.len() != SALT_LEN + DERIVED_LEN {
+        return spend_and_refuse(password);
+    }
+    let (salt, expected) = rest.split_at(SALT_LEN);
+    pbkdf2::verify(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        v1_iterations(),
+        salt,
+        password.as_bytes(),
+        expected,
+    )
+    .is_ok()
+}
+
+/// Les deux mêmes, hors du fil de l'exécuteur.
+///
+/// **Ceci n'est pas de la prudence, c'est la condition pour que le KDF soit
+/// utilisable.** 600 000 itérations, ce sont quelques centaines de millisecondes
+/// de CPU *sans point d'attente* : lancées directement dans un handler, elles
+/// bloquent un worker tokio, et tokio en a autant que de cœurs. Quatre
+/// connexions simultanées sur une machine à quatre cœurs, et le serveur ne
+/// répond plus à personne — y compris aux sondes. `spawn_blocking` les envoie
+/// sur le pool prévu pour ça.
+///
+/// Une `JoinError` veut dire que la tâche a paniqué (le CSPRNG du système) : un
+/// 500, jamais un refus, parce qu'un refus dirait à la personne que son mot de
+/// passe est faux alors que c'est nous qui sommes cassés.
+pub(crate) async fn hash_password_off_thread(password: String) -> Result<Vec<u8>, ApiError> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "the password KDF did not finish");
+            ApiError::internal()
+        })
+}
+
+pub(crate) async fn verify_password_off_thread(
+    stored: Vec<u8>,
+    password: String,
+) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || verify_password(&stored, &password))
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "the password KDF did not finish");
+            ApiError::internal()
+        })
+}
+
+/// Payer le prix d'une vérification, puis refuser.
+fn spend_and_refuse(password: &str) -> bool {
+    let mut sink = [0u8; DERIVED_LEN];
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        v1_iterations(),
+        NO_ROW_SALT,
+        password.as_bytes(),
+        &mut sink,
+    );
+    // `black_box`, parce que `sink` est mort ensuite et qu'un optimiseur a le
+    // droit de supprimer un calcul dont personne ne lit le résultat. Il
+    // supprimerait avec lui la seule chose que cette fonction fait.
+    std::hint::black_box(sink);
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Normalisation
+// ---------------------------------------------------------------------------
+
+/// Longueur minimale d'un mot de passe, à la création.
+///
+/// Douze, pas huit. Ce n'est pas un avis sur l'entropie : c'est que le KDF
+/// défend contre un dump volé, et que douze caractères choisis sont la
+/// frontière en dessous de laquelle 600 000 itérations ne rattrapent plus rien.
+/// Aucune règle de composition — majuscule, chiffre, symbole — parce qu'elles
+/// produisent `Password1!` et rien d'autre.
+pub(crate) const MIN_PASSWORD_LEN: usize = 12;
+
+/// Ce que la colonne accepte. La normalisation est ici et la CHECK
+/// `accounts_email_is_normalised` est ce qui garantit qu'elle a eu lieu.
+///
+/// Pas de validation RFC 5322 : elle n'attrape rien qu'un envoi de courriel
+/// n'attrape mieux, et une regex d'adresse est une façon connue de refuser les
+/// adresses de vrais gens. Ce qui est vérifié, c'est ce que la base exige.
+pub(crate) fn normalise_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_lowercase();
+    let plausible = (3..=254).contains(&email.len())
+        && email.match_indices('@').count() == 1
+        && !email.starts_with('@')
+        && !email.ends_with('@')
+        && !email.chars().any(char::is_whitespace);
+    plausible.then_some(email)
+}
 #[cfg(test)]
 mod tests {
+
+    /// A passphrase for the KDF tests. Not a credential of anything.
+    const TEST_PASSWORD: &str = "un-mot-de-passe-honnete";
+
+    /// The same round trip, on the blocking pool — which is where both of these
+    /// actually run, because 600 000 iterations with no await point in them
+    /// would otherwise hold a tokio worker for the whole derivation.
+    #[tokio::test]
+    async fn a_password_survives_the_trip_through_the_blocking_pool() {
+        let stored = hash_password_off_thread(TEST_PASSWORD.to_owned())
+            .await
+            .expect("derive");
+        assert_eq!(stored.len(), HASH_LEN);
+        assert!(
+            verify_password_off_thread(stored.clone(), TEST_PASSWORD.to_owned())
+                .await
+                .expect("verify")
+        );
+        assert!(
+            !verify_password_off_thread(stored, "autre-chose-entierement".to_owned())
+                .await
+                .expect("verify")
+        );
+    }
+
+    /// Le KDF, sans base : sel par ligne, vérification qui accepte le bon mot
+    /// de passe et refuse tout le reste, et une empreinte illisible qui refuse
+    /// au lieu de paniquer.
+    #[test]
+    fn a_digest_is_salted_per_row_and_verifies_only_its_own_password() {
+        let one = hash_password(TEST_PASSWORD);
+        let two = hash_password(TEST_PASSWORD);
+
+        assert_eq!(one.len(), HASH_LEN);
+        assert_eq!(one[0], KDF_VERSION);
+        assert_ne!(one, two, "two people with one password, two digests");
+        assert!(
+            !String::from_utf8_lossy(&one).contains(TEST_PASSWORD),
+            "the password is not in its own digest"
+        );
+
+        assert!(verify_password(&one, TEST_PASSWORD));
+        assert!(verify_password(&two, TEST_PASSWORD));
+        assert!(!verify_password(&one, "presque-le-bon-mot!"));
+        assert!(!verify_password(&one, ""));
+
+        // Illisible: vide, version inconnue, longueur fausse. Aucune ne panique
+        // et aucune n'accepte.
+        assert!(!verify_password(&[], TEST_PASSWORD));
+        assert!(!verify_password(&[0u8; HASH_LEN], TEST_PASSWORD));
+        assert!(!verify_password(&one[..HASH_LEN - 1], TEST_PASSWORD));
+    }
+
+    #[test]
+    fn an_address_is_normalised_or_it_is_not_an_address() {
+        assert_eq!(
+            normalise_email("  Anna@Example.TEST "),
+            Some("anna@example.test".to_owned())
+        );
+        for bad in [
+            "",
+            "@example.test",
+            "anna@",
+            "anna",
+            "a@b@c",
+            "an na@x.test",
+        ] {
+            assert_eq!(normalise_email(bad), None, "{bad:?}");
+        }
+    }
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 

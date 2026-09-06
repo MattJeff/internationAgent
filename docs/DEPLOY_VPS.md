@@ -210,13 +210,13 @@ C'est la racine du chiffrement enveloppe. **Chaque clé privée Ed25519 d'employ
 est scellée dessous** (`employee_signing_keys.sealed_private_key`), ainsi que
 chaque identifiant MCP de tenant depuis `0040_mcp_credentials`.
 
-- **La changer en place orpheline toute identité déjà émise.** `UPDATE` est
-  révoqué sur cette table et il n'existe aucun chemin de rotation : la
-  récupération consiste à supprimer les lignes et à re-provisionner l'identité,
-  ce qui change tous les `kid` publiés.
+- **La changer en place, seule, orpheline toute identité déjà émise.** Il existe
+  maintenant un chemin de rotation — `§11` — et il ne consiste jamais à
+  remplacer la variable et redémarrer.
 - Elle n'est **pas** couverte par un `pg_dump`. Elle se sauvegarde avec la base
   et se restaure avec elle. Une base restaurée sans sa clé donne toutes les clés
-  publiques et aucun moyen de signer avec.
+  publiques et aucun moyen de signer avec. **C'est la seule valeur de ce
+  déploiement dont la perte est définitive** : voir `§11.1`.
 - Elle est validée « non vide » et rien de plus : ni décodée en hexadécimal, ni
   contrôlée en longueur, contrairement à ce que `.env.example` laisse croire.
   Elle est portée à 32 octets par SHA-256, pas par une KDF — donc l'entropie doit
@@ -762,3 +762,125 @@ Ce qui ne m'inquiète pas, et qui pourrait sembler devoir : la RAM (1,5 Go de
 plafond sur 11 Go disponibles), les collisions de port (aucun port publié), et
 l'impact sur orizn.app (aucun conteneur existant n'est touché, nginx n'est pas
 rechargé, `ufw` n'est pas modifié).
+
+---
+
+## 11. Sauvegarder et tourner les clés
+
+Trois procédures. Elles sont courtes exprès : une procédure longue est une
+procédure qu'on n'exécute pas.
+
+### 11.1 La sauvegarde, et la seule preuve qu'elle vaut quelque chose
+
+Deux choses à sauvegarder, et **elles ne vivent pas au même endroit** :
+
+| Quoi | Où | Fréquence |
+|---|---|---|
+| La base | `pg_dump -Fc` du conteneur `agentos-postgres` | quotidienne |
+| `AGENTOS_MASTER_KEY` | gestionnaire de secrets du fondateur, **hors du VPS** | une fois, à la génération, et à chaque rotation |
+
+Un dump sans la clé, c'est un dump dont toutes les identités d'employés, tous
+les jetons MCP, la clé modèle du locataire et tous les secrets de webhook sont
+illisibles pour toujours. Une clé sans dump, c'est une clé qui n'ouvre rien.
+Les deux ensemble, ou rien.
+
+**La vérification, à faire une fois maintenant et une fois par trimestre.** Une
+restauration jamais essayée n'est pas une sauvegarde ; on ne teste pas la
+sauvegarde, on teste la *restauration* :
+
+```bash
+# 1. Restaurer le dump de la nuit dans une base jetable, sur le VPS.
+createdb -h agentos-postgres -U postgres agentos_verif
+pg_restore -h agentos-postgres -U postgres -d agentos_verif /backups/agentos-<date>.dump
+
+# 2. Prouver que la clé sauvegardée ouvre les lignes restaurées. Cette commande
+#    ouvre l'enveloppe de chaque ligne scellée et compte celles qu'elle n'ouvre
+#    pas ; elle n'écrit rien.
+DATABASE_URL=postgres://postgres:<mdp>@agentos-postgres:5432/agentos_verif \
+AGENTOS_MASTER_KEY="$(cat /chemin/vers/la/clé/sauvegardée)" \
+  agentos-server policy rotate-master-key --status
+
+# 3. Attendu : « 0 unreadable » et un code de sortie 0. Puis :
+dropdb -h agentos-postgres -U postgres agentos_verif
+```
+
+Une ligne `unreadable` non nulle veut dire que la clé sauvegardée n'est pas
+celle qui a scellé la base sauvegardée. **C'est exactement ce qu'on veut
+apprendre un mardi après-midi et jamais le jour d'un incident.** Le code de
+sortie est non nul dans ce cas : un cron peut s'en servir.
+
+### 11.2 Tourner `AGENTOS_MASTER_KEY` — sans réémettre une identité
+
+Le chiffrement est en enveloppe : la clé maîtresse ne chiffre que la clé de
+données de chaque ligne, jamais le contenu. Une rotation re-chiffre 60 octets
+par ligne. Aucun `kid` ne change, aucune signature déjà émise ne cesse de
+vérifier, aucun jeton MCP n'est à reconnecter.
+
+Il y a une **fenêtre de recouvrement** : les deux clés valides en lecture, la
+nouvelle seule en écriture. Sans elle, le redémarrage casserait toutes les
+lignes pas encore re-chiffrées.
+
+```bash
+# 1. Générer la nouvelle clé et la mettre au coffre AVANT de s'en servir.
+openssl rand -base64 32
+
+# 2. Ouvrir la fenêtre : .env.production porte les deux clés.
+#    AGENTOS_MASTER_KEY=<la nouvelle>
+#    AGENTOS_MASTER_KEY_PREVIOUS=<l'ancienne>
+docker compose -f docker-compose.prod.yml up -d   # redémarrage : les deux clés lisent
+
+# 3. Re-chiffrer. Idempotent, reprenable, sûr sur un serveur qui tourne.
+#    --tenant <uuid> le fait un locataire à la fois sur une grosse base.
+docker compose exec agentos-server \
+  agentos-server policy rotate-master-key
+
+# 4. Compter ce qui reste. Zéro, et code de sortie 0, sinon on relance (3).
+docker compose exec agentos-server \
+  agentos-server policy rotate-master-key --status
+
+# 5. Fermer la fenêtre : supprimer AGENTOS_MASTER_KEY_PREVIOUS de
+#    .env.production, redémarrer, puis reprendre (4) — qui doit toujours
+#    répondre 0. C'est la preuve que l'ancienne clé ne sert plus à rien.
+```
+
+**Ne pas détruire l'ancienne clé avant l'étape 5 vérifiée.** Tant qu'une
+sauvegarde antérieure à la rotation existe, l'ancienne clé reste la seule qui
+l'ouvre : elle se garde au coffre aussi longtemps que ce dump-là.
+
+Ce que la commande dit à chaque passage : le nombre de lignes scellées, combien
+sont sous la clé courante, combien restent sous l'ancienne, combien ont été
+re-chiffrées, et combien n'ouvrent sous aucune des deux. Cette dernière colonne
+est un `STOP` : elle ne se contourne pas en relançant.
+
+**Deux limites à connaître.** La commande couvre les six colonnes scellées de
+cette base (`employee_signing_keys`, `mcp_servers` ×2, `mcp_oauth_flows`,
+`tenant_model_access`, `webhook_endpoints`). `apps/social` a **sa propre base**
+et n'est pas couvert : ses jetons scellés sous la même clé maîtresse doivent
+être reconnectés par leur flux OAuth, ou la rotation attend qu'il partage cette
+commande.
+
+### 11.3 Tourner la clé d'API d'un client — sans coupure
+
+Rien de spécial à activer : un locataire peut détenir plusieurs clés vivantes,
+et une clé est résolue à chaque requête sans cache. La coupure vient
+uniquement de l'ordre des gestes.
+
+```bash
+# 1. Émettre la seconde clé. L'ancienne continue de fonctionner.
+curl -sS -X POST https://<api>/v1/platform/keys \
+  -H "Authorization: Bearer $AGENTOS_PLATFORM_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"<uuid>","label":"ops-2026-09"}'
+
+# 2. Le client déploie la nouvelle à son rythme. Les deux marchent.
+
+# 3. Confirmer que la nouvelle est bien celle qui sert, puis révoquer
+#    l'ancienne par son id — pas par son secret, qu'on n'a pas.
+curl -sS -X DELETE https://<api>/v1/platform/keys/<key_id_ancien> \
+  -H "Authorization: Bearer $AGENTOS_PLATFORM_KEY"
+```
+
+La révocation est un `DELETE` et il n'y a aucun cache : la requête **suivante**
+qui présente l'ancienne clé est un 401. Pas « dans la minute » — la suivante.
+Le journal d'audit garde `api_key_issued` et `api_key_revoked` alors que la
+ligne, elle, disparaît : c'est la seule trace que cette clé a existé.

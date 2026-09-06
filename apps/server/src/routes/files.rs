@@ -52,6 +52,42 @@
 //! this internal tool's own administration surface, and it survives a connected
 //! adapter because the row stays ours when only the bytes move.
 //!
+//! # Why a deposit reaches the index, and what it means when it does not
+//!
+//! Filing a document and being able to *read* it were two features with nothing
+//! between them, and the gap was the product's own promise. An employee
+//! "answers from the company's knowledge" out of `knowledge_chunks`; this route
+//! wrote `files` and nothing else. So a founder uploaded the signed contract,
+//! got a 201, a size and a digest — and every employee in the company answered
+//! "I have nothing on file" about it, for as long as the company existed. The
+//! bytes were kept perfectly and read by nobody.
+//!
+//! So [`deposit`] now extracts the text of a PDF and ingests it, company-wide
+//! and `Untrusted`, through the same `agentos_app::knowledge::ingest` the JSON
+//! route uses. Three things about how, each of which is a decision rather than
+//! an implementation detail:
+//!
+//! * **The trigger is the bytes, not [`Deposit::content_type`].** That field is
+//!   a string somebody typed beside their own upload — this module already
+//!   refuses to let it decide how a browser treats the file, and it does not let
+//!   it decide what a parser is pointed at either. `%PDF-` is the test.
+//! * **Indexing cannot fail a deposit.** *Le classeur* keeps bytes; that promise
+//!   does not depend on whether anything could be read out of them. A scanned
+//!   contract is filed, exactly as before, and the response says `indexed:
+//!   false` with the reason `not_indexed`. Refusing the whole request would also
+//!   be a lie about state: the file is already written by then, and there is no
+//!   `DELETE` to take it back.
+//! * **`indexed: false` is never silent, and never an empty document.**
+//!   `agentos_app::knowledge::PdfError` names all four reasons and the one that
+//!   matters is the scan — see that enum. A caller can act on the field; an
+//!   operator can grep the `warn` line.
+//!
+//! What is *not* here is a queue. Extraction and ingest happen inside the
+//! request, which is a second or two of CPU on a 768 KiB file and the reason the
+//! parser runs on a blocking thread. ponytail: the moment somebody raises
+//! `MAX_BODY_BYTES`, this belongs behind `outbox`-shaped work rather than in the
+//! handler, and the response grows a `pending` state.
+//!
 //! # What is deliberately not here
 //!
 //! **No `DELETE`.** `0067` withholds the grant and argues both sides at length,
@@ -82,6 +118,8 @@
 //! trail. `AuditKind` stays closed.
 
 use agentos_app::files::{Files, FilesError, PgFiles};
+use agentos_app::knowledge::{Document, Embedder, Format, Scope, ingest, text_from_pdf};
+use agentos_domain::untrusted::TrustLabel;
 use agentos_store::db::{Db, StoreError};
 use agentos_store::files;
 use axum::extract::{Query, State};
@@ -98,14 +136,26 @@ use serde_json::json;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
+/// The classeur and the embedder a deposited PDF is indexed with.
+///
+/// The embedder arrives from `main.rs` for `routes::knowledge`'s reason and not
+/// a second time: `config.rs` is the one place that reads the environment, and
+/// two routes that could disagree about which model this deployment is on would
+/// write two vector spaces into one column.
+#[derive(Clone)]
+pub struct FilesState {
+    db: Db,
+    embedder: Embedder,
+}
+
 /// This unit's routes. Merged into the API router, so it inherits auth, the rate
 /// limit, the 1 MiB body limit and the idempotency layer from `with_api_stack` —
 /// which is also why [`Files::put`] carries no idempotency key of its own.
-pub fn router(db: Db) -> Router {
+pub fn router(db: Db, embedder: Embedder) -> Router {
     Router::new()
         .route("/v1/files", get(index).post(deposit))
         .route("/v1/files/content", get(content))
-        .with_state(db)
+        .with_state(FilesState { db, embedder })
 }
 
 /// Longest `name` and `content_type` the table accepts, in characters.
@@ -171,7 +221,10 @@ impl From<files::Filed> for FiledView {
 /// this on is "what have we been sent", and the bytes are deliberately absent
 /// because an index that carried them would be one query materialising every
 /// document the company has.
-async fn index(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
+async fn index(
+    State(FilesState { db, .. }): State<FilesState>,
+    principal: Principal,
+) -> Result<Response, ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let filed = files::index(&mut tx).await?;
     tx.rollback().await?;
@@ -193,7 +246,7 @@ async fn index(State(db): State<Db>, principal: Principal) -> Result<Response, A
 /// returns — and a second check by whoever asked is not redundant: this one
 /// proves the store is intact, theirs proves the wire was.
 async fn content(
-    State(db): State<Db>,
+    State(FilesState { db, .. }): State<FilesState>,
     principal: Principal,
     Query(which): Query<ByName>,
 ) -> Result<Response, ApiError> {
@@ -221,7 +274,7 @@ async fn content(
 /// which is a mistake in a field the caller controls and is nothing to keep
 /// quiet about.
 async fn deposit(
-    State(db): State<Db>,
+    State(FilesState { db, embedder }): State<FilesState>,
     principal: Principal,
     Json(body): Json<Deposit>,
 ) -> Result<Response, ApiError> {
@@ -262,11 +315,27 @@ async fn deposit(
         ));
     }
 
-    let classeur = PgFiles::new(db, principal.tenant_id);
+    let classeur = PgFiles::new(db.clone(), principal.tenant_id);
     let filed = classeur
         .put(name, content_type, &bytes)
         .await
         .map_err(refusal)?;
+
+    // The bytes are kept whatever happens next. See the module docs: indexing
+    // is a second thing this route does and it may not undo the first.
+    let indexed = index_pdf(&db, &embedder, principal.tenant_id, name, bytes).await;
+    match &indexed {
+        Ok(source_id) => tracing::info!(
+            tenant_id = %principal.tenant_id,
+            %source_id,
+            "a deposited PDF was read and indexed",
+        ),
+        Err(why) => tracing::warn!(
+            tenant_id = %principal.tenant_id,
+            reason = %why,
+            "a deposited file was kept but not indexed; no employee will find it by searching",
+        ),
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -277,9 +346,63 @@ async fn deposit(
             // `sha256sum` on the file you uploaded.
             "digest": hex(&filed.digest),
             "created_at": filed.created_at,
+            // **Whether an employee can now find this by searching**, which is a
+            // different question from whether it was filed and is the one the
+            // product's promise turns on.
+            "indexed": indexed.is_ok(),
+            // Present only when it was not, and never a bare `false`: the four
+            // reasons need different things done about them.
+            "not_indexed": indexed.as_ref().err(),
+            "source_id": indexed.ok(),
         })),
     )
         .into_response())
+}
+
+/// Read a deposited PDF into the knowledge index, or say in one sentence why
+/// not.
+///
+/// **Company-wide and `Untrusted`.** Both for `routes::knowledge`'s reasons and
+/// neither is a parameter: a document filed by hand into the company's classeur
+/// is the company's, and an operator with an API key is a *forwarder* — the
+/// supplier's price list, the customer's specification, the PDF somebody
+/// emailed. Nothing at this boundary can tell "the handbook we wrote" from "a
+/// stranger's document our admin dragged in", so it does not guess.
+///
+/// The reason travels back as a `String` rather than a typed error because
+/// there is exactly one consumer — a JSON field a person reads — and three
+/// unrelated failures (not a PDF, no text in it, the ingest itself) that would
+/// otherwise need an enum joining them for no other purpose.
+async fn index_pdf(
+    db: &Db,
+    embedder: &Embedder,
+    tenant_id: agentos_domain::ids::TenantId,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<uuid::Uuid, String> {
+    let text = text_from_pdf(bytes).await.map_err(|err| err.to_string())?;
+
+    let mut tx = db
+        .tenant_tx(tenant_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    // The name is the only address this file has, so it is the citation.
+    let uri = format!("files:{name}");
+    let document = Document {
+        scope: Scope::Company,
+        uri: Some(&uri),
+        title: Some(name),
+        // Extracted PDF text is plain text: there are no headings left for the
+        // chunker to know about.
+        format: Format::Text,
+        trust: TrustLabel::Untrusted,
+        text: &text,
+    };
+    let ingested = ingest(&mut tx, embedder, &document)
+        .await
+        .map_err(|err| err.to_string())?;
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok(ingested.source_id)
 }
 
 /// A classeur refusing, in the four ways a classeur can refuse.
@@ -354,7 +477,19 @@ mod tests {
             .expect("keyring");
             Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    // The hash embedder, which is what every deployment without
+                    // an `EMBEDDER_API_KEY` runs and every test runs: no
+                    // network, no spend, and the full-text leg — the only one
+                    // `retrieve` consults on it — is the whole of what the PDF
+                    // test below asserts.
+                    router(db.clone(), Embedder::default()).merge(
+                        // The search half of the round trip the PDF tests
+                        // assert. Deposit and retrieval are two units and the
+                        // whole claim is that a deposit reaches the other one,
+                        // so the test drives both over HTTP rather than calling
+                        // `recall` and believing itself.
+                        crate::routes::knowledge::router(db.clone(), Embedder::default()),
+                    ),
                     db.clone(),
                     Keyring::new(keys, db.clone(), TEST_MASTER_KEY),
                 ),
@@ -403,6 +538,212 @@ mod tests {
             .expect("insert tenant");
         tx.commit().await.expect("commit");
         tenant
+    }
+
+    /// The smallest valid PDF wrapping one content stream. A second copy of
+    /// the skeleton `agentos_app::knowledge`'s tests and
+    /// `crate::invoice_document` write, because a fixture builder is not API
+    /// and the alternative is a kilobyte of base64 nobody can read or vary.
+    fn pdf(stream: &str) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_owned(),
+            format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        out.into_bytes()
+    }
+
+    /// A contract somebody can read.
+    fn contract_pdf(lines: &[&str]) -> Vec<u8> {
+        let mut stream = String::from("BT /F1 11 Tf 14 TL 50 790 Td\n");
+        for line in lines {
+            stream.push('(');
+            stream.push_str(line);
+            stream.push_str(") Tj T*\n");
+        }
+        stream.push_str("ET\n");
+        pdf(&stream)
+    }
+
+    /// A page with no text operators: a grey rectangle where the scan of a
+    /// contract would have its image.
+    fn scanned_pdf() -> Vec<u8> {
+        pdf("0.5 0.5 0.5 rg 50 50 495 742 re f\n")
+    }
+
+    /// **The gap this route had: filed and unreadable.**
+    ///
+    /// A founder deposits the signed contract. Before this, that was a 201, a
+    /// digest, and an employee that answered "nothing on file" about it for the
+    /// life of the company. Here the deposit and the retrieval are two HTTP
+    /// calls to two units, and the second one finds what the first one filed —
+    /// while the bytes themselves still come back byte-for-byte, because
+    /// indexing a document may not change what keeping it means.
+    #[tokio::test]
+    async fn a_deposited_pdf_is_something_an_employee_can_find() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the classeur needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+
+        let bytes = contract_pdf(&[
+            "Master services agreement",
+            "The supplier shall deliver every pallet to the loading dock before noon.",
+            "Payment terms are thirty days from receipt of a valid invoice.",
+        ]);
+        let (status, filed) = h
+            .send(
+                "POST",
+                "/v1/files",
+                SECRET_A,
+                Some(json!({
+                    "name": "signed/Acme MSA.pdf",
+                    "content_type": "application/pdf",
+                    "content": B64.encode(&bytes),
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{filed}");
+        assert_eq!(filed["indexed"], true, "{filed}");
+        assert!(filed["not_indexed"].is_null(), "{filed}");
+        assert!(filed["source_id"].is_string(), "{filed}");
+
+        // The employee's own retrieval, over the route that runs it.
+        let (status, found) = h
+            .send(
+                "GET",
+                "/v1/knowledge/search?q=when%20are%20pallets%20delivered%20to%20the%20dock",
+                SECRET_A,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        let hits = found["hits"].as_array().expect("hits");
+        assert!(
+            hits.iter().any(|hit| {
+                hit["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("loading dock"))
+            }),
+            "the contract was filed and cannot be found: {found}"
+        );
+        assert_eq!(
+            hits[0]["source_id"], filed["source_id"],
+            "the passage does not cite the document the deposit created: {found}"
+        );
+
+        // And the classeur's own promise is untouched: the same bytes, exactly.
+        let (status, back) = h
+            .send(
+                "GET",
+                "/v1/files/content?name=signed%2FAcme%20MSA.pdf",
+                SECRET_A,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{back}");
+        assert_eq!(
+            B64.decode(back["content"].as_str().expect("content"))
+                .expect("base64"),
+            bytes
+        );
+    }
+
+    /// **A scan is filed and refused by name, and the refusal is never an empty
+    /// document.**
+    ///
+    /// The failure this is written against is the quiet one: extraction of a
+    /// scanned page returns the empty string, and an ingest of the empty string
+    /// would be a source row, a green `indexed: true`, and an employee that
+    /// answers "we have nothing on file" about a document its founder watched
+    /// upload. So the reason is named in the body, the file is still kept, and
+    /// the knowledge listing has nothing in it.
+    #[tokio::test]
+    async fn a_pdf_with_no_text_is_kept_and_the_reason_it_is_not_indexed_is_named() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the classeur needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+
+        let bytes = scanned_pdf();
+        let (status, filed) = h
+            .send(
+                "POST",
+                "/v1/files",
+                SECRET_A,
+                Some(json!({
+                    "name": "scans/Acme MSA (scanned).pdf",
+                    "content_type": "application/pdf",
+                    "content": B64.encode(&bytes),
+                })),
+            )
+            .await;
+
+        // Filed: the classeur keeps bytes whatever can be read out of them.
+        assert_eq!(status, StatusCode::CREATED, "{filed}");
+        assert_eq!(filed["indexed"], false, "{filed}");
+        let why = filed["not_indexed"].as_str().expect("a named reason");
+        assert!(
+            why.contains("scan") && why.contains("OCR"),
+            "the refusal has to tell the person holding the scan what happened: {why}"
+        );
+
+        // And nothing was written to the index — no phantom source, no empty
+        // chunk, nothing for a listing to show.
+        let (status, documents) = h
+            .send("GET", "/v1/knowledge/documents", SECRET_A, None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{documents}");
+        assert_eq!(
+            documents["documents"].as_array().expect("documents").len(),
+            0,
+            "an unreadable PDF still created a knowledge source: {documents}"
+        );
+
+        // The bytes are there.
+        let (status, back) = h
+            .send(
+                "GET",
+                "/v1/files/content?name=scans%2FAcme%20MSA%20%28scanned%29.pdf",
+                SECRET_A,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{back}");
+        assert_eq!(
+            B64.decode(back["content"].as_str().expect("content"))
+                .expect("base64"),
+            bytes
+        );
     }
 
     /// **"Keep the signed contract, as it is", over HTTP**: bytes no text column

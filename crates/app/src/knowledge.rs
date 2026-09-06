@@ -178,24 +178,42 @@
 //! degrades gracefully from exact words to near ones, because it never did — it
 //! degraded to a hash.
 //!
-//! **And on the turn path it is mostly empty**, which is worth stating rather
-//! than discovering. The recall query is the counterparty's whole message and
-//! `plainto_tsquery` ANDs every lexeme in it, so a chunk has to contain every
-//! non-stopword of the first [`MAX_QUERY_CHARS`] characters of an email. That
-//! is close to never. Retrieval on this build therefore answers a *search
-//! phrase* and not a message. Fixing that is query construction — a real piece
-//! of work, and one whose right shape depends on whether the embedder that
-//! eventually lands makes the text leg the fallback or the main event, so it is
-//! not done here.
+//! **And on the turn path it used to be empty almost always**, which was the
+//! second defect and is the one this section is now about. The recall query is
+//! the counterparty's whole message; `plainto_tsquery` ANDed every lexeme in
+//! it, so a chunk had to contain every non-stopword of the first
+//! [`MAX_QUERY_CHARS`] characters of an email. That is close to never — this
+//! file said so and then left it, on the argument that the right query shape
+//! depended on an embedder that had not landed. It does not. A product that
+//! says an employee answers from company knowledge, and whose only selection
+//! channel matches close to never, is making a false statement in every
+//! deployment without an `EMBEDDER_API_KEY`, which is all of them here.
 //!
-//! That sentence used to name `websearch_to_tsquery` and was false, which
-//! mattered more than a wrong function name. `websearch_to_tsquery` is a query
-//! *language*: `or` is disjunction and `-` is negation, so "a whole email
-//! matches close to never" described honest email and nothing else, while the
-//! only selection channel this build has took its boolean structure from the
-//! sender. `agentos_store::knowledge`'s `TEXT_SQL` argues the parser choice and
-//! `a_senders_message_is_words_and_not_a_query_language` reproduces both
-//! operators.
+//! So the lexemes are ORed and ranked, and the whole of the design is the
+//! **threshold** — [`MIN_COVERAGE`] — because an OR with no threshold is the
+//! padding this module refused two sections ago wearing better clothes. The
+//! score `agentos_store::knowledge`'s `TEXT_SQL` returns is the *fraction of
+//! the question's own distinct lexemes a passage carries*, and a passage below
+//! [`MIN_COVERAGE`] of them is dropped even when that leaves the hand empty.
+//! `a_three_sentence_question_finds_the_document_it_is_about` is the test that
+//! matters and it names the old query in its own body, so the claim "the old
+//! one could not do this" is executed rather than asserted.
+//!
+//! **What the OR does not give back is the sender's boolean structure.** The
+//! query is built out of `to_tsvector` — the *document* parser — so `or`, `-`
+//! and `"` do not survive tokenisation and there is no expression left to
+//! write; `a_senders_message_is_words_and_not_a_query_language` still holds a
+//! hyphen against the corpus and still refuses to let it delete a passage. What
+//! the OR *does* change is the price of steering, and this is the honest cost
+//! of the fix: under the AND a message that retrieved a document had to be that
+//! document, and it now has to spend [`MIN_COVERAGE`] of its own words on it.
+//! That is a real widening of the "selection" surface reason 2 above describes,
+//! bought with the only thing that makes recall exist at all. It is priced in
+//! the same place as everything else in this module: the turn that recalls is
+//! tainted and loses `pay`.
+//!
+//! `agentos_store::knowledge`'s `TEXT_SQL` argues the parser and the ranking,
+//! with the measurements.
 //!
 //! [`RECALLED_BRIEF`] says the same thing to the model in one sentence, because
 //! the passage list is the model's only evidence about what its store holds.
@@ -220,9 +238,60 @@
 //! sentence that answers the question is otherwise the one that got cut in
 //! half.
 //!
-//! PDF is **out of scope**: extracting text from a PDF is a dependency and a
-//! project of its own, and a half-done extractor that silently drops tables is
-//! worse than an honest refusal. Plaintext and Markdown only.
+//! # Reading a PDF, and the dependency that took
+//!
+//! This section used to say PDF was out of scope, on the grounds that
+//! extracting text from one is "a dependency and a project of its own, and a
+//! half-done extractor that silently drops tables is worse than an honest
+//! refusal". The first half was right and the conclusion did not follow: *le
+//! classeur* accepts the bytes either way, so the state being defended was one
+//! where a founder uploads the contract, the system stores it, bills for it,
+//! and no employee can ever read a line of it. That is not an honest refusal,
+//! it is a silent one.
+//!
+//! **[`text_from_pdf`], on `pdf-extract`.** What was actually needed is
+//! narrower than a PDF library: *extraction is not rendering*. Nothing here
+//! rasterises a page, resolves a colour space, or lays out a glyph — it needs
+//! the content streams inflated and the text-showing operators mapped back
+//! through the font's encoding into Unicode. `pdf-extract` is the crate whose
+//! whole surface is that, it is pure Rust with no `unsafe` of its own, MIT
+//! (compatible with this workspace's Apache-2.0), published inside the last
+//! quarter, and it already carries the part a hand-rolled `Tj` scanner gets
+//! wrong: `ToUnicode` CMaps, Type1 and CFF built-in encodings, and CID fonts.
+//! A scanner that skipped those does not fail loudly — it returns confident
+//! mojibake, which is the "silently drops tables" failure the old paragraph was
+//! right to fear, and writing one here would have been choosing it.
+//!
+//! What was weighed against it: `lopdf` alone (which `pdf-extract` sits on) is
+//! a PDF object model and leaves every encoding question to the caller, and the
+//! full renderer crates bring a font rasteriser for output nobody looks at.
+//!
+//! **Every failure is named and none of them is an empty string.**
+//! [`PdfError`] has four variants — not a PDF, encrypted, unreadable, no
+//! extractable text — because the failure this costs the most is the quiet one:
+//! a scanned contract extracts to `""`, and an empty document that ingests
+//! "successfully" is a source row, a green response, and an employee that will
+//! answer "we have nothing on file" for the rest of that document's life.
+//! [`PdfError::NoText`] says *scan* and says this deployment runs no OCR, which
+//! is the sentence the person holding the scan needs. **OCR is out of scope and
+//! stays out**: it is a model, not a parser — a per-page inference bill and an
+//! accuracy question — and it belongs behind
+//! [`agentos_providers`] as a port with a price, not inside
+//! a chunker.
+//!
+//! Extraction runs on a blocking thread, which also converts the one thing a
+//! PDF parser does that a `Result` cannot express — a panic on a malformed
+//! file — into [`PdfError::Unreadable`] rather than into a dead connection.
+//!
+//! **`docx` is not done**, and the reason is arithmetic rather than
+//! difficulty: it is a zip of XML, so it is a zip reader plus an XML reader —
+//! two dependency trees this workspace does not have — for a format nothing has
+//! ever deposited here. `w:t` elements also have to be walked rather than
+//! regexed, or the index fills with markup. One line in [`text_from_pdf`]'s
+//! caller the day somebody deposits one.
+//!
+//! Chunking itself is still plaintext and Markdown only: extracted PDF text is
+//! plain text, and there is nothing in it for a chunker to know.
 
 use std::time::Duration;
 
@@ -251,6 +320,46 @@ pub const CHUNK_CHARS: usize = 1200;
 
 /// How much of the previous chunk each chunk repeats.
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
+
+/// **The share of a question's own distinct words a passage has to carry
+/// before it is allowed into an answer.** The threshold that keeps an OR from
+/// padding.
+///
+/// `agentos_store::knowledge`'s `TEXT_SQL` ORs the sender's lexemes and scores
+/// each passage by the fraction of them it carries; this is where that fraction
+/// is cut. It is a product decision — how much silence buys how little noise —
+/// so it lives here rather than in the store, and it is measured rather than
+/// picked.
+///
+/// **The measurement.** Two questions against a four-chunk corpus in which
+/// exactly one chunk answers, scored by the query below:
+///
+/// | question | answering chunk | best other chunk |
+/// |---|---|---|
+/// | 40 words, 28 lexemes, written like a person asks | 0.603 | 0.118 |
+/// | 100 words, 47 lexemes, chatty, greeting and sign-off | 0.337 | 0.090 |
+///
+/// The gap is a factor of four to five and it survives the message getting
+/// longer, because a longer question divides the answer's coverage and the
+/// noise's coverage by the same denominator. `0.2` sits between them with
+/// roughly a factor of two of headroom on each side, and it reads as a sentence
+/// somebody can argue with: **a passage has to be about a fifth of what the
+/// question is made of.**
+///
+/// What it costs, in the direction this module always chooses: a *very* long
+/// message dilutes every passage below the floor and comes back empty. That is
+/// the honest failure — an empty hand rather than five passages about the
+/// greeting — and [`MAX_QUERY_CHARS`] already bounds how long the question can
+/// get.
+///
+/// ponytail: a flat fraction, with no idea which of the sender's words are
+/// worth anything. "Hello", "Friday" and "invoice" all cost the same slice of
+/// the denominator, so a chatty message is a harder message. The upgrade is
+/// IDF — weight each lexeme by how rare it is in this tenant's corpus — which
+/// is a statistic Postgres full-text search does not keep and would be a table
+/// to maintain. Worth it when somebody can show a real question this floor
+/// drops.
+pub const MIN_COVERAGE: f64 = 0.2;
 
 /// The embedder produces exactly what the column stores. A mismatch is a
 /// migration, so it fails here at build time rather than as a Postgres error
@@ -319,6 +428,101 @@ impl Format {
             Format::Markdown => "markdown",
         }
     }
+}
+
+/// **Why a PDF could not be read, in the words a person needs to fix it.**
+///
+/// Four variants and not a `bool`, because "we could not index your contract"
+/// is useless and each of these has a different next step: send the text
+/// instead, send the password-free copy, send a file that is not damaged, run
+/// it through OCR somewhere else. The one that matters most is [`Self::NoText`]
+/// — see the module docs — because it is the failure that would otherwise be
+/// silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PdfError {
+    /// The bytes do not start `%PDF-`. Not a refusal to try: a JPEG that
+    /// reached this path is a mistake one layer up, and saying so beats
+    /// spending a parser on it.
+    #[error("not a PDF: the bytes do not begin with %PDF-")]
+    NotAPdf,
+    /// Parsed as an encrypted document this deployment holds no password for.
+    /// Checked *after* extraction fails rather than before it is tried, so a
+    /// document encrypted with an empty user password — which is most of the
+    /// "protected" PDFs a company actually receives, and which the parser reads
+    /// straight through — is indexed instead of refused on a byte pattern.
+    #[error(
+        "this PDF is encrypted and no password was supplied: file the unprotected copy instead"
+    )]
+    Encrypted,
+    /// Damaged, truncated, or built out of something the extractor does not
+    /// read. Also where a panic inside the parser lands — see [`text_from_pdf`].
+    #[error(
+        "this PDF could not be parsed: it is damaged, or built in a way this reader cannot follow"
+    )]
+    Unreadable,
+    /// It parsed, and it holds no text worth indexing. **This is a scan**: an
+    /// image of a page carries no text objects at all, and there is no OCR in
+    /// this system to invent them.
+    ///
+    /// The alternative — ingesting the empty string — is the failure this whole
+    /// enum exists to prevent: a source row, a 201, and an employee that
+    /// answers "we have nothing on file" about a document its founder watched
+    /// upload successfully.
+    #[error(
+        "this PDF carries no extractable text: it is a scan or an image, and this deployment runs no OCR"
+    )]
+    NoText,
+}
+
+/// Below this much text over the whole document, [`text_from_pdf`] calls it a
+/// scan.
+///
+/// Not zero, and the difference is the case the zero check misses: a scanned
+/// contract is very often not empty, it is a stamped page number and a fax
+/// header per page, extracted perfectly and meaning nothing. Thirty-two
+/// non-whitespace characters is under one line of prose, so no real document is
+/// near it and no page furniture reaches it.
+const MIN_PDF_CHARS: usize = 32;
+
+/// **Text out of a PDF, or a named reason there is none.**
+///
+/// See the module docs for why `pdf-extract` and what is deliberately not
+/// attempted (rendering, layout, OCR, `docx`). What is worth knowing at the
+/// call site is the two-line shape of the failure handling.
+///
+/// Extraction is CPU-bound and synchronous, so it runs on a blocking thread —
+/// which buys the second thing as a side effect: a PDF parser is a parser, a
+/// malformed file can panic one, and `spawn_blocking` turns that panic into a
+/// [`JoinError`](tokio::task::JoinError) this function reports as
+/// [`PdfError::Unreadable`] instead of into an aborted task and a dropped
+/// connection. `catch_unwind` would be the other way to say it, and this one is
+/// already required for the CPU.
+///
+/// Takes an owned `Vec<u8>` because the work crosses a thread boundary. That is
+/// one copy of the file per ingest, bounded by the API's own body limit.
+pub async fn text_from_pdf(bytes: Vec<u8>) -> Result<String, PdfError> {
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(PdfError::NotAPdf);
+    }
+
+    // `/Encrypt` in the trailer is what distinguishes "we have no password" from
+    // "this file is broken", and it is only consulted once extraction has
+    // already failed — see `PdfError::Encrypted`.
+    let refusal = if bytes.windows(8).any(|window| window == b"/Encrypt") {
+        PdfError::Encrypted
+    } else {
+        PdfError::Unreadable
+    };
+
+    let text = tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem(&bytes))
+        .await
+        .map_err(|_panicked| refusal)?
+        .map_err(|_failed| refusal)?;
+
+    if text.chars().filter(|ch| !ch.is_whitespace()).count() < MIN_PDF_CHARS {
+        return Err(PdfError::NoText);
+    }
+    Ok(text)
 }
 
 /// A document to ingest.
@@ -513,6 +717,7 @@ pub async fn retrieve(
         model: model_name(embedder),
         employee_id,
         limit,
+        min_coverage: MIN_COVERAGE,
     };
 
     let hits = if embedder.is_semantic() {
@@ -594,6 +799,33 @@ Your company's document store could not be reached while preparing this \
 message, so you are answering without it. Do not present anything as coming \
 from a company document, and if the answer turns on one, say plainly that you \
 were unable to check rather than guessing.";
+
+/// **What the model is told when the store was searched and nothing cleared
+/// [`MIN_COVERAGE`].** The empty hand, said out loud.
+///
+/// This branch used to say nothing at all, and the argument for that was
+/// costed: a sentence here is a sentence on every turn of every employee that
+/// has not uploaded anything yet, and a word-AND search missed so much that
+/// "found nothing" barely meant anything. The second half is what changed. A
+/// question now fails to retrieve because no document carries a fifth of its
+/// words, which is a *result* — weak, but a result — and the difference
+/// between "I looked and there is nothing" and saying nothing is the
+/// difference between an employee that offers to escalate and one that quietly
+/// answers from itself.
+///
+/// It is deliberately not an instruction to apologise or to stop. Three
+/// sentences: what happened, what it does and does not prove, and what to do
+/// with it. It stays short because the price is per turn.
+///
+/// Not in `agentos_eval::toolchoice::PREPENDED_BRIEFS`, which is a gap
+/// somebody should close: it is operator prose a real turn puts in front of a
+/// task, which is exactly what that list is for.
+pub const NOTHING_FOUND_BRIEF: &str = "\
+Your company's document store was searched for this message and no document \
+matched enough of it to be worth quoting. That is a weak signal and not a \
+finding: the search matches words, so a document that answers in different \
+words would not have matched either. Answer without it, and say that you found \
+nothing on file rather than implying there is nothing on file.";
 
 /// What a turn wants recalled.
 ///
@@ -702,16 +934,13 @@ impl Recalled {
     ///
     /// * **unavailable** — one trusted sentence saying so. Nothing third-party
     ///   arrived, so the turn is not tainted and keeps its tools.
-    /// * **nothing found** — nothing added. ponytail: an employee whose store
-    ///   has no answer is in the same position as one with no store, and a
-    ///   sentence about an empty search is a sentence the model has to read on
-    ///   every turn of every employee that has not uploaded anything yet. Known
-    ///   ceiling, and it got shorter when the vector leg stopped being consulted:
-    ///   a word search misses documents that *do* answer, so "found nothing" is
-    ///   now a weaker signal than it reads as, and this branch says nothing at
-    ///   all about it. Upgrade path is a sentence here, priced against every
-    ///   turn of every employee — worth it once retrieval is worth trusting,
-    ///   not before.
+    /// * **nothing found** — [`NOTHING_FOUND_BRIEF`], one trusted sentence
+    ///   saying the store was searched and matched nothing. Nothing
+    ///   third-party arrived, so this branch does not taint either: an empty
+    ///   hand must not be paid for in tools any more than in tokens. This used
+    ///   to add nothing at all, priced against every turn of every employee
+    ///   with an empty store; the price is unchanged and what it buys went up
+    ///   when the query stopped being a conjunction — see that constant.
     /// * **passages** — a trusted brief naming what the frames are, then one
     ///   fenced block per passage.
     #[must_use]
@@ -720,7 +949,7 @@ impl Recalled {
             return context.with_task(UNAVAILABLE_BRIEF);
         }
         if self.hits.is_empty() {
-            return context;
+            return context.with_task(NOTHING_FOUND_BRIEF);
         }
 
         let mut context = context.with_task(RECALLED_BRIEF);
@@ -1319,6 +1548,13 @@ mod tests {
     /// Asked with a buyer's floor, the one pack whose `proposable` set covers
     /// every kind the catalogue names — so a `false` here is the retrieved
     /// passage's taint talking and never a role's.
+    /// Every task paragraph of a context, joined — the cheapest way to ask
+    /// "did the model get told this sentence" without reaching into
+    /// `turn::Context`'s shape.
+    fn rendered(context: &Context) -> String {
+        format!("{context:?}")
+    }
+
     fn may_pay(trust: TrustLabel) -> bool {
         tools_for(
             trust,
@@ -1668,10 +1904,20 @@ mod tests {
         assert!(!recalled.unavailable(), "an empty store is not a failure");
         assert!(recalled.hits().is_empty());
 
-        // And it adds nothing at all, so an employee with no documents pays no
-        // tokens and keeps a byte-identical context.
+        // Both branches now say something, and the whole of this test is that
+        // they do not say the *same* thing: "I looked and found nothing" and
+        // "I could not look" are opposite claims and the model has to be able
+        // to tell them apart. Neither taints.
         let before = Context::new().with_task("answer the buyer");
-        assert_eq!(recalled.into_context(before.clone()), before);
+        let after = recalled.into_context(before.clone());
+        assert_ne!(after, before, "an empty search told the model nothing");
+        assert!(rendered(&after).contains(NOTHING_FOUND_BRIEF));
+        assert!(
+            !rendered(&after).contains(UNAVAILABLE_BRIEF),
+            "an empty store was reported as an outage"
+        );
+        assert_eq!(after.trust(), TrustLabel::Trusted);
+        assert!(may_pay(after.trust()));
 
         drop_tenant(&db, tenant).await;
     }
@@ -1695,12 +1941,19 @@ mod tests {
     /// looks at what else came back. This is the one that looks.
     ///
     /// What half 2 does **not** isolate, and cannot: the miss has a purely
-    /// mechanical cause — `plainto_tsquery` ANDs every lexeme, and 'happen'
-    /// is absent from the document on its own. Asking the same question in the
-    /// document's own words *plus* one word it does not use misses too. That is
-    /// not a weakness of the fixture, it is the finding: word-AND is the entire
-    /// mechanism, there is no meaning underneath it to rescue a near miss, and
-    /// the only honest report of a near miss is an empty hand.
+    /// mechanical cause — no chunk of the fixture contains 'happen', 'damag'
+    /// or 'pallet', so the disjunction matches no row at all and the threshold
+    /// is not even consulted. That is not a weakness of the fixture, it is the
+    /// finding: words are the entire mechanism, there is no meaning underneath
+    /// them to rescue a near miss, and the only honest report of a near miss is
+    /// an empty hand.
+    ///
+    /// **Half 1 was measured against the AND and survived the move to the OR
+    /// unchanged**, which is worth stating because it is the property
+    /// [`MIN_COVERAGE`] exists to keep: 'crushed skids' is a two-lexeme
+    /// question, forty-odd chunks are in scope, and exactly one of them clears
+    /// a fifth of it. Under an OR with no floor this assertion is the first
+    /// thing to go red.
     ///
     /// **Half 2 only holds because the sender wrote no operator**, which is a
     /// premise this test cannot see and did not state while the parser was
@@ -1774,7 +2027,15 @@ mod tests {
         );
         let before = Context::new().with_task("answer the buyer");
         let after = missed.into_context(before.clone());
-        assert_eq!(after, before, "a miss added something to the prompt");
+        assert!(
+            rendered(&after).contains(NOTHING_FOUND_BRIEF),
+            "the empty hand did not say it was empty"
+        );
+        assert!(
+            !rendered(&after).contains("Crushed skids"),
+            "a miss put a passage in the prompt anyway"
+        );
+        assert_eq!(after.trust(), TrustLabel::Trusted);
         assert!(may_pay(after.trust()));
 
         drop_tenant(&db, tenant).await;
@@ -1794,14 +2055,24 @@ mod tests {
     /// full-text leg is the **only** selection channel this build has, and its
     /// operators belonged to the sender.
     ///
-    /// Both halves below were measured against the unfixed query on this
-    /// fixture, and both are things a conjunction cannot do:
+    /// Both halves below were measured against `websearch_to_tsquery` on this
+    /// fixture, and both are things the parser must not let a sender do:
     ///
-    /// * **`or` makes steering covert.** Under conjunction, a message that
-    ///   retrieves a document has to *be* that document — every word of it in
-    ///   one chunk — which anybody reading the thread can see. The message in
-    ///   the loop below is an ordinary customer email and returned exactly the
-    ///   chunk its last three words name.
+    /// * **`or` used to make steering covert, and the fix is that the word is
+    ///   now inert.** Under `websearch_to_tsquery` an ordinary customer email
+    ///   with `or crushed skids` on the end returned exactly the chunk its last
+    ///   three words name, while the same email without the operator returned
+    ///   nothing — the *operator*, not the words, was the capability. The query
+    ///   is now built from `to_tsvector`, which has no operators, so half 1
+    ///   below asserts the equality that says so: with `or` and without it, the
+    ///   same message retrieves the same chunks.
+    ///
+    ///   That message **does** now retrieve the rule, and this test says so
+    ///   rather than hiding it. It is the OR's price and it is paid in the
+    ///   open: the sender had to write 'crushed skids' — the document's own
+    ///   distinctive words — into a thread a person can read. What it cannot do
+    ///   is retrieve it with words that are not the document's, and what it
+    ///   never buys is the next bullet.
     /// * **`-` suppresses one document and leaves the answer looking full.**
     ///   Not "only negation removes": a conjunction removes far more, because
     ///   every extra word drops every passage that does not contain it — the
@@ -1825,9 +2096,10 @@ mod tests {
     /// What this does **not** fix is selection itself, and nothing here can: a
     /// sender who writes "crushed skids" still gets the crushed-skids chunk,
     /// which the module docs accept on purpose. What it fixes is that the
-    /// message is now *words* — `plainto_tsquery`, in `agentos_store::knowledge`
-    /// — so steering costs the attacker a message that visibly quotes the
-    /// document it is aimed at.
+    /// message is *words* — the lexemes come out of `to_tsvector`, in
+    /// `agentos_store::knowledge` — so steering costs the attacker a message
+    /// that visibly quotes the document it is aimed at, and costs it
+    /// [`MIN_COVERAGE`] of the message's own length.
     #[tokio::test]
     async fn a_senders_message_is_words_and_not_a_query_language() {
         let Some(db) = db().await else { return };
@@ -1845,25 +2117,56 @@ mod tests {
         assert!(!missed.unavailable());
         assert!(missed.hits().is_empty(), "the premise moved");
 
-        // The same miss with one clause appended, inside a message that reads
-        // like every other email this employee gets.
-        let steered = Untrusted::new(
+        // The same message with the document's own words on the end, once with
+        // the operator and once without it. Under `websearch_to_tsquery` these
+        // two returned different things, which is the definition of the sender
+        // holding an operator; under a query built from `to_tsvector` the word
+        // `or` is a stopword and the two are the same retrieval.
+        let with_operator = Untrusted::new(
             "hello, we spoke last week about the shipment that arrived on friday and I \
              wanted to confirm the paperwork or crushed skids"
                 .to_owned(),
         );
-        let steered = recall(&db, &Embedder::Mock, tenant, &Recall::new(&steered, None)).await;
-        assert!(
-            !steered
+        let without_operator = Untrusted::new(
+            "hello, we spoke last week about the shipment that arrived on friday and I \
+             wanted to confirm the paperwork crushed skids"
+                .to_owned(),
+        );
+        let steered = recall(
+            &db,
+            &Embedder::Mock,
+            tenant,
+            &Recall::new(&with_operator, None),
+        )
+        .await;
+        let plainly = recall(
+            &db,
+            &Embedder::Mock,
+            tenant,
+            &Recall::new(&without_operator, None),
+        )
+        .await;
+        let ids = |recalled: &Recalled| {
+            recalled
                 .hits()
                 .iter()
-                .any(|hit| hit.content.expose_for_parsing().contains(RULE)),
-            "an `or` clause selected a document the same message without it cannot reach: {:?}",
+                .map(|hit| hit.chunk_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&steered),
+            ids(&plainly),
+            "`or` changed what the sender retrieved, so it is still an operator"
+        );
+        // And the price the OR does charge, stated rather than left implicit:
+        // this message reaches the rule, and it reaches it by quoting it.
+        assert!(
             steered
                 .hits()
                 .iter()
-                .map(|hit| hit.content.expose_for_parsing().clone())
-                .collect::<Vec<_>>()
+                .any(|hit| hit.content.expose_for_parsing().contains(RULE)),
+            "the fixture no longer reaches the rule by quoting it, so the equality above \
+             is an equality between two empty hands and proves nothing"
         );
 
         // Half 2 — suppression. The word on its own retrieves the rule...
@@ -1891,6 +2194,309 @@ mod tests {
         );
 
         drop_tenant(&db, tenant).await;
+    }
+
+    /// A handbook whose first paragraph answers one specific operational
+    /// question, followed by forty notes that answer nothing.
+    ///
+    /// The shape is [`store_that_answers_in_other_words`]'s and the difference
+    /// is the point: that fixture's answer is written in words the question
+    /// does not use, so no word-based retrieval can reach it. This one's answer
+    /// is written in the words a person actually uses when they ask — 'pallets',
+    /// 'crushed', 'dock', 'delivery note', 'carrier' — spread across three
+    /// sentences, which is what a real message looks like and what the AND
+    /// could not do anything with.
+    fn damaged_delivery_handbook() -> String {
+        let mut doc = "# Deliveries\n\nA pallet that arrives crushed or broken is photographed \
+                       on the dock, refused on the delivery note, and the carrier is invoiced \
+                       for the residual value within five working days. Do not sign for it.\n\n"
+            .to_owned();
+        for note in 0..40 {
+            doc.push_str(&format!(
+                "## Note {note}\n\nNote {note} concerns invoice numbering, tariff codes and \
+                 office opening hours, at enough length that this handbook needs several \
+                 chunks rather than one.\n\n"
+            ));
+        }
+        doc
+    }
+
+    /// The distinguishing clause of [`damaged_delivery_handbook`]'s answer.
+    const ANSWER: &str = "photographed on the dock";
+
+    /// **The query this module used to send, kept verbatim.**
+    ///
+    /// It is here so that "the old query could not do this" is *executed*
+    /// against the same corpus in the same tenant rather than asserted in a
+    /// comment — the failure mode the module docs have been burned by twice is
+    /// a claim about a mechanism nobody re-ran. Only the count is selected:
+    /// what matters is that `plainto_tsquery` matches no row at all, and the
+    /// scope predicate is irrelevant to that.
+    const AND_EVERY_LEXEME: &str = "SELECT count(*) FROM knowledge_chunks c, \
+         plainto_tsquery('english', $1) q WHERE c.tsv @@ q";
+
+    async fn matched_by_the_old_query(db: &Db, tenant: TenantId, question: &str) -> i64 {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let matched: i64 = sqlx::query_scalar(AND_EVERY_LEXEME)
+            .bind(question)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the old query");
+        tx.rollback().await.expect("rollback");
+        matched
+    }
+
+    /// **The test this whole change exists for.**
+    ///
+    /// A customer writes three sentences about a damaged delivery. The company
+    /// has a paragraph on file that answers them, in the customer's own words.
+    /// Before this change the employee did not see it — not because the
+    /// document was missing, badly scoped or unindexed, but because
+    /// `plainto_tsquery` ANDed every lexeme of the message and no chunk on
+    /// earth contains all twenty-odd of them. Step 1 below runs that query
+    /// against this exact corpus and shows it matching zero rows.
+    ///
+    /// Step 2 is the fix, and step 3 is the fix not turning into padding: one
+    /// passage comes back, not [`RECALL_LIMIT`] of them. Both matter — an OR
+    /// with no [`MIN_COVERAGE`] passes step 2 and fails step 3, which is the
+    /// bargain this module has already refused once for the vector leg.
+    #[tokio::test]
+    async fn a_three_sentence_question_finds_the_document_it_is_about() {
+        let Some(db) = db().await else { return };
+        let tenant = create_tenant(&db).await;
+
+        let ingested = stock(&db, tenant, &damaged_delivery_handbook()).await;
+        assert!(
+            ingested.chunks > RECALL_LIMIT as usize,
+            "the corpus must be larger than the top-k or step 3 proves nothing: {} chunks",
+            ingested.chunks
+        );
+
+        /// Three sentences, as a person writes them: a greeting, what happened,
+        /// what they did, and the question.
+        const MESSAGE: &str = "Hello, two of the pallets on yesterday's delivery arrived \
+             crushed and the shrink wrap was torn. I have photographed them on the dock and \
+             refused to sign the delivery note. What do you want me to do about the carrier?";
+
+        // 1. The old query, on this corpus, in this tenant.
+        assert_eq!(
+            matched_by_the_old_query(&db, tenant, MESSAGE).await,
+            0,
+            "`plainto_tsquery` matched a chunk, so this fixture no longer demonstrates the \
+             defect and the assertions below prove nothing about the fix"
+        );
+
+        // 2. The employee, asked the same thing, now finds the paragraph.
+        let question = Untrusted::new(MESSAGE.to_owned());
+        let found = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+        assert!(!found.unavailable());
+        assert!(
+            !found.hits().is_empty(),
+            "a three-sentence question still recalls nothing"
+        );
+        assert!(
+            found.hits()[0]
+                .content
+                .expose_for_parsing()
+                .contains(ANSWER),
+            "the answering passage is not the one ranked first: {:?}",
+            found
+                .hits()
+                .iter()
+                .map(|hit| hit.ordinal)
+                .collect::<Vec<_>>()
+        );
+
+        // 3. And it is one passage, not one passage wrapped in four about
+        //    tariff codes. This is the assertion `MIN_COVERAGE` is for.
+        assert_eq!(
+            found.hits().len(),
+            1,
+            "the answer came back padded to the top-k with chunks that share a word with the \
+             greeting: ordinals {:?}",
+            found
+                .hits()
+                .iter()
+                .map(|hit| hit.ordinal)
+                .collect::<Vec<_>>()
+        );
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **An empty hand, and the turn is told the hand is empty.**
+    ///
+    /// The companion to the test above and the reason the OR is safe to ship: a
+    /// question the corpus has nothing to say about must come back with
+    /// nothing, even though the disjunction *does* match rows — 'sign' is in
+    /// the answering paragraph and 'note' is in every one of the forty notes.
+    /// [`MIN_COVERAGE`] is the whole of what stops those from being served as
+    /// an answer.
+    ///
+    /// And then the second half, which is a change of policy rather than of
+    /// mechanism: this used to add nothing at all to the context, so an
+    /// employee that had searched and found nothing was in exactly the same
+    /// state as one that had never looked. [`NOTHING_FOUND_BRIEF`] is the
+    /// difference, and it is still not a taint — no third-party bytes arrived,
+    /// so the turn keeps `pay`.
+    #[tokio::test]
+    async fn nothing_relevant_is_an_empty_hand_that_says_it_is_empty() {
+        let Some(db) = db().await else { return };
+        let tenant = create_tenant(&db).await;
+
+        stock(&db, tenant, &damaged_delivery_handbook()).await;
+
+        // Shares 'sign' with the answering paragraph and 'note' with all forty
+        // of the others, and is about neither.
+        let question = Untrusted::new(
+            "Quick question about our parental leave. How many weeks are paid in full, and \
+             who signs the request off? I could not find a note about it."
+                .to_owned(),
+        );
+        let missed = recall(&db, &Embedder::Mock, tenant, &Recall::new(&question, None)).await;
+
+        assert!(!missed.unavailable(), "a miss is not an outage");
+        assert!(
+            missed.hits().is_empty(),
+            "a question with nothing on file came back with {} passages about something \
+             else: {:?}",
+            missed.hits().len(),
+            missed
+                .hits()
+                .iter()
+                .map(|hit| hit.content.expose_for_parsing().clone())
+                .collect::<Vec<_>>()
+        );
+
+        let before = Context::new().with_task("answer the buyer");
+        let after = missed.into_context(before.clone());
+        assert!(
+            rendered(&after).contains(NOTHING_FOUND_BRIEF),
+            "the turn was not told the store had been searched"
+        );
+        assert_eq!(
+            after.trust(),
+            TrustLabel::Trusted,
+            "an empty hand tainted the turn"
+        );
+        assert!(may_pay(after.trust()));
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    // -- reading a PDF -----------------------------------------------------
+
+    /// The smallest valid PDF wrapping one content stream, so the PDF tests
+    /// depend on no fixture file. The same five-object skeleton
+    /// `crate::invoice_document` writes, which is what this deployment's own
+    /// PDFs look like.
+    fn pdf(stream: &str) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_owned(),
+            format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        out.into_bytes()
+    }
+
+    /// A PDF that says something, in the form a text-showing operator takes.
+    fn pdf_that_says(lines: &[&str]) -> Vec<u8> {
+        let mut stream = String::from("BT /F1 11 Tf 14 TL 50 790 Td\n");
+        for line in lines {
+            stream.push('(');
+            stream.push_str(line);
+            stream.push_str(") Tj T*\n");
+        }
+        stream.push_str("ET\n");
+        pdf(&stream)
+    }
+
+    /// A page with no text operators at all — a filled rectangle where the scan
+    /// of a contract would have its image. This is what a scanned document
+    /// extracts to, and the reason [`PdfError::NoText`] exists.
+    fn pdf_that_is_a_picture() -> Vec<u8> {
+        pdf("0.5 0.5 0.5 rg 50 50 495 742 re f\n")
+    }
+
+    #[tokio::test]
+    async fn a_pdf_gives_up_its_text() {
+        let bytes = pdf_that_says(&[
+            "Master services agreement",
+            "The supplier shall deliver the pallets to the dock before noon.",
+            "Payment terms are thirty days from receipt of a valid invoice.",
+        ]);
+        let text = text_from_pdf(bytes).await.expect("extract");
+        assert!(text.contains("Master services agreement"), "{text}");
+        assert!(text.contains("thirty days"), "{text}");
+    }
+
+    /// **The refusal that must never be a silent empty string.**
+    ///
+    /// A scan parses perfectly and yields no words. Returning `Ok("")` here
+    /// would ingest as [`KnowledgeError::Empty`] at best and as a real source
+    /// row with a blank chunk at worst; either way the founder sees a success
+    /// and the employee sees nothing, forever. Each of the four refusals is
+    /// checked, because a single `Err` variant would have been the same silence
+    /// with a different spelling.
+    #[tokio::test]
+    async fn a_pdf_with_no_text_is_refused_and_the_reason_is_named() {
+        assert_eq!(
+            text_from_pdf(pdf_that_is_a_picture()).await,
+            Err(PdfError::NoText)
+        );
+        assert!(
+            PdfError::NoText.to_string().contains("scan")
+                && PdfError::NoText.to_string().contains("OCR"),
+            "the reason has to be readable by the person holding the scan: {}",
+            PdfError::NoText
+        );
+
+        // A page number and a fax header is not a document either — the check
+        // is `MIN_PDF_CHARS`, not "is it empty".
+        assert_eq!(
+            text_from_pdf(pdf_that_says(&["1"])).await,
+            Err(PdfError::NoText)
+        );
+
+        assert_eq!(
+            text_from_pdf(b"just a text file, honestly".to_vec()).await,
+            Err(PdfError::NotAPdf)
+        );
+
+        // Truncated halfway through the object table: a real corruption, and it
+        // must not come back as an empty document.
+        let mut damaged = pdf_that_says(&["Master services agreement, at some length."]);
+        damaged.truncate(damaged.len() / 2);
+        assert!(
+            matches!(
+                text_from_pdf(damaged).await,
+                Err(PdfError::Unreadable | PdfError::NoText)
+            ),
+            "a truncated PDF has to refuse by name"
+        );
     }
 
     /// One tenant never recalls another's documents — asserted through the API

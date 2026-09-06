@@ -61,6 +61,31 @@
 //! call, and the customer's next request is `GET /v1/whoami` with a key nobody
 //! deployed. That is the step that did not exist.
 //!
+//! # And the same argument, one turn further: who may create a person
+//!
+//! A tenant with a key is reachable by a *program*. It is not yet reachable by
+//! a **human being**, and until this wave the human was `ADMIN_EMAIL` and
+//! `ADMIN_PASSWORD` in the console's environment — one administrator per
+//! deployment, so a second customer was a second deployment. `accounts` closes
+//! that, and its creation route is here rather than anywhere else, for the
+//! reason everything else on this surface is:
+//!
+//! **A customer who signs receives an account; they do not make themselves
+//! one.** If a tenant could create accounts for its own tenant, then a stolen
+//! session would create a second person, and revoking the first would be the
+//! same silent race a self-minted key is. So [`create_account`] takes a
+//! [`PlatformPrincipal`] like everything else in this file, and there is no
+//! route anywhere that creates an account for the caller's own tenant.
+//!
+//! What is *not* here is the login itself — `POST /v1/accounts/session`, in
+//! `routes::accounts`, on the public tier, because a person logging in holds
+//! neither keyring. That module carries the argument for why the credential it
+//! hands back does not reopen the hole this file is about; the short version is
+//! that what it accepts is a **password**, which authenticates nothing else
+//! anywhere in this system, so the "a key mints a key" cycle is not created.
+//! [`deactivate_account`] is the other half and it belongs here: closing a
+//! person's access is the revocation, and revocation is the vendor's act.
+//!
 //! # Why these routes are not behind `with_api_stack`
 //!
 //! Because that stack *is* `auth::require_api_key` — a platform key would be
@@ -122,6 +147,8 @@ pub fn router(
         .route("/v1/platform/keys", post(issue_key).get(list_keys))
         .route("/v1/platform/keys/{id}", delete(revoke_key))
         .route("/v1/platform/webhooks", post(register_webhook))
+        .route("/v1/platform/accounts", post(create_account))
+        .route("/v1/platform/accounts/{id}", delete(deactivate_account))
         .with_state(PlatformState {
             db,
             hasher,
@@ -519,6 +546,186 @@ async fn register_webhook(
         .into_response())
 }
 
+/// `POST /v1/platform/accounts` — the person who will open this customer's
+/// console.
+///
+/// The mirror of [`create_tenant`], one layer up: that call makes a company
+/// reachable by a program, this one makes it reachable by a human. A customer
+/// who signs gets one; see the module docs on why they cannot make their own.
+///
+/// # The password comes in and never comes back
+///
+/// The same shape as `register_webhook`'s provider secret and the opposite of
+/// [`IssuedKeyBody`]: the vendor's signup form collected a password the customer
+/// chose, it is derived here — PBKDF2, salted, `routes::accounts` owns the
+/// argument — and this response carries an id, an address and a date. Nothing in
+/// this system can recover it, including us.
+///
+/// # The three refusals
+///
+/// * `400 bad_request` — the address is not one, or the password is under
+///   [`MIN_PASSWORD_LEN`]. Two things a form can fix.
+/// * `404 unknown_tenant` — the uuid names no company. Not the `400
+///   unknown_tenant` `ApiError::from` produces, for the reason [`issue_for`]
+///   gives: that message is addressed to the holder of a tenant key.
+/// * `409 account_exists` — the address is already somebody's. Possibly another
+///   customer's somebody: `accounts_email_key` is unique deployment-wide,
+///   because the login form takes an address and nothing else and therefore
+///   cannot be told which tenant to look in. `0089` argues that trade, and this
+///   surface being vendor-only is the half that makes it acceptable.
+#[derive(Deserialize)]
+struct CreateAccountRequest {
+    /// Whose console this person opens. Named by the platform, never by her —
+    /// and this is the field that makes the whole session design safe, because
+    /// the tenant a login resolves to is read from the row this writes.
+    tenant_id: Uuid,
+    /// Her address. Normalised here; the `accounts_email_is_normalised` CHECK is
+    /// what enforces that it was.
+    email: String,
+    /// What she will type. Derived before the transaction opens and dropped
+    /// with this struct.
+    password: String,
+}
+
+async fn create_account(
+    State(state): State<PlatformState>,
+    who: PlatformPrincipal,
+    body: Result<Json<CreateAccountRequest>, JsonRejection>,
+) -> AxumResult<Response, ApiError> {
+    let Json(request) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+
+    let Some(email) = crate::auth::normalise_email(&request.email) else {
+        return Err(ApiError::bad_request(
+            "email: must be an address, at most 254 characters, with one `@`",
+        ));
+    };
+    // Counted in characters, not bytes: a twelve-character passphrase with an
+    // accent in it is not shorter than one without, and telling somebody it is
+    // would be telling them to pick a worse one.
+    if request.password.chars().count() < crate::auth::MIN_PASSWORD_LEN {
+        return Err(ApiError::bad_request(format!(
+            "password: at least {} characters",
+            crate::auth::MIN_PASSWORD_LEN
+        )));
+    }
+
+    let password_hash = crate::auth::hash_password_off_thread(request.password).await?;
+
+    // v7, so a directory of people sorts by when they joined — and minted here
+    // rather than accepted from the body, for the reason `create_tenant` mints
+    // the tenant's: an id a caller chooses is an id a caller can aim.
+    let id = Uuid::now_v7();
+    let tenant_id = TenantId::from_uuid(request.tenant_id);
+    let account = agentos_store::accounts::create(
+        &state.db,
+        id,
+        tenant_id,
+        &email,
+        &password_hash,
+        Utc::now(),
+    )
+    .await
+    .map_err(|err| match err {
+        StoreError::UnknownTenant(_) => {
+            ApiError::new(StatusCode::NOT_FOUND, "unknown_tenant", "no such tenant").with_detail(
+                format!(
+                    "There is no tenant {}. Create one with `POST /v1/platform/tenants`.",
+                    request.tenant_id
+                ),
+            )
+        }
+        StoreError::Conflict(_) => ApiError::conflict(
+            "account_exists",
+            "an account with this address already exists",
+        ),
+        err => err.into(),
+    })?;
+
+    // The id and the tenant. Never the address — a log line is a thing somebody
+    // ships to a third party, and an address is a person.
+    tracing::info!(
+        account_id = %account.id,
+        tenant_id = %tenant_id.as_uuid(),
+        by = %who.label,
+        "console account created"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "account_id": account.id,
+            "tenant_id": account.tenant_id.as_uuid(),
+            "email": account.email,
+            "created_at": account.created_at,
+        })),
+    )
+        .into_response())
+}
+
+/// `DELETE /v1/platform/accounts/{id}` — this person stops being able to open
+/// the console, and her live session stops reading **on the next request**.
+///
+/// # This is the revocation the session design rests on
+///
+/// `routes::accounts` argues that a stolen session token cannot mint another,
+/// so destroying it ends the incident. The case it cannot answer alone is a
+/// stolen *password*, where the thief simply logs in again — and this is the
+/// answer to that one. Deactivating and killing the live token are one commit
+/// (`store::accounts::deactivate`), because two calls leave a window in which
+/// the account is closed and the token still reads every row of that tenant,
+/// and a failure between them leaves that window open with nothing anywhere
+/// saying so.
+///
+/// # Not a DELETE of the row, and the verb is still `DELETE`
+///
+/// The row stays: her address stays taken, her id stays resolvable in the audit
+/// trail, and reactivation stays an `UPDATE` rather than a re-creation that
+/// would give her a different id. `api_keys` deletes on revocation for the
+/// opposite reason — there, a `revoked_at` is a predicate a future `SELECT` can
+/// forget, and forgetting it un-revokes a stolen key. Here there is exactly one
+/// reader of `deactivated_at` and its predicate is a `&'static str`.
+///
+/// Idempotent, and it reports what it found: a second call answers `200` with
+/// the *first* deactivation's date, so a script working from a screenshot does
+/// not have to special-case "already closed". `404` only for an id that names
+/// nobody.
+async fn deactivate_account(
+    State(state): State<PlatformState>,
+    who: PlatformPrincipal,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> AxumResult<Json<serde_json::Value>, ApiError> {
+    let Path(id) = id.map_err(|err| ApiError::bad_request(err.body_text()))?;
+
+    let closed = agentos_store::accounts::deactivate(
+        &state.db,
+        id,
+        &AuditActor::Operator(who.label.clone()),
+        Utc::now(),
+    )
+    .await?;
+
+    tracing::info!(
+        account_id = %id,
+        tenant_id = %closed.tenant_id.as_uuid(),
+        session_revoked = closed.session_revoked,
+        by = %who.label,
+        "console account deactivated"
+    );
+
+    Ok(Json(json!({
+        "account_id": id,
+        // Said back for the reason `revoke_key` says it: an operator working
+        // from a screenshot finds out which customer they just locked out.
+        "tenant_id": closed.tenant_id.as_uuid(),
+        "deactivated_at": closed.deactivated_at,
+        // Whether there was a browser holding a live token when this ran. The
+        // caller cannot work it out from anything else, and it is the
+        // difference between "she was logged in and is not any more" and "she
+        // was not there".
+        "session_revoked": closed.session_revoked,
+    })))
+}
+
 /// Postgres SQLSTATE for `check_violation`.
 ///
 /// Named here rather than reached for from `agentos_store::db`, which keeps its
@@ -717,6 +924,230 @@ fn key_label(raw: Option<&str>) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request as HttpRequest, header};
+    use tower::ServiceExt as _;
+
+    use crate::auth::{PlatformKeys, TEST_MASTER_KEY};
+
+    const PLATFORM_SECRET: &str = "0platform0platform0platform0plat";
+    const A_TENANT_KEY: &str = "0tenant00tenant00tenant00tenant0";
+    const PASSWORD: &str = "un-mot-de-passe-honnete";
+
+    /// The platform surface, behind its own middleware, exactly as `main` mounts
+    /// it — so a test that presents the wrong keyring is refused by the same
+    /// layer production has and not by an assertion in the handler.
+    async fn surface() -> Option<(Db, Router)> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the platform surface needs a real Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let router = crate::with_platform_stack(
+            router(
+                db.clone(),
+                agentos_app::api_keys::Hasher::from_master_key(TEST_MASTER_KEY),
+                agentos_app::mcp::Credentials::from_master_key(TEST_MASTER_KEY),
+            ),
+            PlatformKeys::parse(&format!("signup:{PLATFORM_SECRET}")).expect("keyring"),
+        );
+        Some((db, router))
+    }
+
+    async fn call(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        secret: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"));
+        let body = match body {
+            Some(value) => {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = router
+            .clone()
+            .oneshot(req.body(body).expect("request"))
+            .await
+            .expect("service");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let parsed = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)));
+        (status, parsed)
+    }
+
+    /// **A person is created by the vendor and by nobody else**, and the three
+    /// refusals a signup form can actually cause each have their own code.
+    ///
+    /// The first assertion is the one the whole file is about: a *tenant's* key
+    /// — a real, working credential — presented here is a string that is not in
+    /// the platform keyring, and gets the same 401 as a typo. There is no route
+    /// by which a customer makes themselves a second administrator.
+    #[tokio::test]
+    async fn only_the_platform_key_makes_a_person_and_it_says_why_it_refused() {
+        let Some((db, router)) = surface().await else {
+            return;
+        };
+
+        let (status, created) = call(
+            &router,
+            "POST",
+            "/v1/platform/tenants",
+            PLATFORM_SECRET,
+            // A slug is at most 32 characters; the tail of a v7 uuid is the random
+            // half, and two tests in one process share its millisecond head.
+            Some(json!({
+                "slug": format!("acc-{}", &Uuid::now_v7().simple().to_string()[12..]),
+                "name": "Acme",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let tenant = created["tenant_id"].as_str().expect("tenant id").to_owned();
+        let tenant_key = created["key"]["secret"]
+            .as_str()
+            .expect("secret")
+            .to_owned();
+
+        let address = format!("anna-{}@example.test", Uuid::now_v7().simple());
+        let account = json!({ "tenant_id": tenant, "email": address, "password": PASSWORD });
+
+        // The customer's own working key, on the surface that makes people.
+        for secret in [tenant_key.as_str(), A_TENANT_KEY] {
+            let (status, _) = call(
+                &router,
+                "POST",
+                "/v1/platform/accounts",
+                secret,
+                Some(account.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a tenant credential must not reach the account surface"
+            );
+        }
+
+        let (status, person) = call(
+            &router,
+            "POST",
+            "/v1/platform/accounts",
+            PLATFORM_SECRET,
+            Some(account.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{person}");
+        assert_eq!(person["tenant_id"], json!(tenant));
+        assert_eq!(person["email"], json!(address));
+        let rendered = person.to_string();
+        assert!(
+            !rendered.contains(PASSWORD) && !rendered.contains("password"),
+            "the password goes in and never comes back: {rendered}"
+        );
+        let id = person["account_id"].as_str().expect("id").to_owned();
+
+        // Same address twice.
+        let (status, again) = call(
+            &router,
+            "POST",
+            "/v1/platform/accounts",
+            PLATFORM_SECRET,
+            Some(account),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{again}");
+        assert_eq!(again["code"], json!("account_exists"));
+
+        // A tenant uuid nobody created.
+        let (status, ghost) = call(
+            &router,
+            "POST",
+            "/v1/platform/accounts",
+            PLATFORM_SECRET,
+            Some(json!({
+                "tenant_id": Uuid::now_v7(),
+                "email": format!("ghost-{}@example.test", Uuid::now_v7().simple()),
+                "password": PASSWORD,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{ghost}");
+        assert_eq!(ghost["code"], json!("unknown_tenant"));
+
+        // A password a dictionary already holds the length of.
+        let (status, short) = call(
+            &router,
+            "POST",
+            "/v1/platform/accounts",
+            PLATFORM_SECRET,
+            Some(json!({
+                "tenant_id": tenant,
+                "email": format!("short-{}@example.test", Uuid::now_v7().simple()),
+                "password": "court",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{short}");
+
+        // Closing her access: idempotent, and it reports whose person it was.
+        let (status, closed) = call(
+            &router,
+            "DELETE",
+            &format!("/v1/platform/accounts/{id}"),
+            PLATFORM_SECRET,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        assert_eq!(closed["tenant_id"], json!(tenant));
+        assert_eq!(
+            closed["session_revoked"],
+            json!(false),
+            "she never logged in"
+        );
+
+        let (status, twice) = call(
+            &router,
+            "DELETE",
+            &format!("/v1/platform/accounts/{id}"),
+            PLATFORM_SECRET,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "closing twice is the state wanted");
+        assert_eq!(twice["deactivated_at"], closed["deactivated_at"]);
+
+        let (status, _) = call(
+            &router,
+            "DELETE",
+            &format!("/v1/platform/accounts/{}", Uuid::now_v7()),
+            PLATFORM_SECRET,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(Uuid::parse_str(&tenant).expect("uuid"))
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit");
+    }
 
     #[test]
     fn a_key_label_defaults_and_is_a_slug() {

@@ -711,6 +711,7 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))
             .merge(routes::accounting::router(db.clone()))
@@ -753,7 +754,7 @@ fn app(
             // resembles a question, and this one keeps the bytes so a person can
             // get the signed contract back. Neither substitutes for the other,
             // and until this router existed only the first half was here.
-            .merge(routes::files::router(db.clone()))
+            .merge(routes::files::router(db.clone(), embedder.clone()))
             // The pool has a source now: `phone_numbers`, written by this
             // router's own `POST /v1/pool/numbers` and read per request. It
             // used to be unmountable because its router wanted a `Pool` built
@@ -828,7 +829,15 @@ fn app(
     // protège l'émission de clés, c'est-à-dire un pouvoir, et ceci est une
     // lecture agrégée d'un consentement déjà donné. Le module dit pourquoi
     // l'anonymat tient sans porte.
-    .merge(routes::public_register::public_router(db.clone()));
+    .merge(routes::public_register::public_router(db.clone()))
+    // Sans credential, et c'est le point : une personne qui se connecte n'en a
+    // pas encore. Ce qu'elle obtient est un jeton de session — une clé de son
+    // seul locataire, qui ne peut en fabriquer aucune autre. `platform` reste
+    // la seule autorité qui crée une personne et qui la révoque.
+    .merge(routes::accounts::public_router(
+        db.clone(),
+        keyring.hasher().clone(),
+    ));
 
     // `/metrics` sits with the health probes and *not* inside `with_api_stack`,
     // and that is a deliberate reading of the two tiers above rather than the
@@ -5716,24 +5725,25 @@ mod tests {
         .await
         .expect("charter the employee");
 
-        // One document, whose only distinguishing word is this company's.
+        // **A handbook with one answer in it and several chunks of something
+        // else**, which is the shape the assertion below needs and the shape
+        // this comment has twice been wrong about.
         //
-        // It is **not** retrieved on the turn below, and the assertion further
-        // down says so. The comment here used to claim the opposite — "the
-        // recall query is the inbound message, which carries the same word, so
-        // the full-text leg has something real to match" — and it was false in
-        // two steps. The recall query is not the body, it is the whole framed
-        // message including the `from:` and `subject:` lines; and
-        // `plainto_tsquery` ANDs every lexeme in it, so a chunk would have
-        // to contain 'accounts', the sender's domain, 'subject', 're' and the
-        // question. The text leg matched nothing here, ever. What put the
-        // document in the prompt was the vector leg — a SHA-256 ranking of the
-        // one chunk this tenant owns, which cannot be wrong because there is
-        // nothing to be wrong about. Now that `retrieve` no longer consults a
-        // leg that has no opinion, the recall is empty and visibly so.
+        // It was one sentence, and it was retrieved — by the vector leg, a
+        // SHA-256 ranking of the single chunk this tenant owned, which cannot
+        // pick wrongly because there is nothing to pick between. When the vector
+        // leg stopped being consulted the assertion was inverted to an
+        // *absence*, because `plainto_tsquery` ANDed every lexeme of the whole
+        // framed message — the `from:` line, the subject, the frame markers —
+        // and no chunk could ever contain all of them.
         //
-        // The ingest stays: it is what makes the *absence* below a measurement
-        // rather than a tautology about an empty store.
+        // Both of those are gone. The recall query is the sender's words ORed
+        // and ranked by how many of them a passage carries, so the paragraph
+        // that names the lead time and the tolerance is found *and* the four
+        // paragraphs about stationery are not — which is what makes the
+        // assertion below a measurement rather than a tautology about a store
+        // holding one row. `agentos_app::knowledge::MIN_COVERAGE` is the line
+        // between the two.
         knowledge::ingest(
             &mut tx,
             &Embedder::default(),
@@ -5743,10 +5753,19 @@ mod tests {
                 title: Some("handbook"),
                 format: agentos_app::knowledge::Format::Markdown,
                 trust: agentos_domain::untrusted::TrustLabel::Untrusted,
-                text: &format!(
-                    "{} lead time is four weeks, ex works, and the {} tolerance is h9.",
-                    brief.keyword, brief.keyword
-                ),
+                text: &{
+                    let mut handbook = format!(
+                        "# Products\n\n{} lead time is four weeks, ex works, and the {} \
+                         tolerance is h9.\n\n",
+                        brief.keyword, brief.keyword
+                    );
+                    for section in 0..8 {
+                        handbook.push_str(&format!(
+                            "## Office {section}\n\nOffice note {section} covers stationery                              orders, the cleaning rota and which cupboard the spare chairs                              live in, at enough length that this handbook needs more than                              one chunk.\n\n"
+                        ));
+                    }
+                    handbook
+                },
             },
         )
         .await
@@ -6074,45 +6093,48 @@ mod tests {
             // pinned here because this is the only test in the workspace that
             // recalls against a real inbound message rather than a search
             // phrase. The document is on file, it answers the question, and it
-            // does not arrive: the recall query is the whole framed message and
-            // `plainto_tsquery` ANDs every lexeme of it, so the text leg —
-            // the only leg `retrieve` consults while `Embedder::is_semantic()`
-            // is false — matches nothing an email could ever match.
+            // **arrives** — which is the assertion this test has been waiting
+            // two rewrites for.
             //
-            // That sentence was written of `websearch_to_tsquery` and was true
-            // only of the email this fixture happens to send. An `or` anywhere
-            // in an inbound message used to turn the conjunction into a
-            // disjunction and this assertion into a coin toss decided by the
-            // sender — `agentos_store::knowledge`'s `TEXT_SQL` has the fix and
-            // the argument. This test never sent one, which is why it stayed
-            // green over a real hole.
+            // The first version passed on the vector leg: a SHA-256 ranking of
+            // the single chunk this tenant owned, which cannot pick wrongly
+            // because there is no second chunk to pick. It read as "recall
+            // works" and meant "there was only one thing to return". The second
+            // asserted the opposite — the AND could not match a whole framed
+            // email, so nothing was ever recalled and the employee's memory was
+            // decorative. The comment there said this assertion should be
+            // flipped back the day retrieval reached a turn, "with a corpus of
+            // more than one chunk behind it", and both halves of that are done:
+            // the handbook above is nine paragraphs and the store is searched
+            // with the sender's words ORed, ranked, and cut at
+            // `agentos_app::knowledge::MIN_COVERAGE`.
             //
-            // This assertion is the inverse of the one that used to be here. The
-            // old one passed on the vector leg: a SHA-256 ranking of the single
-            // chunk this tenant owns, which cannot pick wrongly because there is
-            // no second chunk to pick. It read as "recall works" and meant
-            // "there was only one thing to return".
-            //
-            // It goes red the day retrieval reaches a turn — an embedder, or a
-            // query built from the message instead of quoting it — and that is
-            // when somebody should be made to come back and assert the presence
-            // again, with a corpus of more than one chunk behind it.
-            //
-            // Half of that day has arrived and this fixture is deliberately on
-            // the other half: `EMBEDDER_API_KEY` now selects a real embedder,
-            // and this `Agent` is built with `Embedder::default()` — the hash —
-            // because a test that reached a vendor would cost money per run.
-            // So what is pinned here is the *mock* deployment's behaviour, which
-            // is still every laptop and every CI run. A deployment with the
-            // credential set runs both legs and this assertion says nothing
-            // about it; asserting the presence needs a fake embeddings endpoint
-            // wired through `mocks::embedder`, which is the piece of work this
-            // comment is now asking for.
+            // Still the *mock* deployment: this `Agent` is built with
+            // `Embedder::default()`, the hash, because a test that reached a
+            // vendor would cost money per run. So what is pinned is what every
+            // laptop and every CI run does, on the full-text leg alone. A
+            // deployment with `EMBEDDER_API_KEY` set runs both legs and this
+            // says nothing about it; asserting that needs a fake embeddings
+            // endpoint wired through `mocks::embedder`, which is the piece of
+            // work this comment is still asking for.
             assert!(
-                !whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
-                "{}'s turn recalled its own document, which this build cannot do — \
-                 retrieval reaches a turn now, so assert the *presence* here and give \
-                 this tenant more than one chunk so the assertion means something: {whole}",
+                whole.contains(&format!("{} lead time is four weeks", mine.keyword)),
+                "{}'s turn did not recall the one document that answers the message it \
+                 was sent — the employee has a document store it cannot read from: {whole}",
+                mine.address
+            );
+
+            // And it recalled **one** passage out of a handbook that chunks
+            // into several, rather than filling `RECALL_LIMIT` with the
+            // cleaning rota. A top-k padded out with chunks that answer nothing
+            // would satisfy the assertion above and is the failure
+            // `MIN_COVERAGE` exists for, so it is asserted separately: one
+            // frame, counted by the marker the runtime writes.
+            assert_eq!(
+                whole.matches("source=knowledge:").count(),
+                2,
+                "{}'s recall did not return exactly one passage — a padded top-k reads as \
+                 success on the assertion above: {whole}",
                 mine.address
             );
 

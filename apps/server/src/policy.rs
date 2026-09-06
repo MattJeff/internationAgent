@@ -25,6 +25,7 @@
 //! | `new-tenant <slug> <name>` | the `tenants` row **and** its active `policy_versions` row |
 //! | `install --tenant … [--role …\|--employee …] <layer.json>` | a tenant, role or employee layer |
 //! | `rollback [--tenant …]` | the undo for either |
+//! | `rotate-master-key` | every sealed row, rewrapped onto a new `AGENTOS_MASTER_KEY` |
 //!
 //! # Why a subcommand and not a route
 //!
@@ -226,6 +227,7 @@ usage: agentos-server policy install [ceiling.json]
        agentos-server policy new-tenant <slug> <name> [--id <uuid>]
        agentos-server policy install --tenant <uuid> [--role <name> | --employee <uuid>] <layer.json>
        agentos-server policy rollback [--tenant <uuid>]
+       agentos-server policy rotate-master-key [--status] [--tenant <uuid>]
 
   install                 make a platform policy ceiling active. With no file,
                           installs the documented default.
@@ -236,6 +238,9 @@ usage: agentos-server policy install [ceiling.json]
                           --role and no --employee is the tenant's own layer.
   rollback [--tenant]     make the previous ceiling, or the tenant's previous
                           policy version, active again.
+  rotate-master-key       rewrap every sealed row from AGENTOS_MASTER_KEY_PREVIOUS
+                          to AGENTOS_MASTER_KEY. --status counts without writing.
+                          Both variables must be set. See docs/DEPLOY_VPS.md.
 
 Re-installing the same thing changes nothing and says so. Every one of these
 reads DATABASE_URL and nothing else: writing a limit is proved by the operator's
@@ -335,6 +340,10 @@ async fn run(args: &[String]) -> Result<String, String> {
         }
         ["rollback"] => rollback(&database_url()?).await,
         ["rollback", "--tenant", id] => rollback_layer(&database_url()?, tenant_id(id)?).await,
+        ["rotate-master-key", rest @ ..] => {
+            let (status, tenant) = parse_rotate_args(rest)?;
+            rotate_master_key(&database_url()?, tenant, status).await
+        }
         // Including the empty case: `agentos-server policy` on its own is
         // somebody asking what this does.
         _ => Err(USAGE.to_owned()),
@@ -468,6 +477,82 @@ fn database_url() -> Result<String, String> {
              database credentials — that is its whole authorisation story."
                 .to_owned()
         })
+}
+
+/// `[--status] [--tenant <uuid>]`, in any order. Pure, for the same reason
+/// [`parse_layer_args`] is.
+fn parse_rotate_args(args: &[&str]) -> Result<(bool, Option<TenantId>), String> {
+    let (mut status, mut tenant) = (false, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--status" => {
+                status = true;
+                i += 1;
+            }
+            "--tenant" => {
+                tenant = Some(tenant_id(flag_value(args, i)?)?);
+                i += 2;
+            }
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    Ok((status, tenant))
+}
+
+/// Rewrap every sealed row onto the current master key, or count what is left.
+///
+/// # Why this is a subcommand and not a route, in one line
+///
+/// The master key belongs to no tenant — it wraps every tenant's rows — so the
+/// escalation argument at the top of this module applies to it more sharply
+/// than it does to the ceiling: a credential that means "I am tenant X" cannot
+/// authorise re-encrypting tenant Y. And the command needs *two* master keys in
+/// its environment, which is the operator's shell and nowhere else.
+///
+/// **The exit code is the answer.** A rotation that is not finished exits
+/// non-zero with the counts, so a deploy script can gate "delete the old key"
+/// on this command succeeding rather than on somebody reading a number.
+async fn rotate_master_key(
+    url: &str,
+    tenant: Option<TenantId>,
+    status: bool,
+) -> Result<String, String> {
+    let master = std::env::var("AGENTOS_MASTER_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            "AGENTOS_MASTER_KEY is not set. It is the key rows are rewrapped *to*; without it \
+             this command has no destination."
+                .to_owned()
+        })?;
+    let window_open = std::env::var(agentos_app::identity::PREVIOUS_KEY_VAR)
+        .is_ok_and(|key| !key.trim().is_empty());
+    if !window_open && !status {
+        return Err(format!(
+            "{} is not set, so there is no key to rewrap from. Set it to the master key you are \
+             retiring — the same value the running server has while the window is open — and run \
+             this again. See docs/DEPLOY_VPS.md.",
+            agentos_app::identity::PREVIOUS_KEY_VAR
+        ));
+    }
+
+    let db = connect(url).await?;
+    let progress = agentos_app::identity::rotate_master_key(
+        &db,
+        &agentos_app::identity::envelope(&master),
+        tenant,
+        status,
+    )
+    .await
+    .map_err(|err| format!("the rotation stopped: {err}"))?;
+
+    // Unfinished is a failure exit, finished is a success exit, and the body of
+    // the message is the same counts either way.
+    if progress.under_previous > 0 || progress.unreadable > 0 {
+        return Err(progress.to_string());
+    }
+    Ok(progress.to_string())
 }
 
 /// Install the default ceiling, or the one in `path`.
@@ -808,6 +893,38 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The rotation's flags, and the one refusal that matters: it will not
+    /// rewrap onto a key with nothing to rewrap *from*, because the only thing
+    /// that could do is report "nothing left under the old key" to an operator
+    /// who is about to delete it.
+    #[test]
+    fn the_rotation_flags_parse_in_any_order_and_a_typo_is_the_usage_text() {
+        assert_eq!(parse_rotate_args(&[]), Ok((false, None)));
+        assert_eq!(parse_rotate_args(&["--status"]), Ok((true, None)));
+
+        let id = uuid::Uuid::now_v7();
+        let raw = id.to_string();
+        let both = parse_rotate_args(&["--tenant", &raw, "--status"]).expect("parses");
+        assert_eq!(both, (true, Some(TenantId::from_uuid(id))));
+        assert_eq!(
+            parse_rotate_args(&["--status", "--tenant", &raw]).expect("either order"),
+            both
+        );
+
+        for bad in [
+            vec!["--satus"],
+            vec!["--tenant"],
+            vec!["--tenant", "not-a-uuid"],
+        ] {
+            assert!(
+                parse_rotate_args(&bad)
+                    .expect_err("refused")
+                    .contains("usage:"),
+                "{bad:?} should not parse"
+            );
+        }
     }
 
     /// No database is touched before the arguments make sense, and the failure

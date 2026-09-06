@@ -1,4 +1,8 @@
-pub mod a2a; // U34
+// la session de console : une personne s'authentifie, et la console appelle
+// `/v1/*` pour SON locataire. `platform` en est la moitié fournisseur — c'est
+// lui qui crée une personne et qui la révoque, jamais le client lui-même.
+pub mod a2a;
+pub mod accounts; // U34
 // l'export comptable: the same books as `pnl`, one CSV line per movement, for
 // a human accountant's tool. Its totals foot to `/v1/pnl` by construction.
 pub mod accounting;
@@ -57,7 +61,10 @@ pub mod pool;
 // pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
 // lecture est montée hors de toute clé; sa bascule est un acte de locataire.
 pub mod public_register;
-pub mod queue; // the file the founder uploads, and the only caller of `app::queue`
+pub mod queue;
+// le devis : le fondateur lit ce qui a été proposé et dit ce que le client en a
+// répondu. La moitié employé est un effet derrière la gate.
+pub mod quotes; // the file the founder uploads, and the only caller of `app::queue`
 pub mod refusals; // ce que la gate a refusé, lu dans le journal
 pub mod reports; // the manager's view of its own line
 pub mod spend;

@@ -123,6 +123,12 @@ pub enum RevenueError {
     /// Asked for a number before anyone named one.
     #[error("no value has been proposed on this opportunity yet")]
     NoValueYet,
+    /// A quote this prospect has already accepted was then recorded as
+    /// refused. Whatever happened afterwards — a change of mind, a revision, a
+    /// cancellation — is not "they never accepted", and overwriting the
+    /// acceptance would erase the one fact an invoice is built on.
+    #[error("this opportunity has an accepted quote and it cannot be un-accepted")]
+    QuoteAlreadyAccepted,
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
@@ -184,6 +190,17 @@ revenue_id!(
 revenue_id!(
     /// One pipeline thread against one account.
     OpportunityId
+);
+revenue_id!(
+    /// One priced document put in front of a prospect, at one version.
+    ///
+    /// **Not an invoice number**, and there is deliberately nothing gap-free
+    /// about it: a quote is not a piece of accounting, so the serialisation
+    /// `migrations/0071_an_invoice_needs_a_number.sql` pays for is a cost with
+    /// nothing to buy. The pair a human quotes is `(id, version)`.
+    ///
+    /// See `migrations/0090_un_devis_est_un_document_revisable.sql`.
+    QuoteId
 );
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1183,32 @@ pub enum OpportunityEvent<'a> {
     /// A monthly figure was named. Anything with contractual weight is
     /// `RequireApproval` at the gate before it gets here.
     TermsProposed(Money),
+    /// A **document** carrying that figure went out: one row of `sales_quotes`
+    /// and one PDF, at one version.
+    ///
+    /// # Why this is not [`OpportunityEvent::TermsProposed`] with a comment
+    ///
+    /// The two move the stage identically and are still different facts, and
+    /// the difference is the whole of what `migrations/0090` closes. Terms
+    /// proposed is a number somebody said; a quote issued is a number the
+    /// prospect can hold, forward to their own finance team, and point at three
+    /// weeks later. Only the second one is answerable — which is why
+    /// [`OpportunityEvent::QuoteAccepted`] and
+    /// [`OpportunityEvent::QuoteDeclined`] exist and there is no
+    /// `TermsAccepted`.
+    QuoteIssued(Money),
+    /// They said yes to a quote, at this figure.
+    ///
+    /// **Not a close.** The stage stays `Negotiating`, because acceptance and
+    /// signature are two moments and this workspace can only observe the first
+    /// — see [`OpportunityEvent::Won`], which still needs its approval. What it
+    /// does is fill [`Opportunity::accepted_quote`], and that is the figure an
+    /// invoice may be built on.
+    QuoteAccepted(Money),
+    /// They said no to a quote. The deal is not lost — a refused quote is
+    /// normally re-priced, and `sales_quotes.supersedes_quote_id` is where the
+    /// next version says which one it replaces.
+    QuoteDeclined,
     /// Signed, at this monthly figure.
     Won(Money),
     /// They said no.
@@ -1187,6 +1230,9 @@ impl OpportunityEvent<'_> {
             OpportunityEvent::ObjectionResolved(_) => "resolve an objection",
             OpportunityEvent::TrialStarted => "start a trial",
             OpportunityEvent::TermsProposed(_) => "propose terms",
+            OpportunityEvent::QuoteIssued(_) => "issue a quote",
+            OpportunityEvent::QuoteAccepted(_) => "accept a quote",
+            OpportunityEvent::QuoteDeclined => "decline a quote",
             OpportunityEvent::Won(_) => "close",
             OpportunityEvent::Declined => "record a decline",
             OpportunityEvent::Disqualified => "disqualify",
@@ -1202,6 +1248,12 @@ impl OpportunityEvent<'_> {
             OpportunityEvent::ReplyReceived(_)
                 | OpportunityEvent::ObjectionRaised(_)
                 | OpportunityEvent::TrialStarted
+                // Answering a quote is *them* moving, either way. Issuing one
+                // is us, so `QuoteIssued` is deliberately not on this list —
+                // a deal that has gone quiet since we sent a document is a
+                // cold deal, and three re-sent quotes do not warm it.
+                | OpportunityEvent::QuoteAccepted(_)
+                | OpportunityEvent::QuoteDeclined
                 | OpportunityEvent::Declined
         )
     }
@@ -1259,6 +1311,25 @@ const fn transition(stage: Stage, event: &OpportunityEvent<'_>) -> Option<Stage>
         (S::Engaged | S::Evaluating | S::Negotiating, E::TermsProposed(_)) => Some(S::Negotiating),
         (S::Sourced | S::Qualified | S::Contacted, E::TermsProposed(_)) => None,
 
+        // A quote is terms with a document attached, so it moves the stage the
+        // same way and from the same three places. **No new stage**, and that
+        // is a decision rather than an omission: a `Quoted` variant would have
+        // to answer what happens to a deal whose only live quote was refused —
+        // back to `Negotiating`, which is a backwards edge this table has none
+        // of — and it would say nothing `Opportunity::accepted_quote` does not
+        // say better. Add one the day a report needs to count deals with a
+        // live document separately from deals merely being talked to.
+        (S::Engaged | S::Evaluating | S::Negotiating, E::QuoteIssued(_)) => Some(S::Negotiating),
+        (S::Sourced | S::Qualified | S::Contacted, E::QuoteIssued(_)) => None,
+
+        // Answering happens where the document was issued and nowhere else:
+        // there is no acceptance of a quote nobody sent.
+        (S::Negotiating, E::QuoteAccepted(_) | E::QuoteDeclined) => Some(S::Negotiating),
+        (
+            S::Sourced | S::Qualified | S::Contacted | S::Engaged | S::Evaluating,
+            E::QuoteAccepted(_) | E::QuoteDeclined,
+        ) => None,
+
         // Nothing closes that was never priced.
         (S::Negotiating, E::Won(_)) => Some(S::Won),
         (S::Sourced | S::Qualified | S::Contacted | S::Engaged | S::Evaluating, E::Won(_)) => None,
@@ -1291,6 +1362,9 @@ const fn transition(stage: Stage, event: &OpportunityEvent<'_>) -> Option<Stage>
             | E::ObjectionResolved(_)
             | E::TrialStarted
             | E::TermsProposed(_)
+            | E::QuoteIssued(_)
+            | E::QuoteAccepted(_)
+            | E::QuoteDeclined
             | E::Won(_)
             | E::Declined
             | E::Disqualified
@@ -1333,6 +1407,12 @@ pub struct Opportunity {
     stage: Stage,
     /// What we would bill a month. `None` until terms are proposed.
     monthly_value: Option<Money>,
+    /// The figure on the quote **they said yes to**. `None` until one is
+    /// accepted, and it is a different question from `monthly_value`: that one
+    /// is the last number anybody named, this one is the last number the
+    /// prospect agreed to, and between a re-quote and a signature the two
+    /// differ. See [`Opportunity::accepted_quote`].
+    accepted_quote: Option<Money>,
     /// Raised objections and, once answered, how. `BTreeMap` so iteration order
     /// — and therefore every derived report — is deterministic.
     objections: BTreeMap<Objection, Option<Resolution>>,
@@ -1356,6 +1436,7 @@ impl Opportunity {
             account_id,
             stage: Stage::Sourced,
             monthly_value: None,
+            accepted_quote: None,
             objections: BTreeMap::new(),
             opened_at: now,
             updated_at: now,
@@ -1370,6 +1451,22 @@ impl Opportunity {
     /// What we would bill a month, once somebody has named it.
     pub const fn monthly_value(&self) -> Option<Money> {
         self.monthly_value
+    }
+
+    /// **What the prospect actually agreed to**, once a quote of theirs was
+    /// accepted.
+    ///
+    /// This is the field `migrations/0090` exists for. Before it, an
+    /// opportunity went from `Negotiating` to `Won` with nothing in between
+    /// saying what had been agreed, so an invoice's total was whatever the
+    /// closing employee typed. It is the figure `agentos_store::quotes` writes
+    /// on the row and `agentos_app::quote_document` prints, so the three cannot
+    /// quietly disagree.
+    ///
+    /// `None` is "nobody has accepted anything", never "zero": a quote's amount
+    /// is a [`Money`] and [`Money`] refuses zero.
+    pub const fn accepted_quote(&self) -> Option<Money> {
+        self.accepted_quote
     }
 
     /// Annual contract value: the monthly figure twelve times, through
@@ -1444,10 +1541,23 @@ impl Opportunity {
                     return Err(RevenueError::UnresolvedObjection(open));
                 }
             }
+            // A refusal cannot land on a deal that already has an acceptance.
+            // The acceptance is what an invoice is built on, so letting a later
+            // decline erase it would make a receivable rest on a figure nothing
+            // records any more. A change of mind after acceptance is a
+            // cancellation of a signed thing, which is a different event this
+            // enum does not have and must not pretend to.
+            OpportunityEvent::QuoteDeclined => {
+                if self.accepted_quote.is_some() {
+                    return Err(RevenueError::QuoteAlreadyAccepted);
+                }
+            }
             OpportunityEvent::Qualified
             | OpportunityEvent::ObjectionRaised(_)
             | OpportunityEvent::TrialStarted
             | OpportunityEvent::TermsProposed(_)
+            | OpportunityEvent::QuoteIssued(_)
+            | OpportunityEvent::QuoteAccepted(_)
             | OpportunityEvent::Declined
             | OpportunityEvent::Disqualified
             | OpportunityEvent::ContactSuppressed => {}
@@ -1475,13 +1585,23 @@ impl Opportunity {
                 self.objections
                     .insert(resolved.objection, Some(resolved.resolution));
             }
-            OpportunityEvent::TermsProposed(value) | OpportunityEvent::Won(value) => {
+            OpportunityEvent::TermsProposed(value)
+            | OpportunityEvent::QuoteIssued(value)
+            | OpportunityEvent::Won(value) => {
                 self.monthly_value = Some(value);
+            }
+            // Both fields, and they are not the same fact told twice: the last
+            // number anybody named is now also the last number *they* agreed
+            // to, and the next re-quote will move only the first of the two.
+            OpportunityEvent::QuoteAccepted(value) => {
+                self.monthly_value = Some(value);
+                self.accepted_quote = Some(value);
             }
             OpportunityEvent::Qualified
             | OpportunityEvent::EvidenceSent(_)
             | OpportunityEvent::ReplyReceived(_)
             | OpportunityEvent::TrialStarted
+            | OpportunityEvent::QuoteDeclined
             | OpportunityEvent::Declined
             | OpportunityEvent::Disqualified
             | OpportunityEvent::ContactSuppressed => {}
@@ -2162,6 +2282,74 @@ mod tests {
     /// [`RevenueError::UnresolvedObjection`] exists to stop, arriving by the one
     /// door that guard does not watch.
     ///
+    /// The quote arc, and the one thing it refuses.
+    ///
+    /// A document goes out, they answer, and `accepted_quote` is the figure the
+    /// invoice is built on. A later re-quote moves `monthly_value` and leaves
+    /// the acceptance alone — those are two questions — and a decline after an
+    /// acceptance is refused outright, because erasing the acceptance would
+    /// leave a receivable resting on a number nothing records.
+    #[test]
+    fn an_accepted_quote_is_the_figure_the_deal_carries_and_cannot_be_un_accepted() {
+        let id = account_id();
+        let mut opp = opportunity(id);
+        let msg = ProspectMessage::inbound(contact(id).id, opp.id, canonical(Direction::Inbound))
+            .expect("inbound");
+        let offered = Money::from_major_str("2500.00", Eur).unwrap();
+        let revised = Money::from_major_str("2200.00", Eur).unwrap();
+
+        opp.apply(OpportunityEvent::Qualified, at(T0)).unwrap();
+        opp.apply(OpportunityEvent::ReplyReceived(&msg), at(T0 + 1))
+            .unwrap();
+
+        // Nothing is answerable before a document exists.
+        assert!(matches!(
+            opp.apply(OpportunityEvent::QuoteAccepted(offered), at(T0 + 2)),
+            Err(RevenueError::IllegalTransition { .. })
+        ));
+        assert_eq!(opp.accepted_quote(), None);
+
+        assert_eq!(
+            opp.apply(OpportunityEvent::QuoteIssued(offered), at(T0 + 3)),
+            Ok(Stage::Negotiating)
+        );
+        assert_eq!(opp.monthly_value(), Some(offered));
+        assert_eq!(opp.accepted_quote(), None, "issuing is not agreeing");
+
+        // A refusal is not a loss: the deal stays live and gets re-priced.
+        assert_eq!(
+            opp.apply(OpportunityEvent::QuoteDeclined, at(T0 + 4)),
+            Ok(Stage::Negotiating)
+        );
+        assert_eq!(
+            opp.apply(OpportunityEvent::QuoteIssued(revised), at(T0 + 5)),
+            Ok(Stage::Negotiating)
+        );
+        assert_eq!(
+            opp.apply(OpportunityEvent::QuoteAccepted(revised), at(T0 + 6)),
+            Ok(Stage::Negotiating)
+        );
+        assert_eq!(opp.accepted_quote(), Some(revised));
+
+        // Their answer is prospect activity; our own document was not.
+        assert_eq!(opp.last_prospect_activity(), at(T0 + 6));
+
+        // And it cannot be taken back.
+        assert_eq!(
+            opp.apply(OpportunityEvent::QuoteDeclined, at(T0 + 7)),
+            Err(RevenueError::QuoteAlreadyAccepted)
+        );
+        assert_eq!(opp.accepted_quote(), Some(revised));
+
+        // Closing still needs its own event; acceptance is not a signature.
+        assert_eq!(opp.stage(), Stage::Negotiating);
+        assert_eq!(
+            opp.apply(OpportunityEvent::Won(revised), at(T0 + 8)),
+            Ok(Stage::Won)
+        );
+        assert_eq!(opp.accepted_quote(), Some(revised));
+    }
+
     /// Note what `the_stage_machine_replays_deterministically` cannot see here:
     /// its post-condition is `stage == Won -> open_objections().count() == 0`,
     /// and a raise that never reopened anything satisfies it. The property is

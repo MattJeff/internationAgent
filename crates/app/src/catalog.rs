@@ -799,6 +799,82 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   `publer-mcp-server@1.1.0` est un tiers non affilié, épinglable seulement
 ///   sur une décision assumée que personne n'a prise.
 ///
+/// # La vague signature électronique du 2026-09-06 — un entré, sept refusés
+///
+/// `docs/ROADMAP.md` range la signature électronique avec Slack, GitHub et
+/// Notion : « par MCP, jamais reconstruite ». Huit fournisseurs sondés en
+/// direct, un seul entre (`docusign`, plus bas). Le détail de chaque refus est
+/// ici plutôt que dans un ticket, parce que c'est ce qui évite de re-sonder
+/// dans six mois — et parce que trois d'entre eux redeviennent une entrée le
+/// jour où un fait précis existe.
+///
+/// * **PandaDoc et BoldSign** — les deux seuls autres à servir un point
+///   d'accès MCP hébergé, et **aucun des deux n'est refusé pour une raison
+///   technique** : `https://mcp.pandadoc.com/v1/mcp` et
+///   `https://mcp.boldsign.com/mcp` répondent, leurs documents RFC 8414
+///   annoncent `client_secret_post` et `client_secret_basic` tous les deux, et
+///   PandaDoc offre même l'enregistrement dynamique. Ils ne sont pas là parce
+///   qu'**une entrée est une affirmation, et une affirmation de plus sur le
+///   même métier n'ajoute rien** : trois connecteurs de signature veulent dire
+///   trois listes d'outils à relire quand un fournisseur en change une, pour un
+///   choix qu'aucun client n'a demandé. Le jour où un client en demande un,
+///   c'est douze lignes et les mesures sont ci-dessous :
+///   PandaDoc — `authorization_endpoint https://mcp.pandadoc.com/authorize`,
+///   `token_endpoint https://mcp.pandadoc.com/token`,
+///   `scopes_supported ["read","write"]`, `code_challenge_methods ["S256"]` ;
+///   BoldSign — `https://account.boldsign.com/connect/authorize` et
+///   `/connect/token`, portées `BoldSign.Documents.All`, `BoldSign.Templates.
+///   All`, `BoldSign.Contacts.All`, `BoldSign.Teams.All`, `BoldSign.Users.All`,
+///   `BoldSign.SenderIdentity.All`, `offline_access`, plus les trois d'OIDC.
+///   Les deux enverraient un document à signer, donc les deux seraient
+///   `OptOuts::HeldHere` — aucun ne publie de liste de refus non plus.
+///
+/// * **SignWell** — pas de point d'accès hébergé (`mcp.signwell.com` ne résout
+///   pas), seulement un paquet stdio `@signwell/mcp`. Ce serait donc une entrée
+///   [`Provision::Host`], et il lui manque ce qui manque à tous les paquets de
+///   cette liste : **un `Package::spec` épinglé**. La page npm ne publie pas de
+///   version ; « latest » n'est pas un spec, c'est une promesse que quelqu'un
+///   d'autre tient. Fait qui débloque : un numéro de version, et l'hébergement
+///   rallumé (`BRIDGES_PER_TENANT = 0`, `crate::hosted`).
+///
+/// * **Documenso** — libre et auto-hébergé, donc **[`CUSTOM`] est la réponse et
+///   pas une étape d'attente**, exactement comme pour Postiz et le démon Docker
+///   plus haut. Son serveur MCP est un sous-commande du SDK
+///   (`npx --package @documenso/sdk-typescript -- mcp start`), il parle à
+///   l'instance que le client déploie, et il n'existe aucun hôte canonique dont
+///   ce binaire pourrait affirmer l'adresse. Une entrée nommée affirmerait
+///   quelque chose d'un serveur dont le client fournit l'URL — ce que le floor
+///   `Read` de [`CUSTOM`] refuse de faire.
+///
+/// * **Dropbox Sign (ex-HelloSign)** — `mcp.dropboxsign.com` et
+///   `mcp.hellosign.com` n'ont **aucun enregistrement DNS**. Le MCP Dropbox qui
+///   existe (`https://mcp.dropbox.com/mcp`) est le stockage de fichiers, un
+///   autre produit. Fait qui débloque : l'existence d'un serveur.
+///
+/// * **Adobe Acrobat Sign** — `mcp.adobesign.com` résout et **redirige en 302
+///   vers `https://secure.adobesign.com/`**, c'est à dire vers l'écran de
+///   connexion de l'application web. Ce n'est pas un serveur MCP, c'est un
+///   sous-domaine qui retombe sur le produit ; le registre IA d'Adobe ne liste
+///   pas Acrobat Sign. Fait qui débloque : le même.
+///
+/// * **Yousign** — le candidat français, et celui dont le refus surprend le
+///   plus. `mcp.yousign.com` répond 200 mais sert la coquille de l'application,
+///   et sa `.well-known/oauth-protected-resource` rend une page 403 de marque
+///   plutôt que du JSON : c'est un routage attrape-tout, pas un serveur. Pire
+///   pour qui voudrait écrire l'entrée à la main :
+///   **`developers.yousign.com` renvoie un 308 permanent vers
+///   `developers.youtrust.com`**, un domaine tiers. La documentation
+///   officiellement liée ne sert plus la documentation. Fait qui débloque : un
+///   serveur MCP, ou à défaut un domaine de documentation qui soit à eux.
+///
+/// **Et le constat qui vaut pour les huit, celui qui décide `opt_outs` :**
+/// aucun fournisseur de signature électronique, à aucun rang, ne publie de
+/// liste de désabonnés, de suppression ou de refus qu'un appelant puisse
+/// relire. C'est cohérent avec leur métier — un signataire n'est pas un
+/// abonné — et c'est précisément pourquoi [`OptOuts::HeldHere`] existe : la
+/// demande de signature part quand même vers quelqu'un qui n'a rien demandé, et
+/// le seul registre de son refus est `suppressions`, ici.
+///
 /// * **Zapier / Postiz / Mixpost Pro** — « CUSTOM est la réponse », même
 ///   argument que le démon Docker : une URL par compte (Zapier), ou une
 ///   instance auto-hébergée dont le client fournit l'adresse (Postiz AGPL,
@@ -2042,6 +2118,149 @@ pub const CATALOG: &[Connector] = &[
             from: "GET /v1/sms/opt-outs",
         },
     },
+    Connector {
+        key: "docusign",
+        label: "DocuSign — signature électronique",
+        // **La signature électronique, et la première entrée de ce catalogue
+        // dont l'acte engage l'entreprise juridiquement.**
+        //
+        // `docs/ROADMAP.md` dit d'elle « par MCP, jamais reconstruite », et
+        // c'est le bon appel : une signature qui tienne devant un tribunal
+        // demande un horodatage qualifié, une piste d'audit conservée et une
+        // preuve d'identité du signataire — trois choses qu'un fournisseur
+        // vend et qu'on ne réécrit pas.
+        //
+        // Sondé le 2026-09-06, et les quatre littéraux sortent du document
+        // que DocuSign sert lui-même :
+        //
+        //   GET https://mcp.docusign.com/.well-known/oauth-protected-resource
+        //   → resource: "https://mcp.docusign.com/mcp",
+        //     resource_name: "Docusign MCP",
+        //     authorization_servers: ["https://mcp.docusign.com"],
+        //     bearer_methods_supported: ["header"],
+        //     scopes_supported:
+        //       ["adm_store_unified_repo_read","aow_manage","signature"]
+        //   GET https://mcp.docusign.com/.well-known/oauth-authorization-server
+        //   → issuer: "https://account.docusign.com",
+        //     authorization_endpoint: "https://account.docusign.com/oauth/auth",
+        //     token_endpoint: "https://account.docusign.com/oauth/token",
+        //     grant_types_supported: ["authorization_code","refresh_token"],
+        //     code_challenge_methods_supported: ["S256"]
+        //
+        // `.../oauth-protected-resource/mcp` et un GET nu sur `/mcp` répondent
+        // **403 « RBAC: access denied »** et non 404 : une passerelle ferme la
+        // porte à un appelant sans jeton, ce qui est le comportement attendu et
+        // pas une absence de serveur.
+        provision: Provision::Dial("https://mcp.docusign.com/mcp"),
+        reach: Reach::Public,
+        // **`Post`, et c'est le seul champ de cette entrée qui ne se lit pas
+        // sur le document ci-dessus** : celui du serveur MCP omet
+        // `token_endpoint_auth_methods_supported` entièrement. Un champ absent
+        // n'est pas un `["none"]`, et deviner l'un pour l'autre est ce que le
+        // refus Vercel plus haut interdit — alors la question a été posée au
+        // serveur d'autorisation que ce document **nomme** :
+        //
+        //   GET https://account.docusign.com/.well-known/openid-configuration
+        //   → token_endpoint_auth_methods_supported:
+        //       ["client_secret_post","client_secret_basic"]
+        //
+        // Client confidentiel des deux façons, donc la condition d'entrée de ce
+        // catalogue est remplie, et `Post` parce que c'est ce que la
+        // documentation de DocuSign montre. Le serveur de démonstration
+        // (`account-d.docusign.com`) annonce exactement la même paire ; c'est
+        // la production qui est écrite ici, parce qu'un client qui signe
+        // vraiment signe en production.
+        //
+        // **Une seule portée sur les trois offertes**, et le choix est le
+        // travail : `signature` est celle qui envoie une enveloppe et en lit
+        // l'état. `aow_manage` gouverne les *workflows* Agreement — créer et
+        // modifier des automatismes qui signent tout seuls, ce qu'un siège n'a
+        // aucune raison de pouvoir faire — et `adm_store_unified_repo_read` lit
+        // le dépôt d'accords de l'organisation entière, c'est à dire tous les
+        // contrats de l'entreprise et pas seulement ceux qu'on envoie.
+        //
+        // Et le prix, dit franchement : `extended` — la portée DocuSign qui
+        // allonge la vie du jeton de rafraîchissement — **n'est pas dans les
+        // trois annoncées** par le document de ressource, donc elle n'est pas
+        // demandée ici. On ne mesure pas ce que dure ce rafraîchissement ;
+        // `crate::oauth::refresh_due` le rejouera comme les autres, et le jour
+        // où une liaison meurt plus tôt qu'attendu, c'est le mot qui manque.
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://account.docusign.com/oauth/auth",
+            token: "https://account.docusign.com/oauth/token",
+            scopes: "signature",
+            auth: ClientAuth::Post,
+        }),
+        // **`Destructive`, et c'est la deuxième entrée du tableau à ne pas être
+        // `Write`.** `google-calendar` porte la même classe pour la même
+        // raison, écrite là-haut : la classe d'un connecteur est celle de son
+        // pire outil, et `RiskClass::Destructive` est défini comme
+        // « irréversible, ou coûteux à défaire ».
+        //
+        // Envoyer une enveloppe est irréversible en deux temps, et les deux
+        // comptent :
+        //
+        //   1. **Le courriel est parti.** DocuSign notifie le destinataire à
+        //      l'instant où l'enveloppe est envoyée. `void` retire l'enveloppe ;
+        //      il ne retire pas le message de la boîte de quelqu'un, et il en
+        //      envoie un second pour annoncer l'annulation.
+        //   2. **Une signature déjà recueillie ne se reprend pas.** Un contrat
+        //      signé engage l'entreprise, et c'est l'acte le plus lourd que ce
+        //      catalogue permette — plus lourd qu'un virement, qui se rembourse.
+        //
+        // Le prix est réel et c'est la moitié honnête, celle que
+        // `google-calendar` paie aussi : **lire l'état d'une enveloppe doit
+        // être déclaré `Destructive`**, donc un humain approuve une lecture.
+        // C'est ce que coûte une classe grossière par connecteur quand un
+        // connecteur sert un outil irréversible, et c'est le bon sens de
+        // l'erreur ici. Une entrée en lecture seule sur une portée réduite est
+        // le connecteur qui porterait `Read` ; personne ne l'a demandée.
+        //
+        // À rapprocher de `Action::ContractSign` (`agentos_domain::action`),
+        // qui est `Risk::High` et **escalade** : la gate demande un humain
+        // avant qu'un employé signe quoi que ce soit. Les deux mécanismes sont
+        // indépendants et disent la même chose de deux côtés — celui-ci borne
+        // ce qu'un client peut déclarer, celui-là ce qu'un tour peut faire.
+        floor: RiskClass::Destructive,
+        // **Ce serveur atteint des inconnus, et c'est le cœur du métier plutôt
+        // qu'un effet de bord** : une demande de signature est un courriel
+        // envoyé à une adresse que l'appelant nomme, à quelqu'un qui n'a rien
+        // demandé à DocuSign. `NoStrangers` serait un mensonge, et le blog
+        // développeur de DocuSign décrit la capacité en toutes lettres
+        // (« send a new document for signature », guide du connecteur MCP).
+        //
+        // La seconde lecture — celle que `HeldHere` coûte, et la seule qui
+        // pouvait faire mentir la première — a été faite le 2026-09-06 et est
+        // revenue vide : **DocuSign ne publie aucune liste de refus.** Le seul
+        // réglage voisin est le paramètre de signature « Suppress emails to
+        // embedded signers », qui éteint les notifications d'un *flux* de
+        // signature intégré ; ce n'est pas une liste, elle ne se lit pas, et
+        // elle ne dit rien de ce qu'une personne a refusé. Il n'y a donc rien
+        // à viser pour `crate::queue::reconcile_opt_outs`, et
+        // `OptOuts::Pulled` ne peut pas nommer une lecture qui n'existe pas.
+        //
+        // C'est l'aveu de `stripe` et `cloudflare` mot pour mot : le registre
+        // du refus est `suppressions`, chez nous, et `OUTREACH_HELD_HERE` nomme
+        // cette entrée. La voie de sortie existe et vaut d'être prise le jour
+        // où quelqu'un s'en occupe — DocuSign permet d'éteindre ses propres
+        // courriels et de livrer soi-même le lien de signature, auquel cas le
+        // `List-Unsubscribe` retombe sur une route à nous et cette entrée
+        // devient `Pushed`.
+        //
+        // Le fait qui n'a pas été obtenu, et qui est écrit ici pour qu'on ne le
+        // recherche pas dans six mois : **la liste d'outils exacte.** Les deux
+        // pages que le document de ressource cite comme
+        // `resource_documentation` sont des coquilles JavaScript (`/tools/
+        // mcp-server/` rend même un 404 en HTTP direct), donc `tools/list` n'a
+        // pas pu être lu sans jeton — contrairement aux trois serveurs Google
+        // plus haut, qui répondent sans credential. La classe et l'aveu
+        // ci-dessus tiennent donc sur la documentation du fournisseur et sur
+        // ses portées annoncées, et non sur une liste d'outils relevée. C'est
+        // une entrée plus faible que `google-gmail` sur ce seul point, et la
+        // façon de la renforcer est un `tools/list` avec un jeton réel, le jour
+        // où l'application est enregistrée.
+        opt_outs: OptOuts::HeldHere,
+    },
     CUSTOM,
 ];
 
@@ -2174,13 +2393,13 @@ pub const NO_OUTREACH: [&str; 20] = {
 /// `pub` for the same reason [`NO_OUTREACH`] is: it is the artifact the
 /// obligation needs. Somebody answering for what this deployment can reach
 /// reads these two arrays and nothing else.
-pub const OUTREACH_HELD_HERE: [&str; 6] = {
-    let mut out = [""; 6];
+pub const OUTREACH_HELD_HERE: [&str; 7] = {
+    let mut out = [""; 7];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         if matches!(CATALOG[i].opt_outs, OptOuts::HeldHere) {
             assert!(
-                n < 6,
+                n < 7,
                 "a connector claiming `OptOuts::HeldHere` was added to CATALOG and \
                  OUTREACH_HELD_HERE's length was not updated. That claim is two readings, \
                  not one: the vendor's own tool list, to see which tool takes the address of \
@@ -2197,7 +2416,7 @@ pub const OUTREACH_HELD_HERE: [&str; 6] = {
         i += 1;
     }
     assert!(
-        n == 6,
+        n == 7,
         "a connector stopped claiming `OptOuts::HeldHere` and OUTREACH_HELD_HERE's length \
          was not updated"
     );
@@ -2640,6 +2859,52 @@ mod tests {
             opt_outs: OptOuts::HeldHere,
             ..CUSTOM
         });
+    }
+
+    /// **Signer engage l'entreprise, et l'entrée le dit de trois façons qui ne
+    /// peuvent pas dériver l'une de l'autre.**
+    ///
+    /// Ce test ne redit pas les boucles au-dessus — elles passent déjà sur
+    /// toutes les entrées. Il épingle le *jugement* porté sur celle-ci, parce
+    /// que c'est le jugement et pas la forme qui se relâche : quelqu'un qui
+    /// trouve `Destructive` pénible sur une lecture d'état d'enveloppe le
+    /// descendra à `Write`, et rien d'autre dans ce fichier ne s'en
+    /// apercevrait. La classe est ici pour la raison que `google-calendar`
+    /// écrit en toutes lettres — un outil irréversible fixe le plancher du
+    /// connecteur entier — et le prix est nommé là-bas comme ici.
+    #[test]
+    fn the_signature_connector_is_classed_by_its_worst_tool_and_answers_for_its_outreach() {
+        let sign = find("docusign").expect("the signature connector is in the catalogue");
+        assert_eq!(sign.url(), Some("https://mcp.docusign.com/mcp"));
+
+        // 1. Rien ne peut être déclaré sous `Destructive` sur ce connecteur —
+        //    y compris une lecture, qui est le coût assumé.
+        assert_eq!(sign.floor, RiskClass::Destructive);
+        assert_eq!(sign.admits(RiskClass::Read), Err(RiskClass::Destructive));
+        assert_eq!(sign.admits(RiskClass::Write), Err(RiskClass::Destructive));
+        assert_eq!(sign.admits(RiskClass::Destructive), Ok(()));
+
+        // 2. Il atteint des inconnus et aucun fournisseur ne tient de liste, ce
+        //    qui est un aveu et pas une permission : il est sur le registre qui
+        //    le dit, et sur aucun autre.
+        assert!(matches!(sign.opt_outs, OptOuts::HeldHere));
+        assert!(OUTREACH_HELD_HERE.contains(&"docusign"));
+        assert!(!NO_OUTREACH.contains(&"docusign"));
+
+        // 3. Et les deux gardes que ce module s'impose mordent sur elle comme
+        //    sur n'importe quelle autre — dont l'`https` sur la page de
+        //    consentement, qui est la seule chose entre un caractère glissé et
+        //    un navigateur.
+        vet(sign);
+        let endpoints = sign
+            .credential
+            .oauth()
+            .expect("a signature connector is not a pasted token");
+        assert_oauth_is_usable(sign.key, endpoints);
+        assert_eq!(endpoints.auth, ClientAuth::Post);
+        // Une portée sur les trois annoncées. Un espace ici voudrait dire qu'on
+        // en a repris une deuxième sans l'argumenter.
+        assert_eq!(endpoints.scopes, "signature");
     }
 
     /// Keys are the API. Two entries under one key is a lookup that silently
