@@ -796,6 +796,26 @@ impl McpServer {
         //
         // Dropping the future on timeout drops the transport with it, which
         // closes the socket; there is nothing to unwind and nothing to leak.
+        // **Un enfant, jamais le jeton qu'on nous a passé.** `rmcp` arme un
+        // garde de destruction sur le jeton qu'il reçoit et l'annule quand le
+        // client se ferme ou tombe : `RunningService::close` appelle
+        // `self.cancellation_token.cancel()`, et son propre commentaire parle de
+        // « désarmer le garde pour qu'il n'annule pas une seconde fois ».
+        //
+        // Ce jeton-ci vient du lieur MCP, qui reçoit celui du processus. Sans ce
+        // `child_token`, la première reconstruction de flotte — toutes les
+        // `REFRESH` secondes, donc cinq minutes après chaque démarrage — détruit
+        // les clients précédents, `rmcp` annule le jeton racine, et **les quatre
+        // boucles s'arrêtent ensemble** : plus un tour, plus d'outbox, plus de
+        // provisionnement. Le serveur HTTP, lui, attend le signal du système et
+        // continue de répondre, donc l'entreprise a l'air vivante et ne fait plus
+        // rien. Mesuré deux fois en production le 2026-09-05 (mort à 11:10:01
+        // après un démarrage à 11:04:24) et le 2026-09-06 (01:18:54 après
+        // 01:13:52) — cinq minutes et des poussières, à chaque fois.
+        //
+        // Un enfant annulé ne remonte pas à son parent, et un parent annulé
+        // emporte ses enfants : l'arrêt du processus ferme toujours les clients.
+        let ct = ct.child_token();
         let bound = tokio::time::timeout(BIND_TIMEOUT, async move {
             let client = serve_client_with_lifecycle_and_ct(
                 info,
@@ -3081,6 +3101,57 @@ mod tests {
     ///
     /// `undeclared` is bound, classified and callable by exact name — it is
     /// simply not a string an MCP server gets to put in a system prompt.
+    /// **Le bug qui a tué deux fois la société en production.**
+    ///
+    /// `rmcp` arme un garde de destruction sur le jeton qu'on lui passe et
+    /// l'annule quand le client se ferme. Le lieur MCP reçoit le jeton du
+    /// processus et reconstruit la flotte toutes les cinq minutes ; sans
+    /// `child_token`, la première reconstruction détruisait les clients
+    /// précédents et emportait les quatre boucles avec eux — plus un tour, plus
+    /// d'outbox, plus de provisionnement, pendant que le serveur HTTP continuait
+    /// de répondre. Mort mesurée à 11:10:01 après un démarrage à 11:04:24, puis
+    /// à 01:18:54 après 01:13:52.
+    ///
+    /// Le test ferme un client comme le lieur le fait, et vérifie que le jeton
+    /// du parent est intact. Il rougit si quelqu'un enlève le `child_token`.
+    #[tokio::test]
+    async fn closing_a_bound_client_never_cancels_the_token_it_was_handed() {
+        let server = FakeMcp::start(two_pages()).await;
+        let parent = CancellationToken::new();
+
+        let bound = McpServer::bind(
+            erp(),
+            &server.url,
+            &declared(),
+            Reach::Private,
+            None,
+            parent.clone(),
+        )
+        .await
+        .expect("bind to the fake server");
+
+        assert!(!parent.is_cancelled(), "binding alone must not cancel it");
+
+        // Ce que fait le lieur à chaque tour de `REFRESH` : l'ancienne flotte est
+        // remplacée, donc ses clients sont détruits. C'est ce geste-là, et pas
+        // un arrêt, qui coupait tout.
+        drop(bound);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            !parent.is_cancelled(),
+            "un client détruit a annulé le jeton du processus : les quatre \
+             boucles s'arrêteraient ensemble et le serveur HTTP continuerait \
+             de répondre"
+        );
+
+        // Et l'autre sens : l'arrêt du processus doit toujours fermer les
+        // clients, sinon on aurait échangé une panne contre une fuite.
+        let child = parent.child_token();
+        parent.cancel();
+        assert!(child.is_cancelled(), "un parent annulé emporte ses enfants");
+    }
+
     #[tokio::test]
     async fn the_inventory_names_only_what_an_operator_declared() {
         let server = FakeMcp::start(two_pages()).await;
