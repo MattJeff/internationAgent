@@ -34,6 +34,12 @@ chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "2"
 hmac = "0.12"
 rand = "0.9"
+# PBKDF2 pour les mots de passe des comptes de console. Déjà dans le graphe de
+# compilation — rustls le tire par `sqlx/tls-rustls-ring` — donc cette ligne
+# n'ajoute rien à la lock file. L'argument complet (pourquoi pas `argon2`,
+# pourquoi surtout pas un PBKDF2 écrit à la main sur `hmac`) est en tête de
+# `apps/server/src/routes/accounts.rs`.
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 aes-gcm = "0.10"
 secrecy = "0.10"
@@ -52,6 +58,12 @@ tower-http = { version = "0.6", features = ["trace", "request-id", "limit", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
+# Text extraction from a PDF, and deliberately *only* that: no rasteriser, no
+# layout engine, no font renderer. Pure Rust, MIT, and it carries the ToUnicode
+# / CFF / Type1 / CID encoding work that a hand-rolled content-stream scanner
+# gets wrong quietly. `crates/app/src/knowledge.rs` argues the choice and what
+# was weighed against it.
+pdf-extract = "0.12"
 url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = "1"

@@ -275,6 +275,24 @@ const PREPENDED_BRIEFS: &[&str] = &[
     agentos_app::brief::DIARY_BRIEF,
     agentos_app::knowledge::RECALLED_BRIEF,
     agentos_app::knowledge::UNAVAILABLE_BRIEF,
+    // **Manque ici, et c'est délibéré : `knowledge::NOTHING_FOUND_BRIEF`.**
+    //
+    // La main vide qui se dit vide est de la prose d'opérateur qu'un vrai tour
+    // met devant une tâche, exactement comme les deux au-dessus : sa place est
+    // dans cette liste. L'y mettre invalide les scores enregistrés — c'est le
+    // mécanisme, et il fonctionne : la suite rougit tant que la série vivante
+    // n'a pas été rejouée.
+    //
+    // Ce geste-là n'appartient pas à un agent. `docs/ROADMAP.md` l'écrit :
+    // « deux runs `--live`, jamais par un agent ». Donc la ligne attend, et la
+    // tâche est :
+    //
+    //     cargo run -p agentos-eval -- --live      (deux fois)
+    //     puis recoller les scores et le digest, et ajouter la ligne ci-dessous
+    //     agentos_app::knowledge::NOTHING_FOUND_BRIEF,
+    //
+    // Tant qu'elle attend, le pin est plus étroit qu'un vrai tour d'exactement
+    // cette phrase — ce qui est écrit ici plutôt que découvert plus tard.
 ];
 
 /// **Where the two pins stop, said in the report rather than in a doc

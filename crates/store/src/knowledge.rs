@@ -28,9 +28,8 @@
 //! your policy on damaged pallets" and very bad at `BRK-4471-XZ`. Part numbers,
 //! HS codes and SKUs carry no distributional meaning — the nearest neighbours
 //! of one part number are other part numbers. Those exact-token lookups are
-//! most of what a buyer actually types, so retrieval runs a `ts_rank_cd`
-//! full-text leg alongside the vector leg and fuses the two with Reciprocal
-//! Rank Fusion. RRF needs no score calibration between the legs, which is the
+//! most of what a buyer actually types, so retrieval runs a `ts_rank` full-text
+//! leg alongside the vector leg and fuses the two with Reciprocal Rank Fusion. RRF needs no score calibration between the legs, which is the
 //! whole reason to prefer it over a weighted sum of a cosine distance and a
 //! rank score that share no units.
 //!
@@ -179,46 +178,119 @@ const VECTOR_SQL: &str = concat!(
     "LIMIT $4"
 );
 
-/// Full-text leg. **`plainto_tsquery`, and the choice of parser is a security
-/// boundary rather than ergonomics.**
+/// Full-text leg. **The sender's words, ORed, ranked by how many of them a
+/// passage carries — and cut off below [`Search::min_coverage`].**
 ///
 /// `$1` is not a search box. Its only production caller is
 /// `agentos_app::knowledge::recall`, whose query text is the first 512
 /// characters of the message a counterparty sent — and while the embedder is
 /// not semantic, this leg is the *only* thing selecting what an employee
 /// recalls. Whoever writes `$1` therefore chooses which of this tenant's
-/// documents reach the model.
+/// documents reach the model. Two separate things have to be true of the
+/// parser, and the two previous versions of this constant each had one of them.
 ///
-/// `websearch_to_tsquery`, which was here, is a query *language*: `or` is
-/// disjunction, `-` is negation, `"…"` is a phrase. That handed the sender the
-/// query's boolean structure on top of its words, which is two capabilities
-/// nothing above this line intended to grant. Disjunction lets a message that
-/// reads like ordinary correspondence select one named document — under
-/// conjunction, steering costs a message that visibly quotes its target.
-/// Negation is worse and has no conjunctive equivalent at all: extra words only
-/// narrow, so only `-` can *remove* the passage that constrains the sender and
-/// leave a full, plausible top-k in its place. Both are reproduced in
-/// `agentos_app::knowledge`'s
+/// **1. The sender writes words, never structure.** `websearch_to_tsquery`,
+/// which was here first, is a query *language*: `or` is disjunction, `-` is
+/// negation, `"…"` is a phrase. That handed the sender the query's boolean
+/// structure on top of its words, and negation is the one with no honest
+/// equivalent — extra words can only narrow, so only `-` can *remove* the
+/// passage that constrains the sender and leave a full, plausible top-k in its
+/// place. Both operators are reproduced in `agentos_app::knowledge`'s
 /// `a_senders_message_is_words_and_not_a_query_language`.
 ///
-/// `plainto_tsquery` ANDs every lexeme and has no operators to write, so the
-/// message is words. It keeps the reason `to_tsquery` was rejected: it never
-/// raises a syntax error on stray punctuation, which arbitrary email very much
-/// contains. What it does not fix is selection itself — a sender who writes the
+/// `plainto_tsquery` replaced it and closed that hole by ANDing every lexeme.
+/// The query below closes it a second way, and a stronger one: the lexemes are
+/// taken out of `to_tsvector('english', $1)` — the *document* parser — which
+/// has no operators at all. `-`, `or`, `"` and `!` do not survive
+/// tokenisation, so there is no expression left for the sender to write. What
+/// reaches `tsquery` is a list of normalised lexemes quoted one by one, which
+/// is why the string is built with a doubled `''` rather than with
+/// `quote_literal`: `quote_literal` emits an `E'…'` string for a lexeme
+/// containing a backslash, the `tsquery` parser does not understand one, and
+/// the symptom would be a syntax error on the first live retrieval whose email
+/// contained a Windows path. Lexemes carrying a backslash are dropped instead.
+///
+/// **2. A whole message has to be able to match something.** That is what
+/// `plainto_tsquery` gave away. It ANDs, so a chunk had to contain *every*
+/// non-stopword of an email — three sentences of ordinary correspondence
+/// matched nothing, ever, and `agentos_app::knowledge` said so in its own
+/// module docs: "That is close to never." An employee whose only selection
+/// channel matches close to never does not answer from company knowledge, it
+/// only appears to.
+///
+/// So the lexemes are ORed, and **the threshold is what keeps an OR from
+/// padding** — which is the failure this repository refuses one layer up, in
+/// `agentos_app::knowledge`'s argument for consulting no leg that has no
+/// opinion: a passage sharing one common word with a long email is not an
+/// answer, and five of those wrapped around one real hit are worse than an
+/// empty hand, because an empty hand is visibly empty.
+///
+/// **`ts_rank` over an OR query is coverage, which is why the score is
+/// divided.** `calc_rank_or` sums a weight per *matched query operand* and
+/// divides by the number of operands, so the score of a passage carrying every
+/// one of the query's lexemes is a constant — measured at 0.06079271 here, and
+/// deliberately not written down anywhere in this file, because
+/// `array_to_tsvector(lex)` **is** that passage and Postgres computes the
+/// constant itself, once per query, in the `MATERIALIZED` CTE below. The ratio is therefore the fraction of the
+/// question's distinct lexemes this passage carries, in `0..1`, comparable
+/// across queries and across Postgres versions, and it is the same number the
+/// `WHERE` thresholds on. Repetition raises a term's weight sub-linearly and
+/// saturates — measured against a one-lexeme query: one occurrence 0.0203,
+/// three 0.0276, five hundred 0.0998 — so a chunk that repeats one of the
+/// sender's words fifty times still does not out-score one that carries two of
+/// them once.
+///
+/// `ts_rank_cd`, which this replaces, is cover *density*: it is defined over
+/// the span containing the whole query and has no meaning for a disjunction
+/// most of whose branches are absent from the passage.
+///
+/// What none of this fixes is selection itself — a sender who writes the
 /// document's own words still gets that document, which
-/// `agentos_app::knowledge` accepts on purpose and argues.
+/// `agentos_app::knowledge` accepts on purpose and argues. What changed is the
+/// price of steering: under the AND the message had to *be* the document, and
+/// it now has to spend [`Search::min_coverage`] of its own words on it.
 ///
 /// If a human search box ever lands, it gets its own query built from
 /// structured input. It does not get this one back.
 const TEXT_SQL: &str = concat!(
+    // The sender's words as the *document* parser sees them: normalised,
+    // de-punctuated, stopwords gone, and no operator expressible.
+    "WITH lexemes AS ( ",
+    "  SELECT array_agg(lexeme) AS lex ",
+    "    FROM unnest(to_tsvector('english', $1)) AS w(lexeme, positions, weights) ",
+    // See the doc comment: a lexeme with a backslash in it is a `tsquery`
+    // syntax error waiting for the email that contains one.
+    "   WHERE position('\\' in lexeme) = 0 ), ",
+    // `array_agg` over no rows is NULL, so a question that survives
+    // tokenisation as nothing at all leaves this empty, the join below returns
+    // nothing, and the caller gets an empty hand rather than a division by
+    // zero.
+    "built AS ( ",
+    "  SELECT lex, (SELECT string_agg('''' || replace(l, '''', '''''') || '''', ' | ') ",
+    "                 FROM unnest(lex) AS l)::tsquery AS query ",
+    "    FROM lexemes WHERE lex IS NOT NULL ), ",
+    // MATERIALIZED, and it is worth the keyword. Without it the planner inlines
+    // the CTE and re-derives the `tsquery` and the divisor as five separate
+    // SubPlans, two of them inside the per-row `Filter`. With it both are
+    // computed once, and the scan still reaches `knowledge_chunks_tsv_gin` by
+    // bitmap index scan — checked on `EXPLAIN`, both ways.
+    //
+    // `perfect` is `ts_rank` of the passage that carries every one of the
+    // query's own lexemes: what a coverage of 1.0 means, and what the score
+    // below is a fraction of.
+    "q AS MATERIALIZED ( ",
+    "  SELECT query, ts_rank(array_to_tsvector(lex), query) AS perfect FROM built ) ",
     "SELECT c.id, c.source_id, c.ordinal, c.content, ",
-    "       ts_rank_cd(c.tsv, q)::float8 AS score ",
-    "FROM knowledge_chunks c, plainto_tsquery('english', $1) q ",
-    "WHERE c.tsv @@ q ",
+    "       (ts_rank(c.tsv, q.query) / q.perfect)::float8 AS score ",
+    "FROM knowledge_chunks c, q ",
+    "WHERE c.tsv @@ q.query ",
+    // The threshold, written as a multiplication rather than a division so it
+    // stays a plain filter beside the index condition.
+    "  AND ts_rank(c.tsv, q.query) >= $2 * q.perfect ",
     "  AND ",
-    entitled!("$2"),
+    entitled!("$3"),
     " ORDER BY score DESC, c.id ",
-    "LIMIT $3"
+    "LIMIT $4"
 );
 
 /// Who a document is for. **Stamped at ingest, and there are exactly three.**
@@ -321,6 +393,20 @@ pub struct Search<'a> {
     pub employee_id: Option<EmployeeId>,
     /// Rows wanted. The legs each fetch this many before fusion.
     pub limit: i64,
+    /// **The share of the question's own words a passage has to carry to be
+    /// returned at all**, in `0..=1`. Below it the passage is not an answer to
+    /// this question and is dropped, even when that leaves nothing.
+    ///
+    /// A field rather than a constant here because it is a product decision —
+    /// how much silence is worth how much noise — and this crate has no
+    /// standing to make it. `agentos_app::knowledge::MIN_COVERAGE` is the one
+    /// number every caller passes, and it is argued there against measurements.
+    /// `0.0` disables the threshold, which is what the test that shows what the
+    /// threshold is holding back passes.
+    ///
+    /// Read by [`search_text`] only. The vector leg has no comparable quantity:
+    /// a cosine distance is not a fraction of anything the sender wrote.
+    pub min_coverage: f64,
 }
 
 /// One retrieved chunk.
@@ -336,8 +422,11 @@ pub struct Hit {
     /// The text. Wrapped because it is third-party content heading for a
     /// prompt: see [`Untrusted`].
     pub content: Untrusted<String>,
-    /// Cosine similarity, `ts_rank_cd`, or the fused RRF score, depending on
-    /// which function produced it. Comparable within one result set only.
+    /// What it means depends on which function produced it: cosine similarity
+    /// from [`search_vector`], the fused RRF score from [`search_hybrid`], and
+    /// from [`search_text`] the **fraction of the question's distinct lexemes
+    /// this passage carries**, in `0..=1` and comparable across queries — see
+    /// [`TEXT_SQL`]. The other two are comparable within one result set only.
     pub score: f64,
 }
 
@@ -467,14 +556,18 @@ pub async fn search_vector(
     Ok(rows.iter().map(hit).collect())
 }
 
-/// Full-text ranking by `ts_rank_cd`. Finds the exact token the vector leg
-/// cannot: a SKU, a part number, an HS code, an invoice number.
+/// Full-text ranking. Finds the exact token the vector leg cannot — a SKU, a
+/// part number, an HS code, an invoice number — and, since the lexemes are ORed
+/// rather than ANDed, finds a document that a whole three-sentence message is
+/// only partly about. [`TEXT_SQL`] argues both halves and
+/// [`Search::min_coverage`] is what stops the second one padding.
 pub async fn search_text(
     tx: &mut TenantTx<'_>,
     search: &Search<'_>,
 ) -> Result<Vec<Hit>, StoreError> {
     let rows = sqlx::query(TEXT_SQL)
         .bind(search.text)
+        .bind(search.min_coverage)
         .bind(search.employee_id.map(|e| e.as_uuid()))
         .bind(search.limit)
         .fetch_all(&mut ***tx)
@@ -772,6 +865,10 @@ mod tests {
             text,
             model: DEFAULT_EMBEDDING_MODEL,
             employee_id: None,
+            // The threshold is `agentos_app::knowledge`'s number and is
+            // exercised by its tests; these ones are about which *rows* each
+            // leg can reach, so they take everything that matched at all.
+            min_coverage: 0.0,
             limit,
         }
     }

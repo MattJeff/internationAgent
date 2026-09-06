@@ -240,6 +240,9 @@ impl Envelope {
 /// for what has to be right today so the swap stays a body change.
 pub struct LocalEnvelopeSecretStore {
     master_key: Zeroizing<[u8; KEY_LEN]>,
+    /// The key being retired, during a rotation window. Reads try it; writes
+    /// never do. See [`LocalEnvelopeSecretStore::with_previous`].
+    previous_key: Option<Zeroizing<[u8; KEY_LEN]>>,
     rows: Mutex<HashMap<SecretRef, Envelope>>,
 }
 
@@ -260,8 +263,114 @@ impl LocalEnvelopeSecretStore {
     pub fn new(master_key: [u8; KEY_LEN]) -> Self {
         Self {
             master_key: Zeroizing::new(master_key),
+            previous_key: None,
             rows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Accept a second master key **for reading only**, for the length of a
+    /// rotation window.
+    ///
+    /// This is the whole recovery period, and it is one field because that is
+    /// all it needs to be: a deployment that flips its master key in one step
+    /// breaks every row it has not re-wrapped yet, so the two keys have to
+    /// overlap. [`Self::seal_in`] never consults this one — everything written
+    /// during the window is written under the new key — so the window closes by
+    /// deleting the variable that supplies it, not by a second migration.
+    ///
+    /// Under KMS the equivalent is a key *alias* pointing at the new key while
+    /// the old one stays enabled for `Decrypt`, which is the same two states.
+    #[must_use]
+    pub fn with_previous(mut self, previous: [u8; KEY_LEN]) -> Self {
+        self.previous_key = Some(Zeroizing::new(previous));
+        self
+    }
+
+    /// Unwrap the data key, trying the current master key and then the one
+    /// being retired.
+    ///
+    /// Order matters for cost, not for correctness: after a rotation almost
+    /// every row is under the current key, so the common path is one AES-GCM
+    /// open and the fallback runs on rows the rewrap has not reached.
+    fn unwrap_data_key(
+        &self,
+        tenant_id: TenantId,
+        envelope: &Envelope,
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, ProviderError> {
+        let aad = wrap_aad(tenant_id);
+        let unwrapped = match decrypt(
+            &self.master_key,
+            aad.as_bytes(),
+            &envelope.key_nonce,
+            &envelope.wrapped_key,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let previous = self.previous_key.as_ref().ok_or(err)?;
+                decrypt(
+                    previous,
+                    aad.as_bytes(),
+                    &envelope.key_nonce,
+                    &envelope.wrapped_key,
+                )?
+            }
+        };
+        let unwrapped = Zeroizing::new(unwrapped);
+        let data_key: [u8; KEY_LEN] =
+            unwrapped
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProviderError::Terminal {
+                    code: "secret_key_length",
+                })?;
+        Ok(Zeroizing::new(data_key))
+    }
+
+    /// Move an envelope from the previous master key to the current one.
+    ///
+    /// `Ok(None)` means the row is already under the current key — which is
+    /// what makes a rotation resumable *and* countable: the same pass that
+    /// rewrites the stragglers is the pass that reports how many are left, with
+    /// no column recording which key wrote which row.
+    ///
+    /// # The payload is not touched, and that is the entire point
+    ///
+    /// Only the wrapped data key is re-encrypted. The ciphertext, its nonce and
+    /// its data key are copied across byte for byte, so this needs no
+    /// encryption context for the payload — no [`SecretRef`], no `mcp://…`,
+    /// nothing table-specific. One caller can therefore rewrap every sealed
+    /// column in the schema knowing only each row's tenant, and no signing key
+    /// is reissued, no OAuth token is re-fetched, no signature already in the
+    /// world stops verifying.
+    ///
+    /// `secret_decrypt_failed` when neither key opens the row: it predates both
+    /// keys, or it is corrupt. Either way it is not something to pass over
+    /// quietly.
+    pub fn rewrap(
+        &self,
+        tenant_id: TenantId,
+        envelope: &Envelope,
+    ) -> Result<Option<Envelope>, ProviderError> {
+        let aad = wrap_aad(tenant_id);
+        if decrypt(
+            &self.master_key,
+            aad.as_bytes(),
+            &envelope.key_nonce,
+            &envelope.wrapped_key,
+        )
+        .is_ok()
+        {
+            return Ok(None);
+        }
+
+        let data_key = self.unwrap_data_key(tenant_id, envelope)?;
+        let (key_nonce, wrapped_key) = encrypt(&self.master_key, aad.as_bytes(), &*data_key)?;
+        Ok(Some(Envelope {
+            wrapped_key,
+            key_nonce,
+            ciphertext: envelope.ciphertext.clone(),
+            nonce: envelope.nonce,
+        }))
     }
 
     /// Encrypt a value for `secret_ref`, without storing it.
@@ -351,20 +460,7 @@ impl LocalEnvelopeSecretStore {
         context: &str,
         envelope: &Envelope,
     ) -> Result<Secret, ProviderError> {
-        let unwrapped = Zeroizing::new(decrypt(
-            &self.master_key,
-            wrap_aad(tenant_id).as_bytes(),
-            &envelope.key_nonce,
-            &envelope.wrapped_key,
-        )?);
-        let data_key: [u8; KEY_LEN] =
-            unwrapped
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProviderError::Terminal {
-                    code: "secret_key_length",
-                })?;
-        let data_key = Zeroizing::new(data_key);
+        let data_key = self.unwrap_data_key(tenant_id, envelope)?;
 
         let plain = Zeroizing::new(decrypt(
             &data_key,

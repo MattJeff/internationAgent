@@ -61,9 +61,13 @@
 //!
 //! It follows that this route inherits `recall`'s honesty problem and has to
 //! pass it on. On a deployment with no `EMBEDDER_API_KEY` the vector leg is not
-//! run at all, so an empty result means *no document contained these words* and
-//! not *the company has nothing on this* — `RECALLED_BRIEF` says exactly that to
-//! the model, and `ranked_by` in the response body says it to the person.
+//! run at all, so an empty result means *no document carried
+//! `agentos_app::knowledge::MIN_COVERAGE` of these words* and not *the company
+//! has nothing on this* — `RECALLED_BRIEF` says exactly that to the model, and
+//! `ranked_by` in the response body says it to the person. What changed
+//! underneath both is that the words are now ORed and ranked rather than ANDed,
+//! so a whole three-sentence message can match something; the score on each hit
+//! is the share of the question that passage carries.
 //!
 //! # Two rules the reads do not get to bend
 //!
@@ -213,8 +217,11 @@ struct NewDocument {
     /// and getting that wrong degrades retrieval invisibly.
     #[serde(default)]
     format: Format,
-    /// The document, already decoded to UTF-8. PDF is out of scope — see
-    /// `agentos_app::knowledge`.
+    /// The document, already decoded to UTF-8. **A PDF does not come in here**
+    /// — this field is a JSON string and a PDF is bytes. It is deposited at
+    /// `POST /v1/files`, which extracts its text and ingests it through the
+    /// same `agentos_app::knowledge::ingest` this handler calls; `routes::files`
+    /// argues why the classeur is the door for bytes and this one for text.
     text: String,
 }
 
@@ -312,7 +319,13 @@ struct HitView {
     /// Position in the document. `knowledge:<source_id>#<ordinal>` is the
     /// citation a turn carries for this exact passage.
     ordinal: i32,
-    /// Comparable within this result set and meaningless outside it.
+    /// **On a deployment with no embedding credential this is the share of
+    /// `q`'s own distinct words the passage carries**, in `0..=1`, so it is
+    /// comparable between two searches and it is what
+    /// `agentos_app::knowledge::MIN_COVERAGE` cut at — a hit at 0.21 scraped
+    /// in. With both legs running it is the fused RRF score instead, which is
+    /// comparable within this result set and meaningless outside it.
+    /// `ranked_by` says which of the two you are reading.
     score: f64,
     /// The passage. In clear, because the reader is a person and not a prompt —
     /// `Untrusted` serialises transparently, exactly as `routes::desk` sends a

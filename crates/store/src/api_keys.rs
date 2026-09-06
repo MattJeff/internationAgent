@@ -227,6 +227,91 @@ pub async fn revoke(
     Ok(tenant_id)
 }
 
+/// The label the console's session key carries, for one person.
+///
+/// **The session credential is an ordinary row in this table**, and that is the
+/// decision, not an implementation detail — `apps/server/src/routes/accounts.rs`
+/// argues it in full against `routes::platform`'s "who may issue a key". What
+/// the label buys, here, is three properties that come free:
+///
+/// * `api_keys_tenant_label_key` makes it **one live session per person**. A
+///   second `POST /v1/accounts/session` cannot silently leave the first token
+///   working — the caller has to delete it first, which is what
+///   [`revoke_session_in`] is for.
+/// * The account id is in the label, so "kill this person's session" is a
+///   statement about a row that can be written without looking anything up.
+/// * It holds **no role**. `routes::approvals::held_role` reads the approval
+///   role straight off a credential's label, and `session-<uuid>` is not the
+///   name of any role — so a console session cannot approve a payment, which is
+///   the correct default for a credential that lives in a browser.
+///
+/// Forty characters, so it is not a [`Slug`](agentos_domain::ids::Slug) — those
+/// stop at 32 — and it does not need to be: `label` is `text`, and the slug rule
+/// exists for names an operator types.
+pub fn session_label(account_id: Uuid) -> String {
+    format!("{SESSION_LABEL_PREFIX}{}", account_id.simple())
+}
+
+/// What every session label starts with, and no other label may.
+///
+/// The one reader is `routes::accounts::close_session`, which refuses to destroy
+/// a credential that is *not* a session — a customer's integration key is
+/// revoked by the platform and by nothing else. A literal in that file would be
+/// a literal that drifts from [`session_label`]'s.
+pub const SESSION_LABEL_PREFIX: &str = "session-";
+
+/// Delete this person's session key inside a transaction somebody else opened.
+///
+/// `Ok(None)` is "there was no live session", which is the ordinary case at a
+/// first login and is not an error at a deactivation either.
+///
+/// **It takes a transaction rather than a `&Db` for one reason**, and it is the
+/// reason the whole account surface is safe: deactivating a person and killing
+/// their live session have to be one commit. Two calls leave a window in which
+/// the account is closed and the token still reads — and if the second call is
+/// the one that fails, the window is forever. `accounts::deactivate` is the
+/// caller that needs this; the login path calls it too, for symmetry rather than
+/// for atomicity.
+pub(crate) async fn revoke_session_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: TenantId,
+    account_id: Uuid,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<Option<Uuid>, StoreError> {
+    let label = session_label(account_id);
+
+    // The tenant is in the predicate as well as the label, so a caller that
+    // passes the wrong pair deletes nothing rather than another tenant's key.
+    // RETURNING for the reason [`revoke`] has one: the delete and the "was there
+    // one" are one statement, and a SELECT-then-DELETE races itself.
+    let Some(row) =
+        sqlx::query("DELETE FROM api_keys WHERE tenant_id = $1 AND label = $2 RETURNING id")
+            .bind(tenant_id.as_uuid())
+            .bind(&label)
+            .fetch_optional(&mut **tx)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let id: Uuid = row.try_get("id")?;
+
+    // The same kind [`revoke`] writes, deliberately: a session key is a key, and
+    // a trail that spelled its destruction differently would be a trail where
+    // "how many credentials did this tenant lose this month" has two answers.
+    append_admin(
+        tx,
+        tenant_id,
+        &AuditEvent {
+            payload: json!({ "key_id": id.to_string(), "label": label }),
+            ..AuditEvent::new(actor.clone(), AuditKind::ApiKeyRevoked, now)
+        },
+    )
+    .await?;
+
+    Ok(Some(id))
+}
+
 /// This tenant's live keys, oldest first. Never the digests.
 ///
 /// The reason it exists: [`revoke`] takes a key id, and the only other place a
@@ -408,6 +493,84 @@ mod tests {
                 "the trail must not carry the digest: {rendered}"
             );
         }
+    }
+
+    /// **The rotation of a customer's API key, with no window of refusal.**
+    ///
+    /// Nothing here is new code, and that is the finding worth writing down: the
+    /// schema already allows a tenant more than one live key — `0044`'s unique
+    /// constraints are `(tenant_id, label)` and `secret_hash`, neither of which
+    /// is "one per tenant" — and [`lookup`] resolves a digest with no tenant
+    /// predicate and no cache. So the overlap a customer needs is issue, hand
+    /// over, revoke, and the only thing that was missing was somebody proving
+    /// it and writing the order down (`docs/DEPLOY_VPS.md`).
+    ///
+    /// What this test pins is that the order is safe in *both* directions: the
+    /// new key works before the old one is destroyed, so the customer can
+    /// deploy it at their own pace, and the old one stops on the very next
+    /// request after the revoke, so the overlap ends when the operator says so
+    /// and not when a cache expires.
+    #[tokio::test]
+    async fn two_keys_of_one_tenant_both_resolve_and_the_old_one_stops_when_it_is_revoked() {
+        let Some(db) = db().await else { return };
+        let tenant = tenant(&db, "rotate").await;
+        let (old_id, old_digest) = (Uuid::now_v7(), digest());
+        let (new_id, new_digest) = (Uuid::now_v7(), digest());
+
+        issue(
+            &db,
+            old_id,
+            tenant,
+            "ops",
+            &old_digest,
+            &actor(),
+            Utc::now(),
+        )
+        .await
+        .expect("the key in production today");
+
+        // The overlap opens. The customer is still presenting the old key.
+        issue(
+            &db,
+            new_id,
+            tenant,
+            "ops-2026-09",
+            &new_digest,
+            &actor(),
+            Utc::now(),
+        )
+        .await
+        .expect("a second live key for the same tenant");
+
+        for (digest, id) in [(&old_digest, old_id), (&new_digest, new_id)] {
+            let who = lookup(&db, digest).await.expect("lookup").expect("live");
+            assert_eq!(who.tenant_id, tenant, "both keys speak for the same tenant");
+            assert_eq!(who.key_id, id);
+        }
+        assert_eq!(
+            list(&db, tenant).await.expect("list").len(),
+            2,
+            "an operator must be able to see the overlap it opened"
+        );
+
+        // The overlap closes: only the old key does.
+        revoke(&db, old_id, &actor(), Utc::now())
+            .await
+            .expect("revoke the old one");
+        assert_eq!(
+            lookup(&db, &old_digest).await.expect("lookup"),
+            None,
+            "the retired key stops on the next request, with no cache to wait out"
+        );
+        assert_eq!(
+            lookup(&db, &new_digest)
+                .await
+                .expect("lookup")
+                .expect("live")
+                .key_id,
+            new_id,
+            "and revoking the old key must not touch the one that replaced it"
+        );
     }
 
     /// Two tenants may both call a key `ops`; one tenant may not, twice.

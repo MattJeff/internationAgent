@@ -68,7 +68,7 @@
 use std::sync::Arc;
 
 use agentos_domain::identity::{PublicKey, PublicKeyError, signing_key_ref};
-use agentos_domain::ids::SecretRefError;
+use agentos_domain::ids::{SecretRefError, TenantId};
 use agentos_providers::ProviderError;
 use agentos_providers::secrets::{Envelope, LocalEnvelopeSecretStore};
 use agentos_providers::signing::{Signature, SigningKey};
@@ -78,6 +78,7 @@ use agentos_store::signing::{self as keys, StoredKey};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Row as _;
 
 use crate::gate::{Authorized, Principal};
 
@@ -107,15 +108,235 @@ const DIGEST_KEY: &str = "payload_sha256";
 /// string, and this function will not fix that. Generate it (`openssl rand
 /// -base64 32`) and store it where the rest of the credentials live.
 ///
-/// ponytail: no key id, no versioning, no rotation path. Rotating this key
-/// means re-sealing every row, which is a migration and a maintenance window,
-/// not a constant. The real answer is KMS — where this argument becomes a key
-/// id and rotation becomes somebody else's problem — and `agentos_providers::secrets`
-/// documents that swap as a body change.
+/// # Rotation, and where the second key comes from
+///
+/// The paragraph that used to stand here said there was no rotation path and
+/// that rotating meant re-sealing every row. The first half is now false and the
+/// second half was always an overstatement: the storage is *envelope*
+/// encryption, so the master key wraps a per-row data key and nothing else.
+/// Moving to a new master key rewraps 60 bytes per row and never touches a
+/// payload — see [`LocalEnvelopeSecretStore::rewrap`] and
+/// [`rotate_master_key`]. No identity is reissued, no signature stops verifying.
+///
+/// What a rotation needs from *this* function is the overlap. Reading
+/// [`PREVIOUS_KEY_VAR`] here, rather than threading a second argument through
+/// every caller, is deliberate: this is the one place the deployment's key
+/// becomes a cipher, so it is the one place that can give **every** sealed
+/// column the same window — signing keys, MCP tokens, the tenant model key,
+/// webhook secrets — without any of their modules learning that a rotation
+/// exists. The variable is read once per cipher and a cipher is built once per
+/// process, so this is not a per-request `getenv`.
+///
+/// ponytail: an env read inside a library function, and the ceiling is that a
+/// caller cannot ask for a window this process's environment does not have. The
+/// upgrade path is KMS, where the second key is the old key id left enabled for
+/// `Decrypt` and this whole function becomes a key alias.
 pub fn envelope(master_key: &str) -> Arc<LocalEnvelopeSecretStore> {
-    Arc::new(LocalEnvelopeSecretStore::new(
-        Sha256::digest(master_key.as_bytes()).into(),
-    ))
+    let store = LocalEnvelopeSecretStore::new(Sha256::digest(master_key.as_bytes()).into());
+    let store = match std::env::var(PREVIOUS_KEY_VAR) {
+        // An empty variable is an operator who unset it the wrong way. Treating
+        // it as "no window" rather than as the SHA-256 of the empty string is
+        // the difference between a closed window and a second key nobody chose.
+        Ok(previous) if !previous.trim().is_empty() => {
+            store.with_previous(Sha256::digest(previous.as_bytes()).into())
+        }
+        _ => store,
+    };
+    Arc::new(store)
+}
+
+/// The environment variable holding the master key being retired.
+///
+/// Set it to the *old* `AGENTOS_MASTER_KEY` for the length of a rotation, and
+/// delete it once [`rotate_master_key`] reports nothing left. While it is set,
+/// both keys open a row and only the new one seals it.
+pub const PREVIOUS_KEY_VAR: &str = "AGENTOS_MASTER_KEY_PREVIOUS";
+
+// ---------------------------------------------------------------------------
+// Master key rotation
+// ---------------------------------------------------------------------------
+
+/// Every column in this schema that holds an [`Envelope`], with the column that
+/// says which tenant's context wrapped it.
+///
+/// A list, in this file, rather than each module rewrapping its own rows: the
+/// rewrap needs the tenant and nothing else — not the payload's encryption
+/// context, not the shape of the row — so per-module knowledge would buy
+/// nothing and a column that is missing from the list is a row that is still
+/// under the old key when the operator deletes it. Adding a `sealed_*` column
+/// anywhere means adding a line here; the test at the bottom of this module
+/// fails if the schema grows one that is not listed.
+const SEALED_COLUMNS: &[(&str, &str)] = &[
+    ("employee_signing_keys", "sealed_private_key"),
+    ("mcp_servers", "sealed_token"),
+    ("mcp_servers", "sealed_refresh_token"),
+    ("mcp_oauth_flows", "sealed_verifier"),
+    ("tenant_model_access", "sealed_key"),
+    ("webhook_endpoints", "sealed_secret"),
+];
+
+/// Where a rotation has got to. Every field is a row count, and the deployment
+/// is done when `under_previous` and `unreadable` are both zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RotationProgress {
+    /// Sealed rows looked at.
+    pub sealed: usize,
+    /// Rows already wrapped under the current `AGENTOS_MASTER_KEY`.
+    pub under_current: usize,
+    /// Rows that only the retiring key opens. **This is the number that has to
+    /// reach zero before the old key is deleted.**
+    pub under_previous: usize,
+    /// Rows this pass rewrapped. Zero on a `--status` run.
+    pub rewrapped: usize,
+    /// Rows neither key opens: they predate both, or they are corrupt. Never a
+    /// reason to keep going quietly — a rotation that reports "done" over one
+    /// of these has thrown away the only key that could read it.
+    pub unreadable: usize,
+}
+
+impl std::fmt::Display for RotationProgress {
+    /// One line of counts and one sentence saying what to do next, because the
+    /// operator reading this is deciding whether it is safe to delete a key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "sealed rows {}: {} under the current key, {} under the previous key, {} rewrapped \
+             this pass, {} unreadable",
+            self.sealed, self.under_current, self.under_previous, self.rewrapped, self.unreadable
+        )?;
+        if self.unreadable > 0 {
+            write!(
+                f,
+                "STOP: {} row(s) open under neither key. Do not delete {PREVIOUS_KEY_VAR} and do \
+                 not delete the backup — find out what wrapped them first.",
+                self.unreadable
+            )
+        } else if self.under_previous > 0 {
+            write!(
+                f,
+                "{} row(s) still under the previous key. Both keys must stay set; run this again.",
+                self.under_previous
+            )
+        } else {
+            write!(
+                f,
+                "Nothing is under the previous key. It is safe to unset {PREVIOUS_KEY_VAR} and \
+                 restart."
+            )
+        }
+    }
+}
+
+/// The rotation talks to the pool directly — it is the one thing here that
+/// crosses every table — so it meets `sqlx::Error` where the rest of this module
+/// meets [`StoreError`].
+fn unavailable(err: sqlx::Error) -> IdentityError {
+    IdentityError::Unavailable(StoreError::from(err))
+}
+
+/// Rewrap every sealed row from the retiring master key to the current one, or
+/// just count them.
+///
+/// `cipher` is the one [`envelope`] built, so "current" and "previous" are the
+/// deployment's own two keys and this function has no opinion about key
+/// material at all. `dry_run` counts without writing — the same scan, so the
+/// number an operator reads is produced by the code that would have done the
+/// work rather than by a second query that could disagree with it.
+///
+/// `tenant` scopes the pass. `None` is the whole deployment; `Some(id)` is one
+/// tenant, which is how a large rotation is run in pieces that can each be
+/// checked, and how a test rotates its own rows without touching a parallel
+/// test's.
+///
+/// # Why this is safe to run against a live deployment
+///
+/// * **Idempotent.** A row already under the current key is skipped, so
+///   re-running costs one AES-GCM open per row and changes nothing.
+/// * **Resumable.** There is no cursor to lose: the state is in the rows.
+/// * **It cannot lose a concurrent write.** The `UPDATE` matches on the exact
+///   bytes it read, so a row that `ensure_key` (or an OAuth refresh) rewrote
+///   between the read and the write is left alone — and picked up, already
+///   sealed under the current key, by the next pass.
+/// * **One transaction per row.** A crash halfway through leaves a partly
+///   rotated deployment, which is precisely the state the recovery window makes
+///   harmless.
+pub async fn rotate_master_key(
+    db: &Db,
+    cipher: &LocalEnvelopeSecretStore,
+    tenant: Option<TenantId>,
+    dry_run: bool,
+) -> Result<RotationProgress, IdentityError> {
+    let mut progress = RotationProgress::default();
+    let mut needed = 0usize;
+
+    for (table, column) in SEALED_COLUMNS {
+        // Identifiers are from the const above and never from a caller, so the
+        // format! cannot carry anything an operator typed. The tenant filter is
+        // a bound parameter.
+        let select = format!(
+            "SELECT tenant_id, {column} FROM {table} \
+             WHERE {column} IS NOT NULL AND ($1::uuid IS NULL OR tenant_id = $1)"
+        );
+        let mut tx = db
+            .admin_tx_bypassing_rls()
+            .await
+            .map_err(IdentityError::Unavailable)?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(select))
+            .bind(tenant.map(|t| t.as_uuid()))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(unavailable)?;
+        tx.rollback().await.map_err(unavailable)?;
+
+        for row in rows {
+            let tenant_id = TenantId::from_uuid(row.try_get("tenant_id").map_err(unavailable)?);
+            let sealed: Vec<u8> = row.try_get(*column).map_err(unavailable)?;
+            progress.sealed += 1;
+
+            // A blob that is not an envelope at all counts as unreadable rather
+            // than aborting the pass: one corrupt row must not stop the other
+            // ten thousand from being rotated.
+            let Ok(envelope) = Envelope::from_bytes(&sealed) else {
+                progress.unreadable += 1;
+                continue;
+            };
+            match cipher.rewrap(tenant_id, &envelope) {
+                Ok(None) => progress.under_current += 1,
+                Ok(Some(fresh)) => {
+                    needed += 1;
+                    if dry_run {
+                        continue;
+                    }
+                    let update = format!(
+                        "UPDATE {table} SET {column} = $1 WHERE tenant_id = $2 AND {column} = $3"
+                    );
+                    let mut tx = db
+                        .admin_tx_bypassing_rls()
+                        .await
+                        .map_err(IdentityError::Unavailable)?;
+                    let done = sqlx::query(sqlx::AssertSqlSafe(update))
+                        .bind(fresh.to_bytes())
+                        .bind(tenant_id.as_uuid())
+                        .bind(&sealed)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(unavailable)?;
+                    tx.commit().await.map_err(unavailable)?;
+                    if done.rows_affected() > 0 {
+                        progress.rewrapped += 1;
+                    }
+                }
+                Err(_) => progress.unreadable += 1,
+            }
+        }
+    }
+
+    // What is *left* under the old key, not what was found under it: after a
+    // real pass those differ by everything this run rewrapped, and the number
+    // an operator acts on is the remainder. A row whose compare-and-set matched
+    // nothing stays in it, which is what makes "run it again" the right advice.
+    progress.under_previous = needed - progress.rewrapped;
+    Ok(progress)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +897,252 @@ mod tests {
             .await
             .expect_err("the seed does not unseal");
         assert_eq!(err.code(), "secret_decrypt_failed");
+    }
+
+    // -- the rotation -------------------------------------------------------
+
+    /// The key being retired in these tests. `MASTER` is the new one, so a row
+    /// this module minted before the rotation is a row sealed under `OLD`.
+    const OLD: [u8; 32] = [3u8; 32];
+
+    /// The cipher a deployment runs **during** the window: new key for writing,
+    /// old key still accepted for reading.
+    fn during_the_window() -> LocalEnvelopeSecretStore {
+        LocalEnvelopeSecretStore::new(MASTER).with_previous(OLD)
+    }
+
+    /// Seed a tenant, mint its key under the **old** master key, and hand back
+    /// the principal — the state every deployment is in when a rotation starts.
+    async fn seeded_under_the_old_key(db: &Db) -> Principal {
+        let (principal, _) = seed(db, "active").await;
+        Identity::new(
+            db.clone(),
+            Arc::new(LocalEnvelopeSecretStore::new(OLD)),
+            principal.clone(),
+        )
+        .ensure_key()
+        .await
+        .expect("mint under the retiring key");
+        principal
+    }
+
+    /// **The recovery period.** A row sealed under the old key still signs while
+    /// both keys are configured, with nothing rewrapped yet.
+    ///
+    /// This is the property that makes a rotation something an operator dares
+    /// start: the new key can be deployed *before* a single row has moved.
+    #[tokio::test]
+    async fn a_row_under_the_retiring_key_still_opens_during_the_window() {
+        let Some(db) = db().await else { return };
+        let principal = seeded_under_the_old_key(&db).await;
+
+        // The new key alone does not open it — so the window is doing the work
+        // below, and not some accident of the fixture.
+        let new_only = Identity::new(
+            db.clone(),
+            Arc::new(LocalEnvelopeSecretStore::new(MASTER)),
+            principal.clone(),
+        );
+        assert_eq!(
+            new_only
+                .sign(&token(&db, &principal).await, PAYLOAD)
+                .await
+                .expect_err("the new key was not what sealed this row")
+                .code(),
+            "secret_decrypt_failed"
+        );
+
+        let windowed = Identity::new(db.clone(), Arc::new(during_the_window()), principal.clone());
+        let signature = windowed
+            .sign(&token(&db, &principal).await, PAYLOAD)
+            .await
+            .expect("both keys are valid for reading");
+        assert!(verify(
+            &windowed.public_key().await.expect("published"),
+            PAYLOAD,
+            &signature
+        ));
+    }
+
+    /// **After the rewrap.** The same row now opens under the new key alone, and
+    /// the old key on its own is worthless — which is what makes deleting it a
+    /// real retirement rather than a hopeful one.
+    ///
+    /// The identity itself is untouched: the `kid` published before the rotation
+    /// is the `kid` published after it, so no signature already in the world
+    /// stops verifying.
+    #[tokio::test]
+    async fn after_the_rewrap_the_row_needs_the_new_key_and_the_identity_is_unchanged() {
+        let Some(db) = db().await else { return };
+        let principal = seeded_under_the_old_key(&db).await;
+        let windowed = Identity::new(db.clone(), Arc::new(during_the_window()), principal.clone());
+        let before = windowed.public_key().await.expect("published");
+
+        let progress =
+            rotate_master_key(&db, &during_the_window(), Some(principal.tenant_id), false)
+                .await
+                .expect("rotate");
+        assert!(progress.rewrapped >= 1, "{progress}");
+
+        // The new key alone, which is the deployment after the window closes.
+        let after_the_window = Identity::new(
+            db.clone(),
+            Arc::new(LocalEnvelopeSecretStore::new(MASTER)),
+            principal.clone(),
+        );
+        let signature = after_the_window
+            .sign(&token(&db, &principal).await, PAYLOAD)
+            .await
+            .expect("the row moved onto the new key");
+        assert_eq!(
+            after_the_window.public_key().await.expect("published"),
+            before,
+            "a rewrap re-encrypts the envelope, never the identity inside it"
+        );
+        assert!(verify(&before, PAYLOAD, &signature));
+
+        // And the retired key opens nothing.
+        let retired = Identity::new(
+            db.clone(),
+            Arc::new(LocalEnvelopeSecretStore::new(OLD)),
+            principal.clone(),
+        );
+        assert_eq!(
+            retired
+                .sign(&token(&db, &principal).await, PAYLOAD)
+                .await
+                .expect_err("the old key is retired")
+                .code(),
+            "secret_decrypt_failed"
+        );
+    }
+
+    /// **The counter.** How many rows are left under the old key, before and
+    /// after — and the sentence an operator reads to decide whether it is safe
+    /// to delete it.
+    ///
+    /// `--status` is asserted to write nothing, because a status run that
+    /// silently rotated would make every "is it safe yet?" check a rotation.
+    #[tokio::test]
+    async fn the_count_of_rows_under_the_old_key_falls_to_zero_and_says_so() {
+        let Some(db) = db().await else { return };
+        let principal = seeded_under_the_old_key(&db).await;
+        let scope = Some(principal.tenant_id);
+
+        let before = rotate_master_key(&db, &during_the_window(), scope, true)
+            .await
+            .expect("status");
+        assert_eq!(before.sealed, 1);
+        assert_eq!(before.under_previous, 1, "{before}");
+        assert_eq!(before.rewrapped, 0, "--status must not write");
+        assert_eq!(before.unreadable, 0, "{before}");
+        assert!(
+            before
+                .to_string()
+                .contains("1 row(s) still under the previous key"),
+            "{before}"
+        );
+
+        // Twice, because a status run that had written would show zero here.
+        let again = rotate_master_key(&db, &during_the_window(), scope, true)
+            .await
+            .expect("status");
+        assert_eq!(again, before);
+
+        let done = rotate_master_key(&db, &during_the_window(), scope, false)
+            .await
+            .expect("rotate");
+        assert_eq!(done.rewrapped, 1, "{done}");
+        assert_eq!(done.under_previous, 0, "{done}");
+        assert!(
+            done.to_string()
+                .contains("safe to unset AGENTOS_MASTER_KEY_PREVIOUS"),
+            "{done}"
+        );
+
+        // Idempotent: the second pass finds everything already current and
+        // writes nothing.
+        let settled = rotate_master_key(&db, &during_the_window(), scope, false)
+            .await
+            .expect("rotate again");
+        assert_eq!(settled.under_current, 1);
+        assert_eq!(settled.rewrapped, 0);
+        assert_eq!(settled.under_previous, 0);
+
+        // And with only the new key configured — the deployment after the
+        // window has closed — nothing is unreadable. This is the check that
+        // says the old key can go in the bin.
+        let closed = rotate_master_key(&db, &LocalEnvelopeSecretStore::new(MASTER), scope, true)
+            .await
+            .expect("status");
+        assert_eq!(closed.unreadable, 0, "{closed}");
+        assert_eq!(closed.under_current, 1, "{closed}");
+    }
+
+    /// A row neither key opens is counted, loudly, and never passed over as
+    /// "done". The rotation reports it and keeps going, because one corrupt row
+    /// must not strand the other ten thousand.
+    #[tokio::test]
+    async fn a_row_no_key_opens_is_reported_and_does_not_stop_the_pass() {
+        let Some(db) = db().await else { return };
+        let principal = seeded_under_the_old_key(&db).await;
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "UPDATE employee_signing_keys SET sealed_private_key = $1 WHERE tenant_id = $2",
+        )
+        .bind(vec![0xffu8; 64])
+        .bind(principal.tenant_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("corrupt the row");
+        tx.commit().await.expect("commit");
+
+        let progress =
+            rotate_master_key(&db, &during_the_window(), Some(principal.tenant_id), false)
+                .await
+                .expect("a corrupt row is a count, not an abort");
+        assert_eq!(progress.unreadable, 1, "{progress}");
+        assert!(
+            progress.to_string().starts_with("sealed rows 1"),
+            "{progress}"
+        );
+        assert!(
+            progress.to_string().contains("STOP"),
+            "an unreadable row must not read as a finished rotation: {progress}"
+        );
+    }
+
+    /// Every `sealed_*` column in the schema is in [`SEALED_COLUMNS`].
+    ///
+    /// The failure this catches is the only way the rotation can lie: a column
+    /// added later is a column still under the old key when the operator reads
+    /// "nothing left" and deletes it. Asking `information_schema` rather than
+    /// keeping a second list means the test cannot drift the way the list can.
+    #[tokio::test]
+    async fn no_sealed_column_is_missing_from_the_rotation() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        let found: Vec<(String, String)> = sqlx::query_as(
+            "SELECT table_name, column_name FROM information_schema.columns \
+              WHERE table_schema = 'public' AND column_name LIKE 'sealed%' \
+              ORDER BY table_name, column_name",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("information_schema");
+        tx.rollback().await.expect("rollback");
+
+        for (table, column) in &found {
+            assert!(
+                SEALED_COLUMNS
+                    .iter()
+                    .any(|(t, c)| *t == table && *c == column),
+                "{table}.{column} holds an envelope and no rotation pass touches it. Add it to \
+                 SEALED_COLUMNS."
+            );
+        }
+        assert!(!found.is_empty(), "the query itself must not be vacuous");
     }
 
     /// The regression that matters most: no rendering of anything this module

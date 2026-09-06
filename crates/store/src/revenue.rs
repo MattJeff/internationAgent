@@ -1793,9 +1793,35 @@ pub enum Event<'a> {
     },
     /// A proposal went out. Commercial terms belong to a human decision; the
     /// approval is on the opportunity.
+    ///
+    /// **Kept exactly as it was**, and not repurposed: it says an offer was
+    /// made and names nothing more. The three quote variants below are what it
+    /// could never say, and `0090` adds them beside it rather than in place of
+    /// it — rows already written under this kind stay true.
     ProposalSent {
         /// Who received it.
         contact_id: Uuid,
+    },
+    /// A priced **document** went out: one row of `sales_quotes` and one PDF.
+    ///
+    /// `quote_id` is not optional, for `Event::EvidenceShared`'s reason one
+    /// variant up: a claim without the row that is it cannot be re-read. `0090`
+    /// repeats the rule as `opportunity_events_has_quote`.
+    QuoteIssued {
+        /// The document.
+        quote_id: Uuid,
+    },
+    /// They said yes to it. Asserted by an operator — nothing here observes a
+    /// signature — see `apps/server/src/routes/quotes.rs`.
+    QuoteAccepted {
+        /// The document they accepted.
+        quote_id: Uuid,
+    },
+    /// They said no to it. Not a loss: the next version says which quote it
+    /// replaces.
+    QuoteDeclined {
+        /// The document they refused.
+        quote_id: Uuid,
     },
     /// They pushed back.
     ObjectionRaised {
@@ -1830,8 +1856,8 @@ pub enum Event<'a> {
 }
 
 impl<'a> Event<'a> {
-    /// `(kind, contact_id, evidence_id, objection, to_stage, close_reason)` as
-    /// the table stores them.
+    /// `(kind, contact_id, evidence_id, objection, to_stage, close_reason,
+    /// quote_id)` as the table stores them.
     #[allow(clippy::type_complexity)]
     const fn parts(
         self,
@@ -1842,6 +1868,7 @@ impl<'a> Event<'a> {
         Option<&'static str>,
         Option<&'a str>,
         Option<&'a str>,
+        Option<Uuid>,
     ) {
         match self {
             Event::OutreachSent {
@@ -1854,16 +1881,29 @@ impl<'a> Event<'a> {
                 None,
                 None,
                 None,
+                None,
             ),
-            Event::ReplyReceived { contact_id } => {
-                ("reply_received", Some(contact_id), None, None, None, None)
-            }
+            Event::ReplyReceived { contact_id } => (
+                "reply_received",
+                Some(contact_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             Event::CallHeld { contact_id } => {
-                ("call_held", Some(contact_id), None, None, None, None)
+                ("call_held", Some(contact_id), None, None, None, None, None)
             }
-            Event::MeetingHeld { contact_id } => {
-                ("meeting_held", Some(contact_id), None, None, None, None)
-            }
+            Event::MeetingHeld { contact_id } => (
+                "meeting_held",
+                Some(contact_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             Event::EvidenceShared {
                 contact_id,
                 evidence_id,
@@ -1874,15 +1914,44 @@ impl<'a> Event<'a> {
                 None,
                 None,
                 None,
+                None,
             ),
-            Event::ProposalSent { contact_id } => {
-                ("proposal_sent", Some(contact_id), None, None, None, None)
+            Event::ProposalSent { contact_id } => (
+                "proposal_sent",
+                Some(contact_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Event::QuoteIssued { quote_id } => {
+                ("quote_issued", None, None, None, None, None, Some(quote_id))
             }
+            Event::QuoteAccepted { quote_id } => (
+                "quote_accepted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(quote_id),
+            ),
+            Event::QuoteDeclined { quote_id } => (
+                "quote_declined",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(quote_id),
+            ),
             Event::ObjectionRaised { objection } => (
                 "objection_raised",
                 None,
                 None,
                 Some(objection.as_str()),
+                None,
                 None,
                 None,
             ),
@@ -1893,16 +1962,35 @@ impl<'a> Event<'a> {
                 Some(objection.as_str()),
                 None,
                 None,
+                None,
             ),
-            Event::StageChanged { to, close_reason } => {
-                ("stage_changed", None, None, None, Some(to), close_reason)
-            }
-            Event::OptOutReceived { contact_id } => {
-                ("opt_out_received", Some(contact_id), None, None, None, None)
-            }
-            Event::NoResponse { contact_id } => {
-                ("no_response", Some(contact_id), None, None, None, None)
-            }
+            Event::StageChanged { to, close_reason } => (
+                "stage_changed",
+                None,
+                None,
+                None,
+                Some(to),
+                close_reason,
+                None,
+            ),
+            Event::OptOutReceived { contact_id } => (
+                "opt_out_received",
+                Some(contact_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Event::NoResponse { contact_id } => (
+                "no_response",
+                Some(contact_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         }
     }
 }
@@ -1942,7 +2030,8 @@ pub async fn record_event(
     id: Uuid,
     event: &NewEvent<'_>,
 ) -> Result<(), RevenueError> {
-    let (kind, contact_id, evidence_id, objection, to_stage, close_reason) = event.event.parts();
+    let (kind, contact_id, evidence_id, objection, to_stage, close_reason, quote_id) =
+        event.event.parts();
 
     let _: (Uuid,) = sqlx::query_as(
         "WITH before AS ( \
@@ -1960,10 +2049,10 @@ pub async fn record_event(
          ) \
          INSERT INTO opportunity_events \
              (id, tenant_id, opportunity_id, contact_id, employee_id, kind, from_stage, \
-              to_stage, objection, message_id, evidence_id, occurred_at) \
+              to_stage, objection, message_id, evidence_id, occurred_at, quote_id) \
          SELECT $1, $2, $3, $4::uuid, $5::uuid, $6::text, \
                 CASE WHEN $7::text IS NOT NULL THEN before.stage END, $7::text, $10::text, \
-                $11::uuid, $12::uuid, $9::timestamptz \
+                $11::uuid, $12::uuid, $9::timestamptz, $13::uuid \
            FROM before, touched \
          RETURNING id",
     )
@@ -1979,6 +2068,7 @@ pub async fn record_event(
     .bind(objection)
     .bind(event.message_id)
     .bind(evidence_id)
+    .bind(quote_id)
     .fetch_one(&mut ***tx)
     .await?;
 

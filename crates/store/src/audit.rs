@@ -355,6 +355,13 @@ pub enum AuditKind {
     /// the figure did not match the demand. Nothing was marked paid; the
     /// payload carries both amounts so a person can decide.
     InvoicePaymentMismatch,
+    /// A quote was accepted or declined, and who said so. The payload names the
+    /// quote, the answer (`"accepted"` / `"declined"`) and its `source` —
+    /// `"operator"` today, and a provider's name the day a signature service
+    /// reports back. Same shape as [`AuditKind::InvoicePaid`], for the same
+    /// reason: a document that binds the company has two possible authors and
+    /// the row has to say which.
+    QuoteAnswered,
 }
 
 impl AuditKind {
@@ -380,6 +387,7 @@ impl AuditKind {
             AuditKind::ApiKeyRevoked => "api_key_revoked",
             AuditKind::WebhookEndpointRegistered => "webhook_endpoint_registered",
             AuditKind::InvoicePaid => "invoice_paid",
+            AuditKind::QuoteAnswered => "quote_answered",
             AuditKind::InvoicePaymentMismatch => "invoice_payment_mismatch",
         }
     }

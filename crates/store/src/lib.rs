@@ -11,6 +11,7 @@
 //! and this header went on making it.
 
 pub mod a2a; // U28
+pub mod accounts; // vague 3: une personne ouvre la console, et un seul locataire avec
 pub mod api_keys; // wave J: a keyring that outlives the deployment that made it
 pub mod approvals; // U13
 pub mod audit; // U11
@@ -37,6 +38,7 @@ pub mod provisioning; // U8
 pub mod psyche;
 // le registre public: ce que la gate a refusé, agrégé, sur consentement explicite
 pub mod public_register;
+pub mod quotes; // le devis : ce qui a été proposé avant qu'on facture
 pub mod revenue; // wave 12: seller vertical
 pub mod signing;
 pub mod sourcing;
