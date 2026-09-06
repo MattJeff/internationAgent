@@ -60,14 +60,23 @@
 //! spells its binding exactly like `Step::Whatsapp`'s shared company sender —
 //! see `ProvisioningEngine::take_pooled_slot`.
 //!
-//! # Orphans are never retried
+//! # Orphans are never retried blindly
 //!
 //! An intent left `in_flight` by a worker whose lease has lapsed has an
 //! **unknown outcome** — the phone number may or may not have been bought, and
 //! nothing we hold says which. Retrying it is how you buy two. So the engine
-//! files an approval for a human, marks the intent `orphaned`, and refuses to
-//! touch that step again: every later pass sees the `orphaned` intent and
-//! parks. The refusal is durable, not a flag in this process's memory.
+//! files an approval for a human, marks the intent `orphaned` naming that
+//! approval, and refuses to touch that step again: every later pass sees the
+//! `orphaned` intent and parks. The refusal is durable, not a flag in this
+//! process's memory.
+//!
+//! It is a refusal, not a grave. A blind retry is forbidden; a retry a human
+//! authorised is precisely what granting that approval *means*, so the pass
+//! that finds the accord granted spends it, clears the orphanage and carries
+//! on under the same idempotency key —
+//! [`agentos_store::provisioning::resume_orphaned_intent`]. The accord is
+//! consumed by the resumption, so a second death asks a human again rather
+//! than helping itself to the first one's answer.
 //!
 //! That is the *only* thing here that needs a human. A step that failed with an
 //! answer — a 4xx, an exhausted retry budget — is retried freely, because the
@@ -80,7 +89,7 @@ use std::time::Duration;
 
 use agentos_domain::action::{Action, McpTool};
 use agentos_domain::employee::{Employee, Lifecycle, ProviderBinding, ResourceState, Step};
-use agentos_domain::ids::{EmployeeId, IdempotencyKey, SecretRef, Slug, TenantId};
+use agentos_domain::ids::{ApprovalId, EmployeeId, IdempotencyKey, SecretRef, Slug, TenantId};
 use agentos_domain::phone_pool::NumberStrategy;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::email::EmailProvider;
@@ -1045,10 +1054,15 @@ impl ProvisioningEngine {
             // is not claimed, not retried, and not touched again: the intent
             // becomes `orphaned`, which every later pass will see, and a human
             // gets the question.
+            //
+            // The question is filed first so the intent can name it. That link
+            // is what makes the answer belong to *this* orphanage rather than
+            // to the step in general — see `resume_orphaned_intent`.
             let key = IdempotencyKey::for_step(employee.id(), step.as_str());
-            provisioning::mark_intent_orphaned(&mut tx, &key, now).await?;
-            self.file_reconciliation(&mut tx, employee, step, now)
+            let approval = self
+                .file_reconciliation(&mut tx, employee, step, now)
                 .await?;
+            provisioning::mark_intent_orphaned(&mut tx, &key, approval, now).await?;
             tx.commit().await?;
             tracing::warn!(
                 employee = %employee.id().as_uuid(), step = %step,
@@ -1104,10 +1118,21 @@ impl ProvisioningEngine {
         .await?;
 
         if intent == IntentState::Orphaned {
-            // Already parked by an earlier pass. Roll back so this pass leaves
-            // no trace at all — including the claim we just took.
-            tx.rollback().await?;
-            return Ok(Claimed::Parked);
+            // Parked by an earlier pass. The one thing that unparks it is the
+            // human having granted the reconciliation approval that orphanage
+            // filed — a blind retry is forbidden, an authorised one is what the
+            // approval says. Spending it is the same statement that clears the
+            // orphanage, so the next death asks again.
+            if !provisioning::resume_orphaned_intent(&mut tx, claim.idempotency_key(), now).await? {
+                // Still nobody's answer. Roll back so this pass leaves no trace
+                // at all — including the claim we just took.
+                tx.rollback().await?;
+                return Ok(Claimed::Parked);
+            }
+            tracing::info!(
+                employee = %employee.id().as_uuid(), step = %step,
+                "reconciliation approved by a human; resuming the parked step"
+            );
         }
 
         tx.commit().await?;
@@ -1144,7 +1169,9 @@ impl ProvisioningEngine {
     }
 
     /// File the one thing a human must look at: a provider call whose outcome
-    /// nobody knows.
+    /// nobody knows. Returns the approval's id, which the caller writes onto
+    /// the intent so that granting *this* request — and not some older one for
+    /// the same step — is what allows the retry.
     ///
     /// ponytail: an `Action::McpCall` named `provisioning/<step>`, because
     /// `Action` is a closed domain enum with no "reconcile a provider resource"
@@ -1156,7 +1183,7 @@ impl ProvisioningEngine {
         employee: &Employee,
         step: Step,
         now: DateTime<Utc>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<ApprovalId, EngineError> {
         let action = Action::McpCall {
             tool: reconcile_tool(step),
         };
@@ -1169,7 +1196,7 @@ impl ProvisioningEngine {
             employee.id().as_uuid(),
             IdempotencyKey::for_step(employee.id(), step.as_str()).as_str(),
         );
-        approvals::create(
+        let requested = approvals::create(
             tx,
             &NewApproval {
                 employee_id: Some(employee.id()),
@@ -1182,7 +1209,7 @@ impl ProvisioningEngine {
             now,
         )
         .await?;
-        Ok(())
+        Ok(requested.id())
     }
 
     // -- the call ----------------------------------------------------------
@@ -2799,6 +2826,338 @@ mod tests {
             count(&db, &employee, "SELECT count(*) FROM approvals").await,
             1,
             "a parked step asks once, not once per pass"
+        );
+    }
+
+    // -- the way back out of a park ----------------------------------------
+
+    /// Kill a run inside the telephony call and wait for its lease to lapse.
+    ///
+    /// Returns nothing: what it leaves behind is a `provisioning` row holding a
+    /// dead worker's expired lease and an `in_flight` intent, which is the
+    /// whole starting position of every test below.
+    async fn kill_mid_call(
+        db: &Db,
+        employee: &Employee,
+        telephony: &Arc<HangingTelephony>,
+        email: &Arc<MockEmailProvider>,
+        cfg: &EngineConfig,
+    ) {
+        let dying = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), email.clone()),
+            cfg.clone(),
+        );
+        let (tenant_id, employee_id) = (employee.tenant_id(), employee.id());
+        let run = tokio::spawn(async move { dying.converge(tenant_id, employee_id).await });
+        tokio::time::timeout(Duration::from_secs(20), telephony.entered.notified())
+            .await
+            .expect(
+                "`converge` never entered `ensure_number`, so there was no in-flight \
+                 provider call to kill. Does `Step::Phone` still get scheduled, and does \
+                 the engine still reach the telephony port for it?",
+            );
+        run.abort();
+        let _ = run.await;
+        // The lease has to lapse before the next pass can see the crash.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// A lease short enough that a crash is visible within a test.
+    fn dying_cfg() -> EngineConfig {
+        EngineConfig {
+            lease: TimeDelta::milliseconds(200),
+            ..cfg()
+        }
+    }
+
+    /// What the approvals route commits when a human grants the reconciliation.
+    /// Returns how many were granted, so a test can assert it granted the one
+    /// it meant to.
+    async fn grant_pending(db: &Db, employee: &Employee) -> u64 {
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        let done = sqlx::query(
+            "UPDATE approvals SET state = 'redeemed', decided_at = now(), \
+                                  decided_by = 'an-operator' \
+             WHERE employee_id = $1 AND state = 'pending'",
+        )
+        .bind(employee.id().as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("grant");
+        tx.commit().await.expect("commit grant");
+        done.rows_affected()
+    }
+
+    /// **The production bug.** A seat whose worker died mid-purchase, whose
+    /// human answered the question, and which then went round in circles for
+    /// eleven hours because `orphaned` had no way out.
+    ///
+    /// The accord is not permission to buy a second number: the resumed call
+    /// goes to the provider under the same derived idempotency key and comes
+    /// back with the number that was already bought.
+    #[tokio::test]
+    async fn a_reconciliation_a_human_granted_resumes_the_parked_step() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(HangingTelephony::hanging());
+        let email = Arc::new(MockEmailProvider::new());
+        let cfg = dying_cfg();
+        kill_mid_call(&db, &employee, &telephony, &email, &cfg).await;
+
+        let engine =
+            ProvisioningEngine::new(db.clone(), adapters(telephony.clone(), email.clone()), cfg);
+
+        // The pass after the crash parks the step and asks a human.
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge after the crash");
+        assert_eq!(reports.get(&Step::Phone), Some(&StepReport::Parked));
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM approvals").await,
+            1
+        );
+
+        // ---- the human answers -------------------------------------------
+        assert_eq!(grant_pending(&db, &employee).await, 1);
+        // ...and the provider, which was black-holed, is reachable again.
+        telephony.hang.store(false, Ordering::SeqCst);
+
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge after the accord");
+
+        assert_eq!(
+            reports.get(&Step::Phone),
+            Some(&StepReport::Ready),
+            "a retry a human authorised is exactly what the approval means"
+        );
+        let (state, lease, provider, external_id, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "ready");
+        assert!(lease.is_none(), "a settled step holds no lease");
+        assert_eq!(provider.as_deref(), Some(HangingTelephony::PROVIDER));
+        assert_eq!(
+            external_id.as_deref(),
+            telephony.bought.lock().expect("poisoned").as_deref(),
+            "the resumed call returned the number that was already bought — the \
+             accord authorised a reconciliation, not a second purchase"
+        );
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM provider_intents WHERE state = 'orphaned'"
+            )
+            .await,
+            0,
+            "the orphanage is cleared, not merely stepped over"
+        );
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM provider_intents WHERE step = 'phone'"
+            )
+            .await,
+            1,
+            "the resumption reuses the intent under the same key"
+        );
+        assert_eq!(
+            reload(&db, &employee).await.health(),
+            Health::Online,
+            "the seat is provisioned"
+        );
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM approvals").await,
+            1,
+            "one question, asked once, answered once"
+        );
+    }
+
+    /// No accord, no retry. Neither a question still waiting for its human nor
+    /// somebody else's granted approval moves this step, and nothing at the
+    /// provider is touched while it waits.
+    #[tokio::test]
+    async fn an_orphan_without_a_granted_accord_stays_parked_and_touches_nothing() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(HangingTelephony::hanging());
+        let email = Arc::new(MockEmailProvider::new());
+        let cfg = dying_cfg();
+        kill_mid_call(&db, &employee, &telephony, &email, &cfg).await;
+
+        let engine =
+            ProvisioningEngine::new(db.clone(), adapters(telephony.clone(), email.clone()), cfg);
+        assert_eq!(
+            engine
+                .converge(employee.tenant_id(), employee.id())
+                .await
+                .expect("converge")
+                .get(&Step::Phone),
+            Some(&StepReport::Parked)
+        );
+
+        // A redeemed approval that is not the one this orphanage asked for —
+        // a colleague's reconciliation, granted the same afternoon. Being
+        // `redeemed` is not what authorises a retry; being *the* approval the
+        // intent names is.
+        let other = colleague(&db, employee.tenant_id(), "milo").await;
+        let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO approvals (id, tenant_id, employee_id, action_kind, state, decided_at) \
+             VALUES ($1, $2, $3, 'mcp_call', 'redeemed', now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(employee.tenant_id().as_uuid())
+        .bind(other.id().as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("someone else's answer");
+        tx.commit().await.expect("commit");
+
+        // The provider is reachable again, so nothing but the refusal itself
+        // is keeping this step parked.
+        telephony.hang.store(false, Ordering::SeqCst);
+
+        for pass in 0..3 {
+            assert_eq!(
+                engine
+                    .converge(employee.tenant_id(), employee.id())
+                    .await
+                    .expect("converge")
+                    .get(&Step::Phone),
+                Some(&StepReport::Parked),
+                "pass {pass} retried an intent nobody authorised"
+            );
+        }
+
+        assert_eq!(
+            telephony.calls(),
+            1,
+            "not one byte reached the provider for an unauthorised retry"
+        );
+        let (state, _, provider, external_id, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(state, "provisioning");
+        assert_eq!(provider, None);
+        assert_eq!(external_id, None, "nothing was bound");
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM provider_intents WHERE state = 'orphaned'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE state = 'pending'"
+            )
+            .await,
+            1,
+            "a parked step asks once, not once per pass"
+        );
+    }
+
+    /// **An accord is spent by the resumption it authorised.** The worker dies
+    /// a second time, inside the very call the human allowed; the retry that
+    /// follows is a new unknown outcome, so it needs a new answer and may not
+    /// help itself to the first one.
+    #[tokio::test]
+    async fn a_second_death_asks_a_human_again_instead_of_reusing_the_first_accord() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let telephony = Arc::new(HangingTelephony::hanging());
+        let email = Arc::new(MockEmailProvider::new());
+        let cfg = dying_cfg();
+
+        // First death, first question, first answer.
+        kill_mid_call(&db, &employee, &telephony, &email, &cfg).await;
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(telephony.clone(), email.clone()),
+            cfg.clone(),
+        );
+        assert_eq!(
+            engine
+                .converge(employee.tenant_id(), employee.id())
+                .await
+                .expect("converge")
+                .get(&Step::Phone),
+            Some(&StepReport::Parked)
+        );
+        assert_eq!(grant_pending(&db, &employee).await, 1);
+
+        // Second death: the resumed call is the one that dies, so the provider
+        // is entered a second time and abandoned a second time.
+        kill_mid_call(&db, &employee, &telephony, &email, &cfg).await;
+        assert_eq!(telephony.calls(), 2, "the accord did get its retry");
+
+        // The pass after it. There *is* a redeemed reconciliation approval for
+        // this employee and this step sitting in the database — and it buys
+        // this orphanage nothing.
+        telephony.hang.store(false, Ordering::SeqCst);
+        for pass in 0..2 {
+            assert_eq!(
+                engine
+                    .converge(employee.tenant_id(), employee.id())
+                    .await
+                    .expect("converge")
+                    .get(&Step::Phone),
+                Some(&StepReport::Parked),
+                "pass {pass} reused an accord that was already spent"
+            );
+        }
+        assert_eq!(
+            telephony.calls(),
+            2,
+            "the second unknown outcome was not retried on the first answer"
+        );
+        assert_eq!(
+            count(
+                &db,
+                &employee,
+                "SELECT count(*) FROM approvals WHERE state = 'pending'"
+            )
+            .await,
+            1,
+            "the second death filed its own question"
+        );
+        assert_eq!(
+            count(&db, &employee, "SELECT count(*) FROM approvals").await,
+            2,
+            "two deaths, two questions — and not one per pass"
+        );
+
+        // And it is a live question, not a dead end: answering it resumes.
+        assert_eq!(grant_pending(&db, &employee).await, 1);
+        assert_eq!(
+            engine
+                .converge(employee.tenant_id(), employee.id())
+                .await
+                .expect("converge")
+                .get(&Step::Phone),
+            Some(&StepReport::Ready)
+        );
+        assert_eq!(telephony.calls(), 3);
+        let (_, _, _, external_id, _) = row(&db, &employee, Step::Phone).await;
+        assert_eq!(
+            external_id.as_deref(),
+            telephony.bought.lock().expect("poisoned").as_deref(),
+            "three calls, one number"
         );
     }
 

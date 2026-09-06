@@ -3167,13 +3167,22 @@ mod tests {
         let label = format!("turn-{}", employee.as_uuid().simple());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
 
-        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
-            .bind(tenant.as_uuid())
-            .bind(&label)
-            .bind(&label)
-            .execute(&mut *tx)
-            .await
-            .expect("insert tenant");
+        // Avec ses mentions légales, pour la raison écrite dans la fixture
+        // d'`effects` : depuis `0087`, une entreprise qui n'a pas dit sa forme
+        // juridique ne peut pas facturer, et un tour de finance qui émet une
+        // facture est le sujet de deux tests d'ici.
+        sqlx::query(
+            "INSERT INTO tenants (id, slug, name, legal_form, postal_address, siren, \
+                                  rcs_city, vat_number, vat_rate_bp, late_penalty_rate_bp) \
+             VALUES ($1, $2, $3, 'SAS', '1 rue de la Fixture, 75001 Paris', '552100554', \
+                     'Paris', 'FR40552100554', 2000, 1000)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(&label)
+        .bind(&label)
+        .execute(&mut *tx)
+        .await
+        .expect("insert tenant");
         sqlx::query(
             "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
              VALUES ($1, $2, 'lena', 'lena', 'active')",

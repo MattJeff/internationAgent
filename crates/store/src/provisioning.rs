@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use agentos_domain::employee::{ProviderBinding, ResourceState, Step};
-use agentos_domain::ids::{EmployeeId, IdempotencyKey};
+use agentos_domain::ids::{ApprovalId, EmployeeId, IdempotencyKey};
 
 use crate::db::{StoreError, TenantTx};
 
@@ -308,19 +308,71 @@ pub async fn begin_intent(
     IntentState::parse(&state).ok_or_else(|| StoreError::conflict("provider_intents.state"))
 }
 
-/// Give up on an intent nobody closed.
+/// Give up on an intent nobody closed, and name the approval that may bring it
+/// back.
 ///
-/// The recovery loop calls this once it has reconciled with the provider (or
-/// decided it cannot), so the row stops looking like a call still in progress.
-/// Only an `in_flight` row moves, so this cannot overwrite a real outcome.
+/// The recovery loop calls this once it has filed the reconciliation question
+/// for a human, so the row stops looking like a call still in progress. Only an
+/// `in_flight` row moves, so this cannot overwrite a real outcome.
+///
+/// `approval` is the request a human must grant before this intent may be
+/// retried: it is the only one [`resume_orphaned_intent`] will accept, and
+/// writing it here — rather than dating the orphanage and hunting for a
+/// matching approval later — is what makes an accord belong to *this*
+/// orphanage. A second death files a second approval and overwrites this link,
+/// so the first accord can never authorise the second retry.
 pub async fn mark_intent_orphaned(
+    tx: &mut TenantTx<'_>,
+    key: &IdempotencyKey,
+    approval: ApprovalId,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "UPDATE provider_intents \
+            SET state = 'orphaned', reconciliation_approval_id = $3, updated_at = $4 \
+         WHERE tenant_id = $1 AND idempotency_key = $2 AND state = 'in_flight'",
+    )
+    .bind(tx.tenant_id().as_uuid())
+    .bind(key.as_str())
+    .bind(approval.as_uuid())
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+
+    Ok(done.rows_affected() == 1)
+}
+
+/// The way back out of `orphaned`, and the only one.
+///
+/// `true` means a human granted the reconciliation approval filed at the moment
+/// of the orphanage, that accord has now been **spent**, and the intent is
+/// `in_flight` again for this caller's pass to carry on under the same
+/// idempotency key. `false` means no such accord exists — the step stays parked,
+/// exactly as before.
+///
+/// The whole guarantee is in one statement. Only the approval named by the row
+/// counts, so an accord granted for an earlier orphanage of the same step is
+/// not it; the row must still be `orphaned`, so two passes racing cannot both
+/// resume; and `reconciliation_approval_id` is cleared in the same update, so a
+/// second death — which files its own approval and overwrites the link — can
+/// never inherit the first one's permission.
+///
+/// The intent row itself is deliberately reused rather than replaced. The key
+/// is [`IdempotencyKey::for_step`], derived and therefore identical on the
+/// retry: the same row, flipped back, is what makes the resumed call reach the
+/// provider under the key it already used, which is the whole of
+/// reconcile-before-create.
+pub async fn resume_orphaned_intent(
     tx: &mut TenantTx<'_>,
     key: &IdempotencyKey,
     now: DateTime<Utc>,
 ) -> Result<bool, StoreError> {
     let done = sqlx::query(
-        "UPDATE provider_intents SET state = 'orphaned', updated_at = $3 \
-         WHERE tenant_id = $1 AND idempotency_key = $2 AND state = 'in_flight'",
+        "UPDATE provider_intents i \
+            SET state = 'in_flight', reconciliation_approval_id = NULL, updated_at = $3 \
+           FROM approvals a \
+          WHERE i.tenant_id = $1 AND i.idempotency_key = $2 AND i.state = 'orphaned' \
+            AND a.id = i.reconciliation_approval_id AND a.state = 'redeemed'",
     )
     .bind(tx.tenant_id().as_uuid())
     .bind(key.as_str())
@@ -1124,6 +1176,41 @@ mod tests {
         row
     }
 
+    /// One approval row in `state`, written straight in.
+    ///
+    /// ponytail: raw SQL rather than `approvals::create` + `approvals::redeem`.
+    /// This module cares about exactly one column of that table — `state` — and
+    /// the ceremony that produces it (canonical action, nonce, hash) is tested
+    /// where it lives. Swap in the real pair the day this needs to assert on
+    /// anything the ceremony writes.
+    async fn approval(db: &Db, tenant: TenantId, state: &str) -> ApprovalId {
+        let id = ApprovalId::new_v7(Utc::now());
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO approvals (id, tenant_id, action_kind, state) \
+             VALUES ($1, $2, 'mcp_call', $3)",
+        )
+        .bind(id.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(state)
+        .execute(&mut **tx)
+        .await
+        .expect("insert approval");
+        tx.commit().await.expect("commit approval");
+        id
+    }
+
+    /// What a human granting the reconciliation leaves behind.
+    async fn decide(db: &Db, tenant: TenantId, id: ApprovalId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query("UPDATE approvals SET state = 'redeemed', decided_at = now() WHERE id = $1")
+            .bind(id.as_uuid())
+            .execute(&mut **tx)
+            .await
+            .expect("redeem");
+        tx.commit().await.expect("commit decision");
+    }
+
     async fn count(db: &Db, tenant: TenantId, sql: &'static str) -> i64 {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         let n: i64 = sqlx::query_scalar(sql)
@@ -1639,14 +1726,15 @@ mod tests {
         );
 
         // Reconciled and written off; the sweep stops flagging a live call.
+        let asked = approval(&db, tenant, "pending").await;
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         assert!(
-            mark_intent_orphaned(&mut tx, claim.idempotency_key(), at(T0 + 1_100))
+            mark_intent_orphaned(&mut tx, claim.idempotency_key(), asked, at(T0 + 1_100))
                 .await
                 .expect("orphan")
         );
         assert!(
-            !mark_intent_orphaned(&mut tx, claim.idempotency_key(), at(T0 + 1_200))
+            !mark_intent_orphaned(&mut tx, claim.idempotency_key(), asked, at(T0 + 1_200))
                 .await
                 .expect("orphan again"),
             "only an in_flight intent moves"
@@ -1656,6 +1744,101 @@ mod tests {
             .expect("sweep");
         tx.commit().await.expect("commit");
         assert_eq!(stuck[0].in_flight_provider, None);
+
+        teardown(&db, tenant).await;
+    }
+
+    /// `orphaned` is not a grave. The accord named by the row — and only that
+    /// one, and only once — puts the intent back `in_flight` under the same
+    /// idempotency key.
+    #[tokio::test]
+    async fn only_the_accord_the_orphanage_asked_for_resumes_it_and_only_once() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db, "resume").await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let claim = claim_step(
+            &mut tx,
+            employee,
+            Step::Phone,
+            Uuid::now_v7(),
+            lease(),
+            at(T0),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        begin_intent(&mut tx, &claim, "twilio", &json!({}), at(T0))
+            .await
+            .expect("intent");
+        tx.commit().await.expect("commit");
+
+        // An accord granted for something else does not count: it is the link,
+        // not the existence of a redeemed approval, that authorises a retry.
+        let _stranger = approval(&db, tenant, "redeemed").await;
+        let asked = approval(&db, tenant, "pending").await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            mark_intent_orphaned(&mut tx, claim.idempotency_key(), asked, at(T0 + 100))
+                .await
+                .expect("orphan")
+        );
+        assert!(
+            !resume_orphaned_intent(&mut tx, claim.idempotency_key(), at(T0 + 110))
+                .await
+                .expect("resume"),
+            "a pending question is not an answer"
+        );
+        tx.commit().await.expect("commit");
+
+        // The human grants it.
+        decide(&db, tenant, asked).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            resume_orphaned_intent(&mut tx, claim.idempotency_key(), at(T0 + 200))
+                .await
+                .expect("resume")
+        );
+        // Same row, same key: the resumed call reaches the provider under the
+        // key it already used.
+        let replay = begin_intent(&mut tx, &claim, "twilio", &json!({}), at(T0 + 201))
+            .await
+            .expect("replay");
+        tx.commit().await.expect("commit");
+        assert_eq!(replay, IntentState::InFlight);
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM provider_intents").await,
+            1,
+            "the resumption reuses the intent, it does not open a second one"
+        );
+
+        // The worker dies again. A second orphanage files its own question, and
+        // the accord spent on the first one authorises nothing.
+        let asked_again = approval(&db, tenant, "pending").await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            mark_intent_orphaned(&mut tx, claim.idempotency_key(), asked_again, at(T0 + 300))
+                .await
+                .expect("orphan twice")
+        );
+        assert!(
+            !resume_orphaned_intent(&mut tx, claim.idempotency_key(), at(T0 + 310))
+                .await
+                .expect("resume"),
+            "the first accord is spent; the second death has to ask again"
+        );
+        tx.commit().await.expect("commit");
+
+        // And granting the second one does resume it, so this is a fresh
+        // question rather than a step that can never move again.
+        decide(&db, tenant, asked_again).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        assert!(
+            resume_orphaned_intent(&mut tx, claim.idempotency_key(), at(T0 + 400))
+                .await
+                .expect("resume")
+        );
+        tx.commit().await.expect("commit");
 
         teardown(&db, tenant).await;
     }

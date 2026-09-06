@@ -244,6 +244,22 @@ pub const NO_WON_DEAL: &str = "no_won_deal";
 /// silence, one act later: the register's not-found and RLS's are one answer.
 pub const NO_SUCH_INVOICE: &str = "no_such_invoice";
 
+/// The company has not written down what a French invoice must carry.
+///
+/// A refusal and not an [`EffectError::Unavailable`], for `NO_WON_DEAL`'s
+/// reason: nothing is broken, the company is not in a state where it may bill.
+/// Legal form, address, SIREN, RCS city, VAT number and either a rate or an
+/// exemption — `0087` argues each one, and `invoices::Issuer::missing_mentions`
+/// is the single list.
+///
+/// **Refused here rather than inside `invoices::issue`.** The register may hold
+/// a row an incomplete company wrote; what must never leave is a *document*.
+/// Putting the guard in `issue` would also have failed every fixture in this
+/// workspace that files an invoice to test something else, which is how a guard
+/// ends up deleted. `routes::invoices` refuses the same way, on the other
+/// document path, and both name the same constant.
+pub const ISSUER_MENTIONS_MISSING: &str = "issuer_mentions_missing";
+
 /// The address the gate ruled on is not the billed account's contact. See
 /// [`Effects::send_invoice`]: an email ruling says the seat may write there,
 /// not that this document is that address's business.
@@ -2539,6 +2555,12 @@ impl Effects {
                 // is handed back to a caller as a failure and it must not become
                 // an existence oracle for another company's opportunity ids.
                 StoreError::NotFound => EffectError::Refused(NO_WON_DEAL),
+                // Le seul `Conflict` que `write_invoice` fabrique lui-même. Un
+                // conflit du store est une panne ; celui-ci est une décision,
+                // et il doit arriver à l'employé comme un refus nommé.
+                StoreError::Conflict(ref code) if code == ISSUER_MENTIONS_MISSING => {
+                    EffectError::Refused(ISSUER_MENTIONS_MISSING)
+                }
                 other => EffectError::Unavailable(other),
             });
 
@@ -2566,6 +2588,20 @@ impl Effects {
         draft: &InvoiceDraft,
     ) -> Result<(), StoreError> {
         let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
+        // Before the number is claimed. An invoice numbered and then refused
+        // would leave a hole in a sequence the tax authority reads as a
+        // deletion — `0071` makes the counter gapless on purpose, so the only
+        // safe place to say no is upstream of it.
+        let missing = invoices::issuer(&mut tx).await?.missing_mentions();
+        if !missing.is_empty() {
+            tx.rollback().await?;
+            tracing::warn!(
+                tenant_id = %self.principal.tenant_id,
+                missing = ?missing,
+                "an invoice was refused: this company has not written its legal mentions"
+            );
+            return Err(StoreError::Conflict(ISSUER_MENTIONS_MISSING.to_owned()));
+        }
         let written = invoices::issue(
             &mut tx,
             invoices::Draft {
@@ -3563,13 +3599,24 @@ mod tests {
         let label = format!("fx-{}", employee.as_uuid().simple());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
 
-        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
-            .bind(tenant.as_uuid())
-            .bind(&label)
-            .bind(&label)
-            .execute(&mut *tx)
-            .await
-            .expect("insert tenant");
+        // Les mentions légales avec le locataire, et pas après : depuis `0087`
+        // une entreprise qui n'a pas écrit sa forme juridique, son adresse, son
+        // SIREN, son RCS et sa TVA ne peut pas facturer — `write_invoice`
+        // refuse avant même de réclamer un numéro. Une fixture sans elles
+        // décrit une entreprise qui n'a pas le droit d'émettre, ce qui n'est le
+        // sujet d'aucun des tests d'ici.
+        sqlx::query(
+            "INSERT INTO tenants (id, slug, name, legal_form, postal_address, siren, \
+                                  rcs_city, vat_number, vat_rate_bp, late_penalty_rate_bp) \
+             VALUES ($1, $2, $3, 'SAS', '1 rue de la Fixture, 75001 Paris', '552100554', \
+                     'Paris', 'FR40552100554', 2000, 1000)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(&label)
+        .bind(&label)
+        .execute(&mut *tx)
+        .await
+        .expect("insert tenant");
         sqlx::query(
             "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
              VALUES ($1, $2, 'lena', 'lena', 'active')",
@@ -5437,6 +5484,62 @@ mod tests {
     /// stops a hundred invoices to strangers, so the assertion is on the
     /// refusal — and on the audit row, because a refused demand for money is
     /// exactly the thing an operator has to be able to see afterwards.
+    /// **Le garde-fou mord, et il mord avant le numéro.**
+    ///
+    /// `0071` rend le compteur de factures sans trou, exprès : une numérotation
+    /// à trous se lit comme une suppression. Refuser après avoir réclamé un
+    /// numéro fabriquerait donc le trou que la migration interdit — le seul
+    /// endroit sûr pour dire non est en amont du compteur, et c'est ce que ce
+    /// test asserte : le registre est vide *et* le refus est au journal.
+    ///
+    /// La fixture écrit les mentions avec le locataire ; ici on les efface,
+    /// parce que c'est l'état d'une entreprise qui vient d'être créée et n'a
+    /// pas encore dit sous quelle forme juridique elle facture.
+    #[tokio::test]
+    async fn a_company_that_has_not_written_its_legal_mentions_cannot_invoice() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = won_deal(&db, &principal).await;
+
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "UPDATE tenants SET legal_form = NULL, postal_address = NULL, siren = NULL, \
+                                rcs_city = NULL, vat_number = NULL, vat_rate_bp = NULL \
+             WHERE id = $1",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("wipe the mentions");
+        admin.commit().await.expect("commit");
+
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let token = gate(&db)
+            .authorize(&principal, billed(120_000))
+            .await
+            .expect("the gate permits the verb");
+        let err = effects
+            .issue_invoice(token, &draft(opportunity))
+            .await
+            .expect_err("a company with no legal mentions may not bill");
+        assert_eq!(err.code(), ISSUER_MENTIONS_MISSING);
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let register = agentos_store::invoices::register(&mut tx)
+            .await
+            .expect("read the register");
+        tx.rollback().await.expect("rollback");
+        assert!(register.is_empty(), "no number was claimed");
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "the refusal is on the record");
+        assert_eq!(rows[0].1["error"], json!(ISSUER_MENTIONS_MISSING));
+    }
+
     #[tokio::test]
     async fn an_authorised_seat_still_cannot_invoice_a_deal_nobody_won() {
         let Some(db) = db().await else { return };
