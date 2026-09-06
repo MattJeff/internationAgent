@@ -690,6 +690,7 @@ fn app(
             // `allow(dead_code)` each carried made the compiler agree to say
             // nothing about it. Mounted here, once, on purpose.
             .merge(routes::autonomy::router(db.clone()))
+            .merge(routes::events::router(db.clone()))
             // Beside `autonomy`, deliberately: "how much of the work was the
             // agent's" and "what did it burn doing it" are the same question
             // asked twice, they share a window parser, and an operator reading
@@ -709,6 +710,7 @@ fn app(
             // And the third reading, beside the two it reconciles: what the
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
+            .merge(routes::outreach::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))
             .merge(routes::accounting::router(db.clone()))

@@ -554,14 +554,200 @@ async fn one(tx: &mut TenantTx<'_>, row: Option<PgRow>) -> Result<Option<Invoice
 /// this crate speaks SQL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parties {
-    /// The company issuing it: `tenants.name`, which is the only name this
-    /// workspace holds for a tenant.
-    pub issuer: String,
+    /// The company issuing it, with the mentions its invoices must carry.
+    pub issuer: Issuer,
     /// The account the deal was won with: `accounts.legal_name`.
     pub account: String,
     /// Where the demand is sent: the account's primary active contact with an
     /// address, else any active one with an address, else nobody.
     pub contact_email: Option<String>,
+}
+
+/// The issuing company as a French invoice has to name it: `tenants` (0001) and
+/// the mentions `0087` added beside them.
+///
+/// Every field but the name is `Option`, and that is the schema's shape rather
+/// than laxity — a tenant created before `0087`, or by a runbook that has not
+/// reached the billing step, has none of them. [`Issuer::missing_mentions`] is
+/// the one place that says which absences make a document unissuable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issuer {
+    /// `tenants.name`, the only name this workspace holds for a tenant.
+    pub name: String,
+    /// « SAS », « SARL »… — the legal form, beside the name.
+    pub legal_form: Option<String>,
+    /// The registered office, on one line.
+    pub address: Option<String>,
+    /// Nine digits.
+    pub siren: Option<String>,
+    /// The town of the registry: "RCS Paris 123 456 789".
+    pub rcs_city: Option<String>,
+    /// The intra-community VAT number.
+    pub vat_number: Option<String>,
+    /// The default rate in basis points, **never zero** — 0087's CHECK. `None`
+    /// is "not subject to VAT", which is why it demands
+    /// [`Issuer::vat_exemption_reason`] rather than defaulting to a rate.
+    pub vat_rate_bp: Option<i32>,
+    /// The sentence that replaces VAT when it does not apply. Exclusive with
+    /// [`Issuer::vat_rate_bp`], by 0087's CHECK.
+    pub vat_exemption_reason: Option<String>,
+    /// Late-payment penalties, in basis points a year.
+    pub late_penalty_rate_bp: Option<i32>,
+}
+
+/// The names of the mentions, as an API reports them and as
+/// [`Issuer::missing_mentions`] returns them.
+///
+/// Stable strings rather than a message: they are what a `detail` lists, so a
+/// caller can map each one to the field of its own form.
+pub const MENTION_LEGAL_FORM: &str = "legal_form";
+pub const MENTION_POSTAL_ADDRESS: &str = "postal_address";
+pub const MENTION_SIREN: &str = "siren";
+pub const MENTION_RCS_CITY: &str = "rcs_city";
+pub const MENTION_LATE_PENALTY_RATE: &str = "late_penalty_rate_bp";
+/// One name for both halves of the exclusive pair: a tenant owes *either* a rate
+/// (with its intra-community number, which 0087 makes inseparable from it) *or*
+/// the sentence that says why there is none. Two names would suggest a document
+/// could want both.
+pub const MENTION_VAT_RATE_OR_EXEMPTION: &str = "vat_rate_bp_or_vat_exemption_reason";
+
+/// The company as one line: the name, and the legal form when there is one.
+///
+/// The form belongs beside the name wherever the company is named — the PDF's
+/// letterhead, and the subject and body of the email that carries it — so it is
+/// this impl rather than a `format!` at each site. A tenant with no
+/// `legal_form` renders exactly `tenants.name`, which is what every caller
+/// printed before `0087`.
+impl std::fmt::Display for Issuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.legal_form {
+            Some(form) if !form.trim().is_empty() => write!(f, "{} {}", self.name, form.trim()),
+            _ => f.write_str(&self.name),
+        }
+    }
+}
+
+impl Issuer {
+    /// The obligatory mentions this company has not written down, in a stable
+    /// order.
+    ///
+    /// Empty is "this company may issue". Everything here is a fact about the
+    /// *issuer*, never about a particular invoice, which is why the answer is a
+    /// property of this struct and not of a document: the same list refuses a
+    /// credit note, and would refuse an issue.
+    ///
+    /// `name` is not in it — `tenants.name` is NOT NULL since 0001, so a tenant
+    /// that exists has one.
+    pub fn missing_mentions(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        let blank = |field: &Option<String>| field.as_deref().is_none_or(|s| s.trim().is_empty());
+        if blank(&self.legal_form) {
+            missing.push(MENTION_LEGAL_FORM);
+        }
+        if blank(&self.address) {
+            missing.push(MENTION_POSTAL_ADDRESS);
+        }
+        if self.siren.is_none() {
+            missing.push(MENTION_SIREN);
+        }
+        if blank(&self.rcs_city) {
+            missing.push(MENTION_RCS_CITY);
+        }
+        // The exclusive pair. 0087 refuses both at once and refuses a rate with
+        // no VAT number, so the only state left to catch here is *neither*.
+        if self.vat_rate_bp.is_none() && blank(&self.vat_exemption_reason) {
+            missing.push(MENTION_VAT_RATE_OR_EXEMPTION);
+        }
+        if self.late_penalty_rate_bp.is_none() {
+            missing.push(MENTION_LATE_PENALTY_RATE);
+        }
+        missing
+    }
+}
+
+/// The issuer's columns, in one spelling, so [`parties`] and [`issuer`] cannot
+/// disagree about what a mention is. `{t}` is the alias of `tenants`.
+///
+/// Interpolated, and [`COLUMNS`]' audit sentence covers it: both halves are
+/// compile-time constants of this module and no caller's value reaches the
+/// string.
+fn issuer_columns(t: &str) -> String {
+    [
+        "name",
+        "legal_form",
+        "postal_address",
+        "siren",
+        "rcs_city",
+        "vat_number",
+        "vat_rate_bp",
+        "vat_exemption_reason",
+        "late_penalty_rate_bp",
+    ]
+    .map(|column| format!("{t}.{column} AS issuer_{column}"))
+    .join(", ")
+}
+
+fn issuer_of(row: &PgRow) -> Issuer {
+    Issuer {
+        name: row.get("issuer_name"),
+        legal_form: row.get("issuer_legal_form"),
+        address: row.get("issuer_postal_address"),
+        siren: row.get("issuer_siren"),
+        rcs_city: row.get("issuer_rcs_city"),
+        vat_number: row.get("issuer_vat_number"),
+        vat_rate_bp: row.get("issuer_vat_rate_bp"),
+        vat_exemption_reason: row.get("issuer_vat_exemption_reason"),
+        late_penalty_rate_bp: row.get("issuer_late_penalty_rate_bp"),
+    }
+}
+
+/// This company's own invoicing mentions.
+///
+/// One row, always: RLS on `tenants` (0001) is `id = app.tenant_id`, so a tenant
+/// transaction sees its own row and no other. [`StoreError::NotFound`] would
+/// mean the tenant row is gone underneath the key, which is not a state a
+/// caller can be in.
+///
+/// Read separately from [`parties`] because the refusal comes *before* a
+/// document exists: a route that checks the mentions must not have to name an
+/// opportunity to learn them.
+pub async fn issuer(tx: &mut TenantTx<'_>) -> Result<Issuer, StoreError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM tenants t WHERE t.id = $1",
+        issuer_columns("t")
+    )))
+    .bind(tx.tenant_id().as_uuid())
+    .fetch_optional(&mut ***tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    Ok(issuer_of(&row))
+}
+
+/// Write this company's invoicing mentions, all of them, in one statement.
+///
+/// A whole replacement and not a patch: the fields are one document's letterhead
+/// and a partial update is how a company ends up claiming a VAT rate it stopped
+/// charging. 0087's CHECKs — the exclusive rate/reason pair, the SIREN's shape,
+/// a rate with no intra-community number — arrive as
+/// [`StoreError::Database`]'s `23514`, so a caller that wants a readable message
+/// checks before it writes; the constraint is the belt underneath.
+pub async fn set_issuer(tx: &mut TenantTx<'_>, issuer: &Issuer) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE tenants SET legal_form = $1, postal_address = $2, siren = $3, rcs_city = $4, \
+                            vat_number = $5, vat_rate_bp = $6, vat_exemption_reason = $7, \
+                            late_penalty_rate_bp = $8",
+    )
+    .bind(issuer.legal_form.as_deref())
+    .bind(issuer.address.as_deref())
+    .bind(issuer.siren.as_deref())
+    .bind(issuer.rcs_city.as_deref())
+    .bind(issuer.vat_number.as_deref())
+    .bind(issuer.vat_rate_bp)
+    .bind(issuer.vat_exemption_reason.as_deref())
+    .bind(issuer.late_penalty_rate_bp)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
 }
 
 /// The parties to a deal, for the document that bills it.
@@ -572,8 +758,8 @@ pub async fn parties(
     tx: &mut TenantTx<'_>,
     opportunity_id: uuid::Uuid,
 ) -> Result<Parties, StoreError> {
-    let row = sqlx::query(
-        "SELECT t.name AS issuer, a.legal_name AS account, \
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {}, a.legal_name AS account, \
                 (SELECT c.email FROM contacts c \
                   WHERE c.account_id = a.id AND c.active AND c.email IS NOT NULL \
                   ORDER BY c.is_primary DESC, c.created_at ASC LIMIT 1) AS contact_email \
@@ -581,13 +767,14 @@ pub async fn parties(
            JOIN accounts a ON a.id = o.account_id \
            JOIN tenants t ON t.id = o.tenant_id \
           WHERE o.id = $1",
-    )
+        issuer_columns("t")
+    )))
     .bind(opportunity_id)
     .fetch_optional(&mut ***tx)
     .await?
     .ok_or(StoreError::NotFound)?;
     Ok(Parties {
-        issuer: row.get("issuer"),
+        issuer: issuer_of(&row),
         account: row.get("account"),
         contact_email: row.get("contact_email"),
     })

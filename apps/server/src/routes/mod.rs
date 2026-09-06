@@ -27,6 +27,10 @@ pub mod files;
 // a chance of success. Beside `usage` and `turns` in spirit: those two report
 // what already happened, this one is the same arithmetic pointed forwards.
 pub mod forecast;
+// le journal : `audit_log` rendu comme un flux avec un curseur, pour que
+// l'écran d'accueil cesse de reconstituer l'activité à partir de six lectures
+// d'état — et pour que l'autonomie d'un fait se lise sur le fait lui-même.
+pub mod events;
 pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod initiative;
 pub mod interview; // the guided conversation that finishes a company
@@ -42,6 +46,10 @@ pub mod model; // wave H: the tenant connects the model their employees think wi
 // where none exists; this one replaces one, and can only tighten — see its
 // module docs for the invariant and the three mechanisms that hold it.
 pub mod platform; // wave J: step zero — a tenant signs up and gets a key that can be revoked
+// l'activité commerciale plutôt que l'administration : combien d'inconnus ont
+// été approchés cette semaine, et combien ont répondu. Avec ce que le chiffre
+// ne mesure pas, dans la réponse.
+pub mod outreach;
 pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money it moved
 pub mod policy;
 pub mod pool;

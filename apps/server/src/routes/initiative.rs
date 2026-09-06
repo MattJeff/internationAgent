@@ -51,7 +51,7 @@ use agentos_domain::employee::Lifecycle;
 use agentos_domain::ids::{EmployeeId, Slug};
 use agentos_domain::initiative::{Cadence, MAX_INTERVAL, MIN_INTERVAL};
 use agentos_domain::money::{Currency, Money};
-use agentos_store::db::Db;
+use agentos_store::db::{Db, StoreError};
 use agentos_store::initiative::{self, Schedule};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -76,6 +76,10 @@ pub fn router(db: Db) -> Router {
             "/v1/employees/{id}/initiative",
             get_route(get).put(set_initiative),
         )
+        // The plural, beside the singular and in the same file, because it is
+        // the same three columns read for every seat instead of one — see
+        // [`fleet`].
+        .route("/v1/initiative", get_route(fleet))
         .with_state(db)
 }
 
@@ -631,6 +635,118 @@ async fn get(
     Ok(Json(InitiativeView::of(&schedule?, charter.as_ref(), Utc::now())).into_response())
 }
 
+/// One row of the fleet query, in `SELECT` order. A named type because the
+/// tuple is eight wide — `routes::employees::SummaryRow`'s reason.
+type FleetRow = (
+    Uuid,
+    String,
+    Option<String>,
+    i64,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One seat on the fleet screen: who it is, how often it wakes, when it wakes
+/// next, and what its last beat said.
+///
+/// Deliberately thinner than [`InitiativeView`]: no plan, no objective, no
+/// `clarify`. Those three are recomputed from the charter — `plan_of` per seat —
+/// and a home screen that renders thirty of them would be paying for thirty
+/// role-pack runs to draw a list of names. A seat whose plan the operator wants
+/// is one `GET /v1/employees/{id}/initiative` away, and the whole point of this
+/// route is that the screen no longer needs that call to draw the *list*.
+///
+/// `role` is the stored column, not `Charter::role`: this route never parses an
+/// objective, so a charter that will not read still shows its seat working here
+/// rather than turning the whole fleet into a 500. `GET /v1/interview` is where
+/// an unreadable one is named.
+#[derive(Debug, Serialize)]
+struct FleetSeat {
+    employee_id: Uuid,
+    slug: String,
+    role: Option<String>,
+    interval_secs: i64,
+    next_at: DateTime<Utc>,
+    last_claimed_at: Option<DateTime<Utc>>,
+    last_outcome: Option<String>,
+    last_detail: Option<String>,
+}
+
+/// `GET /v1/initiative` — every scheduled seat in this company, in one read.
+///
+/// The plural of the route above, and the reason it exists: a console home
+/// screen showing "who is working right now" was making one request per seat,
+/// and said so in its own comment.
+///
+/// # A seat with no cadence is not here, and that is the answer to the only
+/// open question in the shape
+///
+/// The join to `employee_initiative` is inner. A seat with no schedule never
+/// wakes up on its own — it is chartered or not, it answers its mail, and it is
+/// not *working* in the sense this screen asks about. Rendering it with a null
+/// `interval_secs` and a null `next_at` would put two more nullable fields in
+/// the contract for the console to branch on, to say exactly what absence says.
+/// The surface that lists **every** seat, scheduled or not, already exists and
+/// is `GET /v1/interview`; it is the one that must show the seat nobody has set
+/// going, because that is the state a new company is entirely in.
+///
+/// So `interval_secs` and `next_at` are never null here, and `role` and the
+/// three `last_*` are — a seat can be scheduled with no charter, and a seat that
+/// has never been claimed (or whose claim just cleared the beat) has nothing to
+/// say about its last outcome.
+///
+/// ponytail: not paginated, for `routes::interview::questionnaire`'s reason —
+/// an org chart is capped at `teams::MAX_ROWS` seats, this is one short row per
+/// seat, and half a fleet is worse than none because the screen cannot tell it
+/// is half.
+async fn fleet(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    // No `WHERE tenant_id`: RLS is forced on all three tables and a hand-written
+    // filter here would be a second place for it to be forgotten. Ordered by
+    // slug so the screen reads the same way twice.
+    let rows: Vec<FleetRow> = sqlx::query_as(
+        "SELECT i.employee_id, e.slug, c.role, i.interval_secs, i.next_at, \
+                i.last_claimed_at, i.last_outcome, i.last_detail \
+           FROM employee_initiative i \
+           JOIN employees e ON e.id = i.employee_id \
+           LEFT JOIN employee_charters c ON c.employee_id = i.employee_id \
+          ORDER BY e.slug",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(StoreError::from)?;
+    tx.rollback().await?;
+
+    let seats: Vec<FleetSeat> = rows
+        .into_iter()
+        .map(
+            |(
+                employee_id,
+                slug,
+                role,
+                interval_secs,
+                next_at,
+                last_claimed_at,
+                last_outcome,
+                last_detail,
+            )| FleetSeat {
+                employee_id,
+                slug,
+                role,
+                interval_secs,
+                next_at,
+                last_claimed_at,
+                last_outcome,
+                last_detail,
+            },
+        )
+        .collect();
+
+    Ok(Json(json!({ "seats": seats })).into_response())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1099,6 +1215,93 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::NOT_FOUND);
         }
+
+        h.teardown().await;
+    }
+
+    /// The fleet is one read, and it is this tenant's fleet.
+    ///
+    /// Also the decision on a seat with no cadence, asserted rather than
+    /// documented: `quiet` exists, is this tenant's, and is not in the list.
+    #[tokio::test]
+    async fn la_flotte_ne_rend_que_les_sieges_du_locataire() {
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let mine = h.employee(h.a, "ada").await;
+        let theirs = h.employee(h.b, "bob").await;
+        let quiet = h.employee(h.a, "quiet").await;
+
+        for (id, secret) in [(mine, SECRET_A), (theirs, SECRET_B)] {
+            let (status, body) = h
+                .send(
+                    "PUT",
+                    &format!("/v1/employees/{id}/initiative"),
+                    secret,
+                    Some(buying(3_600)),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let (status, body) = h.send("GET", "/v1/initiative", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seats = body["seats"].as_array().expect("seats");
+        assert_eq!(seats.len(), 1, "one scheduled seat for this tenant: {body}");
+        assert_eq!(seats[0]["employee_id"], json!(mine.to_string()));
+        assert_eq!(seats[0]["role"], json!("international-buyer"));
+        assert_eq!(seats[0]["interval_secs"], json!(3_600));
+        assert!(seats[0]["next_at"].is_string());
+        assert!(
+            !seats
+                .iter()
+                .any(|seat| seat["employee_id"] == json!(quiet.to_string())),
+            "a seat with no cadence does not appear: {body}"
+        );
+
+        // And the other tenant sees exactly the other one.
+        let (_, theirs_body) = h.send("GET", "/v1/initiative", SECRET_B, None).await;
+        let theirs_seats = theirs_body["seats"].as_array().expect("seats");
+        assert_eq!(theirs_seats.len(), 1);
+        assert_eq!(theirs_seats[0]["employee_id"], json!(theirs.to_string()));
+
+        h.teardown().await;
+    }
+
+    /// A seat scheduled and never claimed shows its nulls rather than being
+    /// hidden or faked — including `role`, because a schedule can be filed
+    /// before anybody says what the seat is for.
+    #[tokio::test]
+    async fn un_siege_jamais_reveille_figure_avec_ses_nulls() {
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let id = h.employee(h.a, "neuf").await;
+
+        // The schedule without the charter: the door `PUT .../initiative` does
+        // not open, so it goes through the store the poller uses.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        initiative::set(
+            &mut tx,
+            EmployeeId::from_uuid(id),
+            Cadence::every(Duration::from_secs(3_600)).expect("cadence"),
+            Utc::now(),
+        )
+        .await
+        .expect("set");
+        tx.commit().await.expect("commit");
+
+        let (status, body) = h.send("GET", "/v1/initiative", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seat = &body["seats"].as_array().expect("seats")[0];
+        assert_eq!(seat["employee_id"], json!(id.to_string()));
+        assert!(seat["role"].is_null(), "no charter, no role: {seat}");
+        assert!(seat["last_claimed_at"].is_null(), "{seat}");
+        assert!(seat["last_outcome"].is_null(), "{seat}");
+        assert!(seat["last_detail"].is_null(), "{seat}");
+        assert_eq!(seat["interval_secs"], json!(3_600));
 
         h.teardown().await;
     }

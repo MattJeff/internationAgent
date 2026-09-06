@@ -69,7 +69,7 @@ use crate::error::ApiError;
 
 /// One `employees` row as [`list`] selects it: id, slug, lifecycle, created_at,
 /// updated_at.
-type SummaryRow = (Uuid, String, String, DateTime<Utc>, DateTime<Utc>);
+type SummaryRow = (Uuid, String, String, DateTime<Utc>, DateTime<Utc>, bool);
 
 /// Page size when the caller does not ask for one.
 const DEFAULT_LIMIT: i64 = 50;
@@ -202,11 +202,36 @@ struct EmployeeView<'a> {
     /// nobody visits would leave `provider_intents` exactly as unread as it was
     /// before anything started writing to it.
     unsettled_calls: Vec<UnsettledCallView>,
+    /// Whether `GET /book/{domain}/{slug}` exists for this seat — the column
+    /// `PUT /v1/employees/{id}/booking` flips, and `false` on every row until an
+    /// operator says otherwise.
+    ///
+    /// Read here rather than carried on [`Employee`]. The domain type does not
+    /// have it, and putting it there means the aggregate, the store's row
+    /// mapping and every constructor in the workspace, for a bit that no
+    /// invariant of the aggregate depends on — nothing in `Employee` decides
+    /// anything from it, and the one reader that acts on it
+    /// (`routes::booking::page`) reads the column directly with `(domain,
+    /// slug)`. So it comes in beside the aggregate the way `unsettled_calls`
+    /// does: one more query in a transaction the handler already opens.
+    ///
+    /// It has to be readable at all because the console just grew a switch for
+    /// it and could not show its state — it rendered "unknown" rather than
+    /// assuming "closed", which is right and is also useless. A seat whose door
+    /// is open to strangers with nobody able to see that it is open is the
+    /// failure this closes.
+    booking_open: bool,
 }
 
 impl<'a> EmployeeView<'a> {
-    fn of(employee: &'a Employee, now: DateTime<Utc>, unsettled: Vec<UnsettledCall>) -> Self {
+    fn of(
+        employee: &'a Employee,
+        now: DateTime<Utc>,
+        unsettled: Vec<UnsettledCall>,
+        booking_open: bool,
+    ) -> Self {
         Self {
+            booking_open,
             unsettled_calls: unsettled.into_iter().map(UnsettledCallView::from).collect(),
             id: employee.id().as_uuid(),
             slug: employee.slug().as_str(),
@@ -250,6 +275,10 @@ struct EmployeeSummary {
     lifecycle: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    /// Here, unlike `health`, because it costs nothing: it is a column on the
+    /// row this query already selects, not eleven rows of another table. A list
+    /// is where an operator would notice that a seat they never opened is open.
+    booking_open: bool,
 }
 
 /// Keyset pagination. Ids are UUIDv7, so `id > after` is "created after".
@@ -351,9 +380,13 @@ async fn create(
     // transaction that just committed, so no provider request has ever been made
     // under it. `create` calls nothing external — that is the whole point of the
     // 202 above.
+    // `false`, and not by assumption: the column defaults to `false` (`0083`),
+    // nothing in the transaction that just committed writes it, and the only
+    // writer is `PUT /v1/employees/{id}/booking` — which cannot have run
+    // against an id that did not exist a moment ago.
     Ok((
         StatusCode::ACCEPTED,
-        Json(EmployeeView::of(&employee, now, Vec::new())),
+        Json(EmployeeView::of(&employee, now, Vec::new(), false)),
     )
         .into_response())
 }
@@ -367,8 +400,8 @@ async fn get(
     let id = EmployeeId::from_uuid(id);
     let now = Utc::now();
     let employee = load(&db, &principal, id).await?.employee;
-    let unsettled = unsettled(&db, &principal, id, now).await?;
-    Ok(Json(EmployeeView::of(&employee, now, unsettled)).into_response())
+    let (unsettled, booking_open) = beside(&db, &principal, id, now).await?;
+    Ok(Json(EmployeeView::of(&employee, now, unsettled, booking_open)).into_response())
 }
 
 /// `GET /v1/employees` — this tenant's employees, oldest first.
@@ -384,7 +417,7 @@ async fn list(
     // No `WHERE tenant_id` and that is not an oversight: RLS adds it, and a
     // hand-written filter here would be a second place for it to be forgotten.
     let rows: Vec<SummaryRow> = sqlx::query_as(
-        "SELECT id, slug, lifecycle, created_at, updated_at \
+        "SELECT id, slug, lifecycle, created_at, updated_at, booking_open \
            FROM employees \
           WHERE ($1::uuid IS NULL OR id > $1) \
           ORDER BY id \
@@ -400,12 +433,13 @@ async fn list(
     let employees: Vec<EmployeeSummary> = rows
         .into_iter()
         .map(
-            |(id, slug, lifecycle, created_at, updated_at)| EmployeeSummary {
+            |(id, slug, lifecycle, created_at, updated_at, booking_open)| EmployeeSummary {
                 id,
                 slug,
                 lifecycle,
                 created_at,
                 updated_at,
+                booking_open,
             },
         )
         .collect();
@@ -531,27 +565,44 @@ async fn load(db: &Db, principal: &Principal, id: EmployeeId) -> Result<StoredEm
 /// and a knob on a diagnostic is a second thing to get wrong.
 const SETTLING: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 
-/// The provider requests for `id` that never came back — see
-/// [`EmployeeView::unsettled_calls`].
+/// The two things `GET /v1/employees/{id}` reads beside the aggregate: the
+/// provider requests for `id` that never came back — see
+/// [`EmployeeView::unsettled_calls`] — and [`EmployeeView::booking_open`].
 ///
-/// Its own transaction rather than [`load`]'s, and its own round trip: `load` is
-/// on every lifecycle write in this module and this read is owed only to the
-/// handler that renders a whole employee without writing one.
+/// Its own transaction rather than [`load`]'s, and one round trip for both:
+/// `load` is on every lifecycle write in this module and these reads are owed
+/// only to the handler that renders a whole employee without writing one. Two
+/// queries in one transaction, not two transactions — the second read is a
+/// column, and it is not worth a connection.
 ///
 /// [`set_lifecycle`] deliberately does **not** call this. It has a transaction
-/// open already and calls [`provisioning::unsettled_calls`] inside it, so that
-/// a failed read fails the whole request instead of turning a committed
-/// termination into a 5xx.
-async fn unsettled(
+/// open already and calls [`provisioning::unsettled_calls`] and
+/// [`booking_open`] inside it, so that a failed read fails the whole request
+/// instead of turning a committed termination into a 5xx.
+async fn beside(
     db: &Db,
     principal: &Principal,
     id: EmployeeId,
     now: DateTime<Utc>,
-) -> Result<Vec<UnsettledCall>, ApiError> {
+) -> Result<(Vec<UnsettledCall>, bool), ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let calls = provisioning::unsettled_calls(&mut tx, id, now - SETTLING).await;
+    let open = booking_open(&mut tx, id).await;
     tx.rollback().await?;
-    Ok(calls?)
+    Ok((calls?, open?))
+}
+
+/// `employees.booking_open` for one seat.
+///
+/// A query and not a field on [`Employee`] — [`EmployeeView::booking_open`]
+/// carries that argument. No `WHERE tenant_id`: RLS adds it, so another
+/// tenant's id is [`StoreError::NotFound`] and never somebody else's bit.
+async fn booking_open(tx: &mut TenantTx<'_>, id: EmployeeId) -> Result<bool, StoreError> {
+    sqlx::query_scalar("SELECT booking_open FROM employees WHERE id = $1")
+        .bind(id.as_uuid())
+        .fetch_optional(&mut ***tx)
+        .await?
+        .ok_or(StoreError::NotFound)
 }
 
 /// Move the lifecycle, record the move, and answer with the new state.
@@ -694,10 +745,15 @@ async fn set_lifecycle(
     // else terminated it". Inside the transaction the two agree again: an error
     // means nothing was committed and the call is safe to repeat.
     let unsettled = provisioning::unsettled_calls(&mut tx, id, now - SETTLING).await?;
+    // In the same transaction, for the same reason and because a suspension is
+    // exactly when somebody wants to know whether strangers can still book this
+    // seat. Suspending does not close the door — `routes::booking::page` checks
+    // the lifecycle itself — so this renders the column as it stands.
+    let open = booking_open(&mut tx, id).await?;
     tx.commit().await?;
 
     tracing::info!(%id, %from, %to, "lifecycle changed");
-    Ok(Json(EmployeeView::of(&employee, now, unsettled)).into_response())
+    Ok(Json(EmployeeView::of(&employee, now, unsettled, open)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +809,11 @@ mod tests {
 
             Some(Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    // The booking switch merged in, because the only honest way
+                    // to test that `booking_open` reads back is to flip it
+                    // through the route that owns it. It is one `PUT` and no
+                    // state of its own.
+                    router(db.clone()).merge(crate::routes::booking::router(db.clone())),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
@@ -2016,6 +2076,77 @@ mod tests {
                 .ends_with("effect:overdue"),
             "and it is the same overdue row, bounded by the same grace: {calls:?}"
         );
+
+        h.teardown().await;
+    }
+
+    /// `booking_open` is readable, and reads `false` until somebody says
+    /// otherwise.
+    ///
+    /// The bug this closes is not a wrong value, it is an absent one: the
+    /// console could open a seat's public page and then had no way to show that
+    /// it was open, so a stranger could be written to by a seat nobody could see
+    /// was reachable.
+    #[tokio::test]
+    async fn booking_open_se_lit_et_vaut_false_par_defaut() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (status, created) = h
+            .send(
+                "POST",
+                "/v1/employees",
+                SECRET_A,
+                Some(&key("booking")),
+                Some(json!({"slug": "porte", "domain": "agents.example.com"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let id = created["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            created["booking_open"],
+            json!(false),
+            "a new seat's door is shut: {created}"
+        );
+
+        // The read, and the list row, before anything is flipped.
+        let (_, seat) = h
+            .send("GET", &format!("/v1/employees/{id}"), SECRET_A, None, None)
+            .await;
+        assert_eq!(seat["booking_open"], json!(false), "{seat}");
+        let (_, page) = h.send("GET", "/v1/employees", SECRET_A, None, None).await;
+        let row = page["employees"]
+            .as_array()
+            .expect("employees")
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .expect("the seat we just made");
+        assert_eq!(row["booking_open"], json!(false), "{row}");
+
+        // And after the switch, both surfaces say so.
+        let (status, flipped) = h
+            .send(
+                "PUT",
+                &format!("/v1/employees/{id}/booking"),
+                SECRET_A,
+                None,
+                Some(json!({"open": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{flipped}");
+
+        let (_, seat) = h
+            .send("GET", &format!("/v1/employees/{id}"), SECRET_A, None, None)
+            .await;
+        assert_eq!(seat["booking_open"], json!(true), "{seat}");
+        let (_, page) = h.send("GET", "/v1/employees", SECRET_A, None, None).await;
+        let row = page["employees"]
+            .as_array()
+            .expect("employees")
+            .iter()
+            .find(|row| row["id"] == json!(id))
+            .expect("the seat we just made");
+        assert_eq!(row["booking_open"], json!(true), "{row}");
 
         h.teardown().await;
     }

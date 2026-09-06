@@ -31,6 +31,31 @@
 //! reach the effect from a turn, so the register fills only from Rust. The
 //! endpoint that would paper over that is the one this module refuses to be.
 //!
+//! # The mentions an invoice must carry, and where they are refused
+//!
+//! A French invoice is a regulated document: the issuer's legal identity, the
+//! breakdown by VAT rate, and what is owed for paying late. `0087` puts those
+//! on `tenants`, `PUT /v1/invoices/issuer` writes them, and
+//! [`refuse_without_mentions`] is the one list of what is missing.
+//!
+//! **The refusal sits on the surfaces that emit a document**, not on
+//! `agentos_store::invoices::issue`. That is a deliberate line and it is the
+//! same one `paid` draws: the store function is what every fixture in this
+//! workspace uses to put a row in the register, and a register row is not a
+//! document. What must never leave the building is a **PDF** without its
+//! mentions, and there are exactly two paths that produce one —
+//! `POST /v1/invoices/{id}/credit`, which refuses here with the missing
+//! mentions named, and `Effects::issue_invoice`, whose transaction is in
+//! `agentos_app::effects` and is not this module's to change. Until that second
+//! path carries the same check, `agentos_app::invoice_document` renders its
+//! document with `FACTURE NON CONFORME` and the list across the top, so an
+//! unissuable invoice is never mistaken for an issuable one.
+//!
+//! And the paragraph above still holds: **there is no `POST /v1/invoices`** to
+//! put the check on. An operator route that issued would be the second path
+//! with no ruling behind it that this module exists to refuse; the check
+//! belongs to whatever issues, not to a new way of issuing.
+//!
 //! # Why `paid` is an operator's and never an employee's
 //!
 //! Nothing in this process can call a bank or a PSP, so "it was paid" is not
@@ -61,7 +86,7 @@
 use agentos_domain::ids::InvoiceId;
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::Db;
-use agentos_store::invoices;
+use agentos_store::invoices::{self, Issuer};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -79,6 +104,7 @@ use crate::error::ApiError;
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/invoices", get(register))
+        .route("/v1/invoices/issuer", get(read_issuer).put(write_issuer))
         .route("/v1/invoices/{id}/paid", post(paid))
         .route("/v1/invoices/{id}/credit", post(credit))
         .with_state(db)
@@ -327,6 +353,13 @@ async fn credit(
 
     let note = InvoiceId::new_v7(Utc::now());
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    // Before a number is claimed: a credit note is a document that leaves the
+    // building, so it carries the same obligatory mentions as the demand it
+    // withdraws. See [`refuse_without_mentions`].
+    if let Some(refusal) = refuse_without_mentions(&mut tx).await? {
+        tx.rollback().await?;
+        return Err(refusal);
+    }
     let written = invoices::credit(
         &mut tx,
         note,
@@ -362,6 +395,185 @@ async fn credit(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The issuer's obligatory mentions
+// ---------------------------------------------------------------------------
+
+/// `409` naming every obligatory mention this company has not written down, or
+/// `None` when it may issue.
+///
+/// **The refusal is here and not in [`agentos_store::invoices::issue`]**, and
+/// the line is drawn at the surface that emits rather than at the SQL: the store
+/// function is the one thing every fixture in this workspace uses to put a row
+/// in the register, and a company whose invoices are not issuable is not a
+/// company whose *register* is unreadable. What must not happen is a **document
+/// leaving the building** without its mentions, and the two paths that produce
+/// one are `Effects::issue_invoice` and this module's credit note.
+///
+/// The names are `agentos_store::invoices`' constants — the field names, not a
+/// sentence — so a console can map each one to the input its operator has to
+/// fill. A `detail` that said "some mentions are missing" would be a 409 nobody
+/// can act on.
+async fn refuse_without_mentions(
+    tx: &mut agentos_store::db::TenantTx<'_>,
+) -> Result<Option<ApiError>, ApiError> {
+    let missing = invoices::issuer(tx).await?.missing_mentions();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        ApiError::conflict(
+            "issuer_mentions_missing",
+            "this company cannot issue an invoice yet",
+        )
+        .with_detail(format!(
+            "a French invoice must carry these mentions of its issuer and this company has not \
+             recorded them: {}. Write them with PUT /v1/invoices/issuer.",
+            missing.join(", ")
+        ))
+        .with_extension("missing", json!(missing)),
+    ))
+}
+
+/// The letterhead, on the wire. Every field is optional here and obligatory in
+/// [`Issuer::missing_mentions`]: the refusal is one list, written once, so a
+/// `PUT` that would store an unissuable letterhead fails with the same `detail`
+/// the credit note would have produced later.
+#[derive(serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IssuerBody {
+    #[serde(default)]
+    legal_form: Option<String>,
+    #[serde(default)]
+    postal_address: Option<String>,
+    #[serde(default)]
+    siren: Option<String>,
+    #[serde(default)]
+    rcs_city: Option<String>,
+    #[serde(default)]
+    vat_number: Option<String>,
+    /// Basis points, `2000` for 20 %. Never `0`: a company outside VAT sends
+    /// `vat_exemption_reason` instead, which is 0087's CHECK and this product's
+    /// whole position on the question.
+    #[serde(default)]
+    vat_rate_bp: Option<i32>,
+    #[serde(default)]
+    vat_exemption_reason: Option<String>,
+    #[serde(default)]
+    late_penalty_rate_bp: Option<i32>,
+}
+
+impl IssuerBody {
+    fn into_issuer(self, name: String) -> Issuer {
+        let trimmed = |field: Option<String>| {
+            field
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        Issuer {
+            name,
+            legal_form: trimmed(self.legal_form),
+            address: trimmed(self.postal_address),
+            siren: trimmed(self.siren),
+            rcs_city: trimmed(self.rcs_city),
+            vat_number: trimmed(self.vat_number),
+            vat_rate_bp: self.vat_rate_bp,
+            vat_exemption_reason: trimmed(self.vat_exemption_reason),
+            late_penalty_rate_bp: self.late_penalty_rate_bp,
+        }
+    }
+}
+
+impl From<Issuer> for IssuerBody {
+    fn from(issuer: Issuer) -> Self {
+        Self {
+            legal_form: issuer.legal_form,
+            postal_address: issuer.address,
+            siren: issuer.siren,
+            rcs_city: issuer.rcs_city,
+            vat_number: issuer.vat_number,
+            vat_rate_bp: issuer.vat_rate_bp,
+            vat_exemption_reason: issuer.vat_exemption_reason,
+            late_penalty_rate_bp: issuer.late_penalty_rate_bp,
+        }
+    }
+}
+
+/// `GET /v1/invoices/issuer` — the letterhead as it stands, and what is missing
+/// from it.
+async fn read_issuer(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let issuer = invoices::issuer(&mut tx).await?;
+    tx.rollback().await?;
+    let missing = issuer.missing_mentions();
+    Ok(Json(json!({
+        "name": issuer.name,
+        "issuer": IssuerBody::from(issuer),
+        "missing": missing,
+    }))
+    .into_response())
+}
+
+/// `PUT /v1/invoices/issuer` — write this company's obligatory mentions.
+///
+/// A whole replacement, `agentos_store::invoices::set_issuer`'s rule: these
+/// fields are one letterhead and a patch is how a company keeps claiming a VAT
+/// number it no longer has. The name is not in the body — it is `tenants.name`,
+/// which this route may not rewrite; a company that renamed itself did so
+/// through the surface that owns its identity.
+///
+/// Refused with the mentions named when the result would not be issuable, which
+/// is the same refusal [`refuse_without_mentions`] makes and the reason a
+/// half-filled letterhead cannot be stored and discovered a month later on a
+/// document a customer already has.
+async fn write_issuer(
+    State(db): State<Db>,
+    principal: Principal,
+    Json(body): Json<IssuerBody>,
+) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let name = invoices::issuer(&mut tx).await?.name;
+    let issuer = body.into_issuer(name);
+
+    // 0087 refuses these two at the database and would surface a `23514` as a
+    // 500 — "we broke" — for a body the founder fixes by deleting a field.
+    if issuer.vat_rate_bp.is_some() && issuer.vat_exemption_reason.is_some() {
+        tx.rollback().await?;
+        return Err(ApiError::bad_request(
+            "a company either charges VAT at a rate or says why it does not; sending both leaves \
+             the document with two answers to the same question",
+        ));
+    }
+    if issuer.vat_rate_bp.is_some() && issuer.vat_number.is_none() {
+        tx.rollback().await?;
+        return Err(ApiError::bad_request(
+            "a company that charges VAT has an intra-community VAT number, and an invoice must \
+             print it",
+        ));
+    }
+    let missing = issuer.missing_mentions();
+    if !missing.is_empty() {
+        tx.rollback().await?;
+        return Err(ApiError::conflict(
+            "issuer_mentions_missing",
+            "this letterhead would not be issuable",
+        )
+        .with_detail(format!(
+            "a French invoice must carry these mentions of its issuer and this body does not \
+             supply them: {}",
+            missing.join(", ")
+        ))
+        .with_extension("missing", json!(missing)));
+    }
+
+    invoices::set_issuer(&mut tx, &issuer).await?;
+    tx.commit().await?;
+    Ok(
+        Json(json!({ "issuer": IssuerBody::from(issuer), "missing": Vec::<&str>::new() }))
+            .into_response(),
+    )
 }
 
 #[cfg(test)]
@@ -455,17 +667,43 @@ mod tests {
         }
     }
 
+    /// A company that may issue: with the mentions `0087` makes obligatory,
+    /// because every test below that emits a document would otherwise be
+    /// testing the refusal. The one that *is* about the refusal wipes them
+    /// again — see [`wipe_mentions`].
     async fn new_tenant(db: &Db) -> TenantId {
         let tenant = TenantId::new_v7(Utc::now());
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'invoice-routes-test')")
-            .bind(tenant.as_uuid())
-            .bind(tenant.as_uuid().to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("insert tenant");
+        sqlx::query(
+            "INSERT INTO tenants \
+                 (id, slug, name, legal_form, postal_address, siren, rcs_city, vat_number, \
+                  vat_rate_bp, late_penalty_rate_bp) \
+             VALUES ($1, $2, 'invoice-routes-test', 'SAS', '1 rue du Test, 75001 Paris', \
+                     '123456789', 'Paris', 'FR12123456789', 2000, 1200)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(tenant.as_uuid().to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("insert tenant");
         tx.commit().await.expect("commit");
         tenant
+    }
+
+    /// Put a company back where `0087` found it: no mentions at all.
+    async fn wipe_mentions(db: &Db, tenant: TenantId) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "UPDATE tenants SET legal_form = NULL, postal_address = NULL, siren = NULL, \
+                                rcs_city = NULL, vat_number = NULL, vat_rate_bp = NULL, \
+                                vat_exemption_reason = NULL, late_penalty_rate_bp = NULL \
+              WHERE id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("wipe");
+        tx.commit().await.expect("commit");
     }
 
     /// One issued invoice for `tenant`, through the same store call the gated
@@ -773,5 +1011,132 @@ mod tests {
             .collect();
         assert_eq!(numbers, vec![json!(1), json!(2), json!(3)]);
         let _ = next;
+    }
+
+    /// **A company with no letterhead may not emit a document**, and the refusal
+    /// names every mention it is missing rather than saying "invalid".
+    ///
+    /// The whole round trip: refused, refused again on a half-filled `PUT`,
+    /// accepted on a complete one, and only then does a document leave.
+    #[tokio::test]
+    async fn a_document_is_refused_until_the_issuer_mentions_are_written_down() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the register needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let invoice = issued(&db, h.a).await;
+        let uri = format!("/v1/invoices/{}/credit", invoice.as_uuid());
+        wipe_mentions(&db, h.a).await;
+
+        let all = json!([
+            "legal_form",
+            "postal_address",
+            "siren",
+            "rcs_city",
+            "vat_rate_bp_or_vat_exemption_reason",
+            "late_penalty_rate_bp",
+        ]);
+
+        // The register still reads — a company that cannot issue is not a
+        // company whose books are sealed — and says what it is missing.
+        let (status, body) = h.send("GET", "/v1/invoices/issuer", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["missing"], all);
+
+        let (status, problem) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 1, "memo": "trop tard"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert_eq!(problem["code"], json!("issuer_mentions_missing"));
+        assert_eq!(problem["missing"], all, "{problem}");
+        let detail = problem["detail"].as_str().expect("a detail");
+        for mention in all.as_array().expect("array") {
+            assert!(
+                detail.contains(mention.as_str().expect("a name")),
+                "the detail does not name {mention}: {detail}"
+            );
+        }
+
+        // The refusal took no number with it: the run is still at two.
+        let (_, body) = h.send("GET", "/v1/invoices", SECRET_A).await;
+        assert_eq!(body["invoices"].as_array().expect("array").len(), 1);
+
+        // A half letterhead is refused by the same list, so it cannot be stored
+        // and discovered later on a document a customer already has.
+        let (status, problem) = h
+            .send_json(
+                "PUT",
+                "/v1/invoices/issuer",
+                SECRET_A,
+                json!({"legal_form": "SAS", "siren": "123456789"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert_eq!(
+            problem["missing"],
+            json!([
+                "postal_address",
+                "rcs_city",
+                "vat_rate_bp_or_vat_exemption_reason",
+                "late_penalty_rate_bp",
+            ])
+        );
+
+        // Nor may it claim a rate with no intra-community number, which 0087
+        // refuses at the database and this refuses first, as a 400 rather than
+        // as the 500 a `23514` would have been.
+        let (status, _) = h
+            .send_json(
+                "PUT",
+                "/v1/invoices/issuer",
+                SECRET_A,
+                json!({
+                    "legal_form": "SAS",
+                    "postal_address": "1 rue du Test",
+                    "siren": "123456789",
+                    "rcs_city": "Paris",
+                    "vat_rate_bp": 2000,
+                    "late_penalty_rate_bp": 1200,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A company outside VAT completes its letterhead with a sentence and
+        // not with a zero: `vat_rate_bp` stays absent.
+        let complete = json!({
+            "legal_form": "SAS",
+            "postal_address": "1 rue du Test, 75001 Paris",
+            "siren": "123456789",
+            "rcs_city": "Paris",
+            "vat_exemption_reason": "TVA non applicable, art. 293 B du CGI",
+            "late_penalty_rate_bp": 1200,
+        });
+        let (status, body) = h
+            .send_json("PUT", "/v1/invoices/issuer", SECRET_A, complete)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["missing"], json!([]));
+        assert_eq!(body["issuer"]["vat_rate_bp"], Value::Null);
+
+        // And now the document leaves.
+        let (status, note) = h
+            .send_json(
+                "POST",
+                &uri,
+                SECRET_A,
+                json!({"amount_minor": 1, "memo": "avec les mentions"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{note}");
+        assert_eq!(note["number"], json!(2), "the refusals took no number");
     }
 }
