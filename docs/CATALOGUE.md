@@ -782,3 +782,126 @@ lecture de métriques entre par le chemin qui existe déjà — `work_items`, le
 `BOARD_BRIEF` et le journal (`loops/initiative.rs:30` et `:1261`). Un ingest
 métriques→knowledge serait une seconde porte pour des données qui en ont déjà
 une. Pas de scheduler, pas de migration, pas de table.
+
+
+---
+
+## Lumail, l'ajout du 2026-09-10
+
+Demande : l'email marketing d'un client — abonnés, campagnes, workflows —
+piloté par un employé. Une entrée, `lumail`, sondée en direct le 2026-09-10 ;
+les requêtes sont recopiées dans le commentaire de l'entrée et se rejouent en
+quelques `curl`.
+
+**Lumail sert deux serveurs MCP, et un seul est utilisable d'ici.**
+
+### Le serveur OAuth, et le mur n°3 derrière une métadonnée qui dit le contraire
+
+`https://lumail.io/mcp` est OAuth 2.1 seulement. Sa découverte est propre :
+`.well-known/oauth-protected-resource/mcp` donne `authorization_servers:
+["https://lumail.io/api/auth"]` et sept portées (`openid`, `profile`, `email`,
+`offline_access`, `lumail.read`, `lumail.write`, `lumail.cli`) ;
+`.well-known/oauth-authorization-server` donne les trois endpoints
+(`/api/auth/oauth2/authorize`, `/token`, `/register`), `S256`, les trois grants
+(`authorization_code`, `client_credentials`, `refresh_token`) et — c'est le
+point — `token_endpoint_auth_methods_supported: ["none", "client_secret_basic",
+"client_secret_post"]`. Trois méthodes : sur le papier, un client confidentiel,
+donc la condition d'entrée que Vercel et Buffer échouent.
+
+**Mesuré deux fois, et la métadonnée ment.** `POST …/oauth2/register` avec
+`token_endpoint_auth_method: "client_secret_post"`, puis avec
+`"client_secret_basic"`, `redirect_uris:
+["https://siglair.com/v1/mcp/oauth/callback"]` → 200 les deux fois, mais la
+réponse porte `"token_endpoint_auth_method":"none"`, `"public":true`, et
+**aucun `client_secret`**. Le serveur annonce trois méthodes et n'en enregistre
+qu'une : client public seulement. `OauthClients::parse` refuse un secret vide,
+donc cette porte est fermée — c'est le mur n°3, dans une variante nouvelle où
+le document RFC 8414 ne suffit pas à le voir. Deux clients publics nommés
+« InternationalAgent (siglair.com) » existent donc chez Lumail, inutilisés.
+
+Ce serveur ne prend pas non plus un jeton d'API : `initialize` sans jeton → 200,
+`serverInfo.name: "lumail-discovery"`, avec pour instructions « Public
+discovery exposes only Lumail developer documentation. Authenticate with OAuth
+2.1 to access organization-scoped tools and data. » ; `tools/list` sans jeton →
+`-32601 Method not found` ; avec `Bearer lum_faux` → 401, `www-authenticate:
+Bearer resource_metadata="…/oauth-protected-resource/mcp", scope="lumail.read
+lumail.write", error="invalid_token"`. Et même ouvert, il **exclut**
+volontairement l'envoi, la planification, la publication de workflow, le
+désabonnement et les suppressions (`lumail.io/docs/ai-integration/chatgpt-plugin`).
+
+### Le serveur à jeton, retenu — et `/sse` n'est qu'un nom
+
+`https://lumail.io/api/mcp/sse` est le « API-token MCP server »
+(`lumail.io/docs/api-reference/mcp` ; `lumail.io/docs/ai-integration/mcp-cursor`
+montre `"url": "https://lumail.io/api/mcp/sse", "headers": {"Authorization":
+"Bearer lum_your_api_token_here"}`). Le chemin dit SSE, le mur n°1 dirait non —
+mais le transport est mesuré, pas lu : `GET` → 405
+`{"jsonrpc":"2.0","error":{"code":-32000,"message":"Standalone SSE streams are
+not supported."}}` ; `POST` initialize sans jeton → 401 `{"error":"Authorization
+required"}` ; avec `Bearer lum_faux` → 401 `{"error":"Invalid or expired
+token"}`. C'est du **Streamable HTTP**. Le jeton `lum_…` se crée dans le tableau
+de bord Lumail, Settings → API Tokens ; c'est ce que le client colle, donc
+`Credential::Bearer`.
+
+Le catalogue d'outils y est **complet** — même liste que `GET
+https://lumail.io/api/v2/tools` (`lumail.io/docs/ai-integration/tools-api`) :
+
+* Subscribers : `list_subscribers`, `add_subscriber`, `get_subscriber`,
+  `update_subscriber`, `delete_subscriber`, `unsubscribe`, `add_tags`,
+  `remove_tags`
+* Campaigns : `list_campaigns`, `create_campaign`, `get_campaign`,
+  `edit_campaign`, `send_campaign`, `delete_campaign`
+* Tags : `list_tags`, `create_tag`, `get_tag`, `update_tag`
+* Fields : `get_custom_fields`, `create_custom_field`, `rename_custom_field`,
+  `delete_custom_field`
+* Emails : `send_email`, `verify_email`
+* Events : `track_event`, `list_events`
+* Workflows : `list_workflows`, `get_workflow`, `create_workflow`,
+  `configure_workflow_draft`, `update_workflow_draft`, `publish_workflow`,
+  `update_workflow_status`, `delete_workflow`, `add_subscriber_to_workflow`,
+  `add_subscribers_to_workflow`, `remove_subscriber_from_workflow`,
+  `get_subscriber_workflow_runs`, `fast_forward_workflow_subscriber`,
+  `list_workflow_groups`, `get_workflow_group`, `create_workflow_group`,
+  `update_workflow_group`, `set_workflow_group`, `delete_workflow_group`
+* Analytics : `get_dashboard_stats`, `get_campaign_stats`
+
+**Plancher `Destructive`** : cinq `delete_*` irréversibles, la classe du pire
+outil fixe celle du connecteur, comme pour `google-calendar` et `docusign`, et
+au même prix — une lecture de statistiques passe par un humain.
+
+**La confirmation à cinq chiffres.** Les outils à fort impact (`send_email`,
+`send_campaign`, `publish_workflow`, `update_workflow_status`, `unsubscribe`,
+`delete_*`) exigent un aller-retour : premier appel → `CONFIRMATION_REQUIRED` +
+`confirmationCode`, second appel avec le code, à usage unique (expire en ~60 s
+côté CLI, 5 min côté doc MCP). C'est une garde du fournisseur, pas la nôtre :
+le même appelant confirme, et un modèle qui lit `CONFIRMATION_REQUIRED` rejoue
+le code. Elle ne baisse donc rien ici.
+
+**`OptOuts::Pulled`, et pas `NoStrangers`.** `send_email` prend un `to` libre,
+`send_campaign` écrit à une liste, et `add_subscriber_to_workflow` — ou un
+simple `add_tags`, puisqu'un tag déclenche un workflow publié — met un message
+devant quelqu'un qui n'a rien demandé. Et Lumail tient la liste :
+`list_subscribers` avec `status: "UNSUBSCRIBED"` (statuts : `SUBSCRIBED,
+UNSUBSCRIBED, PENDING_CONFIRMATION, BOUNCED, BANNED, COMPLAINED,
+TRANSACTIONAL`) est la lecture que `reconcile_opt_outs` peut viser ;
+`unsubscribe` / `POST /api/v2/subscribers/{id}/unsubscribe` l'écriture en
+face. Précédent `posthog` : une liste qui existe se nomme, elle ne se cache pas
+sous `HeldHere`. Limites : 100 req/min (Free), 700 (Premium), 2 000
+(Business) par organisation.
+
+### Ce qui n'est PAS fait : pas d'adaptateur `EmailProvider` Lumail
+
+Le trait `agentos_providers::email::EmailProvider` exige `fetch_inbound`,
+`fetch_attachment` et `verify_webhook` en plus de l'envoi, et Lumail ne
+documente **ni courrier entrant, ni webhook de rebond**. Ce qui existe côté
+envoi direct : `POST /api/v2/emails` avec `{from, to, subject, html | markdown
+| tiptap}` → `{id}`, base `https://lumail.io/api/v2`, `Authorization: Bearer
+lum_…`, 40 emails/s par voie ; et SMTP sur `smtp.lumail.io:587` en STARTTLS,
+mot de passe = le jeton. Un adaptateur qui n'implémenterait que la moitié
+sortante d'un trait à quatre obligations serait un `todo!()` sur la boîte de
+réception, et le trait existe précisément pour qu'on ne puisse pas l'écrire.
+
+La règle produit de Lumail 2.0 dit d'ailleurs où va quoi : « marketing email
+belongs in Workflows, not in the transactional email API or SMTP ». Le marketing
+passe donc par le connecteur MCP ci-dessus, et le transactionnel reste chez le
+fournisseur email déjà câblé.
