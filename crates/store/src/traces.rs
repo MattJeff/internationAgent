@@ -224,7 +224,7 @@ fn clamp(n: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::{EmployeeId, TenantId};
-    use chrono::TimeDelta;
+    use chrono::{SubsecRound as _, TimeDelta};
 
     use super::*;
     use crate::db::Db;
@@ -344,7 +344,7 @@ mod tests {
     async fn la_meme_livraison_deux_fois_est_une_ligne() {
         let Some(db) = db().await else { return };
         let (tenant, lena) = seed(&db).await;
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
         let thread = sent(&db, tenant, lena, "email_1", now).await;
         let opened = Signal {
             kind: "opened",
@@ -379,7 +379,7 @@ mod tests {
     async fn une_trace_arrivee_avant_la_ligne_est_retrouvee_par_le_fournisseur() {
         let Some(db) = db().await else { return };
         let (tenant, lena) = seed(&db).await;
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
 
         let clicked = Signal {
             kind: "clicked",
