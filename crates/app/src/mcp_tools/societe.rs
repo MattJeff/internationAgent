@@ -87,6 +87,23 @@ pub fn tools() -> Vec<ToolDef> {
         // Le registre public : la seule chose que cette société publie d'elle
         // -------------------------------------------------------------------
         t(
+            "health_company",
+            "Est-ce que cette société travaille encore ?",
+            "Rend, en un appel, si les employés prennent leurs tours ou non : combien tentés \
+             et combien ratés aujourd'hui, la date du dernier qui a réussi, le code et la \
+             phrase du dernier échec, et un verdict — `working`, `degraded`, `stopped`. \
+             **C'est le premier outil à appeler quand quelque chose semble immobile** : un \
+             employé qui ne répond pas, une campagne qui n'avance pas, une demande sans suite. \
+             Une société au repos rend `working` et pas `degraded` : ne rien avoir à faire \
+             n'est pas une panne. `stopped` nomme la cause dans `last_failure_detail`, et \
+             c'est presque toujours la connexion au modèle.",
+            Method::Get,
+            "/v1/health/company",
+            nothing(),
+            &[],
+            Risk::Read,
+        ),
+        t(
             "public_register_read",
             "Lire le registre public : ce que les gates des entreprises consentantes ont arrêté",
             "Rend le tableau public, en temps réel, de ce que les politiques ont refusé chez \
@@ -1532,7 +1549,7 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 15] = [
+    const ROUTE_SOURCES: [&str; 16] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
@@ -1551,6 +1568,7 @@ mod tests {
         // test de couverture de `mod.rs` a montré que ces deux routes étaient
         // montées et déclarées par personne.
         include_str!("../../../../apps/server/src/routes/public_register.rs"),
+        include_str!("../../../../apps/server/src/routes/health.rs"),
     ];
 
     /// Tout chemin passé à un `.route(` dans ces sources.
