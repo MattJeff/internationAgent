@@ -246,7 +246,13 @@ pub async fn brief(db: &Db, tenant: TenantId, conversation: ConversationId) -> O
     .fetch_one(&mut **tx)
     .await
     .ok()?;
-    let engagement = traces::engagement(&mut tx, conversation).await.ok()?;
+    // A trace read that fails is not a reason to wake the employee with no
+    // brief at all: the follow-up stands on `since`, the engagement only
+    // colours it. `Default` reads as "never opened", which is the honest
+    // sentence when nothing could be read.
+    let engagement = traces::engagement(&mut tx, conversation)
+        .await
+        .unwrap_or_default();
     let _ = tx.rollback().await;
     let since = since?;
     Some(format!(
