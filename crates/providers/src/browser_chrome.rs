@@ -4649,15 +4649,29 @@ mod tests {
             },
         );
         let ds = session(&d).await;
-        let err = d
-            .act(&ds, BrowserStep::Goto(&proxied_url()))
-            .await
-            .expect_err("407 with nothing to answer it");
-        assert_eq!(err.code(), NAVIGATION_FAILED, "{err:?}");
+        // **Ce que devient un 407 sans rien pour y répondre n'est pas une
+        // promesse de ce produit, et l'affirmer coûtait un déploiement.**
+        // Mesuré le 2026-09-10 : Chrome 152 en `--headless=new` rend une
+        // erreur de navigation, `chromedp/headless-shell` 151 — le binaire de
+        // la CI et de la production — rend la page d'erreur du proxy comme une
+        // page ordinaire, donc un `Navigated`. Les deux sont des lectures
+        // défendables d'un défi auquel personne ne peut répondre, et aucune
+        // n'est notre décision.
+        //
+        // Ce que ce test doit tenir, et qui est vrai des deux côtés : **rien
+        // n'invente d'identifiants.** Sans `credentials`, l'adaptateur n'arme
+        // pas le motif au stade requête, ne voit aucun `authRequired`, et ne
+        // peut donc rien envoyer — un `Authorization` chez le proxy voudrait
+        // dire qu'il en a fabriqué, ou repris ceux d'un autre locataire.
+        let outcome = d.act(&ds, BrowserStep::Goto(&proxied_url())).await;
         assert!(
             refusing.requests().iter().all(|(_, auth)| auth.is_none()),
-            "credentials appeared from nowhere: {:?}",
+            "credentials appeared from nowhere ({outcome:?}): {:?}",
             refusing.requests()
+        );
+        assert!(
+            !refusing.requests().is_empty(),
+            "the proxy was never reached, so nothing was proved: {outcome:?}"
         );
         d.release(&ds.binding).await.unwrap();
     }
