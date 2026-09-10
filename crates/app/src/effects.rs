@@ -6311,10 +6311,16 @@ mod tests {
     /// response to whatever request arrives.
     async fn static_site(html: &'static str) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        // Every interface, advertised at `BROWSER_TEST_SITE_HOST` (loopback
+        // when unset): in CI the Chromium under test is a container, and its
+        // `127.0.0.1` is not this runner. See `browser_chrome::test_site_host`.
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
             .await
             .expect("bind");
-        let addr = listener.local_addr().expect("addr");
+        let addr = std::net::SocketAddr::new(
+            agentos_providers::browser_chrome::test_site_host(),
+            listener.local_addr().expect("addr").port(),
+        );
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
