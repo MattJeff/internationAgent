@@ -30,6 +30,7 @@ pub mod invoice_document; // la facture comme document : un PDF écrit à la mai
 pub mod knowledge; // U26
 pub mod mcp; // U27
 pub mod mcp_server; // ce que ce déploiement expose comme serveur MCP : une table de routes, pas une deuxième implémentation
+pub mod mcp_tools; // les outils annoncés, un module par domaine
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod model_access; // wave H: the tenant's own model, connected and proven
 pub mod model_choice; // quel modèle pour ce tour-ci : une table de règles, pas une constante
