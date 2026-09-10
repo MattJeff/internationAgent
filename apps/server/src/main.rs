@@ -650,10 +650,19 @@ fn app(
         bridges,
         &config.public_host,
     );
+    // One state for the four routers that mint an address: the email port to
+    // register a domain on the way, and the deployment's default domain.
+    let hiring = routes::domain::Hiring {
+        db: db.clone(),
+        ports: ports.clone(),
+        default_domain: config.agent_email_domain.clone(),
+        cloudflare_api: agentos_app::sending_domain::CLOUDFLARE_API.to_owned(),
+    };
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
-            .merge(routes::employees::router(db.clone()))
+            .merge(routes::employees::router(hiring.clone()))
+            .merge(routes::domain::router(hiring.clone()))
             .merge(routes::halt::router(db.clone()))
             .merge(routes::initiative::router(db.clone()))
             // Beside `initiative`, deliberately: that one says *how often* a
@@ -720,8 +729,8 @@ fn app(
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))
             .merge(routes::accounting::router(db.clone()))
-            .merge(routes::teams::router(db.clone()))
-            .merge(routes::companies::router(db.clone()))
+            .merge(routes::teams::router(hiring.clone()))
+            .merge(routes::companies::router(hiring.clone()))
             .merge(routes::turns::router(db.clone()))
             // Beside `turns`, which reports the budget a seat has today: this
             // is the same company read forwards over a window the founder

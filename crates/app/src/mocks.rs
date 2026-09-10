@@ -161,7 +161,12 @@ pub struct EmailCredentials {
     /// its own per-tenant registry and never calls the adapter's
     /// `verify_webhook`, so this is a belt with no braces on it yet.
     pub webhook_secret: String,
-    /// The one sending domain this adapter owns, i.e. `AGENT_EMAIL_DOMAIN`.
+    /// `AGENT_EMAIL_DOMAIN`. **Not the adapter's domain any more** — the
+    /// sending domain is the tenant's, in `tenant_domains` (0093), and the
+    /// seat reads it off the employee's row. This is the default a tenant
+    /// that never named one is registered under by `POST /v1/org` and
+    /// `POST /v1/employees`, and the origin of the unsubscribe link when
+    /// there is no `PUBLIC_HOST` to hang it on.
     pub domain: String,
 }
 
@@ -226,13 +231,15 @@ fn email_provider(credentials: &Credentials, public_host: Option<&str>) -> Arc<d
             let provider = ResendEmailProvider::new(
                 Secret::new(email.api_key.clone()),
                 Secret::new(email.webhook_secret.clone()),
-                email.domain.clone(),
             );
             Arc::new(match public_host {
                 Some(host) => {
                     provider.with_unsubscribe_origin(&crate::inbound::callback_origin(host))
                 }
-                None => provider,
+                // The adapter has no domain of its own to fall back on any
+                // more; the deployment's default domain is the honest guess
+                // it used to make for itself.
+                None => provider.with_unsubscribe_origin(&format!("https://{}", email.domain)),
             })
         }
         None => Arc::new(MockEmailProvider::new()),

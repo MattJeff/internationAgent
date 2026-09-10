@@ -268,6 +268,53 @@ and another tenant's employee id is a 404.
 From 2026-09-01 the same slice goes to Smartlead's API instead of to your
 clipboard. Nothing above changes except where the bytes land.
 
+### 1.4f The sending domain — the tenant's, verified before a seat writes
+
+Every employee address is `slug@domain`, and the domain is **one row per
+tenant** (`tenant_domains`, 0093) that the email provider has to verify before
+any seat is provisioned on it. `AGENT_EMAIL_DOMAIN` is only the default a
+tenant is registered under when the first hire names none. Four routes, same
+key as everything else on `/v1`:
+
+```bash
+# Register (finds a domain already on the Resend account, never duplicates it).
+# 201 the first time, 200 on the same name again, 409 another_domain on a
+# different one, 409 domain_taken if another tenant of this deployment has it,
+# 400 bad_domain.
+curl -sS -X POST http://localhost:8090/v1/domain \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"domain":"agents.getorizn.com"}'
+# -> {"domain":"agents.getorizn.com","provider":"resend","status":"pending",
+#     "records":[{"record":"DKIM","type":"TXT","name":"resend._domainkey",
+#                 "value":"p=…","ttl":"Auto","status":"not_started"}, …],
+#     "checked_at":"…","verified_at":null}
+
+# Read it back. 404 no_domain until registered.
+curl -sS -H "Authorization: Bearer $KEY" http://localhost:8090/v1/domain
+
+# Publish the records in the Cloudflare zone that holds the domain — plus the
+# inbound MX, which Resend does not list until receiving is enabled. The token
+# (Zone:Read + DNS:Edit) is used for this one call and stored nowhere.
+curl -sS -X POST http://localhost:8090/v1/domain/dns \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"cloudflare_api_token":"…"}'
+# -> {"posed":4,"skipped":0,"zone":"getorizn.com"}   (click twice: posed 0)
+
+# Ask the provider to look at DNS again. On "verified", every seat of the
+# tenant that was waiting on the domain goes back to `pending` and the
+# provisioning loop seats it on its next tick.
+curl -sS -X POST -H "Authorization: Bearer $KEY" http://localhost:8090/v1/domain/verify
+```
+
+Until the domain is `verified`, `GET /v1/employees/{id}` shows the `email`
+step as `pending_external` with the provider's domain id for `poll_ref` and an
+`expected_by` an hour out. That hour is the slow path — the loop re-asks the
+provider once per seat per hour, never per tick — and `verify` is the fast
+one. A domain nobody registered (a hire under a name that is not on the
+account, which the routes above make hard to do) fails the step with
+`domain_not_registered`. `docs/PROVIDERS.md` §Resend has what each call does
+at the provider.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**
@@ -455,7 +502,7 @@ That is deliberate.
 |---|---|---|
 | `DATABASE_URL` | Postgres connection string | `refusing to start: DATABASE_URL is not set…` |
 | `PUBLIC_HOST` | The origin this deployment is reachable at, **including scheme** | Boot failure. It is interpolated into the A2A agent card's `url` (`{PUBLIC_HOST}/a2a/jsonrpc?employee=…`), so a wrong value means peers call nowhere. There is no defensible default. |
-| `AGENT_EMAIL_DOMAIN` | Domain employee addresses are minted under | Boot failure |
+| `AGENT_EMAIL_DOMAIN` | The **default** sending domain — the one a tenant is registered under when its first hire names none. The domain itself is per tenant, `POST /v1/domain` (§1.4f) | Boot failure |
 | `AGENTOS_MASTER_KEY` | Envelope-encryption root key | Boot failure. **It is read, and it is load-bearing:** every employee's Ed25519 private key is sealed under it. Validated only as "non-empty" — it is not hex-decoded or length-checked at boot despite what `.env.example` implies, and it is bridged to 32 bytes by SHA-256, not a KDF, because the input is a secret with full entropy rather than a password. Losing it is unrecoverable ([§10](#10-backup-and-restore)). |
 
 ### Optional, with defaults
@@ -485,8 +532,9 @@ disagree. Selection is **per adapter**: one set and two unset is a normal
 deployment, not an error.
 
 The email adapter also needs the `whsec_…` signing secret and takes it from the
-`email` entry of `AGENTOS_WEBHOOK_SECRETS`, and its sending domain from
-`AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
+`email` entry of `AGENTOS_WEBHOOK_SECRETS`; it has no variable of its own. The
+sending domain is not the adapter's any more: it is each tenant's row
+(§1.4f), and `AGENT_EMAIL_DOMAIN` is the default a tenant gets registered under.
 
 `EMBEDDER_API_KEY` is a row here again, and the reason it was deleted is worth
 knowing before you set it. It used to be the guard's own version of the failure

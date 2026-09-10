@@ -40,7 +40,9 @@ constant, not a second half.
 
 The email adapter's third input, the `whsec_…` signing secret, comes from the
 `email` entry of `AGENTOS_WEBHOOK_SECRETS`, where you have already pasted it.
-Its sending domain is `AGENT_EMAIL_DOMAIN`. Neither has a variable of its own.
+Its sending domain is **the tenant's**, registered through `POST /v1/domain`;
+`AGENT_EMAIL_DOMAIN` is only the default for a tenant that never named one.
+Neither secret has a variable of its own.
 
 That variable holds **one tenant per provider** and always has. A deployment
 with a second customer registers theirs in `webhook_endpoints` instead — see
@@ -204,13 +206,14 @@ boot guard refuses unless `AGENTOS_ALLOW_MOCKS=1`.
 ### The account and the credentials — *two* of them
 
 1. Open an account at [resend.com](https://resend.com).
-2. **Domains → Add domain.** Enter the same value you set as
-   `AGENT_EMAIL_DOMAIN`. Resend gives you DNS records (SPF, DKIM, and a
-   `MX`/return-path record). Add them at your DNS host and wait for Resend to
-   show the domain as verified. *This is DNS propagation, not human review — it
-   is usually minutes, occasionally hours.*
+2. **The sending domain is registered from the API, per tenant** — see "The
+   sending domain is the tenant's" below. You may also add it in **Domains →
+   Add domain** first; `POST /v1/domain` *finds* a domain that is already on
+   the account and never creates a second one. Either way, wait for Resend to
+   show it as verified. *This is DNS propagation, not human review — it is
+   usually minutes, occasionally hours.*
 3. **API Keys → Create API Key**, sending permission. Copy the `re_…` value.
-   This is the API key: `ResendEmailProvider::new(api_key, …)`.
+   This is the API key: `ResendEmailProvider::new(api_key, webhook_secret)`.
 4. **Webhooks → Add endpoint**, pointing at
    `{PUBLIC_HOST}/v1/webhooks/email`, subscribed — the form ticks them one by
    one — to `email.received`, `email.bounced`, `email.complained`,
@@ -229,7 +232,7 @@ Where each goes:
 |---|---|---|
 | `re_…` API key | `EMAIL_API_KEY` | **builds the adapter** — set it and mail is really sent |
 | `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…`, or `POST /v1/platform/webhooks` for a second customer | verifies inbound deliveries, **and** (from the variable) is handed to the adapter as its own webhook secret — one paste, not two |
-| the sending domain | `AGENT_EMAIL_DOMAIN` | the one domain this adapter owns |
+| the sending domain | `POST /v1/domain` (one row per tenant); `AGENT_EMAIL_DOMAIN` is the default for a tenant that named none | the domain every seat of that tenant sits on — verified at Resend before any seat is provisioned |
 
 The webhook half works even with the mock adapter: the route verifies the
 signature against the configured secret and stores the raw bytes. The path
@@ -237,6 +240,59 @@ segment (`email`) is the `{path}` in `/v1/webhooks/{path}` and must match the
 label in `AGENTOS_WEBHOOK_SECRETS`. An unregistered path is a **404**, and an
 empty registry with an empty `webhook_endpoints` table means no inbound message
 can arrive at all.
+
+### The sending domain is the tenant's, and it is verified before a seat sits on it
+
+**Measured 2026-09-10.** The domain used to be one variable per deployment,
+`AGENT_EMAIL_DOMAIN`, handed to the adapter, and nothing between it and Resend
+ever asked whether the name existed there: Orizn ran five days on
+`agent-orizn.com`, a domain nobody owns. Now every employee's row carries its
+domain (it always did — `slug@domain`), the seat reads it, and the domain is a
+row of its own, `tenant_domains` (`migrations/0093`), one per tenant and one
+tenant per name. The variable stays as the **default** a tenant is registered
+under when `POST /v1/org` or `POST /v1/employees` names none.
+
+The four routes (`docs/OPERATIONS.md` §1.4f):
+
+| Route | What it does at Resend |
+|---|---|
+| `POST /v1/domain {domain}` | `GET /domains`, then `POST /domains {name}` only if the name is not there — so `agents.getorizn.com`, already on Orizn's account, is *found*. Answers the DNS `records` Resend wants. |
+| `GET /v1/domain` | nothing — the row. |
+| `POST /v1/domain/verify` | `POST /domains/{id}/verify`, then `GET /domains/{id}`. On `verified`, every seat of the tenant waiting on the domain is woken. |
+| `POST /v1/domain/dns {cloudflare_api_token}` | nothing at Resend; the `records` are posted into the Cloudflare zone holding the domain, plus the inbound MX below. |
+
+**What a seat does with it.** `ensure_identity` looks the tenant's domain up
+in `GET /domains` and never creates one. Absent: `Terminal {
+domain_not_registered }` — the step fails and says why. Present but not
+`verified`: `PendingExternal { poll_ref: <domain id> }`, and the seat waits
+with nothing reserved for it. **The wait is not a poll**: the engine leaves a
+`pending_external` step alone until its `expected_by`, one
+`DOMAIN_VERIFY_WAIT` (an hour) out, then the loop's reaper retries it — one
+`GET /domains` per seat per hour at most, never one per 200 ms tick. The fast
+path is `POST /v1/domain/verify`: on `verified` it puts the waiting seats back
+to `pending` and the next tick seats them.
+
+**Statuses.** Resend's `not_started`, `pending` and `temporary_failure` are
+all `pending` here — the last one Resend retries by itself; `verified` and
+`failed` are themselves. A verified domain for *sending* is DKIM + SPF
+verified.
+
+**The inbound MX is not in `records`.** Receiving needs one more record,
+`inbound-smtp.<region>.amazonaws.com`, priority 10, on the domain name itself
+— and Resend does not list it in the domain's `records` until receiving is
+switched on in the dashboard (read 2026-09-10 on Orizn's account). The row
+keeps the domain's `region`, and `POST /v1/domain/dns` derives the MX from it
+rather than waiting; if you copy records by hand, add that one yourself.
+
+**Open and click tracking** are per domain (`PATCH /domains/{id}
+{open_tracking, click_tracking}`), off by default, and not touched by any
+route here: `email.opened` / `email.clicked` only arrive once you enable them
+in Domains → Configuration, as the webhook step above says.
+
+**Changing a tenant's domain is another story.** `POST /v1/domain` with a
+second name answers `409 another_domain`: every address already printed in
+mail that left lives on the first one, and re-addressing a company is not a
+column update. Nothing here does it yet.
 
 ### More than one customer on one provider account
 
@@ -302,8 +358,8 @@ paragraph warns about is not the one that binds. It holds `phone` as well as
 
 **The sending domain cannot be released.** `ensure_identity` reconciles on the
 domain *name* (Resend domains have no free-form metadata field to stamp the
-idempotency tag into), so one adapter owns one sending domain and every employee
-sits on it. `release` therefore returns
+idempotency tag into), so one tenant owns one sending domain and every employee
+of the tenant sits on it. `release` therefore returns
 `Terminal { code: "release_not_supported" }` — not `Ok(())`, which would clear the
 binding on a domain that is still very much alive, and not a transient failure,
 which would make **every** termination end in the dead-letter queue.

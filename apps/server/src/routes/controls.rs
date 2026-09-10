@@ -576,12 +576,13 @@ mod tests {
 
             // The routers every lever points at, so the levers test asks the
             // real thing and not a list.
+            let hiring = super::super::domain::Hiring::for_tests(db.clone());
             let routes = router(db.clone())
                 .merge(super::super::halt::router(db.clone()))
                 .merge(super::super::spend::router(db.clone()))
-                .merge(super::super::teams::router(db.clone()))
+                .merge(super::super::teams::router(hiring.clone()))
                 .merge(super::super::policy::router(db.clone()))
-                .merge(super::super::employees::router(db.clone()));
+                .merge(super::super::employees::router(hiring));
             Some(Self {
                 app: crate::with_api_stack(
                     routes,

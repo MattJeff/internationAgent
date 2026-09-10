@@ -23,6 +23,10 @@ pub mod controls; // tâche K: ce qui borne chaque siège et le bouton d'arrêt,
 // No table and no port — `0028`'s internal channel already is the thread; see
 // `agentos_app::inbound`'s desk section and `migrations/0065`.
 pub mod desk;
+// le domaine d'envoi : au locataire, vérifié chez le fournisseur, posé chez
+// Cloudflare en un appel. `Hiring` y vit aussi — l'état des trois routes qui
+// embauchent, parce qu'embaucher enregistre le domaine au passage.
+pub mod domain;
 pub mod employees; // U31
 // le classeur: the founder files a document and gets those exact bytes back.
 // `knowledge` next door indexes in order to find again; this one keeps.

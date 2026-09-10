@@ -43,6 +43,7 @@
 //! [`StoreError::NotFound`], and is answered **404** — not 403, which would
 //! confirm the id exists.
 
+use agentos_app::sending_domain;
 use agentos_domain::action::Domain;
 use agentos_domain::employee::{Employee, Health, Lifecycle, ProviderBinding, ResourceState, Step};
 use agentos_domain::ids::{EmployeeId, Slug};
@@ -66,6 +67,7 @@ use uuid::Uuid;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
+use crate::routes::domain::{Hiring, refused};
 
 /// One `employees` row as [`list`] selects it: id, slug, lifecycle, created_at,
 /// updated_at.
@@ -92,14 +94,14 @@ pub fn lifecycle_event(to: Lifecycle) -> String {
 
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack`.
-pub fn router(db: Db) -> Router {
+pub fn router(hiring: Hiring) -> Router {
     Router::new()
         .route("/v1/employees", post(create).get(list))
         .route("/v1/employees/{id}", get_route(get))
         .route("/v1/employees/{id}/suspend", post(suspend))
         .route("/v1/employees/{id}/resume", post(resume))
         .route("/v1/employees/{id}/terminate", post(terminate))
-        .with_state(db)
+        .with_state(hiring)
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +115,13 @@ pub fn router(db: Db) -> Router {
 struct CreateEmployee {
     /// Becomes the local part of the address and the employee's handle.
     slug: String,
-    /// The sending/receiving domain, e.g. `agents.example.com`.
-    domain: String,
+    /// The sending/receiving domain, e.g. `agents.example.com` — **the
+    /// tenant's** (`tenant_domains`, 0093): registered on the way if the
+    /// tenant has none, 409 `another_domain` if it has another. Absent, the
+    /// tenant's own — or, for a tenant with none, the deployment's
+    /// `AGENT_EMAIL_DOMAIN`.
+    #[serde(default)]
+    domain: Option<String>,
 }
 
 /// One resource, rendered honestly.
@@ -302,11 +309,12 @@ struct Page {
 /// **202, never 201.** The employee exists, but nothing it needs to do its job
 /// does yet; a 201 would be telling the client its resource is ready.
 async fn create(
-    State(db): State<Db>,
+    State(hiring): State<Hiring>,
     principal: Principal,
     headers: HeaderMap,
     body: Result<Json<CreateEmployee>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let db = hiring.db.clone();
     // The layer in main.rs replays a repeated key. It cannot invent one, and a
     // create without a key is a duplicate employee waiting for a retry.
     if !headers.contains_key("idempotency-key") {
@@ -318,7 +326,29 @@ async fn create(
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
     let slug =
         Slug::parse(&body.slug).map_err(|err| ApiError::bad_request(format!("slug: {err}")))?;
-    let domain = Domain::parse(&body.domain)
+    // Parsed before the transaction so a bad name is a 400 with no write —
+    // and parsed again inside `require`, which is where the tenant's own row
+    // decides whether this is the domain.
+    if let Some(named) = &body.domain {
+        Domain::parse(named).map_err(|err| ApiError::bad_request(format!("domain: {err}")))?;
+    }
+
+    // One transaction: the domain (registered on the way if the tenant has
+    // none), the row, its eleven pending resources, the event that makes
+    // somebody go and provision them, and the audit row. A subscriber can
+    // never see the event for an employee that was rolled back, an employee can
+    // never exist with nobody coming for it, and the trail can never claim a
+    // hire that did not happen.
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let registered = sending_domain::require(
+        &mut tx,
+        &*hiring.ports.email,
+        body.domain.as_deref(),
+        &hiring.default_domain,
+    )
+    .await
+    .map_err(refused)?;
+    let domain = Domain::parse(&registered.domain)
         .map_err(|err| ApiError::bad_request(format!("domain: {err}")))?;
 
     let now = Utc::now();
@@ -329,13 +359,6 @@ async fn create(
         domain,
         now,
     );
-
-    // One transaction: the row, its eleven pending resources, the event that
-    // makes somebody go and provision them, and the audit row. A subscriber can
-    // never see the event for an employee that was rolled back, an employee can
-    // never exist with nobody coming for it, and the trail can never claim a
-    // hire that did not happen.
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
     employee_store::insert(&mut tx, &employee).await?;
     outbox::enqueue(
         &mut tx,
@@ -800,6 +823,11 @@ mod tests {
 
             let a = new_tenant(&db).await;
             let b = new_tenant(&db).await;
+            // Each tenant its own sending domain, so a body with no `domain`
+            // hires on it — see `Hiring::domain_of` for why not one literal.
+            let hiring = Hiring::for_tests(db.clone());
+            hiring.adopt(a).await;
+            hiring.adopt(b).await;
             let keys = ApiKeys::parse(&format!(
                 "ops-a:{}:{SECRET_A},ops-b:{}:{SECRET_B}",
                 a.as_uuid(),
@@ -813,7 +841,7 @@ mod tests {
                     // to test that `booking_open` reads back is to flip it
                     // through the route that owns it. It is one `PUT` and no
                     // state of its own.
-                    router(db.clone()).merge(crate::routes::booking::router(db.clone())),
+                    router(hiring).merge(crate::routes::booking::router(db.clone())),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
@@ -906,8 +934,10 @@ mod tests {
         tenant
     }
 
+    /// No `domain`: each harness tenant was given its own by
+    /// [`Hiring::adopt`], and the route hires on it.
     fn body(slug: &str) -> Value {
-        json!({"slug": slug, "domain": "agents.example.com"})
+        json!({"slug": slug})
     }
 
     /// A fresh key. Keys are scoped per tenant *and* per endpoint, but tests in
@@ -1033,7 +1063,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the id we were just handed 404'd");
         assert_eq!(employee["lifecycle"], "draft");
         assert_eq!(employee["health"], "provisioning");
-        assert_eq!(employee["address"], "ines@agents.example.com");
+        assert_eq!(
+            employee["address"],
+            format!("ines@{}", Hiring::domain_of(h.a))
+        );
 
         let resources = employee["resources"].as_array().expect("resources");
         assert_eq!(
@@ -1072,7 +1105,7 @@ mod tests {
             json!({"slug": "Not A Slug", "domain": "agents.example.com"}),
             json!({"slug": "lena", "domain": "localhost"}),
             json!({"slug": "lena", "domain": "10.0.0.1"}),
-            json!({"slug": "lena"}),
+            json!({"slug": "lena", "domain": ""}),
             json!({"slug": "lena", "domain": "agents.example.com", "tenant_id": "…"}),
         ] {
             let (status, _) = h
@@ -1870,7 +1903,7 @@ mod tests {
         assert_eq!(trail[0].0, "employee_created");
         assert_eq!(trail[0].1, "operator:ops-a", "the key that acted");
         assert_eq!(trail[0].2["slug"], "nadia");
-        assert_eq!(trail[0].2["domain"], "agents.example.com");
+        assert_eq!(trail[0].2["domain"], Hiring::domain_of(h.a));
 
         // Activate it the way the provisioning engine does, so suspend is legal.
         let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
@@ -2098,7 +2131,7 @@ mod tests {
                 "/v1/employees",
                 SECRET_A,
                 Some(&key("booking")),
-                Some(json!({"slug": "porte", "domain": "agents.example.com"})),
+                Some(json!({"slug": "porte"})),
             )
             .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{created}");

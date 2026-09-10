@@ -411,7 +411,9 @@ mod tests {
                 // qui puisse authentifier dans ces tests est une ligne de la
                 // table, c'est-à-dire un jeton de session.
                 api: crate::with_api_stack(
-                    crate::routes::employees::router(db.clone()),
+                    crate::routes::employees::router(crate::routes::domain::Hiring::for_tests(
+                        db.clone(),
+                    )),
                     db.clone(),
                     Keyring::new(ApiKeys::default(), db.clone(), TEST_MASTER_KEY),
                 ),

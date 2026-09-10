@@ -41,7 +41,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -888,6 +888,99 @@ impl OptOuts {
 }
 
 // ---------------------------------------------------------------------------
+// The sending domain
+// ---------------------------------------------------------------------------
+
+/// How long a seat waits on a domain that is registered but not yet verified
+/// before the wait is escalated — the `expected_by` an adapter stamps into
+/// [`ProviderError::PendingExternal`] for a domain.
+///
+/// **This number is the whole polling cadence, so it is written down here and
+/// not in each adapter.** `agentos_app::provisioning::ProvisioningEngine::ensure_step`
+/// never re-calls a step that is `pending_external`; the only thing that puts
+/// it back in front of an adapter is the loop's reaper, which fires when
+/// `expected_by` has passed, flips the row to `failed`, and lets the claim
+/// query retry it (at most `max_attempts` times in total). So per seat, one
+/// `GET /domains` every `DOMAIN_VERIFY_WAIT` and never more — against
+/// Resend's own "usually minutes, occasionally hours" for DNS propagation,
+/// which is what an hour is. Faster is what a 200 ms tick would have done
+/// on its own: one listing per seat per tick, a denial of service on the
+/// provider paid for by the customer's account.
+///
+/// The fast path is not this clock at all: `POST /v1/domain/verify` wakes
+/// every waiting seat the moment the provider says `verified`
+/// (`agentos_app::sending_domain::verify`).
+pub const DOMAIN_VERIFY_WAIT: Duration = Duration::hours(1);
+
+/// Where a sending domain stands at the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainStatus {
+    /// Registered; DNS not yet seen, or seen and still propagating. Resend's
+    /// `not_started`, `pending` and `temporary_failure` all land here — the
+    /// provider retries the last one on its own.
+    Pending,
+    /// DKIM and SPF verified; mail may be sent from it.
+    Verified,
+    /// The provider gave up on the records it saw. A human fixes DNS, then
+    /// `verify_domain` asks again.
+    Failed,
+}
+
+impl DomainStatus {
+    /// Stable wire/storage spelling, the `status` CHECK of `tenant_domains`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One DNS record the provider wants published, copied verbatim from its
+/// answer. `kind` is the DNS type and travels as `type` on the wire, both in
+/// the provider's JSON and in ours, so a console can hand it straight to a DNS
+/// host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRecord {
+    /// The provider's own label: `DKIM`, `SPF`, `MX`, …
+    #[serde(default)]
+    pub record: String,
+    /// `TXT`, `MX`, `CNAME`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The host — relative to the domain as Resend spells it
+    /// (`resend._domainkey`, `send`), see `dns_cloudflare::fqdn`.
+    pub name: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+    /// `"Auto"` from Resend; a string because that is what it is.
+    #[serde(default)]
+    pub ttl: String,
+    /// Per record: `not_started`, `pending`, `verified`, …
+    #[serde(default)]
+    pub status: String,
+}
+
+/// A sending domain as the provider knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainState {
+    /// Adapter identity, e.g. `"resend"` — what the row says verified it.
+    pub provider: &'static str,
+    /// The provider's id for it — the `poll_ref` a waiting seat carries.
+    pub provider_domain_id: String,
+    pub status: DomainStatus,
+    /// What to publish. Empty for a provider that never asked for anything.
+    pub records: Vec<DnsRecord>,
+    /// The provider's region for the domain (`eu-west-1`), when it names one.
+    /// The inbound MX — `inbound-smtp.<region>.amazonaws.com` at Resend — is
+    /// derived from it and is **not** in `records` until receiving is switched
+    /// on in the provider's dashboard.
+    pub region: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // The trait
 // ---------------------------------------------------------------------------
 
@@ -895,9 +988,26 @@ impl OptOuts {
 /// [`ResendEmailProvider`](crate::email_resend::ResendEmailProvider).
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
-    /// Make the sending identity (domain + mailbox) exist, reconciling on
-    /// [`EnsureCtx::tag`] before creating anything. See the crate docs.
+    /// Seat the employee on [`EnsureCtx::domain`].
+    ///
+    /// The domain is the tenant's, registered beforehand through
+    /// [`EmailProvider::ensure_domain`]; this method **never creates one**.
+    /// Not registered at the provider is `Terminal { domain_not_registered }`;
+    /// registered but not [`DomainStatus::Verified`] is
+    /// `PendingExternal { poll_ref: <provider domain id> }` with
+    /// [`DOMAIN_VERIFY_WAIT`] — the seat waits, and nothing is reserved for
+    /// it; verified is a [`Provisioned`] whose id is stable across calls for
+    /// the same [`EnsureCtx::tag`].
     async fn ensure_identity(&self, ctx: &EnsureCtx) -> Result<Provisioned, ProviderError>;
+
+    /// Find `name` at the provider, or register it there. Idempotent: the
+    /// second call finds what the first created and creates nothing.
+    async fn ensure_domain(&self, name: &str) -> Result<DomainState, ProviderError>;
+
+    /// Ask the provider to look at DNS again, and read back where the domain
+    /// stands. `provider_domain_id` is what [`EmailProvider::ensure_domain`]
+    /// returned.
+    async fn verify_domain(&self, provider_domain_id: &str) -> Result<DomainState, ProviderError>;
 
     /// Give the sending identity back.
     ///
@@ -967,6 +1077,17 @@ pub trait EmailProvider: Send + Sync {
 struct MockState {
     /// tag -> external_id. Keyed by tag, so a second `ensure` cannot create.
     identities: HashMap<String, String>,
+    /// domain name -> (provider id, status). Seeded by `ensure_domain`, or by
+    /// `ensure_identity` itself when nothing registered the domain first —
+    /// the mock verifies on sight, so a test about anything else never has
+    /// to register a domain to get a seat.
+    domains: HashMap<String, (String, DomainStatus)>,
+    /// While set, a domain this mock registers stays `Pending` and a seat on
+    /// it waits. See [`MockEmailProvider::hold_domain_pending`].
+    hold_pending: bool,
+    /// Every `ensure_identity`, answered or not — the number the cadence
+    /// proof in `agentos_app::provisioning` reads.
+    ensure_identity_calls: u64,
     /// idempotency key -> message id.
     sent: HashMap<String, ProviderMessageId>,
     /// What actually went out, in order. A test that asserts on an attachment
@@ -977,6 +1098,41 @@ struct MockState {
     /// (message id, attachment id) -> bytes.
     attachments: HashMap<(String, String), Vec<u8>>,
     next: u64,
+}
+
+/// Find `name` in the mock's domains or register it, verified unless held.
+fn register(state: &mut MockState, name: &str) -> (String, DomainStatus) {
+    if let Some(known) = state.domains.get(name) {
+        return known.clone();
+    }
+    let id = MockEmailProvider::next_id(state, "dom_");
+    let status = if state.hold_pending {
+        DomainStatus::Pending
+    } else {
+        DomainStatus::Verified
+    };
+    state.domains.insert(name.to_owned(), (id.clone(), status));
+    (id, status)
+}
+
+/// The one record the mock asks for, so a console rendering `records` has
+/// something to render and a DNS poser has something to pose.
+fn mock_domain(id: String, status: DomainStatus) -> DomainState {
+    DomainState {
+        provider: MockEmailProvider::PROVIDER,
+        provider_domain_id: id,
+        status,
+        records: vec![DnsRecord {
+            record: "DKIM".to_owned(),
+            kind: "TXT".to_owned(),
+            name: "mock._domainkey".to_owned(),
+            value: "p=MOCK".to_owned(),
+            priority: None,
+            ttl: "Auto".to_owned(),
+            status: status.as_str().to_owned(),
+        }],
+        region: Some("eu-west-1".to_owned()),
+    }
 }
 
 /// In-memory email provider that reproduces the two-phase inbound shape, the
@@ -1040,6 +1196,29 @@ impl MockEmailProvider {
         format!("{prefix}{:04}", state.next)
     }
 
+    /// Keep every domain `Pending` until [`MockEmailProvider::release_domains`].
+    ///
+    /// The default verifies on sight because almost every test wants a seat,
+    /// not a DNS story. The tests that want the wait — a seat that must sit
+    /// in `pending_external` and then wake — turn this on.
+    pub fn hold_domain_pending(&self) {
+        self.state.lock().expect("mock state poisoned").hold_pending = true;
+    }
+
+    /// DNS "propagated": the next `verify_domain` reports `Verified`.
+    pub fn release_domains(&self) {
+        self.state.lock().expect("mock state poisoned").hold_pending = false;
+    }
+
+    /// How many domains this mock has registered.
+    pub fn domain_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("mock state poisoned")
+            .domains
+            .len()
+    }
+
     /// Sign a body the way the real provider would, for tests.
     pub fn sign(&self, body: &[u8], now: DateTime<Utc>) -> WebhookHeaders {
         let id = "msg_webhook_1".to_owned();
@@ -1064,6 +1243,14 @@ impl MockEmailProvider {
             state.attachments.insert((id.clone(), attachment_id), blob);
         }
         state.inbound.insert(id, raw);
+    }
+
+    /// How many times `ensure_identity` was asked, whatever it answered.
+    pub fn ensure_identity_calls(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("mock state poisoned")
+            .ensure_identity_calls
     }
 
     /// How many external identities actually exist. The duplicate-resource
@@ -1097,6 +1284,19 @@ impl EmailProvider for MockEmailProvider {
     async fn ensure_identity(&self, ctx: &EnsureCtx) -> Result<Provisioned, ProviderError> {
         self.fault.check_before()?;
         let mut state = self.state.lock().expect("mock state poisoned");
+        state.ensure_identity_calls += 1;
+
+        // The domain first, the way the real adapter reads it: a seat on a
+        // domain that is not verified is a wait, not a resource. The mock
+        // registers an unknown name on the spot (verified unless held) so
+        // that a test with no DNS story gets its seat.
+        let (domain_id, status) = register(&mut state, &ctx.domain);
+        if status != DomainStatus::Verified {
+            return Err(ProviderError::PendingExternal {
+                poll_ref: domain_id,
+                expected_by: Utc::now() + DOMAIN_VERIFY_WAIT,
+            });
+        }
 
         // 1 & 2: look up by tag, return the hit without creating.
         if let Some(external_id) = state.identities.get(ctx.tag()) {
@@ -1104,7 +1304,7 @@ impl EmailProvider for MockEmailProvider {
         }
 
         // 3: create, stamping the tag into the field the lookup reads.
-        let external_id = Self::next_id(&mut state, "dom_");
+        let external_id = format!("{domain_id}/{}", ctx.tag());
         state
             .identities
             .insert(ctx.tag().to_owned(), external_id.clone());
@@ -1114,6 +1314,32 @@ impl EmailProvider for MockEmailProvider {
         // buys a second one — unless the lookup above runs first next time.
         self.fault.check_after()?;
         Ok(Provisioned::new(Self::PROVIDER, external_id))
+    }
+
+    async fn ensure_domain(&self, name: &str) -> Result<DomainState, ProviderError> {
+        self.fault.check_before()?;
+        let mut state = self.state.lock().expect("mock state poisoned");
+        let (id, status) = register(&mut state, name);
+        Ok(mock_domain(id, status))
+    }
+
+    async fn verify_domain(&self, provider_domain_id: &str) -> Result<DomainState, ProviderError> {
+        self.fault.check_before()?;
+        let mut state = self.state.lock().expect("mock state poisoned");
+        let hold = state.hold_pending;
+        let Some((_, (id, status))) = state
+            .domains
+            .iter_mut()
+            .find(|(_, (id, _))| id == provider_domain_id)
+        else {
+            return Err(ProviderError::Terminal {
+                code: "domain_not_registered",
+            });
+        };
+        if !hold {
+            *status = DomainStatus::Verified;
+        }
+        Ok(mock_domain(id.clone(), *status))
     }
 
     async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError> {
@@ -1243,8 +1469,23 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
     let employee_id = EmployeeId::new_v7(now);
     let slug = agentos_domain::ids::Slug::parse("lena").expect("valid slug");
 
+    // -- the domain is the tenant's, registered before any seat -------------
+    let domain = p
+        .ensure_domain("agents.example.com")
+        .await
+        .expect("register the domain");
+    let again = p
+        .ensure_domain("agents.example.com")
+        .await
+        .expect("register it again");
+    assert_eq!(
+        domain.provider_domain_id, again.provider_domain_id,
+        "ensure_domain must find the domain it registered, not register a second"
+    );
+
     // -- ensure twice => ONE resource, SAME external id --------------------
-    let ctx = EnsureCtx::new(tenant_id, employee_id, slug, "email");
+    let ctx =
+        EnsureCtx::new(tenant_id, employee_id, slug, "email").with_domain("agents.example.com");
     let first = p.ensure_identity(&ctx).await.expect("first ensure");
     let second = p
         .ensure_identity(&ctx.clone().retry())
@@ -1260,7 +1501,8 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
     // second domain nobody meant to buy. Both are checked; the only thing that
     // is never acceptable is an adapter that does whichever happened to fall
     // out of the code.
-    let other = EnsureCtx::new(tenant_id, employee_id, ctx.slug.clone(), "email_alt");
+    let other = EnsureCtx::new(tenant_id, employee_id, ctx.slug.clone(), "email_alt")
+        .with_domain("agents.example.com");
     let other = p.ensure_identity(&other).await.expect("other ensure");
     match scope {
         IdentityScope::PerKey => assert_ne!(
@@ -1705,11 +1947,59 @@ mod tests {
             )),
         };
         let found = recovered
-            .ensure_identity(&ctx.retry())
+            .ensure_identity(&ctx.clone().retry())
             .await
             .expect("reconciled");
-        assert_eq!(found.external_id, "dom_0001");
+        assert_eq!(found.external_id, format!("dom_0001/{}", ctx.tag()));
         assert_eq!(recovered.identity_count(), 1, "exactly one resource, ever");
+    }
+
+    /// The wait, on the mock: held, a seat is `PendingExternal` on the
+    /// domain's id and nothing is bound; released and verified, the same
+    /// seat is provisioned. The engine test in `agentos_app::provisioning`
+    /// runs this same story through the database.
+    #[tokio::test]
+    async fn a_held_domain_makes_a_seat_wait_and_a_released_one_seats_it() {
+        let p = MockEmailProvider::new();
+        p.hold_domain_pending();
+        let now = Utc::now();
+        let ctx = EnsureCtx::new(
+            TenantId::new_v7(now),
+            EmployeeId::new_v7(now),
+            agentos_domain::ids::Slug::parse("lena").unwrap(),
+            "email",
+        )
+        .with_domain("agents.example.com");
+
+        let registered = p
+            .ensure_domain("agents.example.com")
+            .await
+            .expect("register");
+        assert_eq!(registered.status, DomainStatus::Pending);
+        let Err(ProviderError::PendingExternal { poll_ref, .. }) = p.ensure_identity(&ctx).await
+        else {
+            panic!("a held domain must be a wait");
+        };
+        assert_eq!(poll_ref, registered.provider_domain_id);
+        assert_eq!(
+            p.identity_count(),
+            0,
+            "nothing is reserved for a waiting seat"
+        );
+
+        // Still held: verifying changes nothing, which is what real DNS does.
+        assert_eq!(
+            p.verify_domain(&poll_ref).await.expect("verify").status,
+            DomainStatus::Pending
+        );
+        p.release_domains();
+        assert_eq!(
+            p.verify_domain(&poll_ref).await.expect("verify").status,
+            DomainStatus::Verified
+        );
+        let seated = p.ensure_identity(&ctx).await.expect("seated");
+        assert_eq!(seated.external_id, format!("{poll_ref}/{}", ctx.tag()));
+        assert_eq!(p.domain_count(), 1);
     }
 
     #[tokio::test]
