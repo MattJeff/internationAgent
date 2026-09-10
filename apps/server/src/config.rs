@@ -33,6 +33,11 @@
 //! Half of one is a named boot failure, because an adapter holding half its
 //! credential is the deployment that believes it is real and is not.
 //!
+//! The browser has a third answer beside key and mock: `BROWSER_FETCH=http`
+//! reads pages with a `GET` and an HTML parser, no JavaScript, no vendor. It
+//! counts as real — it fetches the page it is asked for — and the boot line
+//! says `browser=http(no-js)` so nobody mistakes it for the one that types.
+//!
 //! The model is the one adapter chosen by name rather than by credential:
 //! `AGENTOS_LLM` is `mock` (the default), `cli` or `anthropic`, and only the
 //! last of those counts as real. Picking `anthropic` without `ANTHROPIC_API_KEY`
@@ -109,6 +114,13 @@ const PROVIDER_CREDENTIALS: [(&str, &str, &str); 4] = [
     ("browser", "BROWSER_API_KEY", "browserbase"),
     ("embedder", "EMBEDDER_API_KEY", "openai"),
 ];
+
+/// What the `browser` row reads when `BROWSER_FETCH=http` stands in for a
+/// key: real, and without JavaScript. The second browser in the table above
+/// is not a row of its own because it has no credential to select on —
+/// `agentos_app::mocks::Credentials::browser_fetch_http` is a switch, and the
+/// key still outranks it.
+const HTTP_BROWSER: &str = "http(no-js)";
 
 /// The vault, named in every boot summary beside the adapters a credential
 /// selects — because it is the line an operator reads to find out what is real,
@@ -608,15 +620,37 @@ impl Config {
             // index predicate is a SQL literal. See
             // `agentos_providers::embedder_openai`.
             embedder: get("EMBEDDER_API_KEY").map(|api_key| EmbedderCredentials { api_key }),
+            // The one switch among the credentials, read with them so that
+            // the guard below and `mocks::browser_provider` see the same
+            // value. `http` or nothing: a typo here must not be a fake browser
+            // that reads as configured.
+            browser_fetch_http: match get("BROWSER_FETCH").as_deref() {
+                None => false,
+                Some("http") => true,
+                Some(other) => {
+                    return Err(ConfigError::Invalid {
+                        var: "BROWSER_FETCH",
+                        detail: format!(
+                            "{other:?} is not `http` (the only value; unset it for the mock)"
+                        ),
+                    });
+                }
+            },
         };
 
         // Fixed length, matching [`PROVIDER_CREDENTIALS`] row for row: adding a
         // provider without deciding whether it is real is a compile error, not
         // an adapter that slips past the guard.
+        //
+        // The browser is real under either of two answers: a Browserbase key,
+        // or `BROWSER_FETCH=http`. The second is software that is in the tree
+        // and fetches real pages — measured 2026-09-10, the fake it replaces
+        // answered `no_such_element` to every read a customer's employee made
+        // — so it is not a mock, and `AGENTOS_ALLOW_MOCKS` is not needed for it.
         let is_real: [bool; PROVIDER_CREDENTIALS.len()] = [
             credentials.email.is_some(),
             credentials.telephony.is_some(),
-            credentials.browser.is_some(),
+            credentials.browser.is_some() || credentials.browser_fetch_http,
             credentials.embedder.is_some(),
         ];
         let mut mock_adapters = Vec::new();
@@ -639,7 +673,7 @@ impl Config {
             return Err(ConfigError::MocksNotAllowed {
                 adapters: mock_adapters.join(", "),
                 vars: mock_vars.join(", "),
-                summary: summarize(&mock_adapters, llm),
+                summary: summarize(&mock_adapters, llm, http_browser_selected(&credentials)),
             });
         }
 
@@ -699,7 +733,19 @@ impl Config {
     /// it". Names the vault as well, so that a line with no `MOCK` in it
     /// cannot be manufactured by omission.
     pub fn adapter_summary(&self) -> String {
-        summarize(&self.mock_adapters, self.llm)
+        summarize(
+            &self.mock_adapters,
+            self.llm,
+            http_browser_selected(&self.credentials),
+        )
+    }
+
+    /// Whether the browser behind `Ports::browser` runs JavaScript — that is,
+    /// whether it is Browserbase. `/readyz` publishes it so the console can say
+    /// "pages are read without scripts" instead of leaving an operator to
+    /// infer it from a `needs_real_browser` in the audit trail.
+    pub fn browser_js(&self) -> bool {
+        self.credentials.browser.is_some()
     }
 
     /// Say, loudly and every time, what is real and what is not.
@@ -763,12 +809,17 @@ impl Config {
 /// Free-standing so [`Config::parse`] can put it in the refusal it returns
 /// *instead of* a `Config` — the boot that does not happen is the one an
 /// operator most needs the inventory for.
-fn summarize(mock_adapters: &[&'static str], llm: LlmBackend) -> String {
+fn summarize(mock_adapters: &[&'static str], llm: LlmBackend, http_browser: bool) -> String {
     let mut parts = PROVIDER_CREDENTIALS
         .iter()
         .map(|(adapter, _, vendor)| {
             if mock_adapters.contains(adapter) {
                 format!("{adapter}=MOCK")
+            } else if *adapter == "browser" && http_browser {
+                // Real, and named for what it cannot do: an operator reading
+                // this line for "why did the booking probe fail" needs the
+                // `no-js` more than the vendor name.
+                format!("{adapter}={HTTP_BROWSER}")
             } else {
                 format!("{adapter}={vendor}")
             }
@@ -782,6 +833,15 @@ fn summarize(mock_adapters: &[&'static str], llm: LlmBackend) -> String {
     });
     parts.push(SECRETS_ADAPTER.to_owned());
     parts.join(" ")
+}
+
+/// Is the `GET` browser what `mocks::browser_provider` will build? The same
+/// rule as that function, read here so the boot line cannot disagree with
+/// the adapter: the switch selects only when there is no key. Caught by the
+/// disarm half of `browser_fetch_http_is_real_without_a_key_…` — the first
+/// version read the switch alone and printed `http(no-js)` beside a key.
+fn http_browser_selected(credentials: &Credentials) -> bool {
+    credentials.browser.is_none() && credentials.browser_fetch_http
 }
 
 /// Split a `left:right` credential, or refuse by name.
@@ -1162,6 +1222,52 @@ mod tests {
         assert!(summary.contains("browser=MOCK"), "{summary}");
         assert!(summary.contains("email=resend"), "{summary}");
         assert!(err.to_string().contains("email=resend"), "{err}");
+    }
+
+    /// `BROWSER_FETCH=http` is a real browser as far as the guard is concerned
+    /// — it fetches the page — so a deployment with no Browserbase key boots
+    /// on it without `AGENTOS_ALLOW_MOCKS`, the boot line names it for what
+    /// it lacks, and `/readyz` can say the browser has no JavaScript. A key
+    /// still outranks it, and a value that is not `http` is refused by name
+    /// rather than read as the mock.
+    #[test]
+    fn browser_fetch_http_is_real_without_a_key_and_is_named_for_what_it_lacks() {
+        let mut env = complete();
+        env.remove("BROWSER_API_KEY");
+        env.insert("BROWSER_FETCH", "http".to_owned());
+
+        let config = parse(&env).expect("a GET browser is not a mock");
+        assert!(
+            config.mock_adapters.is_empty(),
+            "{:?}",
+            config.mock_adapters
+        );
+        assert!(config.credentials.browser.is_none());
+        assert!(config.credentials.browser_fetch_http);
+        assert!(!config.browser_js(), "no key, no JavaScript");
+        assert_eq!(
+            config.adapter_summary(),
+            format!(
+                "email=resend telephony=twilio browser={HTTP_BROWSER} embedder=openai \
+                 llm=anthropic {SECRETS_ADAPTER}"
+            ),
+        );
+
+        // Disarm: the key back, and the switch is not what runs.
+        env.insert("BROWSER_API_KEY", "proj_test:bb_live_key".to_owned());
+        let config = parse(&env).expect("valid");
+        assert!(config.browser_js());
+        assert!(config.adapter_summary().contains("browser=browserbase"));
+
+        env.remove("BROWSER_API_KEY");
+        env.insert("BROWSER_FETCH", "chrome".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::Invalid {
+                var: "BROWSER_FETCH",
+                ..
+            })
+        ));
     }
 
     /// The vault is named every time, so a summary with no `MOCK` in it is a

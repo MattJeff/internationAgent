@@ -20,6 +20,9 @@ ed25519-dalek.workspace = true
 hmac.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+# `browser_http`, le navigateur sans JavaScript. Argumenté dans le Cargo.toml
+# racine.
+scraper.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

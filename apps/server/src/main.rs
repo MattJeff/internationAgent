@@ -888,6 +888,7 @@ fn app(
             // The port `routes::approvals` refuses on, not a second opinion
             // about it.
             payment_rail: ports.payments.configured(),
+            browser_js: config.browser_js(),
         })
         .merge(metrics::router(db, config.metrics_key.clone()));
 
@@ -2648,6 +2649,13 @@ struct Health {
     /// than an operator inferring it from a `502` — which is the shape of the
     /// question this struct exists to answer on demand.
     payment_rail: bool,
+    /// Whether the browser runs JavaScript: [`Config::browser_js`].
+    ///
+    /// Reported beside `mock_adapters` and not inside it, because the `GET`
+    /// browser is not a mock — it fetches the page — and an operator whose
+    /// booking probe answered `needs_real_browser` is asking a replica, not a
+    /// boot log, which of the two real browsers this is.
+    browser_js: bool,
 }
 
 /// Readiness: this replica can usefully take traffic *right now*.
@@ -2724,6 +2732,9 @@ async fn readyz(State(health): State<Health>) -> Response {
             // False on every build today. The route that reads the same port
             // answers `501 no_payment_rail` and leaves the approval pending.
             "payment_rail": health.payment_rail,
+            // `false` under `BROWSER_FETCH=http` and under the mock alike:
+            // the question is "can it type into a form", and neither can.
+            "browser_js": health.browser_js,
         })),
     )
         .into_response()
@@ -3166,6 +3177,7 @@ mod tests {
                     db,
                     mocks: Vec::new().into(),
                     payment_rail: false,
+                    browser_js: false,
                 })
                 .oneshot(
                     HttpRequest::get("/readyz")

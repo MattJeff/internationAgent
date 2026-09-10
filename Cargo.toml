@@ -64,6 +64,13 @@ unicode-normalization = "0.1"
 # gets wrong quietly. `crates/app/src/knowledge.rs` argues the choice and what
 # was weighed against it.
 pdf-extract = "0.12"
+# Lire une page statique sans navigateur : un GET et un parseur HTML. `scraper`
+# est html5ever (le parseur de Servo, tolérant aux pages cassées comme l'est un
+# navigateur) plus les sélecteurs CSS de `selectors` — les deux briques qu'il
+# faudrait sinon réécrire, et le sélecteur est exactement ce que `read_page`
+# reçoit du modèle. Sans `default-features` : « main » ne sert qu'au binaire
+# de démonstration du crate. `crates/providers/src/browser_http.rs` argumente.
+scraper = { version = "0.27.0", default-features = false }
 url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = "1"

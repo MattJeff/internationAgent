@@ -4013,7 +4013,7 @@ mod tests {
     /// `Ports` has no `..Default::default()`: a port added to that struct has to
     /// be answered by every fixture, which is how a build stops when somebody
     /// adds a way to affect the world and a test harness quietly does not.
-    fn ports_browsing(browser: Arc<MockBrowser>) -> Arc<Ports> {
+    fn ports_browsing(browser: Arc<dyn BrowserProvider>) -> Arc<Ports> {
         Arc::new(Ports {
             email: Arc::new(MockEmailProvider::new()),
             telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
@@ -6304,6 +6304,123 @@ mod tests {
             .await
             .expect("an ordinary read");
         assert_eq!(text.into_inner_for_rendering(), "EUR 12,340");
+    }
+
+    /// A static page on a loopback port, spoken as HTTP/1.1 by hand: this
+    /// crate has no `axum`, and the whole of what the test needs is one
+    /// response to whatever request arrives.
+    async fn static_site(html: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                        html.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// **The verb the employees call, on the browser a deployment without a
+    /// key now gets.** Measured 2026-09-10: with the mock behind this port,
+    /// every `read_page` Orizn's employees made answered `no_such_element`.
+    /// This is the same call, through the same token, scope check and audit
+    /// row, against a page that is actually served — and the one refusal the
+    /// `GET` browser adds, `needs_real_browser`, arrives through
+    /// `browse_write` where a step that types would.
+    #[tokio::test]
+    async fn read_page_over_http_reads_a_prospects_static_page() {
+        use agentos_providers::browser::NO_SUCH_ELEMENT;
+        use agentos_providers::browser_http::{HttpBrowser, NEEDS_REAL_BROWSER, PinnedHost};
+
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let site = static_site(
+            "<!doctype html><html><body><h1> Visa desk </h1>\
+             <script>render()</script>\
+             <p>No visa for stays under 90 days.</p></body></html>",
+        )
+        .await;
+        // The site is reached under a name `Domain::parse` accepts, pinned to
+        // the loopback port it actually listens on — the same shape the
+        // production vet gives the adapter, minus DNS.
+        let browser: Arc<dyn BrowserProvider> = Arc::new(HttpBrowser::new(Arc::new(
+            PinnedHost::new("portal.example.com", site.ip()),
+        )));
+        let effects = Effects::new(db.clone(), ports_browsing(browser), principal.clone());
+        provision_browser(&db, &principal).await;
+        let url =
+            Url::parse(&format!("http://portal.example.com:{}/visa", site.port())).expect("url");
+        let reading = || BrowserRead {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+        let read = async |selector: &str| {
+            let token = gate(&db)
+                .authorize(&principal, reading())
+                .await
+                .expect("reading is a channel, and this seat has it");
+            effects.read_page(token, &url, selector).await
+        };
+
+        assert_eq!(
+            read("h1").await.expect("read").into_inner_for_rendering(),
+            "Visa desk"
+        );
+        // What the tool sends when the model names no selector: the page,
+        // minus its script, one line per block.
+        assert_eq!(
+            read(WHOLE_PAGE)
+                .await
+                .expect("read")
+                .into_inner_for_rendering(),
+            "Visa desk\nNo visa for stays under 90 days."
+        );
+        // A selector the page lacks is still a fact about our selector.
+        assert_eq!(
+            read("#visa-panel")
+                .await
+                .expect_err("nothing matches")
+                .code(),
+            NO_SUCH_ELEMENT
+        );
+
+        // Typing needs a DOM that reacts. The session is on the page the read
+        // left it on — inside the domain, so the scope check passes — and it
+        // is the adapter that refuses, by the name the docs promise.
+        let session = effects.browser_session().await.expect("provisioned");
+        let token = gate(&db)
+            .authorize(
+                &principal,
+                BrowserWrite {
+                    domain: Domain::parse("portal.example.com").expect("domain"),
+                },
+            )
+            .await
+            .expect("portal.example.com is on the write list");
+        let err = effects
+            .browse_write(
+                token,
+                &session,
+                BrowserStep::Type {
+                    sel: "#passport",
+                    text: "FRA",
+                },
+            )
+            .await
+            .expect_err("no JavaScript, no keystroke");
+        assert_eq!(err.code(), NEEDS_REAL_BROWSER);
     }
 
     #[tokio::test]

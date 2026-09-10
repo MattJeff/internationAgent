@@ -25,6 +25,7 @@ integration, not an error.
 | **Resend** | `email_resend.rs` | `EMAIL_API_KEY` | `re_…` |
 | **Twilio** | `telephony_twilio.rs` | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` |
 | **Browserbase** | `browser_browserbase.rs` + `cdp.rs` | `BROWSER_API_KEY` | `project-id:api-key` |
+| `GET` + HTML parser, no JavaScript | `browser_http.rs` | none — `BROWSER_FETCH=http` | — |
 | **OpenAI embeddings** | `embedder_openai.rs` | `EMBEDDER_API_KEY` | `sk-…` |
 | Meta WhatsApp | none at all | — | — |
 | secret vault | mock only — an in-process plaintext map | — | — |
@@ -598,6 +599,52 @@ deadline exists.
 browser context per employee, so it can stay logged into a supplier portal
 between tasks.
 
+### Three modes, and why the middle one exists
+
+| Configuration | Adapter | Reads a page | Types, clicks, screenshots |
+|---|---|---|---|
+| `BROWSER_API_KEY=project-id:key` | `BrowserbaseBrowser` — real Chrome over CDP | yes, with JavaScript | yes |
+| `BROWSER_FETCH=http` (no key) | `HttpBrowser` (`browser_http.rs`) — one `GET`, `scraper` on the body | yes, **without** JavaScript | `Terminal { needs_real_browser }` |
+| neither | `MockBrowser` — needs `AGENTOS_ALLOW_MOCKS=1` | every selector is `no_such_element` | pretends |
+
+Measured in production on 2026-09-10: `readyz` listed `browser` under
+`mock_adapters`, and every `read_page` an Orizn employee made answered
+`no_such_element` — on `visa.orizn.app` and on `example.com` alike. Their CTO
+diagnosed "our fetch layer is broken", and it was: it was the fake. The
+founder pays for no hosted browser before a task needs one (software before
+resources with a gatekeeper), and reading a static page never needed one.
+
+**What "without JavaScript" cannot do.** A page that builds itself
+client-side reads as the empty shell the server sent — `Text("body")` comes
+back empty, not as an error, because that *is* what the server says. Nothing
+that reacts: `Click`, `Type`, `Fill` and `Screenshot` are refused as
+`needs_real_browser` with the page and the step in the log line, so the
+refusal a model reads says "this site needs a real browser" rather than "the
+element is missing". No cookies survive between reads, so nothing stays
+logged in — the `proof_of_need` probe, which types into a booking form, needs
+the key.
+
+**What it does.** `Goto` is a `GET` as `InternationalAgent/<version>
+(+https://siglair.com)`, fifteen seconds, at most five redirects, body capped
+at 2 MB, `text/*` or XHTML only (`not_html` otherwise). Every hop — the URL
+asked for and every redirect — goes through the MCP client's own
+`resolve_and_vet` at `Reach::Public` before a socket opens, and the socket is
+pinned to the addresses that check resolved: loopback, RFC 1918 and the
+metadata endpoint are `blocked_address`, and a redirect cannot walk around
+it. `Text(sel)` is the visible text of the first match — scripts and styles
+out, one line per block, whitespace collapsed, 32 000 characters at most;
+`Markup(sel)` is its `outerHTML`; `Location` is where the last `Goto` landed.
+The document is kept per binding, so two seats never read each other's page.
+
+**Deliberately absent.** No cache: a read is a request. No `robots.txt`: this
+is one employee reading one page it was asked to read, one page per turn, not
+a crawler walking a site. No charset sniffing: bytes are read as UTF-8 and a
+Latin-1 page arrives with a few wrong accents.
+
+The boot line says `browser=http(no-js)`, `mock_adapters` does **not** list
+`browser`, and `/readyz` carries `browser_js: false` so the console can say
+which real browser this is.
+
 **Status: real, and selected by `BROWSER_API_KEY`.**
 `BrowserbaseBrowser` (`crates/providers/src/browser_browserbase.rs`) implements
 `BrowserProvider` against `https://api.browserbase.com` — `POST /v1/contexts`
@@ -634,7 +681,12 @@ it** — `browser.rs::contract_suite`, invoked by
 hermetic loopback HTTP server, the way `EmailProvider`'s and
 `TelephonyProvider`'s are. That is what makes a vendor swap provable rather than
 hopeful, and this paragraph claimed the opposite of it for a while — see the
-section further down that already described the wiring.
+section further down that already described the wiring. `HttpBrowser` runs the
+same suite through `contract_suite_on`, which takes the address to navigate to
+— a parameter rather than an exemption, because that adapter actually fetches
+and the fixed public-looking URL the mock and the recording driver never dial
+would have gone to the network. Its fake site is an `axum` router on a loopback
+port, reached under a real-looking name that `PinnedHost` resolves to it.
 
 ### Why the trait looks the way it does
 
