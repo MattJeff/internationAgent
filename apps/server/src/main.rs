@@ -323,9 +323,19 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // `public_host` is here for one field: a placed call has to tell the
     // carrier where to report back, and that is this deployment's own webhook
     // endpoint. See `mocks::telephony_provider`.
+    // The employee's cookie jar, for the Chrome browser only: sealed under
+    // `browser://<tenant>/<employee>` with the same cipher as every other
+    // `sealed_*` column, kept on the `browser` row of `employee_resources`.
+    // Built once and shared by both sides, because the provisioner's release
+    // has to forget the jar the effects side filled.
+    let cookie_jar = Arc::new(agentos_app::cookie_jar::SealedCookieJar::new(
+        db.clone(),
+        agentos_app::identity::envelope(&config.master_key),
+    ));
     let ports = Arc::new(agentos_app::mocks::ports_for(
         &config.credentials,
         &config.public_host,
+        cookie_jar.clone(),
     ));
     // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
     // the real client and its absence selects the SHA-256 hash. Not a field of
@@ -356,7 +366,12 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // is a table.
     let engine = ProvisioningEngine::new(
         db.clone(),
-        agentos_app::mocks::adapters_for(&config.master_key, &config.credentials, secrets.clone()),
+        agentos_app::mocks::adapters_for(
+            cookie_jar,
+            &config.master_key,
+            &config.credentials,
+            secrets.clone(),
+        ),
         EngineConfig::default(),
     );
 

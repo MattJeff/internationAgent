@@ -25,6 +25,7 @@ integration, not an error.
 | **Resend** | `email_resend.rs` | `EMAIL_API_KEY` | `re_…` |
 | **Twilio** | `telephony_twilio.rs` | `TELEPHONY_API_KEY` | `ACxxxx:auth_token` |
 | **Browserbase** | `browser_browserbase.rs` + `cdp.rs` | `BROWSER_API_KEY` | `project-id:api-key` |
+| **our own Chromium** over CDP | `browser_chrome.rs` + `cdp.rs` | none — `BROWSER_CDP_URL=http://browser:9222` | — |
 | `GET` + HTML parser, no JavaScript | `browser_http.rs` | none — `BROWSER_FETCH=http` | — |
 | **OpenAI embeddings** | `embedder_openai.rs` | `EMBEDDER_API_KEY` | `sk-…` |
 | Meta WhatsApp | none at all | — | — |
@@ -593,19 +594,101 @@ deadline exists.
 
 ---
 
-## Browserbase — the browser the employee logs in with
+## Browser — the browser the employee logs in with
 
 **What it is for.** The `browser` provisioning step: a persistent, isolated
 browser context per employee, so it can stay logged into a supplier portal
 between tasks.
 
-### Three modes, and why the middle one exists
+### Four modes, in the order they are selected
 
-| Configuration | Adapter | Reads a page | Types, clicks, screenshots |
-|---|---|---|---|
-| `BROWSER_API_KEY=project-id:key` | `BrowserbaseBrowser` — real Chrome over CDP | yes, with JavaScript | yes |
-| `BROWSER_FETCH=http` (no key) | `HttpBrowser` (`browser_http.rs`) — one `GET`, `scraper` on the body | yes, **without** JavaScript | `Terminal { needs_real_browser }` |
-| neither | `MockBrowser` — needs `AGENTOS_ALLOW_MOCKS=1` | every selector is `no_such_element` | pretends |
+| Configuration | Adapter | Reads a page | Types, clicks, screenshots | Stays logged in |
+|---|---|---|---|---|
+| `BROWSER_API_KEY=project-id:key` | `BrowserbaseBrowser` — hosted Chrome over CDP, proxies and stealth on their side | yes, with JavaScript | yes | Browserbase context |
+| `BROWSER_CDP_URL=http://browser:9222` (no key) | `ChromeBrowser` (`browser_chrome.rs`) — **our own** headless Chromium over CDP; `docs/BROWSER.md` | yes, with JavaScript | yes | sealed cookie jar, see below |
+| `BROWSER_FETCH=http` (neither) | `HttpBrowser` (`browser_http.rs`) — one `GET`, `scraper` on the body | yes, **without** JavaScript | `Terminal { needs_real_browser }` | no |
+| none | `MockBrowser` — needs `AGENTOS_ALLOW_MOCKS=1` | every selector is `no_such_element` | pretends | — |
+
+A key outranks the URL, the URL outranks the switch, and `mocks.rs::browser_provider`
+is the one place that order is written. `/readyz` says `browser_js: true` for
+the first two; the boot line names each: `browser=browserbase`,
+`browser=chrome(cdp)`, `browser=http(no-js)`, `browser=MOCK`.
+
+### Our own Chromium — `BROWSER_CDP_URL`
+
+**What it is.** A `chromedp/headless-shell` container on the compose network
+(`browser:9222`, port never published — CDP has no authentication) and the
+same `CdpWebsocket` that drives Browserbase, handed a page URL of our own.
+Decided and measured in `docs/BROWSER.md`; this section is what an operator
+needs.
+
+**One task is this CDP conversation, in this order** (`browser_chrome.rs`,
+test `one_task_is_context_target_cookies_steps_cookies_close_dispose`):
+`GET /json/version` → `Target.createBrowserContext` → `Target.createTarget
+{url: about:blank, browserContextId}` → `Network.setCookies` with the
+employee's jar, when there is one → every `BrowserStep` of the task over
+`ws://<ip>:9222/devtools/page/<targetId>` (`Page.navigate`, `Runtime.evaluate`,
+…, plus one `Runtime.evaluate` after each navigation for the wall check
+below) → `Network.getAllCookies` → `Target.closeTarget` →
+`Target.disposeBrowserContext`.
+
+**The cookie jar, and what it contains.** A CDP browser context is
+incognito-shaped: isolated, and gone with the process. What survives between
+two tasks is what `Network.getAllCookies` exported when the tab closed: a JSON
+array of `CookieParam`s — `name`, `value`, `domain`, `path`, `secure`,
+`httpOnly`, `sameSite`, and `expires` when the cookie has one. Session cookies
+are kept (a login usually *is* one); `size`, `session` and `partitionKey` are
+not, because `Network.setCookies` does not take them. Nothing else survives:
+no `localStorage`, no IndexedDB, no open page. The jar lives on the employee's
+`browser` row, `employee_resources.sealed_cookies` (migration `0095`), sealed
+AES-256-GCM under `browser://<tenant>/<employee>` by
+`agentos_app::cookie_jar::SealedCookieJar` with the same cipher as
+`mcp://`, `model://` and `webhook://` — the master-key rotation covers it like
+the others. `release` throws the jar away; a jar that no longer opens is a
+logged-out employee, never a broken browser.
+
+**When a tab lives and dies.** The trait is one step at a time, so the tab is
+kept per binding between steps — `read_page` is a `Goto` then a `Text` — and
+closed by the first of: the park `Goto(about:blank)` that `effects` sends, an
+error about the browser rather than about our selector, or 120 s without a
+step. At most **3 tabs** process-wide (`BROWSER_MAX_TABS`); a fourth task
+waits `BROWSER_QUEUE_WAIT_SECS` (60) and is then `Retryable`. The VPS has
+3.8 GB and Chromium is capped at 1 GB; the arithmetic is in `docs/BROWSER.md`.
+
+**The ceiling: `blocked_by_site`.** After every navigation the adapter reads
+the document's title and the status it was served with. A challenge or
+refusal page — « Just a moment… », « Access denied », « Attention Required »,
+« Enable JavaScript and cookies to continue », or a 403/503 — is
+`Terminal { code: "blocked_by_site" }`, the tab is closed, and the audit row
+says so. **There is no proxy, no residential IP and no captcha solving behind
+this adapter**, on purpose (resources with a gatekeeper, paid for when a task
+needs them): a site that walls the VPS's address stays walled, and the upgrade
+is `BROWSER_API_KEY`, not a retry.
+
+**The address check is the same one.** Every `Goto` goes through
+`mcp::resolve_and_vet` at `Reach::Public` before a tab is even opened — a
+loopback or RFC 1918 target is `blocked_address` with no `Page.navigate`
+sent — and the container is launched with `--host-resolver-rules` sending
+`db`, `api`, `web`, `caddy` and `localhost` to `~NOTFOUND`, so a page's own
+script cannot reach the database either.
+
+**Measured, and different from the obvious.** Chromium refuses a `Host`
+header that is not an IP or `localhost` (« Host header is specified and is
+not an IP address or localhost. », Chrome 151 and 152), and writes the
+loopback address *it* listens on into `webSocketDebuggerUrl`. So
+`BROWSER_CDP_URL` names the compose service, and the adapter resolves the
+name itself and dials every socket — HTTP and websocket — by address.
+
+**Proof.** `browser::contract_suite` runs against a real Chromium when
+`BROWSER_CDP_URL` is set and skips otherwise (`DATABASE_URL`'s discipline),
+beside three more real-Chromium tests: a page rendered by JavaScript that
+`HttpBrowser` reads as empty on the same run, a cookie set in one task and
+sent by the next through a fresh context, a 403 reported as
+`blocked_by_site`. A fake CDP on a loopback port proves the semaphore, the
+jar's shape on the wire, the teardown after a failed step, the wall check,
+the refused private address and the `Host` rule. `effects.rs` reads a
+JavaScript page end to end through `read_page`, token and audit row
+included.
 
 Measured in production on 2026-09-10: `readyz` listed `browser` under
 `mock_adapters`, and every `read_page` an Orizn employee made answered
@@ -644,6 +727,8 @@ Latin-1 page arrives with a few wrong accents.
 The boot line says `browser=http(no-js)`, `mock_adapters` does **not** list
 `browser`, and `/readyz` carries `browser_js: false` so the console can say
 which real browser this is.
+
+### Browserbase — `BROWSER_API_KEY`
 
 **Status: real, and selected by `BROWSER_API_KEY`.**
 `BrowserbaseBrowser` (`crates/providers/src/browser_browserbase.rs`) implements

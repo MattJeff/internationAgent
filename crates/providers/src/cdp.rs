@@ -145,7 +145,12 @@ impl CdpWebsocket {
     }
 
     /// Open the socket the connect URL points at.
-    async fn connect(
+    ///
+    /// `pub(crate)` for [`crate::browser_chrome`], which speaks to the
+    /// *browser* endpoint (`Target.*`) and to a page it owns (`Network.*`)
+    /// with the same pump, on the same deadlines, and with no second
+    /// websocket in the crate.
+    pub(crate) async fn connect(
         &self,
         connect_url: &Secret,
     ) -> Result<Cdp<MaybeTlsStream<TcpStream>>, ProviderError> {
@@ -203,7 +208,7 @@ impl CdpDriver for CdpWebsocket {
 // ---------------------------------------------------------------------------
 
 /// A connected CDP endpoint with a monotonic request id.
-struct Cdp<S> {
+pub(crate) struct Cdp<S> {
     conn: WsConn<S>,
     next_id: u64,
     deadline: Duration,
@@ -393,7 +398,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Cdp<S> {
     }
 
     /// `Runtime.evaluate`, unwrapped to the returned value.
-    async fn evaluate(&mut self, expression: String) -> Result<Value, ProviderError> {
+    pub(crate) async fn evaluate(&mut self, expression: String) -> Result<Value, ProviderError> {
         let out = self
             .call(
                 "Runtime.evaluate",
@@ -414,8 +419,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Cdp<S> {
         Ok(out["result"]["value"].clone())
     }
 
+    /// Hang up politely. Consumes the connection: there is nothing to say
+    /// on a closed socket.
+    pub(crate) async fn close(mut self) {
+        let _ = self.conn.close().await;
+    }
+
     /// One JSON-RPC round trip, bounded, answered by `id`.
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, ProviderError> {
+    pub(crate) async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ProviderError> {
         let deadline = self.deadline;
         match tokio::time::timeout(deadline, self.call_inner(method, params)).await {
             Ok(result) => result,
@@ -479,7 +494,7 @@ fn js_string(value: &str) -> String {
 /// contract; writes always succeed into `outbox` and are pushed to the real
 /// socket by [`WsConn::drain`].
 #[derive(Debug, Default)]
-struct Pipe {
+pub(crate) struct Pipe {
     inbox: Vec<u8>,
     read_pos: usize,
     outbox: Vec<u8>,
@@ -510,7 +525,10 @@ impl io::Write for Pipe {
 }
 
 /// Push whatever tungstenite queued out to the real socket.
-async fn drain_pipe<S: AsyncWrite + Unpin>(pipe: &mut Pipe, io: &mut S) -> io::Result<()> {
+pub(crate) async fn drain_pipe<S: AsyncWrite + Unpin>(
+    pipe: &mut Pipe,
+    io: &mut S,
+) -> io::Result<()> {
     if pipe.outbox.is_empty() {
         return Ok(());
     }
@@ -520,7 +538,7 @@ async fn drain_pipe<S: AsyncWrite + Unpin>(pipe: &mut Pipe, io: &mut S) -> io::R
 }
 
 /// Wait for more bytes from the real socket and give them to tungstenite.
-async fn fill_pipe<S: AsyncRead + Unpin>(pipe: &mut Pipe, io: &mut S) -> io::Result<()> {
+pub(crate) async fn fill_pipe<S: AsyncRead + Unpin>(pipe: &mut Pipe, io: &mut S) -> io::Result<()> {
     let mut chunk = [0_u8; 8192];
     let n = io.read(&mut chunk).await?;
     if n == 0 {
@@ -536,9 +554,9 @@ async fn fill_pipe<S: AsyncRead + Unpin>(pipe: &mut Pipe, io: &mut S) -> io::Res
 
 /// A websocket message loop: a synchronous tungstenite plus the async socket
 /// its [`Pipe`] is pumped from.
-struct WsConn<S> {
-    ws: WebSocket<Pipe>,
-    io: S,
+pub(crate) struct WsConn<S> {
+    pub(crate) ws: WebSocket<Pipe>,
+    pub(crate) io: S,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
@@ -550,12 +568,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
         }
     }
 
-    async fn send(&mut self, message: Message) -> io::Result<()> {
+    pub(crate) async fn send(&mut self, message: Message) -> io::Result<()> {
         self.ws.send(message).map_err(io::Error::other)?;
         self.drain().await
     }
 
-    async fn recv(&mut self) -> io::Result<Message> {
+    pub(crate) async fn recv(&mut self) -> io::Result<Message> {
         loop {
             match self.ws.read() {
                 Ok(message) => {
@@ -583,7 +601,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConn<S> {
         self.io.shutdown().await
     }
 
-    async fn drain(&mut self) -> io::Result<()> {
+    pub(crate) async fn drain(&mut self) -> io::Result<()> {
         drain_pipe(self.ws.get_mut(), &mut self.io).await
     }
 
