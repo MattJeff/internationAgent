@@ -1246,6 +1246,28 @@ Operationally: `audit_log` is where you answer "who did what and why". `approval
 is where a human is in the loop. `spend_buckets` holds one row per
 (tenant, employee, day, currency) and every reservation takes a write lock on it.
 
+### `deliverability` — un mail qui ressemble à du spam ne part pas
+
+`crates/app/src/deliverability.rs`, appelé par `Effects::send_email` et par
+elle seule — une facture (`send_invoice`) et un mot à un collègue
+(`send_internal`) ne sont pas de la prospection. Le contrôle court avant le
+jeton de désinscription, avant la ligne `provider_intents` et avant le
+fournisseur ; le modèle reçoit `failed (deliverability): …` avec une ligne par
+problème et réécrit lui-même. Pas de score, pas de réécriture automatique.
+
+Refus (un seul suffit) : sujet vide ; corps vide ; sujet tout en majuscules
+(≥ 3 lettres) ; plus de 3 URL dans le corps (le lien `List-Unsubscribe` de
+`0085` voyage en en-tête et ne compte pas) ; deux expressions à spam de la
+liste courte du module (`act now`, `cliquez ici`, `$$$`…, sans casse ni
+accents) ; plus de 30 % de majuscules sur ≥ 40 lettres ; plus de 3 `!` dans
+sujet + corps.
+
+Avertissements (journalisés en `info`, jamais bloquants) : sujet > 78
+caractères (RFC 5322 §2.1.1) ; corps < 20 mots ; une seule expression à spam ;
+une ligne qui n'est qu'une URL ; un corps qui ne demande rien. Les sources sont
+citées et datées en tête du module ; les 0,3 % de plaintes que ces règles
+protègent sont `Deliverability::MAX_REFUSALS_PER_MILLE` dans `policy.rs`.
+
 ### `Untrusted<T>` — documents are data, never instructions
 
 Everything from outside — an email body, a PDF, a web page, an inbound A2A

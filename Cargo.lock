@@ -140,6 +140,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trybuild",
+ "unicode-normalization",
  "url",
  "uuid",
 ]

@@ -12,6 +12,7 @@ pub mod backlog; // le carnet: the port a work board is reached through, ours or
 pub mod brief; // the operator's own words that open a turn — reachable, so a pin can hash them
 pub mod calendar; // le calendrier: the port a seat's diary is reached through, ours or the customer's
 pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
+pub mod deliverability; // la délivrabilité du contenu : un mail qui ressemble à du spam ne part pas
 pub mod effects; // U21
 pub mod files; // le classeur: the port a company's documents are kept behind, ours or the customer's
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them

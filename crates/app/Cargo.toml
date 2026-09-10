@@ -42,6 +42,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+# `deliverability::fold` : « Cliquez ICI » et « cliquez ici » sont la même
+# expression à spam. NFD puis suppression des marques combinantes ; déjà dans
+# le lock via `agentos-domain`.
+unicode-normalization.workspace = true
 url.workspace = true
 uuid.workspace = true
 
