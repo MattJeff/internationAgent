@@ -84,9 +84,17 @@ const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 /// never trips it; a loop that is genuinely stuck trips it after this long with
 /// nothing moving, which is the only reading of "wedged" that does not depend
 /// on how busy the machine is. 60s because eleven steps against mock adapters
-/// take well under a second each even on a runner, so a full minute of complete
+/// take well under a second each even on a runner, so a minute of complete
 /// silence is already far past anything healthy.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(60);
+///
+/// **Measured again the same day, and raised to 180s:** running the six
+/// packages of this workspace at once on the founder's laptop starved the
+/// provisioning loop for a full sixty seconds — the same test converging in
+/// 5.2s when run on its own a minute later. Total starvation is still
+/// starvation, so the number has to clear it; what changed for good is that it
+/// now clears *silence* rather than *duration*, so a loop that is merely slow
+/// is never accused, however long it takes.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(180);
 
 // ---------------------------------------------------------------------------
 // Harness
