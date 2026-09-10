@@ -4475,7 +4475,7 @@ pub struct Attached {
 }
 
 /// How many documents one message may hand over.
-pub const MAX_ATTACHMENTS: usize = 5;
+pub const MAX_ATTACHMENTS: usize = 20;
 
 /// How much of one document reaches the model, in bytes of extracted text.
 ///
