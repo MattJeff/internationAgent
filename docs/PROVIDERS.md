@@ -212,9 +212,16 @@ boot guard refuses unless `AGENTOS_ALLOW_MOCKS=1`.
 3. **API Keys → Create API Key**, sending permission. Copy the `re_…` value.
    This is the API key: `ResendEmailProvider::new(api_key, …)`.
 4. **Webhooks → Add endpoint**, pointing at
-   `{PUBLIC_HOST}/v1/webhooks/email`, subscribed to `email.received` (and
-   whatever delivery events you want). Copy the **signing secret**, a separate
-   `whsec_…` value. This is *not* the API key.
+   `{PUBLIC_HOST}/v1/webhooks/email`, subscribed — the form ticks them one by
+   one — to `email.received`, `email.bounced`, `email.complained`,
+   `email.delivered`, `email.opened` and `email.clicked`. The last three feed
+   `message_events` (0091) and the follow-up brief; `email.opened` and
+   `email.clicked` are only emitted once tracking is enabled on the domain
+   (Domains → Configuration → *Enable tracking metrics*: a tracking subdomain
+   and one CNAME; off by default, per
+   <https://resend.com/docs/dashboard/domains/tracking>, read 2026-09-10).
+   Copy the **signing secret**, a separate `whsec_…` value. This is *not* the
+   API key.
 
 Where each goes:
 

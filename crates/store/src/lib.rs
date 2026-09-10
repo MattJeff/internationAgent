@@ -43,5 +43,6 @@ pub mod revenue; // wave 12: seller vertical
 pub mod signing;
 pub mod sourcing;
 pub mod spend; // U12
+pub mod traces; // un envoi laisse des traces : livré, ouvert, cliqué (0091)
 pub mod turns; // le budget de tours quotidien
 pub mod webhooks; // wave M: which customer a provider callback belongs to
