@@ -976,6 +976,26 @@ intersection, resolved once when the turn is assembled:
   failure. There is no fallback model, and retrying will not help — the fix is a
   policy layer.
 
+**The allowlist is a ceiling on the seat; which model a *turn* sends is decided
+per turn.** `crates/app/src/model_choice.rs` is a table of rules read before each
+call — a rhythm wake with nothing on the board and nothing to read runs
+`claude-haiku-4-5`, a turn with a stranger's text in front of it that nobody
+asked for runs `claude-opus-5`, and everything in between is `claude-sonnet-5`.
+The rules and their arguments are in `docs/ORIZN.md` § "Quel modèle pour quel
+tour". Two consequences for an operator:
+
+* **The allowlist still wins**, and it wins slightly differently here. A turn
+  whose rule asks for a model this policy excludes falls to the **most capable
+  permitted model no more expensive than the one it asked for** — not to the
+  cheapest, which is the right answer for an excluded role *preference* and the
+  wrong one for a turn holding untrusted text. Nothing is ever upgraded past
+  what the rule asked for, and the empty set still refuses the turn.
+* **`GET /v1/usage/models?days=7`** is where the effect is read: one row per
+  model over the window, with calls, input, cached and output tokens. Since
+  `migrations/0097` the ledger keys on the model, so a seat that woke on Haiku
+  and answered a customer on Sonnet is two rows. `GET /v1/usage` sums back
+  across them and is unchanged.
+
 `AGENTOS_LLM` still selects the *backend* (`mock` / `cli` / `anthropic`) and no
 longer selects a model; there was a process-wide model string and it is gone.
 Under `cli` the deployment is on a subscription, where the rate card is the wrong

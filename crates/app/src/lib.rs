@@ -29,6 +29,7 @@ pub mod knowledge; // U26
 pub mod mcp; // U27
 pub mod mocks; // U38 — the fakes the binary cannot build for itself
 pub mod model_access; // wave H: the tenant's own model, connected and proven
+pub mod model_choice; // quel modèle pour ce tour-ci : une table de règles, pas une constante
 pub mod oauth; // wave I: a consent page instead of a pasted token
 pub mod peer_keys;
 pub mod pool_ops;

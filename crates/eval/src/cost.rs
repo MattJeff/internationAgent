@@ -128,6 +128,138 @@ pub fn ceiling_calls_per_turn() -> f64 {
     f64::from(Budgets::default().max_turns)
 }
 
+/// **Ce qu'Anthropic facture une lecture de cache : 10 % de l'entrée de base.**
+///
+/// Et une *écriture* de cache à 5 minutes : 125 %. Les deux ensemble sont le
+/// modèle complet, parce qu'un tour paie une écriture puis des lectures — voir
+/// [`with_cache_usd`], qui ne fait rien d'autre que les additionner.
+///
+/// Source : documentation Anthropic « Prompt caching », section Pricing —
+/// `cache_read_input_tokens` facturé 0,1× l'entrée de base,
+/// `cache_creation_input_tokens` 1,25× pour le TTL de cinq minutes (2× pour
+/// celui d'une heure, que ce dépôt n'utilise pas). Lue le **2026-09-10**. C'est
+/// la deuxième chose de ce fichier qui vient de l'extérieur du dépôt, après
+/// [`rate_card`], et elle vieillit de la même façon : un multiplicateur
+/// republié est une ligne à relire, pas un test qui rougit.
+pub const CACHE_READ: f64 = 0.10;
+
+/// Le prix d'écriture du cache de cinq minutes. Voir [`CACHE_READ`].
+pub const CACHE_WRITE: f64 = 1.25;
+
+/// **Combien de jetons d'un appel le cache peut servir**, mesuré et non estimé.
+///
+/// `llm_anthropic::body` pose l'unique point de rupture sur le bloc `system`, et
+/// l'ordre de rendu est outils → système → messages : ce qui est mis en cache
+/// est donc exactement *les schémas d'outils plus le prompt système*, et les
+/// messages — le plan, le brief, le texte clôturé — sont dehors. C'est la
+/// définition que `scoping::weigh` sépare déjà en trois, donc rien n'est estimé
+/// ici : c'est la somme de deux de ses trois champs.
+///
+/// Moyenne sur les trois chartes de [`charters`], sur l'étiquette de confiance
+/// ordinaire : un tour clôturé porte moins d'outils, donc moins de préfixe, donc
+/// une part cachée plus faible — l'inclure ferait une moyenne d'une population
+/// que la course enregistrée n'a pas mesurée.
+pub fn cached_prefix_tokens() -> f64 {
+    let charters = charters();
+    let total: usize = charters
+        .iter()
+        .map(|(_, charter)| {
+            let prompt = match policy_for(charter.role()) {
+                Some(policy) => charter
+                    .system_prompt(PIN_IDENTITY)
+                    .with_mcp_tools(&policy, []),
+                None => charter.system_prompt(PIN_IDENTITY),
+            };
+            let request =
+                prompt.request(charter.model().as_str(), 1, TrustLabel::Trusted, Vec::new());
+            let weighed = crate::scoping::weigh(&request);
+            weighed.system + weighed.tools
+        })
+        .sum();
+    total as f64 / charters.len() as f64
+}
+
+/// La part de l'entrée d'un appel que le cache peut servir, entre 0 et 1.
+///
+/// Numérateur et dénominateur passent par le même estimateur —
+/// `scoping::tokens`, ±20 % — donc la part est cohérente même si les deux
+/// chiffres sont approximatifs, ce qui est le seul point qui compte pour un
+/// rapport.
+///
+/// Bornée à 1 : un échantillon dont l'entrée mesurée serait plus courte que le
+/// préfixe qu'on vient de calculer dirait qu'un tour a envoyé moins que son
+/// propre prompt système, ce qui est impossible et arriverait si quelqu'un
+/// re-pinait un `RECORDED` d'une autre époque. La borne rend cette incohérence
+/// inoffensive pour l'arithmétique ; la ligne du rapport la rend visible.
+pub fn cached_share(sample: Sample) -> f64 {
+    if sample.input_tokens_per_call <= 0.0 {
+        return 0.0;
+    }
+    (cached_prefix_tokens() / sample.input_tokens_per_call).min(1.0)
+}
+
+/// **La même paie, cache compris**, à mettre à côté de [`company_usd`].
+///
+/// Un tour réservé fait `calls_per_turn` appels qui partagent un préfixe
+/// identique — c'est ce que `llm_anthropic`'s `the_prefix_is_byte_identical_across_calls`
+/// garantit — donc le premier écrit le cache à [`CACHE_WRITE`] et les suivants
+/// le lisent à [`CACHE_READ`]. Le multiplicateur moyen sur l'entrée d'un appel
+/// est donc :
+///
+/// ```text
+/// m = (1 - part) + part × (1,25 + 0,10 × (n − 1)) / n
+/// ```
+///
+/// **Une écriture par tour et non une par jour**, et c'est délibérément la
+/// lecture prudente : le cache de cinq minutes se compte depuis le *début* de
+/// la requête qui l'écrit, et deux tours du même siège sont séparés par des
+/// minutes ou des heures — la cadence la plus serrée que la plateforme autorise
+/// est cinq minutes. Un déploiement dont les tours se suivent de près paie moins
+/// que ce que cette fonction dit ; aucun ne paie plus.
+///
+/// La sortie n'est pas touchée : le cache ne concerne que l'entrée.
+pub fn with_cache_usd(sample: Sample, calls_per_turn: f64) -> f64 {
+    let n = calls_per_turn.max(1.0);
+    let share = cached_share(sample);
+    let multiplier = (1.0 - share) + share * (CACHE_WRITE + CACHE_READ * (n - 1.0)) / n;
+    seats()
+        .iter()
+        .map(|seat| {
+            let (per_m_in, per_m_out) = rate_card(seat.model);
+            sample.usd_at(
+                (per_m_in * multiplier, per_m_out),
+                calls_per_turn,
+                f64::from(seat.turns) * MONTH_DAYS,
+            )
+        })
+        .sum()
+}
+
+/// **La paie répartie par modèle** : ce que chaque modèle coûte par mois, et
+/// combien de sièges tournent dessus.
+///
+/// `mix()` dit qui tourne sur quoi ; ceci dit ce que ça coûte, ce qui n'est pas
+/// la même phrase dès que les budgets de tours diffèrent — un siège Opus à 6
+/// tours et trois sièges Sonnet à 60 ne se lisent pas dans un compte de sièges.
+/// Du plus cher au moins cher, parce que c'est l'ordre dans lequel on lit une
+/// facture.
+pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64)> {
+    let seats = seats();
+    let mut rows: Vec<(ModelId, usize, f64)> = ModelId::ALL
+        .into_iter()
+        .filter_map(|model| {
+            let mine: Vec<&Seat> = seats.iter().filter(|s| s.model == model).collect();
+            let usd: f64 = mine
+                .iter()
+                .map(|seat| monthly_usd(sample, model, calls_per_turn, f64::from(seat.turns)))
+                .sum();
+            (!mine.is_empty()).then_some((model, mine.len(), usd))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2));
+    rows
+}
+
 // ---------------------------------------------------------------------------
 // What one run measured
 // ---------------------------------------------------------------------------
@@ -738,24 +870,54 @@ pub fn evaluate() -> Surface {
              not about tokens.",
         ),
     );
+    // **La ligne « avec cache » est ici, contre la phrase pinée et non dedans.**
+    // `headline()` est vérifiée caractère par caractère contre `docs/ORIZN.md`
+    // (ligne 6 plus bas) et le re-pin se fait à la main avec deux runs `--live`,
+    // jamais par un agent : la déplacer d'un cent rendrait le document faux
+    // jusqu'à ce que quelqu'un repasse. La note, elle, n'est pinée par rien, et
+    // c'est l'endroit exact où un lecteur du plafond a besoin du chiffre.
+    //
+    // Elle arrive dans une note plutôt que dans une ligne à elle parce que
+    // `the_measurements_fit_on_a_screen` compte les lignes et que ce fichier en
+    // dépense déjà treize sur quatorze. Une mesure de plus n'est pas une raison
+    // de relever le plafond du rapport ; c'est une raison d'écrire plus serré.
+    let (cached_lo, cached_hi) = spread(|s| with_cache_usd(s, s.calls_per_turn));
     rows.push(
-        Row::ok("Orizn's monthly bill", headline(), Truth::Characterises).note(
-            "a range because a reserved turn is 1–10 model calls; the floor alone is what \
-               this document used to publish as an estimate",
-        ),
+        Row::ok("Orizn's monthly bill", headline(), Truth::Characterises).note(format!(
+            "a range because a reserved turn is 1–10 model calls; the floor alone is what this \
+             document used to publish as an estimate. And it is the UNCACHED ceiling of its own \
+             row: the same runs with the prefix cache are ${cached_lo:.0}–${cached_hi:.0}, at \
+             {:.0}% of the input served by the prefix — cache read 0.1×, five-minute write \
+             1.25× (Anthropic, « Prompt caching », read 2026-09-10)",
+            cached_share(RECORDED[0]) * 100.0,
+        )),
     );
 
     // --- 1b. the seat mix, which is now half the arithmetic -----------------
     // Read off the operator's documents and the role packs by the same rule the
     // running system uses, so this row is what `apps/server` would resolve for
     // each of these employees and not a summary somebody typed.
+    //
+    // **Et ce que chaque modèle coûte**, sur la même ligne : le compte de sièges
+    // ne se lit pas comme une répartition dès que les budgets de tours diffèrent
+    // — un siège Opus à 6 tours et trois sièges Sonnet à 60 ne pèsent pas ce que
+    // « 1 contre 3 » suggère. Même ligne pour la raison de la note ci-dessus.
+    let sample = RECORDED[0];
     rows.push(Row::ok(
-        "what each seat thinks with",
-        seats()
-            .iter()
-            .map(|s| format!("{} {} ({} turns)", s.role, s.model, s.turns))
-            .collect::<Vec<_>>()
-            .join(", "),
+        "what each seat thinks with, and what that costs",
+        format!(
+            "{} — par modèle : {}",
+            seats()
+                .iter()
+                .map(|s| format!("{} {} ({} turns)", s.role, s.model, s.turns))
+                .collect::<Vec<_>>()
+                .join(", "),
+            by_model(sample, sample.calls_per_turn)
+                .iter()
+                .map(|(model, seats, usd)| format!("{model} ${usd:.0} ({seats})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         Truth::Characterises,
     ));
 
@@ -849,9 +1011,18 @@ pub fn evaluate() -> Surface {
                  quotes it verbatim",
         rows,
         unmeasured: vec![
-            "prompt caching, which lowers it. `llm_anthropic` puts a `cache_control` breakpoint \
-             on the system block; a prefix re-sent inside the window bills at a tenth. Nothing \
-             here prices that, so every figure above is the uncached ceiling of its own row",
+            "prompt caching, at the *rate* rather than at the hit rate. `with_cache_usd` now \
+             prices it — one write per turn then reads, at 1.25x and 0.1x of base input — and \
+             the row above says what that comes to. What is still unmeasured is whether the \
+             cache is really hit: the five-minute entry is timed from the start of the request \
+             that writes it, and nothing here reads `Usage::cache_read_tokens` off a real run \
+             to check. `GET /v1/usage/models` is where a real week answers that. Every OTHER \
+             figure above, `headline` included, remains the uncached ceiling of its own row",
+            "per-turn model routing, which lowers it further and is not in any figure above. \
+             `agentos_app::model_choice` picks a model per turn — a rhythm wake with nothing to \
+             do runs Haiku — while `seats` prices every one of a seat's turns at the seat's own \
+             model, because that is what the recorded run measured. The gap is a whole model \
+             tier on the turns that do nothing, and it can only be measured on real traffic",
             "the provisioning loop's own model calls, which raise it. The dry run stands the \
              company up before it starts counting",
             "the shim. `--dry-run` drives the local `claude` CLI, which renders tool schemas into \
@@ -964,6 +1135,75 @@ mod tests {
             by_hand < all_opus,
             "the seat mix costs {by_hand:.2}, one-model-for-everybody costs {all_opus:.2}"
         );
+    }
+
+    /// **La répartition par modèle est la même facture, vue autrement.** Si elle
+    /// ne se resomme pas, l'une des deux est fausse et le rapport en publie
+    /// deux.
+    #[test]
+    fn la_repartition_par_modele_se_resomme_en_la_facture() {
+        let sample = RECORDED[0];
+        let split: f64 = by_model(sample, sample.calls_per_turn)
+            .iter()
+            .map(|(_, _, usd)| usd)
+            .sum();
+        assert!((split - measured_usd(sample)).abs() < 1e-9);
+
+        // Et elle est ordonnée du plus cher au moins cher, sinon la première
+        // ligne d'une facture n'est pas la ligne qui coûte.
+        let rows = by_model(sample, sample.calls_per_turn);
+        assert!(rows.windows(2).all(|w| w[0].2 >= w[1].2));
+    }
+
+    /// **Le cache baisse la facture, et l'écriture est vraiment dedans.**
+    ///
+    /// Deux assertions, et la seconde est celle qui compte : à *un seul* appel
+    /// par tour il n'y a personne pour lire ce que le premier appel a écrit, et
+    /// le cache coûte donc **plus cher** que pas de cache — 1,25× sur le
+    /// préfixe contre 1×. Une implémentation qui aurait oublié le prix
+    /// d'écriture passerait la première assertion et échouerait ici, ce qui est
+    /// exactement la garde désarmée.
+    #[test]
+    fn le_cache_baisse_la_facture_et_lecriture_est_dans_le_calcul() {
+        for sample in RECORDED {
+            let uncached = measured_usd(*sample);
+            let cached = with_cache_usd(*sample, sample.calls_per_turn);
+            assert!(
+                cached < uncached,
+                "{cached:.2} avec cache contre {uncached:.2} sans, à {:.2} appels par tour",
+                sample.calls_per_turn
+            );
+            // Et jamais en dessous du plancher arithmétique : la sortie n'est
+            // pas cachée et le dixième de l'entrée reste payé.
+            assert!(cached > uncached * CACHE_READ);
+
+            // La borne haute : un tour d'un seul appel paie l'écriture et ne
+            // lit rien.
+            let alone = with_cache_usd(*sample, 1.0);
+            let alone_uncached = company_usd(*sample, 1.0);
+            assert!(
+                alone > alone_uncached,
+                "un tour d'un seul appel paierait {alone:.2} avec cache contre \
+                 {alone_uncached:.2} sans : le prix d'écriture n'est pas dans le calcul"
+            );
+        }
+    }
+
+    /// Le préfixe mesuré est une part et pas une supposition : entre zéro et
+    /// tout, et sur les échantillons enregistrés il est la majorité de l'entrée
+    /// — ce qui est la raison pour laquelle le cache change quelque chose.
+    #[test]
+    fn la_part_cachee_est_mesuree_et_reste_une_part() {
+        assert!(cached_prefix_tokens() > 0.0);
+        for sample in RECORDED {
+            let share = cached_share(*sample);
+            assert!((0.0..=1.0).contains(&share), "{share} n'est pas une part");
+            assert!(
+                share > 0.5,
+                "{share:.2} du prompt seulement est du préfixe stable ; la ligne « avec cache » \
+                 du rapport ne dit plus grand-chose"
+            );
+        }
     }
 
     /// A role layer with turns and no pack would be priced at

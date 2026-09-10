@@ -84,6 +84,7 @@ use crate::error::ApiError;
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/usage", get_route(get))
+        .route("/v1/usage/models", get_route(by_model))
         .with_state(db)
 }
 
@@ -232,12 +233,122 @@ async fn get(
 }
 
 // ---------------------------------------------------------------------------
+// `GET /v1/usage/models`
+// ---------------------------------------------------------------------------
+
+/// Default and maximum for `?days=`, the same shape [`super::outreach`]'s
+/// health window has and for the same reason: a window with no default is a
+/// query string every caller has to get right, and one with no maximum is a
+/// full-table scan anybody can ask for.
+const MODELS_DEFAULT_DAYS: i64 = 7;
+
+/// Ninety days. Longer than the question — "did the routing change anything" is
+/// answered by a week — and short enough that the scan is bounded.
+const MODELS_MAX_DAYS: i64 = 90;
+
+/// `?days=N`, 1..=90, default 7.
+#[derive(Debug, serde::Deserialize)]
+struct DaysQuery {
+    days: Option<i64>,
+}
+
+/// One model's share of the window.
+///
+/// **`calls` and not `turns`**, and the difference is not pedantry: this ledger
+/// counts model round trips — `Finished::turns` is round trips, and one
+/// `Turn::run` makes between one and `Budgets::max_turns` of them — while no
+/// column in this schema counts runs. A field called `turns` here would be a
+/// number a reader divides the bill by to get an answer an order of magnitude
+/// wrong. When a run counter exists it arrives as a column and then as a field,
+/// not as a rename.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct ModelRow {
+    /// The model string as it was billed. Empty for rows written before
+    /// `migrations/0097` — nobody wrote it down, and it is shown as its own
+    /// line rather than distributed over the models that *were* named.
+    model: String,
+    calls: i64,
+    input_tokens: i64,
+    /// `cache_read_tokens`, named for what it is to a reader: input the prefix
+    /// cache served, billed by Anthropic at a tenth of fresh input.
+    cached_tokens: i64,
+    output_tokens: i64,
+}
+
+/// What the endpoint answers.
+#[derive(Debug, Serialize)]
+struct ByModelView {
+    /// The window asked for, in days back from today inclusive.
+    days: i64,
+    /// Biggest consumer first, because alphabetical is not a question anybody
+    /// has about a bill.
+    by_model: Vec<ModelRow>,
+}
+
+/// One row per model this tenant billed anything to in the window.
+///
+/// No `WHERE tenant_id`: `model_usage_daily` carries `tenant_isolation`,
+/// forced, so the tenant predicate is the policy rather than a filter each
+/// reader has to remember. `sum(...)::bigint` because `sum()` over `bigint` is
+/// `numeric` in Postgres and this crate has no decimal type.
+const BY_MODEL_SQL: &str = "\
+SELECT model, \
+       sum(calls)::bigint             AS calls, \
+       sum(input_tokens)::bigint      AS input_tokens, \
+       sum(cache_read_tokens)::bigint AS cached_tokens, \
+       sum(output_tokens)::bigint     AS output_tokens \
+  FROM model_usage_daily \
+ WHERE day >= $1 \
+ GROUP BY model \
+ ORDER BY sum(input_tokens + output_tokens + cache_read_tokens) DESC, model";
+
+/// `GET /v1/usage/models?days=N` — **what the per-turn routing actually
+/// changed.**
+///
+/// `agentos_app::model_choice` picks a model per turn from a table of rules,
+/// and a table of rules is an argument. This is the evidence: how many calls
+/// went to the cheap model, how much of the input the prefix cache served, and
+/// whether the expensive model is where the judgement is. It is deliberately a
+/// *reading* and not a forecast, and it holds no money — the module docs above
+/// carry that argument in full and it is not weakened by there being three
+/// models in the answer instead of one.
+///
+/// The window is `days` days back from today **inclusive**, so `days=1` is
+/// today. Same auth as `/v1/outreach`: the tenant is the API key's, and RLS
+/// makes another tenant's mix invisible rather than merely unlisted.
+async fn by_model(
+    State(db): State<Db>,
+    principal: Principal,
+    query: Result<Query<DaysQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let days = query.days.unwrap_or(MODELS_DEFAULT_DAYS);
+    if !(1..=MODELS_MAX_DAYS).contains(&days) {
+        return Err(ApiError::bad_request(format!(
+            "days: between 1 and {MODELS_MAX_DAYS}"
+        )));
+    }
+    let since = chrono::Utc::now().date_naive() - chrono::Duration::days(days - 1);
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let by_model: Vec<ModelRow> = sqlx::query_as(BY_MODEL_SQL)
+        .bind(since)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+    tx.rollback().await?;
+
+    Ok(axum::Json(ByModelView { days, by_model }).into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::{EmployeeId, TenantId};
+    use agentos_domain::policy::ModelId;
     use agentos_store::model_usage;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, StatusCode, header};
@@ -310,8 +421,21 @@ mod tests {
         /// Consume tokens the way a turn does: through the real writer, not by
         /// writing the ledger by hand.
         async fn spend(&self, tenant: TenantId, employee: EmployeeId, consumed: Consumed) {
+            self.spend_on(tenant, employee, ModelId::Opus5, consumed)
+                .await;
+        }
+
+        /// The same, on a named model. Since `0097` a seat's day is one row per
+        /// model, and `/v1/usage/models` is the only reader that cares which.
+        async fn spend_on(
+            &self,
+            tenant: TenantId,
+            employee: EmployeeId,
+            model: ModelId,
+            consumed: Consumed,
+        ) {
             let mut tx = self.db.tenant_tx(tenant).await.expect("tenant tx");
-            model_usage::record(&mut tx, employee, Utc::now().date_naive(), consumed)
+            model_usage::record(&mut tx, employee, Utc::now().date_naive(), model, consumed)
                 .await
                 .expect("record");
             tx.commit().await.expect("commit");
@@ -369,6 +493,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+
+    /// **`GET /v1/usage/models` : ce que le routage par tour a changé.**
+    ///
+    /// Un siège, une journée, deux modèles — ce qui était impossible à écrire
+    /// avant `0097` et impossible à lire avant cette route. Le test couvre les
+    /// trois choses qu'une route de mesure peut rater : la somme par modèle, le
+    /// locataire d'à côté, et la fenêtre.
+    #[tokio::test]
+    async fn la_route_des_modeles_separe_ce_quun_siege_a_depense_sur_chacun() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let lena = employee(&h.db, h.a, "lena").await;
+
+        // Rien encore : une vraie réponse vide, pas un 404.
+        let (status, body) = h.get("/v1/usage/models", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["days"], 7);
+        assert_eq!(body["by_model"].as_array().expect("array").len(), 0);
+
+        // Une journée d'un seul siège, sur deux modèles : huit réveils de rythme
+        // qui n'ont rien trouvé, et deux tours qui ont écrit.
+        h.spend_on(
+            h.a,
+            lena,
+            ModelId::Haiku45,
+            Consumed::reported(8, 40_000, 400, 300_000),
+        )
+        .await;
+        h.spend_on(
+            h.a,
+            lena,
+            ModelId::Sonnet5,
+            Consumed::reported(2, 15_000, 900, 60_000),
+        )
+        .await;
+
+        let (status, body) = h.get("/v1/usage/models?days=1", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["days"], 1);
+        let rows = body["by_model"].as_array().expect("array");
+        assert_eq!(rows.len(), 2, "{body}");
+        // Le plus gros consommateur d'abord, et c'est Haiku : le tri est sur les
+        // jetons et non sur le nom, sinon `claude-haiku-4-5` serait premier par
+        // hasard alphabétique et la garde ne prouverait rien.
+        assert_eq!(rows[0]["model"], "claude-haiku-4-5");
+        assert_eq!(rows[0]["calls"], 8);
+        assert_eq!(rows[0]["input_tokens"], 40_000);
+        assert_eq!(rows[0]["cached_tokens"], 300_000);
+        assert_eq!(rows[0]["output_tokens"], 400);
+        assert_eq!(rows[1]["model"], "claude-sonnet-5");
+        assert_eq!(rows[1]["calls"], 2);
+
+        // Et le total de `/v1/usage` ne bouge pas d'un jeton : la même journée,
+        // resommée. C'est ce qui dit que la quatrième colonne de clé a coupé la
+        // ligne en deux sans en perdre la moitié.
+        let (_, usage) = h.get("/v1/usage", SECRET_A).await;
+        assert_eq!(usage["tenant"]["calls"], 10);
+        assert_eq!(usage["tenant"]["input_tokens"], 55_000);
+        assert_eq!(usage["tenant"]["cache_read_tokens"], 360_000);
+
+        // Le locataire d'à côté lit des zéros, et il ne lit pas « pas de
+        // permission » : il ne sait pas que ces lignes existent.
+        let (status, theirs) = h.get("/v1/usage/models?days=1", SECRET_B).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(theirs["by_model"].as_array().expect("array").len(), 0);
+
+        // `days` a un défaut, un maximum et refuse zéro.
+        for refused in ["?days=0", "?days=-3", "?days=91"] {
+            let (status, _) = h.get(&format!("/v1/usage/models{refused}"), SECRET_A).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{refused} devrait être refusé"
+            );
+        }
+        let (status, _) = h.get("/v1/usage/models?days=90", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+
+        h.teardown().await;
+    }
 
     #[tokio::test]
     async fn an_operator_can_see_what_each_employee_consumed() {

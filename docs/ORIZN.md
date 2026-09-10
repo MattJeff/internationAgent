@@ -618,6 +618,70 @@ Two rules are worth knowing before you write one:
   not start, and it is recorded as `no_model` with the role and the preference
   named. That is not a provider failure and retrying will not fix it.
 
+### Quel modèle pour quel tour
+
+Le tableau au-dessus dit ce qu'un **siège** a le droit de faire tourner. Il ne
+dit rien de ce qu'un **tour** a besoin de faire tourner, et c'est la moitié de
+l'argent : la majorité des réveils de rythme finissent en « rien à faire », et un
+siège qui paie Opus pour lire un tableau vide paie cinq fois le prix d'un non.
+Aucune couche de politique ne peut le corriger — une politique parle de sièges,
+pas de moments.
+
+`crates/app/src/model_choice.rs` est la table qui le corrige. Elle est pure,
+sans I/O, testée cas par cas, et elle est délibérément une table : pas
+d'apprentissage, pas de score, pas de fenêtre glissante. Premier bras qui
+correspond gagne.
+
+| ce que le tour est | modèle | pourquoi |
+|---|---|---|
+| un siège de direction, de finance ou d'achat | **`claude-opus-5`** | une négociation, un devis, une facture et un ordre donné à un autre siège sont les quatre choses qu'on ne reprend pas en disant « le modèle s'est trompé » |
+| du texte d'inconnu dans le cadre, sur un tour parti de nous — rythme, relance, séquence | **`claude-opus-5`** | le taint est exactement le moment où le jugement compte : personne n'a demandé ces mots, et le siège s'apprête à agir dessus |
+| réveil de rythme, aucun texte d'inconnu, fil vide ou d'un seul message, et deux passages récents qui n'ont rien proposé | **`claude-haiku-4-5`** | c'est le tour « regarde s'il y a quelque chose à faire », et la réponse est presque toujours non |
+| tout le reste : écrire une relance, écrire l'étape d'une séquence, répondre à un entrant, répondre à un collègue, lire une page | **`claude-sonnet-5`** | la routine |
+| un employé que personne n'a chartré | **`claude-haiku-4-5`** | son travail de ce tour est une note interne disant qu'il a été réveillé sans savoir pourquoi |
+
+**Répondre à un mail client est sur Sonnet, alors qu'un mail client est du texte
+non fiable par construction.** C'est le seul endroit où la table s'écarte de la
+lecture littérale « taint ⇒ Opus », et l'écart est ce qui rend la deuxième ligne
+utile : si le corps d'un entrant suffisait, *tout* entrant irait sur Opus, la
+règle voudrait dire « Opus dès qu'il y a une contrepartie » et ne trierait plus
+rien. Le siège dont les tours engagent vraiment l'entreprise est déjà sur Opus
+par la première ligne, quel que soit qui a écrit.
+
+**La politique tranche en dernier, et elle tranche autrement que pour un
+siège.** `allowed_models` est un plafond, pas une suggestion. Si le tour demande
+Opus et que l'opérateur ne permet que haiku ∧ sonnet, il tourne sur **Sonnet** —
+le plus capable des permis — et jamais sur Haiku : descendre au moins cher est la
+bonne réponse quand c'est la *préférence d'un rôle* qui a été refusée
+(`policy::model_for`, et le paragraphe « A role whose preference you exclude »
+ci-dessus reste vrai), et la mauvaise quand c'est un tour qui a du texte
+d'inconnu sous les yeux. Ensemble vide : le tour ne démarre pas, `no_model`,
+comme avant.
+
+**Ce que le chiffre du pin ne contient pas.** La phrase encadrée plus haut est le
+plafond **sans cache** *et* **sans routage** :
+
+* **sans cache** — chaque appel y est facturé au tarif d'entrée plein, alors que
+  `llm_anthropic` pose un point de rupture sur le préfixe stable et qu'une
+  lecture de cache coûte 0,1× l'entrée (écriture à cinq minutes : 1,25×).
+  Anthropic, « Prompt caching », lu le 2026-09-10. La ligne « avec cache » du
+  rapport le chiffre à côté du plafond : **$254–$289 contre $453–$481**, à 71 %
+  de l'entrée servie par le préfixe.
+* **sans routage** — `cost::seats` facture *tous* les tours d'un siège au modèle
+  du siège, parce que c'est ce que la course enregistrée a mesuré. Un réveil de
+  rythme qui ne trouve rien coûte désormais un cran de moins, et l'écart est un
+  étage de tarif entier sur les tours qui ne font rien. Aucun chiffre de ce
+  document ne le contient et aucun ne peut le contenir : ça se mesure sur du
+  vrai trafic.
+
+**Et c'est ce que `GET /v1/usage/models?days=7` sert à lire.** Une ligne par
+modèle, sur une vraie semaine : appels, jetons d'entrée, jetons servis par le
+cache, jetons de sortie. Deux lectures valent le détour — la part des appels
+partie sur Haiku, qui est la mesure du routage, et `cached_tokens` sur
+`input_tokens`, qui est la mesure du cache. Si la seconde est proche de zéro,
+quelque chose casse le préfixe entre deux appels et le chiffre « avec cache »
+ci-dessus est une fiction.
+
 ### Re-measuring it
 
 One command, a database and the local `claude` binary. No API key and no spend:

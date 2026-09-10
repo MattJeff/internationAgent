@@ -689,6 +689,7 @@ mod tests {
             &mut tx,
             lena,
             day(1),
+            agentos_domain::policy::ModelId::Opus5,
             crate::model_usage::Consumed::reported(9_000, 800_000_000, 400_000_000, 0),
         )
         .await

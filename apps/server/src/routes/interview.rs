@@ -851,6 +851,10 @@ async fn answer(
             &mut tx,
             employee_id,
             Utc::now().date_naive(),
+            // The interview is not routed: it is one scripted question with no
+            // tools and no frame, so `model_choice` has nothing to read that
+            // `model_for` did not already answer. What is recorded is what ran.
+            model,
             Consumed::reported(
                 turns_taken,
                 usage.input_tokens,
