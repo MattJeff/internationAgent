@@ -180,7 +180,13 @@ mod tests {
             .expect("marie, later");
         tx.commit().await.expect("commit");
 
-        assert_eq!(tick(&db, now).await.expect("tick"), 1, "one run was due");
+        // `>= 1`, not `== 1`: the tick reads every tenant, and a parallel test
+        // on the same database may have a run due at this very instant. What
+        // this test owns is paul and marie, asserted by name below.
+        assert!(
+            tick(&db, now).await.expect("tick") >= 1,
+            "paul's run was due"
+        );
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
         let paul_run = sequence::find(&mut tx, due)

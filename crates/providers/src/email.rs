@@ -1221,9 +1221,14 @@ impl EmailProvider for MockEmailProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityScope {
     /// Distinct keys must not collapse onto one resource.
+    ///
+    /// The only scope left. `AccountWide` — "distinct keys must collapse onto
+    /// *the* resource" — was written for Resend and removed on 2026-09-10,
+    /// when production showed what it licensed: two seats bound to one
+    /// external id, which `employee_resources_provider_external_id_key`
+    /// forbids. A shared domain is a fact about the vendor; a shared binding
+    /// is a bug the suite must refuse, for every adapter.
     PerKey,
-    /// Distinct keys must collapse onto one resource, deliberately.
-    AccountWide,
 }
 
 /// Every [`EmailProvider`] must pass this. Panics on the first violation.
@@ -1261,10 +1266,6 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
         IdentityScope::PerKey => assert_ne!(
             first.external_id, other.external_id,
             "distinct idempotency keys must not collapse onto one resource"
-        ),
-        IdentityScope::AccountWide => assert_eq!(
-            first.external_id, other.external_id,
-            "an account-wide identity must reconcile, not create a second one"
         ),
     }
 

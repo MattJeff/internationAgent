@@ -384,6 +384,25 @@ impl MockBrowser {
         Self::default()
     }
 
+    /// The mock a *deployment* runs when no real browser is configured.
+    ///
+    /// [`Self::new`] mints `ctx-1`, `ctx-2`, … from zero, which is what the
+    /// tests below pin. In production that counter restarts on every boot,
+    /// and `employee_resources_provider_external_id_key` (0001) is global:
+    /// measured 2026-09-10, the eighth seat could never provision because
+    /// `ctx-1` already belonged to the first one, bound five days earlier.
+    /// Seeding the counter with the boot second keeps ids unique across boots
+    /// without touching what the tests read.
+    ///
+    /// ponytail: a second boot within the same second as one that created a
+    /// context would collide; a nonce would not, and is the upgrade if it ever
+    /// happens.
+    pub fn booted() -> Self {
+        let mock = Self::default();
+        mock.lock().created = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX / 2);
+        mock
+    }
+
     /// Point a fault at a specific window; see [`FaultMode`].
     pub fn set_fault(&self, fault: FaultMode) {
         self.lock().fault = fault;
@@ -685,6 +704,20 @@ mod tests {
             binding: p.binding(),
             user_data_dir: Some(PathBuf::from("/var/lib/agentos").join(&p.external_id)),
         }
+    }
+
+    /// The deployment constructor must not hand out the ids the test one does:
+    /// `ctx-1` is already bound in every database that ever ran the mock.
+    #[tokio::test]
+    async fn a_booted_mock_never_mints_the_ids_a_fresh_one_does() {
+        let fresh = MockBrowser::new();
+        let booted = MockBrowser::booted();
+        let ctx = ctx(EmployeeId::new_v7(Utc::now()));
+        let a = fresh.ensure_context(&ctx).await.expect("fresh");
+        let b = booted.ensure_context(&ctx).await.expect("booted");
+        assert_eq!(a.external_id, "ctx-1");
+        assert_ne!(a.external_id, b.external_id);
+        assert!(b.external_id.starts_with("ctx-"), "{}", b.external_id);
     }
 
     #[tokio::test]
