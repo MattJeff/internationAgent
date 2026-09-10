@@ -14,6 +14,9 @@ pub mod billing;
 // la page de réservation: a stranger picks an hour on a seat that opened its
 // door, and the seat is woken by it. Public pair + one private switch.
 pub mod booking;
+// le navigateur : le journal de ses tâches, la vue en direct de l'une d'elles,
+// et le résumé du jour. Le lecteur de `BrowserObserver`, côté routes.
+pub mod browser;
 // le calendrier: the founder promises a moment and sees what has been promised.
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;

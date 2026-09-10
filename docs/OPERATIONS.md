@@ -395,6 +395,52 @@ account, which the routes above make hard to do) fails the step with
 `domain_not_registered`. `docs/PROVIDERS.md` §Resend has what each call does
 at the provider.
 
+### 1.4g The browser's journal and live view
+
+What Browserbase shows in its dashboard, read from our own Chromium
+(`docs/BROWSER.md` § v2). The adapter narrates every task to the
+`BrowserObserver` port; `agentos_app::browser_journal::Journal` is the
+listener, and these four routes are how a person reads it. All under the
+tenant key; `browser_tasks` (migration 0096) has RLS `force`.
+
+```
+GET /v1/browser/tasks?employee_id=<uuid>&limit=<1..200>   # newest first, default 50, employee_id optional
+GET /v1/browser/tasks/{id}                                # one task, 404 for another tenant's
+GET /v1/browser/live/{employee_id}                        # text/event-stream, 404 for another tenant's employee
+GET /v1/browser/summary                                   # today's counts
+```
+
+A task:
+
+```json
+{ "id": "…", "employee_id": "…", "provider": "chrome", "context": "ctx-…",
+  "started_at": "…", "ended_at": null, "outcome": "running",
+  "steps": [ { "kind": "goto", "url": "https://…", "outcome": "ok", "took_ms": 420, "at": "…" } ],
+  "frames_sent": 0 }
+```
+
+`outcome` is `running` until `ended_at` is set, then `ok`, `refused:<code>`
+or `failed:<code>` — the same three shapes as each step's. `url` is present
+for `goto` only. Nothing from the page is in a row — no text, no image, no
+typed value — because the port never carries it.
+
+The live view is the switch: the screencast runs while at least one
+`/v1/browser/live/{employee_id}` connection is open, and stops when the last
+one closes. The stream carries `event: frame` / `data: <JPEG, base64>` for
+each image, `event: task` / `data: {"task_id": …, "state": "started"|"finished",
+"outcome": …}` at the borders, and a `: ping` comment every 15 s. A reader
+more than four frames behind skips to the current one.
+
+`summary` answers `{ "tasks_today", "refused_today", "failed_today",
+"blocked_by_site_today", "browser_js" }` — UTC day, `blocked_by_site_today`
+counts a task where the wall was met at any step or at the end, and
+`browser_js` is the same boolean `/readyz` publishes.
+
+The journal is written off the request path, through a bounded queue: a
+narration the queue cannot take is dropped and logged
+(`browser journal: a narration was dropped`), never waited on. A hole in the
+journal is a Postgres that was slow at that moment, not a task that did not run.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**

@@ -902,21 +902,32 @@ mod tests {
             .expect("it was stopped");
         tx.commit().await.expect("commit release");
 
-        assert_eq!(
-            tick(&db, &ingest, now).await.expect("tick"),
-            1,
+        // `>= 1`, not `== 1`: `tick` claims across every tenant, and the tests
+        // of this binary share one database. What this test owns is its own
+        // tenant's mail, asserted on the next line.
+        assert!(
+            tick(&db, &ingest, now).await.expect("tick") >= 1,
             "the release has to drain the mail the halt deferred"
         );
         assert_eq!(messages(&db, tenant).await, 1);
+        // Read the row; do not *claim* it. `claim_except` is admin-wide and
+        // batched: with the tests of this binary sharing one database it
+        // returned somebody else's thirty-two events instead of this one — and
+        // worse, claiming them took them from the test that owned them. What is
+        // asserted here is the property itself: the halt no longer holds the
+        // raw delivery back, so it is due and unclaimed.
         let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
-        let general = outbox::claim_except(&mut tx, Some(NOTICE_AGGREGATE), 32, now)
-            .await
-            .expect("claim");
+        let due: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox_events \
+             WHERE id = $1 AND published_at IS NULL AND available_at <= $2",
+        )
+        .bind(raw)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read the raw delivery");
         tx.rollback().await.expect("rollback");
-        assert!(
-            general.iter().any(|event| event.id == raw),
-            "and the raw delivery with it"
-        );
+        assert_eq!(due, 1, "and the raw delivery with it");
     }
 
     // -- concurrency --------------------------------------------------------
