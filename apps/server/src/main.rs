@@ -332,10 +332,27 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         db.clone(),
         agentos_app::identity::envelope(&config.master_key),
     ));
+    // Le profil de navigation de chaque siège — langue, fuseau, écran, lus sur
+    // `employees.spec`. Bâti ici comme le pot de cookies, et partagé par les
+    // deux côtés pour la même raison : un provisionneur qui bâtirait un
+    // `ChromeBrowser` habillé autrement serait un deuxième navigateur portant
+    // le même nom.
+    let browser_profiles = Arc::new(agentos_app::browser_profile::SpecBrowserProfiles::new(
+        db.clone(),
+    ));
+    // Personne n'écoute le navigateur pour l'instant : `NoopObserver`, qui est
+    // aussi ce qui garantit qu'aucun screencast ne tourne — la question
+    // « est-ce que quelqu'un regarde ? » lui est posée avant chaque capture et
+    // il répond non. Le journal des tâches (`browser_journal::Journal`) est un
+    // autre chantier ; c'est cette ligne, et elle seule, qui change quand il
+    // arrive.
+    let browser_observer = Arc::new(agentos_app::mocks::NoopObserver);
     let ports = Arc::new(agentos_app::mocks::ports_for(
         &config.credentials,
         &config.public_host,
         cookie_jar.clone(),
+        browser_observer.clone(),
+        browser_profiles.clone(),
     ));
     // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
     // the real client and its absence selects the SHA-256 hash. Not a field of
@@ -371,6 +388,8 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             &config.master_key,
             &config.credentials,
             secrets.clone(),
+            browser_observer,
+            browser_profiles,
         ),
         EngineConfig::default(),
     );

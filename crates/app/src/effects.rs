@@ -295,6 +295,46 @@ pub const BAD_SUBJECT: &str = "bad_subject";
 /// same fact, in the column an operator reads.
 const RATE_LIMITED: &str = "rate_limited";
 
+/// A navigation brought back a document and the classeur would not take it.
+///
+/// Its own code rather than the store error, because from the model's side
+/// this is not « the page did not load »: the page loaded, it was a file, and
+/// the file is not somewhere it can be pointed at later. Two different things
+/// to fix.
+const NOT_FILED: &str = "not_filed";
+
+/// One path component of a filed document's name, made safe on our side.
+///
+/// The input is a counterparty's `Content-Disposition` or a URL segment, so it
+/// is text a stranger chose: a `/` in it walks out of this employee's folder,
+/// a `..` walks up, and a 4 Ko name is a column nobody meant to fill. Letters,
+/// digits, dot, dash and underscore survive; everything else becomes a dash,
+/// and the whole thing is capped. `browser_chrome::filename_from` cuts the
+/// path separators too — twice on purpose, because neither crate should have
+/// to trust the other to have done it.
+fn file_segment(raw: &str) -> String {
+    let cleaned: String = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', '-']).to_owned();
+    if cleaned.is_empty() {
+        "document".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 /// What a send's write-ahead row names as its provider: the **port**, not the
 /// vendor bound behind it.
 ///
@@ -2424,6 +2464,25 @@ impl Effects {
                 self.in_scope(allowed, true, &session, &here, elsewhere)
                     .await?;
             }
+            // The address answered with a file, not a page. It is filed, and
+            // the *selector* the caller asked for never runs — there is
+            // nothing to run it against, and inventing a text read out of a
+            // PDF here would be `knowledge::text_from_pdf`'s job done in the
+            // wrong place, on bytes nobody has stored yet.
+            //
+            // No scope re-check: this navigation is inside `allowed` (checked
+            // above, before the tab), and a document has no landing address
+            // to have been redirected to — the adapter answered with the body
+            // of the response to *our* URL.
+            BrowserOutcome::Document {
+                content_type,
+                filename,
+                bytes,
+            } => {
+                return self
+                    .file_document(url, &content_type, filename.as_deref(), &bytes)
+                    .await;
+            }
             _ => return Err(EffectError::Refused(NO_LOCATION)),
         }
         match self
@@ -2438,6 +2497,98 @@ impl Effects {
             // Only a broken adapter answers a text read with something else.
             _ => Err(EffectError::Refused("not_text")),
         }
+    }
+
+    /// File a document a navigation brought back, and tell the model about it
+    /// in **our** words.
+    ///
+    /// # Why the model never sees the bytes
+    ///
+    /// [`Effects::read_page`] hands a model a stranger's prose, wrapped, and
+    /// `agentos_domain::untrusted` carries the whole argument for why that is
+    /// survivable. A PDF is the same prose plus a container format, and the
+    /// container is the problem: turning it into text would put
+    /// `knowledge::text_from_pdf` on the reading path of every navigation, and
+    /// a model asked to summarise a 40-page tariff would spend a turn's whole
+    /// budget on it. So the bytes go to the classeur — where
+    /// `knowledge::ingest` can be pointed at them deliberately, by a step that
+    /// meant to — and what comes back here is a sentence made of three things
+    /// we measured: a type, a length, and a name we composed.
+    ///
+    /// The `content_type` in that sentence is the *essence* of what the site
+    /// asserted, parameters stripped: `application/pdf` and not
+    /// `application/pdf; charset=binary; boundary=…`, because everything after
+    /// the semicolon is a counterparty's free text and this sentence is the
+    /// one place it would reach a prompt.
+    ///
+    /// # The name
+    ///
+    /// `navigateur/<employé>/<date>/<nom>` — the employee so two seats cannot
+    /// collide, the date so a classeur read by a human sorts by when, and the
+    /// name from `Content-Disposition` or, failing that, from the URL's last
+    /// segment. Every component is sanitised *here* as well as in the adapter,
+    /// because a name that crosses two crates should be refused by both.
+    ///
+    /// ponytail: `Files::put` is first-write-wins, so reading the same
+    /// document twice in one day answers with the file already there rather
+    /// than a second copy. That is the right answer for the ordinary case (a
+    /// retry) and a slightly wrong one for the rare case (a tariff republished
+    /// the same day under the same name). Add the digest to the name the day
+    /// somebody reports the second.
+    async fn file_document(
+        &self,
+        url: &Url,
+        content_type: &str,
+        filename: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<Untrusted<String>, EffectError> {
+        let essence = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let leaf = filename
+            .map(str::to_owned)
+            .or_else(|| {
+                url.path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "document".to_owned());
+        let name = format!(
+            "navigateur/{}/{}/{}",
+            self.principal.employee_id.as_uuid(),
+            Utc::now().date_naive(),
+            file_segment(&leaf),
+        );
+        use crate::files::Files as _;
+        let classeur = crate::files::PgFiles::new(self.db.clone(), self.principal.tenant_id);
+        match classeur.put(&name, &essence, bytes).await {
+            Ok(_) => {}
+            // First-write-wins: the row that refused us is the row we were
+            // writing. `inbound`'s attachment path makes the same argument at
+            // length — the file is filed, and saying otherwise sends a reader
+            // hunting for bytes that are already there.
+            Err(crate::files::FilesError::Unavailable(StoreError::Conflict(_))) => {}
+            Err(err) => {
+                tracing::warn!(
+                    employee = %self.principal.employee_id.as_uuid(),
+                    error = %err,
+                    "a document a navigation brought back could not be filed"
+                );
+                return Err(EffectError::Refused(NOT_FILED));
+            }
+        }
+        // Untrusted because `read_page`'s return type says every answer from
+        // a browser is, and because one word of it — the type — is still
+        // theirs. Nothing else in it is: the length we counted, the name we
+        // wrote.
+        Ok(Untrusted::new(format!(
+            "document {essence} de {} Ko rangé sous {name}",
+            bytes.len().div_ceil(1024)
+        )))
     }
 
     /// This employee's own browser context, as provisioning left it.
@@ -6304,6 +6455,145 @@ mod tests {
             .await
             .expect("an ordinary read");
         assert_eq!(text.into_inner_for_rendering(), "EUR 12,340");
+    }
+
+    /// A browser whose one navigation answers with a file, so the arm
+    /// `read_page` grew for it can be driven without a Chromium.
+    struct DocumentBrowser {
+        content_type: &'static str,
+        filename: Option<&'static str>,
+        bytes: &'static [u8],
+    }
+
+    #[async_trait]
+    impl BrowserProvider for DocumentBrowser {
+        async fn ensure_context(
+            &self,
+            _ctx: &agentos_providers::EnsureCtx,
+        ) -> Result<agentos_providers::Provisioned, ProviderError> {
+            Ok(agentos_providers::Provisioned::new("mock-browser", "ctx-1"))
+        }
+
+        async fn act(
+            &self,
+            _session: &BrowserSession,
+            step: BrowserStep<'_>,
+        ) -> Result<BrowserOutcome, ProviderError> {
+            match step {
+                BrowserStep::Goto(_) => Ok(BrowserOutcome::Document {
+                    content_type: self.content_type.to_owned(),
+                    filename: self.filename.map(str::to_owned),
+                    bytes: self.bytes.to_vec(),
+                }),
+                // A selector never runs against a document: if one does, the
+                // arm under test fell through to the ordinary path.
+                _ => panic!("a step ran after a document: {}", step.name()),
+            }
+        }
+
+        async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// **A tariff is a PDF, and until 2026-09-10 that read answered
+    /// `navigation_failed`.** Now the bytes go to the classeur and the model
+    /// gets a sentence made of three things we measured — a type, a length,
+    /// and a name we composed — instead of a false statement about the
+    /// supplier's site.
+    #[tokio::test]
+    async fn a_navigation_that_answers_with_a_pdf_is_filed_and_described() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(Arc::new(DocumentBrowser {
+                content_type: "application/pdf; charset=binary",
+                // A counterparty's name, with the path it should not have.
+                filename: Some("../../tarifs 2026.pdf"),
+                bytes: b"%PDF-1.4 the whole tariff",
+            })),
+            principal.clone(),
+        );
+        provision_browser(&db, &principal).await;
+        let reading = || BrowserRead {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+        let url = Url::parse("https://portal.example.com/tarifs").expect("url");
+
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("ok");
+        let said = effects
+            .read_page(token, &url, "#price")
+            .await
+            .expect("a document is not a failed read")
+            .into_inner_for_rendering();
+
+        let name = format!(
+            "navigateur/{}/{}/tarifs-2026.pdf",
+            principal.employee_id.as_uuid(),
+            Utc::now().date_naive()
+        );
+        // Our words, and the *essence* of the type: everything the supplier
+        // wrote after the semicolon stops here rather than reaching a prompt.
+        assert_eq!(
+            said,
+            format!("document application/pdf de 1 Ko rangé sous {name}")
+        );
+        assert!(!said.contains("charset=binary"), "{said}");
+        assert!(
+            !said.contains(".."),
+            "the path in their filename survived: {said}"
+        );
+
+        // And the bytes are actually in the classeur, unchanged.
+        use crate::files::Files as _;
+        let kept = crate::files::PgFiles::new(db.clone(), principal.tenant_id)
+            .get(&name)
+            .await
+            .expect("filed");
+        assert_eq!(
+            kept.bytes.into_inner_for_rendering(),
+            b"%PDF-1.4 the whole tariff"
+        );
+
+        // The audit row is a `browser_read` like any other: what came back
+        // does not change what was ruled.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["outcome"], json!("ok"));
+
+        // Reading it again the same day is first-write-wins and answers the
+        // same sentence rather than a conflict — the retry case, which is the
+        // ordinary one.
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("ok");
+        assert_eq!(
+            effects
+                .read_page(token, &url, "#price")
+                .await
+                .expect("again")
+                .into_inner_for_rendering(),
+            said
+        );
+    }
+
+    /// The name a counterparty proposes is cut on this side too — twice on
+    /// purpose, because neither crate should have to trust the other.
+    #[test]
+    fn a_filed_name_keeps_nothing_a_counterparty_could_walk_out_of() {
+        assert_eq!(file_segment("tarifs 2026.pdf"), "tarifs-2026.pdf");
+        assert_eq!(file_segment("../../etc/passwd"), "passwd");
+        assert_eq!(file_segment("..\\..\\secrets"), "secrets");
+        assert_eq!(file_segment(".."), "document");
+        assert_eq!(file_segment(""), "document");
+        assert_eq!(file_segment(&"a".repeat(500)).len(), 120);
+        // Disarm: an ordinary name comes through untouched.
+        assert_eq!(file_segment("rapport_2026-Q1.csv"), "rapport_2026-Q1.csv");
     }
 
     /// A static page on a loopback port, spoken as HTTP/1.1 by hand: this

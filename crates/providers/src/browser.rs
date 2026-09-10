@@ -280,6 +280,36 @@ pub enum BrowserOutcome {
     /// prompt because two call sites drifted. They cannot drift; they do not
     /// share a name.
     Markup(Untrusted<String>),
+    /// **A [`BrowserStep::Goto`] whose answer was not a page.**
+    ///
+    /// A supplier's tariff is a PDF, an availability list is a CSV, an invoice
+    /// is an `application/vnd.openxmlformats…`. Until 2026-09-10 every one of
+    /// those came back as `navigation_failed`: Chromium commits the
+    /// navigation, there is no document to read a title or a selector out of,
+    /// and the employee learned only that the address did not work. That is a
+    /// false sentence about somebody's site.
+    ///
+    /// So a navigation has two shapes of answer now, and this is the second.
+    /// `bytes` are the response body as it was served — no decoding, no text
+    /// extraction, no guess. `content_type` and `filename` are **the site's
+    /// own assertions**, off `Content-Type` and `Content-Disposition`; they
+    /// are named as such rather than wrapped because the one caller
+    /// ([`agentos_app::effects::Effects::read_page`]) files the bytes and hands
+    /// the model a sentence of *our* words about them — a length we measured
+    /// and a name we composed — instead of anything the counterparty wrote.
+    ///
+    /// Not [`Self::Screenshot`], which is a PNG *we* asked Chromium to make.
+    /// Not [`Self::Text`], which is a stranger's prose and is wrapped for it.
+    /// A caller that matches neither arm gets neither, which is the point of a
+    /// third name.
+    Document {
+        /// `Content-Type`, header value and all, as served.
+        content_type: String,
+        /// `Content-Disposition`'s `filename`, when the site gave one.
+        filename: Option<String>,
+        /// The body, unaltered.
+        bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
