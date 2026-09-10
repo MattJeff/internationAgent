@@ -871,6 +871,22 @@ fn app(
         keyring.clone(),
     );
 
+    // Le serveur MCP joue **cet** étage-ci, et rien d'autre. Deux conséquences,
+    // toutes deux voulues :
+    //
+    // * un outil ne peut pas rappeler `/v1/mcp/server` — la route n'est pas dans
+    //   le routeur qu'il joue, donc la boucle n'est pas seulement interdite,
+    //   elle n'est pas exprimable ;
+    // * le routeur ne détient pas l'état du gestionnaire qui le détient, donc il
+    //   n'y a pas de cycle `Arc` à faire vivre le processus entier en mémoire.
+    //
+    // Ce que l'étage extérieur ajoute — l'identifiant de requête, la trace, le
+    // plafond de corps, le délai — la requête MCP entrante l'a déjà traversé une
+    // fois ; le rejouer à l'intérieur donnerait un deuxième identifiant à ce qui
+    // est un seul appel.
+    let mcp_server = routes::mcp_server::McpServerState::new(keyring.clone());
+    mcp_server.attach(api.clone());
+
     // The signup and key-issuance surface. Outside `with_api_stack` because
     // that stack IS `require_api_key`, and a platform key is deliberately not a
     // tenant key — `routes::platform` argues the whole split. Its own middleware
@@ -899,6 +915,13 @@ fn app(
     // stands in for the credential is the `state` parameter, and
     // `routes::mcp::public_router` is where that argument lives.
     .merge(routes::mcp::public_router(mcp_state))
+    // Le serveur MCP, et pas derrière `with_api_stack` : un client MCP appelle
+    // `initialize` avant d'avoir présenté quoi que ce soit, et un 401 sur cette
+    // sonde est un serveur qui ne s'affiche jamais dans le terminal. Il
+    // s'authentifie lui-même, avec le trousseau de cette pile-ci et le même
+    // `auth::unauthorized()`, sur les deux méthodes qui lisent des données —
+    // voir `routes::mcp_server`.
+    .merge(routes::mcp_server::router(mcp_server))
     .merge(routes::well_known::router(db.clone()))
     // La page de réservation : un prospect n'a pas de clé. Une lecture par
     // `(domain, slug)` qui répond 404 à tout siège qui n'a pas ouvert, et un

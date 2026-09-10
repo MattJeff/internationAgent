@@ -68,6 +68,12 @@ unicode-normalization = "0.1"
 # gets wrong quietly. `crates/app/src/knowledge.rs` argues the choice and what
 # was weighed against it.
 pdf-extract = "0.12"
+# `routes::mcp_server` : un identifiant peut contenir un `/`, et un `/` non
+# encodé dans un trou de chemin n'est pas un caractère de plus dans un segment,
+# c'est un segment de plus dans le chemin — donc une autre route et un 404 que
+# personne n'explique. Déjà dans la lock file (`url`, `reqwest`, `scraper` le
+# tirent tous) : cette ligne n'ajoute rien à compiler, elle nomme ce qui est là.
+percent-encoding = "2"
 # Lire une page statique sans navigateur : un GET et un parseur HTML. `scraper`
 # est html5ever (le parseur de Servo, tolérant aux pages cassées comme l'est un
 # navigateur) plus les sélecteurs CSS de `selectors` — les deux briques qu'il

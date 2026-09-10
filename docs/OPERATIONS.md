@@ -441,6 +441,54 @@ narration the queue cannot take is dropped and logged
 (`browser journal: a narration was dropped`), never waited on. A hole in the
 journal is a Postgres that was slow at that moment, not a task that did not run.
 
+### 1.4h Le serveur MCP — la même société, depuis un terminal
+
+`POST /v1/mcp/server` expose les routes de ce déploiement comme outils MCP, pour
+que le Claude Code du fondateur — **sa** machine, **ses** identifiants — pilote la
+société sans ouvrir la console. `docs/MCP_SERVEUR.md` porte le dossier complet :
+la note légale et ses citations datées, la table des outils, et la règle « un
+outil est une ligne ».
+
+Rien à provisionner. La clé est une clé de locataire ordinaire, celle du §1.4 :
+
+```bash
+claude mcp add --transport http siglair https://siglair.com/v1/mcp/server \
+  --header "Authorization: Bearer <la clé du locataire>"
+
+claude mcp list          # vérifie que le serveur est enregistré
+claude mcp get siglair   # son détail
+```
+
+Forme de la commande vérifiée le 2026-09-10 sur <https://code.claude.com/docs/en/mcp>.
+Depuis Claude Code, `/mcp` dit s'il répond.
+
+Ce qui se voit d'ici, côté serveur :
+
+* La route est montée **hors** de `with_api_stack` — un client MCP appelle
+  `initialize` avant d'avoir présenté quoi que ce soit. `initialize` passe donc
+  sans clé ; `tools/list` et `tools/call` répondent le `unauthenticated`
+  habituel, `WWW-Authenticate` compris. Un `curl -s -o /dev/null -w '%{http_code}'`
+  sur un `tools/list` sans en-tête doit dire `401`.
+* Chaque `tools/call` rejoue une route interne **avec la clé reçue**, à travers
+  `with_api_stack`. Donc : la limite de débit par locataire compte ces appels, `audit_log`
+  les enregistre sous le label de la clé comme n'importe quel appel de console, et
+  un refus de la Gate arrive au terminal avec son `code` (`daily_limit`,
+  `pending_approval`, `halted`) sans être reformulé.
+* Le trafic ne sort jamais du processus : `tower::ServiceExt::oneshot`, pas de
+  socket. Un `tools/call` n'apparaît pas dans les logs d'accès de l'ingress, et
+  son `x-request-id` est celui de l'appel MCP entrant, pas un second.
+
+Pannes possibles, et ce qu'elles veulent dire :
+
+| ce que le client voit | ce que c'est |
+|---|---|
+| `401` sur `tools/list` | la clé n'est ni dans `AGENTOS_API_KEYS` ni dans `api_keys` |
+| `500`/`503` sur `tools/list` | Postgres, pas la clé — le trousseau interroge la table |
+| `-32601` | une méthode que ce serveur n'implémente pas ; seules `initialize`, `tools/list` et `tools/call` existent |
+| `-32602` | un nom d'outil qui n'est pas dans la table |
+| `-32603` « pas de routeur » | le déploiement est mal câblé : `McpServerState::attach` n'a pas été appelé |
+| `isError: true` avec un `code` | la route a refusé. C'est le produit qui parle, pas le transport ; le code est celui que la route rend déjà à la console |
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**

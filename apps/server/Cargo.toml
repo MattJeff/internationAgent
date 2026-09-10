@@ -29,6 +29,9 @@ chrono.workspace = true
 # Le KDF des mots de passe, et rien d'autre — voir `routes::accounts`. Déjà lié
 # dans ce binaire par rustls, donc rien de neuf dans la lock file.
 ring.workspace = true
+# L'encodage des trous de chemin et de la chaîne de requête que
+# `routes::mcp_server` construit. Voir le Cargo.toml racine.
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

@@ -218,6 +218,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "percent-encoding",
  "ring",
  "serde",
  "serde_json",

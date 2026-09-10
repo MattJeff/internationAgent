@@ -1664,6 +1664,7 @@ merges.
 | `GET` | `/metrics` |
 | `POST` | `/v1/webhooks/{path}` |
 | `GET` | `/v1/mcp/oauth/callback` |
+| `POST` | `/v1/mcp/server` — le serveur MCP. Hors de la pile parce qu'un client appelle `initialize` sans clé ; il exige la clé lui-même sur `tools/list` et `tools/call`, avec le même trousseau et le même 401. Voir `docs/MCP_SERVEUR.md`. |
 | `GET` | `/.well-known/agent-card.json` |
 | `GET` | `/.well-known/http-message-signatures-directory` |
 
