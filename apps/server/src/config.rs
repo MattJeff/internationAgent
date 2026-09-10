@@ -33,10 +33,13 @@
 //! Half of one is a named boot failure, because an adapter holding half its
 //! credential is the deployment that believes it is real and is not.
 //!
-//! The browser has a third answer beside key and mock: `BROWSER_FETCH=http`
-//! reads pages with a `GET` and an HTML parser, no JavaScript, no vendor. It
-//! counts as real — it fetches the page it is asked for — and the boot line
+//! The browser has two more answers beside key and mock, in this order:
+//! `BROWSER_CDP_URL=http://browser:9222` drives our own Chromium over CDP —
+//! JavaScript, cookies sealed per employee, no vendor (`docs/BROWSER.md`) —
+//! and the boot line says `browser=chrome(cdp)`; `BROWSER_FETCH=http` reads
+//! pages with a `GET` and an HTML parser, no JavaScript, and the boot line
 //! says `browser=http(no-js)` so nobody mistakes it for the one that types.
+//! Both count as real — they fetch the page they are asked for.
 //!
 //! The model is the one adapter chosen by name rather than by credential:
 //! `AGENTOS_LLM` is `mock` (the default), `cli` or `anthropic`, and only the
@@ -50,7 +53,7 @@ use std::sync::Arc;
 
 use agentos_app::hosted::{BRIDGES_PER_TENANT, BridgeNetwork};
 use agentos_app::mocks::{
-    BrowserCredentials, Credentials, EmailCredentials, EmbedderCredentials, LlmBackend,
+    BrowserCredentials, ChromeCdp, Credentials, EmailCredentials, EmbedderCredentials, LlmBackend,
     TelephonyCredentials,
 };
 use agentos_app::oauth::OauthClients;
@@ -121,6 +124,12 @@ const PROVIDER_CREDENTIALS: [(&str, &str, &str); 4] = [
 /// `agentos_app::mocks::Credentials::browser_fetch_http` is a switch, and the
 /// key still outranks it.
 const HTTP_BROWSER: &str = "http(no-js)";
+
+/// What the `browser` row reads when `BROWSER_CDP_URL` stands in for a key:
+/// our own Chromium, JavaScript included. Named for the wire it is driven
+/// over, because the difference from `browserbase` an operator needs is
+/// "this one is ours, on this compose network, with no proxy behind it".
+const CHROME_BROWSER: &str = "chrome(cdp)";
 
 /// The vault, named in every boot summary beside the adapters a credential
 /// selects — because it is the line an operator reads to find out what is real,
@@ -614,6 +623,40 @@ impl Config {
                 project_id,
                 api_key,
             }),
+            // Our own Chromium. The two ceilings are read only inside this
+            // branch: a deployment that sets `BROWSER_MAX_TABS` and no URL
+            // has configured nothing. `ChromeCdp::parse` refuses a URL that
+            // is not `http(s)://host[:port]` by name.
+            browser_cdp: match get("BROWSER_CDP_URL") {
+                None => None,
+                Some(raw) => {
+                    let number = |var: &'static str, default: u64| -> Result<u64, ConfigError> {
+                        match get(var) {
+                            None => Ok(default),
+                            Some(raw) => raw.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                                var,
+                                detail: format!("{raw:?} is not a count ({err})"),
+                            }),
+                        }
+                    };
+                    let max_tabs = number("BROWSER_MAX_TABS", ChromeCdp::DEFAULT_MAX_TABS as u64)?;
+                    let queue_wait = number(
+                        "BROWSER_QUEUE_WAIT_SECS",
+                        ChromeCdp::DEFAULT_QUEUE_WAIT.as_secs(),
+                    )?;
+                    Some(
+                        ChromeCdp::parse(
+                            &raw,
+                            usize::try_from(max_tabs).unwrap_or(usize::MAX),
+                            std::time::Duration::from_secs(queue_wait),
+                        )
+                        .map_err(|detail| ConfigError::Invalid {
+                            var: "BROWSER_CDP_URL",
+                            detail,
+                        })?,
+                    )
+                }
+            },
             // One value and not a pair, unlike the two above: the customer
             // brings the key and the model is a constant of the adapter,
             // because the HNSW index is partial on a model name and a partial
@@ -642,15 +685,18 @@ impl Config {
         // provider without deciding whether it is real is a compile error, not
         // an adapter that slips past the guard.
         //
-        // The browser is real under either of two answers: a Browserbase key,
-        // or `BROWSER_FETCH=http`. The second is software that is in the tree
-        // and fetches real pages — measured 2026-09-10, the fake it replaces
-        // answered `no_such_element` to every read a customer's employee made
-        // — so it is not a mock, and `AGENTOS_ALLOW_MOCKS` is not needed for it.
+        // The browser is real under any of three answers: a Browserbase key,
+        // `BROWSER_CDP_URL`, or `BROWSER_FETCH=http`. The last two are
+        // software that is in the tree and fetches real pages — measured
+        // 2026-09-10, the fake they replace answered `no_such_element` to
+        // every read a customer's employee made — so neither is a mock, and
+        // `AGENTOS_ALLOW_MOCKS` is not needed for them.
         let is_real: [bool; PROVIDER_CREDENTIALS.len()] = [
             credentials.email.is_some(),
             credentials.telephony.is_some(),
-            credentials.browser.is_some() || credentials.browser_fetch_http,
+            credentials.browser.is_some()
+                || credentials.browser_cdp.is_some()
+                || credentials.browser_fetch_http,
             credentials.embedder.is_some(),
         ];
         let mut mock_adapters = Vec::new();
@@ -673,7 +719,7 @@ impl Config {
             return Err(ConfigError::MocksNotAllowed {
                 adapters: mock_adapters.join(", "),
                 vars: mock_vars.join(", "),
-                summary: summarize(&mock_adapters, llm, http_browser_selected(&credentials)),
+                summary: summarize(&mock_adapters, llm, browser_label(&credentials)),
             });
         }
 
@@ -736,16 +782,17 @@ impl Config {
         summarize(
             &self.mock_adapters,
             self.llm,
-            http_browser_selected(&self.credentials),
+            browser_label(&self.credentials),
         )
     }
 
     /// Whether the browser behind `Ports::browser` runs JavaScript — that is,
-    /// whether it is Browserbase. `/readyz` publishes it so the console can say
-    /// "pages are read without scripts" instead of leaving an operator to
-    /// infer it from a `needs_real_browser` in the audit trail.
+    /// whether it is Browserbase or our own Chromium. `/readyz` publishes it
+    /// so the console can say "pages are read without scripts" instead of
+    /// leaving an operator to infer it from a `needs_real_browser` in the
+    /// audit trail.
     pub fn browser_js(&self) -> bool {
-        self.credentials.browser.is_some()
+        self.credentials.browser.is_some() || self.credentials.browser_cdp.is_some()
     }
 
     /// Say, loudly and every time, what is real and what is not.
@@ -809,17 +856,24 @@ impl Config {
 /// Free-standing so [`Config::parse`] can put it in the refusal it returns
 /// *instead of* a `Config` — the boot that does not happen is the one an
 /// operator most needs the inventory for.
-fn summarize(mock_adapters: &[&'static str], llm: LlmBackend, http_browser: bool) -> String {
+fn summarize(
+    mock_adapters: &[&'static str],
+    llm: LlmBackend,
+    browser: Option<&'static str>,
+) -> String {
     let mut parts = PROVIDER_CREDENTIALS
         .iter()
         .map(|(adapter, _, vendor)| {
             if mock_adapters.contains(adapter) {
                 format!("{adapter}=MOCK")
-            } else if *adapter == "browser" && http_browser {
-                // Real, and named for what it cannot do: an operator reading
-                // this line for "why did the booking probe fail" needs the
-                // `no-js` more than the vendor name.
-                format!("{adapter}={HTTP_BROWSER}")
+            } else if *adapter == "browser"
+                && let Some(ours) = browser
+            {
+                // Real, and named for what it is or cannot do: an operator
+                // reading this line for "why did the booking probe fail"
+                // needs `no-js`, or `chrome(cdp)` (ours, no proxy behind it),
+                // more than a vendor name.
+                format!("{adapter}={ours}")
             } else {
                 format!("{adapter}={vendor}")
             }
@@ -835,13 +889,22 @@ fn summarize(mock_adapters: &[&'static str], llm: LlmBackend, http_browser: bool
     parts.join(" ")
 }
 
-/// Is the `GET` browser what `mocks::browser_provider` will build? The same
-/// rule as that function, read here so the boot line cannot disagree with
-/// the adapter: the switch selects only when there is no key. Caught by the
-/// disarm half of `browser_fetch_http_is_real_without_a_key_…` — the first
-/// version read the switch alone and printed `http(no-js)` beside a key.
-fn http_browser_selected(credentials: &Credentials) -> bool {
-    credentials.browser.is_none() && credentials.browser_fetch_http
+/// Which of *our* browsers `mocks::browser_provider` will build, if not the
+/// vendor's. The same order as that function, read here so the boot line
+/// cannot disagree with the adapter: a key outranks the CDP URL, which
+/// outranks the switch. Caught by the disarm halves of the two browser tests
+/// below — the first version read the switch alone and printed `http(no-js)`
+/// beside a key.
+fn browser_label(credentials: &Credentials) -> Option<&'static str> {
+    if credentials.browser.is_some() {
+        None
+    } else if credentials.browser_cdp.is_some() {
+        Some(CHROME_BROWSER)
+    } else if credentials.browser_fetch_http {
+        Some(HTTP_BROWSER)
+    } else {
+        None
+    }
 }
 
 /// Split a `left:right` credential, or refuse by name.
@@ -1267,6 +1330,85 @@ mod tests {
                 var: "BROWSER_FETCH",
                 ..
             })
+        ));
+    }
+
+    /// `BROWSER_CDP_URL` is our own Chromium: real, JavaScript, named
+    /// `chrome(cdp)` on the boot line, `browser_js: true` for `/readyz`. It
+    /// sits between the key and the `GET` switch; its two ceilings are read
+    /// only beside it, and a value that is not a count or not a URL is
+    /// refused by name.
+    #[test]
+    fn browser_cdp_url_is_real_without_a_key_and_sits_between_the_key_and_the_switch() {
+        let mut env = complete();
+        env.remove("BROWSER_API_KEY");
+        env.insert("BROWSER_CDP_URL", "http://browser:9222".to_owned());
+        env.insert("BROWSER_FETCH", "http".to_owned());
+
+        let config = parse(&env).expect("our own Chromium is not a mock");
+        assert!(
+            config.mock_adapters.is_empty(),
+            "{:?}",
+            config.mock_adapters
+        );
+        let chrome = config.credentials.browser_cdp.as_ref().expect("selected");
+        assert_eq!(chrome.url.as_str(), "http://browser:9222/");
+        assert_eq!(chrome.max_tabs, 3);
+        assert_eq!(chrome.queue_wait, std::time::Duration::from_secs(60));
+        assert!(config.browser_js(), "a Chromium runs JavaScript");
+        assert_eq!(
+            config.adapter_summary(),
+            format!(
+                "email=resend telephony=twilio browser={CHROME_BROWSER} embedder=openai \
+                 llm=anthropic {SECRETS_ADAPTER}"
+            ),
+            "the CDP URL outranks the GET switch on the boot line"
+        );
+
+        // The ceilings.
+        env.insert("BROWSER_MAX_TABS", "2".to_owned());
+        env.insert("BROWSER_QUEUE_WAIT_SECS", "15".to_owned());
+        let chrome = parse(&env).expect("valid").credentials.browser_cdp.unwrap();
+        assert_eq!(chrome.max_tabs, 2);
+        assert_eq!(chrome.queue_wait, std::time::Duration::from_secs(15));
+        env.insert("BROWSER_MAX_TABS", "three".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::Invalid {
+                var: "BROWSER_MAX_TABS",
+                ..
+            })
+        ));
+        env.remove("BROWSER_MAX_TABS");
+        env.insert("BROWSER_CDP_URL", "browser:9222".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::Invalid {
+                var: "BROWSER_CDP_URL",
+                ..
+            })
+        ));
+
+        // Disarm: the key back, and the URL is not what runs.
+        env.insert("BROWSER_CDP_URL", "http://browser:9222".to_owned());
+        env.insert("BROWSER_API_KEY", "proj_test:bb_live_key".to_owned());
+        let config = parse(&env).expect("valid");
+        assert!(config.adapter_summary().contains("browser=browserbase"));
+        // And without it, the switch is.
+        env.remove("BROWSER_API_KEY");
+        env.remove("BROWSER_CDP_URL");
+        assert!(
+            parse(&env)
+                .expect("valid")
+                .adapter_summary()
+                .contains(HTTP_BROWSER)
+        );
+        // A ceiling with no URL configures nothing, not even a refusal.
+        env.remove("BROWSER_FETCH");
+        env.insert("BROWSER_MAX_TABS", "three".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::MocksNotAllowed { .. })
         ));
     }
 

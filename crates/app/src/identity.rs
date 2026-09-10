@@ -167,6 +167,7 @@ pub const PREVIOUS_KEY_VAR: &str = "AGENTOS_MASTER_KEY_PREVIOUS";
 /// anywhere means adding a line here; the test at the bottom of this module
 /// fails if the schema grows one that is not listed.
 const SEALED_COLUMNS: &[(&str, &str)] = &[
+    ("employee_resources", "sealed_cookies"),
     ("employee_signing_keys", "sealed_private_key"),
     ("mcp_servers", "sealed_token"),
     ("mcp_servers", "sealed_refresh_token"),

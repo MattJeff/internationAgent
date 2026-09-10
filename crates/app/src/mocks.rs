@@ -49,6 +49,7 @@ use agentos_domain::untrusted::Untrusted;
 use agentos_providers::Secret;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
+use agentos_providers::browser_chrome::{ChromeBrowser, CookieJar, MemoryCookieJar};
 use agentos_providers::browser_http::{HttpBrowser, UrlVet};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider};
@@ -147,9 +148,16 @@ pub struct Credentials {
     pub email: Option<EmailCredentials>,
     /// Twilio. `None` is [`MockTelephony`].
     pub telephony: Option<TelephonyCredentials>,
-    /// Browserbase. `None` is [`HttpBrowser`] when [`Self::browser_fetch_http`]
-    /// says so, and [`MockBrowser`] otherwise.
+    /// Browserbase. `None` is [`ChromeBrowser`] when [`Self::browser_cdp`]
+    /// is set, [`HttpBrowser`] when [`Self::browser_fetch_http`] says so, and
+    /// [`MockBrowser`] otherwise.
     pub browser: Option<BrowserCredentials>,
+    /// `BROWSER_CDP_URL`: our own Chromium, over CDP. Outranked by a
+    /// Browserbase key, outranks `BROWSER_FETCH=http`. Not a credential —
+    /// the port is never published and has no authentication — but a
+    /// selection all the same, and read beside the others for the reason
+    /// [`Self::browser_fetch_http`] gives. See `docs/BROWSER.md`.
+    pub browser_cdp: Option<ChromeCdp>,
     /// `BROWSER_FETCH=http`: with no Browserbase key, read pages with a `GET`
     /// and a parser rather than with the fake.
     ///
@@ -187,6 +195,46 @@ pub struct TelephonyCredentials {
     pub account_sid: String,
     /// The auth token.
     pub auth_token: String,
+}
+
+/// What [`ChromeBrowser::new`] takes, plus its two ceilings.
+#[derive(Debug, Clone)]
+pub struct ChromeCdp {
+    /// `http://browser:9222`. The adapter resolves the name itself — Chromium
+    /// refuses a `Host` that is not an address — so the compose service name
+    /// is the right thing to write here.
+    pub url: url::Url,
+    /// `BROWSER_MAX_TABS`, default 3.
+    pub max_tabs: usize,
+    /// `BROWSER_QUEUE_WAIT_SECS`, default 60.
+    pub queue_wait: std::time::Duration,
+}
+
+impl ChromeCdp {
+    /// `BROWSER_MAX_TABS` when unset.
+    pub const DEFAULT_MAX_TABS: usize = agentos_providers::browser_chrome::DEFAULT_MAX_TABS;
+    /// `BROWSER_QUEUE_WAIT_SECS` when unset.
+    pub const DEFAULT_QUEUE_WAIT: std::time::Duration =
+        agentos_providers::browser_chrome::DEFAULT_QUEUE_WAIT;
+
+    /// `raw` as `BROWSER_CDP_URL` has it. Here rather than in `config.rs`
+    /// because the binary does not depend on `url`; the error is a sentence
+    /// for the boot refusal and never quotes the value.
+    pub fn parse(
+        raw: &str,
+        max_tabs: usize,
+        queue_wait: std::time::Duration,
+    ) -> Result<Self, String> {
+        let url = url::Url::parse(raw).map_err(|err| format!("not a URL ({err})"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("expected `http://host[:port]`, the DevTools HTTP endpoint".to_owned());
+        }
+        Ok(Self {
+            url,
+            max_tabs,
+            queue_wait,
+        })
+    }
 }
 
 /// What [`BrowserbaseBrowser::new`] takes. The API key alone is not enough:
@@ -319,15 +367,34 @@ fn telephony_provider(
 /// `example.com` alike. The fake was the fetch layer. A static page needs no
 /// browser, and the founder pays for none until a task does; see
 /// `agentos_providers::browser_http`.
-fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
-    match (&credentials.browser, credentials.browser_fetch_http) {
-        (Some(browser), _) => Arc::new(
+///
+/// Four since `docs/BROWSER.md` (2026-09-10), in this order: a Browserbase
+/// key, then `BROWSER_CDP_URL` — our own Chromium, JavaScript included, cookies
+/// sealed in `jar` between two tasks — then the `GET` browser, then the fake.
+/// The jar is a parameter rather than built here because the real one needs
+/// the database and the deployment's cipher, which this module does not hold;
+/// only the Chrome branch reads it.
+fn browser_provider(
+    credentials: &Credentials,
+    jar: Arc<dyn CookieJar>,
+) -> Arc<dyn BrowserProvider> {
+    match (
+        &credentials.browser,
+        &credentials.browser_cdp,
+        credentials.browser_fetch_http,
+    ) {
+        (Some(browser), _, _) => Arc::new(
             BrowserbaseBrowser::new(browser.project_id.clone(), &browser.api_key)
                 .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
         ),
-        (None, true) => Arc::new(HttpBrowser::new(Arc::new(PublicWeb))),
+        (None, Some(chrome), _) => Arc::new(
+            ChromeBrowser::new(chrome.url.clone(), Arc::new(PublicWeb), jar)
+                .with_max_tabs(chrome.max_tabs)
+                .with_queue_wait(chrome.queue_wait),
+        ),
+        (None, None, true) => Arc::new(HttpBrowser::new(Arc::new(PublicWeb))),
         // `booted`, not `new`: a deployment's mock must not reuse `ctx-1`.
-        (None, false) => Arc::new(MockBrowser::booted()),
+        (None, None, false) => Arc::new(MockBrowser::booted()),
     }
 }
 
@@ -394,6 +461,7 @@ pub fn embedder(credentials: &Credentials) -> Embedder {
 /// `master_key`: see [`secret_store`].
 pub fn adapters(master_key: &str) -> Adapters {
     adapters_for(
+        Arc::new(MemoryCookieJar::new()),
         master_key,
         &Credentials::default(),
         secret_store(master_key),
@@ -460,7 +528,12 @@ pub fn secret_store(master_key: &str) -> Arc<LocalEnvelopeSecretStore> {
 /// Real client per `Some` field, mock per `None`. Every other field is what
 /// [`adapters`] always gave: `secrets` and `envelope` are both real crypto over
 /// the deployment's own master key — see [`secret_store`].
+///
+/// `jar` is where the Chrome browser keeps an employee's cookies — the
+/// provisioner only ever *releases* through it, which is the one call that
+/// throws a jar away; see `browser_provider`.
 pub fn adapters_for(
+    jar: Arc<dyn CookieJar>,
     master_key: &str,
     credentials: &Credentials,
     secrets: Arc<dyn SecretStore>,
@@ -470,7 +543,7 @@ pub fn adapters_for(
         // `None`: the provisioner buys and releases numbers and never places a
         // call, so there is no outcome for a carrier to report back.
         telephony: telephony_provider(credentials, None),
-        browser: browser_provider(credentials),
+        browser: browser_provider(credentials, jar),
         // Passed in rather than built here: see `secret_store`. One deployment,
         // one vault, so the provisioning canary a step writes is the one the
         // next step reads.
@@ -489,7 +562,11 @@ pub fn adapters_for(
 pub fn ports() -> Ports {
     // No credentials, so every port is a fake and the address below reaches
     // nothing: `telephony_provider` only hands it to the real adapter.
-    ports_for(&Credentials::default(), "http://localhost")
+    ports_for(
+        &Credentials::default(),
+        "http://localhost",
+        Arc::new(MemoryCookieJar::new()),
+    )
 }
 
 /// The ports this deployment's credentials actually select.
@@ -508,11 +585,16 @@ pub fn ports() -> Ports {
 /// has to tell the carrier where to report back, and that address is this
 /// deployment's own webhook endpoint. See [`telephony_provider`], which is the
 /// only reader and which gives it to the real adapter only.
-pub fn ports_for(credentials: &Credentials, public_host: &str) -> Ports {
+///
+/// `jar` is the sealed cookie jar the Chrome browser reads and writes between
+/// two tasks — `crate::cookie_jar::SealedCookieJar` in a deployment, a map
+/// in a test. Passed in for `secret_store`'s reason: it needs the database,
+/// and this module builds nothing that does.
+pub fn ports_for(credentials: &Credentials, public_host: &str, jar: Arc<dyn CookieJar>) -> Ports {
     Ports {
         email: email_provider(credentials, Some(public_host)),
         telephony: telephony_provider(credentials, Some(public_host)),
-        browser: browser_provider(credentials),
+        browser: browser_provider(credentials, jar),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
         // Always the mock, and there is no `Credentials` field to select on
@@ -1045,8 +1127,13 @@ mod tests {
             embedder: Some(EmbedderCredentials {
                 api_key: "sk-live-key".to_owned(),
             }),
+            browser_cdp: None,
             browser_fetch_http: false,
         }
+    }
+
+    fn jar() -> Arc<dyn CookieJar> {
+        Arc::new(MemoryCookieJar::new())
     }
 
     /// `BROWSER_FETCH=http` selects the `GET` browser, a key outranks it, and
@@ -1064,7 +1151,7 @@ mod tests {
             "browser",
         );
         let provider_of = async |credentials: &Credentials| {
-            ports_for(credentials, "https://agents.test")
+            ports_for(credentials, "https://agents.test", jar())
                 .browser
                 .ensure_context(&ctx)
                 .await
@@ -1084,7 +1171,7 @@ mod tests {
             browser_fetch_http: true,
             ..Credentials::default()
         };
-        let ports = ports_for(&both, "https://agents.test");
+        let ports = ports_for(&both, "https://agents.test", jar());
         let existing = ProviderBinding {
             provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
             external_id: "ctx_bb".to_owned(),
@@ -1110,6 +1197,76 @@ mod tests {
         }
     }
 
+    /// The order `docs/BROWSER.md` fixes: a key outranks `BROWSER_CDP_URL`,
+    /// which outranks `BROWSER_FETCH=http`. Identified through
+    /// `ensure_context`, which for Chrome creates nothing at Chromium — so the
+    /// address below is never dialled.
+    #[tokio::test]
+    async fn browser_cdp_url_selects_chrome_below_a_key_and_above_the_get_browser() {
+        use agentos_providers::EnsureCtx;
+
+        let ctx = EnsureCtx::new(
+            agentos_domain::ids::TenantId::new_v7(Utc::now()),
+            agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
+            agentos_domain::ids::Slug::parse("ada").expect("valid slug"),
+            "browser",
+        );
+        let chrome = || {
+            Some(ChromeCdp {
+                url: url::Url::parse("http://browser:9222").expect("url"),
+                max_tabs: 3,
+                queue_wait: std::time::Duration::from_secs(60),
+            })
+        };
+        let provider_of = async |credentials: &Credentials| {
+            ports_for(credentials, "https://agents.test", jar())
+                .browser
+                .ensure_context(&ctx)
+                .await
+                .expect("ensure")
+                .provider
+        };
+
+        assert_eq!(
+            provider_of(&Credentials {
+                browser_cdp: chrome(),
+                browser_fetch_http: true,
+                ..Credentials::default()
+            })
+            .await,
+            agentos_providers::browser_chrome::PROVIDER,
+            "the CDP URL outranks the GET switch"
+        );
+        // Disarm both ways: without the URL the switch runs, and with a key
+        // neither does.
+        assert_eq!(
+            provider_of(&Credentials {
+                browser_fetch_http: true,
+                ..Credentials::default()
+            })
+            .await,
+            HttpBrowser::PROVIDER
+        );
+        let both = Credentials {
+            browser: live().browser,
+            browser_cdp: chrome(),
+            ..Credentials::default()
+        };
+        let existing = agentos_providers::ProviderBinding {
+            provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
+            external_id: "ctx_bb".to_owned(),
+        };
+        assert_eq!(
+            ports_for(&both, "https://agents.test", jar())
+                .browser
+                .ensure_context(&ctx.clone().with_existing(existing))
+                .await
+                .expect("a persisted binding needs no round trip")
+                .provider,
+            agentos_providers::browser_browserbase::PROVIDER
+        );
+    }
+
     /// The claim this whole unit exists to make true: a credential does not
     /// merely satisfy a boot guard, it selects the client that talks to the
     /// provider — and its absence selects the fake.
@@ -1128,7 +1285,7 @@ mod tests {
         };
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let real = ports_for(&live(), "https://agents.test");
+        let real = ports_for(&live(), "https://agents.test", jar());
         let mock = ports();
 
         // -- email: signed with a secret only Resend was handed -------------
@@ -1212,6 +1369,7 @@ mod tests {
                 ..Credentials::default()
             },
             "https://agents.test",
+            jar(),
         );
         let ctx = EnsureCtx::new(
             agentos_domain::ids::TenantId::new_v7(Utc::now()),
@@ -1295,6 +1453,7 @@ mod tests {
                 ..Credentials::default()
             },
             "https://agents.test",
+            jar(),
         );
         let body = br#"{"type":"email.received"}"#;
         let timestamp = Utc::now().timestamp().to_string();

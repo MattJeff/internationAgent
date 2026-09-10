@@ -239,8 +239,11 @@ normal, pas une erreur.
 |---|---|---|
 | `EMAIL_API_KEY` | `MockEmailProvider` | construit le vrai client Resend (`re_…`) |
 | `TELEPHONY_API_KEY` | `MockTelephony` | vrai client Twilio. Format `ACxxxx:auth_token` — **une moitié seule est un refus au boot nommé** |
-| `BROWSER_API_KEY` | `MockBrowser`, ou `HttpBrowser` si `BROWSER_FETCH=http` | vrai Browserbase + driver CDP. Format `project-id:api-key`, même refus sur une moitié |
-| `BROWSER_FETCH` | le faux (chaque `read_page` répond `no_such_element` — mesuré en production le 2026-09-10) | `http`, seule valeur : un `GET` et un parseur HTML, sans JavaScript. Compte comme réel (`browser=http(no-js)` au boot, `browser_js: false` dans `/readyz`) ; ignoré si la clé est là |
+| `BROWSER_API_KEY` | `ChromeBrowser` si `BROWSER_CDP_URL`, `HttpBrowser` si `BROWSER_FETCH=http`, sinon `MockBrowser` | vrai Browserbase + driver CDP. Format `project-id:api-key`, même refus sur une moitié |
+| `BROWSER_CDP_URL` | l'un des deux suivants | `http://browser:9222` : **notre** Chromium sans tête (service `browser` du compose, `docs/BROWSER.md`), JavaScript, cookies scellés par employé dans `employee_resources.sealed_cookies`. Compte comme réel (`browser=chrome(cdp)` au boot, `browser_js: true`) ; ignoré si la clé est là. L'adaptateur résout le nom lui-même : Chromium refuse un `Host` qui n'est pas une IP |
+| `BROWSER_MAX_TABS` | 3 | onglets simultanés dans ce Chromium, tous employés confondus ; au-delà on attend, on ne lance pas. Lu seulement avec `BROWSER_CDP_URL` |
+| `BROWSER_QUEUE_WAIT_SECS` | 60 | attente d'un onglet avant `Retryable`. Lu seulement avec `BROWSER_CDP_URL` |
+| `BROWSER_FETCH` | le faux (chaque `read_page` répond `no_such_element` — mesuré en production le 2026-09-10) | `http`, seule valeur : un `GET` et un parseur HTML, sans JavaScript. Compte comme réel (`browser=http(no-js)` au boot, `browser_js: false` dans `/readyz`) ; ignoré si la clé ou `BROWSER_CDP_URL` est là |
 | `EMBEDDER_API_KEY` | hash SHA-256 (`mock-sha256-1536`) | `OpenAiEmbedder`, `text-embedding-3-small`, sur la clé **du client** |
 | `AGENTOS_LLM` | `mock` → répond `MOCK_REPLY` | `anthropic` (seul réel) ou `cli`. Une valeur inconnue est un refus qui liste les valeurs valides |
 | `ANTHROPIC_API_KEY` | — | **exigée au boot** quand `AGENTOS_LLM=anthropic` |
@@ -583,6 +586,9 @@ AGENTOS_LLM=mock
 # Les pages des prospects se lisent sans navigateur hébergé : un GET, un
 # parseur, pas de JavaScript. Sans cette ligne, `read_page` tourne sur le faux.
 BROWSER_FETCH=http
+# Avec le service `browser` du compose (docs/BROWSER.md), le vrai navigateur,
+# JavaScript compris, et la ligne au-dessus n'est plus lue :
+# BROWSER_CDP_URL=http://browser:9222
 
 AGENTOS_PLATFORM_KEYS=signup:<openssl rand -hex 32>
 RUST_LOG=info,agentos_server=debug

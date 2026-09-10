@@ -1,0 +1,48 @@
+-- 0095_un_employe_garde_ses_cookies : le pot de cookies d'un employé, scellé,
+-- sur la ligne `browser` de ses ressources.
+--
+-- `docs/BROWSER.md` (2026-09-10) : notre Chromium ouvre **un contexte CDP par
+-- tâche** et le jette à la fin. Un contexte ne survit pas au processus, et
+-- `--user-data-dir` coûterait un processus par employé sur un VPS de 3,8 Go.
+-- La seule chose durable est donc ce que la tâche a laissé : ses cookies,
+-- exportés par `Network.getAllCookies` à la fermeture de l'onglet et
+-- ré-injectés par `Network.setCookies` à l'ouverture du suivant. C'est ce que
+-- Browserbase fait côté serveur derrière `persist: true` ; ici on le voit.
+--
+-- ---------------------------------------------------------------------------
+-- POURQUOI UNE COLONNE SUR `employee_resources`, ET PAS UNE TABLE
+-- ---------------------------------------------------------------------------
+--
+-- Le pot appartient à la ressource `browser` de l'employé, exactement une par
+-- employé (`primary key (employee_id, step)`, 0001), et il vit et meurt avec
+-- elle : `release` l'oublie, la cascade du locataire l'emporte. Une table à
+-- part serait une deuxième clé pour la même chose, avec un `join` à chaque
+-- ouverture d'onglet pour rien. Et `state` n'est pas le bon endroit : c'est
+-- la colonne du cycle de vie (`provisioning`, `ready`…), lue par
+-- `claim_step` et `Effects::browser_session` — y ranger un blob casserait
+-- les deux.
+--
+-- ---------------------------------------------------------------------------
+-- SCELLÉ, SOUS `browser://<locataire>/<employé>`
+-- ---------------------------------------------------------------------------
+--
+-- Un cookie de session EST la session : qui lit la colonne est connecté au
+-- portail du client. Donc un `Envelope` AES-256-GCM (`secrets.rs`), comme
+-- `mcp_servers.sealed_token` (0040) et `tenant_model_access.sealed_key`
+-- (0050) : la clé de donnée enveloppée sous le locataire, la charge sous le
+-- contexte `browser://<tenant>/<employee>` — une ligne recopiée sur la
+-- ressource d'un autre employé ne s'ouvre pas. Le préfixe `sealed_` est ce
+-- que `identity::SEALED_COLUMNS` et son test lisent : la rotation de clé
+-- maître passe par ici comme par les autres.
+--
+-- Lue et écrite par `agentos_app::cookie_jar`, sous `admin_tx_bypassing_rls`,
+-- parce que la recherche se fait par `(provider, external_id)` — l'identifiant
+-- que le fournisseur tient — AVANT de connaître le locataire, l'argument de
+-- `webhook_endpoints` (0053) et d'`unsubscribe_links` (0085). Le locataire
+-- est ensuite dans la ligne, et dans l'AAD.
+--
+-- NULL : aucun onglet fermé sous ce contexte, ou `release` l'a oublié. La RLS
+-- de la table (0001) couvre la colonne ; rien à ajouter.
+
+alter table employee_resources
+  add column if not exists sealed_cookies bytea;

@@ -6423,6 +6423,97 @@ mod tests {
         assert_eq!(err.code(), NEEDS_REAL_BROWSER);
     }
 
+    /// **The same verb, on our own Chromium, on a page the `GET` browser
+    /// cannot read.** `docs/BROWSER.md`'s third proof: a `read_page` of an
+    /// employee on a page rendered by JavaScript — the same token, scope
+    /// check and audit row as the test above — comes back with the word the
+    /// script wrote, where `HttpBrowser` on the very same page comes back with
+    /// the empty shell the server sent. Both halves run here, so the claim is
+    /// measured rather than asserted.
+    ///
+    /// Needs `BROWSER_CDP_URL` and a Chromium that resolves
+    /// `portal.example.com` to the loopback site — `Domain::parse` refuses an
+    /// IP literal, so the launch line in `browser_chrome.rs` carries
+    /// `--host-resolver-rules="MAP portal.example.com 127.0.0.1"`. Skips
+    /// without the variable, like the database tests without theirs.
+    #[tokio::test]
+    async fn read_page_over_our_chromium_reads_a_page_rendered_by_javascript() {
+        use agentos_providers::browser_chrome::{ChromeBrowser, MemoryCookieJar};
+        use agentos_providers::browser_http::{HttpBrowser, PinnedHost};
+
+        let Some(db) = db().await else { return };
+        let Ok(cdp) = std::env::var("BROWSER_CDP_URL") else {
+            eprintln!("SKIP: BROWSER_CDP_URL is unset; this read needs a real Chromium");
+            return;
+        };
+        let principal = seed(&db).await;
+        let site = static_site(
+            "<!doctype html><html><head><title>App</title></head><body>\
+             <div id=\"app\"></div>\
+             <script>document.getElementById('app').textContent='rendu'</script>\
+             </body></html>",
+        )
+        .await;
+        provision_browser(&db, &principal).await;
+        let url =
+            Url::parse(&format!("http://portal.example.com:{}/app", site.port())).expect("url");
+        let vet = || Arc::new(PinnedHost::new("portal.example.com", site.ip()));
+        let read = async |browser: Arc<dyn BrowserProvider>, selector: &str| {
+            let effects = Effects::new(db.clone(), ports_browsing(browser), principal.clone());
+            let token = gate(&db)
+                .authorize(
+                    &principal,
+                    BrowserRead {
+                        domain: Domain::parse("portal.example.com").expect("domain"),
+                    },
+                )
+                .await
+                .expect("reading is a channel, and this seat has it");
+            effects
+                .read_page(token, &url, selector)
+                .await
+                .expect("read")
+                .into_inner_for_rendering()
+        };
+
+        let chrome: Arc<dyn BrowserProvider> = Arc::new(ChromeBrowser::new(
+            Url::parse(&cdp).expect("BROWSER_CDP_URL is a URL"),
+            vet(),
+            Arc::new(MemoryCookieJar::new()),
+        ));
+        assert_eq!(read(chrome.clone(), "#app").await, "rendu");
+        assert_eq!(read(chrome.clone(), WHOLE_PAGE).await, "rendu");
+        // Give the tab back rather than wait for the reaper.
+        let session = Effects::new(
+            db.clone(),
+            ports_browsing(chrome.clone()),
+            principal.clone(),
+        )
+        .browser_session()
+        .await
+        .expect("provisioned");
+        chrome.release(&session.binding).await.expect("release");
+
+        // The disarm, and the reason this adapter exists: the `GET` browser on
+        // the same page, through the same verb, reads nothing.
+        let http: Arc<dyn BrowserProvider> = Arc::new(HttpBrowser::new(vet()));
+        assert_eq!(
+            read(http, "#app").await,
+            "",
+            "the GET browser ran the script"
+        );
+
+        // Both reads left their rows: same kind, same domain, same selector
+        // field — the trail does not know which browser it was, and should
+        // not have to.
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 3);
+        for (_, row) in &rows {
+            assert_eq!(row["outcome"], json!("ok"));
+            assert_eq!(row["detail"]["domain"], json!("portal.example.com"));
+        }
+    }
+
     #[tokio::test]
     async fn an_untrusted_draft_still_sends_but_an_untrusted_payment_never_does() {
         let Some(db) = db().await else { return };

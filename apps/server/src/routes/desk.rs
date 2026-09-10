@@ -1258,7 +1258,7 @@ mod tests {
     /// The three refusals: a name nobody filed, one document too many, and a
     /// document another company filed — which reads exactly like the first.
     #[tokio::test]
-    async fn an_unfiled_name_a_sixth_document_and_another_company_s_file_are_refused() {
+    async fn an_unfiled_name_a_twenty_first_document_and_another_company_s_file_are_refused() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; a desk needs a real Postgres");
             return;
@@ -1288,7 +1288,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
         assert_eq!(refused["code"], json!("no_such_file"), "{refused}");
 
-        let six: Vec<Value> = (0..6)
+        let six: Vec<Value> = (0..inbound::MAX_ATTACHMENTS + 1)
             .map(|n| json!({ "name": format!("{n}.csv") }))
             .collect();
         let (status, refused) = h
@@ -1297,7 +1297,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "six is refused before any name is looked up: {refused}"
+            "one over the cap is refused before any name is looked up: {refused}"
         );
 
         deposit(&h, SECRET_B, "b/secret.csv", "text/csv", b"B's prospects").await;
