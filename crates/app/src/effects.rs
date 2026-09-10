@@ -83,6 +83,7 @@ use crate::calendar::{Calendar, CalendarError, PgCalendar};
 use crate::follow_up;
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
+use crate::sequence;
 use crate::turn::WHOLE_PAGE;
 pub use agentos_providers::telephony::{Announcement, NotSpeakable};
 
@@ -3152,6 +3153,15 @@ impl Effects {
         let promised = async {
             let thread =
                 follow_up::sent(&mut tx, employee, to, Some(subject), sent.as_str(), now).await?;
+            // A send a sequence step was waiting for advances the run, and the
+            // sequence is then the chase: no J+3 promise beside it, or the
+            // thread is written to twice on day three by two mechanisms.
+            if sequence::sent(&mut tx, employee, thread, to, sent.as_str(), now)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
             follow_up::schedule(&mut tx, employee, thread, to, now).await
         }
         .await

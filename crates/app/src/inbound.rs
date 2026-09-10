@@ -2881,6 +2881,11 @@ pub async fn land(
         calendar::cancel_for_conversation(tx, message.conversation_id, now)
             .await
             .map_err(InboundError::Store)?;
+        // And the sequence, for the same reason in the same transaction: a
+        // run on this thread has its answer, and its next step is not owed.
+        crate::sequence::replied(tx, message.conversation_id, now)
+            .await
+            .map_err(InboundError::Store)?;
     }
 
     // `work_item` rides on the receipt rather than on a row of its own:

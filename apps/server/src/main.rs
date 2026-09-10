@@ -486,6 +486,10 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 cancel.clone(),
             )),
         ),
+        (
+            "sequence",
+            tokio::spawn(loops::sequence::run(db.clone(), cancel.clone())),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -711,6 +715,7 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))

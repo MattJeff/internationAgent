@@ -37,7 +37,7 @@ use sqlx::PgConnection;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
-use agentos_domain::ids::{AppointmentId, ConversationId, EmployeeId, TenantId};
+use agentos_domain::ids::{AppointmentId, ConversationId, EmployeeId, SequenceRunId, TenantId};
 
 use crate::db::{StoreError, TenantTx};
 
@@ -133,6 +133,10 @@ pub struct Kept {
     /// The thread a follow-up is about — see [`Appointment::conversation_id`].
     /// What lets the wake say *who* has not answered and since when.
     pub conversation_id: Option<ConversationId>,
+    /// The sequence run this promise is a step of (`0092`), when it is one:
+    /// the wake then briefs the turn from `agentos_app::sequence::brief`
+    /// rather than from the follow-up's. `None` for every other promise.
+    pub sequence_run_id: Option<SequenceRunId>,
 }
 
 /// The columns, in one spelling, so the statements below cannot disagree about
@@ -395,7 +399,7 @@ pub async fn claim_due(
           WHERE a.id = d.id \
         RETURNING a.id, a.tenant_id, a.employee_id, a.at, a.at_zone, \
                   to_char(a.at AT TIME ZONE a.at_zone, 'YYYY-MM-DD HH24:MI') AS local_time, \
-                  a.subject, a.conversation_id",
+                  a.subject, a.conversation_id, a.sequence_run_id",
     ))
     .bind(now)
     .bind(limit)
@@ -420,6 +424,9 @@ pub async fn claim_due(
             conversation_id: row
                 .get::<Option<uuid::Uuid>, _>("conversation_id")
                 .map(ConversationId::from_uuid),
+            sequence_run_id: row
+                .get::<Option<uuid::Uuid>, _>("sequence_run_id")
+                .map(SequenceRunId::from_uuid),
         })
         .collect())
 }

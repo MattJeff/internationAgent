@@ -25,7 +25,7 @@ It never says `✓`.
 
 ## Architecture
 
-Five crates, one binary, five loops.
+Five crates, one binary, six loops.
 
 ```text
 agentos-domain      pure types, employee state machine, Policy Gate evaluator

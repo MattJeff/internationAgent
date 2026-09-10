@@ -54,9 +54,12 @@ pub mod platform; // wave J: step zero — a tenant signs up and gets a key that
 // été approchés cette semaine, et combien ont répondu. Avec ce que le chiffre
 // ne mesure pas, dans la réponse.
 pub mod outreach;
+// la séquence : le fondateur définit les pas et inscrit un contact ; le siège
+// écrit chaque mail lui-même, réveillé par une promesse. Aucune route d'envoi.
 pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money it moved
 pub mod policy;
 pub mod pool;
+pub mod sequences;
 // le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
 // pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
 // lecture est montée hors de toute clé; sa bascule est un acte de locataire.

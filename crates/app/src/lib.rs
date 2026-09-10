@@ -42,6 +42,7 @@ pub mod rolepack;
 pub mod rolepack_sales; // wave 12
 pub mod rolepack_service; // customer success, growth, finance
 pub mod secrets; // U22
+pub mod sequence; // la séquence: several promises in a row, branching on what the provider saw, and never a second send path
 pub mod sourcing;
 pub mod stripe; // une livraison Stripe encaisse une facture : le quatrième schéma de webhook
 pub mod turn; // U25
