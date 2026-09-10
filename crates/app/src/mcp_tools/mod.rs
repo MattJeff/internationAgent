@@ -11,8 +11,12 @@
 
 use crate::mcp_server::ToolDef;
 
+pub mod appels;
 pub mod commerce;
+pub mod contenu;
+pub mod croissance;
 pub mod exploitation;
+pub mod social;
 pub mod societe;
 
 /// Tous les outils de ce déploiement, dans l'ordre où un lecteur les découvre.
@@ -21,6 +25,14 @@ pub fn registry() -> Vec<ToolDef> {
     let mut all = societe::tools();
     all.extend(commerce::tools());
     all.extend(exploitation::tools());
+    // Les quatre domaines de la croissance, ouverts le 2026-09-11 : ce qui
+    // fait passer une entreprise au niveau au-dessus plutôt que ce qui la fait
+    // tourner. Un module par levier, pour la même raison que les trois
+    // premiers — un chantier par fichier.
+    all.extend(contenu::tools());
+    all.extend(social::tools());
+    all.extend(appels::tools());
+    all.extend(croissance::tools());
     all
 }
 
