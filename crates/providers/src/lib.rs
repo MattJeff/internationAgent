@@ -68,6 +68,7 @@
 pub mod browser; // U18
 pub mod browser_browserbase;
 pub mod cdp;
+pub mod dns_cloudflare; // one-shot: pose a sending domain's records in a Cloudflare zone
 pub mod email; // U16
 pub mod email_resend; // real Resend client
 pub mod embedder; // U19
@@ -155,6 +156,18 @@ pub struct EnsureCtx {
     pub attempt: u32,
     /// What a previous run recorded, if the engine has it.
     pub existing: Option<ProviderBinding>,
+    /// The sending domain the seat's address is minted under — the host in
+    /// `slug@domain`, read off the employee's own row by the caller.
+    ///
+    /// Empty from [`EnsureCtx::new`], because thirteen of the fifteen sites
+    /// that build one are provisioning a phone or a browser and have no
+    /// domain to give. Only the email step reads it, and an adapter that finds
+    /// it empty finds no such domain at the provider — `Terminal {
+    /// domain_not_registered }`, the same answer a caller that forgot
+    /// [`EnsureCtx::with_domain`] deserves. Measured 2026-09-10: the previous
+    /// shape carried the domain on the *adapter*, one per deployment, and the
+    /// deployment ran five days on a domain nobody owned.
+    pub domain: String,
 }
 
 impl EnsureCtx {
@@ -171,7 +184,15 @@ impl EnsureCtx {
             idempotency_key: IdempotencyKey::for_step(employee_id, step),
             attempt: 0,
             existing: None,
+            domain: String::new(),
         }
+    }
+
+    /// Name the sending domain this seat sits on. See [`EnsureCtx::domain`].
+    #[must_use]
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = domain.into();
+        self
     }
 
     /// Attach the binding a previous run persisted.

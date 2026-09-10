@@ -112,6 +112,7 @@
 //! employee — [`employee_in_tenant`] is what stops a membership row being filed
 //! for someone else's agent.
 
+use agentos_app::sending_domain;
 use agentos_domain::action::Domain;
 use agentos_domain::employee::Employee;
 use agentos_domain::ids::{EmployeeId, Slug};
@@ -137,6 +138,7 @@ use uuid::Uuid;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
+use crate::routes::domain::{Hiring, refused};
 
 /// Largest list any read here will build.
 ///
@@ -149,7 +151,7 @@ const MAX_ROWS: i64 = 500;
 /// This unit's routes. Merged into the API router, so it inherits auth, the
 /// rate limit and the idempotency layer from `with_api_stack` — which is where
 /// the 401 for a missing credential comes from, well before any handler here.
-pub fn router(db: Db) -> Router {
+pub fn router(hiring: Hiring) -> Router {
     Router::new()
         .route("/v1/org", post(apply_org))
         .route("/v1/teams", post(create_team).get(list_teams))
@@ -171,7 +173,7 @@ pub fn router(db: Db) -> Router {
             "/v1/teams/{team_id}/budget",
             put(set_budget).get(get_budget),
         )
-        .with_state(db)
+        .with_state(hiring)
 }
 
 // ---------------------------------------------------------------------------
@@ -192,10 +194,17 @@ pub(crate) struct OrgChart {
     /// local part's host in `slug@domain`, and a company whose founder and
     /// whose head of growth answer on different domains is two companies.
     ///
+    /// **It is the tenant's domain**, `tenant_domains` (0093): a tenant that
+    /// has none yet is registered under this name on the way (one call fewer
+    /// for the console), a tenant that has another answers 409
+    /// `another_domain`. Absent, the tenant's own — or, for a tenant with
+    /// none, the deployment's `AGENT_EMAIL_DOMAIN`.
+    ///
     /// Ignored for an employee that already exists — its address was minted
     /// when it was created and re-addressing it would strand every reply in
     /// flight.
-    pub(crate) domain: String,
+    #[serde(default)]
+    pub(crate) domain: Option<String>,
     /// One object per row of the table, in any order. The order of the rows is
     /// not the shape of the tree: [`apply_org`] resolves every seat before it
     /// draws a single line, so the CEO may be the last row.
@@ -556,15 +565,15 @@ struct Built {
 /// re-apply that changed a mission has nothing outstanding and saying
 /// "Accepted" about it would be a lie an operator learns to ignore.
 async fn apply_org(
-    State(db): State<Db>,
+    State(hiring): State<Hiring>,
     principal: Principal,
     body: Result<Json<OrgChart>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
 
     let now = Utc::now();
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    let chart = apply_org_chart(&mut tx, &principal.actor, &body, now).await?;
+    let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
+    let chart = apply_org_chart(&mut tx, &hiring, &principal.actor, &body, now).await?;
     tx.commit().await?;
 
     let hired = hired_slugs(&chart);
@@ -609,11 +618,23 @@ pub(crate) fn hired_slugs(chart: &[SeatView]) -> Vec<String> {
 /// runs on.
 pub(crate) async fn apply_org_chart(
     tx: &mut TenantTx<'_>,
+    hiring: &Hiring,
     actor: &AuditActor,
     body: &OrgChart,
     now: DateTime<Utc>,
 ) -> Result<Vec<SeatView>, ApiError> {
-    let domain = Domain::parse(&body.domain)
+    // The tenant's domain — registered on the way if it has none, refused if
+    // it has another. `Domain::parse` ran inside `require`; the row's name is
+    // the normalised one.
+    let registered = sending_domain::require(
+        tx,
+        &*hiring.ports.email,
+        body.domain.as_deref(),
+        &hiring.default_domain,
+    )
+    .await
+    .map_err(refused)?;
+    let domain = Domain::parse(&registered.domain)
         .map_err(|err| ApiError::bad_request(format!("domain: {err}")))?;
     if body.rows.is_empty() {
         return Err(ApiError::bad_request("rows: an org chart needs a row"));
@@ -1767,6 +1788,11 @@ mod tests {
 
             let a = new_tenant(&db).await;
             let b = new_tenant(&db).await;
+            // Each tenant its own sending domain, so a chart with no `domain`
+            // hires on it — see `Hiring::domain_of` for why not one literal.
+            let hiring = Hiring::for_tests(db.clone());
+            hiring.adopt(a).await;
+            hiring.adopt(b).await;
             // Minted, not inserted. `new_tenant` is what writes the row, and
             // this one deliberately never gets it.
             let ghost = TenantId::new_v7(Utc::now());
@@ -1780,7 +1806,7 @@ mod tests {
 
             Some(Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    router(hiring),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
@@ -2481,7 +2507,8 @@ mod tests {
     /// The founder's slug — the head everybody else answers to.
     const FOUNDER: &str = SEVEN[0].2;
 
-    /// [`SEVEN`] as a `POST /v1/org` body.
+    /// [`SEVEN`] as a `POST /v1/org` body. No `domain`: each harness tenant
+    /// was given its own by [`Hiring::adopt`], and the route hires on it.
     fn seven_rows() -> Value {
         let rows = SEVEN
             .iter()
@@ -2496,7 +2523,7 @@ mod tests {
                 row
             })
             .collect::<Vec<_>>();
-        json!({"domain": "agents.example.com", "rows": rows})
+        json!({"rows": rows})
     }
 
     /// [`SEVEN`] as `read_back` renders it, given the founder's employee id.
@@ -2685,7 +2712,6 @@ mod tests {
         tx.commit().await.expect("commit");
 
         let eighth = json!({
-            "domain": "agents.example.com",
             "rows": [{
                 "team": "veille", "name": "Veille",
                 "mission": "Lire ce que le marché publie",
@@ -2908,7 +2934,12 @@ mod tests {
             return;
         };
 
-        let (status, problem) = h.apply(SECRET_GHOST, seven_rows()).await;
+        // A domain of its own, so the first row the request writes — the
+        // tenant's domain, now — trips the foreign key and not the unique
+        // index another harness's tenant holds on the shared default.
+        let mut chart = seven_rows();
+        chart["domain"] = json!(Hiring::domain_of(h.ghost));
+        let (status, problem) = h.apply(SECRET_GHOST, chart).await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,

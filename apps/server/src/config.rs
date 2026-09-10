@@ -238,7 +238,18 @@ pub struct Config {
     /// URLs and A2A agent cards. There is no defensible default: guessing it
     /// wrong means providers deliver callbacks nowhere.
     pub public_host: String,
-    /// `AGENT_EMAIL_DOMAIN` — the domain employee addresses are minted under.
+    /// `AGENT_EMAIL_DOMAIN` — the **default** sending domain: the one a
+    /// tenant is registered under when `POST /v1/org` or `POST /v1/employees`
+    /// names none.
+    ///
+    /// Not the adapter's domain any more. The sending domain is the tenant's,
+    /// one row in `tenant_domains` (0093) that `POST /v1/domain` writes and
+    /// the provider verifies; every seat reads it off its employee's row.
+    /// Measured 2026-09-10: as the one domain of the whole deployment this
+    /// variable ran Orizn five days on `agent-orizn.com`, a name nobody owns,
+    /// because nothing between it and the provider ever asked. A default is
+    /// still checked — the first hire registers it and the seat waits until
+    /// it is verified — which the variable alone never was.
     pub agent_email_domain: String,
     /// `DATABASE_URL` — Postgres.
     pub database_url: String,
@@ -569,7 +580,8 @@ impl Config {
                     .iter()
                     .find(|hook| hook.provider == "email")
                     .map_or_else(String::new, |hook| hook.secret.clone()),
-                // One adapter owns one sending domain, and this is it.
+                // The tenant's default, and the unsubscribe origin when
+                // there is no `PUBLIC_HOST`; see `EmailCredentials::domain`.
                 domain: agent_email_domain.clone(),
             }),
             telephony: split_pair(

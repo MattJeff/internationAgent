@@ -26,13 +26,21 @@
 //! [`EmailProvider::send`]; the provider does not give it to us and no caller
 //! should assume it does.
 //!
-//! # `ensure_identity` reconciles a domain *name*, and binds a *seat*
+//! # `ensure_identity` finds a domain *name* it never creates, and binds a *seat*
 //!
 //! Resend domains have no free-form metadata field to stamp
 //! [`EnsureCtx::tag`] into, so the reconcile key is the domain name itself —
 //! which is fine, because a name is unique per account by construction. The
-//! consequence: one adapter owns one sending domain, and every employee sits on
-//! it.
+//! name is [`EnsureCtx::domain`], the tenant's own, read off the employee's
+//! row: this adapter carried one `domain` per deployment until 2026-09-10,
+//! when Orizn was found to have run five days on `agent-orizn.com`, a domain
+//! nobody owns, because nothing between the environment variable and the
+//! provider ever asked whether the name existed there. Now the seat asks:
+//! a name absent from `GET /domains` is `Terminal { domain_not_registered }`
+//! — registering it is [`EmailProvider::ensure_domain`]'s job, reached from
+//! `POST /v1/domain`, never a side effect of hiring — and a name present but
+//! not `verified` is `PendingExternal { poll_ref: <domain id> }` on
+//! [`crate::email::DOMAIN_VERIFY_WAIT`]. Only a verified domain seats anyone.
 //!
 //! What every employee does **not** share is the `external_id` this method
 //! hands back. Measured in production on 2026-09-10: the first seat to
@@ -48,9 +56,23 @@
 //!
 //! That is why the suite runs here as [`crate::email::IdentityScope::PerKey`]
 //! like every other adapter, and why the hermetic test below still counts one
-//! `POST /domains` for three ensures: the domain reconciles, the binding does
-//! not collapse.
+//! `POST /domains` for two `ensure_domain`s and three seats: the domain
+//! reconciles, the binding does not collapse.
+//!
+//! # The domain object, as read on 2026-09-10 against Orizn's account
+//!
+//! `GET /domains` lists `{id, name, status, region, created_at}` and **no
+//! records**; `POST /domains {name}` and `GET /domains/{id}` return the same
+//! object plus `records: [{record, name, type, ttl, status, value,
+//! priority?}]`; `POST /domains/{id}/verify` starts a check and returns
+//! nothing worth reading, so `verify_domain` reads the object back after it.
+//! `status` is one of `not_started | pending | verified | failed |
+//! temporary_failure`. The inbound MX (`inbound-smtp.<region>.amazonaws.com`,
+//! priority 10, on the domain name itself) is **not** in `records` until
+//! receiving is enabled in the dashboard — `region` is kept so a DNS poser
+//! can derive it rather than invent it.
 
+use crate::email::{DOMAIN_VERIFY_WAIT, DnsRecord, DomainState, DomainStatus};
 use agentos_domain::ids::IdempotencyKey;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -94,6 +116,24 @@ pub const API_BASE: &str = "https://api.resend.com";
 /// expiry, it just stops working, so we stamp the documented hour ourselves.
 pub const ATTACHMENT_URL_TTL_SECS: i64 = 3600;
 
+/// The MX that makes a Resend domain *receive*, derived from its region.
+///
+/// Read on 2026-09-10 against Orizn's account: `inbound-smtp.<region>.amazonaws.com`,
+/// priority 10, on the domain name itself — and **absent** from the domain's
+/// `records` until receiving is switched on in the dashboard, which is why a
+/// DNS poser derives it here rather than waiting for the provider to list it.
+pub fn inbound_mx(region: &str) -> DnsRecord {
+    DnsRecord {
+        record: "MX".to_owned(),
+        kind: "MX".to_owned(),
+        name: "@".to_owned(),
+        value: format!("inbound-smtp.{region}.amazonaws.com"),
+        priority: Some(10),
+        ttl: "Auto".to_owned(),
+        status: String::new(),
+    }
+}
+
 /// The binding one seat holds on the shared domain — see the module docs for
 /// why it is not the domain id alone.
 fn seat_on(domain_id: &str, ctx: &EnsureCtx) -> String {
@@ -107,7 +147,6 @@ pub struct ResendEmailProvider {
     base_url: String,
     api_key: Secret,
     webhook_secret: Secret,
-    domain: String,
     unsubscribe_origin: String,
 }
 
@@ -173,12 +212,12 @@ impl ResendEmailProvider {
     ///    an absent one.
     pub const OPT_OUTS: OptOuts = OptOuts::Pushed { at: "email" }.vetted();
 
-    /// Build an adapter for one sending `domain`.
+    /// Build an adapter for one Resend account. The sending domain is not an
+    /// argument any more: it is each seat's, on [`EnsureCtx::domain`].
     ///
     /// `webhook_secret` is the `whsec_…` signing secret from the Resend
     /// webhook page, not the API key.
-    pub fn new(api_key: Secret, webhook_secret: Secret, domain: impl Into<String>) -> Self {
-        let domain = domain.into();
+    pub fn new(api_key: Secret, webhook_secret: Secret) -> Self {
         Self {
             // Built rather than `new()`: see `REQUEST_TIMEOUT`. `build` fails
             // only if the TLS backend cannot be initialised, at which point
@@ -190,28 +229,20 @@ impl ResendEmailProvider {
             base_url: API_BASE.to_owned(),
             api_key,
             webhook_secret,
-            unsubscribe_origin: format!("https://{domain}"),
-            domain,
+            unsubscribe_origin: String::new(),
         }
     }
 
-    /// Point the unsubscribe link at another origin.
+    /// Point the unsubscribe link at an origin.
     ///
-    /// ponytail: the default is `https://{sending domain}`, which is right for
-    /// a deployment that serves the app on the same registrable domain it mails
-    /// from — and that is the alignment Google and Yahoo want anyway, since a
-    /// `List-Unsubscribe` host on a stranger's domain is one more reason to
-    /// distrust the mail. The ceiling is honest: a deployment whose
-    /// `PUBLIC_HOST` differs from `AGENT_EMAIL_DOMAIN` prints a link that
-    /// resolves nowhere, and a link that goes nowhere is worse than no link
-    /// (`agentos_app::vertical::OPT_OUT` says so in as many words).
-    ///
-    /// The upgrade is one line and it is not in this crate: `mocks::ports_for`
-    /// already carries `PUBLIC_HOST` for the telephony adapter's status
-    /// callback and already normalises it with `inbound::callback_origin` —
-    /// `mocks::email_provider` has only to take the same argument and end with
-    /// `.with_unsubscribe_origin(&inbound::callback_origin(host))`. Until it
-    /// does, the default above is what ships.
+    /// There is no default any more: the old one was `https://{sending
+    /// domain}`, and the adapter no longer has a sending domain of its own.
+    /// `agentos_app::mocks::email_provider` sets it from `PUBLIC_HOST` when
+    /// there is one, and from `AGENT_EMAIL_DOMAIN` otherwise. Left empty,
+    /// [`EmailProvider::send`] writes **neither** unsubscribe header rather
+    /// than a link to nowhere — the same "both or none" rule it applies to
+    /// the token, and `agentos_app::vertical::OPT_OUT` says why a dead link
+    /// is worse than none.
     ///
     /// Takes an origin that is already an origin — that normaliser lives in
     /// `agentos_app`, one crate up, and this one cannot reach it. All this does
@@ -251,6 +282,22 @@ impl ResendEmailProvider {
         self.http
             .post(format!("{}{path}", self.base_url))
             .bearer_auth(self.api_key.expose_for_transport())
+    }
+
+    /// The one domain named `name` on this account, from the listing.
+    ///
+    /// Two is `Terminal { duplicate_resource }`: a past adapter created
+    /// blind, and papering over it would pick one at random.
+    async fn find_domain(&self, name: &str) -> Result<Option<DomainRow>, ProviderError> {
+        let listed: DomainList = self.call_json(self.get("/domains")).await?;
+        let mut hits = listed.data.into_iter().filter(|d| d.name == name);
+        let hit = hits.next();
+        if hit.is_some() && hits.next().is_some() {
+            return Err(ProviderError::Terminal {
+                code: "duplicate_resource",
+            });
+        }
+        Ok(hit)
     }
 
     /// Send a request and classify the outcome.
@@ -344,16 +391,44 @@ struct DomainList {
     data: Vec<DomainRow>,
 }
 
+/// A domain as `GET /domains` lists it and as `POST /domains` /
+/// `GET /domains/{id}` return it; the listing has no `records`.
 #[derive(Deserialize)]
 struct DomainRow {
     id: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    records: Vec<DnsRecord>,
 }
 
+/// `POST /emails` answers with the id and nothing else worth reading.
 #[derive(Deserialize)]
 struct Created {
     id: String,
+}
+
+impl DomainRow {
+    /// Resend's five statuses onto our three. `temporary_failure` is a
+    /// wait Resend retries on its own, so it is `Pending` and not `Failed`.
+    fn state(self) -> DomainState {
+        let status = match self.status.as_str() {
+            "verified" => DomainStatus::Verified,
+            "failed" => DomainStatus::Failed,
+            _ => DomainStatus::Pending,
+        };
+        DomainState {
+            provider: ResendEmailProvider::PROVIDER,
+            provider_domain_id: self.id,
+            status,
+            records: self.records,
+            region: self.region,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -400,35 +475,65 @@ struct RetrievedAttachment {
 #[async_trait]
 impl EmailProvider for ResendEmailProvider {
     async fn ensure_identity(&self, ctx: &EnsureCtx) -> Result<Provisioned, ProviderError> {
-        // 1 & 2: look up first, return the hit without creating. This is the
-        // whole reason a crashed provisioning run does not buy a second domain.
-        let listed: DomainList = self.call_json(self.get("/domains")).await?;
-        let mut hits = listed.data.iter().filter(|d| d.name == self.domain);
-        if let Some(hit) = hits.next() {
-            if hits.next().is_some() {
-                // Two domains with one name means a past adapter created
-                // blind. Papering over it picks one at random.
-                return Err(ProviderError::Terminal {
-                    code: "duplicate_resource",
-                });
-            }
-            return Ok(Provisioned::new(Self::PROVIDER, seat_on(&hit.id, ctx)));
+        // Look up, never create: the domain is the tenant's and was
+        // registered by `ensure_domain`. A seat that created one here would
+        // be the deployment that mails from a domain nobody verified.
+        let Some(hit) = self.find_domain(&ctx.domain).await? else {
+            return Err(ProviderError::Terminal {
+                code: "domain_not_registered",
+            });
+        };
+        if hit.status != "verified" {
+            // The seat waits; nothing is reserved for it. The wait is
+            // `DOMAIN_VERIFY_WAIT` long and the loop re-asks after it — see
+            // the constant for why that, and not the tick, is the cadence.
+            return Err(ProviderError::PendingExternal {
+                poll_ref: hit.id,
+                expected_by: Utc::now() + DOMAIN_VERIFY_WAIT,
+            });
         }
+        // `ctx.existing` needs no branch: the id is a pure function of the
+        // domain id and the tag, so a re-provisioned seat lands on the same
+        // binding it had.
+        Ok(Provisioned::new(Self::PROVIDER, seat_on(&hit.id, ctx)))
+    }
 
+    async fn ensure_domain(&self, name: &str) -> Result<DomainState, ProviderError> {
+        // 1 & 2: look up first, return the hit without creating — the crate's
+        // reconcile-before-create contract, keyed on the name because a name
+        // is unique per Resend account. The listing carries no records, so a
+        // hit is read back in full.
+        if let Some(hit) = self.find_domain(name).await? {
+            let full: DomainRow = self
+                .call_json(self.get(&format!("/domains/{}", hit.id)))
+                .await?;
+            return Ok(full.state());
+        }
         // 3: only now create, under the same name the lookup reads.
-        let created: Created = self
+        let created: DomainRow = self
             .call_json(
                 self.post("/domains")
-                    .json(&serde_json::json!({ "name": self.domain })),
+                    .json(&serde_json::json!({ "name": name })),
             )
             .await?;
-        Ok(Provisioned::new(Self::PROVIDER, seat_on(&created.id, ctx)))
+        Ok(created.state())
+    }
+
+    async fn verify_domain(&self, provider_domain_id: &str) -> Result<DomainState, ProviderError> {
+        // The verify call answers with nothing worth reading; the object is
+        // read back for the status and the per-record statuses.
+        self.call(self.post(&format!("/domains/{provider_domain_id}/verify")))
+            .await?;
+        let read: DomainRow = self
+            .call_json(self.get(&format!("/domains/{provider_domain_id}")))
+            .await?;
+        Ok(read.state())
     }
 
     /// **Not supported, on purpose.**
     ///
-    /// The resource `ensure_identity` binds is the account's *sending domain*,
-    /// reconciled by name — one adapter, one domain, every employee on it. So
+    /// The resource `ensure_identity` binds is the tenant's *sending domain*,
+    /// reconciled by name — one domain, every employee of the tenant on it. So
     /// there is no per-employee thing to give back: `DELETE /domains/{id}` here
     /// would stop email for the whole tenant because one employee was
     /// terminated. Saying so is the only honest answer; returning `Ok(())`
@@ -466,7 +571,11 @@ impl EmailProvider for ResendEmailProvider {
             headers.insert("In-Reply-To".to_owned(), reference.clone());
             headers.insert("References".to_owned(), reference);
         }
-        if let Some(token) = &email.unsubscribe_token {
+        if let Some(token) = email
+            .unsubscribe_token
+            .as_ref()
+            .filter(|_| !self.unsubscribe_origin.is_empty())
+        {
             // **Les deux, ou aucun.** Google et Yahoo exigent depuis février
             // 2024 que tout envoi en volume porte `List-Unsubscribe` ET
             // `List-Unsubscribe-Post` (RFC 8058) ; `List-Unsubscribe` seul est
@@ -644,6 +753,10 @@ mod tests {
         /// adapter put on the wire.
         last_sent: Option<Value>,
         next: u64,
+        /// The status a domain lands on after `POST /domains/{id}/verify`;
+        /// empty means "leave it", which is what real DNS does most of the
+        /// time.
+        verify_outcome: String,
         /// When set, every route answers with this status instead.
         force_status: Option<u16>,
         /// Answer the next request with its status line and `Content-Length`,
@@ -686,12 +799,23 @@ mod tests {
         }
 
         fn provider(&self) -> ResendEmailProvider {
-            ResendEmailProvider::new(
-                Secret::new("re_test_key"),
-                Secret::new(WEBHOOK_SECRET),
-                "agents.example.com",
-            )
-            .with_base_url(self.base())
+            ResendEmailProvider::new(Secret::new("re_test_key"), Secret::new(WEBHOOK_SECRET))
+                .with_base_url(self.base())
+                .with_unsubscribe_origin("https://agents.example.com")
+        }
+
+        /// A domain already on the account, as the Orizn one is.
+        fn seed_domain(&self, id: &str, name: &str, status: &str) {
+            self.state
+                .lock()
+                .expect("not poisoned")
+                .domains
+                .push(domain_object(id, name, status));
+        }
+
+        /// What the next `POST /domains/{id}/verify` leaves the domain at.
+        fn verify_outcome(&self, status: &str) {
+            self.state.lock().expect("not poisoned").verify_outcome = status.to_owned();
         }
 
         fn seen(&self) -> Vec<String> {
@@ -769,7 +893,16 @@ mod tests {
         };
         match line {
             "GET /domains" => {
-                let data = state.domains.clone();
+                // The listing has no `records`, as at Resend.
+                let data: Vec<Value> = state
+                    .domains
+                    .iter()
+                    .map(|d| {
+                        let mut row = d.clone();
+                        row.as_object_mut().expect("object").remove("records");
+                        row
+                    })
+                    .collect();
                 json(json!({ "data": data }))
             }
             "POST /domains" => {
@@ -779,8 +912,32 @@ mod tests {
                     .unwrap_or_default();
                 state.next += 1;
                 let id = format!("dom_{:04}", state.next);
-                state.domains.push(json!({ "id": id, "name": name }));
-                json(json!({ "id": id, "name": name }))
+                let created = domain_object(&id, &name, "not_started");
+                state.domains.push(created.clone());
+                json(created)
+            }
+            _ if line.starts_with("GET /domains/") => {
+                let id = &line["GET /domains/".len()..];
+                match state.domains.iter().find(|d| d["id"] == id) {
+                    Some(d) => json(d.clone()),
+                    None => (404, b"{}".to_vec(), "application/json"),
+                }
+            }
+            _ if line.starts_with("POST /domains/") && line.ends_with("/verify") => {
+                let id = &line["POST /domains/".len()..line.len() - "/verify".len()];
+                let outcome = state.verify_outcome.clone();
+                match state.domains.iter_mut().find(|d| d["id"] == id) {
+                    Some(d) => {
+                        if !outcome.is_empty() {
+                            d["status"] = json!(outcome);
+                            for r in d["records"].as_array_mut().expect("records") {
+                                r["status"] = json!(outcome);
+                            }
+                        }
+                        json(json!({ "object": "domain", "id": id }))
+                    }
+                    None => (404, b"{}".to_vec(), "application/json"),
+                }
             }
             // Resend's own de-duplication, modelled: the same key gets the
             // first message's id back and nothing is sent again. Without this
@@ -878,6 +1035,26 @@ mod tests {
 
     // -- fixtures ----------------------------------------------------------
 
+    /// A domain object with the two records Resend asks for on sending, in
+    /// the shape read on 2026-09-10.
+    fn domain_object(id: &str, name: &str, status: &str) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "status": status,
+            "region": "eu-west-1",
+            "created_at": "2026-09-10T10:00:00Z",
+            "records": [
+                {"record": "DKIM", "name": "resend._domainkey", "type": "TXT", "ttl": "Auto",
+                 "status": status, "value": "p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC"},
+                {"record": "SPF", "name": "send", "type": "MX", "ttl": "Auto",
+                 "status": status, "value": "feedback-smtp.eu-west-1.amazonses.com", "priority": 10},
+                {"record": "SPF", "name": "send", "type": "TXT", "ttl": "Auto",
+                 "status": status, "value": "v=spf1 include:amazonses.com ~all"}
+            ]
+        })
+    }
+
     fn webhook_body() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "type": "email.received",
@@ -909,6 +1086,7 @@ mod tests {
             agentos_domain::ids::Slug::parse("lena").expect("slug"),
             "email",
         )
+        .with_domain("agents.example.com")
     }
 
     // -- signatures --------------------------------------------------------
@@ -1109,23 +1287,27 @@ mod tests {
         );
     }
 
-    // -- reconcile before create -------------------------------------------
+    // -- the domain: reconcile before create ------------------------------
 
     #[tokio::test]
-    async fn ensure_twice_yields_one_domain_with_the_same_external_id() {
+    async fn ensure_domain_twice_registers_once_and_finds_the_existing_one() {
         let fake = FakeResend::start().await;
         let p = fake.provider();
-        let ctx = ctx();
 
-        let first = p.ensure_identity(&ctx).await.expect("first ensure");
-        let second = p
-            .ensure_identity(&ctx.clone().retry())
-            .await
-            .expect("second ensure");
+        let first = p.ensure_domain("agents.example.com").await.expect("first");
+        let second = p.ensure_domain("agents.example.com").await.expect("second");
 
-        assert_eq!(first, second);
-        assert_eq!(first.provider, ResendEmailProvider::PROVIDER);
-        assert_eq!(first.external_id, format!("dom_0001/{}", ctx.tag()));
+        assert_eq!(first.provider_domain_id, "dom_0001");
+        assert_eq!(first.status, DomainStatus::Pending, "not_started is a wait");
+        assert_eq!(first.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(first.records.len(), 3, "records copied as they came");
+        assert_eq!(first.records[1].kind, "MX");
+        assert_eq!(first.records[1].priority, Some(10));
+        assert_eq!(second.provider_domain_id, first.provider_domain_id);
+        assert_eq!(
+            second.records, first.records,
+            "the hit is read back in full"
+        );
         assert_eq!(fake.domain_count(), 1, "exactly one domain, ever");
         assert_eq!(
             fake.seen(),
@@ -1133,9 +1315,150 @@ mod tests {
                 // Look up, miss, create.
                 "GET /domains".to_owned(),
                 "POST /domains".to_owned(),
-                // Look up, hit, create NOTHING.
+                // Look up, hit, read it, create NOTHING.
                 "GET /domains".to_owned(),
+                "GET /domains/dom_0001".to_owned(),
             ]
+        );
+    }
+
+    /// Orizn's case: `agents.getorizn.com` is already on the account. It has
+    /// to be *found*, and registering it must not create a second.
+    #[tokio::test]
+    async fn ensure_domain_finds_a_domain_already_on_the_account() {
+        let fake = FakeResend::start().await;
+        fake.seed_domain("dom_orizn", "agents.getorizn.com", "verified");
+
+        let found = fake
+            .provider()
+            .ensure_domain("agents.getorizn.com")
+            .await
+            .expect("found");
+        assert_eq!(found.provider_domain_id, "dom_orizn");
+        assert_eq!(found.status, DomainStatus::Verified);
+        assert_eq!(fake.domain_count(), 1);
+        assert!(
+            !fake.seen().iter().any(|l| l == "POST /domains"),
+            "nothing was created: {:?}",
+            fake.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_domain_triggers_a_check_and_reads_the_object_back() {
+        let fake = FakeResend::start().await;
+        let p = fake.provider();
+        let registered = p
+            .ensure_domain("agents.example.com")
+            .await
+            .expect("register");
+
+        // DNS not there yet: the provider says so, and so do we.
+        let still = p
+            .verify_domain(&registered.provider_domain_id)
+            .await
+            .expect("verify");
+        assert_eq!(still.status, DomainStatus::Pending);
+
+        fake.verify_outcome("verified");
+        let done = p
+            .verify_domain(&registered.provider_domain_id)
+            .await
+            .expect("verify again");
+        assert_eq!(done.status, DomainStatus::Verified);
+        assert!(done.records.iter().all(|r| r.status == "verified"));
+        assert_eq!(
+            fake.seen()[fake.seen().len() - 2..],
+            [
+                "POST /domains/dom_0001/verify".to_owned(),
+                "GET /domains/dom_0001".to_owned()
+            ]
+        );
+
+        // Resend's failed maps to ours; temporary_failure is still a wait.
+        fake.verify_outcome("temporary_failure");
+        assert_eq!(
+            p.verify_domain("dom_0001").await.expect("verify").status,
+            DomainStatus::Pending
+        );
+        fake.verify_outcome("failed");
+        assert_eq!(
+            p.verify_domain("dom_0001").await.expect("verify").status,
+            DomainStatus::Failed
+        );
+    }
+
+    // -- the seat: absent, pending, verified ----------------------------------
+
+    #[tokio::test]
+    async fn a_seat_on_a_domain_nobody_registered_is_terminal() {
+        let fake = FakeResend::start().await;
+        assert_eq!(
+            fake.provider().ensure_identity(&ctx()).await,
+            Err(ProviderError::Terminal {
+                code: "domain_not_registered"
+            })
+        );
+        assert_eq!(fake.domain_count(), 0, "a seat never registers a domain");
+        assert_eq!(fake.seen(), vec!["GET /domains".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_seat_on_a_pending_domain_waits_on_the_domain_id() {
+        let fake = FakeResend::start().await;
+        fake.seed_domain("dom_wait", "agents.example.com", "pending");
+        let before = Utc::now();
+
+        let Err(ProviderError::PendingExternal {
+            poll_ref,
+            expected_by,
+        }) = fake.provider().ensure_identity(&ctx()).await
+        else {
+            panic!("a pending domain must be a wait");
+        };
+        assert_eq!(
+            poll_ref, "dom_wait",
+            "the poll_ref is the provider's domain id"
+        );
+        let wait = expected_by - before;
+        assert!(
+            wait >= DOMAIN_VERIFY_WAIT && wait < DOMAIN_VERIFY_WAIT + Duration::minutes(1),
+            "the wait is DOMAIN_VERIFY_WAIT, not the tick: {wait}"
+        );
+        assert_eq!(
+            fake.seen(),
+            vec!["GET /domains".to_owned()],
+            "one listing, no write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seat_on_a_verified_domain_is_provisioned_with_a_stable_id() {
+        let fake = FakeResend::start().await;
+        fake.seed_domain("dom_ok", "agents.example.com", "verified");
+        let p = fake.provider();
+        let ctx = ctx();
+
+        let first = p.ensure_identity(&ctx).await.expect("first ensure");
+        // A retry, and a re-provisioning that carries the binding it had.
+        let second = p
+            .ensure_identity(&ctx.clone().retry())
+            .await
+            .expect("second ensure");
+        let third = p
+            .ensure_identity(&ctx.clone().with_existing(first.binding()))
+            .await
+            .expect("re-provision");
+
+        assert_eq!(first, second);
+        assert_eq!(first, third, "an existing binding lands on the same seat");
+        assert_eq!(first.provider, ResendEmailProvider::PROVIDER);
+        assert_eq!(first.external_id, format!("dom_ok/{}", ctx.tag()));
+        assert_eq!(fake.domain_count(), 1, "nothing was created");
+        assert!(
+            fake.seen().iter().all(|l| l == "GET /domains"),
+            "{:?}",
+            fake.seen()
         );
     }
 
@@ -1146,10 +1469,10 @@ mod tests {
             let mut state = fake.state.lock().expect("not poisoned");
             state
                 .domains
-                .push(json!({"id": "dom_a", "name": "agents.example.com"}));
+                .push(domain_object("dom_a", "agents.example.com", "verified"));
             state
                 .domains
-                .push(json!({"id": "dom_b", "name": "agents.example.com"}));
+                .push(domain_object("dom_b", "agents.example.com", "verified"));
         }
         assert_eq!(
             fake.provider().ensure_identity(&ctx()).await,
@@ -1307,8 +1630,35 @@ mod tests {
         );
     }
 
-    /// L'origine par défaut est le domaine d'envoi, et un déploiement qui sert
-    /// sa console ailleurs la déplace en un appel.
+    /// Sans origine, aucun des deux en-têtes : un lien vers nulle part est
+    /// pire que pas de lien, et « les deux ou aucun » vaut aussi ici.
+    #[tokio::test]
+    async fn no_unsubscribe_origin_means_neither_header() {
+        let fake = FakeResend::start().await;
+        ResendEmailProvider::new(Secret::new("re_test_key"), Secret::new(WEBHOOK_SECRET))
+            .with_base_url(fake.base())
+            .send(
+                &IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:cold-4"),
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@supplier.example".to_owned()],
+                    subject: "hello".to_owned(),
+                    body_text: "…".to_owned(),
+                    in_reply_to: None,
+                    unsubscribe_token: Some("unsub_ZZZZ".to_owned()),
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send");
+        assert!(
+            fake.last_sent().expect("a body").get("headers").is_none(),
+            "a token with no origin to hang it on writes no header"
+        );
+    }
+
+    /// L'origine est posée par `mocks::email_provider`, et un déploiement qui
+    /// sert sa console ailleurs la déplace en un appel.
     #[tokio::test]
     async fn the_unsubscribe_origin_is_the_sending_domain_until_it_is_told_otherwise() {
         let fake = FakeResend::start().await;
@@ -1398,10 +1748,14 @@ mod tests {
     #[tokio::test]
     async fn the_real_client_satisfies_the_contract() {
         let fake = FakeResend::start().await;
+        // Verified beforehand, as a customer's domain is by the time seats
+        // are hired on it: the suite's seats need a domain that seats them,
+        // and a fake that verified on creation would be lying about DNS.
+        fake.seed_domain("dom_0001", "agents.example.com", "verified");
         crate::email::contract_suite(&fake.provider(), crate::email::IdentityScope::PerKey).await;
 
-        // One domain for three ensures, checked on the socket rather than taken
-        // from the adapter's word.
+        // One domain for two registrations and three seats, checked on the
+        // socket rather than taken from the adapter's word.
         assert_eq!(fake.domain_count(), 1);
 
         // All three sends *do* reach the wire, and that is correct: this

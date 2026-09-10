@@ -132,13 +132,14 @@ use serde_json::{Value, json};
 
 use crate::auth::Principal;
 use crate::error::ApiError;
+use crate::routes::domain::Hiring;
 use crate::routes::halt::must_end_in_the_future;
 use crate::routes::teams::{self, OrgChart};
 
-pub fn router(db: Db) -> Router {
+pub fn router(hiring: Hiring) -> Router {
     Router::new()
         .route("/v1/companies", post(create_company))
-        .with_state(db)
+        .with_state(hiring)
 }
 
 /// A company: who it is, who works there, and what they may do.
@@ -340,11 +341,12 @@ struct LayerView {
 /// 202 when it hired somebody, 200 when it did not — `apply_org`'s rule, for
 /// `apply_org`'s reason: a replay that changed nothing has nothing outstanding.
 async fn create_company(
-    State(db): State<Db>,
+    State(hiring): State<Hiring>,
     principal: Principal,
     body: Result<Json<NewCompany>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let db = hiring.db.clone();
 
     // --- everything that can be decided from the body, before any write -----
     let now = Utc::now();
@@ -563,7 +565,7 @@ async fn create_company(
             .await?;
         }
     }
-    let chart = teams::apply_org_chart(&mut tx, &principal.actor, &body.org, now).await?;
+    let chart = teams::apply_org_chart(&mut tx, &hiring, &principal.actor, &body.org, now).await?;
     let hired = teams::hired_slugs(&chart);
     teams::record(
         &mut tx,
@@ -883,7 +885,7 @@ mod tests {
         ))
         .expect("keyring");
         let app = crate::with_api_stack(
-            router(db.clone()),
+            router(Hiring::for_tests(db.clone())),
             db.clone(),
             Keyring::new(keys, db.clone(), TEST_MASTER_KEY),
         );
@@ -899,7 +901,9 @@ mod tests {
             "name": "First",
             "window_ends_at": (Utc::now() + chrono::Duration::days(30)).trunc_subsecs(6),
             "org": {
-                "domain": "agents.example.com",
+                // A's own name: `tenant_domains.domain` is unique across the
+                // database, and this one outlives the binary.
+                "domain": Hiring::domain_of(a),
                 "rows": [{
                     "team": "direction",
                     "name": "Direction",

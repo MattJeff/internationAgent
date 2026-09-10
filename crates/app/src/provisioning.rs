@@ -1222,12 +1222,16 @@ impl ProvisioningEngine {
         step: Step,
         claim: &Claim,
     ) -> Result<ProviderBinding, ProviderError> {
+        // The seat's own domain, off its row — the host of `slug@domain`.
+        // Only the email adapter reads it, and it reads it instead of a
+        // domain of its own: see `EnsureCtx::domain`.
         let mut ctx = EnsureCtx::new(
             employee.tenant_id(),
             employee.id(),
             employee.slug().clone(),
             step.as_str(),
-        );
+        )
+        .with_domain(employee.domain().as_str());
         if let Some(existing) = employee.resource(step).binding() {
             ctx = ctx.with_existing(agentos_providers::ProviderBinding {
                 provider: existing.provider().to_owned(),
@@ -3158,6 +3162,127 @@ mod tests {
             external_id.as_deref(),
             telephony.bought.lock().expect("poisoned").as_deref(),
             "three calls, one number"
+        );
+    }
+
+    /// A seat on a domain the provider has not verified **waits**, and the
+    /// wait is not a poll: the second and third pass ask the adapter nothing,
+    /// because `ensure_step` returns a `pending_external` row untouched and
+    /// only the loop's reaper — at `expected_by`, one `DOMAIN_VERIFY_WAIT`
+    /// out — puts it back in front of an adapter. That is the cadence, one
+    /// listing per seat per hour, and this test is what holds it: drop the
+    /// `PendingExternal` arm of `ensure_step` and the count below reads 3.
+    ///
+    /// Then DNS lands, `sending_domain::verify` hears `verified` and wakes the
+    /// seat, and the next pass seats it — the fast path, without the hour.
+    #[tokio::test]
+    async fn a_seat_waits_on_an_unverified_domain_without_polling_and_wakes_when_verified() {
+        let Some(db) = db().await else { return };
+        let _guard = DB_LOCK.lock().await;
+        reset(&db).await;
+        let employee = seed(&db).await;
+
+        let email = Arc::new(MockEmailProvider::new());
+        email.hold_domain_pending();
+        {
+            let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+            let row = crate::sending_domain::register(&mut tx, &*email, "example.com")
+                .await
+                .expect("register the tenant's domain");
+            assert_eq!(row.status, agentos_providers::email::DomainStatus::Pending);
+            tx.commit().await.expect("commit");
+        }
+        let engine = ProvisioningEngine::new(
+            db.clone(),
+            adapters(
+                Arc::new(MockTelephony::new(Utc::now(), "tok")),
+                email.clone(),
+            ),
+            cfg(),
+        );
+
+        let before = Utc::now();
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge");
+        let Some(StepReport::PendingExternal { poll_ref }) = reports.get(&Step::Email) else {
+            panic!(
+                "an unverified domain must be a wait, got {:?}",
+                reports.get(&Step::Email)
+            );
+        };
+        assert_eq!(
+            poll_ref, "dom_0001",
+            "the poll_ref is the provider's domain id"
+        );
+        assert_eq!(
+            email.identity_count(),
+            0,
+            "nothing is reserved for a waiting seat"
+        );
+        let ResourceState::PendingExternal { expected_by, .. } = reload(&db, &employee)
+            .await
+            .resource(Step::Email)
+            .state()
+            .clone()
+        else {
+            panic!("the row must say pending_external");
+        };
+        let wait = expected_by - before;
+        assert!(
+            wait >= agentos_providers::email::DOMAIN_VERIFY_WAIT
+                && wait < agentos_providers::email::DOMAIN_VERIFY_WAIT + TimeDelta::minutes(1),
+            "the wait on the row is DOMAIN_VERIFY_WAIT: {wait}"
+        );
+
+        // Two more passes, the way the loop would run them every 200 ms.
+        for _ in 0..2 {
+            let reports = engine
+                .converge(employee.tenant_id(), employee.id())
+                .await
+                .expect("converge again");
+            assert!(matches!(
+                reports.get(&Step::Email),
+                Some(StepReport::PendingExternal { .. })
+            ));
+        }
+        assert_eq!(
+            email.ensure_identity_calls(),
+            1,
+            "a waiting seat is not polled: the provider heard from it once, and hears again \
+             at expected_by or when the domain is verified"
+        );
+
+        // DNS lands. The verification wakes the seat; the next pass seats it.
+        email.release_domains();
+        {
+            let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
+            let row = crate::sending_domain::verify(&mut tx, &*email)
+                .await
+                .expect("verify");
+            assert_eq!(row.status, agentos_providers::email::DomainStatus::Verified);
+            tx.commit().await.expect("commit");
+        }
+        assert_eq!(
+            reload(&db, &employee).await.resource(Step::Email).state(),
+            &ResourceState::Pending,
+            "verified wakes the seat"
+        );
+        let reports = engine
+            .converge(employee.tenant_id(), employee.id())
+            .await
+            .expect("converge after verify");
+        assert_eq!(reports.get(&Step::Email), Some(&StepReport::Ready));
+        assert_eq!(email.ensure_identity_calls(), 2);
+        let (state, _, provider, external_id, _) = row(&db, &employee, Step::Email).await;
+        assert_eq!(state, "ready");
+        assert_eq!(provider.as_deref(), Some(MockEmailProvider::PROVIDER));
+        assert!(
+            external_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("dom_0001/")),
+            "the seat sits on the tenant's domain: {external_id:?}"
         );
     }
 

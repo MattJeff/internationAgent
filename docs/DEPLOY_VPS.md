@@ -201,7 +201,7 @@ vide compte comme absente** — c'est délibéré.
 |---|---|---|
 | `DATABASE_URL` | `postgres://postgres:<mdp>@agentos-postgres:5432/agentos` | `refusing to start: DATABASE_URL is not set…` |
 | `PUBLIC_HOST` | **schéma compris.** Voir §4 : tant que rien d'externe n'appelle, `http://agentos-server:8080` suffit ; le jour où un webhook arrive, ce doit être l'URL publique | Refus au boot. Interpolée dans la carte d'agent A2A (`{PUBLIC_HOST}/a2a/jsonrpc?employee=…`) : une mauvaise valeur envoie les pairs nulle part |
-| `AGENT_EMAIL_DOMAIN` | le domaine d'envoi vérifié chez Resend — **pas à moi de le choisir**, §9 | Refus au boot |
+| `AGENT_EMAIL_DOMAIN` | le domaine par défaut d'un locataire qui n'en pose aucun ; le vrai est posé par `POST /v1/domain` — **pas à moi de le choisir**, §9 | Refus au boot |
 | `AGENTOS_MASTER_KEY` | `openssl rand -base64 32`, **généré une fois** | Refus au boot |
 
 #### `AGENTOS_MASTER_KEY` — à lire avant de la générer
@@ -699,9 +699,13 @@ Elles ne sont pas les miennes.
    déploiement. À noter aussi : la boucle de provisioning interroge toutes les
    200 ms ; une base à un aller-retour Internet, ce n'est pas la même machine.
 
-2. **Quel domaine d'envoi pour `AGENT_EMAIL_DOMAIN` ?** Il doit être vérifié
-   chez le fournisseur d'email. Je ne peux pas l'inventer, et une mauvaise
-   valeur ne se voit qu'au premier mail.
+2. **Quel domaine d'envoi pour `AGENT_EMAIL_DOMAIN` ?** Depuis 0093 ce n'est
+   plus que le défaut d'un locataire qui n'en nomme aucun : le domaine est au
+   locataire, posé par `POST /v1/domain` (`agents.getorizn.com` pour Orizn,
+   déjà chez Resend — la route le *trouve*), et un siège attend qu'il soit
+   `verified` avant d'écrire. Une mauvaise valeur se voit désormais au premier
+   `GET /v1/employees/{id}` — `email` en `pending_external` — et non plus au
+   premier mail.
 
 3. **`PUBLIC_HOST` et la surface publique.** Reste-t-on entièrement interne
    (recommandé maintenant), ou ouvre-t-on `api-agents.orizn.app` limité à
