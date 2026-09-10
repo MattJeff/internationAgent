@@ -591,6 +591,65 @@ pub async fn record_outcome(
     Ok(())
 }
 
+/// Leave a permanent trace of what one beat came to — `0099`.
+///
+/// # Why this exists beside [`record_outcome`], which writes the same word
+///
+/// Because that one is an *instantaneous* column: one row per seat, overwritten
+/// by the next beat, and emptied by [`claim_due`] before the beat that will
+/// fill it. It answers "is this seat's cadence working right now", which is the
+/// question `GET /v1/employees/{id}/initiative` asks, and it cannot answer
+/// either half of "has this **company** stopped thinking, and when did it last
+/// think" — the last success is gone the moment the next failure lands.
+///
+/// Orizn spent four days in exactly that state: every seat read `error`, the
+/// success that preceded them was written over on 2026-09-06, and nothing on
+/// any screen was red. `migrations/0099` carries the full argument and the four
+/// tables that were read before this one was written.
+///
+/// # Not every beat
+///
+/// The caller decides, and it decides by an exhaustive `match` — see
+/// `loops::initiative::Outcome::health`. A beat at rest (no charter, no work,
+/// a question for the operator, a budget the operator set) writes nothing:
+/// filling this table with a healthy company's idleness would grow it at the
+/// speed of the cadence and make a new company read as `degraded`.
+///
+/// # Swallowed by its caller, like the outcome next door
+///
+/// Same trade and the same reason: the beat is already consumed, and stopping
+/// the loop over bookkeeping would cost every other employee its turn. What a
+/// lost row costs here is one missing point in a health verdict, and the
+/// verdict is a `count(*)` over many.
+///
+/// `tenant_id` is named rather than inferred: the poller writes from
+/// [`admin_tx_bypassing_rls`](crate::db::Db::admin_tx_bypassing_rls), where no
+/// `app.tenant_id` is set and RLS's `with check` has nothing to compare to.
+pub async fn record_turn_trace(
+    conn: &mut PgConnection,
+    tenant_id: TenantId,
+    employee_id: EmployeeId,
+    at: DateTime<Utc>,
+    code: &str,
+    detail: Option<&str>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO turn_outcomes (id, tenant_id, employee_id, at, code, detail) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    // `now_v7`, comme `audit::append` : une clé ordonnée dans le temps, et le
+    // seul générateur que les features `uuid` de ce workspace fournissent.
+    .bind(Uuid::now_v7())
+    .bind(tenant_id.as_uuid())
+    .bind(employee_id.as_uuid())
+    .bind(at)
+    .bind(code)
+    .bind(detail)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Every seat of this tenant sleeps until `until`, unless it was already going
 /// to sleep longer.
 ///

@@ -793,6 +793,11 @@ fn app(
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))
+            // Beside `controls` and `refusals`, and it is the one that shouts.
+            // Those two answer "what is this company allowed to do" and "what
+            // was it stopped from doing"; this one answers the question nobody
+            // had a route for on 2026-09-06 — "is it doing anything at all".
+            .merge(routes::health::router(db.clone()))
             .merge(routes::accounting::router(db.clone()))
             .merge(routes::teams::router(hiring.clone()))
             .merge(routes::companies::router(hiring.clone()))

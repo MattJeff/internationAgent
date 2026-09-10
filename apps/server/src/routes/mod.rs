@@ -42,7 +42,10 @@ pub mod forecast;
 // l'écran d'accueil cesse de reconstituer l'activité à partir de six lectures
 // d'état — et pour que l'autonomie d'un fait se lise sur le fait lui-même.
 pub mod events;
+// la santé de la société : est-ce que ses employés pensent encore. Née du
+// 2026-09-06, quatre jours pendant lesquels tout le reste répondait vert.
 pub mod halt; // wave J: stop the whole company, and let it go again
+pub mod health;
 pub mod initiative;
 pub mod interview; // the guided conversation that finishes a company
 pub mod inventory;
