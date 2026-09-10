@@ -68,30 +68,25 @@ const APPROVER_SECRET: &str = "fedcba9876543210fedcba9876543210";
 /// The signing secret this deployment registers for the `email` provider.
 const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 
-/// How long the provisioning loop gets to converge eleven steps against mock
-/// adapters. It normally takes well under a second; this is the "it is wedged"
-/// deadline, not the expected one.
+/// How long the provisioning loop gets to make **no progress at all** before
+/// this test calls it wedged.
 ///
-/// Raised from 30s after it fired for real on 2026-08-28, with three sibling
-/// worktrees compiling on the same machine: 31s under load against 5s isolated.
-/// Nothing was wedged. A deadline that only holds on an idle machine is worse
-/// than a slow one — it fails where the work is, teaches whoever sees it to
-/// re-run without reading, and the day it means something nobody believes it.
-/// Since this bound is never reached when the loop is healthy, making it
-/// generous costs a green run nothing and costs a wedged one only patience.
+/// It is not a budget for the whole convergence, and that is the point. The
+/// number was 30s, then 120s, then 300s, raised each time after it fired on a
+/// machine that was merely loaded — three sibling worktrees compiling on
+/// 2026-08-28, parallel agent builds on 2026-08-29, a CI runner on 2026-09-10
+/// (run 34461698789, the same test converging in seconds when re-run alone).
+/// Each raise bought a few weeks and taught whoever saw the red to re-run
+/// without reading, which is the actual cost.
 ///
-/// **And the first half of that sentence was falsified on 2026-08-29, which is
-/// why the number moved.** The loop was healthy — the same test converged in
-/// **3.8 seconds** run on its own, immediately afterwards — and it still ran out
-/// of 120 seconds with `mcp` in `provisioning`, on a machine carrying parallel
-/// agent builds. So the bound is a function of how much CPU the loop is getting,
-/// not of whether it is stuck, and a CI runner is a loaded machine too.
-///
-/// 300 rather than a bigger round number because it is the one this workspace
-/// already uses for the same kind of judgement (`MAX_OUTBOX_LAG_SECS`), and
-/// because the argument above still holds where it is true: a wedged loop fails
-/// either way, just later.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(300);
+/// So the clock now measures the right thing: it is reset every time any step's
+/// state changes. A loop that is slow because it is getting a tenth of a core
+/// never trips it; a loop that is genuinely stuck trips it after this long with
+/// nothing moving, which is the only reading of "wedged" that does not depend
+/// on how busy the machine is. 60s because eleven steps against mock adapters
+/// take well under a second each even on a runner, so a full minute of complete
+/// silence is already far past anything healthy.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -382,24 +377,38 @@ impl Server {
     /// been attempted at all. Reading health as the finish line makes this test
     /// pass or fail on which poll happened to land where.
     fn await_provisioned(&self, id: &str) -> Value {
-        let deadline = Instant::now() + CONVERGE_DEADLINE;
-        let mut last = Value::Null;
-        while Instant::now() < deadline {
+        // The deadline follows progress rather than the wall clock: every time
+        // a step's state changes, the loop has proved it is alive and the
+        // countdown starts over. See `CONVERGE_DEADLINE`.
+        let mut idle_since = Instant::now();
+        let mut seen = String::new();
+        loop {
             let (status, employee) = self.get(&format!("/v1/employees/{id}"), Some(SECRET));
             assert_eq!(status, 200, "the id we were handed stopped resolving");
 
-            let settled = employee["resources"]
-                .as_array()
-                .expect("resources")
+            let resources = employee["resources"].as_array().expect("resources");
+            let settled = resources
                 .iter()
                 .all(|r| !matches!(r["state"].as_str(), Some("pending" | "provisioning")));
             if settled {
                 return employee;
             }
-            last = employee;
+
+            let states: String = resources
+                .iter()
+                .map(|r| format!("{}={};", r["step"], r["state"]))
+                .collect();
+            if states != seen {
+                seen = states;
+                idle_since = Instant::now();
+            } else if idle_since.elapsed() >= CONVERGE_DEADLINE {
+                panic!(
+                    "the provisioning loop moved nothing for {}s; wedged: {employee:#}",
+                    CONVERGE_DEADLINE.as_secs()
+                );
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("the provisioning loop never converged the employee: {last:#}");
     }
 
     /// Poll until the employee is activated.
