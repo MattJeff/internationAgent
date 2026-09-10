@@ -74,6 +74,7 @@ expensive defect available in this product.
 | Employees, emails, phones | built | `/v1/employees`, `provisioning.rs` |
 | Guided objectives interview | built | `/v1/interview`, `/v1/employees/{id}/interview` |
 | Connect tools (MCP) | built | `/v1/mcp/*`, `catalog.rs`, `mcp.rs` |
+| Drive the company from a terminal | built | `POST /v1/mcp/server` — le serveur MCP, `mcp_server.rs`, runbook in `docs/MCP_SERVEUR.md` |
 | Budget and caps | built | `/v1/employees/{id}/spend-caps`, `/v1/billing`, `/v1/usage` |
 | Declared tariff → P&L per seat | built | `POST /v1/model` carries `usd_per_mtok_*`; `GET /v1/pnl?days=N`, `pnl.rs` |
 | Accounting export | built | `GET /v1/accounting/export?days=N&journal=invoices\|spend\|usage`, one CSV line per movement, foots to `/v1/pnl`; `accounting.rs` |

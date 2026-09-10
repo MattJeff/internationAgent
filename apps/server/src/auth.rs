@@ -14,6 +14,14 @@
 //! not exist; if one ever does, it is decoration, and this module is still the
 //! authority.
 //!
+//! [`Keyring::principal_of`] is the resolution [`require_api_key`] performs,
+//! reachable by name, and it does not weaken that sentence. It hands a
+//! [`Principal`] back to its caller; it does not put one in a request. The claim
+//! is not "one function builds a Principal" but "one function attaches one to a
+//! request", and the `extensions_mut().insert` below is still the only place
+//! that happens. `routes::mcp_server`, the one caller, reads the answer as a
+//! yes-or-no and drops the value — it has no handler to hand it to.
+//!
 //! # Where the keys live: two keyrings, and the split is the design
 //!
 //! **`api_keys`, a table** — every credential a *customer* holds. Issued and
@@ -287,6 +295,33 @@ impl Keyring {
                 }),
         )
     }
+
+    /// Who this `Authorization` header speaks for, **without refusing anybody**.
+    ///
+    /// The half of [`require_api_key`] that establishes an identity, split out
+    /// so that the one route which cannot be behind that middleware can still
+    /// reach exactly this answer: `routes::mcp_server`, whose `initialize` has
+    /// to succeed unauthenticated while `tools/list` and `tools/call` must not.
+    /// A second parser of `Bearer …` in that module would be a second opinion
+    /// about what a credential is, and the two would drift on the day one of
+    /// them learns a new scheme.
+    ///
+    /// `Ok(None)` is "nobody" — no header, wrong scheme, or a secret in neither
+    /// keyring. `Err` is the database, and a caller that renders it as a 401 is
+    /// telling every customer to rotate a key that is fine.
+    pub(crate) async fn principal_of(
+        &self,
+        header: Option<&HeaderValue>,
+    ) -> Result<Option<Principal>, agentos_store::db::StoreError> {
+        let Some(presented) = header
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+        else {
+            return Ok(None);
+        };
+        self.resolve(presented).await
+    }
 }
 
 /// The master key this crate's own tests derive a hashing key from.
@@ -318,19 +353,10 @@ pub async fn require_api_key(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
-
-    let resolved = match presented {
-        None => Ok(None),
-        Some(secret) => keys.resolve(secret).await,
-    };
-
-    let principal = match resolved {
+    let principal = match keys
+        .principal_of(req.headers().get(header::AUTHORIZATION))
+        .await
+    {
         Ok(Some(principal)) => principal,
         Ok(None) => {
             // One response for "no header", "wrong scheme" and "wrong secret":
@@ -347,9 +373,10 @@ pub async fn require_api_key(
     next.run(req).await
 }
 
-/// 401 plus the challenge header, in one place so the two middlewares here
-/// cannot answer a missing credential two different ways.
-fn unauthorized() -> Response {
+/// 401 plus the challenge header, in one place so the two middlewares here —
+/// and `routes::mcp_server`, which authenticates outside both of them — cannot
+/// answer a missing credential three different ways.
+pub(crate) fn unauthorized() -> Response {
     let mut response = ApiError::unauthorized().into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,

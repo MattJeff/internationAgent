@@ -52,6 +52,10 @@ pub mod inventory;
 pub mod invoices;
 pub mod knowledge;
 pub mod mcp;
+// le serveur MCP : l'autre sens de `mcp`. Celui-ci n'appelle personne — il
+// rend cette société pilotable depuis le Claude Code du fondateur, en rejouant
+// ses propres routes en interne. Une ligne de table par outil.
+pub mod mcp_server;
 pub mod model; // wave H: the tenant connects the model their employees think with
 // the one route that changes a limit. `POST /v1/companies` creates a role layer
 // where none exists; this one replaces one, and can only tighten — see its

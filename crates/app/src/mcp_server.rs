@@ -107,6 +107,19 @@ pub struct ToolDef {
     /// de requête ; le reste forme le corps.
     pub schema: Value,
     pub query: &'static [&'static str],
+    /// Quand la route ne prend pas du JSON : le type MIME, et le **nom de la
+    /// propriété** dont la valeur — une chaîne — part telle quelle comme corps.
+    ///
+    /// Une seule route de ce déploiement en a besoin, et c'est elle qui a
+    /// imposé le champ : `POST /v1/prospects/import` lit des octets et refuse
+    /// en 415 tout ce qui n'est pas `text/csv`. Sans ce champ, la seule façon
+    /// d'importer une liste de prospects depuis un terminal aurait été de ne
+    /// pas l'exposer du tout — ce que le chantier du commerce a fait, en le
+    /// disant, plutôt que d'annoncer un outil qui échoue à chaque appel.
+    ///
+    /// La propriété nommée ici est retirée du corps JSON par construction : un
+    /// outil à corps brut n'a pas d'autre corps.
+    pub raw_body: Option<(&'static str, &'static str)>,
     pub risk: Risk,
 }
 
@@ -151,6 +164,7 @@ mod tests {
             path,
             schema,
             query,
+            raw_body: None,
             risk: Risk::Read,
         }
     }

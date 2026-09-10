@@ -45,16 +45,14 @@
 //!
 //! # Ce que ce module ne fait pas encore, et où c'est dû
 //!
-//! ponytail: **aucune ligne de journal.** `POST /v1/invoices/{id}/paid` en
-//! écrit une, avec `AuditKind::InvoicePaid`, et la même chose est due ici — il
-//! manque la variante, qui vit dans `crates/store/src/audit.rs`. Elle n'est pas
-//! ajoutée dans cette vague parce que ce fichier est celui d'un autre agent.
-//! `AuditKind::QuoteAnswered`, une ligne, et les deux voies ci-dessous
-//! l'écrivent avec `{"quote_id": …, "answer": "accepted"|"declined", "source":
-//! "operator"}` — la forme exacte du payload de `paid`. Jusque-là, la trace est
-//! la colonne elle-même, que `0090` rend inaltérable une fois écrite.
+//! Le journal, lui, est écrit depuis le 2026-09-11 : `AuditKind::QuoteAnswered`,
+//! dans la transaction qui répond, avec `{"quote_id": …, "answer":
+//! "accepted"|"declined", "source": "operator"}` — la forme exacte du payload
+//! de `paid`. La colonne reste la trace inaltérable que `0090` garantit ; la
+//! ligne d'audit est ce qui rend la décision visible depuis `GET /v1/events`.
 
 use agentos_domain::revenue::QuoteId;
+use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::Db;
 use agentos_store::quotes;
 use axum::extract::{Path, State};
@@ -255,6 +253,20 @@ async fn answer(
              An offer that has lapsed is re-issued, not back-dated",
         ));
     }
+    // La ligne de journal que ce module devait depuis le 2026-09-06, et qui
+    // manquait pour une raison d'organisation, pas de conception : la variante
+    // vivait dans le fichier d'un autre chantier. Même forme que le règlement
+    // d'une facture, et même transaction que la réponse elle-même — un devis
+    // accepté sans trace est une décision que `GET /v1/events` ne montre pas,
+    // alors que c'est exactement l'écran où l'on cherche « qu'a fait
+    // l'entreprise aujourd'hui ».
+    let mut row = AuditEvent::new(principal.actor.clone(), AuditKind::QuoteAnswered, now);
+    row.payload = json!({
+        "quote_id": id,
+        "answer": if accept { "accepted" } else { "declined" },
+        "source": "operator",
+    });
+    audit::append(&mut tx, &row).await?;
     tx.commit().await?;
 
     Ok(Json(json!({
