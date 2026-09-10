@@ -673,9 +673,18 @@ fn app(
         default_domain: config.agent_email_domain.clone(),
         cloudflare_api: agentos_app::sending_domain::CLOUDFLARE_API.to_owned(),
     };
+    // The reader of `BrowserObserver`: one journal per process, built here so
+    // the routes can read it and the adapter can narrate to it. The adapter's
+    // setter is the integration's seam, not this unit's.
+    let browser = routes::browser::BrowserState {
+        db: db.clone(),
+        journal: agentos_app::browser_journal::Journal::new(db.clone()),
+        browser_js: config.browser_js(),
+    };
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
+            .merge(routes::browser::router(browser))
             .merge(routes::employees::router(hiring.clone()))
             .merge(routes::domain::router(hiring.clone()))
             .merge(routes::halt::router(db.clone()))

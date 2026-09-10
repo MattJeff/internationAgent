@@ -199,6 +199,18 @@ mesure a corrigé le document, et ce que le code fait à la place.
    `blocked_by_site` ; `Network.responseReceived` n'est pas utilisé — le
    pilote ignore les événements, exprès.
 
+5. **Le journal ne tient pas de « captures ».** Le § v2 ci-dessus range les
+   captures dans `browser_tasks` ; le port `BrowserObserver` ne les fait pas
+   passer — une image n'est qu'un flux vers qui regarde, et rien de la page
+   (texte, cookie, valeur tapée) n'a de chemin vers une colonne. La table
+   (0096) tient donc l'employé, le fournisseur, le contexte, les bornes, cinq
+   champs par étape (`kind`, `url` pour `goto` seulement, `outcome`,
+   `took_ms`, `at`) et le *nombre* d'images diffusées (`frames_sent`). Une
+   capture à conserver est l'enregistrement de tâche, au classeur, pas encore
+   construit. Et l'écriture est asynchrone derrière une file bornée qui perd
+   plutôt que d'attendre : le port est synchrone et l'adaptateur ne doit pas
+   payer un aller-retour Postgres par étape.
+
 Ce qui s'est confirmé sans surprise : `Network.setCookies` sur un contexte
 neuf, avec les `CookieParam` dérivés de `Network.getAllCookies` (sept champs,
 `expires` seulement s'il est positif), remet la session sur la requête

@@ -49,6 +49,10 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+# `routes::browser`: the live view is a `broadcast` receiver rendered as SSE, and
+# `BroadcastStream` is the one adapter between the two. Already in the lock via
+# `rmcp` and `sqlx`.
+tokio-stream = { version = "0.1", features = ["sync"] }
 # CDP is JSON-RPC over a websocket, and Browserbase launches Chrome for us, so a
 # websocket client is all we need — chromiumoxide would bring a whole browser
 # model we never drive.
