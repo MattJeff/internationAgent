@@ -1151,4 +1151,100 @@ mod tests {
         tx.rollback().await.expect("rollback");
         assert!(!granted, "app_role must not hold DELETE on audit_log");
     }
+    /// **0094 : la ligne qui existait devient primaire, sans geste.** Orizn a
+    /// une ligne `tenant_domains` en production depuis 0093 ; sur un
+    /// déploiement déjà migré `sqlx::migrate!` ne rejoue rien, alors le
+    /// chemin « 0093 posé, une ligne, puis 0094 » ne se prouve que sur une
+    /// base neuve arrêtée à 0093. Créée et détruite ici, par nom unique :
+    /// `private_db` migre jusqu'au bout et ne peut pas s'arrêter avant.
+    #[tokio::test]
+    async fn the_domain_row_a_tenant_already_had_becomes_its_primary_on_0094() {
+        use sqlx::Connection as _;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the 0094 upgrade needs a real Postgres");
+            return;
+        };
+        let (host_part, tail) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+        let (base, _) = tail.split_once('?').map_or((tail, ""), |(b, o)| (b, o));
+        let name = format!("{base}_m94_{}", Uuid::now_v7().simple());
+        let mut admin = sqlx::PgConnection::connect(&url)
+            .await
+            .expect("connect to the database DATABASE_URL names");
+        // DDL takes no parameters; the name is DATABASE_URL's own plus a uuid.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+            .execute(&mut admin)
+            .await
+            .expect("create the scratch database");
+
+        let db = Db::connect(&format!("{host_part}/{name}"))
+            .await
+            .expect("connect to the scratch database");
+        MIGRATOR
+            .run_to(93, &db.pool)
+            .await
+            .expect("migrate up to 0093");
+        let tenant = Uuid::now_v7();
+        {
+            let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+            sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'orizn')")
+                .bind(tenant)
+                .bind(format!("t-{}", tenant.simple()))
+                .execute(&mut *tx)
+                .await
+                .expect("tenant");
+            // 0093's shape: no `is_primary` column yet, `tenant_id` the key.
+            sqlx::query(
+                "INSERT INTO tenant_domains (tenant_id, domain, provider, status) \
+                 VALUES ($1, 'agents.getorizn.com', 'resend', 'verified')",
+            )
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await
+            .expect("the one domain a tenant had under 0093");
+            tx.commit().await.expect("commit");
+        }
+
+        MIGRATOR.run_to(94, &db.pool).await.expect("migrate 0094");
+        let (is_primary, daily_cap): (bool, i32) =
+            sqlx::query_as("SELECT is_primary, daily_cap FROM tenant_domains WHERE tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&db.pool)
+                .await
+                .expect("the row survived the key change");
+        assert!(is_primary, "the row a tenant already had is its primary");
+        assert_eq!(daily_cap, 50, "the default cap");
+        // A second row for the same tenant is now possible, and not primary.
+        sqlx::query(
+            "INSERT INTO tenant_domains (tenant_id, domain, provider, status) \
+             VALUES ($1, 'agent.oriznapi.uk', 'resend', 'verified')",
+        )
+        .bind(tenant)
+        .execute(&db.pool)
+        .await
+        .expect("a second domain on the same tenant");
+        let primaries: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM tenant_domains WHERE tenant_id = $1 AND is_primary",
+        )
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+        assert_eq!(primaries, 1);
+        assert!(
+            sqlx::query("UPDATE tenant_domains SET is_primary = true WHERE tenant_id = $1")
+                .bind(tenant)
+                .execute(&db.pool)
+                .await
+                .is_err(),
+            "two primaries on one tenant: `tenant_domains_one_primary` refuses"
+        );
+
+        db.pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE \"{name}\"")))
+            .execute(&mut admin)
+            .await
+            .expect("drop the scratch database");
+        admin.close().await.expect("close");
+    }
 }

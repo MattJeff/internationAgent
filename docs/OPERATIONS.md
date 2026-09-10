@@ -268,41 +268,63 @@ and another tenant's employee id is a 404.
 From 2026-09-01 the same slice goes to Smartlead's API instead of to your
 clipboard. Nothing above changes except where the bytes land.
 
-### 1.4f The sending domain — the tenant's, verified before a seat writes
+### 1.4f The sending domains — the tenant's, verified before a seat writes, each under a daily cap
 
-Every employee address is `slug@domain`, and the domain is **one row per
-tenant** (`tenant_domains`, 0093) that the email provider has to verify before
-any seat is provisioned on it. `AGENT_EMAIL_DOMAIN` is only the default a
-tenant is registered under when the first hire names none. Four routes, same
-key as everything else on `/v1`:
+Every employee address is `slug@domain`, and a domain is a row of the
+tenant's (`tenant_domains`, 0093, 0094) that the email provider has to verify
+before any seat is provisioned on it. A tenant has **several**: the first one
+registered is the *primary* — seats are hired on it when a body names none,
+`GET /v1/domain` answers it — and the others are what prospecting rotates
+over, each under a `daily_cap` (50 by default, set by hand). Which domain a
+cold email leaves from is chosen at send time: the thread's previous sender
+if there is one, else the verified domain with the most cap left today;
+when every domain is at its cap the send is refused (`domain_caps_exhausted`)
+with the UTC midnight the counters reset at. Mail to a colleague and
+invoices keep the primary address. `AGENT_EMAIL_DOMAIN` is only the default
+a tenant is registered under when the first hire names none. Same key as
+everything else on `/v1`:
 
 ```bash
 # Register (finds a domain already on the Resend account, never duplicates it).
-# 201 the first time, 200 on the same name again, 409 another_domain on a
-# different one, 409 domain_taken if another tenant of this deployment has it,
-# 400 bad_domain.
+# 201 the first time — the first domain becomes the primary — 200 on the same
+# name again, 409 domain_taken if another tenant of this deployment has it,
+# 400 bad_domain. A second name is a second row, not a refusal.
 curl -sS -X POST http://localhost:8090/v1/domain \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"domain":"agents.getorizn.com"}'
 # -> {"domain":"agents.getorizn.com","provider":"resend","status":"pending",
 #     "records":[{"record":"DKIM","type":"TXT","name":"resend._domainkey",
 #                 "value":"p=…","ttl":"Auto","status":"not_started"}, …],
-#     "checked_at":"…","verified_at":null}
+#     "checked_at":"…","verified_at":null,
+#     "is_primary":true,"daily_cap":50,"sent_today":0}
 
-# Read it back. 404 no_domain until registered.
+# Read the primary back. 404 no_domain until registered.
 curl -sS -H "Authorization: Bearer $KEY" http://localhost:8090/v1/domain
+# Every domain, primary first, with today's count.
+curl -sS -H "Authorization: Bearer $KEY" http://localhost:8090/v1/domains
+# -> {"domains":[{…,"is_primary":true,"daily_cap":50,"sent_today":12}, …]}
+
+# The cap of one domain (at least 1), and the removal of a secondary one —
+# 409 primary_domain on the primary, 404 no_domain on a name that is not yours.
+curl -sS -X PUT http://localhost:8090/v1/domains/agent.oriznapi.uk/cap \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"daily_cap":30}'
+curl -sS -X DELETE -H "Authorization: Bearer $KEY" \
+  http://localhost:8090/v1/domains/agent.oriznapi.uk      # 204
 
 # Publish the records in the Cloudflare zone that holds the domain — plus the
 # inbound MX, which Resend does not list until receiving is enabled. The token
-# (Zone:Read + DNS:Edit) is used for this one call and stored nowhere.
+# (Zone:Read + DNS:Edit) is used for this one call and stored nowhere. The
+# primary without "domain"; any other of yours with it.
 curl -sS -X POST http://localhost:8090/v1/domain/dns \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"cloudflare_api_token":"…"}'
-# -> {"posed":4,"skipped":0,"zone":"getorizn.com"}   (click twice: posed 0)
+  -d '{"cloudflare_api_token":"…","domain":"agent.oriznapi.uk"}'
+# -> {"posed":4,"skipped":0,"zone":"oriznapi.uk"}   (click twice: posed 0)
 
-# Ask the provider to look at DNS again. On "verified", every seat of the
-# tenant that was waiting on the domain goes back to `pending` and the
-# provisioning loop seats it on its next tick.
+# Ask the provider to look at DNS again — the primary without a body,
+# {"domain":"…"} for another. On "verified", every seat of the tenant that
+# was waiting on a domain goes back to `pending` and the provisioning loop
+# seats it on its next tick.
 curl -sS -X POST -H "Authorization: Bearer $KEY" http://localhost:8090/v1/domain/verify
 ```
 

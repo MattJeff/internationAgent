@@ -3258,7 +3258,7 @@ mod tests {
         email.release_domains();
         {
             let mut tx = db.tenant_tx(employee.tenant_id()).await.expect("tx");
-            let row = crate::sending_domain::verify(&mut tx, &*email)
+            let row = crate::sending_domain::verify(&mut tx, &*email, None)
                 .await
                 .expect("verify");
             assert_eq!(row.status, agentos_providers::email::DomainStatus::Verified);

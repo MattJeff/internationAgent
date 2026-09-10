@@ -1044,9 +1044,17 @@ mod tests {
     /// The employee's `send_email` went out, as `Effects::chase` records it.
     async fn sent_by_lena(f: &Fixture, id: &str, now: DateTime<Utc>) -> Option<SequenceRunId> {
         let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
-        let thread = follow_up::sent(&mut tx, f.lena, &prospect(), Some("hello"), id, now)
-            .await
-            .expect("record");
+        let thread = follow_up::sent(
+            &mut tx,
+            f.lena,
+            &prospect(),
+            Some("hello"),
+            "lena@ours.example",
+            id,
+            now,
+        )
+        .await
+        .expect("record");
         let run = sent(&mut tx, f.lena, thread, &prospect(), id, now)
             .await
             .expect("sent");

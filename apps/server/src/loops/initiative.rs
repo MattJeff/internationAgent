@@ -2431,6 +2431,9 @@ pub(crate) mod tests {
         tx.commit().await.expect("commit");
         turn_budget(db, tenant, 100).await;
         connect_model(db, tenant).await;
+        // And a verified sending domain: since 0094 a tenant without one
+        // sends nothing (`sending_domain::pick_from`).
+        agentos_app::sending_domain::adopt_for_tests(db, tenant).await;
         tenant
     }
 
@@ -3107,10 +3110,17 @@ pub(crate) mod tests {
         // beside it — so the wake has to say whose silence this is, and since
         // when, in our voice and outside the frame.
         let gruber = "frau.gruber@zoll.example".parse().expect("address");
-        let thread =
-            agentos_app::follow_up::sent(&mut tx, ada, &gruber, Some("hello"), "msg_1", past)
-                .await
-                .expect("record the send on its thread");
+        let thread = agentos_app::follow_up::sent(
+            &mut tx,
+            ada,
+            &gruber,
+            Some("hello"),
+            "ada@ours.example",
+            "msg_1",
+            past,
+        )
+        .await
+        .expect("record the send on its thread");
         diary_store::book_on(
             &mut tx,
             AppointmentId::new_v7(now),

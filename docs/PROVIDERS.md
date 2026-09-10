@@ -232,7 +232,7 @@ Where each goes:
 |---|---|---|
 | `re_…` API key | `EMAIL_API_KEY` | **builds the adapter** — set it and mail is really sent |
 | `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…`, or `POST /v1/platform/webhooks` for a second customer | verifies inbound deliveries, **and** (from the variable) is handed to the adapter as its own webhook secret — one paste, not two |
-| the sending domain | `POST /v1/domain` (one row per tenant); `AGENT_EMAIL_DOMAIN` is the default for a tenant that named none | the domain every seat of that tenant sits on — verified at Resend before any seat is provisioned |
+| the sending domains | `POST /v1/domain` (one row per domain, the first is the tenant's *primary*); `AGENT_EMAIL_DOMAIN` is the default for a tenant that named none | the domains the tenant's mail leaves from — each verified at Resend before a seat sits on it, each under a daily cap (`PUT /v1/domains/{domain}/cap`) |
 
 The webhook half works even with the mock adapter: the route verifies the
 signature against the configured secret and stores the raw bytes. The path
@@ -241,25 +241,42 @@ label in `AGENTOS_WEBHOOK_SECRETS`. An unregistered path is a **404**, and an
 empty registry with an empty `webhook_endpoints` table means no inbound message
 can arrive at all.
 
-### The sending domain is the tenant's, and it is verified before a seat sits on it
+### The sending domains are the tenant's, verified before a seat sits on them, and each under a daily cap
 
 **Measured 2026-09-10.** The domain used to be one variable per deployment,
 `AGENT_EMAIL_DOMAIN`, handed to the adapter, and nothing between it and Resend
 ever asked whether the name existed there: Orizn ran five days on
 `agent-orizn.com`, a domain nobody owns. Now every employee's row carries its
-domain (it always did — `slug@domain`), the seat reads it, and the domain is a
-row of its own, `tenant_domains` (`migrations/0093`), one per tenant and one
-tenant per name. The variable stays as the **default** a tenant is registered
-under when `POST /v1/org` or `POST /v1/employees` names none.
+domain (it always did — `slug@domain`), the seat reads it, and each domain is
+a row of its own, `tenant_domains` (`migrations/0093`, `0094`): several per
+tenant, one tenant per name. The first one registered is the tenant's
+**primary** — the one seats are hired on when a body names none, and the one
+`GET /v1/domain` answers. The variable stays as the **default** a tenant is
+registered under when `POST /v1/org` or `POST /v1/employees` names none.
 
-The four routes (`docs/OPERATIONS.md` §1.4f):
+The routes (`docs/OPERATIONS.md` §1.4f):
 
 | Route | What it does at Resend |
 |---|---|
-| `POST /v1/domain {domain}` | `GET /domains`, then `POST /domains {name}` only if the name is not there — so `agents.getorizn.com`, already on Orizn's account, is *found*. Answers the DNS `records` Resend wants. |
-| `GET /v1/domain` | nothing — the row. |
-| `POST /v1/domain/verify` | `POST /domains/{id}/verify`, then `GET /domains/{id}`. On `verified`, every seat of the tenant waiting on the domain is woken. |
-| `POST /v1/domain/dns {cloudflare_api_token}` | nothing at Resend; the `records` are posted into the Cloudflare zone holding the domain, plus the inbound MX below. |
+| `POST /v1/domain {domain}` | `GET /domains`, then `POST /domains {name}` only if the name is not there — so `agents.getorizn.com`, already on Orizn's account, is *found*. Adds the row (201; 200 if it was there). Answers the DNS `records` Resend wants. |
+| `GET /v1/domain` | nothing — the primary row. |
+| `GET /v1/domains` | nothing — every row, primary first, with `is_primary`, `daily_cap`, `sent_today`. |
+| `POST /v1/domain/verify {domain?}` | `POST /domains/{id}/verify`, then `GET /domains/{id}` — the primary without a body. On `verified`, every seat of the tenant waiting on a domain is woken. |
+| `POST /v1/domain/dns {cloudflare_api_token, domain?}` | nothing at Resend; the `records` are posted into the Cloudflare zone holding the domain, plus the inbound MX below. |
+| `PUT /v1/domains/{domain}/cap {daily_cap}` | nothing — the row's cap. |
+| `DELETE /v1/domains/{domain}` | nothing at Resend (the domain stays on the account); the row and its counters go. 409 `primary_domain` on the primary. |
+
+**Which domain a mail leaves from is decided at send time**, by
+`agentos_app::sending_domain::pick_from`, for mail to the outside only — a
+note to a colleague and an invoice keep the primary address. A thread keeps
+its sender: if this employee already wrote to that address, the same `from`
+again, whatever the caps say. A new recipient gets the *verified* domain with
+the most cap left today, reserved in `domain_send_buckets` under a row lock
+(never counted then written — the shape of `outreach_buckets`). When every
+domain is at its cap the send is refused before Resend is called, as
+`domain_caps_exhausted` with the UTC midnight the counters reset at; the
+model reads that sentence. `daily_cap` is a fixed number set by hand (50 by
+default); a warm-up ramp per domain is the next step, not this one.
 
 **What a seat does with it.** `ensure_identity` looks the tenant's domain up
 in `GET /domains` and never creates one. Absent: `Terminal {
@@ -289,10 +306,10 @@ rather than waiting; if you copy records by hand, add that one yourself.
 route here: `email.opened` / `email.clicked` only arrive once you enable them
 in Domains → Configuration, as the webhook step above says.
 
-**Changing a tenant's domain is another story.** `POST /v1/domain` with a
-second name answers `409 another_domain`: every address already printed in
-mail that left lives on the first one, and re-addressing a company is not a
-column update. Nothing here does it yet.
+**Changing the primary is another story.** `POST /v1/domain` with a second
+name *adds* it; nothing moves the primary, because every seat's address was
+minted on it and re-addressing a company is not a column update. Nothing here
+does it yet.
 
 ### More than one customer on one provider account
 

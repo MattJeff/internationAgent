@@ -194,11 +194,10 @@ pub(crate) struct OrgChart {
     /// local part's host in `slug@domain`, and a company whose founder and
     /// whose head of growth answer on different domains is two companies.
     ///
-    /// **It is the tenant's domain**, `tenant_domains` (0093): a tenant that
-    /// has none yet is registered under this name on the way (one call fewer
-    /// for the console), a tenant that has another answers 409
-    /// `another_domain`. Absent, the tenant's own — or, for a tenant with
-    /// none, the deployment's `AGENT_EMAIL_DOMAIN`.
+    /// **It is one of the tenant's domains**, `tenant_domains` (0093, 0094):
+    /// a name the tenant does not have yet is registered on the way (one
+    /// call fewer for the console). Absent, the tenant's primary — or, for a
+    /// tenant with none, the deployment's `AGENT_EMAIL_DOMAIN`.
     ///
     /// Ignored for an employee that already exists — its address was minted
     /// when it was created and re-addressing it would strand every reply in

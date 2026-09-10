@@ -2581,8 +2581,8 @@ impl Turn {
                     .effects
                     .send_email(ok, body)
                     .await);
-                let id = match sent {
-                    Ok(id) => id,
+                let sent = match sent {
+                    Ok(sent) => sent,
                     Err(EffectError::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
                     Err(err) => return Ok(Reply::Error(format!("failed ({}): {err}", err.code()))),
                 };
@@ -2599,7 +2599,7 @@ impl Turn {
                 let chased = match trust {
                     TrustLabel::Trusted => {
                         match self.gate.authorize(principal, AppointmentBook).await {
-                            Ok(ok) => self.effects.chase(ok, &to, &line, &id).await,
+                            Ok(ok) => self.effects.chase(ok, &to, &line, &sent).await,
                             Err(Denied::Unavailable(err)) => {
                                 return Err(TurnError::Unavailable(err));
                             }
@@ -2611,7 +2611,7 @@ impl Turn {
                         .authorize_from(principal, Untrusted::new(AppointmentBook), origin)
                         .await
                     {
-                        Ok(ok) => self.effects.chase(ok, &to, &line, &id).await,
+                        Ok(ok) => self.effects.chase(ok, &to, &line, &sent).await,
                         Err(Denied::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
                         Err(_) => Ok(None),
                     },
@@ -2624,8 +2624,9 @@ impl Turn {
                     Ok(None) | Err(_) => "",
                 };
                 Ok(Reply::Ok(format!(
-                    "sent, provider message id {}{chase}",
-                    id.as_str()
+                    "sent from {}, provider message id {}{chase}",
+                    sent.from,
+                    sent.id.as_str()
                 )))
             }
             Proposal::Read(subject, url, selector) => {
@@ -3208,6 +3209,9 @@ mod tests {
         .await
         .expect("set caps");
         tx.commit().await.expect("commit caps");
+        // A verified sending domain: since 0094 a tenant without one sends
+        // nothing (`sending_domain::pick_from`).
+        crate::sending_domain::adopt_for_tests(db, tenant).await;
 
         // The policy the gate will read: email, one MCP server, and enough
         // budget that a €50,000 wire would be *allowed* if the taint did not
