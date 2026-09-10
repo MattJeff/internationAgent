@@ -617,7 +617,21 @@ impl BrowserProvider for MockBrowser {
 /// Pure and idempotent paths only: ensure, ensure again, honour a persisted
 /// binding, drive one step, and give the context back three times over. The
 /// crash-window case needs fault injection and stays in this module's tests.
+///
+/// Navigates to a fixed public-looking URL that the mock and Browserbase's
+/// recording driver never actually fetch. An adapter that *does* fetch —
+/// [`crate::browser_http`] — runs [`contract_suite_on`] against its own fake
+/// site instead; the suite is the same, only the address is a parameter.
 pub async fn contract_suite<P: BrowserProvider + ?Sized>(p: &P) {
+    let url = Url::parse("https://portal.example.com/login").expect("valid url");
+    contract_suite_on(p, &url).await;
+}
+
+/// [`contract_suite`], navigating to `url` — which must answer `200` at that
+/// exact address, because the suite asserts the landing is the address asked
+/// for. The parameter rather than an exemption: an adapter that could not
+/// pass the navigation half would be an adapter that passed half the contract.
+pub async fn contract_suite_on<P: BrowserProvider + ?Sized>(p: &P, url: &Url) {
     let c = EnsureCtx::new(
         TenantId::new_v7(Utc::now()),
         EmployeeId::new_v7(Utc::now()),
@@ -652,9 +666,8 @@ pub async fn contract_suite<P: BrowserProvider + ?Sized>(p: &P) {
     assert_eq!(third.external_id, first.external_id);
 
     // A session can be driven.
-    let url = Url::parse("https://portal.example.com/login").expect("valid url");
     assert_eq!(
-        p.act(&session(&first), BrowserStep::Goto(&url))
+        p.act(&session(&first), BrowserStep::Goto(url))
             .await
             .expect("navigate"),
         BrowserOutcome::Navigated(url.clone())
@@ -667,7 +680,7 @@ pub async fn contract_suite<P: BrowserProvider + ?Sized>(p: &P) {
         p.act(&session(&first), BrowserStep::Location)
             .await
             .expect("location"),
-        BrowserOutcome::Navigated(url),
+        BrowserOutcome::Navigated(url.clone()),
         "a session has to be able to report the page it is on"
     );
 

@@ -39,6 +39,9 @@
 //! `agentos_app::prospects::import`, which is a library function taking a
 //! `&str` precisely so that the route is a body reader and nothing else.
 //!
+//! That day came with the per-tenant console session: [`crate::routes::prospects`]
+//! is that route, and this subcommand stays for the operator with a shell.
+//!
 //! # `--dry-run`
 //!
 //! Not a luxury. The first run of this command writes a four-figure number of

@@ -58,6 +58,9 @@ pub mod platform; // wave J: step zero — a tenant signs up and gets a key that
 // été approchés cette semaine, et combien ont répondu. Avec ce que le chiffre
 // ne mesure pas, dans la réponse.
 pub mod outreach;
+// l'import de prospects : le fichier Smartlead du fondateur, déposé depuis la
+// console. Le même `agentos_app::prospects::import` que la sous-commande.
+pub mod prospects;
 // la séquence : le fondateur définit les pas et inscrit un contact ; le siège
 // écrit chaque mail lui-même, réveillé par une promesse. Aucune route d'envoi.
 pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money it moved

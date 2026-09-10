@@ -239,7 +239,8 @@ normal, pas une erreur.
 |---|---|---|
 | `EMAIL_API_KEY` | `MockEmailProvider` | construit le vrai client Resend (`re_…`) |
 | `TELEPHONY_API_KEY` | `MockTelephony` | vrai client Twilio. Format `ACxxxx:auth_token` — **une moitié seule est un refus au boot nommé** |
-| `BROWSER_API_KEY` | `MockBrowser` | vrai Browserbase + driver CDP. Format `project-id:api-key`, même refus sur une moitié |
+| `BROWSER_API_KEY` | `MockBrowser`, ou `HttpBrowser` si `BROWSER_FETCH=http` | vrai Browserbase + driver CDP. Format `project-id:api-key`, même refus sur une moitié |
+| `BROWSER_FETCH` | le faux (chaque `read_page` répond `no_such_element` — mesuré en production le 2026-09-10) | `http`, seule valeur : un `GET` et un parseur HTML, sans JavaScript. Compte comme réel (`browser=http(no-js)` au boot, `browser_js: false` dans `/readyz`) ; ignoré si la clé est là |
 | `EMBEDDER_API_KEY` | hash SHA-256 (`mock-sha256-1536`) | `OpenAiEmbedder`, `text-embedding-3-small`, sur la clé **du client** |
 | `AGENTOS_LLM` | `mock` → répond `MOCK_REPLY` | `anthropic` (seul réel) ou `cli`. Une valeur inconnue est un refus qui liste les valeurs valides |
 | `ANTHROPIC_API_KEY` | — | **exigée au boot** quand `AGENTOS_LLM=anthropic` |
@@ -579,6 +580,9 @@ AGENTOS_MASTER_KEY=<openssl rand -base64 32 — GÉNÉRÉE UNE FOIS, SAUVEGARDÉ
 # Aucun adaptateur réel au premier boot : obligatoire, sinon refus de démarrer.
 AGENTOS_ALLOW_MOCKS=1
 AGENTOS_LLM=mock
+# Les pages des prospects se lisent sans navigateur hébergé : un GET, un
+# parseur, pas de JavaScript. Sans cette ligne, `read_page` tourne sur le faux.
+BROWSER_FETCH=http
 
 AGENTOS_PLATFORM_KEYS=signup:<openssl rand -hex 32>
 RUST_LOG=info,agentos_server=debug

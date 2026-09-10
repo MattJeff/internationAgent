@@ -49,6 +49,7 @@ use agentos_domain::untrusted::Untrusted;
 use agentos_providers::Secret;
 use agentos_providers::browser::BrowserProvider;
 use agentos_providers::browser_browserbase::{BrowserbaseBrowser, CdpDriver};
+use agentos_providers::browser_http::{HttpBrowser, UrlVet};
 use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider};
 use agentos_providers::email_resend::ResendEmailProvider;
@@ -81,7 +82,7 @@ use crate::provisioning::Adapters;
 // cursor is shared, so which company gets which scripted turn depends on who
 // wins the race.
 pub use agentos_providers::ProviderError;
-pub use agentos_providers::llm::{Llm, LlmRequest, LlmResponse, ScriptedLlm, Usage};
+pub use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, ScriptedLlm, Usage};
 
 // And the browser, for exactly the same reason as `ScriptedLlm` next door: the
 // sales vertical drives a prospect's page, so a test of the loop that dispatches
@@ -146,8 +147,17 @@ pub struct Credentials {
     pub email: Option<EmailCredentials>,
     /// Twilio. `None` is [`MockTelephony`].
     pub telephony: Option<TelephonyCredentials>,
-    /// Browserbase. `None` is [`MockBrowser`].
+    /// Browserbase. `None` is [`HttpBrowser`] when [`Self::browser_fetch_http`]
+    /// says so, and [`MockBrowser`] otherwise.
     pub browser: Option<BrowserCredentials>,
+    /// `BROWSER_FETCH=http`: with no Browserbase key, read pages with a `GET`
+    /// and a parser rather than with the fake.
+    ///
+    /// A switch beside a credential, and the only one in this struct, because
+    /// what it selects costs nothing and has no account: there is no key that
+    /// could stand for "use the software we already have". Ignored when a key
+    /// is present — the real browser does everything this one does.
+    pub browser_fetch_http: bool,
     /// The embedding model. `None` is [`Embedder::Mock`], the SHA-256 hash.
     pub embedder: Option<EmbedderCredentials>,
 }
@@ -300,14 +310,48 @@ fn telephony_provider(
 /// `Terminal { code: "no_cdp_driver" }`, so a deployment would provision real
 /// browser contexts and then fail every step that used one. Half a browser is
 /// the failure this whole module is arranged against.
+/// The browser: Browserbase with a key, the `GET`-and-parse one when
+/// `BROWSER_FETCH=http`, the fake otherwise.
+///
+/// Three and not two since 2026-09-10, when `readyz` on the Orizn deployment
+/// listed `browser` under `mock_adapters` and every `read_page` an employee
+/// made answered `no_such_element` — on the prospect's site and on
+/// `example.com` alike. The fake was the fetch layer. A static page needs no
+/// browser, and the founder pays for none until a task does; see
+/// `agentos_providers::browser_http`.
 fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
-    match &credentials.browser {
-        Some(browser) => Arc::new(
+    match (&credentials.browser, credentials.browser_fetch_http) {
+        (Some(browser), _) => Arc::new(
             BrowserbaseBrowser::new(browser.project_id.clone(), &browser.api_key)
                 .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
         ),
+        (None, true) => Arc::new(HttpBrowser::new(Arc::new(PublicWeb))),
         // `booted`, not `new`: a deployment's mock must not reuse `ctx-1`.
-        None => Arc::new(MockBrowser::booted()),
+        (None, false) => Arc::new(MockBrowser::booted()),
+    }
+}
+
+/// The address check the `GET` browser dials through: the MCP client's own,
+/// at [`Reach::Public`](crate::mcp::Reach::Public).
+///
+/// One implementation and no second copy of the rules, which is the whole
+/// reason the trait lives in the providers crate and the impl here: the SSRF
+/// vocabulary — loopback, RFC 1918, the metadata endpoint, every IPv6 costume
+/// an IPv4 address can wear — is `mcp::placement`'s, and a browser that kept
+/// its own list would be the two lists `config.rs` exists to avoid. Refusals
+/// keep `McpError::code` — `blocked_address`, `unresolvable` — so the audit
+/// row reads the same whichever client was refused.
+struct PublicWeb;
+
+#[async_trait]
+impl UrlVet for PublicWeb {
+    async fn resolve_and_vet(
+        &self,
+        url: &url::Url,
+    ) -> Result<Vec<std::net::IpAddr>, ProviderError> {
+        crate::mcp::resolve_and_vet(url, crate::mcp::Reach::Public)
+            .await
+            .map_err(|err| ProviderError::Terminal { code: err.code() })
     }
 }
 
@@ -1001,6 +1045,68 @@ mod tests {
             embedder: Some(EmbedderCredentials {
                 api_key: "sk-live-key".to_owned(),
             }),
+            browser_fetch_http: false,
+        }
+    }
+
+    /// `BROWSER_FETCH=http` selects the `GET` browser, a key outranks it, and
+    /// the production vet refuses what `mcp::resolve_and_vet` refuses —
+    /// proved on the addresses that need no DNS to be refused.
+    #[tokio::test]
+    async fn browser_fetch_http_selects_the_get_browser_behind_the_public_vet() {
+        use agentos_providers::browser::MOCK_PROVIDER;
+        use agentos_providers::{EnsureCtx, ProviderBinding};
+
+        let ctx = EnsureCtx::new(
+            agentos_domain::ids::TenantId::new_v7(Utc::now()),
+            agentos_domain::ids::EmployeeId::new_v7(Utc::now()),
+            agentos_domain::ids::Slug::parse("ada").expect("valid slug"),
+            "browser",
+        );
+        let provider_of = async |credentials: &Credentials| {
+            ports_for(credentials, "https://agents.test")
+                .browser
+                .ensure_context(&ctx)
+                .await
+                .expect("ensure")
+                .provider
+        };
+
+        assert_eq!(provider_of(&Credentials::default()).await, MOCK_PROVIDER);
+        let http = Credentials {
+            browser_fetch_http: true,
+            ..Credentials::default()
+        };
+        assert_eq!(provider_of(&http).await, HttpBrowser::PROVIDER);
+        // Disarm: with a key, the switch is not read.
+        let both = Credentials {
+            browser: live().browser,
+            browser_fetch_http: true,
+            ..Credentials::default()
+        };
+        let ports = ports_for(&both, "https://agents.test");
+        let existing = ProviderBinding {
+            provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
+            external_id: "ctx_bb".to_owned(),
+        };
+        assert_eq!(
+            ports
+                .browser
+                .ensure_context(&ctx.clone().with_existing(existing))
+                .await
+                .expect("a persisted binding needs no round trip")
+                .provider,
+            agentos_providers::browser_browserbase::PROVIDER
+        );
+
+        // The vet is the MCP client's: loopback and the metadata endpoint are
+        // refused before any socket opens, by the code `mcp.rs` uses.
+        for literal in ["http://127.0.0.1:1/", "http://169.254.169.254/latest/"] {
+            let err = PublicWeb
+                .resolve_and_vet(&url::Url::parse(literal).expect("url"))
+                .await
+                .expect_err(literal);
+            assert_eq!(err.code(), "blocked_address", "{literal}");
         }
     }
 

@@ -107,7 +107,7 @@ use crate::routes::webhooks::Webhooks;
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Wall clock a handler gets before the client is answered 408.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -724,6 +724,7 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            .merge(routes::prospects::router(db.clone()))
             .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
@@ -887,6 +888,7 @@ fn app(
             // The port `routes::approvals` refuses on, not a second opinion
             // about it.
             payment_rail: ports.payments.configured(),
+            browser_js: config.browser_js(),
         })
         .merge(metrics::router(db, config.metrics_key.clone()));
 
@@ -1813,15 +1815,17 @@ impl Agent {
             // `trust_label` on such a row is the label of the *colleague's own
             // turn* when it composed the message.
             #[allow(clippy::type_complexity)]
-            let (channel, sender, subject, body, trust_label, internal_kind): (
+            let (channel, sender, subject, body, trust_label, internal_kind, attachments): (
                 String,
                 String,
                 Option<String>,
                 String,
                 String,
                 Option<String>,
+                serde_json::Value,
             ) = sqlx::query_as(
-                "SELECT c.channel, m.sender, m.subject, m.body, m.trust_label, m.internal_kind \
+                "SELECT c.channel, m.sender, m.subject, m.body, m.trust_label, m.internal_kind, \
+                        m.attachments \
                    FROM messages m JOIN conversations c ON c.id = m.conversation_id \
                   WHERE m.id = $1 AND m.conversation_id = $2",
             )
@@ -2151,14 +2155,28 @@ impl Agent {
             // and on the untrusted branch it would let a relayed injection
             // choose which documents get pulled into the turn.
             let context = match errand {
-                Some(errand) => inbound::into_context(
-                    context,
-                    &sender,
-                    errand,
-                    Untrusted::new(body.clone()),
-                    composed_by,
-                    message_id,
-                ),
+                Some(errand) => {
+                    let context = inbound::into_context(
+                        context,
+                        &sender,
+                        errand,
+                        Untrusted::new(body.clone()),
+                        composed_by,
+                        message_id,
+                    );
+                    // The documents the colleague handed over, each read off
+                    // the classeur now and framed like any other third-party
+                    // text. The classeur is per tenant, so it is built here
+                    // the way `ingest_email` builds it.
+                    inbound::attachments_into_context(
+                        context,
+                        &sender,
+                        message_id,
+                        &inbound::attached_of(&attachments),
+                        &agentos_app::files::PgFiles::new(self.db.clone(), event.tenant_id),
+                    )
+                    .await
+                }
                 None => {
                     // The same text is also the retrieval query, and that is a
                     // deliberate choice with a paragraph behind it in
@@ -2631,6 +2649,13 @@ struct Health {
     /// than an operator inferring it from a `502` — which is the shape of the
     /// question this struct exists to answer on demand.
     payment_rail: bool,
+    /// Whether the browser runs JavaScript: [`Config::browser_js`].
+    ///
+    /// Reported beside `mock_adapters` and not inside it, because the `GET`
+    /// browser is not a mock — it fetches the page — and an operator whose
+    /// booking probe answered `needs_real_browser` is asking a replica, not a
+    /// boot log, which of the two real browsers this is.
+    browser_js: bool,
 }
 
 /// Readiness: this replica can usefully take traffic *right now*.
@@ -2707,6 +2732,9 @@ async fn readyz(State(health): State<Health>) -> Response {
             // False on every build today. The route that reads the same port
             // answers `501 no_payment_rail` and leaves the approval pending.
             "payment_rail": health.payment_rail,
+            // `false` under `BROWSER_FETCH=http` and under the mock alike:
+            // the question is "can it type into a form", and neither can.
+            "browser_js": health.browser_js,
         })),
     )
         .into_response()
@@ -3149,6 +3177,7 @@ mod tests {
                     db,
                     mocks: Vec::new().into(),
                     payment_rail: false,
+                    browser_js: false,
                 })
                 .oneshot(
                     HttpRequest::get("/readyz")

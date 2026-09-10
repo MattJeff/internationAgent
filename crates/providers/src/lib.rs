@@ -67,6 +67,7 @@
 
 pub mod browser; // U18
 pub mod browser_browserbase;
+pub mod browser_http; // a GET and a parser: the browser a static page needs, and no more
 pub mod cdp;
 pub mod dns_cloudflare; // one-shot: pose a sending domain's records in a Cloudflare zone
 pub mod email; // U16

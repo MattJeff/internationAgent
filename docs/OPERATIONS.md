@@ -228,6 +228,28 @@ not given as ISO-2 (the location string is kept verbatim instead). An address on
 the suppression list is skipped and never re-activated. `docs/ORIZN.md` §8 is the
 column-by-column table and `agentos_app::prospects` is the argument for each.
 
+**The same import, from the console.** `POST /v1/prospects/import` is the
+subcommand as a route, for the founder who has the CSV on a laptop and no shell
+in the container. Same auth as `outreach`, the body is the file:
+
+```bash
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Content-Type: text/csv" \
+     --data-binary @list.csv \
+     "$HOST/v1/prospects/import?segment=relocation&country=PH&dry_run=true"
+```
+
+`segment` is required (`GET /v1/prospects/segments` lists the eight the CHECK
+admits), `country` defaults to `ZZ`, and `dry_run=true` rolls the transaction
+back after producing the full report — the console requires a clean dry run
+before it enables the write. The response counts what `import` counts:
+`rows`, `accounts.{created,existing}`, `contacts.{created,existing,skipped}`
+(skipped = on the suppression list), `nameless`, `phones_dropped`,
+`linkedin_dropped`, `unknown_country`, and `errors[{line,reason}]` for every
+refused row. Refusals of the whole file are `400 bad_csv` (with the expected
+header in `detail`), `bad_segment`, `bad_country`; `415` on anything but
+`text/csv`; `413` over the body limit every route shares (1 MiB — the largest
+list on file is 141 KB).
+
 ### 1.4e The file you upload — the other end of the same pipeline
 
 `import` puts prospects in. This takes them out, in the shape Smartlead loads:
@@ -267,6 +289,42 @@ and another tenant's employee id is a 404.
 
 From 2026-09-01 the same slice goes to Smartlead's API instead of to your
 clipboard. Nothing above changes except where the bytes land.
+
+### 1.4e² Handing a document to an employee
+
+A message from a chair (`POST /v1/employees/{chair}/desk`) can carry up to five
+documents, by the name each was deposited under at `POST /v1/files`:
+
+```bash
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Idempotency-Key: $(uuidgen)" \
+     -H "Content-Type: application/json" "$HOST/v1/files" \
+     -d "{\"name\":\"prospects/vienne.csv\",\"content_type\":\"text/csv\",\"content\":\"$(base64 < vienne.csv)\"}"
+
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Idempotency-Key: $(uuidgen)" \
+     -H "Content-Type: application/json" "$HOST/v1/employees/$CHAIR/desk" \
+     -d '{"to":"sdr","kind":"order","body":"Work through this list, Vienna first.",
+          "attachments":[{"name":"prospects/vienne.csv"}]}'
+```
+
+What to know:
+
+* **The message row records `{name, content_type, size}`**, never the bytes.
+  The employee's turn reads the file off the classeur at wake-up time, so the
+  classeur is the single copy and `GET /v1/files/content?name=` is how a person
+  gets it back.
+* **The employee reads it inside the message.** Each document is rendered under
+  the colleague's words in its own `⟦UNTRUSTED⟧` frame — name, declared type,
+  size, then the content: `text/csv`, `text/plain`, `text/markdown` and
+  `application/json` as text, `application/pdf` through the same reader that
+  indexes deposited PDFs, anything else as "non lu". The excerpt is cut at
+  8 KiB per document with `… (tronqué, N Ko au total)`. There is no tool that
+  fetches a file: a document is something a colleague handed you.
+* **It taints the turn.** A filed document is somebody's bytes, and reading it
+  costs the employee its high-risk tools for that turn exactly as an inbound
+  email would.
+* **Refusals:** a name this company has not filed is a 404 `no_such_file`;
+  another company's file reads identically. Six names is a 400. The message
+  is not written in either case.
 
 ### 1.4f The sending domains — the tenant's, verified before a seat writes, each under a daily cap
 
