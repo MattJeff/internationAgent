@@ -518,9 +518,15 @@ mod tests {
         // 1900 tokens × 3 USD/Mtok = 0.0057 USD a day: each day rounds to a
         // cent on its own, the two together round to one.
         for day in [yesterday, today] {
-            model_usage::record(&mut tx, lena, day, Consumed::reported(2, 1_900, 0, 0))
-                .await
-                .expect("record");
+            model_usage::record(
+                &mut tx,
+                lena,
+                day,
+                agentos_domain::policy::ModelId::Opus5,
+                Consumed::reported(2, 1_900, 0, 0),
+            )
+            .await
+            .expect("record");
         }
         let paid = invoices::issue(
             &mut tx,

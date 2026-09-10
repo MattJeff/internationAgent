@@ -688,6 +688,7 @@ mod tests {
             &mut tx,
             lena,
             today,
+            agentos_domain::policy::ModelId::Opus5,
             Consumed::reported(4_000, 900_000_000, 50_000_000, 12_000_000),
         )
         .await

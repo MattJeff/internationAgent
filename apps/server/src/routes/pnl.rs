@@ -810,6 +810,7 @@ pub(crate) mod tests {
             &mut tx,
             lena,
             today,
+            agentos_domain::policy::ModelId::Opus5,
             Consumed::reported(2, 1_000_000, 100_000, 2_000_000),
         )
         .await
@@ -1092,12 +1093,24 @@ pub(crate) mod tests {
         let today = Utc::now().date_naive();
 
         let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
-        model_usage::record(&mut tx, lossy, today, Consumed::reported(1, 500_000, 0, 0))
-            .await
-            .expect("record");
-        model_usage::record(&mut tx, lossy, today, Consumed::reported(1, 0, 0, 0))
-            .await
-            .expect("record");
+        model_usage::record(
+            &mut tx,
+            lossy,
+            today,
+            agentos_domain::policy::ModelId::Opus5,
+            Consumed::reported(1, 500_000, 0, 0),
+        )
+        .await
+        .expect("record");
+        model_usage::record(
+            &mut tx,
+            lossy,
+            today,
+            agentos_domain::policy::ModelId::Opus5,
+            Consumed::reported(1, 0, 0, 0),
+        )
+        .await
+        .expect("record");
         tx.commit().await.expect("commit");
 
         let (status, body) = h
@@ -1150,6 +1163,7 @@ pub(crate) mod tests {
             &mut tx,
             lena,
             now.date_naive(),
+            agentos_domain::policy::ModelId::Opus5,
             Consumed::reported(3, 1_000, 200, 0),
         )
         .await

@@ -4766,6 +4766,97 @@ mod tests {
         );
     }
 
+    /// **Le modèle que `model_choice` a dit est le modèle que le fournisseur
+    /// reçoit** — asserté sur la requête qui part, pas sur la valeur de retour
+    /// de `choose`.
+    ///
+    /// C'est le même argument que `two_employees_of_different_packs_send_different_models`
+    /// juste au-dessus, appliqué au tour et non au siège : `choose` juste et le
+    /// fil faux, c'est un argument oublié à `Turn::new`, l'unité passe, la
+    /// flotte reste sur un seul modèle et la facture ne bouge pas. La table de
+    /// règles est testée en table dans `model_choice` ; ce qui est testé ici est
+    /// **la couture**.
+    ///
+    /// Trois formes de tour, un siège, une politique, trois modèles sur le fil.
+    #[tokio::test]
+    async fn le_modele_que_choose_a_dit_est_celui_qui_part_au_fournisseur() {
+        use crate::model_choice::{self, TurnShape, Wake};
+
+        let Some(db) = db().await else { return };
+        let seat = seed(&db).await;
+        let policy = fresh_deployment(agentos_store::policy::default_ceiling());
+
+        // Le siège est un support : sa charte préfère Sonnet, et c'est ce qui
+        // rend les deux autres lignes intéressantes — la forme du tour bouge le
+        // modèle dans les deux sens autour de la préférence du pack.
+        let charter = Charter::Support {
+            objective: crate::rolepack_service::Support {
+                product: "the Orizn entry-requirements API".to_owned(),
+                first_response_hours: 8,
+                escalate_to: None,
+            },
+        };
+        let quiet = TurnShape {
+            wake: Wake::Rhythm,
+            role: Some(charter.role()),
+            untrusted: false,
+            thread_messages: 0,
+            quiet_runs: model_choice::QUIET_RUNS,
+        };
+        let shapes = [
+            // Rien à faire : le moins cher.
+            quiet,
+            // Une relance à écrire : la routine.
+            TurnShape {
+                wake: Wake::FollowUp,
+                ..quiet
+            },
+            // Le texte d'un inconnu, sur un tour que personne n'a demandé.
+            TurnShape {
+                untrusted: true,
+                ..quiet
+            },
+        ];
+
+        let mut sent = Vec::new();
+        let mut chosen = Vec::new();
+        for shape in shapes {
+            let model = model_choice::choose(&shape, Some(&policy))
+                .expect("the shipped ceiling permits every model");
+            chosen.push(model.to_string());
+            let llm = Arc::new(ScriptedLlm::responses(vec![done()]));
+            let turn = Turn::new(
+                llm.clone(),
+                gate(&db),
+                Effects::new(db.clone(), Arc::new(crate::mocks::ports()), seat.clone()),
+                charter.system_prompt("You are an AI employee of Fabrikam."),
+                model.as_str(),
+                "seat@fabrikam.example",
+            );
+            turn.run(
+                Context::new().with_task(charter.brief()),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("a one-turn run");
+            sent.push(llm.requests()[0].model.clone());
+        }
+
+        assert_eq!(
+            sent,
+            vec![
+                "claude-haiku-4-5".to_owned(),
+                "claude-sonnet-5".to_owned(),
+                "claude-opus-5".to_owned(),
+            ],
+            "la forme du tour n'a pas atteint le fournisseur"
+        );
+        assert_eq!(
+            sent, chosen,
+            "le fil et `choose` ne disent pas la même chose"
+        );
+    }
+
     /// The same two seats under an operator who has decided this fleet does not
     /// run Opus: **both fall to the cheapest model that operator permits, and
     /// neither falls upward.**

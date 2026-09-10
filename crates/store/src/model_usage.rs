@@ -123,6 +123,23 @@
 //! afternoon costs an employee its whole daily turn budget and every one of
 //! those turns is on the bill.
 //!
+//! # One row per model, since `0097`
+//!
+//! The grain was `(tenant, employee, day)` while a deployment ran one model, and
+//! it stopped being enough twice over: role packs put two seats of one tenant on
+//! two models, and `agentos_app::model_choice` puts two *turns of one seat* on
+//! two models — a rhythm wake with nothing to do on Haiku, the customer's email
+//! that arrives an hour later on Sonnet. A single row summing both is a token
+//! count no rate multiplies, which is the same failure `calls_unmetered` exists
+//! to prevent one level down.
+//!
+//! So [`record`] takes the model it billed and the row is keyed on it.
+//! [`on_day`] sums back across models, because "what did this employee cost
+//! today" is one number; `GET /v1/usage/models` is where the split is read. Rows
+//! written before `0097` carry `''` — nobody wrote it down, and back-filling a
+//! plausible model would fabricate the measurement the column exists to make
+//! possible.
+//!
 //! # What this ledger still cannot see
 //!
 //! **A turn that was reserved and never counted, on the inbound path.** The
@@ -140,6 +157,7 @@
 //! for it, so there is no column for it here. See decision 2 of the migration.
 
 use agentos_domain::ids::EmployeeId;
+use agentos_domain::policy::ModelId;
 use chrono::NaiveDate;
 use serde::Serialize;
 
@@ -307,6 +325,7 @@ pub async fn record(
     tx: &mut TenantTx<'_>,
     employee_id: EmployeeId,
     day: NaiveDate,
+    model: ModelId,
     consumed: Consumed,
 ) -> Result<(), StoreError> {
     if consumed.calls == 0 {
@@ -315,13 +334,17 @@ pub async fn record(
 
     // Additive on conflict, deliberately not idempotent. Two calls that cost the
     // same on the same day are two calls; see the module docs.
+    //
+    // `model` is part of the conflict target since `0097`, which is what makes
+    // a seat that woke on Haiku and answered a customer on Sonnet two rows
+    // instead of one unmultipliable total.
     sqlx::query(
         "INSERT INTO model_usage_daily \
-           (tenant_id, employee_id, day, calls, calls_unmetered, \
+           (tenant_id, employee_id, day, model, calls, calls_unmetered, \
             input_tokens, output_tokens, cache_read_tokens, \
             runs_unbacked, unbacked_chars) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-         ON CONFLICT (tenant_id, employee_id, day) DO UPDATE SET \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (tenant_id, employee_id, day, model) DO UPDATE SET \
            calls             = model_usage_daily.calls + excluded.calls, \
            calls_unmetered   = model_usage_daily.calls_unmetered + excluded.calls_unmetered, \
            input_tokens      = model_usage_daily.input_tokens + excluded.input_tokens, \
@@ -335,6 +358,7 @@ pub async fn record(
     .bind(tx.tenant_id().as_uuid())
     .bind(employee_id.as_uuid())
     .bind(day)
+    .bind(model.as_str())
     .bind(consumed.calls)
     .bind(consumed.calls_unmetered)
     .bind(consumed.input_tokens)
@@ -360,10 +384,21 @@ pub async fn on_day(
 ) -> Result<Consumed, StoreError> {
     // No `WHERE tenant_id`: RLS adds it, and a hand-written filter would be a
     // second place to forget it.
+    //
+    // Summed across models since `0097` gave the table a fourth key column: this
+    // question is "what did this employee cost today", which is one number
+    // whether it was spent on one model or three. `GET /v1/usage/models` is
+    // where the split is read.
     let row: Option<Consumed> = sqlx::query_as(
-        "SELECT calls, calls_unmetered, input_tokens, output_tokens, cache_read_tokens, \
-                runs_unbacked, unbacked_chars \
-           FROM model_usage_daily WHERE employee_id = $1 AND day = $2",
+        "SELECT sum(calls)::bigint             AS calls, \
+                sum(calls_unmetered)::bigint   AS calls_unmetered, \
+                sum(input_tokens)::bigint      AS input_tokens, \
+                sum(output_tokens)::bigint     AS output_tokens, \
+                sum(cache_read_tokens)::bigint AS cache_read_tokens, \
+                sum(runs_unbacked)::bigint     AS runs_unbacked, \
+                sum(unbacked_chars)::bigint    AS unbacked_chars \
+           FROM model_usage_daily WHERE employee_id = $1 AND day = $2 \
+          HAVING count(*) > 0",
     )
     .bind(employee_id.as_uuid())
     .bind(day)
@@ -450,7 +485,7 @@ mod tests {
         consumed: Consumed,
     ) {
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        record(&mut tx, employee, day, consumed)
+        record(&mut tx, employee, day, ModelId::Opus5, consumed)
             .await
             .expect("record");
         tx.commit().await.expect("commit");
@@ -714,9 +749,15 @@ mod tests {
 
         // A turn that made its model call and then failed before commit.
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        record(&mut tx, employee, DAY, Consumed::reported(1, 50, 10, 0))
-            .await
-            .expect("record");
+        record(
+            &mut tx,
+            employee,
+            DAY,
+            ModelId::Opus5,
+            Consumed::reported(1, 50, 10, 0),
+        )
+        .await
+        .expect("record");
         tx.rollback().await.expect("rollback");
         assert_eq!(
             read(&db, tenant, employee, DAY).await,

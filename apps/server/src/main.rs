@@ -2117,26 +2117,32 @@ impl Agent {
                 .await
                 .map_err(|err| format!("could not read this employee's open questions: {err}"))?;
 
+            // The two measured inputs to `model_choice`, read in this same
+            // transaction because everything else this turn needs already is.
+            // Neither can fail the turn: a routing input that could not be read
+            // is a cheaper model, never a customer's email left unanswered.
+            //
+            // `runs_unbacked` is today's row; the thread count is what this turn
+            // is about, an index scan on `messages_conversation_idx` (0001).
+            let quiet_runs = model_usage::on_day(tx, employee_id, Utc::now().date_naive())
+                .await
+                .map(|consumed| u32::try_from(consumed.runs_unbacked).unwrap_or(u32::MAX))
+                .unwrap_or(0);
+            let thread_messages: u32 = sqlx::query_as::<_, (i64,)>(
+                "SELECT count(*) FROM messages WHERE conversation_id = $1",
+            )
+            .bind(conversation_id.as_uuid())
+            .fetch_one(&mut ***tx)
+            .await
+            .map(|(n,)| u32::try_from(n).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+
             let principal = ActingAs::employee(event.tenant_id, employee_id);
             // The same fleet the prefix was built from, so what the model is
             // told exists and what it can actually call are one binding.
             let ports = Arc::new(Ports {
                 mcp: fleet,
                 ..(*self.ports).clone()
-            });
-            let turn = Turn::new(
-                llm,
-                self.gate,
-                Effects::new(self.db.clone(), ports, principal),
-                prompt,
-                model.as_str(),
-                employee.address().to_string(),
-            )
-            // What the employee may answer or hand over: this thread and no
-            // other. It comes off the event, so the model has no id to swap.
-            .on_thread(Thread {
-                conversation_id,
-                message_id,
             });
 
             // Three things reach the model, and the order is the argument.
@@ -2228,6 +2234,60 @@ impl Agent {
                 }
             };
 
+            // **Which model this turn sends.** `model` above is the seat's
+            // ceiling — what the operator permits this role — and this is the
+            // turn's own answer, decided here because the frame now exists and
+            // `agentos_app::model_choice` reads it. The two are the same value
+            // on most turns; when they are not, the log line below is the only
+            // place that says so.
+            //
+            // `choose` cannot answer `None` where `model_for` answered `Some`:
+            // both bottom out on the same `allowed_models`, and the empty set
+            // was already refused above. The seat's ceiling is the fallback if
+            // that ever stops being true.
+            let shape = agentos_app::model_choice::TurnShape {
+                wake: if errand.is_some() {
+                    agentos_app::model_choice::Wake::Internal
+                } else {
+                    agentos_app::model_choice::Wake::Counterparty
+                },
+                role: charter.as_ref().map(Charter::role),
+                // A message from outside is third-party text by construction.
+                // A colleague's is third-party text when the colleague's own
+                // turn was — `composed_by` is that label, and this handler
+                // deliberately does not re-decide it.
+                untrusted: errand.is_none()
+                    || composed_by == agentos_domain::untrusted::TrustLabel::Untrusted,
+                thread_messages,
+                quiet_runs,
+            };
+            let running =
+                agentos_app::model_choice::choose(&shape, policy.as_ref()).unwrap_or(model);
+            if running != model {
+                tracing::info!(
+                    employee_id = %employee_id.as_uuid(),
+                    role = charter.as_ref().map_or("(none)", Charter::role),
+                    seat_model = %model,
+                    running = %running,
+                    "this turn is not this seat's ordinary model"
+                );
+            }
+
+            let turn = Turn::new(
+                llm,
+                self.gate,
+                Effects::new(self.db.clone(), ports, principal),
+                prompt,
+                running.as_str(),
+                employee.address().to_string(),
+            )
+            // What the employee may answer or hand over: this thread and no
+            // other. It comes off the event, so the model has no id to swap.
+            .on_thread(Thread {
+                conversation_id,
+                message_id,
+            });
+
             let cancel = self.cancel.child_token();
             let deadline = tokio::spawn({
                 let cancel = cancel.clone();
@@ -2266,6 +2326,7 @@ impl Agent {
                     &mut bill,
                     employee_id,
                     Utc::now().date_naive(),
+                    running,
                     Consumed::reported(
                         failed.turns,
                         failed.usage.input_tokens,
@@ -2463,6 +2524,7 @@ impl Agent {
                 tx,
                 employee_id,
                 Utc::now().date_naive(),
+                running,
                 Consumed::reported(
                     finished.turns,
                     finished.usage.input_tokens,

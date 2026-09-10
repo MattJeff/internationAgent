@@ -811,6 +811,7 @@ mod tests {
             &mut tx,
             EmployeeId::from_uuid(alba),
             Utc::now().date_naive(),
+            agentos_domain::policy::ModelId::Opus5,
             Consumed::reported(3, 100, 20, 5),
         )
         .await
@@ -822,6 +823,7 @@ mod tests {
             &mut tx,
             EmployeeId::from_uuid(carla),
             Utc::now().date_naive(),
+            agentos_domain::policy::ModelId::Opus5,
             Consumed::reported(1, 40, 3_000, 0).unbacked(0, NARRATION),
         )
         .await

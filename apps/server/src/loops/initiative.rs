@@ -146,6 +146,7 @@ use agentos_app::calendar::{Calendar, PgCalendar};
 use agentos_app::effects::{Effects, Ports};
 use agentos_app::gate::{Principal as ActingAs, TaintOrigin};
 use agentos_app::inbound;
+use agentos_app::model_choice;
 use agentos_app::prompt::Relation;
 use agentos_app::proof_of_need::Prober;
 use agentos_app::revenue::Seller;
@@ -264,8 +265,8 @@ pub struct Assignment {
     /// `None` is a policy that would not load, which names nothing — see
     /// [`assignment_for`].
     pub policy: Option<EffectivePolicy>,
-    /// Which model this turn runs on: the charter's preference, already
-    /// intersected with `policy`'s `allowed_models` by
+    /// Which model this **seat** is permitted to run: the charter's preference,
+    /// already intersected with `policy`'s `allowed_models` by
     /// [`model_for`](agentos_domain::policy::model_for).
     ///
     /// Resolved in [`assignment_for`] rather than in [`take_turn`] because the
@@ -273,7 +274,26 @@ pub struct Assignment {
     /// a missing charter or an unanswered gap — and every other such reason is
     /// an [`Outcome`] decided there. Resolving it later would mean spending a
     /// reserved turn to discover it.
+    ///
+    /// **It is not necessarily the model this turn sends.** That is
+    /// `agentos_app::model_choice::choose`, decided in [`take_turn`] once the
+    /// frame is assembled, because half of what it reads — whether a stranger's
+    /// words went into the context — is not known until they have. This field
+    /// stays what it always was: the seat's ceiling, and the refusal when there
+    /// is none.
     pub model: ModelId,
+    /// How many messages sit on the thread this turn wakes on. Zero for a turn
+    /// that wakes on no thread, which is every cadence turn.
+    pub thread_messages: u32,
+    /// How many of this seat's runs today ended with prose and nothing the gate
+    /// ruled on — `model_usage_daily.runs_unbacked`, read in the same
+    /// transaction as everything else here.
+    ///
+    /// The one measured input to the routing table: a seat whose last runs
+    /// proposed nothing is a seat whose next "is there anything to do" is almost
+    /// certainly answered no. `model_choice::TurnShape::quiet_runs` states the
+    /// ceiling of reading it per day rather than per run.
+    pub quiet_runs: u32,
     /// **Whose credential this turn is billed to**, as it was proven.
     ///
     /// A different question from [`Assignment::model`] and answered by a
@@ -869,7 +889,39 @@ async fn assignment_for(
         let connection = agentos_app::model_access::connected(&mut tx)
             .await
             .map_err(|err| Outcome::NoModel(err.to_string()))?;
-        Ok((employee.employee, charter, colleagues, policy, connection))
+        // And the two facts the routing table reads, in this same transaction
+        // because opening a second one to ask a `bigint` and a `count` would
+        // cost more than the answers are worth.
+        //
+        // `runs_unbacked` is today's, by primary key. The thread is counted only
+        // when there is one — a cadence turn wakes on nothing, and `0` there is
+        // the truth rather than a default. `messages_conversation_idx` (0001)
+        // makes the count an index scan.
+        let quiet_runs = model_usage::on_day(&mut tx, due.employee_id, now.date_naive())
+            .await
+            .map(|consumed| u32::try_from(consumed.runs_unbacked).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        let thread_messages = match due.kept.as_ref().and_then(|kept| kept.conversation_id) {
+            Some(thread) => {
+                let count: (i64,) =
+                    sqlx::query_as("SELECT count(*) FROM messages WHERE conversation_id = $1")
+                        .bind(thread.as_uuid())
+                        .fetch_one(&mut **tx)
+                        .await
+                        .unwrap_or((0,));
+                u32::try_from(count.0).unwrap_or(u32::MAX)
+            }
+            None => 0,
+        };
+        Ok((
+            employee.employee,
+            charter,
+            colleagues,
+            policy,
+            connection,
+            quiet_runs,
+            thread_messages,
+        ))
     }
     .await;
 
@@ -877,7 +929,7 @@ async fn assignment_for(
     // is awaited rather than dropped so a pooled connection is handed back
     // deliberately.
     let _ = tx.rollback().await;
-    let (employee, charter, colleagues, policy, connection) = read?;
+    let (employee, charter, colleagues, policy, connection, quiet_runs, thread_messages) = read?;
 
     let Some(charter) = charter else {
         return Ok(None);
@@ -888,6 +940,13 @@ async fn assignment_for(
     // And the model question, also before any model call and for the same
     // reason: an employee whose policy permits no model cannot take this turn or
     // any other, so it must not reserve one to find that out.
+    //
+    // **This is the seat's ceiling and not this turn's model.** Which model the
+    // turn actually sends is `model_choice::choose` in `take_turn`, once the
+    // frame exists — the routing table reads whether a stranger's words went
+    // into it, and that is not known here. What is decided here is the only part
+    // that is a reason *not to start*: the empty intersection, which no per-turn
+    // rule can rescue because `choose` bottoms out on the same allowlist.
     //
     // No fallback. The expensive model would be a bill nobody authorised and the
     // cheap one would be a policy this operator did not write — see
@@ -954,6 +1013,8 @@ async fn assignment_for(
         colleagues,
         policy,
         model,
+        thread_messages,
+        quiet_runs,
         connection,
         sales,
     }))
@@ -1107,6 +1168,8 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         colleagues,
         policy,
         model,
+        thread_messages,
+        quiet_runs,
         connection,
         sales,
     } = assignment;
@@ -1205,8 +1268,6 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     }
     .with_colleagues(colleagues);
 
-    let turn = Turn::new(llm, agent.gate, effects, prompt, model.as_str(), address);
-
     // `Charter::brief` is the plan, recomputed this turn and stored nowhere. It
     // is a message rather than part of the prompt because it varies per
     // objective — which is what both role packs say about `Task::instruction`,
@@ -1224,6 +1285,19 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // hour it was promised for *in the words the promise was made in*, and is
     // told what time it is now, so that a moment kept four days late is visible
     // to the employee rather than only to whoever reads `rang_at` afterwards.
+    // **What the routing table will be shown**, tracked as the frame is built
+    // rather than guessed at afterwards. `wake` starts at the cadence and is
+    // narrowed by each branch below that finds a reason; `untrusted` is set by
+    // the one branch that puts a *stranger's* words in — see
+    // `model_choice::TurnShape::untrusted` on why the board and the diary, which
+    // are fenced too, deliberately do not count.
+    let mut wake = if due.kept.is_some() {
+        model_choice::Wake::FollowUp
+    } else {
+        model_choice::Wake::Rhythm
+    };
+    let mut untrusted = false;
+
     let mut context = Context::new();
     context = match &due.kept {
         Some(kept) => context
@@ -1253,6 +1327,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // step says what to write: `sequence::brief` speaks first and the
     // follow-up's is not asked, since the sequence is the chase on that thread.
     if let Some(run) = due.kept.as_ref().and_then(|kept| kept.sequence_run_id) {
+        wake = model_choice::Wake::Sequence;
         if let Some(brief) = agentos_app::sequence::brief(&agent.db, due.tenant_id, run).await {
             context = context.with_task(brief);
         }
@@ -1263,6 +1338,12 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
                 if let Some((id, sender, reason)) =
                     booked_reason(&agent.db, due.tenant_id, thread).await
                 {
+                    // A stranger typed this through a public page, and it is the
+                    // whole reason the turn is awake. Both halves of the routing
+                    // table's opinion of it are set here: it woke on somebody
+                    // else's message, and that message is in the frame.
+                    wake = model_choice::Wake::Counterparty;
+                    untrusted = true;
                     let sender = inbound::contact_of(&Untrusted::new(sender));
                     context = context.with_task(BOOKING_BRIEF).with_untrusted_from(
                         &Untrusted::new(reason),
@@ -1313,6 +1394,34 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
             .with_untrusted(&promised.lines, DIARY);
     }
 
+    // **Which model this turn sends**, decided now and not at the seat's
+    // charter: the frame is built, so every input the table reads is a fact
+    // rather than a forecast. `assignment_for` has already refused the seat that
+    // is permitted no model at all, so `choose` cannot answer `None` here —
+    // both bottom out on the same allowlist — and the seat's own ceiling is the
+    // honest thing to fall back on if that ever stops being true.
+    let shape = model_choice::TurnShape {
+        wake,
+        role: Some(role),
+        untrusted,
+        thread_messages,
+        quiet_runs,
+    };
+    let running = model_choice::choose(&shape, policy.as_ref()).unwrap_or(model);
+    if running != model {
+        tracing::info!(
+            employee_id = %due.employee_id.as_uuid(),
+            role,
+            seat_model = %model,
+            running = %running,
+            ?wake,
+            untrusted,
+            quiet_runs,
+            "this turn is not this seat's ordinary model"
+        );
+    }
+    let turn = Turn::new(llm, agent.gate, effects, prompt, running.as_str(), address);
+
     let cancel = agent.cancel.child_token();
     let deadline = tokio::spawn({
         let cancel = cancel.clone();
@@ -1347,6 +1456,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
                     &mut tx,
                     due.employee_id,
                     Utc::now().date_naive(),
+                    running,
                     Consumed::reported(
                         failed.turns,
                         failed.usage.input_tokens,
@@ -1459,6 +1569,7 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
         &mut tx,
         due.employee_id,
         Utc::now().date_naive(),
+        running,
         Consumed::reported(
             finished.turns,
             finished.usage.input_tokens,
@@ -4173,6 +4284,121 @@ pub(crate) mod tests {
         .expect("count");
         tx.rollback().await.expect("rollback");
         count
+    }
+
+    /// **Le siège qui n'a rien proposé deux fois se réveille sur le modèle le
+    /// moins cher — et celui d'à côté, non.**
+    ///
+    /// La table de règles est testée en table dans `agentos_app::model_choice`
+    /// et la couture avec le fournisseur dans `agentos_app::turn`. Ce qui est
+    /// testé ici est la troisième couture, celle que ni l'une ni l'autre ne
+    /// voit : **la boucle lit-elle vraiment le grand livre du jour, et le
+    /// passe-t-elle vraiment à `choose` ?** Une constante à la place de
+    /// `quiet_runs` passerait les deux autres tests et laisserait la flotte
+    /// entière sur Sonnet.
+    ///
+    /// Deux sièges identiques, une seule différence : l'un a deux passages
+    /// enregistrés qui n'ont rien proposé, l'autre aucun. C'est la garde
+    /// désarmée et réarmée dans le même test.
+    #[tokio::test]
+    async fn un_siege_qui_na_rien_propose_deux_fois_se_reveille_sur_le_modele_le_moins_cher() {
+        use agentos_app::gate::PolicyGate;
+        use agentos_app::mocks::{LlmResponse, ScriptedLlm, Usage};
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+
+        /// Un tour, un siège, et le modèle que le fournisseur a vu passer.
+        async fn model_sent(
+            db: &Db,
+            tenant: TenantId,
+            slug: &str,
+            quiet_runs: u32,
+        ) -> (EmployeeId, String) {
+            let employee = seed_due(db, tenant, slug, Some(supporting())).await;
+
+            // Les passages vides d'avant, écrits par le vrai writer. Sur Haiku,
+            // parce qu'il faut bien un modèle et que celui-ci ne change rien à
+            // ce que la règle lit : elle compte des passages, pas des tarifs.
+            for _ in 0..quiet_runs {
+                let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+                model_usage::record(
+                    &mut tx,
+                    employee,
+                    Utc::now().date_naive(),
+                    ModelId::Haiku45,
+                    Consumed::reported(1, 4_000, 20, 0).unbacked(0, "rien à faire"),
+                )
+                .await
+                .expect("record");
+                tx.commit().await.expect("commit");
+            }
+
+            let llm = Arc::new(ScriptedLlm::responses(vec![LlmResponse::text(
+                "Rien à faire.",
+                Usage::new(4_000, 12, 0),
+            )]));
+            let cancel = CancellationToken::new();
+            let agent = Agent {
+                db: db.clone(),
+                llm: llm.clone(),
+                backend: agentos_app::mocks::LlmBackend::Mock,
+                credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+                gate: PolicyGate::new(db.clone()),
+                ports: Arc::new(agentos_app::mocks::ports()),
+                embedder: agentos_app::knowledge::Embedder::default(),
+                fleets: crate::routes::mcp::Fleets::new().0,
+                cancel: cancel.clone(),
+            };
+            let take = move |assignment: Assignment| {
+                let agent = agent.clone();
+                async move { take_turn(agent, assignment).await }
+            };
+            assert_eq!(
+                tick(db, &take, &cancel, Utc::now()).await.expect("tick"),
+                1,
+                "{slug} n'était pas seul dans le lot, donc pas seul sur ce fournisseur"
+            );
+            assert_eq!(
+                outcome_of(db, tenant, employee).await.0,
+                "turn",
+                "{slug} n'a jamais atteint le modèle"
+            );
+            let model = llm.requests()[0].model.clone();
+            (employee, model)
+        }
+
+        // Désarmée : rien d'enregistré, donc rien qui dise que ce siège n'a rien
+        // à faire. La routine, au tarif de la routine.
+        let (_, busy) = model_sent(&db, tenant, "occupe", 0).await;
+        assert_eq!(
+            busy, "claude-sonnet-5",
+            "un siège dont on ne sait rien ne doit pas être dégradé"
+        );
+
+        // Réarmée : deux passages qui n'ont rien proposé, et le troisième est
+        // « regarde s'il y a quelque chose à faire ».
+        let (quiet, cheap) = model_sent(&db, tenant, "silencieux", 2).await;
+        assert_eq!(
+            cheap, "claude-haiku-4-5",
+            "deux passages vides n'ont pas atteint le choix du modèle"
+        );
+
+        // Et le grand livre porte les deux modèles pour ce siège, sur la même
+        // journée — ce qui est exactement ce que `0097` a rendu possible et ce
+        // que `GET /v1/usage/models` lit.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let models: Vec<String> = sqlx::query_scalar(
+            "SELECT model FROM model_usage_daily WHERE employee_id = $1 ORDER BY model",
+        )
+        .bind(quiet.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("ledger");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(models, vec!["claude-haiku-4-5".to_owned()]);
     }
 
     /// **A turn that did nothing and said it did everything, and the row that
