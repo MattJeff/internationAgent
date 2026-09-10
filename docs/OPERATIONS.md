@@ -290,6 +290,42 @@ and another tenant's employee id is a 404.
 From 2026-09-01 the same slice goes to Smartlead's API instead of to your
 clipboard. Nothing above changes except where the bytes land.
 
+### 1.4e² Handing a document to an employee
+
+A message from a chair (`POST /v1/employees/{chair}/desk`) can carry up to five
+documents, by the name each was deposited under at `POST /v1/files`:
+
+```bash
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Idempotency-Key: $(uuidgen)" \
+     -H "Content-Type: application/json" "$HOST/v1/files" \
+     -d "{\"name\":\"prospects/vienne.csv\",\"content_type\":\"text/csv\",\"content\":\"$(base64 < vienne.csv)\"}"
+
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Idempotency-Key: $(uuidgen)" \
+     -H "Content-Type: application/json" "$HOST/v1/employees/$CHAIR/desk" \
+     -d '{"to":"sdr","kind":"order","body":"Work through this list, Vienna first.",
+          "attachments":[{"name":"prospects/vienne.csv"}]}'
+```
+
+What to know:
+
+* **The message row records `{name, content_type, size}`**, never the bytes.
+  The employee's turn reads the file off the classeur at wake-up time, so the
+  classeur is the single copy and `GET /v1/files/content?name=` is how a person
+  gets it back.
+* **The employee reads it inside the message.** Each document is rendered under
+  the colleague's words in its own `⟦UNTRUSTED⟧` frame — name, declared type,
+  size, then the content: `text/csv`, `text/plain`, `text/markdown` and
+  `application/json` as text, `application/pdf` through the same reader that
+  indexes deposited PDFs, anything else as "non lu". The excerpt is cut at
+  8 KiB per document with `… (tronqué, N Ko au total)`. There is no tool that
+  fetches a file: a document is something a colleague handed you.
+* **It taints the turn.** A filed document is somebody's bytes, and reading it
+  costs the employee its high-risk tools for that turn exactly as an inbound
+  email would.
+* **Refusals:** a name this company has not filed is a 404 `no_such_file`;
+  another company's file reads identically. Six names is a 400. The message
+  is not written in either case.
+
 ### 1.4f The sending domains — the tenant's, verified before a seat writes, each under a daily cap
 
 Every employee address is `slug@domain`, and a domain is a row of the

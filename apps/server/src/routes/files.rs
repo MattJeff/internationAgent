@@ -439,8 +439,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `pub(crate)` for two fixtures: `routes::desk` hands `contract_pdf` to an
+/// employee and asserts on the text that reaches it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, header};
@@ -540,11 +542,17 @@ mod tests {
         tenant
     }
 
+    /// A page with no text operators: a grey rectangle where the scan of a
+    /// contract would have its image.
+    fn scanned_pdf() -> Vec<u8> {
+        pdf("0.5 0.5 0.5 rg 50 50 495 742 re f\n")
+    }
+
     /// The smallest valid PDF wrapping one content stream. A second copy of
     /// the skeleton `agentos_app::knowledge`'s tests and
     /// `crate::invoice_document` write, because a fixture builder is not API
     /// and the alternative is a kilobyte of base64 nobody can read or vary.
-    fn pdf(stream: &str) -> Vec<u8> {
+    pub(crate) fn pdf(stream: &str) -> Vec<u8> {
         let objects = [
             "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
@@ -577,7 +585,7 @@ mod tests {
     }
 
     /// A contract somebody can read.
-    fn contract_pdf(lines: &[&str]) -> Vec<u8> {
+    pub(crate) fn contract_pdf(lines: &[&str]) -> Vec<u8> {
         let mut stream = String::from("BT /F1 11 Tf 14 TL 50 790 Td\n");
         for line in lines {
             stream.push('(');
@@ -586,12 +594,6 @@ mod tests {
         }
         stream.push_str("ET\n");
         pdf(&stream)
-    }
-
-    /// A page with no text operators: a grey rectangle where the scan of a
-    /// contract would have its image.
-    fn scanned_pdf() -> Vec<u8> {
-        pdf("0.5 0.5 0.5 rg 50 50 495 742 re f\n")
     }
 
     /// **The gap this route had: filed and unreadable.**

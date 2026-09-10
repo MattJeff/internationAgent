@@ -1814,15 +1814,17 @@ impl Agent {
             // `trust_label` on such a row is the label of the *colleague's own
             // turn* when it composed the message.
             #[allow(clippy::type_complexity)]
-            let (channel, sender, subject, body, trust_label, internal_kind): (
+            let (channel, sender, subject, body, trust_label, internal_kind, attachments): (
                 String,
                 String,
                 Option<String>,
                 String,
                 String,
                 Option<String>,
+                serde_json::Value,
             ) = sqlx::query_as(
-                "SELECT c.channel, m.sender, m.subject, m.body, m.trust_label, m.internal_kind \
+                "SELECT c.channel, m.sender, m.subject, m.body, m.trust_label, m.internal_kind, \
+                        m.attachments \
                    FROM messages m JOIN conversations c ON c.id = m.conversation_id \
                   WHERE m.id = $1 AND m.conversation_id = $2",
             )
@@ -2152,14 +2154,28 @@ impl Agent {
             // and on the untrusted branch it would let a relayed injection
             // choose which documents get pulled into the turn.
             let context = match errand {
-                Some(errand) => inbound::into_context(
-                    context,
-                    &sender,
-                    errand,
-                    Untrusted::new(body.clone()),
-                    composed_by,
-                    message_id,
-                ),
+                Some(errand) => {
+                    let context = inbound::into_context(
+                        context,
+                        &sender,
+                        errand,
+                        Untrusted::new(body.clone()),
+                        composed_by,
+                        message_id,
+                    );
+                    // The documents the colleague handed over, each read off
+                    // the classeur now and framed like any other third-party
+                    // text. The classeur is per tenant, so it is built here
+                    // the way `ingest_email` builds it.
+                    inbound::attachments_into_context(
+                        context,
+                        &sender,
+                        message_id,
+                        &inbound::attached_of(&attachments),
+                        &agentos_app::files::PgFiles::new(self.db.clone(), event.tenant_id),
+                    )
+                    .await
+                }
                 None => {
                     // The same text is also the retrieval query, and that is a
                     // deliberate choice with a paragraph behind it in

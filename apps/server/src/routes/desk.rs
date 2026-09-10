@@ -132,10 +132,11 @@
 //! head — which is what an org chart is, and an operator bypass here would make
 //! the reporting line advisory.
 
-use agentos_app::inbound::{self, Errand, InternalError, OnDesk};
+use agentos_app::inbound::{self, Attached, Errand, InternalError, OnDesk};
 use agentos_domain::ids::{EmployeeId, IdempotencyKey, Slug};
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_store::db::{Db, StoreError};
+use agentos_store::files;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -179,6 +180,9 @@ struct DeskView {
     /// question — nothing answers an order.
     answered: bool,
     at: DateTime<Utc>,
+    /// The documents handed over with it: `{name, content_type, size}` each,
+    /// the name being what `GET /v1/files/content?name=` takes.
+    attachments: Vec<Attached>,
 }
 
 impl From<OnDesk> for DeskView {
@@ -194,6 +198,7 @@ impl From<OnDesk> for DeskView {
             },
             answered: message.answered,
             at: message.at,
+            attachments: message.attachments,
         }
     }
 }
@@ -248,6 +253,20 @@ struct Message {
     /// `InternalNote::thread` is.
     #[serde(default)]
     answers: Option<Uuid>,
+    /// Documents to hand over with the words, by the name each was deposited
+    /// under at `POST /v1/files`. At most [`inbound::MAX_ATTACHMENTS`]; a name
+    /// this company has not filed is a 404 `no_such_file`, and another
+    /// company's file reads exactly the same way. The employee reads each one
+    /// inside the message when it wakes — there is no verb to fetch a file.
+    #[serde(default)]
+    attachments: Vec<ByName>,
+}
+
+/// One attachment on the wire: the name and nothing else, because the type and
+/// the size are the classeur's to say, not the sender's to repeat.
+#[derive(Deserialize)]
+struct ByName {
+    name: String,
 }
 
 /// The three errands a person may send, which is [`Errand`] minus one.
@@ -327,6 +346,13 @@ async fn say(
         ApiError::bad_request(format!("`to` is not a colleague's short name: {err}"))
     })?;
     let errand = Errand::from(body.kind);
+    if body.attachments.len() > inbound::MAX_ATTACHMENTS {
+        return Err(ApiError::bad_request(format!(
+            "a message hands over at most {} documents, and this one names {}",
+            inbound::MAX_ATTACHMENTS,
+            body.attachments.len()
+        )));
+    }
 
     let seat = EmployeeId::from_uuid(id);
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
@@ -334,6 +360,21 @@ async fn say(
     let sent = async {
         if !inbound::is_a_chair(&mut tx, seat).await? {
             return Err(Refusal::NotAChair);
+        }
+        // Each document, looked up inside RLS: another company's file is a
+        // `NotFound` here, which is the same 404 an unfiled name earns.
+        let mut attached = Vec::with_capacity(body.attachments.len());
+        for ByName { name } in &body.attachments {
+            let held = match files::fetch(&mut tx, name).await {
+                Ok(held) => held,
+                Err(StoreError::NotFound) => return Err(Refusal::NoSuchFile(name.clone())),
+                Err(err) => return Err(err.into()),
+            };
+            attached.push(Attached {
+                name: name.clone(),
+                content_type: held.content_type,
+                size: held.content.len() as i64,
+            });
         }
         // Looked up rather than taken from the body, so the answer is on the
         // question's own thread and cannot be pointed at another. `send` still
@@ -353,7 +394,7 @@ async fn say(
             _ => None,
         };
 
-        inbound::send(
+        let delivered = inbound::send(
             &mut tx,
             seat,
             &to,
@@ -372,7 +413,13 @@ async fn say(
             Utc::now(),
         )
         .await
-        .map_err(Refusal::Internal)
+        .map_err(Refusal::Internal)?;
+        // Same transaction as the row and the turn it queued: the employee
+        // wakes on a message that already names its documents, or not at all.
+        if !attached.is_empty() {
+            inbound::attach(&mut tx, delivered.message_id, &attached).await?;
+        }
+        Ok(delivered)
     }
     .await;
 
@@ -412,6 +459,8 @@ enum Refusal {
     NotAChair,
     /// An `answer` that named no question.
     AnswersMissing,
+    /// An attachment this company has not filed — or another company has.
+    NoSuchFile(String),
     /// Everything the internal channel itself refuses.
     Internal(InternalError),
 }
@@ -423,6 +472,20 @@ impl From<Refusal> for ApiError {
     /// codebase wrote, with no interpolation but a `&'static str` code.
     fn from(refusal: Refusal) -> Self {
         let err = match refusal {
+            Refusal::NoSuchFile(name) => {
+                // The name is the caller's own string, echoed back to the
+                // caller that sent it — the one interpolation here, and it
+                // says nothing about anybody else's classeur.
+                return Self::new(
+                    StatusCode::NOT_FOUND,
+                    "no_such_file",
+                    "no file by that name in this company",
+                )
+                .with_detail(format!(
+                    "`{name}` is not in this company's classeur: deposit it at POST /v1/files \
+                     first, and name it here exactly as it was deposited"
+                ));
+            }
             Refusal::NotAChair => {
                 return Self::conflict(
                     "not_a_chair",
@@ -535,7 +598,12 @@ mod tests {
             .expect("keyring");
             Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    // The classeur too: a document is deposited there before
+                    // it is handed over from here.
+                    router(db.clone()).merge(crate::routes::files::router(
+                        db.clone(),
+                        agentos_app::knowledge::Embedder::default(),
+                    )),
                     db.clone(),
                     Keyring::new(keys, db.clone(), TEST_MASTER_KEY),
                 ),
@@ -961,5 +1029,301 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a chair from another company is not a pen anybody may pick up: {refused}"
         );
+    }
+
+    // -- attachments -------------------------------------------------------
+
+    /// Deposit `bytes` under `name` as `secret`'s company.
+    async fn deposit(h: &Harness, secret: &str, name: &str, content_type: &str, bytes: &[u8]) {
+        use base64::Engine as _;
+        let (status, filed) = h
+            .send(
+                "POST",
+                "/v1/files",
+                secret,
+                Some(json!({
+                    "name": name,
+                    "content_type": content_type,
+                    "content": base64::engine::general_purpose::STANDARD.encode(bytes),
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{filed}");
+    }
+
+    /// The turn's context for the message `id` on `sdr`'s desk, assembled the
+    /// way `Agent::on_turn` assembles it, flattened to the text the model sees.
+    async fn as_the_employee_reads_it(h: &Harness, id: Uuid) -> String {
+        use agentos_app::mocks::Content;
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+        let column: Value = sqlx::query_scalar("SELECT attachments FROM messages WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the row");
+        tx.rollback().await.expect("rollback");
+
+        let context = inbound::attachments_into_context(
+            agentos_app::turn::Context::new(),
+            "founder",
+            id,
+            &inbound::attached_of(&column),
+            &agentos_app::files::PgFiles::new(h.db.clone(), h.a),
+        )
+        .await;
+        assert!(
+            context.trust().is_untrusted(),
+            "a document somebody filed taints the turn that reads it"
+        );
+        context
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The founder hands over a CSV, and the employee reads it in the message.**
+    ///
+    /// The row records what travelled; the frame carries the beginning of it,
+    /// cut at `ATTACHMENT_EXCERPT` with the cut named, and nothing but the
+    /// runtime's own sentence sits outside a frame.
+    #[tokio::test]
+    async fn a_csv_travels_with_the_message_and_reaches_the_employee_framed_and_cut() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; a desk needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let (founder, _sdr) = chart(&db, h.a).await;
+
+        // 20 KiB of prospects: a header and rows that each say where they are.
+        let mut csv = String::from("company,city,contact\n");
+        let mut row = 0;
+        while csv.len() < 20 * 1024 {
+            csv.push_str(&format!("Firma {row} GmbH,Wien,contact{row}@example.at\n"));
+            row += 1;
+        }
+        let total = csv.len();
+        deposit(
+            &h,
+            SECRET_A,
+            "prospects/vienne.csv",
+            "text/csv",
+            csv.as_bytes(),
+        )
+        .await;
+
+        let (status, sent) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{}/desk", founder.as_uuid()),
+                SECRET_A,
+                Some(json!({
+                    "to": "sdr",
+                    "kind": "order",
+                    "body": "Work through this list, Vienna first.",
+                    "attachments": [{ "name": "prospects/vienne.csv" }],
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{sent}");
+        let id: Uuid = sent["id"].as_str().expect("id").parse().expect("uuid");
+
+        let mut tx = db.tenant_tx(h.a).await.expect("tx");
+        let column: Value = sqlx::query_scalar("SELECT attachments FROM messages WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            column,
+            json!([{ "name": "prospects/vienne.csv", "content_type": "text/csv", "size": total }]),
+            "the row names the document, its declared type and the size the classeur measured"
+        );
+
+        let (_, desk) = h
+            .send(
+                "GET",
+                &format!("/v1/employees/{}/desk", _sdr.as_uuid()),
+                SECRET_A,
+                None,
+            )
+            .await;
+        assert_eq!(
+            one(&desk, id)["attachments"][0]["name"],
+            json!("prospects/vienne.csv"),
+            "and the desk shows it, so a console can offer it back: {desk}"
+        );
+
+        let seen = as_the_employee_reads_it(&h, id).await;
+        assert!(
+            seen.contains("founder handed over 1 document(s)"),
+            "the runtime's own sentence introduces them: {seen}"
+        );
+        let frame_start = seen
+            .find(agentos_app::prompt::SENTINEL)
+            .expect("the document sits inside a frame");
+        assert!(
+            seen[frame_start..].contains("prospects/vienne.csv (text/csv, "),
+            "name, type and size head the frame: {seen}"
+        );
+        assert!(
+            seen[frame_start..].contains("company,city,contact\nFirma 0 GmbH,Wien"),
+            "then the beginning of the file: {seen}"
+        );
+        assert!(
+            seen.contains(&format!(
+                "… (tronqué, {} Ko au total)",
+                total.div_ceil(1024)
+            )),
+            "cut at the ceiling, and the cut says how much there was: {seen}"
+        );
+        assert!(
+            seen.len() < inbound::ATTACHMENT_EXCERPT + 1024,
+            "the excerpt is the ceiling and not the file: {} bytes reached the model",
+            seen.len()
+        );
+    }
+
+    /// A PDF reaches the employee as its text, through the reader that already
+    /// indexes deposited PDFs; a type nobody reads is named and not decoded.
+    #[tokio::test]
+    async fn a_pdf_reaches_the_employee_as_its_text_and_a_spreadsheet_as_its_name() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; a desk needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let (founder, _) = chart(&db, h.a).await;
+
+        let pdf = crate::routes::files::tests::contract_pdf(&[
+            "Master services agreement",
+            "Payment terms are thirty days from receipt of a valid invoice.",
+        ]);
+        deposit(&h, SECRET_A, "signed/Acme MSA.pdf", "application/pdf", &pdf).await;
+        deposit(
+            &h,
+            SECRET_A,
+            "prix.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            b"PK\x03\x04 not really a workbook",
+        )
+        .await;
+
+        let (status, sent) = h
+            .send(
+                "POST",
+                &format!("/v1/employees/{}/desk", founder.as_uuid()),
+                SECRET_A,
+                Some(json!({
+                    "to": "sdr",
+                    "kind": "question",
+                    "body": "What are the payment terms, and what do we charge?",
+                    "attachments": [{ "name": "signed/Acme MSA.pdf" }, { "name": "prix.xlsx" }],
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{sent}");
+        let id: Uuid = sent["id"].as_str().expect("id").parse().expect("uuid");
+
+        let seen = as_the_employee_reads_it(&h, id).await;
+        assert!(
+            seen.contains("thirty days from receipt"),
+            "the PDF's text, not its bytes: {seen}"
+        );
+        assert!(
+            !seen.contains("%PDF-"),
+            "no PDF syntax reaches the model: {seen}"
+        );
+        assert!(
+            seen.contains(
+                "prix.xlsx (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, \
+                 26 bytes)\nnon lu"
+            ),
+            "a workbook is named, sized and not read: {seen}"
+        );
+    }
+
+    /// The three refusals: a name nobody filed, one document too many, and a
+    /// document another company filed — which reads exactly like the first.
+    #[tokio::test]
+    async fn an_unfiled_name_a_sixth_document_and_another_company_s_file_are_refused() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; a desk needs a real Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let h = Harness::new(&db).await;
+        let (founder, _) = chart(&db, h.a).await;
+        let desk = format!("/v1/employees/{}/desk", founder.as_uuid());
+        let order = |attachments: Value| {
+            json!({
+                "to": "sdr",
+                "kind": "order",
+                "body": "read this",
+                "attachments": attachments,
+            })
+        };
+
+        let (status, refused) = h
+            .send(
+                "POST",
+                &desk,
+                SECRET_A,
+                Some(order(json!([{ "name": "nothing by that name.csv" }]))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+        assert_eq!(refused["code"], json!("no_such_file"), "{refused}");
+
+        let six: Vec<Value> = (0..6)
+            .map(|n| json!({ "name": format!("{n}.csv") }))
+            .collect();
+        let (status, refused) = h
+            .send("POST", &desk, SECRET_A, Some(order(json!(six))))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "six is refused before any name is looked up: {refused}"
+        );
+
+        deposit(&h, SECRET_B, "b/secret.csv", "text/csv", b"B's prospects").await;
+        let (status, refused) = h
+            .send(
+                "POST",
+                &desk,
+                SECRET_A,
+                Some(order(json!([{ "name": "b/secret.csv" }]))),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "B's file must read to A exactly like a file nobody filed: {refused}"
+        );
+        assert_eq!(refused["code"], json!("no_such_file"), "{refused}");
+
+        let mut tx = db.tenant_tx(h.a).await.expect("tx");
+        let sent: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messages WHERE channel = 'internal' AND internal_kind = 'order'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(sent, 0, "a refused message left no row behind");
     }
 }

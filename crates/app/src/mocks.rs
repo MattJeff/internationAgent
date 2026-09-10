@@ -81,7 +81,7 @@ use crate::provisioning::Adapters;
 // cursor is shared, so which company gets which scripted turn depends on who
 // wins the race.
 pub use agentos_providers::ProviderError;
-pub use agentos_providers::llm::{Llm, LlmRequest, LlmResponse, ScriptedLlm, Usage};
+pub use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, ScriptedLlm, Usage};
 
 // And the browser, for exactly the same reason as `ScriptedLlm` next door: the
 // sales vertical drives a prospect's page, so a test of the loop that dispatches
