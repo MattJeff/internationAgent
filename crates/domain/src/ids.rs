@@ -99,6 +99,16 @@ uuid_newtype!(
     AppointmentId
 );
 uuid_newtype!(
+    /// One email sequence a company defined: the steps, as a whole.
+    /// See `migrations/0092_une_sequence_est_une_suite_de_promesses.sql`.
+    SequenceId
+);
+uuid_newtype!(
+    /// One contact's passage through one sequence: the position, and what
+    /// became of it. See `migrations/0092`.
+    SequenceRunId
+);
+uuid_newtype!(
     /// One demand for money the company has made, in its own register.
     /// See `migrations/0066_invoices.sql`.
     ///

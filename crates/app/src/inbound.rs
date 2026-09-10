@@ -368,8 +368,9 @@ use agentos_domain::message::{CanonicalMessage, Channel, Direction, ProviderRef}
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::ProviderError;
 use agentos_providers::email::{
-    Delivery, EmailProvider, InboundNotice, ParseError, Refusal, Route,
+    Delivery, EmailProvider, InboundNotice, ParseError, Refusal, Route, SignalKind,
 };
+use agentos_providers::email_resend::ResendEmailProvider;
 use agentos_providers::telephony::{self, InboundCtx, TelephonyProvider};
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::backlog;
@@ -380,9 +381,11 @@ use agentos_store::outbox::{self, NewEvent, OutboxEvent};
 use agentos_store::policy::{self as policy_store, PolicyLoadError};
 use agentos_store::provisioning as provisioning_store;
 use agentos_store::revenue as revenue_store;
+use agentos_store::traces;
 use agentos_store::turns;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::files::{Files, FilesError, PgFiles};
@@ -681,6 +684,16 @@ pub enum Recorded {
     /// The far end refused our mail, and the trail now says so.
     Refused(Refusal),
 
+    /// The far end took, opened or clicked our mail, and `message_events`
+    /// (`0091`) holds it.
+    Signal {
+        /// Which of the three.
+        kind: SignalKind,
+        /// `false` on a redelivery: the provider's own delivery id was already
+        /// in the table, and one gesture stays one row.
+        written: bool,
+    },
+
     /// A verified webhook of a type this build has no reader for.
     Unread {
         /// The provider's own `type`, truncated. Third-party text: log it with
@@ -731,9 +744,23 @@ pub enum Recorded {
 /// webhook, a provider that does not have the message yet, a database that said
 /// no. A delivery we understand and a delivery we have never heard of are both
 /// `Ok`, because no number of attempts turns either into something else.
+///
+/// # `delivery_id`
+///
+/// The provider's own id for **this delivery** — Resend's `svix-id`, which the
+/// signature covers and which `routes::webhooks::ingest` already dedupes its
+/// outbox row on, filed on that row as `event_id`. It is what `message_events`
+/// dedupes a redelivered signal on (`0091`, `message_events_dedupe`), so a
+/// webhook replayed from the dashboard is one open and not two. `None` — or an
+/// empty one — falls back to the SHA-256 of the raw body, hex: a scheme that
+/// carries no delivery id still gets a key that is identical for identical
+/// bytes and distinct for distinct ones, which is the same argument
+/// [`verify_telephony_webhook`] makes for Twilio. Only signals read it; a
+/// notice and a refusal have their own keys.
 pub async fn record_raw_email_delivery(
     tx: &mut TenantTx<'_>,
     raw_body: &[u8],
+    delivery_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Recorded, InboundError> {
     match Delivery::parse(raw_body)? {
@@ -748,10 +775,34 @@ pub async fn record_raw_email_delivery(
             record_refusal(tx, &refusal, now).await?;
             Ok(Recorded::Refused(refusal))
         }
+        Delivery::Signal(signal) => {
+            let delivery_id = match delivery_id.filter(|id| !id.is_empty()) {
+                Some(id) => id.to_owned(),
+                None => format!("{:x}", Sha256::digest(raw_body)),
+            };
+            let written = traces::record(
+                tx,
+                // The parser reads Resend's shape and no other, so the row says
+                // so; a second email provider brings its own parser and its
+                // own name.
+                ResendEmailProvider::PROVIDER,
+                traces::Signal {
+                    kind: signal.kind.as_str(),
+                    provider_message_id: signal.provider_message_id.as_str(),
+                    link: signal.link.as_deref(),
+                    occurred_at: signal.at,
+                },
+                &delivery_id,
+            )
+            .await?;
+            Ok(Recorded::Signal {
+                kind: signal.kind,
+                written,
+            })
+        }
         // Nothing is written. The delivery's own bytes are already durable on
         // the `webhook` outbox row that got us here, so the row plus the log
-        // line below it is the whole record — and a row per `email.opened`
-        // would be a table nobody reads.
+        // line below it is the whole record.
         Delivery::Unread { kind } => Ok(Recorded::Unread { kind }),
     }
 }
@@ -2828,6 +2879,11 @@ pub async fn land(
     // has already written back. Zero rows is the ordinary case.
     if message.direction == Direction::Inbound {
         calendar::cancel_for_conversation(tx, message.conversation_id, now)
+            .await
+            .map_err(InboundError::Store)?;
+        // And the sequence, for the same reason in the same transaction: a
+        // run on this thread has its answer, and its next step is not owed.
+        crate::sequence::replied(tx, message.conversation_id, now)
             .await
             .map_err(InboundError::Store)?;
     }
@@ -5095,7 +5151,7 @@ mod tests {
         now: DateTime<Utc>,
     ) -> Result<Recorded, InboundError> {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let read = record_raw_email_delivery(&mut tx, raw_body.as_bytes(), now).await;
+        let read = record_raw_email_delivery(&mut tx, raw_body.as_bytes(), None, now).await;
         match read.is_ok() {
             true => tx.commit().await.expect("commit delivery"),
             false => tx.rollback().await.expect("rollback delivery"),
@@ -5450,18 +5506,88 @@ mod tests {
         let Some(db) = db().await else { return };
         let (tenant, _) = seed(&db).await;
         let now = Utc::now();
-        let opened = r#"{"type":"email.opened","created_at":"2026-08-24T10:00:00Z",
+        let delayed = r#"{"type":"email.delivery_delayed","created_at":"2026-08-24T10:00:00Z",
              "data":{"email_id":"email_out_2","from":"lena@agents.example.com","to":[]}}"#;
 
         assert_eq!(
-            read_delivery(&db, tenant, opened, now)
+            read_delivery(&db, tenant, delayed, now)
                 .await
                 .expect("an unknown type must not be a handler error"),
             Recorded::Unread {
-                kind: "email.opened".to_owned()
+                kind: "email.delivery_delayed".to_owned()
             }
         );
         assert!(refusals(&db, tenant).await.is_empty());
+    }
+
+    /// An open is a row in `message_events`, keyed on the provider's delivery
+    /// id: the same `svix-id` again is the same row, and the bridge says it
+    /// wrote nothing. Without a delivery id, the body's digest stands in — and
+    /// two different bodies are two rows.
+    ///
+    /// Guard checked biting on 2026-09-10: with `written` forced to `true` in
+    /// the bridge the second assertion fails; with the digest fallback removed
+    /// the third insert conflicts on an empty key.
+    #[tokio::test]
+    async fn an_open_is_recorded_once_per_delivery_and_never_a_handler_error() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let opened = r#"{"type":"email.opened","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_2","from":"lena@agents.example.com","to":[]}}"#;
+
+        let db = &db;
+        let read_with = |id: Option<&'static str>, body: &'static str| async move {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let read = record_raw_email_delivery(&mut tx, body.as_bytes(), id, now)
+                .await
+                .expect("a signal is never a handler error");
+            tx.commit().await.expect("commit");
+            read
+        };
+        let signal = |written: bool| Recorded::Signal {
+            kind: SignalKind::Opened,
+            written,
+        };
+
+        assert_eq!(read_with(Some("svix_1"), opened).await, signal(true));
+        assert_eq!(
+            read_with(Some("svix_1"), opened).await,
+            signal(false),
+            "a redelivery is one open, not two"
+        );
+        assert_eq!(read_with(None, opened).await, signal(true));
+        assert_eq!(read_with(Some(""), opened).await, signal(false));
+        let clicked = r#"{"type":"email.clicked","created_at":"2026-08-24T10:00:00Z",
+             "data":{"email_id":"email_out_2","click":{"link":"https://x.example/a"}}}"#;
+        assert_eq!(
+            read_with(None, clicked).await,
+            Recorded::Signal {
+                kind: SignalKind::Clicked,
+                written: true
+            }
+        );
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT kind, provider, link FROM message_events ORDER BY kind")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("rows");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "clicked".to_owned(),
+                    "resend".to_owned(),
+                    Some("https://x.example/a".to_owned())
+                ),
+                ("opened".to_owned(), "resend".to_owned(), None),
+                ("opened".to_owned(), "resend".to_owned(), None),
+            ]
+        );
+        assert!(refusals(db, tenant).await.is_empty());
     }
 
     /// The other half of the frontier, and the half a looser fix would have

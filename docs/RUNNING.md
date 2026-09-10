@@ -89,6 +89,7 @@ expensive defect available in this product.
 | Email | built | `providers/src/email.rs`, `email_resend.rs` |
 | Inbound STOP → suppression | built | `inbound.rs::land`, and the quote is cut first |
 | Provider refusal → suppression | built | `inbound.rs::record_refusal`, gated on `permanent` |
+| Delivered / opened / clicked → the chase knows | built | `message_events` (0091), written by `inbound.rs::record_raw_email_delivery` keyed on `svix-id`; the follow-up brief says "opened twice, the last 3 h ago" or "never opened"; `GET /v1/outreach/health?days=N` (default 30, max 365) → sent, delivered, opened, clicked, bounced, complained, and both rates in ‰ of sent; `store/traces.rs`, `routes/outreach.rs` |
 | Work queues | built | `outbox.rs`, `queue.rs` |
 | Chases (follow-ups) | built, twice | a turn's send: `follow_up.rs`, a calendar promise on the thread; the vertical's send: `vertical.rs`, `due_chase` on `contacts.next_follow_up_at`. Disjoint by sender, both settled by `inbound::land`; the promise is the one that survives the merge (`follow_up.rs` module docs) |
 | New turns | built | `turn.rs` |
@@ -492,7 +493,16 @@ hides its blanks is a map that lies.
 - **Is the Resend endpoint subscribed to `email.bounced` and `email.complained`?**
   A checkbox in a dashboard; no process here can read it. If it is unticked, the
   complaint path is correct and simply never runs, and the dashboard is what to
-  fix rather than any code.
+  fix rather than any code. **Same question for `email.delivered`,
+  `email.opened` and `email.clicked`** since 0091: Resend's *Add Webhook* form
+  ticks events one by one ("Select all events you want to observe",
+  <https://resend.com/docs/dashboard/webhooks/introduction>, read 2026-09-10),
+  and an unticked one leaves `message_events` empty and every chase reading
+  "never opened". Opens and clicks are also **off by default per domain**
+  (<https://resend.com/docs/dashboard/domains/tracking>, read 2026-09-10):
+  Domains → the domain → Configuration → *Enable tracking metrics*, which asks
+  for a tracking subdomain (e.g. `links.<domain>`) and one CNAME record.
+  `email.delivered` needs neither.
 - **A default run duration**, and what happens to work in flight when a window
   ends. Needed twice over: `POST /v1/org` still hires where there is no window,
   and there is no backfill for companies that predate `0054` — both blocked on

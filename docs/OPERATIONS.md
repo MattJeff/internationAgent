@@ -559,9 +559,9 @@ log line is safe to paste into a ticket.
 
 ---
 
-## 3. The five loops
+## 3. The six loops
 
-One binary, five `tokio` tasks, no separate workers. All five hang off one
+One binary, six `tokio` tasks, no separate workers. All six hang off one
 `CancellationToken` cancelled by SIGTERM or SIGINT, so they drain *alongside*
 the HTTP listener rather than after it.
 
@@ -572,6 +572,7 @@ the HTTP listener rather than after it.
 | `outbox` | 250ms idle | 32 |
 | `inbound` | 250ms idle | 8 |
 | `initiative` | 5s | 4 |
+| `sequence` | 30s | 100 |
 
 ### 3.1 provisioning — `apps/server/src/loops/provisioning.rs`
 
@@ -696,6 +697,53 @@ columns together:
 SELECT employee_id, interval_secs, next_at, claims,
        last_claimed_at, last_outcome, last_detail
 FROM   employee_initiative ORDER BY next_at;
+```
+
+### 3.4b sequence — `apps/server/src/loops/sequence.rs`
+
+Polls every **30s** and advances every `sequence_runs` row that is `active`
+with `next_at` in the past — one tenant transaction per run, under `FOR UPDATE
+SKIP LOCKED`. It is the sequencer (what Smartlead or Lemlist sell: trigger,
+email, wait, branch) with no UI: the founder defines the steps, the employee
+writes each email itself.
+
+**No second send path.** An `email` step posts nothing. It books a calendar
+promise *now* that names the run (`appointments.sequence_run_id`, 0092); the
+`initiative` loop rings it like any other promise, the turn is briefed with
+what the step asks for, and its `send_email` goes through the gate like any
+other — suppression, the day's stranger budget, `MAX_TOUCHES` (3 outbound per
+thread, after which the run stops with `stop_reason = 'max_touches'`). A reply
+landing on the thread ends the run in the landing transaction (`replied`); a
+wake that sends nothing within 24h stops it (`not_sent`); an address that opts
+out stops it before anything is booked (`suppressed`).
+
+```
+POST   /v1/sequences                 {name, steps}                → 201 {id} | 400 with the rule
+GET    /v1/sequences
+DELETE /v1/sequences/{id}            archive; live runs finish
+POST   /v1/sequences/{id}/enroll     {contact_id, employee_id}    → 201 {run_id} | 409 already | 403 suppressed
+GET    /v1/sequences/{id}/runs
+```
+
+`steps` is at most 12 entries, at least one `email`, and a branch may jump
+anywhere except onto itself or into a loop that has no `wait` in it:
+
+```json
+[
+  {"kind": "email",  "brief": "introduce us in three lines, one question at the end"},
+  {"kind": "wait",   "hours": 72},
+  {"kind": "branch", "on": "opened", "then": 3, "otherwise": 4},
+  {"kind": "email",  "brief": "they read it: offer a 15-minute call"},
+  {"kind": "email",  "brief": "they did not: same offer, shorter subject line"}
+]
+```
+
+`on` is `opened` or `clicked`, read from `message_events` (0091) on the run's
+last outbound message. A `then`/`otherwise` equal to the number of steps means
+"done".
+
+```sql
+SELECT id, step, state, stop_reason, next_at FROM sequence_runs ORDER BY next_at;
 ```
 
 ### 3.5 mcp — `apps/server/src/routes/mcp.rs::run`
@@ -1245,6 +1293,28 @@ Order inside the gate, and each step is load-bearing:
 Operationally: `audit_log` is where you answer "who did what and why". `approvals`
 is where a human is in the loop. `spend_buckets` holds one row per
 (tenant, employee, day, currency) and every reservation takes a write lock on it.
+
+### `deliverability` — un mail qui ressemble à du spam ne part pas
+
+`crates/app/src/deliverability.rs`, appelé par `Effects::send_email` et par
+elle seule — une facture (`send_invoice`) et un mot à un collègue
+(`send_internal`) ne sont pas de la prospection. Le contrôle court avant le
+jeton de désinscription, avant la ligne `provider_intents` et avant le
+fournisseur ; le modèle reçoit `failed (deliverability): …` avec une ligne par
+problème et réécrit lui-même. Pas de score, pas de réécriture automatique.
+
+Refus (un seul suffit) : sujet vide ; corps vide ; sujet tout en majuscules
+(≥ 3 lettres) ; plus de 3 URL dans le corps (le lien `List-Unsubscribe` de
+`0085` voyage en en-tête et ne compte pas) ; deux expressions à spam de la
+liste courte du module (`act now`, `cliquez ici`, `$$$`…, sans casse ni
+accents) ; plus de 30 % de majuscules sur ≥ 40 lettres ; plus de 3 `!` dans
+sujet + corps.
+
+Avertissements (journalisés en `info`, jamais bloquants) : sujet > 78
+caractères (RFC 5322 §2.1.1) ; corps < 20 mots ; une seule expression à spam ;
+une ligne qui n'est qu'une URL ; un corps qui ne demande rien. Les sources sont
+citées et datées en tête du module ; les 0,3 % de plaintes que ces règles
+protègent sont `Deliverability::MAX_REFUSALS_PER_MILLE` dans `policy.rs`.
 
 ### `Untrusted<T>` — documents are data, never instructions
 

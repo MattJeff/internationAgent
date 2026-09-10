@@ -1161,7 +1161,14 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // inside a transaction, and nothing else in the suite would notice. It has
     // now caught two additions in a row, which is the whole argument for
     // asserting the count rather than only the names.
-    for loop_name in ["provisioning", "outbox", "inbound", "mcp", "initiative"] {
+    for loop_name in [
+        "provisioning",
+        "outbox",
+        "inbound",
+        "mcp",
+        "initiative",
+        "sequence",
+    ] {
         assert!(
             logs.contains(&format!("\"loop_name\":\"{loop_name}\"")),
             "the {loop_name} loop never reported draining; was it spawned?\n{logs}"
@@ -1171,7 +1178,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // than also catching a loop's own "…loop drained" farewell line.
     assert_eq!(
         logs.matches("\"loop_name\":").count(),
-        5,
+        6,
         "every loop has to be joined, not all but one:\n{logs}"
     );
     assert!(

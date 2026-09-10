@@ -83,6 +83,7 @@ use crate::calendar::{Calendar, CalendarError, PgCalendar};
 use crate::follow_up;
 use crate::gate::{Authorizable, Authorized, Principal};
 use crate::inbound::{self, Briefing, Delivered, Errand, InternalError, Thread};
+use crate::sequence;
 use crate::turn::WHOLE_PAGE;
 pub use agentos_providers::telephony::{Announcement, NotSpeakable};
 
@@ -897,6 +898,21 @@ pub enum EffectError {
     #[error("refused: {0}")]
     Refused(&'static str),
 
+    /// Le mail ressemble à du spam et n'est pas parti.
+    ///
+    /// Pas un [`Refused`](EffectError::Refused) : celui-là porte un code fermé
+    /// et rien d'autre, et un code seul apprend au modèle à ne plus demander.
+    /// Ici c'est l'inverse qu'on veut — qu'il redemande, avec un autre texte —
+    /// donc le verdict voyage entier et `Display` liste chaque problème sur sa
+    /// ligne, ce que `turn::performed` rend tel quel. `code()` reste fermé :
+    /// [`crate::deliverability::CODE`].
+    ///
+    /// Une facture (`send_invoice`) et un mot à un collègue (`send_internal`)
+    /// ne passent pas par ce contrôle : ni l'un ni l'autre n'est de la
+    /// prospection, et seul [`Effects::send_email`] le fait.
+    #[error("the email reads like spam and was not sent; rewrite it:\n{0}")]
+    Deliverability(crate::deliverability::Verdict),
+
     /// The effect could not be recorded, so it is reported as failed. The audit
     /// row and the effect are one unit: an unrecorded effect is worse than a
     /// missing one.
@@ -911,6 +927,7 @@ impl EffectError {
             EffectError::Provider(err) => err.code(),
             EffectError::OutOfScope(_) => "out_of_scope",
             EffectError::Refused(code) => code,
+            EffectError::Deliverability(_) => crate::deliverability::CODE,
             EffectError::Unavailable(_) => "unavailable",
         }
     }
@@ -1079,6 +1096,28 @@ impl Effects {
         ok: Authorized<A>,
         body: RenderedEmail,
     ) -> Result<ProviderMessageId, EffectError> {
+        // Le lecteur qui dit non — ici et pas dans `dispatch_email`, parce que
+        // cette méthode est la seule route de la prospection : `send_invoice`
+        // partage `dispatch_email` et une facture n'a pas à passer un contrôle
+        // de spam, `send_internal` est un autre port et un collègue non plus.
+        // Avant le jeton de désinscription (une écriture), avant `begin_send`
+        // (une ligne d'intention), avant le fournisseur : un mail refusé ne
+        // laisse rien derrière lui que la décision de la porte — et la place
+        // d'inconnu que la porte a prise en la rendant, comme pour tout envoi
+        // que le fournisseur refuse ensuite. Les avertissements ne bloquent
+        // pas ; un `ProviderMessageId` n'a pas de place pour eux, alors ils
+        // vont au journal.
+        let verdict = crate::deliverability::check(&body.subject, &body.body_text);
+        if verdict.is_refused() {
+            return Err(EffectError::Deliverability(verdict));
+        }
+        if !verdict.warnings.is_empty() {
+            tracing::info!(
+                employee = %self.principal.employee_id.as_uuid(),
+                warnings = %verdict,
+                "email sent with deliverability warnings"
+            );
+        }
         let email = OutboundEmail {
             from: body.from,
             // The recipient is the one that was ruled on, not one the renderer
@@ -3114,6 +3153,15 @@ impl Effects {
         let promised = async {
             let thread =
                 follow_up::sent(&mut tx, employee, to, Some(subject), sent.as_str(), now).await?;
+            // A send a sequence step was waiting for advances the run, and the
+            // sequence is then the chase: no J+3 promise beside it, or the
+            // thread is written to twice on day three by two mechanisms.
+            if sequence::sent(&mut tx, employee, thread, to, sent.as_str(), now)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
             follow_up::schedule(&mut tx, employee, thread, to, now).await
         }
         .await
@@ -6445,5 +6493,158 @@ mod tests {
         tx.rollback().await.expect("rollback");
         assert_eq!(all.len(), 1, "closing is a column, not a delete");
         assert!(all[0].closed_at.is_some() && all[0].assignee_id == Some(lena));
+    }
+
+    // -- délivrabilité --------------------------------------------------------
+
+    /// Un corps à `n` liens, par ailleurs honnête.
+    fn linked_body(n: usize) -> String {
+        let links = (0..n)
+            .map(|i| format!("la fiche {i} : https://acme.example/fiche/{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Bonjour,\n\nvoici les pages dont nous avons parlé, chacune avec le \
+             délai de traitement du visa concerné, pour vos équipes export.\n{links}\n\n\
+             Pouvez-vous me dire laquelle vous intéresse ?\n\nLena"
+        )
+    }
+
+    /// **Le refus précède le fournisseur, et il ne vaut que pour l'extérieur.**
+    ///
+    /// Quatre liens vers un prospect : le mock n'a rien reçu, aucune ligne
+    /// `provider_call_attempted` n'a été écrite, et l'erreur porte les
+    /// problèmes dans son texte — c'est ce que `turn::performed` rend au
+    /// modèle. Le même corps à un collègue part : `send_internal` est un autre
+    /// port, et un mot entre collègues n'est pas de la prospection.
+    #[tokio::test]
+    async fn a_spam_looking_email_is_refused_before_the_provider_and_a_colleague_gets_it_anyway() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let (bruno, _, _) = org_around(&db, &principal).await;
+        // `seed` n'ouvre pas le canal interne ; la même recette que
+        // `follow_up`'s test, qui a le même besoin.
+        agentos_store::policy::install(
+            &db,
+            principal.tenant_id,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Internal]),
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("open the internal channel");
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+            }),
+            principal.clone(),
+        );
+        let spam = linked_body(crate::deliverability::MAX_LINKS + 1);
+
+        let ok = gate(&db)
+            .authorize(&principal, to("marie@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        let refused = effects
+            .send_email(
+                ok,
+                RenderedEmail {
+                    from: "lena@acme.example".to_owned(),
+                    subject: "Vos visas".to_owned(),
+                    body_text: spam.clone(),
+                    in_reply_to: None,
+                },
+            )
+            .await
+            .expect_err("four links is a newsletter, not a letter");
+        assert_eq!(refused.code(), crate::deliverability::CODE);
+        let text = refused.to_string();
+        assert!(
+            text.contains("- too_many_links: 4 links in the body, at most 3"),
+            "the model must read which rule bit: {text}"
+        );
+        assert_eq!(email.sent_count(), 0, "nothing reached the provider");
+        assert!(
+            effect_rows(&db, &principal).await.is_empty(),
+            "nothing was attempted, so nothing says it was"
+        );
+
+        let ok = gate(&db)
+            .authorize(&principal, InternalSend { to: slug("bruno") })
+            .await
+            .expect("a team-mate");
+        let delivered = effects
+            .send_internal(
+                ok,
+                &InternalNote {
+                    errand: Errand::Question,
+                    body: spam,
+                    thread: None,
+                },
+            )
+            .await
+            .expect("the same words to a colleague are a note, not prospecting");
+        assert_eq!(delivered.recipient, bruno);
+    }
+
+    /// **Le lien de désinscription que nous ajoutons n'est pas un lien du
+    /// corps.** Exactement `MAX_LINKS` liens dans le texte, et le jeton de
+    /// `0085` minté en plus : le mail part, le mock porte le jeton en en-tête,
+    /// et le corps qu'il a reçu est celui du modèle, à trois liens.
+    #[tokio::test]
+    async fn the_unsubscribe_link_we_add_does_not_count_against_max_links() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+            }),
+            principal.clone(),
+        );
+        let ok = gate(&db)
+            .authorize(&principal, to("marie@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        let body = linked_body(crate::deliverability::MAX_LINKS);
+        effects
+            .send_email(
+                ok,
+                RenderedEmail {
+                    from: "lena@acme.example".to_owned(),
+                    subject: "Vos visas".to_owned(),
+                    body_text: body.clone(),
+                    in_reply_to: None,
+                },
+            )
+            .await
+            .expect("three links and the way out is still three links");
+        let sent = email.sent_emails();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].unsubscribe_token.is_some(),
+            "the way out was minted for a stranger"
+        );
+        assert_eq!(
+            sent[0].body_text, body,
+            "the body is the model's, untouched"
+        );
+        assert_eq!(sent[0].body_text.matches("https://").count(), 3);
     }
 }

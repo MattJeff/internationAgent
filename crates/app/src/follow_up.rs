@@ -80,6 +80,7 @@ use agentos_domain::ids::{AppointmentId, ConversationId, EmployeeId, TenantId};
 use agentos_domain::message::Channel;
 use agentos_store::calendar;
 use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::traces;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -221,10 +222,20 @@ pub async fn schedule(
 /// What is said, in our voice, when a follow-up's hour comes round.
 ///
 /// Every value in it is ours: the date is `max(received_at)` over the thread's
-/// outbound rows. The address is *not* here, on purpose — it is in the
-/// promise's subject line, which the wake already shows inside a frame, and a
-/// domain is a stranger's text however short. `None` when the thread cannot be
-/// read, and the turn runs on the frame alone.
+/// outbound rows, and the engagement is `traces::engagement` over the same
+/// rows. The address is *not* here, on purpose — it is in the promise's subject
+/// line, which the wake already shows inside a frame, and a domain is a
+/// stranger's text however short. `None` when the thread cannot be read, and
+/// the turn runs on the frame alone.
+///
+/// # Why the engagement is in the sentence
+///
+/// "Opened twice, never answered" and "never opened" do not call for the same
+/// mail: the first person read it and passed, the second never saw it. A
+/// sequencer's whole value to a salesperson is that second line, and the
+/// signals were already arriving (`0091`); this is where they reach the seat.
+/// The clicked link is ours — the model wrote it into the mail — so it is
+/// rendered as-is, bounded by `Signal::MAX_LINK` at the parser.
 pub async fn brief(db: &Db, tenant: TenantId, conversation: ConversationId) -> Option<String> {
     let mut tx = db.tenant_tx(tenant).await.ok()?;
     let since: Option<DateTime<Utc>> = sqlx::query_scalar(
@@ -235,15 +246,56 @@ pub async fn brief(db: &Db, tenant: TenantId, conversation: ConversationId) -> O
     .fetch_one(&mut **tx)
     .await
     .ok()?;
+    // A trace read that fails is not a reason to wake the employee with no
+    // brief at all: the follow-up stands on `since`, the engagement only
+    // colours it. `Default` reads as "never opened", which is the honest
+    // sentence when nothing could be read.
+    let engagement = traces::engagement(&mut tx, conversation)
+        .await
+        .unwrap_or_default();
     let _ = tx.rollback().await;
     let since = since?;
     Some(format!(
         "This hour is a follow-up. You wrote to the contact named in the frame below on {} and \
-         nothing has come back since. Write to them once more on the same thread, briefly, with \
-         one reason to answer — and if the send is refused, they have asked to be left alone and \
-         that is the answer.",
-        since.format("%Y-%m-%d")
+         nothing has come back since. {} Write to them once more on the same thread, briefly, \
+         with one reason to answer — and if the send is refused, they have asked to be left \
+         alone and that is the answer.",
+        since.format("%Y-%m-%d"),
+        engagement_line(&engagement, Utc::now()),
     ))
+}
+
+/// One sentence on what the provider saw: "Never opened." or "Opened 2 times,
+/// the last 3 h ago, and clicked https://…".
+fn engagement_line(engagement: &traces::Engagement, now: DateTime<Utc>) -> String {
+    let Some(last) = engagement.last_opened_at.filter(|_| engagement.opened > 0) else {
+        return "They never opened it.".to_owned();
+    };
+    let ago = now.signed_duration_since(last);
+    let ago = match (ago.num_hours(), ago.num_days()) {
+        (h, _) if h < 1 => "less than an hour ago".to_owned(),
+        (h, d) if d < 2 => format!("{h} h ago"),
+        (_, d) => format!("{d} days ago"),
+    };
+    let times = match engagement.opened {
+        1 => "once".to_owned(),
+        n => format!("{n} times"),
+    };
+    // ponytail: three links at most — a brief is read by a model per token,
+    // and a fourth link says nothing the first three did not.
+    let links: Vec<&str> = engagement
+        .links
+        .iter()
+        .map(String::as_str)
+        .take(3)
+        .collect();
+    match links.is_empty() {
+        true => format!("They opened it {times}, the last {ago}, and clicked nothing."),
+        false => format!(
+            "They opened it {times}, the last {ago}, and clicked {}.",
+            links.join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -382,16 +434,55 @@ mod tests {
         assert_eq!(diary[0].conversation_id, Some(thread));
         assert_eq!(diary[0].at, now + TimeDelta::hours(72));
         assert_eq!(diary[0].subject, "follow up · p…@prospect.example");
+        let wake = brief(&db, tenant, thread)
+            .await
+            .expect("the thread has a last outbound");
         assert!(
-            brief(&db, tenant, thread)
-                .await
-                .expect("the thread has a last outbound")
-                .contains(&now.format("%Y-%m-%d").to_string()),
-            "the wake says since when"
+            wake.contains(&now.format("%Y-%m-%d").to_string()),
+            "the wake says since when: {wake}"
+        );
+        assert!(
+            wake.contains("They never opened it."),
+            "no trace yet, and the wake says so: {wake}"
         );
         assert!(
             brief(&db, other, thread).await.is_none(),
             "tenant B reads nothing on tenant A's thread"
+        );
+
+        // The provider reports two opens and a click on that mail. The wake
+        // now says so, in one sentence, with the link — that is the difference
+        // between a chase to somebody who read it and one to somebody who did
+        // not. Guard checked biting on 2026-09-10: with `engagement_line`
+        // returning the "never opened" arm unconditionally, this fails.
+        {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            for (kind, link, event) in [
+                ("opened", None, "svix_o1"),
+                ("opened", None, "svix_o2"),
+                ("clicked", Some("https://offer.example/x"), "svix_c1"),
+            ] {
+                let signal = traces::Signal {
+                    kind,
+                    provider_message_id: "msg-1",
+                    link,
+                    occurred_at: Utc::now() - TimeDelta::hours(3),
+                };
+                assert!(
+                    traces::record(&mut tx, "resend", signal, event)
+                        .await
+                        .expect("record")
+                );
+            }
+            tx.commit().await.expect("commit");
+        }
+        let wake = brief(&db, tenant, thread).await.expect("brief");
+        assert!(
+            wake.contains(
+                "They opened it 2 times, the last 3 h ago, and clicked \
+                           https://offer.example/x."
+            ),
+            "{wake}"
         );
 
         // A second email before the hour: one promise, measured from the newest.

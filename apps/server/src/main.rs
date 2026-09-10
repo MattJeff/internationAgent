@@ -486,6 +486,10 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 cancel.clone(),
             )),
         ),
+        (
+            "sequence",
+            tokio::spawn(loops::sequence::run(db.clone(), cancel.clone())),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -711,6 +715,7 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))
             .merge(routes::controls::router(db.clone()))
@@ -1533,7 +1538,12 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
         // fix. Never the payload and never the provider's text in `why`:
         // `code()` is a fixed label and every `InboundError` renders from an
         // authored sentence, and this string is written to `last_error`.
-        let recorded = record_raw_email_delivery(tx, body.as_bytes(), Utc::now())
+        // The provider's own delivery id (`svix-id`), filed by the route beside
+        // the body; `message_events` dedupes a replayed signal on it. Absent
+        // on rows written before the route filed it, and the bridge then keys
+        // on the body's digest.
+        let delivery_id = event.payload.get("event_id").and_then(Value::as_str);
+        let recorded = record_raw_email_delivery(tx, body.as_bytes(), delivery_id, Utc::now())
             .await
             .map_err(|err| {
                 let why = format!("{}: {err}", err.code());
@@ -1565,6 +1575,15 @@ fn on_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'
                     permanent = refusal.permanent,
                     recipients = refusal.addresses.len(),
                     "the far end refused our mail; recorded on the audit trail"
+                );
+            }
+            // `debug`: one line per open on a list of thousands is noise, and
+            // the row is the record. `written = false` is a replay, not a fault.
+            Recorded::Signal { kind, written } => {
+                tracing::debug!(
+                    kind = kind.as_str(),
+                    written,
+                    "the provider reported a delivery signal; recorded in message_events"
                 );
             }
             // `?` and never `%`: third-party text, headed for a log line.

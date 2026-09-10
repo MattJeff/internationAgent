@@ -1248,7 +1248,15 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
     // path an ordinary inbound takes — fenced, with the masked sender as the
     // origin — so the turn is untrusted from here on, which is right: it is
     // the text of somebody nobody here has met.
-    if let Some(thread) = due.kept.as_ref().and_then(|kept| kept.conversation_id) {
+    //
+    // A promise that names a sequence run (`0092`) is a step of one, and the
+    // step says what to write: `sequence::brief` speaks first and the
+    // follow-up's is not asked, since the sequence is the chase on that thread.
+    if let Some(run) = due.kept.as_ref().and_then(|kept| kept.sequence_run_id) {
+        if let Some(brief) = agentos_app::sequence::brief(&agent.db, due.tenant_id, run).await {
+            context = context.with_task(brief);
+        }
+    } else if let Some(thread) = due.kept.as_ref().and_then(|kept| kept.conversation_id) {
         match agentos_app::follow_up::brief(&agent.db, due.tenant_id, thread).await {
             Some(brief) => context = context.with_task(brief),
             None => {

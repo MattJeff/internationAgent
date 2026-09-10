@@ -232,6 +232,78 @@ pub struct Refusal {
     pub at: Option<DateTime<Utc>>,
 }
 
+/// Which of the three delivery signals a provider reported.
+///
+/// Three and not more, because `message_events_kind` (`0091`) admits exactly
+/// these three strings and [`SignalKind::as_str`] is the spelling that CHECK
+/// reads. Refusals have their own type ([`Refusal`]) and their own table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    /// `email.delivered`: the recipient's mail server took it.
+    Delivered,
+    /// `email.opened`: a tracking pixel was fetched.
+    Opened,
+    /// `email.clicked`: a tracked link was followed.
+    Clicked,
+}
+
+impl SignalKind {
+    /// The `kind` column's spelling, as `message_events_kind` CHECKs it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Opened => "opened",
+            Self::Clicked => "clicked",
+        }
+    }
+}
+
+/// What the provider tells us about a mail after it took it: delivered, opened,
+/// clicked.
+///
+/// Shape read off Resend's per-event pages on 2026-09-10 —
+/// <https://resend.com/docs/webhooks/emails/delivered>, `/opened`, `/clicked`,
+/// linked from <https://resend.com/docs/dashboard/webhooks/event-types>. All
+/// three carry `type`, a top-level `created_at` (ISO 8601, "when the webhook
+/// event was created"), and `data.{email_id, from, to, subject, created_at,
+/// broadcast_id, message_id, tags}`. `email.clicked` adds
+/// `data.click { ipAddress, link, timestamp, userAgent }`. Only `email_id`, the
+/// event's `created_at` and `click.link` are read here: the rest is either
+/// already on the `messages` row we sent or is nobody's business to keep
+/// (an IP address and a user agent are personal data with no reader).
+///
+/// Resend documents that **order is not guaranteed** — an `email.opened` may
+/// arrive before the `email.delivered` for the same mail — and that delivery
+/// is at-least-once, deduplicated by the `svix-id` header. Both are the
+/// caller's problem, and `agentos_store::traces::record` is where they are
+/// solved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signal {
+    /// Which of the three.
+    pub kind: SignalKind,
+    /// `data.email_id`: the provider's id for the mail **we sent**, the one
+    /// `messages.provider_message_id` holds since `follow_up::sent` wrote it.
+    pub provider_message_id: ProviderMessageId,
+    /// `data.click.link`, for [`SignalKind::Clicked`] only, cut at
+    /// [`Signal::MAX_LINK`] characters; `None` on the other two kinds and on a
+    /// click that carried no `click` block. The table CHECKs the first half
+    /// (`message_events_link_only_when_clicked`), so it is enforced here and
+    /// not merely documented.
+    pub link: Option<String>,
+    /// The event's own `created_at`. Required, unlike [`Refusal::at`]: a signal
+    /// exists only to be dated and counted, and a payload missing it is not the
+    /// documented shape — refused rather than dated by whenever the poller ran.
+    pub at: DateTime<Utc>,
+}
+
+impl Signal {
+    /// Longest link kept. 2 048 characters is the conventional upper bound a
+    /// browser accepts in an address bar; the links in our own mail are far
+    /// shorter, and a longer one is a tracking wrapper nobody reads past that
+    /// point. It lands in a column and in a brief, so it is sized by us.
+    pub const MAX_LINK: usize = 2048;
+}
+
 /// What a verified email webhook body turns out to be.
 ///
 /// # Why this exists beside [`InboundNotice::parse`]
@@ -269,6 +341,10 @@ pub enum Delivery {
     /// The far end refused our mail.
     Refused(Refusal),
 
+    /// The far end took our mail, opened it, or clicked in it. Recorded in
+    /// `message_events` (`0091`) and read back by the follow-up brief.
+    Signal(Signal),
+
     /// A type this build has no reader for.
     ///
     /// **Not an error, and not to be dropped in silence either.** Retrying will
@@ -292,6 +368,15 @@ impl Delivery {
 
     /// The `type` of a bounce.
     pub const BOUNCED: &'static str = "email.bounced";
+
+    /// The `type` of a delivery report.
+    pub const DELIVERED: &'static str = "email.delivered";
+
+    /// The `type` of an open.
+    pub const OPENED: &'static str = "email.opened";
+
+    /// The `type` of a click.
+    pub const CLICKED: &'static str = "email.clicked";
 
     /// Longest `type` string carried out of a payload and into a log.
     ///
@@ -327,6 +412,9 @@ impl Delivery {
             InboundNotice::EVENT => return InboundNotice::parse(raw_body).map(Self::Received),
             Self::COMPLAINED => "complaint",
             Self::BOUNCED => "bounce",
+            Self::DELIVERED => return Self::signal(&body, SignalKind::Delivered),
+            Self::OPENED => return Self::signal(&body, SignalKind::Opened),
+            Self::CLICKED => return Self::signal(&body, SignalKind::Clicked),
             _ => {
                 return Ok(Self::Unread {
                     kind: kind.chars().take(Self::MAX_KIND).collect(),
@@ -368,6 +456,42 @@ impl Delivery {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
                 .map(|at| at.with_timezone(&Utc)),
+        }))
+    }
+
+    /// One of the three signals, out of an already-decoded body. See
+    /// [`Signal`] for the shape and where it was read.
+    fn signal(body: &serde_json::Value, kind: SignalKind) -> Result<Self, ParseError> {
+        let email_id = body
+            .pointer("/data/email_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(ParseError::MissingField {
+                field: "data.email_id",
+            })?;
+        let at = body
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .ok_or(ParseError::MissingField {
+                field: "created_at",
+            })?
+            .with_timezone(&Utc);
+        // Only a click carries a link, and only when the provider sent the
+        // block: a click without it is still a click, counted with no URL.
+        let link = match kind {
+            SignalKind::Clicked => body
+                .pointer("/data/click/link")
+                .and_then(serde_json::Value::as_str)
+                .filter(|link| !link.is_empty())
+                .map(|link| link.chars().take(Signal::MAX_LINK).collect()),
+            SignalKind::Delivered | SignalKind::Opened => None,
+        };
+        Ok(Self::Signal(Signal {
+            kind,
+            provider_message_id: ProviderRef::new(email_id),
+            link,
+            at,
         }))
     }
 }
@@ -1732,7 +1856,7 @@ mod tests {
     /// says so — so it comes back `Ok`, named, and bounded.
     #[test]
     fn an_unknown_type_is_read_as_unread_rather_than_retried_or_dropped() {
-        for kind in ["email.opened", "email.clicked", "contact.deleted", "wat"] {
+        for kind in ["email.delivery_delayed", "contact.deleted", "wat"] {
             let body = serde_json::to_vec(&serde_json::json!({
                 "type": kind,
                 "created_at": "2026-08-24T10:00:00Z",
@@ -1759,6 +1883,118 @@ mod tests {
             panic!("an oversized type was not read as a novelty");
         };
         assert_eq!(kind.chars().count(), Delivery::MAX_KIND);
+    }
+
+    /// The three signals, in the shape Resend documents (see [`Signal`]):
+    /// `data.email_id` names the mail we sent, the event's `created_at` dates
+    /// it, and only a click carries a link.
+    #[test]
+    fn delivered_opened_and_clicked_are_signals_naming_the_mail_we_sent() {
+        let body = |kind: &str, extra: serde_json::Value| {
+            let mut data = serde_json::json!({
+                "broadcast_id": "8b146471-e88e-4322-86af-016cd36fd216",
+                "created_at": "2026-02-22T23:41:11.894Z",
+                "email_id": "56761188-7520-42d8-8898-ff6fc54ce618",
+                "message_id": "<111-222-333@email.example.com>",
+                "from": "Acme <onboarding@resend.dev>",
+                "to": ["delivered@resend.dev"],
+                "subject": "Sending this example",
+                "tags": { "category": "confirm_email" },
+            });
+            if let Some(more) = extra.as_object() {
+                for (key, value) in more {
+                    data[key] = value.clone();
+                }
+            }
+            serde_json::to_vec(&serde_json::json!({
+                "type": kind, "created_at": "2026-02-22T23:41:12.126Z", "data": data,
+            }))
+            .expect("serialize")
+        };
+        let at = DateTime::parse_from_rfc3339("2026-02-22T23:41:12.126Z")
+            .expect("rfc3339")
+            .with_timezone(&Utc);
+        let id = ProviderRef::new("56761188-7520-42d8-8898-ff6fc54ce618");
+
+        for (kind, expected) in [
+            (Delivery::DELIVERED, SignalKind::Delivered),
+            (Delivery::OPENED, SignalKind::Opened),
+        ] {
+            assert_eq!(
+                Delivery::parse(&body(kind, serde_json::json!({}))),
+                Ok(Delivery::Signal(Signal {
+                    kind: expected,
+                    provider_message_id: id.clone(),
+                    link: None,
+                    at,
+                })),
+                "{kind}"
+            );
+        }
+
+        // A click, with the block Resend documents. The IP and the user agent
+        // are not carried out.
+        let click = serde_json::json!({ "click": {
+            "ipAddress": "122.115.53.11",
+            "link": "https://resend.com",
+            "timestamp": "2026-11-24T05:00:57.163Z",
+            "userAgent": "Mozilla/5.0",
+        }});
+        assert_eq!(
+            Delivery::parse(&body(Delivery::CLICKED, click)),
+            Ok(Delivery::Signal(Signal {
+                kind: SignalKind::Clicked,
+                provider_message_id: id.clone(),
+                link: Some("https://resend.com".to_owned()),
+                at,
+            }))
+        );
+
+        // A click with no `click` block is still a click: counted, no URL,
+        // and never an error — retrying will not grow the block.
+        assert_eq!(
+            Delivery::parse(&body(Delivery::CLICKED, serde_json::json!({}))),
+            Ok(Delivery::Signal(Signal {
+                kind: SignalKind::Clicked,
+                provider_message_id: id,
+                link: None,
+                at,
+            }))
+        );
+
+        // The link is bounded: it lands in a column and in a brief.
+        let long = serde_json::json!({ "click": {
+            "link": "https://x.example/".to_owned() + &"a".repeat(5000),
+        }});
+        let Ok(Delivery::Signal(Signal {
+            link: Some(link), ..
+        })) = Delivery::parse(&body(Delivery::CLICKED, long))
+        else {
+            panic!("a long link was not read as a click");
+        };
+        assert_eq!(link.chars().count(), Signal::MAX_LINK);
+
+        // And the two fields a signal cannot do without.
+        let no_id = serde_json::to_vec(&serde_json::json!({
+            "type": Delivery::OPENED, "created_at": "2026-02-22T23:41:12.126Z", "data": {},
+        }))
+        .expect("serialize");
+        assert_eq!(
+            Delivery::parse(&no_id),
+            Err(ParseError::MissingField {
+                field: "data.email_id"
+            })
+        );
+        let no_date = serde_json::to_vec(&serde_json::json!({
+            "type": Delivery::OPENED, "data": { "email_id": "e_1" },
+        }))
+        .expect("serialize");
+        assert_eq!(
+            Delivery::parse(&no_date),
+            Err(ParseError::MissingField {
+                field: "created_at"
+            })
+        );
     }
 
     /// The frontier itself: what is still an `Err`, and therefore still worth a

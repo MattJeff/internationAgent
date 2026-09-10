@@ -83,13 +83,14 @@
 use std::collections::BTreeMap;
 
 use agentos_store::db::{Db, StoreError};
+use agentos_store::traces;
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get as get_route;
-use chrono::{Duration, NaiveDate};
-use serde::Serialize;
+use chrono::{Duration, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::pnl::PnlQuery;
 use crate::auth::Principal;
@@ -99,6 +100,7 @@ use crate::error::ApiError;
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/outreach", get_route(get))
+        .route("/v1/outreach/health", get_route(health))
         .with_state(db)
 }
 
@@ -295,6 +297,87 @@ async fn get(
         suppressed: totals[1],
         by_day,
         unmeasured: UNMEASURED,
+    })
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/outreach/health — la santé du domaine d'envoi
+// ---------------------------------------------------------------------------
+//
+// Six comptes depuis `now - days` et deux taux, lus par
+// `agentos_store::traces::health` : envoyé, livré, ouvert, cliqué depuis
+// `messages` et `message_events` (0091), rebondi et plainte depuis
+// `suppressions` (0011). Les taux sont en **pour mille sur `sent`**, parce que
+// c'est l'unité des seuils que Google et Yahoo publient pour un expéditeur en
+// masse (0,3 % de plaintes = 3 ‰) et qu'un pourcentage à deux décimales se lit
+// mal ; `0` quand rien n'est parti, jamais une division par zéro.
+//
+// `days` est un entier de jours et non la fenêtre de `PnlQuery` : ici la
+// question est « depuis quand » sur des instants, pas « quels jours » sur des
+// dates, et une borne à 365 suffit à un domaine — les traces de plus d'un an
+// ne disent rien de sa réputation d'aujourd'hui.
+
+/// `?days=N`, défaut [`HEALTH_DEFAULT_DAYS`], au plus [`HEALTH_MAX_DAYS`].
+#[derive(Debug, Deserialize)]
+struct HealthQuery {
+    days: Option<i64>,
+}
+
+const HEALTH_DEFAULT_DAYS: i64 = 30;
+const HEALTH_MAX_DAYS: i64 = 365;
+
+#[derive(Debug, Serialize)]
+struct HealthView {
+    days: i64,
+    sent: u32,
+    delivered: u32,
+    opened: u32,
+    clicked: u32,
+    bounced: u32,
+    complained: u32,
+    /// `complained * 1000 / sent`, deux décimales ; `0` si rien n'est parti.
+    complaint_rate_per_mille: f64,
+    /// `bounced * 1000 / sent`, deux décimales ; `0` si rien n'est parti.
+    bounce_rate_per_mille: f64,
+}
+
+/// `n` pour mille de `sent`, arrondi à deux décimales.
+fn per_mille(n: u32, sent: u32) -> f64 {
+    match sent {
+        0 => 0.0,
+        sent => (f64::from(n) * 1000.0 / f64::from(sent) * 100.0).round() / 100.0,
+    }
+}
+
+async fn health(
+    State(db): State<Db>,
+    principal: Principal,
+    query: Result<Query<HealthQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let days = query.days.unwrap_or(HEALTH_DEFAULT_DAYS);
+    if !(1..=HEALTH_MAX_DAYS).contains(&days) {
+        return Err(ApiError::bad_request(format!(
+            "days: between 1 and {HEALTH_MAX_DAYS}"
+        )));
+    }
+    let since = Utc::now() - Duration::days(days);
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let health = traces::health(&mut tx, since).await?;
+    tx.commit().await?;
+
+    Ok(axum::Json(HealthView {
+        days,
+        sent: health.sent,
+        delivered: health.delivered,
+        opened: health.opened,
+        clicked: health.clicked,
+        bounced: health.bounced,
+        complained: health.complained,
+        complaint_rate_per_mille: per_mille(health.complained, health.sent),
+        bounce_rate_per_mille: per_mille(health.bounced, health.sent),
     })
     .into_response())
 }
@@ -727,5 +810,153 @@ mod tests {
         assert_eq!(body["booked"], Value::from(0), "{body}");
 
         h.teardown().await;
+    }
+
+    /// Un mail sortant e-mail, comme `follow_up::sent` l'écrit, daté d'un jour.
+    async fn outbound(
+        db: &Db,
+        tenant: TenantId,
+        seat: EmployeeId,
+        conversation: Uuid,
+        provider_message_id: &str,
+        day: NaiveDate,
+    ) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
+                  provider_message_id, trust_label, idempotency_key, received_at, created_at) \
+             VALUES ($1, $2, $3, $4, 'email', 'outbound', '', $5, 'trusted', $6, $7, $7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(conversation)
+        .bind(seat.as_uuid())
+        .bind(provider_message_id)
+        .bind(format!("sent:{provider_message_id}"))
+        .bind(noon(day))
+        .execute(&mut **tx)
+        .await
+        .expect("message");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **`/v1/outreach/health` : six comptes, deux taux en pour mille, et le
+    /// locataire d'à côté lit des zéros.** `days` a un défaut, un maximum de
+    /// 365 et refuse zéro — les deux bornes vérifiées mordantes le 2026-09-10
+    /// (`HEALTH_MAX_DAYS = 366` fait passer `?days=366` et rougit le test).
+    #[tokio::test]
+    async fn la_sante_du_domaine_compte_et_taux_en_pour_mille() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let today = Utc::now().date_naive();
+        let fil = thread(&h.db, h.a, h.seat_a, "email").await;
+        // Quatre envoyés, dont un hors fenêtre de 7 jours.
+        for (id, day) in [
+            ("h_1", today),
+            ("h_2", today),
+            ("h_3", today),
+            ("h_old", today - Duration::days(40)),
+        ] {
+            outbound(&h.db, h.a, h.seat_a, fil, id, day).await;
+        }
+        {
+            let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+            for (kind, id, event) in [
+                ("delivered", "h_1", "e1"),
+                ("delivered", "h_2", "e2"),
+                ("opened", "h_1", "e3"),
+                ("clicked", "h_1", "e4"),
+            ] {
+                let signal = traces::Signal {
+                    kind,
+                    provider_message_id: id,
+                    link: (kind == "clicked").then_some("https://x.example"),
+                    occurred_at: noon(today),
+                };
+                assert!(
+                    traces::record(&mut tx, "resend", signal, event)
+                        .await
+                        .expect("record")
+                );
+            }
+            tx.commit().await.expect("commit");
+        }
+        // Un rebond permanent et une plainte, comme `inbound::record_refusal`
+        // les écrit ; un opt-out, qui n'est ni l'un ni l'autre.
+        {
+            let mut tx = h.db.tenant_tx(h.a).await.expect("tx");
+            for (address, reason) in [
+                ("bounced@x.example", "bounce"),
+                ("angry@x.example", "complaint"),
+                ("gone@x.example", "opt_out"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO suppressions \
+                         (id, tenant_id, scope, channel, address, reason, suppressed_at) \
+                     VALUES ($1, $2, 'tenant', 'email', $3, $4, $5)",
+                )
+                .bind(Uuid::now_v7())
+                .bind(h.a.as_uuid())
+                .bind(address)
+                .bind(reason)
+                .bind(noon(today))
+                .execute(&mut **tx)
+                .await
+                .expect("suppression");
+            }
+            tx.commit().await.expect("commit");
+        }
+
+        let (status, body) = h.get("/v1/outreach/health?days=7", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["days"], Value::from(7));
+        assert_eq!(body["sent"], Value::from(3), "{body}");
+        assert_eq!(body["delivered"], Value::from(2), "{body}");
+        assert_eq!(body["opened"], Value::from(1), "{body}");
+        assert_eq!(body["clicked"], Value::from(1), "{body}");
+        assert_eq!(body["bounced"], Value::from(1), "{body}");
+        assert_eq!(body["complained"], Value::from(1), "{body}");
+        assert_eq!(
+            body["complaint_rate_per_mille"],
+            Value::from(333.33),
+            "{body}"
+        );
+        assert_eq!(body["bounce_rate_per_mille"], Value::from(333.33), "{body}");
+
+        // Le défaut et les bornes.
+        let (status, body) = h.get("/v1/outreach/health", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["days"], Value::from(30));
+        assert_eq!(body["sent"], Value::from(3), "{body}");
+        let (status, body) = h.get("/v1/outreach/health?days=365", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sent"], Value::from(4), "{body}");
+        for refused in ["?days=0", "?days=-1", "?days=366", "?days=x"] {
+            let (status, body) = h
+                .get(&format!("/v1/outreach/health{refused}"), SECRET_A)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+        }
+
+        // Le voisin lit des zéros, et des taux à zéro sans division.
+        let (status, body) = h.get("/v1/outreach/health?days=7", SECRET_B).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sent"], Value::from(0), "{body}");
+        assert_eq!(body["complaint_rate_per_mille"], Value::from(0.0), "{body}");
+
+        h.teardown().await;
+    }
+
+    /// Les deux taux, sur des comptes posés à la main : 1 plainte et 2 rebonds
+    /// sur 8 envoyés font 125 ‰ et 250 ‰ ; 1 sur 3 arrondit à 333,33.
+    #[test]
+    fn les_taux_sont_en_pour_mille_sur_les_envoyes() {
+        assert_eq!(per_mille(1, 8), 125.0);
+        assert_eq!(per_mille(2, 8), 250.0);
+        assert_eq!(per_mille(1, 3), 333.33);
+        assert_eq!(per_mille(0, 3), 0.0);
+        assert_eq!(per_mille(3, 0), 0.0, "rien de parti : zéro, pas NaN");
     }
 }
