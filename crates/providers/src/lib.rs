@@ -70,6 +70,7 @@ pub mod browser_browserbase;
 pub mod browser_chrome; // notre Browserbase : un Chromium à nous, un contexte par tâche, un pot de cookies scellé entre deux
 pub mod browser_http; // a GET and a parser: the browser a static page needs, and no more
 pub mod browser_observer; // what an adapter tells about a task: the port the journal and the live view both read
+pub mod captcha; // la prise pour un solveur de captcha : détection chez nous, résolution derrière une clé du client
 pub mod cdp;
 pub mod dns_cloudflare; // one-shot: pose a sending domain's records in a Cloudflare zone
 pub mod email; // U16

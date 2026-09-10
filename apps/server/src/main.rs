@@ -350,12 +350,26 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     // vide que rien n'explique.
     let browser_journal = agentos_app::browser_journal::Journal::new(db.clone());
     let browser_observer: Arc<dyn agentos_app::mocks::BrowserObserver> = browser_journal.clone();
+    // Par où les onglets de chaque locataire sortent (0098), et qui franchit un
+    // défi de captcha. Les deux sont des **prises** : sans ligne dans
+    // `browser_proxies` on sort par l'adresse de la machine, et sans
+    // `CAPTCHA_API_KEY` le solveur refuse — l'état de tout déploiement qui n'a
+    // rien acheté, et le comportement de la v2 mot pour mot.
+    let browser_proxies = Arc::new(agentos_app::browser_proxy::SealedProxies::new(
+        db.clone(),
+        agentos_app::identity::envelope(&config.master_key),
+    ));
+    let browser_ports = || agentos_app::mocks::BrowserPorts {
+        jar: cookie_jar.clone(),
+        observer: browser_observer.clone(),
+        profiles: browser_profiles.clone(),
+        proxies: browser_proxies.clone(),
+        solver: config.captcha_solver(),
+    };
     let ports = Arc::new(agentos_app::mocks::ports_for(
         &config.credentials,
         &config.public_host,
-        cookie_jar.clone(),
-        browser_observer.clone(),
-        browser_profiles.clone(),
+        browser_ports(),
     ));
     // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
     // the real client and its absence selects the SHA-256 hash. Not a field of
@@ -387,12 +401,10 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
     let engine = ProvisioningEngine::new(
         db.clone(),
         agentos_app::mocks::adapters_for(
-            cookie_jar,
+            browser_ports(),
             &config.master_key,
             &config.credentials,
             secrets.clone(),
-            browser_observer,
-            browser_profiles,
         ),
         EngineConfig::default(),
     );
@@ -704,6 +716,10 @@ fn app(
         db: db.clone(),
         journal: browser_journal.clone(),
         browser_js: config.browser_js(),
+        // Le même chiffre que `SealedProxies` : dérivé de la même clé maître,
+        // donc ce que `PUT /v1/browser/proxy` scelle est ce que l'adaptateur
+        // ouvre à l'ouverture de l'onglet.
+        cipher: agentos_app::identity::envelope(&config.master_key),
     };
     let api = with_api_stack(
         Router::new()
@@ -937,6 +953,12 @@ fn app(
             // about it.
             payment_rail: ports.payments.configured(),
             browser_js: config.browser_js(),
+            captcha: config.captcha(),
+            // Lu sur le port et pas sur la configuration : `total` compterait
+            // la même chose des deux côtés, `healthy` non — c'est ce que les
+            // sondes ont vu il y a moins de trente secondes, et c'est la
+            // moitié qui intéresse quelqu'un à trois heures du matin.
+            browser_fleet: ports.browser.fleet_health(),
         })
         .merge(metrics::router(db, config.metrics_key.clone()));
 
@@ -2766,6 +2788,17 @@ struct Health {
     /// booking probe answered `needs_real_browser` is asking a replica, not a
     /// boot log, which of the two real browsers this is.
     browser_js: bool,
+    /// `CAPTCHA_API_KEY` est-il branché ? [`Config::captcha`].
+    ///
+    /// Ici pour la raison de `browser_js`, un cran plus loin : un employé qui
+    /// rapporte `captcha` a rencontré un défi, et la question suivante est
+    /// « y avait-il une clé pour le franchir ? ». Un journal de démarrage n'y
+    /// répond pas trois semaines après ; une réplique, si.
+    captcha: bool,
+    /// `(machines, celles qui répondent)`, lu sur le port lui-même —
+    /// [`BrowserProvider::fleet_health`]. `None` pour un navigateur qui n'a pas
+    /// de flotte, et c'est le cas de trois adaptateurs sur quatre.
+    browser_fleet: Option<(usize, usize)>,
 }
 
 /// Readiness: this replica can usefully take traffic *right now*.
@@ -2845,6 +2878,16 @@ async fn readyz(State(health): State<Health>) -> Response {
             // `false` under `BROWSER_FETCH=http` and under the mock alike:
             // the question is "can it type into a form", and neither can.
             "browser_js": health.browser_js,
+            // `false` partout tant que personne n'a payé de solveur, et c'est
+            // l'état voulu : une page à défi rend `captcha`, qui est honnête.
+            "captcha": health.captcha,
+            // Absent quand le navigateur n'a pas de flotte, plutôt que
+            // `{total: 0, healthy: 0}` — qui se lirait comme « la flotte est
+            // tombée » sur un déploiement qui n'en a jamais eu.
+            "browser_endpoints": health.browser_fleet.map(|(total, healthy)| json!({
+                "total": total,
+                "healthy": healthy,
+            })),
         })),
     )
         .into_response()
@@ -3288,6 +3331,10 @@ mod tests {
                     mocks: Vec::new().into(),
                     payment_rail: false,
                     browser_js: false,
+                    captcha: false,
+                    // Un déploiement sans flotte : `null` dans la réponse, pas
+                    // « zéro machine saine ».
+                    browser_fleet: None,
                 })
                 .oneshot(
                     HttpRequest::get("/readyz")
@@ -5560,6 +5607,7 @@ mod tests {
             rust_log: "info".to_owned(),
             api_keys: crate::auth::ApiKeys::parse(&format!("ops:{}:{SECRET}", tenant.as_uuid()))
                 .expect("keyring"),
+            captcha: None,
             // Empty: this config exists for `handlers`, which is the termination
             // path, and no platform route is mounted from it.
             platform_keys: crate::auth::PlatformKeys::default(),

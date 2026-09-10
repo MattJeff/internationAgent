@@ -83,6 +83,11 @@ change dans `Caddyfile` ni `deploy.sh` (il fait déjà `pull` de toutes les imag
 
 ## Ce qu'on ne fait pas, et pourquoi
 
+*(Cette liste est celle de la v1. Les deux premiers points ont été **révisés**
+par la v2 et la v3, plus bas, et la révision ne contredit pas la règle : la
+furtivité s'est révélée être du logiciel, et du proxy comme du captcha on n'a
+construit que la prise. Le troisième et le quatrième tiennent tels quels.)*
+
 - **Pas de furtivité, pas de proxy, pas de captcha.** Ce sont des ressources à
   guichet (des IP résidentielles, un service de résolution), pas du logiciel.
   Règle du dépôt : rien à payer avant d'en avoir besoin.
@@ -128,15 +133,18 @@ employé, trois onglets, `blocked_by_site`.
 - **Journal** : table `browser_tasks` (employé, URL, étapes, durée, issue,
   captures) et sa page console.
 
-### v3 — les prises, et la flotte
-- **Proxy par session** : `--proxy-server` + `Fetch.authRequired`, le
-  fournisseur (Bright Data, Oxylabs, ou une IP du client) est une clé dans
-  Intégrations. On ne loue pas d'IP.
-- **Captcha** : détection (`blocked_by_site` affiné) et prise pour un solveur
-  par clé. On n'en paie pas.
-- **Flotte** : un ordonnanceur qui répartit les tâches sur N conteneurs
-  Chromium (`BROWSER_CDP_URLS`, santé, jetons par machine). N est une facture,
-  l'ordonnanceur est du code.
+### v3 — les prises, et la flotte (faite le 2026-09-10)
+- **Proxy par contexte** : `Target.createBrowserContext { proxyServer,
+  proxyBypassList }` + `Fetch.authRequired`, une ligne par locataire dans
+  `browser_proxies` (0098), identifiants scellés. Le fournisseur (Bright Data,
+  Oxylabs, ou une IP du client) est une clé que le client apporte. On ne loue
+  pas d'IP.
+- **Captcha** : détection des trois signatures lisibles (`blocked_by_site`
+  affiné en `captcha`) et prise pour un solveur derrière `CAPTCHA_API_KEY`. On
+  n'en paie pas.
+- **Flotte** : `BROWSER_CDP_URL` accepte une liste, chaque machine a son
+  sémaphore, sa santé et ses onglets. N est une facture, l'ordonnanceur est du
+  code.
 
 Chaque phase s'appuie sur l'adaptateur de la précédente et ne démarre qu'une
 fois celle-ci fusionnée : deux agents sur `browser_chrome.rs` en même temps,
@@ -350,3 +358,147 @@ la première lecture.
    décodage — Chromium n'envoie qu'une image non acquittée à la fois, donc
    décoder d'abord diviserait la cadence par deux et une image illisible
    arrêterait le flux pour de bon.
+
+## Ce qui a été mesuré en construisant la v3
+
+Adaptateur étendu le 2026-09-10, contre **Chrome 152.0.7977.83** en local. Le
+tri du document tient : la prise se construit, la ressource s'achète, et rien
+ici n'a ouvert de compte nulle part. Un déploiement sans ligne dans
+`browser_proxies` et sans `CAPTCHA_API_KEY` envoie exactement les trames que la
+v2 envoyait.
+
+1. **Le nom des paramètres est `proxyServer` / `proxyBypassList`, et ils sont
+   sur le contexte.** Relevés dans `GET /json/protocol` du binaire lui-même,
+   pas dans une page de documentation : `Target.createBrowserContext` les
+   documente « similar to the one passed to `--proxy-server` », tous deux
+   `experimental` et optionnels. C'est ce qui permet **une adresse de sortie par
+   tâche sans redémarrer Chromium** — un `--proxy-server` est un drapeau de
+   processus, donc un Chromium par locataire — et c'est pour ça que le drapeau
+   n'est pas touché.
+
+2. **`Fetch.authRequired` n'arrive pas avec le motif de la v2, et ça n'est pas
+   une question de `handleAuthRequests`.** C'est la mesure qui a coûté le plus
+   cher à ce chantier, parce que le brief supposait le contraire. Avec le seul
+   motif de la v2 — `{ requestStage: "Response", resourceType: "Document" }` —
+   plus `handleAuthRequests: true`, contre un proxy qui répond `407` :
+
+   * aucun `Fetch.authRequired` n'est émis ;
+   * le `407` arrive en `Fetch.requestPaused` **au stade réponse**, comme une
+     réponse ordinaire ;
+   * et le continuer donne `net::ERR_INVALID_AUTH_CREDENTIALS` à la navigation.
+
+   L'interception au stade réponse *avale* le défi avant que la pile réseau ait
+   pu le poser. En ajoutant `{ requestStage: "Request", resourceType:
+   "Document" }`, la même navigation donne : pause au stade requête →
+   `continueRequest` → `Fetch.authRequired` → `continueWithAuth
+   { ProvideCredentials }` → pause au stade réponse avec un `200`, **sur le
+   même `requestId`**, et le proxy voit une deuxième requête portant
+   `Proxy-Authorization: Basic …`. Le motif au stade requête n'est donc ajouté
+   que quand le locataire a des identifiants à fournir : il coûte un
+   aller-retour de socket **par document**, jamais par sous-ressource, et
+   seulement à qui a acheté un proxy authentifié.
+
+3. **Une seule session `Fetch` par onglet, et c'est le bug que ce chantier
+   prévoyait.** La v2 montait un `Fetch.enable` sur une socket à elle **avant
+   chaque navigation** et le refermait après ; l'authentification en voulait
+   une deuxième, tenue pour la vie de l'onglet. Deux sessions `Fetch` sur une
+   même cible sont deux interceptions qui se disputent le même
+   `requestPaused` — un `continueResponse` en double, ou pire, une réponse que
+   personne ne continue et une navigation qui ne rend jamais la main. La sortie
+   n'était pas d'arbitrer entre les deux : c'est que la socket qui **tenait
+   déjà l'habillage** (vivante aussi longtemps que l'onglet, déjà en train de
+   lire des événements pour ne pas les accumuler — v2 § 8) fasse le travail au
+   lieu de le jeter. Un `Fetch.enable`, un jeu de motifs, un consommateur.
+   `one_tab_enables_fetch_exactly_once_however_many_navigations` les compte.
+
+   Conséquence gratuite : la synchronisation entre l'étape qui navigue et la
+   pompe est **l'ordre d'écriture**, pas un canal. `Fetch.enable` met la réponse
+   en attente, donc `Page.navigate` ne rend la main que lorsque quelqu'un l'a
+   continuée ; la pompe écrit sa décision *avant* de répondre ; donc au retour
+   de `Page.navigate` la décision est posée. Un `oneshot` par navigation aurait
+   fait le même travail avec une allocation et une branche « et si l'émetteur
+   est mort » qui n'a pas de bonne réponse.
+
+4. **Chromium essaie `https://` d'abord, et il proxifie ses propres sondes.**
+   Deux choses qu'on ne voit qu'avec un vrai navigateur et un vrai proxy. La
+   première requête d'un `Goto(http://…)` n'est pas le `GET` attendu : c'est un
+   `CONNECT hôte:443` (HTTPS-first), lui aussi envoyé au proxy — et c'est *sur
+   ce `CONNECT`* que le 407 tombe et que l'authentification se joue ; quand
+   Chromium retombe sur `http://`, les identifiants sont déjà en cache. Il
+   passe par ailleurs des `CONNECT www.google.com:443` de son cru (ses sondes de
+   connectivité) par le même proxy : à savoir avant de facturer des octets à un
+   client au gigaoctet.
+
+   Et la boucle locale n'est pas proxifiée par défaut : `<-loopback>` dans
+   `proxyBypassList` est ce qui retire l'exception. Sans lui, le test contre un
+   vrai Chrome part en direct et le faux proxy ne voit rien — ce qui a
+   ressemblé pendant une minute à « `proxyServer` ne marche pas ».
+
+5. **Un défi de captcha n'est pas un mur, et l'ordre des deux tests compte.**
+   Une page Turnstile porte le titre « Just a moment… » *et* un
+   `.cf-turnstile[data-sitekey]` : les deux détections réussissent. C'est la
+   plus précise qui gagne, parce que c'est celle qui dit quoi faire —
+   `Terminal { code: "captcha" }` nomme quelque chose qu'une clé franchirait,
+   là où `blocked_by_site` reste pour ce qu'aucune clé ne changerait. Les deux
+   lectures sortent d'une **seule** `Runtime.evaluate` : elles attendent le même
+   `DOMContentLoaded`, et deux évaluations seraient deux fois la même promesse
+   et deux façons de désaccorder ce que « la page » veut dire.
+
+6. **2Captcha valide le type de tâche avant la clé, ce qui rend le nom d'un
+   type vérifiable sans compte.** Leur index de types
+   (`https://2captcha.com/api-docs`, 2026-09-10) ne liste **plus de page
+   hCaptcha** et `/api-docs/hcaptcha` répond 404 — le type
+   `HCaptchaTaskProxyless` n'est donc plus documenté. Il est toujours accepté :
+   `POST https://api.2captcha.com/createTask` avec une clé volontairement
+   invalide répond `ERROR_KEY_DOES_NOT_EXIST` (errorId 1) pour
+   `RecaptchaV2TaskProxyless`, `TurnstileTaskProxyless` et
+   `HCaptchaTaskProxyless`, et `ERROR_TASK_ABSENT` (errorId 22) pour un type
+   inventé. Une requête, aucun compte, et la seule chose de cet adaptateur qui
+   ne vienne pas d'une page de documentation est nommée comme telle dans le
+   code.
+
+7. **Le pot de cookies est ce qui rend la flotte possible, et ce n'est pas une
+   remarque en passant.** Un `--user-data-dir` par employé aurait attaché
+   chaque siège à une machine : sa session vit sur ce disque-là. Ici la session
+   est une colonne scellée (`employee_resources.sealed_cookies`, 0095) et le
+   profil est une clé jsonb — les deux chez nous, aucun des deux sur un
+   Chromium. N'importe quel point de la flotte peut donc ouvrir l'onglet de
+   n'importe quel employé. Ce qui reste attaché, c'est la **tâche** : son onglet
+   est sur une machine, donc elle y reste pour toute sa vie, et `Tab::at` garde
+   l'adresse plutôt que de la re-résoudre à la fermeture.
+
+8. **« Aucune machine saine » se distingue de « la flotte est pleine » par le
+   fait de ne rien composer.** Les deux rendent `Retryable`, et un adaptateur
+   sans flotte rendrait aussi `Retryable` en échouant sur `/json/version` — donc
+   `is_retryable()` seul est une assertion aveugle, et le désarmement l'a montrée
+   telle avant qu'elle ne parte au dépôt. La garde qui mord est le **compte de
+   requêtes HTTP** : quand rien n'est sain, aucun `/json/version` n'est envoyé,
+   et la ligne de journal nomme le total et le nombre de malades. La sonde est à
+   trente secondes et **hors du chemin d'une tâche** ; l'état initial est
+   « saine » parce que présumer le contraire ferait attendre trente secondes à
+   la première tâche d'un déploiement qui vient de démarrer, et le prix d'une
+   erreur optimiste est une ouverture d'onglet ratée, c'est-à-dire un
+   `Retryable`.
+
+9. **Ce que `POST /v1/browser/proxy/check` prouve, et ce qu'il ne prouve pas.**
+   Il fait un `GET` *depuis ce processus* à travers le proxy du locataire, vers
+   un service d'écho **que le client nomme** — il n'y a pas d'URL de tiers en
+   dur dans ce dépôt, et sans `echo_url` la route ne vérifie rien et le dit. Ça
+   prouve l'adresse, le port, les identifiants et l'adresse de sortie : les
+   quatre choses qui se trompent quand on recopie une ligne depuis la console
+   d'un fournisseur. Ça ne prouve pas que Chromium l'honore — c'est le rôle des
+   deux tests contre un vrai Chrome, et c'est la place d'une assertion, pas
+   d'une route. Un proxy SOCKS n'est pas vérifié du tout et répond
+   `socks_not_checked` : le client HTTP de ce dépôt est construit sans le
+   greffon SOCKS de `reqwest`, et l'activer tirerait une caisse de plus dans
+   l'arbre pour une route de diagnostic. Chromium, lui, parle SOCKS.
+
+10. **Le mot de passe du proxy n'a pas de chemin de retour, et c'est prouvé par
+    un test qui lit le journal.** Il entre dans le corps d'un `PUT`, il est
+    scellé à la ligne suivante sous `browser://<locataire>/proxy`, et il ne
+    ressort ni de la vue (qui n'a pas de champ pour — c'est le type qui
+    l'empêche), ni d'un `Debug` (`ProxyConfig` en écrit un à la main), ni d'une
+    ligne de trace : `the_proxy_password_never_appears_in_a_response_or_a_log`
+    capture tout ce que `tracing` émet pendant les quatre routes et y cherche
+    les octets, après avoir vérifié que la capture a vu *quelque chose* — une
+    capture vide prouverait n'importe quoi.

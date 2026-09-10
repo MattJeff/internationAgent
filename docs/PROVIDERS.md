@@ -640,16 +640,21 @@ without `Page.enable` while still answering with a valid identifier. A small
 task holds that socket and discards the `Page` events it is therefore
 subscribed to → every `BrowserStep` of the task over
 `ws://<ip>:9222/devtools/page/<targetId>` (`Page.navigate`, `Runtime.evaluate`,
-…, plus one `Runtime.evaluate` after each navigation for the wall check
-below, and a `Fetch.enable`/`Fetch.disable` pair around each navigation for
-the documents below) → `Network.getAllCookies` → `Target.closeTarget` →
+…, plus one `Runtime.evaluate` after each navigation for the wall and captcha
+check below) → `Network.getAllCookies` → `Target.closeTarget` →
 `Target.disposeBrowserContext`.
 
-Two of those live on **sockets of their own**, opened on the same page and
-dropped with it: the screencast pump and the document watch. The CDP driver
-skips every frame that is not the answer to its own command — deliberately,
-so a command path never grows an unbounded event queue — so anything that
-arrives unbidden is read somewhere else.
+`Fetch.enable` is sent **once, on that same tab socket, at the tab's opening**,
+and there is exactly one interception session per tab — count them with
+`one_tab_enables_fetch_exactly_once_however_many_navigations`. It used to be a
+`Fetch.enable`/`Fetch.disable` pair on a socket of its own around every
+navigation; proxy authentication needed a second one, and two `Fetch` sessions
+on one target fight over the same `requestPaused`. The screencast pump is the
+one thing still on a socket of its own, because it is the one thing that can be
+started and stopped independently of the tab. The CDP driver skips every frame
+that is not the answer to its own command — deliberately, so a command path
+never grows an unbounded event queue — so anything that arrives unbidden is
+read by that pump.
 
 **The cookie jar, and what it contains.** A CDP browser context is
 incognito-shaped: isolated, and gone with the process. What survives between
@@ -679,10 +684,11 @@ the document's title and the status it was served with. A challenge or
 refusal page — « Just a moment… », « Access denied », « Attention Required »,
 « Enable JavaScript and cookies to continue », or a 403/503 — is
 `Terminal { code: "blocked_by_site" }`, the tab is closed, and the audit row
-says so. **There is no proxy, no residential IP and no captcha solving behind
-this adapter**, on purpose (resources with a gatekeeper, paid for when a task
-needs them): a site that walls the VPS's address stays walled, and the upgrade
-is `BROWSER_API_KEY`, not a retry.
+says so. A page carrying a **readable challenge** is `captcha` instead, which is a
+different thing to be — see the proxy and the captcha below. The sockets for
+both exist; **we rent no residential addresses and pay for no solver**
+(resources with a gatekeeper, bought when a task needs them), so a site that
+walls the VPS's address stays walled until a client brings a key.
 
 **Stealth, in software — and its ceiling.** Every context installs one
 script before its first navigation (`Page.addScriptToEvaluateOnNewDocument`)
@@ -731,7 +737,9 @@ Guinea.
 a false sentence about the supplier's site. They now come back as
 `BrowserOutcome::Document { content_type, filename, bytes }`, intercepted at
 `Fetch` response stage on the main navigation (the pattern is narrowed to
-`resourceType: "Document"`, so no subresource is ever paused), fetched with
+`resourceType: "Document"`, so no subresource is ever paused — and a request
+stage is added for that same resource type, and only that one, when the
+tenant's proxy has credentials; see the proxy below), fetched with
 `Fetch.getResponseBody`, and answered with a minimal HTML page via
 `Fetch.fulfillRequest` so the tab stays a tab and the next step has somewhere
 to stand. **Ceiling 8 MB** — a declared `Content-Length` over it is refused
@@ -765,6 +773,97 @@ than a setting, on a box with two vCPU shared with three tabs and a Postgres.
 A password typed by a `Fill` never crosses this port: a step is *named*, never
 quoted.
 
+**The proxy is a socket on the context, not a flag on the process.** A tenant
+may put one row in `browser_proxies` (migration `0098`, one row per tenant,
+`PUT /v1/browser/proxy`); every tab of every seat of that tenant is then opened
+with `Target.createBrowserContext { proxyServer, proxyBypassList }` — both
+names read on 2026-09-10 out of `GET /json/protocol` on Chrome 152.0.7977.83,
+where they are documented « similar to the one passed to `--proxy-server` ».
+That is precisely why `--proxy-server` is *not* used: a process flag would mean
+one Chromium per tenant, where a context parameter gives an exit address per
+task on the same binary. Credentials are sealed AES-256-GCM under
+`browser://<tenant>/proxy` — the cookie jar's namespace, one segment over — and
+answered to `Fetch.authRequired` with `Fetch.continueWithAuth
+{ response: "ProvideCredentials" }`. **We rent no addresses**: this is the
+socket, the client brings the resource, and a tenant with no row goes out by the
+machine's own address exactly as in v2.
+
+| Route | Answer |
+|---|---|
+| `GET /v1/browser/proxy` | `{url, has_credentials, bypass, checked_at, last_error}`, or 404 `no_proxy` |
+| `PUT /v1/browser/proxy {url, username?, password?, bypass?}` | 200, the row |
+| `DELETE /v1/browser/proxy` | 204, including when there was none |
+| `POST /v1/browser/proxy/check {echo_url}` | `{ip, took_ms}`, or 400 `no_echo_url`, or 422 `proxy_unreachable` / `no_ip_in_echo` / `socks_not_checked` |
+
+The password has no return path: no field on the view, a hand-written `Debug` on
+`ProxyConfig`, a fixed rejection text rather than serde's (which quotes the
+value it did not understand), and a test that captures everything `tracing`
+emits across the four routes and greps for the bytes. `url` is `scheme://host
+[:port]` and nothing else — credentials in the URL are refused, because they
+would be a password in a text column. `check` names **no third-party address**:
+without an `echo_url` the client supplies, nothing is verified and the route
+says so. It proves the address, the port, the credentials and the exit IP from
+*this* process; that Chromium honours the setting is proved by two real-Chromium
+tests instead, against a fake proxy that demands Basic auth.
+
+**One `Fetch` session per tab, and the measurement that forced it.** With the
+v2 pattern alone — `{requestStage: "Response", resourceType: "Document"}` plus
+`handleAuthRequests: true` — a proxy's `407` produces **no** `Fetch.authRequired`:
+it arrives as a paused *response*, and continuing it gives
+`net::ERR_INVALID_AUTH_CREDENTIALS`. Adding `{requestStage: "Request",
+resourceType: "Document"}` produces the documented sequence — request pause →
+`continueRequest` → `authRequired` → `continueWithAuth` → response pause with
+`200`, on the same `requestId`. So that pattern is added **only when the
+tenant's proxy has credentials**: one extra socket round trip per document,
+never per subresource, and only for whoever bought an authenticated proxy.
+Measured 2026-09-10 on Chrome 152.0.7977.83, along with two more facts a fake
+cannot show: Chromium tries `CONNECT host:443` first (HTTPS-first) and that is
+where the challenge actually lands, and it sends its own connectivity probes
+(`CONNECT www.google.com:443`) through the customer's proxy — worth knowing
+before billing a client by the gigabyte. Loopback is not proxied unless
+`<-loopback>` is in the bypass list.
+
+**A captcha is named, and it is not a wall.** After a navigation, the same
+`Runtime.evaluate` that reads the title and the status also looks for
+`.g-recaptcha[data-sitekey]`, `.cf-turnstile[data-sitekey]` and
+`.h-captcha[data-sitekey]` — one evaluation, because both answers wait for the
+same `DOMContentLoaded`. A hit is `Terminal { code: "captcha" }` with no solver
+plugged in, **distinct from `blocked_by_site`** and deliberately so: `captcha`
+names something a key would get past, `blocked_by_site` stays for what no key
+would change (a bare 403, an « Access denied », Arkose or DataDome, which have
+no readable site key). The challenge outranks the wall when a page carries both,
+which a Turnstile page does. With `CAPTCHA_API_KEY=2captcha:<key>` the adapter
+asks 2Captcha's v2 API (`POST /createTask`, `POST /getTaskResult`; sources and
+date cited in `crates/providers/src/captcha.rs`), posts the token into the
+field the widget exposes — creating the hidden `<textarea>` if the page has not,
+which is what reCAPTCHA does itself — and the navigation carries on, so the
+model's next `Click` submits with the token. **The ceiling:** we set a value, we
+do not invoke the widget's own callback, so a form whose callback submits itself
+is not covered. The default is `NoSolver`, which always refuses; an unknown
+provider name is a **boot failure**, because the operator paid for something.
+`/readyz` carries `captcha: true|false`.
+
+**The fleet.** `BROWSER_CDP_URL` takes a comma-separated list — the name is
+unchanged and one value is still the ordinary case. Each machine has its own
+semaphore (`BROWSER_MAX_TABS` is **per machine**: memory arithmetic is per
+container, so three machines carry nine tabs), its own health (a `/json/version`
+probe every 30 s, **outside any task's path**, optimistic at boot so the first
+task of a fresh deployment does not wait) and its own open-tab count, derived
+from the semaphore so the two cannot disagree. The **healthiest least-loaded**
+point takes the next task; a task then stays on it for its whole life, because
+its tab is there. No healthy point is `Retryable` **without dialling anything**,
+with a log line naming the total and how many are down — which is the one thing
+that separates "the fleet is full" from "the fleet is down", since both are
+retryable. `/readyz` carries `browser_endpoints: {total, healthy}`, absent
+entirely for a browser that has no fleet rather than `{0, 0}`, which would read
+as an outage.
+
+**What makes the fleet possible is the cookie jar**, and it is worth saying
+out loud: nothing pins an employee to a machine. A `--user-data-dir` per
+employee would have — the session lives on that disk. Here the session is a
+sealed column and the profile is a jsonb key, both on our side; any point can
+open any employee's tab.
+
 **The address check is the same one.** Every `Goto` goes through
 `mcp::resolve_and_vet` at `Reach::Public` before a tab is even opened — a
 loopback or RFC 1918 target is `blocked_address` with no `Page.navigate`
@@ -781,7 +880,12 @@ name itself and dials every socket — HTTP and websocket — by address.
 
 **Proof.** `browser::contract_suite` runs against a real Chromium when
 `BROWSER_CDP_URL` is set and skips otherwise (`DATABASE_URL`'s discipline),
-beside three more real-Chromium tests: a page rendered by JavaScript that
+beside more real-Chromium tests — including two on the proxy: a fake proxy that
+demands Basic auth, sees the navigation arrive in absolute form, sees a request
+challenged, and sees the credentials follow (disarmed by the same proxy with no
+credentials, which fails the navigation by name), and a proxy that is not there,
+which is `navigation_failed` and **keeps the tab**, because a dead proxy is not
+a reason to lose the session. And beside three older ones: a page rendered by JavaScript that
 `HttpBrowser` reads as empty on the same run, a cookie set in one task and
 sent by the next through a fresh context, a 403 reported as
 `blocked_by_site`, a probe page that reads `navigator.webdriver`, the
@@ -793,7 +897,15 @@ semaphore, the jar's shape on the wire, the teardown after a failed step, the
 wall check, the refused private address, the `Host` rule, the narration in
 order with the right step names, a screencast that starts for a watcher and
 stops for none, the script installed before the first navigation, the five
-`Emulation.*` commands carrying the profile, and both document arms.
+`Emulation.*` commands carrying the profile, both document arms, the proxy and
+its bypass reaching `Target.createBrowserContext`, the credentials answering
+`Fetch.authRequired` (and `Default` answering it when there are none), exactly
+**one** `Fetch.enable` per tab across three navigations, a challenge answering
+`captcha` rather than `blocked_by_site` and a solved one posting its token, and
+the fleet: least-loaded first, a sick point skipped, and nothing dialled at all
+when every point is down. Every one of those was disarmed once and went red —
+the fleet's did not, the first time, and the assertion was tightened until it
+did.
 `effects.rs` reads a JavaScript page end to end through `read_page`, token and
 audit row included, and files a PDF through the same path.
 

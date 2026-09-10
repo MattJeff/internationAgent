@@ -12,6 +12,7 @@ pub mod backlog; // le carnet: the port a work board is reached through, ours or
 pub mod brief; // the operator's own words that open a turn — reachable, so a pin can hash them
 pub mod browser_journal; // le journal des tâches de navigateur et la vue en direct : le lecteur de BrowserObserver
 pub mod browser_profile; // la langue, le fuseau et l'écran d'un employé, lus sur sa fiche
+pub mod browser_proxy; // l'adresse par laquelle les onglets d'un locataire sortent, scellée sous browser://<locataire>/proxy
 pub mod calendar; // le calendrier: the port a seat's diary is reached through, ours or the customer's
 pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
 pub mod cookie_jar; // le pot de cookies d'un employé, scellé sous browser://<locataire>/<employé>

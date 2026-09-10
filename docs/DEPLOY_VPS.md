@@ -240,9 +240,10 @@ normal, pas une erreur.
 | `EMAIL_API_KEY` | `MockEmailProvider` | construit le vrai client Resend (`re_…`) |
 | `TELEPHONY_API_KEY` | `MockTelephony` | vrai client Twilio. Format `ACxxxx:auth_token` — **une moitié seule est un refus au boot nommé** |
 | `BROWSER_API_KEY` | `ChromeBrowser` si `BROWSER_CDP_URL`, `HttpBrowser` si `BROWSER_FETCH=http`, sinon `MockBrowser` | vrai Browserbase + driver CDP. Format `project-id:api-key`, même refus sur une moitié |
-| `BROWSER_CDP_URL` | l'un des deux suivants | `http://browser:9222` : **notre** Chromium sans tête (service `browser` du compose, `docs/BROWSER.md`), JavaScript, cookies scellés par employé dans `employee_resources.sealed_cookies`. Compte comme réel (`browser=chrome(cdp)` au boot, `browser_js: true`) ; ignoré si la clé est là. L'adaptateur résout le nom lui-même : Chromium refuse un `Host` qui n'est pas une IP |
-| `BROWSER_MAX_TABS` | 3 | onglets simultanés dans ce Chromium, tous employés confondus ; au-delà on attend, on ne lance pas. Lu seulement avec `BROWSER_CDP_URL` |
+| `BROWSER_CDP_URL` | l'un des deux suivants | `http://browser:9222` : **notre** Chromium sans tête (service `browser` du compose, `docs/BROWSER.md`), JavaScript, cookies scellés par employé dans `employee_resources.sealed_cookies`. Compte comme réel (`browser=chrome(cdp)` au boot, `browser_js: true`) ; ignoré si la clé est là. L'adaptateur résout le nom lui-même : Chromium refuse un `Host` qui n'est pas une IP. **Accepte une liste séparée par des virgules** — `http://browser:9222,http://browser2:9222` — qui est la flotte : chaque machine a ses onglets, sa sonde de santé (30 s, hors du chemin d'une tâche) et son compteur, le point sain le moins chargé prend la tâche suivante, et une tâche reste sur le sien pour toute sa vie. Une entrée vide refuse au démarrage. Une seule valeur reste la forme ordinaire et ne coûte rien de plus. `/readyz` publie `browser_endpoints: {total, healthy}` |
+| `BROWSER_MAX_TABS` | 3 | onglets simultanés **par machine** de la flotte, tous employés confondus ; au-delà on attend, on ne lance pas. C'est une arithmétique de mémoire par conteneur, donc deux machines à 3 portent 6 onglets. Lu seulement avec `BROWSER_CDP_URL` |
 | `BROWSER_QUEUE_WAIT_SECS` | 60 | attente d'un onglet avant `Retryable`. Lu seulement avec `BROWSER_CDP_URL` |
+| `CAPTCHA_API_KEY` | aucun solveur : une page à défi rend `captcha` — distinct de `blocked_by_site` exprès — l'onglet part, et l'employé le dit | `<fournisseur>:<clé>`, et `2captcha` est le seul fournisseur que ce binaire parle : un autre nom **refuse le démarrage** plutôt que de résoudre silencieusement rien. Ce n'est pas une ligne du tableau des mocks — son absence ne se remplit d'aucun faux, parce qu'un jeton inventé ferait échouer la page une seconde plus tard, là où personne ne saurait pourquoi. `/readyz` publie `captcha: true|false` |
 | `BROWSER_FETCH` | le faux (chaque `read_page` répond `no_such_element` — mesuré en production le 2026-09-10) | `http`, seule valeur : un `GET` et un parseur HTML, sans JavaScript. Compte comme réel (`browser=http(no-js)` au boot, `browser_js: false` dans `/readyz`) ; ignoré si la clé ou `BROWSER_CDP_URL` est là |
 | `EMBEDDER_API_KEY` | hash SHA-256 (`mock-sha256-1536`) | `OpenAiEmbedder`, `text-embedding-3-small`, sur la clé **du client** |
 | `AGENTOS_LLM` | `mock` → répond `MOCK_REPLY` | `anthropic` (seul réel) ou `cli`. Une valeur inconnue est un refus qui liste les valeurs valides |
@@ -589,6 +590,15 @@ BROWSER_FETCH=http
 # Avec le service `browser` du compose (docs/BROWSER.md), le vrai navigateur,
 # JavaScript compris, et la ligne au-dessus n'est plus lue :
 # BROWSER_CDP_URL=http://browser:9222
+# Plusieurs conteneurs `browser` : la liste EST la flotte, BROWSER_MAX_TABS est
+# par machine, et le point sain le moins chargé prend la tâche suivante.
+# BROWSER_CDP_URL=http://browser:9222,http://browser2:9222
+# Le solveur de captcha, si un client en paie un. Sans lui, une page à défi
+# rend `captcha` et l'employé le dit — ce qui est l'état voulu, pas une panne.
+# CAPTCHA_API_KEY=2captcha:<la clé du client>
+# Le proxy est par **locataire** et se pose par l'API, jamais par une variable :
+#   PUT /v1/browser/proxy {"url":"http://gate:7000","username":…,"password":…}
+# Les identifiants sont scellés ; sans ligne, on sort par l'adresse du VPS.
 
 AGENTOS_PLATFORM_KEYS=signup:<openssl rand -hex 32>
 RUST_LOG=info,agentos_server=debug

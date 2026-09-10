@@ -341,6 +341,20 @@ pub trait BrowserProvider: Send + Sync {
     /// more", which is equally true whether this call destroyed it or a
     /// previous one did.
     async fn release(&self, binding: &ProviderBinding) -> Result<(), ProviderError>;
+
+    /// `(machines, celles qui répondent)`, ou `None` pour un adaptateur qui n'a
+    /// pas de flotte.
+    ///
+    /// **Une méthode par défaut, et pas un champ de `Ports`.** `/readyz` est le
+    /// seul lecteur et il tient déjà un `Arc<dyn BrowserProvider>` ; lui faire
+    /// porter une deuxième poignée sur le même objet serait deux façons de
+    /// répondre à une question, dont une seule serait branchée. Trois des
+    /// quatre adaptateurs n'ont pas de flotte à décrire — Browserbase a la
+    /// sienne et ne la montre pas, le navigateur `GET` n'a pas de machine, le
+    /// faux non plus — et `None` est ce qu'ils répondent sans écrire une ligne.
+    fn fleet_health(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

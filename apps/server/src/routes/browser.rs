@@ -27,19 +27,46 @@
 //! `employees` sous le locataire avant de s'abonner, sinon un appelant
 //! pourrait regarder l'écran d'un employé dont il devine l'identifiant. Même
 //! réponse qu'un employé inexistant, exprès (`ApiError::not_found`).
+//!
+//! # Le proxy (v3) — quatre routes, et un mot de passe qui ne ressort jamais
+//!
+//! | Route | Réponse |
+//! |---|---|
+//! | `GET /v1/browser/proxy` | 200 `{url, has_credentials, bypass, checked_at, last_error}` ; 404 `no_proxy` |
+//! | `PUT /v1/browser/proxy {url, username?, password?, bypass?}` | 200 la ligne |
+//! | `DELETE /v1/browser/proxy` | 204, y compris quand il n'y en avait pas |
+//! | `POST /v1/browser/proxy/check {echo_url}` | 200 `{ip, took_ms}` ; 400 `no_echo_url` ; 422 le code nommé |
+//!
+//! **Le mot de passe n'a pas de chemin de retour.** Il entre dans le corps d'un
+//! `PUT`, il est scellé à la ligne suivante sous `browser://<locataire>/proxy`
+//! (`agentos_app::browser_proxy`), et il ne ressort ni de [`ProxyView`] — qui
+//! n'a pas de champ pour, c'est le type qui l'empêche — ni d'une ligne de
+//! journal : les `tracing::info!` d'ici nomment l'URL et un booléen, et le
+//! rejet d'un corps mal formé est rendu avec un **texte fixe** plutôt qu'avec
+//! le message de serde, qui cite parfois la valeur qu'il n'a pas comprise.
+//! `the_proxy_password_never_appears_in_a_response_or_a_log` capture tout ce
+//! que `tracing` émet pendant les quatre routes et y cherche les octets.
+//!
+//! Ces routes sont **la prise, pas la ressource** : ce déploiement ne loue
+//! aucune adresse IP et n'écrit l'URL d'aucun tiers en dur, service d'écho
+//! compris — voir `agentos_app::browser_proxy` sur pourquoi `echo_url` n'a pas
+//! de défaut.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use agentos_app::browser_journal::{Journal, Live};
+use agentos_app::browser_proxy::{self, Refusal};
+use agentos_app::identity::LocalEnvelopeSecretStore;
 use agentos_domain::ids::EmployeeId;
 use agentos_store::db::{Db, StoreError};
 use axum::Router;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get as get_route;
+use axum::routing::{get as get_route, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
@@ -51,13 +78,17 @@ use uuid::Uuid;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
-/// Ce que les quatre routes partagent.
+/// Ce que les routes partagent.
 #[derive(Clone)]
 pub struct BrowserState {
     pub db: Db,
     pub journal: Arc<Journal>,
     /// [`crate::config::Config::browser_js`], le même booléen que `/readyz`.
     pub browser_js: bool,
+    /// Le chiffre du déploiement, pour sceller et ouvrir les identifiants du
+    /// proxy. Le même que celui que `SealedProxies` tient de l'autre côté :
+    /// deux instances dérivées de la même clé maître, comme partout ailleurs.
+    pub cipher: Arc<LocalEnvelopeSecretStore>,
 }
 
 pub fn router(state: BrowserState) -> Router {
@@ -66,6 +97,11 @@ pub fn router(state: BrowserState) -> Router {
         .route("/v1/browser/tasks/{id}", get_route(one))
         .route("/v1/browser/live/{employee_id}", get_route(live))
         .route("/v1/browser/summary", get_route(summary))
+        .route(
+            "/v1/browser/proxy",
+            get_route(proxy_get).put(proxy_put).delete(proxy_delete),
+        )
+        .route("/v1/browser/proxy/check", post(proxy_check))
         .with_state(state)
 }
 
@@ -273,6 +309,197 @@ async fn summary(
 }
 
 // ---------------------------------------------------------------------------
+// Le proxy
+// ---------------------------------------------------------------------------
+
+/// La ligne sur le fil. **Aucun champ pour le mot de passe** : `has_credentials`
+/// est tout ce qu'un lecteur obtient, et c'est le type qui le garantit plutôt
+/// qu'une discipline de sérialisation qu'on oublierait au prochain champ.
+#[derive(Debug, Serialize)]
+struct ProxyView {
+    url: String,
+    has_credentials: bool,
+    bypass: Option<String>,
+    checked_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+}
+
+impl From<browser_proxy::Row> for ProxyView {
+    fn from(row: browser_proxy::Row) -> Self {
+        Self {
+            url: row.url,
+            has_credentials: row.has_credentials,
+            bypass: row.bypass,
+            checked_at: row.checked_at,
+            last_error: row.last_error,
+        }
+    }
+}
+
+/// Pas de `Debug`, exprès : un des champs est un mot de passe.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyBody {
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+    bypass: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckBody {
+    echo_url: Option<String>,
+}
+
+fn no_proxy() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "no_proxy",
+        "this tenant has no browser proxy",
+    )
+}
+
+/// Un refus de `browser_proxy`, en statut et en code.
+fn refused(err: Refusal) -> ApiError {
+    match err {
+        Refusal::BadUrl(detail) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "bad_url", "not a proxy address")
+                .with_detail(detail)
+        }
+        Refusal::NoProxy => no_proxy(),
+        Refusal::NoEcho => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "no_echo_url",
+            "no echo service was given",
+        )
+        .with_detail(Refusal::NoEcho.to_string()),
+        // 422 et le code nommé : le proxy est une ressource du client, donc
+        // « il ne répond pas » est un fait sur ce qu'il a acheté et non une
+        // panne de ce déploiement. Le code est le nôtre et jamais le message
+        // du proxy, qui est du texte d'un tiers.
+        Refusal::CheckFailed(code) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            "the proxy did not answer",
+        ),
+        Refusal::Provider(err) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            err.code(),
+            "the sealed credentials could not be used",
+        ),
+        Refusal::Store(err) => ApiError::from(err),
+    }
+}
+
+async fn proxy_get(
+    State(state): State<BrowserState>,
+    principal: Principal,
+) -> Result<Response, ApiError> {
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let row = browser_proxy::get(&mut tx).await?;
+    tx.rollback().await?;
+    match row {
+        Some(row) => Ok((StatusCode::OK, axum::Json(ProxyView::from(row))).into_response()),
+        None => Err(no_proxy()),
+    }
+}
+
+async fn proxy_put(
+    State(state): State<BrowserState>,
+    principal: Principal,
+    body: Result<axum::Json<ProxyBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    // Un texte fixe : le message de serde cite parfois la valeur qu'il n'a pas
+    // comprise, et l'une des valeurs de ce corps est un mot de passe.
+    let axum::Json(body) = body.map_err(|_| {
+        ApiError::bad_request(
+            "body must be {\"url\": \"http://host:port\", \"username\"?, \"password\"?, \"bypass\"?}",
+        )
+    })?;
+    // Les deux moitiés ou aucune : un nom d'utilisateur sans mot de passe est
+    // une ligne à moitié écrite, et `Proxy-Authorization` en veut deux.
+    let credentials = match (&body.username, &body.password) {
+        (Some(username), Some(password)) => Some((username.as_str(), password.as_str())),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::bad_request(
+                "username and password go together: send both, or neither",
+            ));
+        }
+    };
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let row = browser_proxy::set(
+        &mut tx,
+        &state.cipher,
+        &body.url,
+        credentials,
+        body.bypass.as_deref(),
+    )
+    .await
+    .map_err(refused)?;
+    tx.commit().await?;
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        url = %row.url,
+        has_credentials = row.has_credentials,
+        "browser proxy set"
+    );
+    Ok((StatusCode::OK, axum::Json(ProxyView::from(row))).into_response())
+}
+
+async fn proxy_delete(
+    State(state): State<BrowserState>,
+    principal: Principal,
+) -> Result<Response, ApiError> {
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let had = browser_proxy::clear(&mut tx).await?;
+    tx.commit().await?;
+    // 204 dans les deux cas : l'appelant demande un état — « ce locataire n'a
+    // pas de proxy » — et l'état est vrai. La même règle que le contrat de
+    // `release` des fournisseurs.
+    tracing::info!(tenant_id = %principal.tenant_id, had, "browser proxy cleared");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn proxy_check(
+    State(state): State<BrowserState>,
+    principal: Principal,
+    body: Option<axum::Json<CheckBody>>,
+) -> Result<Response, ApiError> {
+    let echo_url = body.and_then(|axum::Json(body)| body.echo_url);
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let checked = browser_proxy::check(&mut tx, &state.cipher, echo_url.as_deref()).await;
+    // Le verdict est écrit sur la ligne même quand il est mauvais, donc la
+    // transaction se valide dans les deux cas — sauf si rien n'a été tenté.
+    let checked = match checked {
+        Ok(checked) => {
+            tx.commit().await?;
+            checked
+        }
+        Err(err @ (Refusal::NoEcho | Refusal::BadUrl(_) | Refusal::NoProxy)) => {
+            tx.rollback().await?;
+            return Err(refused(err));
+        }
+        Err(err) => {
+            tx.commit().await?;
+            return Err(refused(err));
+        }
+    };
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        ip = %checked.ip,
+        took_ms = checked.took_ms,
+        "browser proxy checked"
+    );
+    Ok((
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "ip": checked.ip, "took_ms": checked.took_ms })),
+    )
+        .into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -283,7 +510,9 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, StatusCode, header};
     use serde_json::Value;
+    use serde_json::json;
     use tower::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
     use crate::auth::ApiKeys;
@@ -326,6 +555,7 @@ mod tests {
                         db: db.clone(),
                         journal: journal.clone(),
                         browser_js: false,
+                        cipher: agentos_app::identity::envelope(crate::auth::TEST_MASTER_KEY),
                     }),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
@@ -347,6 +577,41 @@ mod tests {
                 .body(Body::empty())
                 .expect("request");
             self.app.clone().oneshot(req).await.expect("service")
+        }
+
+        /// N'importe quelle méthode, avec ou sans corps.
+        async fn send(
+            &self,
+            method: &str,
+            uri: &str,
+            secret: &str,
+            body: Option<Value>,
+        ) -> (StatusCode, Value) {
+            let mut req = HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"));
+            let body = match body {
+                Some(json) => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(json.to_string())
+                }
+                None => Body::empty(),
+            };
+            let response = self
+                .app
+                .clone()
+                .oneshot(req.body(body).expect("request"))
+                .await
+                .expect("service");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
         }
 
         async fn get(&self, uri: &str, secret: &str) -> (StatusCode, Value) {
@@ -655,6 +920,186 @@ mod tests {
         let (_, body) = h.get("/v1/browser/summary", SECRET_B).await;
         assert_eq!(body["tasks_today"], 1);
         assert_eq!(body["blocked_by_site_today"], 0);
+
+        h.teardown().await;
+    }
+
+    // -- le proxy ----------------------------------------------------------------
+
+    /// Tout ce que `tracing` émet pendant un appel, champs compris, rendu en
+    /// texte — pour y chercher des octets qui ne doivent pas y être. La même
+    /// couche que `routes::domain`, écrite deux fois parce que les deux modules
+    /// de test ne se voient pas.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<String>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use std::fmt::Write as _;
+            struct Render<'a>(&'a mut String);
+            impl tracing::field::Visit for Render<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut out = self.0.lock().expect("not poisoned");
+            let _ = write!(out, "[{}] ", event.metadata().target());
+            event.record(&mut Render(&mut out));
+            out.push('\n');
+        }
+    }
+
+    /// Les quatre routes dans leur forme exacte, la RLS entre deux locataires,
+    /// et **le mot de passe qui ne ressort ni d'une réponse ni d'un journal**.
+    #[tokio::test]
+    async fn the_proxy_password_never_appears_in_a_response_or_a_log() {
+        const PASSWORD: &str = "s3cr3t-de-passage-7f3a";
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let captured = Captured::default();
+        let _log =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        // Rien : 404 nommé, des deux côtés.
+        let (status, body) = h.get("/v1/browser/proxy", SECRET_A).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "no_proxy");
+        // Et un `DELETE` sur rien est quand même 204 : l'appelant demande un
+        // état, et l'état est déjà vrai.
+        let (status, _) = h.send("DELETE", "/v1/browser/proxy", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Une adresse mal formée, et surtout : les identifiants dans l'URL.
+        for bad in [
+            "gate.example.com:7000",
+            "ftp://gate.example.com",
+            &format!("http://orizn:{PASSWORD}@gate.example.com:7000"),
+            "http://gate.example.com:7000/rotate",
+        ] {
+            let (status, body) = h
+                .send(
+                    "PUT",
+                    "/v1/browser/proxy",
+                    SECRET_A,
+                    Some(json!({ "url": bad })),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{bad} was accepted: {body}"
+            );
+            assert_eq!(body["code"], "bad_url");
+        }
+        // Une moitié d'identifiants n'est pas un identifiant.
+        let (status, body) = h
+            .send(
+                "PUT",
+                "/v1/browser/proxy",
+                SECRET_A,
+                Some(json!({ "url": "http://gate.example.com:7000", "username": "orizn" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // Posé, avec ses identifiants et son bypass.
+        let (status, body) = h
+            .send(
+                "PUT",
+                "/v1/browser/proxy",
+                SECRET_A,
+                Some(json!({
+                    "url": "http://gate.example.com:7000",
+                    "username": "orizn-eu",
+                    "password": PASSWORD,
+                    "bypass": "<-loopback>",
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({
+                "url": "http://gate.example.com:7000",
+                "has_credentials": true,
+                "bypass": "<-loopback>",
+                "checked_at": null,
+                "last_error": null,
+            }),
+            "the shape on the wire, and no field for the password"
+        );
+
+        // Relu à l'identique, et invisible au voisin.
+        let (status, again) = h.get("/v1/browser/proxy", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again, body);
+        let (status, _) = h.get("/v1/browser/proxy", SECRET_B).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the neighbour saw it");
+        // Et le voisin ne l'efface pas non plus.
+        h.send("DELETE", "/v1/browser/proxy", SECRET_B, None).await;
+        let (status, _) = h.get("/v1/browser/proxy", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "the neighbour deleted it");
+
+        // La vérification : sans service d'écho, rien n'est vérifié et on le
+        // dit — il n'y a pas d'URL de tiers en dur dans ce dépôt.
+        let (status, body) = h
+            .send("POST", "/v1/browser/proxy/check", SECRET_A, Some(json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "no_echo_url");
+        // Avec un écho, mais un proxy qui n'existe pas : le code nommé, et le
+        // verdict reste sur la ligne pour la console.
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/browser/proxy/check",
+                SECRET_A,
+                Some(json!({ "echo_url": "http://echo.invalid/ip" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], agentos_app::browser_proxy::PROXY_UNREACHABLE);
+        let (_, body) = h.get("/v1/browser/proxy", SECRET_A).await;
+        assert!(body["checked_at"].is_string(), "{body}");
+        assert_eq!(
+            body["last_error"],
+            agentos_app::browser_proxy::PROXY_UNREACHABLE
+        );
+
+        // Retiré : 204, et il n'y a plus rien.
+        let (status, _) = h.send("DELETE", "/v1/browser/proxy", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = h.get("/v1/browser/proxy", SECRET_A).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // **La garde.** La capture a bien vu quelque chose — sinon elle ne
+        // prouve rien — et le mot de passe n'y est pas.
+        let log = captured.0.lock().expect("not poisoned").clone();
+        assert!(
+            log.contains("browser proxy set"),
+            "the capture saw nothing, so it proves nothing:\n{log}"
+        );
+        assert!(
+            log.contains("gate.example.com"),
+            "the capture saw no URL either:\n{log}"
+        );
+        assert!(
+            !log.contains(PASSWORD),
+            "the password reached a log line:\n{log}"
+        );
+        assert!(
+            !log.contains("orizn-eu"),
+            "the username reached a log line:\n{log}"
+        );
 
         h.teardown().await;
     }
