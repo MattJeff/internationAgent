@@ -3201,29 +3201,26 @@ mod tests {
             "the stealth script never ran: WebGL vendor is {gpu}"
         );
 
-        // The disarm: the same binary, asked over HTTP, still says it.
-        let at = ChromeBrowser::new(
-            cdp,
-            Arc::new(PinnedHost::new(site_host().to_string(), site_host())),
-            Arc::new(MemoryCookieJar::new()),
-        )
-        .inner
-        .endpoint()
-        .await
-        .expect("endpoint");
-        let reported: Value = reqwest::get(format!("http://{at}/json/version"))
-            .await
-            .expect("version")
-            .json()
-            .await
-            .expect("json");
-        assert!(
-            reported["User-Agent"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("HeadlessChrome"),
-            "this Chromium was not headless, so the page proves nothing"
-        );
+        // **Le garde « ce Chromium est bien sans tête » a été retiré, et ce
+        // qu'il coûte est écrit ici.**
+        //
+        // Il lisait le `User-Agent` que le binaire annonce sur
+        // `/json/version` et exigeait qu'il porte `HeadlessChrome`. C'est vrai
+        // de Google Chrome lancé en `--headless=new`, sur lequel il a été
+        // écrit, et **faux de `chromedp/headless-shell`**, qui est le binaire
+        // de la CI et de la production : mesuré le 2026-09-10 (run siglair
+        // 34467985232, et à la main sur le VPS), sa version 151 rend
+        // `Mozilla/5.0 (X11; Linux x86_64) … Chrome/151.0.7922.109 Safari/537.36`,
+        // sans jeton. Un binaire sans tête qui ne le dit pas faisait échouer le
+        // garde, pas le produit.
+        //
+        // Ce qu'on perd : la détection du cas « quelqu'un a pointé ces tests
+        // sur un Chrome avec fenêtre », où les signaux propres de la page ne
+        // prouveraient rien. Ce qu'on garde, et qui suffit : l'assertion WebGL
+        // ci-dessus. Un Chrome avec fenêtre rend le vrai vendeur de la machine
+        // (« Google Inc. (Apple) » sur ce portable), jamais une chaîne de
+        // notre table — donc elle rougit exactement dans le cas que le garde
+        // surveillait, et pour la bonne raison.
 
         // And a profile is a profile: a second seat in Auckland reads
         // Auckland, so the timezone above is the override and not the clock.
