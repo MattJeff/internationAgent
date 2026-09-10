@@ -407,6 +407,15 @@ enum Outcome {
     OverBudget(String),
 }
 
+/// The one code that means the employee thought.
+///
+/// `pub(crate)` and named once because two modules read it: this one writes it,
+/// and `routes::health` separates success from failure in `turn_outcomes` by
+/// comparing against it. Two spellings of this string would be a health verdict
+/// that counts every success as a failure — green becoming red, silently, which
+/// is the exact class of bug that screen exists to end.
+pub(crate) const TURN: &str = "turn";
+
 impl Outcome {
     /// Stable, low-cardinality label for `employee_initiative.last_outcome` —
     /// and, since `0072`, for `appointments.outcome` too.
@@ -427,9 +436,41 @@ impl Outcome {
             Outcome::NoModel(_) => "no_model",
             Outcome::Clarify(_) => "clarify",
             Outcome::NoWork(_) => "no_work",
-            Outcome::Turn => "turn",
+            Outcome::Turn => TURN,
             Outcome::Failed(_) => "error",
             Outcome::OverBudget(_) => "over_budget",
+        }
+    }
+
+    /// Does this beat count towards the company's health, and which way?
+    ///
+    /// `Some(true)` — the company thought. `Some(false)` — it tried and could
+    /// not. `None` — **it was resting, and a company at rest is not ill.**
+    ///
+    /// That third answer is the whole point of the function, and it is why
+    /// `GET /v1/health/company` can say `working` about a brand-new tenant. An
+    /// employee nobody chartered, a seller with no prospect due, an objective
+    /// that is waiting on an answer from the operator, and a seat that has
+    /// spent the day it was given are four states somebody chose — none of them
+    /// is a company that has stopped, and counting any of them as a failure
+    /// would put a red banner on every company on its first morning.
+    ///
+    /// [`Outcome::OverBudget`] sits with them on purpose: it is a ceiling the
+    /// operator wrote, `store::turns::reserve` has already raised its own alert
+    /// on the reservation that crossed it, and it lifts by itself at UTC
+    /// midnight. A limit doing its job is not an outage.
+    ///
+    /// Exhaustive, like [`Outcome::code`] beside it: a ninth variant is a
+    /// compile error here, and whoever adds one has to say which of the three
+    /// it is.
+    const fn health(&self) -> Option<bool> {
+        match self {
+            Outcome::Turn => Some(true),
+            Outcome::Failed(_) | Outcome::NoModel(_) | Outcome::Unreadable(_) => Some(false),
+            Outcome::NoCharter
+            | Outcome::Clarify(_)
+            | Outcome::NoWork(_)
+            | Outcome::OverBudget(_) => None,
         }
     }
 
@@ -1145,7 +1186,32 @@ async fn record(db: &Db, due: &Woken, outcome: &Outcome, now: DateTime<Utc>) {
             .await
         }
     };
-    if let Err(err) = written.and(tx.commit().await.map_err(StoreError::from)) {
+    // And the trace that outlives the next beat — `migrations/0099`.
+    //
+    // In the same transaction as the column above and on **both** arms, because
+    // the question it answers is the company's rather than the seat's: a
+    // promise kept and a cadence turn are both the company thinking, and a
+    // health verdict that counted only one of them would call an appointment-
+    // driven employee idle. `Outcome::health` is what decides whether there is
+    // anything to write at all; a beat at rest writes nothing.
+    let traced = match outcome.health() {
+        Some(_) => {
+            initiative::record_turn_trace(
+                &mut tx,
+                due.tenant_id,
+                due.employee_id,
+                now,
+                outcome.code(),
+                outcome.detail(),
+            )
+            .await
+        }
+        None => Ok(()),
+    };
+    if let Err(err) = written
+        .and(traced)
+        .and(tx.commit().await.map_err(StoreError::from))
+    {
         tracing::error!(error = %err, "initiative outcome was not recorded");
     }
 }
@@ -3617,6 +3683,34 @@ pub(crate) mod tests {
     /// the founder back where `0072` found him. This is the test that makes that
     /// loud.
     ///
+    /// **The sentence a stopped company shows its founder is ours.**
+    ///
+    /// `0099` copies `Outcome::detail()` into `turn_outcomes.detail`, and
+    /// `GET /v1/health/company` publishes it verbatim into a banner on the home
+    /// screen. Orizn's banner will carry this exact string, so it has to name
+    /// the gesture that repairs the company rather than read like an outage.
+    ///
+    /// The other half of the same rule — that a *provider's* prose never gets
+    /// there — is asserted on the real path, in
+    /// `a_provider_that_fails_forever_is_bounded_by_the_day_and_billed_for_it`,
+    /// where a failing model actually runs through `take_turn`. Asserting it on
+    /// a hand-built `Outcome::Failed` here would be a test of this test.
+    #[test]
+    fn la_phrase_publiee_quand_le_modele_refuse_est_la_notre() {
+        let du_produit = Outcome::NoModel(
+            agentos_app::model_access::NoModel::SubscriptionIsNotOursToHold.to_string(),
+        );
+        let detail = du_produit.detail().expect("a detail");
+        assert!(
+            detail.contains("Reconnect with POST /v1/model"),
+            "the published sentence has to name the fix: {detail}"
+        );
+        assert!(
+            detail.contains("retrying will not fix it"),
+            "and it has to say that waiting is not one of the options: {detail}"
+        );
+    }
+
     /// ponytail: the array is written out and a tenth variant that nobody adds
     /// here is still missed. The upgrade path is a `create type … as enum` fed
     /// from one list, which costs an `alter type` per value and buys nothing else
@@ -3886,6 +3980,33 @@ pub(crate) mod tests {
         assert!(question.contains("which accounts"), "{question}");
 
         assert_eq!(outcome_of(&db, tenant, bare).await.0, "no_charter");
+
+        // And the trace that outlives the next beat — `migrations/0099`. Four
+        // beats rang and **two** rows exist: the turn that worked and the one
+        // that did not. The employee nobody chartered and the objective that
+        // asked a question wrote nothing, because a company at rest is not a
+        // company that has stopped, and `GET /v1/health/company` would call it
+        // `degraded` if they did.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let traced: Vec<(Uuid, String, Option<String>)> =
+            sqlx::query_as("SELECT employee_id, code, detail FROM turn_outcomes ORDER BY code")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("traces");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            traced,
+            vec![
+                (
+                    fails.as_uuid(),
+                    "error".to_owned(),
+                    Some("turn_failed".to_owned())
+                ),
+                (works.as_uuid(), "turn".to_owned(), None),
+            ],
+            "only the beats that counted leave a trace, and each carries its own \
+             sentence: {traced:?}"
+        );
 
         // And nothing is due again: the claim rescheduled all four.
         let again = tick(&db, &take, &cancel, Utc::now()).await.expect("tick");
@@ -4753,6 +4874,33 @@ pub(crate) mod tests {
             detail.unwrap_or_default().contains("used up"),
             "the operator is not told which ceiling stopped it"
         );
+
+        // And what the two rounds that DID reach the provider wrote down —
+        // `migrations/0099`, on the real path. `GET /v1/health/company` puts
+        // this string in a banner on the founder's home screen, so a provider's
+        // error prose arriving here would be a stranger with a brush on our own
+        // console. `take_turn` reduces it to `failed.error.code()`, a closed
+        // vocabulary, and this is what makes that a failing test rather than a
+        // sentence in a doc comment.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let details: Vec<String> =
+            sqlx::query_scalar("SELECT detail FROM turn_outcomes WHERE code = 'error'")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("traces");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            details.len(),
+            2,
+            "the two rounds that ran left a trace each"
+        );
+        for detail in &details {
+            assert!(
+                !detail.is_empty() && !detail.contains(char::is_whitespace),
+                "a failed turn is recorded as a one-word code, never as whatever \
+                 the provider wrote: {detail}"
+            );
+        }
 
         // Two turns granted, two burned, none handed back by failing.
         assert_eq!(

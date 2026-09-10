@@ -1146,6 +1146,139 @@ Reading it:
 
 ---
 
+## 4.5 Has the company stopped thinking?
+
+### The sentence that was missing
+
+`/readyz` answers "can this replica serve a request". It has never answered
+"are this tenant's employees doing any work", and on **2026-09-06** the
+difference cost four days.
+
+`agentos_app::model_access::NoModel::SubscriptionIsNotOursToHold` began
+refusing every one of Orizn's turns. In the container logs, every wake looked
+like this:
+
+```
+ERROR  the employee's own turn did not finish
+       error: "this tenant's model connection carries a Claude subscription token,
+               which this deployment may no longer run on: …"
+INFO   no turn taken   outcome=error
+ERROR  outbox event dead-lettered; this side effect will not happen
+```
+
+Everywhere else, the company looked healthy. `/readyz` was green — it measures
+this process, not the work. The seats were `active`. `GET /v1/model` returned a
+verified connection, and it *was* verified: the rule changed, not the key. The
+console's home screen said nothing at all. The founder found out on
+**2026-09-10**, because an employee had stopped answering him.
+
+Nothing was broken in a way anything knew how to ask about. That is the gap
+this route closes: **a company where no employee is thinking any more has to
+say so on a screen, in red, from the first lost turn.**
+
+### `GET /v1/health/company`
+
+Same auth as `/v1/outreach` — the tenant's API key — and every read is under
+that tenant's RLS. One tenant cannot see another's arrest.
+
+```json
+{
+  "turns_attempted_today": 288,
+  "turns_failed_today": 288,
+  "last_success_at": "2026-09-06T09:05:11Z",
+  "last_failure_at": "2026-09-10T11:58:02Z",
+  "last_failure_code": "error",
+  "last_failure_detail": "this tenant's model connection carries a Claude subscription token, which this deployment may no longer run on: Anthropic's terms forbid intermediating Claude usage on an end user's behalf. Reconnect with POST /v1/model and an Anthropic API key of their own. Nothing about this is a provider failure and retrying will not fix it",
+  "dead_lettered_today": 12,
+  "model": {"path": "cli", "model": "claude-opus-5", "verified_at": "2026-08-30T14:02:00Z"},
+  "verdict": "stopped"
+}
+```
+
+`model` is `null` when no model is connected — which is itself one of the ways
+a company stops thinking. Every other field is `null` or `0` on a tenant that
+has never taken a beat, and the answer is still `200`: this is a **reading**,
+not a probe. A `503` here would push the console off the route at exactly the
+moment it has something to show.
+
+### The three verdicts
+
+| verdict | what it means | what to do |
+|---|---|---|
+| `working` | No failed turn today, **or** no turn attempted at all. | Nothing. A company at rest is not a company that is ill — a new tenant, a Saturday, a fleet with no cadence set. The console shows no banner. |
+| `degraded` | Failures and successes mixed today. | Read `last_failure_detail`. Something breaks intermittently; nobody has to be woken up. |
+| `stopped` | At least one turn attempted today, **and** no success in more than 6 hours while turns were still being attempted inside that window. | Page someone. This is Orizn's case. |
+
+Both halves of `stopped` carry weight. "No success in six hours" alone is true
+of a company that is closed for the weekend; "it is still trying" alone is true
+of a company that is working. Their conjunction is the only thing that
+describes an employee waking up, failing, and starting over — for four days.
+
+The six-hour boundary is strict: a success exactly six hours old is still
+inside the window, and the verdict is `degraded`.
+
+### Where the numbers come from
+
+`turn_outcomes` (`migrations/0099`), written by `loops::initiative::record` at
+the exact place `no turn taken` is logged. One row per beat **that counted** —
+a success, or a failure. A beat at rest writes nothing: no charter, no work
+due, a question for the operator, a turn budget the operator set. Filling the
+table with a healthy company's idleness would grow it at the speed of the
+cadence and make a new company read `degraded` on its first morning.
+
+Four existing tables were read before that one was written, and none of them
+can answer this question:
+
+* `employee_initiative` (`0020`) holds `last_outcome` and `last_detail`, but
+  it is **one snapshot per seat**, overwritten every beat and emptied by the
+  claim. It says "this seat failed its last turn", never "it has failed every
+  turn for four days", and never the date of the last one that worked —
+  Orizn's success from 2026-09-06 had been written over by 09:05.
+* `turn_buckets` (`0016`) counts today's reservations, so it counts turns
+  *attempted* — not their outcome, and not the ones refused before the
+  reservation.
+* `model_usage_daily` (`0024`/`0097`) counts tokens. A turn that fails before
+  the first call writes nothing there, and a turn that fails after it writes
+  the same row as one that succeeded.
+* `audit_log` (`0001`) records what the gate **ruled**. A cadence turn that
+  only thinks triggers no gated action, so it leaves nothing; `AuditKind` has
+  no turn-outcome variant, and adding one would put an operational fact in the
+  security register.
+
+`dead_lettered_today` comes from `outbox_events` by the same predicate
+[§5](#5-dead-letters) describes. That table has no dead-letter timestamp, so
+"today" is measured on `available_at` — for a parked row, the moment the last
+attempt scheduled a retry that will never happen, i.e. when it died, give or
+take one backoff. It is the only date the table carries, and saying so here is
+better than publishing an all-time total under a field called `today`.
+
+### `last_failure_detail` is our text
+
+It is published verbatim into a banner on the founder's home screen, so a
+provider's error prose reaching it would be a stranger holding a brush on our
+own console. It cannot: `loops::initiative::take_turn` already reduces a failed
+model call to `failed.error.code()`, a closed vocabulary, and everything else
+`Outcome::detail()` can carry is a sentence written in this workspace — the
+`NoModel` variants, the subscription-ceiling sentence. That is a property of
+the **write** side, not a filter on the read side, and
+`a_provider_that_fails_forever_is_bounded_by_the_day_and_billed_for_it` is what
+makes it a failing test rather than a claim in a comment.
+
+### Alerting on it
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" "$API/v1/health/company" | jq -r .verdict
+# working | degraded | stopped
+```
+
+Page on `stopped`. Watch `degraded`. `working` is silence, on purpose — a
+screen that congratulates you every day is a screen nobody reads the day it
+turns red. The console's home screen follows the same rule: the banner exists
+only for the other two verdicts, and it sits above everything else, because it
+is the one line that can make everything below it false.
+
+---
+
 ## 5. Dead letters
 
 ### What one is
