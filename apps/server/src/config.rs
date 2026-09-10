@@ -332,6 +332,21 @@ pub struct Config {
     /// was open". Set it and the scrape works; the operator learns which it is
     /// from one `warn` at boot.
     pub metrics_key: Option<String>,
+    /// `CAPTCHA_API_KEY=<fournisseur>:<clé>` — le solveur de captcha, quand le
+    /// client en paie un.
+    ///
+    /// **Ni un adaptateur du tableau ci-dessus, ni un mock.** Les quatre lignes
+    /// de [`PROVIDER_CREDENTIALS`] sont des capacités dont l'absence se remplit
+    /// d'un faux ; celle-ci est une *ressource humaine* — quelqu'un regarde une
+    /// image — et son absence ne se remplit de rien. Sans elle, une page à
+    /// défi rend `captcha` : l'issue honnête, distincte de `blocked_by_site`
+    /// exprès, pour qu'un opérateur sache qu'il y a quelque chose à acheter.
+    /// Un faux qui rendrait un jeton inventé ferait échouer la page une
+    /// seconde plus tard, là où plus personne ne saurait pourquoi.
+    ///
+    /// Un fournisseur que ce binaire ne connaît pas est un **refus de
+    /// démarrage** : l'opérateur a payé quelque chose et croit l'avoir branché.
+    pub captcha: Option<(String, String)>,
     /// Adapters that will run as mocks in this process, derived from
     /// [`PROVIDER_CREDENTIALS`].
     pub mock_adapters: Vec<&'static str>,
@@ -750,6 +765,24 @@ impl Config {
             }
         };
 
+        // Lu après la garde des mocks et non parmi les `Credentials` : son
+        // absence n'est pas un faux à autoriser, c'est un défi qu'on refuse.
+        // Le nom du fournisseur est validé ici plutôt qu'à la première page à
+        // captcha, qui serait un mardi dans trois semaines.
+        let captcha = split_pair(
+            "CAPTCHA_API_KEY",
+            get("CAPTCHA_API_KEY"),
+            "<provider>:<key> — `2captcha:…` is the only provider this build speaks",
+        )?;
+        if let Some((provider, key)) = &captcha {
+            agentos_app::mocks::captcha_solver(provider, key).map_err(|detail| {
+                ConfigError::Invalid {
+                    var: "CAPTCHA_API_KEY",
+                    detail,
+                }
+            })?;
+        }
+
         Ok(Self {
             bind,
             public_host,
@@ -763,6 +796,7 @@ impl Config {
             api_keys,
             platform_keys,
             metrics_key,
+            captcha,
             mock_adapters,
             credentials,
             webhooks,
@@ -793,6 +827,27 @@ impl Config {
     /// audit trail.
     pub fn browser_js(&self) -> bool {
         self.credentials.browser.is_some() || self.credentials.browser_cdp.is_some()
+    }
+
+    /// Y a-t-il un solveur de captcha derrière ce déploiement ? `/readyz` le
+    /// publie, à côté de `browser_js` et pour sa raison : un opérateur dont un
+    /// employé rapporte `captcha` demande à une réplique, pas à un journal de
+    /// démarrage, s'il y a une clé branchée ou non.
+    pub fn captcha(&self) -> bool {
+        self.captcha.is_some()
+    }
+
+    /// Le solveur que `CAPTCHA_API_KEY` nomme, ou celui qui refuse.
+    ///
+    /// Le nom du fournisseur a déjà été validé par [`Config::parse`] — un
+    /// inconnu y est un refus de démarrage — donc l'échec ici est
+    /// inatteignable et retombe sur le refus plutôt que sur un `expect`.
+    pub fn captcha_solver(&self) -> std::sync::Arc<dyn agentos_app::mocks::CaptchaSolver> {
+        match &self.captcha {
+            Some((provider, key)) => agentos_app::mocks::captcha_solver(provider, key)
+                .unwrap_or_else(|_| agentos_app::mocks::no_captcha_solver()),
+            None => agentos_app::mocks::no_captcha_solver(),
+        }
     }
 
     /// Say, loudly and every time, what is real and what is not.
@@ -1352,7 +1407,15 @@ mod tests {
             config.mock_adapters
         );
         let chrome = config.credentials.browser_cdp.as_ref().expect("selected");
-        assert_eq!(chrome.url.as_str(), "http://browser:9222/");
+        assert_eq!(
+            chrome
+                .urls
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["http://browser:9222/"],
+            "one address is a fleet of one, and still the ordinary case"
+        );
         assert_eq!(chrome.max_tabs, 3);
         assert_eq!(chrome.queue_wait, std::time::Duration::from_secs(60));
         assert!(config.browser_js(), "a Chromium runs JavaScript");

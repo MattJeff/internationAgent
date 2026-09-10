@@ -70,7 +70,10 @@ use std::sync::Arc;
 use agentos_domain::identity::{PublicKey, PublicKeyError, signing_key_ref};
 use agentos_domain::ids::{SecretRefError, TenantId};
 use agentos_providers::ProviderError;
-use agentos_providers::secrets::{Envelope, LocalEnvelopeSecretStore};
+use agentos_providers::secrets::Envelope;
+// Re-exporté : le binaire n'a pas `agentos-providers` dans son manifeste, et
+// `routes::browser` doit pouvoir nommer le chiffre qu'`envelope` lui rend.
+pub use agentos_providers::secrets::LocalEnvelopeSecretStore;
 use agentos_providers::signing::{Signature, SigningKey};
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError};
@@ -167,6 +170,7 @@ pub const PREVIOUS_KEY_VAR: &str = "AGENTOS_MASTER_KEY_PREVIOUS";
 /// anywhere means adding a line here; the test at the bottom of this module
 /// fails if the schema grows one that is not listed.
 const SEALED_COLUMNS: &[(&str, &str)] = &[
+    ("browser_proxies", "sealed_credentials"),
     ("employee_resources", "sealed_cookies"),
     ("employee_signing_keys", "sealed_private_key"),
     ("mcp_servers", "sealed_token"),

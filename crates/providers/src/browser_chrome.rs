@@ -76,8 +76,8 @@
 //!   là et dans `PROVIDERS.md` ; `blocked_by_site` reste la sortie honnête.
 //! * **Documents.** Une navigation dont la réponse n'est pas HTML n'est plus
 //!   une erreur : elle revient en [`BrowserOutcome::Document`], et c'est
-//!   `effects.rs` qui la range au classeur. Voir [`Inner::arm_document_watch`]
-//!   pour pourquoi ça demande une **deuxième socket** sur la même page.
+//!   `effects.rs` qui la range au classeur. La v2 y ouvrait une **deuxième
+//!   socket** ; la v3 l'a repliée dans celle de l'onglet — voir plus bas.
 //!
 //! # L'émulation est par contexte, et le port ressemble au pot de cookies
 //!
@@ -87,6 +87,47 @@
 //! pas neutre et c'est voulu : un employé sans profil est un employé français,
 //! pas un employé américain dans un fuseau UTC, ce que `--headless` annonce
 //! sinon.
+//!
+//! # La troisième phase : les prises, et la flotte
+//!
+//! Trois ajouts du 2026-09-10, et le tri du dépôt tient : le **logiciel** se
+//! construit, la **ressource** se paie par une clé que le client apporte. Rien
+//! ici n'ouvre de compte nulle part, et un déploiement sans clé se comporte
+//! exactement comme la v2.
+//!
+//! * **Le proxy est passé au contexte, pas au processus.**
+//!   `Target.createBrowserContext { proxyServer, proxyBypassList }` — les deux
+//!   noms sont relevés le 2026-09-10 dans `GET /json/protocol` de Chrome
+//!   152.0.7977.83, où ils sont décrits « similar to the one passed to
+//!   `--proxy-server` ». C'est *pourquoi* on ne touche pas à `--proxy-server` :
+//!   un drapeau de processus voudrait un Chromium par locataire, là où un
+//!   paramètre de contexte donne une adresse de sortie par tâche sans
+//!   redémarrer quoi que ce soit. Le port est [`Proxies`], indexé par contexte
+//!   comme [`CookieJar`], et sa table est au locataire (migration 0098).
+//! * **Un défi de captcha est nommé, il n'est plus un mur.** Trois signatures
+//!   lues dans [`WALL_CHECK`], une seule évaluation avec la détection de mur
+//!   parce que les deux attendent le même `DOMContentLoaded`. Sans solveur
+//!   branché : `Terminal { code: "captcha" }`, distinct de [`BLOCKED_BY_SITE`]
+//!   — voir [`crate::captcha`] pour pourquoi la distinction se paie.
+//! * **La flotte.** [`Fleet`] : `BROWSER_CDP_URL` accepte une liste, chaque
+//!   point a son sémaphore, sa santé et ses onglets. **Rien n'attache un
+//!   employé à une machine** — le pot de cookies est chez nous, dans une
+//!   colonne scellée, et le profil aussi : c'est exactement ce qui rend la
+//!   flotte possible, et c'est ce qui manquait à un `--user-data-dir` par
+//!   employé. Une tâche reste sur son point pour toute sa vie parce que
+//!   l'onglet y est, pas parce que l'employé y est.
+//!
+//! # Une seule session `Fetch` par onglet
+//!
+//! La v2 avait deux usages de `Fetch` en tête : la navigation (un document qui
+//! n'est pas une page) et, maintenant, l'authentification du proxy. **Deux
+//! sockets qui activent `Fetch` sur la même cible, c'est deux interceptions qui
+//! se disputent le même `requestPaused`.** Donc il n'y en a qu'une : la socket
+//! qui tenait déjà l'habillage ([`Tab::dressed`], vivante aussi longtemps que
+//! l'onglet et déjà en train de lire des événements pour ne pas les
+//! accumuler) porte aussi `Fetch.enable`, et sa boucle est le seul
+//! consommateur. Voir [`Inner::pump`] pour ce que la mesure a corrigé dans les
+//! motifs.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -109,6 +150,7 @@ use crate::browser::{
 use crate::browser_browserbase::CdpDriver as _;
 use crate::browser_http::UrlVet;
 use crate::browser_observer::{BrowserObserver, NoopObserver, StepOutcome, StepReport, TaskRef};
+use crate::captcha::{CAPTCHA, CaptchaSolver, Challenge, ChallengeKind, NoSolver};
 use crate::cdp::{CdpWebsocket, NAVIGATION_FAILED, SCRIPT_FAILED};
 use crate::{EnsureCtx, ProviderBinding, ProviderError, Provisioned, Secret};
 
@@ -145,9 +187,15 @@ pub const MAX_DOCUMENT: usize = 8 * 1024 * 1024;
 /// screencast promptly, and a page that shows nothing sends no frames — so the
 /// answer cannot be « when the next frame arrives ».
 const PUMP_PATIENCE: Duration = Duration::from_secs(1);
-/// The same, for the document watch, which lives only as long as one
-/// navigation and must not add a second to it.
-const WATCH_PATIENCE: Duration = Duration::from_millis(50);
+
+/// Combien de temps entre deux sondes de santé d'un point de la flotte.
+///
+/// Trente secondes, **hors du chemin d'une tâche** : un `GET /json/version`
+/// devant chaque ouverture d'onglet paierait un aller-retour HTTP pour une
+/// question dont la réponse ne change qu'au redémarrage d'un conteneur. Le prix
+/// de la réponse périmée est borné par le fait qu'un point malade choisi par
+/// erreur échoue à l'ouverture — ce qui est un `Retryable`, pas une perte.
+const HEALTH_PROBE: Duration = Duration::from_secs(30);
 
 /// What replaces a document in the tab, so the tab stays a tab.
 ///
@@ -182,14 +230,38 @@ const BLOCKED_TITLES: &[&str] = &[
     "enable javascript and cookies to continue",
 ];
 
-/// What the page says about itself once it has parsed: its title and the
-/// status its document was served with. Waits for `DOMContentLoaded` because
-/// `Page.navigate` returns at commit, before the `<title>` has been read.
+/// What the page says about itself once it has parsed: its title, the status
+/// its document was served with, **and the captcha it carries, if it carries
+/// one**. Waits for `DOMContentLoaded` because `Page.navigate` returns at
+/// commit, before the `<title>` has been read.
 ///
 /// `responseStatus` is Chrome 109+; an older Chrome reads `0`, which is
 /// « not a wall », the safe direction.
-const WALL_CHECK: &str = "new Promise(done => { const answer = () => done([document.title, \
-     (performance.getEntriesByType('navigation')[0] || {}).responseStatus || 0]); \
+///
+/// # Pourquoi les quatre valeurs sortent ensemble
+///
+/// Le mur et le défi attendent le **même** `DOMContentLoaded` : deux
+/// `Runtime.evaluate` seraient deux fois la même promesse, deux allers-retours
+/// de socket et deux façons de désaccorder ce que « la page » veut dire. Une
+/// seule évaluation, quatre cases — `['', '']` quand il n'y a pas de défi, ce
+/// qui est le cas de toutes les pages sauf une poignée.
+///
+/// # Les trois signatures, et ce qu'elles ne couvrent pas
+///
+/// `.g-recaptcha[data-sitekey]`, `.cf-turnstile[data-sitekey]`,
+/// `.h-captcha[data-sitekey]` : la classe *et* l'attribut, parce que la clé de
+/// site est ce qu'un solveur demande et qu'un widget sans elle est un widget
+/// rendu par script après coup, que nous ne saurions pas résoudre non plus.
+/// Arkose, DataDome et GeeTest n'ont pas cet attribut et restent
+/// [`BLOCKED_BY_SITE`] — voir [`crate::captcha`].
+const WALL_CHECK: &str = "new Promise(done => { const answer = () => { \
+     const hit = [['recaptcha2', '.g-recaptcha'], ['turnstile', '.cf-turnstile'], \
+       ['hcaptcha', '.h-captcha']] \
+       .map(([k, s]) => [k, document.querySelector(s + '[data-sitekey]')]) \
+       .find(([, e]) => e); \
+     done([document.title, \
+       (performance.getEntriesByType('navigation')[0] || {}).responseStatus || 0, \
+       hit ? hit[0] : '', hit ? hit[1].getAttribute('data-sitekey') : '']); }; \
      document.readyState !== 'loading' ? answer() : \
      document.addEventListener('DOMContentLoaded', answer); })";
 
@@ -305,6 +377,74 @@ fn cookie_params(cookies: &[Value]) -> Vec<Value> {
             Value::Object(param)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The proxy
+// ---------------------------------------------------------------------------
+
+/// L'adresse par laquelle les onglets d'un contexte sortent.
+///
+/// Trois champs et pas quatre : le mot de passe n'a pas de champ à lui, il est
+/// la deuxième moitié de `credentials`, pour qu'aucune ligne de code ne puisse
+/// nommer un mot de passe sans nommer l'utilisateur qui va avec — et pour que
+/// le `Debug` écrit à la main n'ait qu'un champ à taire.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProxyConfig {
+    /// `http://hote:port` ou `socks5://hote:port`, tel que
+    /// `Target.createBrowserContext.proxyServer` l'accepte. Sans identifiants
+    /// dedans : ils sont à côté, et un `http://user:pass@…` serait un mot de
+    /// passe dans une colonne en clair.
+    pub server: String,
+    /// Ce que `--proxy-bypass-list` accepte, ou rien.
+    pub bypass: Option<String>,
+    /// `(utilisateur, mot de passe)`, quand le proxy en demande.
+    pub credentials: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    /// À la main, et c'est le point : un `derive` mettrait le mot de passe dans
+    /// la première ligne de trace que quelqu'un écrit en déboguant.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("server", &self.server)
+            .field("bypass", &self.bypass)
+            .field("has_credentials", &self.credentials.is_some())
+            .finish()
+    }
+}
+
+/// D'où vient le proxy d'un contexte.
+///
+/// Un port pour la raison de [`CookieJar`] et avec sa clé : l'identifiant de
+/// contexte est la seule chose que ce crate tient des deux côtés, et la ligne
+/// qui porte l'adresse est au **locataire** (migration 0098), derrière une
+/// recherche que cet adaptateur ne sait pas faire. Le scellé des identifiants
+/// s'ouvre un crate plus haut, sous `browser://<locataire>/proxy`, là où vivent
+/// le chiffre et la clé maître.
+#[async_trait]
+pub trait Proxies: Send + Sync {
+    /// Le proxy de ce contexte, ou `None` — qui veut dire « sort par l'adresse
+    /// de la machine », l'état de tout locataire qui n'a rien posé.
+    ///
+    /// Une erreur ici **n'est pas fatale à l'onglet** et c'est délibéré, pour
+    /// la raison de [`BrowserProfiles::profile_for`] tournée dans l'autre
+    /// sens : un onglet qui refuse de s'ouvrir est un tour mort, là qu'un
+    /// onglet qui sort par la mauvaise adresse est visible et récupérable.
+    /// Voir [`Inner::open`], qui le journalise plutôt que d'échouer.
+    async fn proxy_for(&self, ctx: &str) -> Result<Option<ProxyConfig>, ProviderError>;
+}
+
+/// Personne ne passe par un proxy. Le défaut de l'adaptateur et celui des
+/// tests, et l'état de tout déploiement qui n'en a pas acheté.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoProxies;
+
+#[async_trait]
+impl Proxies for NoProxies {
+    async fn proxy_for(&self, _ctx: &str) -> Result<Option<ProxyConfig>, ProviderError> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +702,99 @@ fn honest_user_agent(reported: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The fleet
+// ---------------------------------------------------------------------------
+
+/// Un Chromium de la flotte : son adresse de configuration, ses jetons, sa
+/// santé.
+///
+/// **Le sémaphore est par machine et non au total**, et c'est tout le sujet :
+/// `BROWSER_MAX_TABS` est une arithmétique de mémoire (≈ 400 Mo de base et
+/// 100–150 Mo par onglet dans un conteneur plafonné à 1 Go), donc trois
+/// machines portent neuf onglets, pas trois. Un plafond global aurait fait de
+/// la deuxième machine une dépense sans effet.
+///
+/// Les onglets ouverts ne sont pas comptés à part : `max_tabs -
+/// tokens.available_permits()` est le compte, il ne peut pas se désaccorder du
+/// sémaphore, et c'est la charge sur laquelle [`Fleet::pick`] classe.
+struct Endpoint {
+    url: Url,
+    tokens: Arc<Semaphore>,
+    max_tabs: usize,
+    /// **Vraie au départ, et c'est délibéré.** Un point présumé malade tant
+    /// qu'une sonde n'a pas dit le contraire ferait attendre trente secondes à
+    /// la première tâche d'un déploiement qui vient de démarrer. Optimiste,
+    /// donc, et la sonde corrige — le prix d'une erreur est une ouverture
+    /// d'onglet qui échoue, c'est-à-dire un `Retryable`.
+    healthy: AtomicBool,
+}
+
+impl Endpoint {
+    /// Onglets ouverts sur ce point, maintenant.
+    fn open_tabs(&self) -> usize {
+        self.max_tabs
+            .saturating_sub(self.tokens.available_permits())
+    }
+}
+
+/// Les Chromium que ce processus pilote.
+///
+/// Une seule valeur dans `BROWSER_CDP_URL` reste valide et donne une flotte
+/// d'un point : rien ne distingue le cas d'avant, ni dans la configuration ni
+/// dans le code.
+struct Fleet {
+    endpoints: Vec<Endpoint>,
+    /// Les sondes sont démarrées à la première ouverture d'onglet et pas dans
+    /// `new` : `tokio::spawn` hors d'un exécuteur panique, et `ChromeBrowser`
+    /// se construit dans des tests qui n'en ont pas.
+    probing: AtomicBool,
+}
+
+impl Fleet {
+    fn new(urls: Vec<Url>, max_tabs: usize) -> Self {
+        let max_tabs = max_tabs.max(1);
+        Self {
+            endpoints: urls
+                .into_iter()
+                .map(|url| Endpoint {
+                    url,
+                    tokens: Arc::new(Semaphore::new(max_tabs)),
+                    max_tabs,
+                    healthy: AtomicBool::new(true),
+                })
+                .collect(),
+            probing: AtomicBool::new(false),
+        }
+    }
+
+    /// Le point sain le moins chargé, ou `None` si aucun n'est sain.
+    ///
+    /// « Le moins chargé » et non « le premier libre » : le premier libre
+    /// remplit la machine 1 avant de toucher la machine 2, ce qui donne un
+    /// point à trois onglets et un point à zéro alors que le travail tient à
+    /// deux et deux. Le classement est lu sans verrou et n'est qu'une
+    /// préférence — le sémaphore du point choisi est le vrai verrou, et si
+    /// quelqu'un le remplit entre les deux, l'attente bornée s'applique là.
+    fn pick(&self) -> Option<&Endpoint> {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| endpoint.healthy.load(Ordering::Acquire))
+            .min_by_key(|endpoint| endpoint.open_tabs())
+    }
+
+    /// `(total, sains)`, pour `/readyz`.
+    fn health(&self) -> (usize, usize) {
+        (
+            self.endpoints.len(),
+            self.endpoints
+                .iter()
+                .filter(|endpoint| endpoint.healthy.load(Ordering::Acquire))
+                .count(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
 
@@ -569,6 +802,11 @@ fn honest_user_agent(reported: &str) -> String {
 /// holds. Dropping it returns the token; closing it properly is
 /// [`Inner::close`]'s job.
 struct Tab {
+    /// **L'adresse du point de la flotte où cet onglet vit**, résolue à
+    /// l'ouverture et gardée : une tâche ne change pas de machine, parce que
+    /// l'onglet est sur celle-là. Gardée plutôt que re-résolue à la fermeture
+    /// pour que fermer une cible ne dépende pas d'un DNS qui a bougé depuis.
+    at: SocketAddr,
     context_id: String,
     target_id: String,
     /// `ws://<ip>:<port>/devtools/page/<target>`, handed to the driver
@@ -606,32 +844,79 @@ struct Tab {
     /// long as the tab lives.
     ///
     /// Which is why the socket is not a field here but is owned by a task
-    /// ([`Inner::hold_the_dressing`]): a subscribed session that nobody reads
-    /// is an event queue that nobody drains, and `Page` is a chatty domain —
-    /// a dozen frames per navigation into a socket buffer that eventually
-    /// blocks Chromium's own writer. The flag is how [`Inner::close`] lets it
-    /// go.
+    /// ([`Inner::pump`]): a subscribed session that nobody reads is an event
+    /// queue that nobody drains, and `Page` is a chatty domain — a dozen frames
+    /// per navigation into a socket buffer that eventually blocks Chromium's
+    /// own writer. The flag is how [`Inner::close`] lets it go.
+    ///
+    /// **Depuis la v3 cette socket porte aussi `Fetch`** : c'est *la* session
+    /// d'interception de l'onglet, une seule, et sa boucle est le seul
+    /// consommateur de `Fetch.requestPaused` et de `Fetch.authRequired`. Voir
+    /// [`Inner::pump`].
     dressed: Arc<AtomicBool>,
+    /// Ce que la pompe a trouvé pendant la navigation en cours. Armé par
+    /// [`BrowserProvider::act`] avant `Page.navigate`, désarmé par la pompe
+    /// quand elle a décidé.
+    watch: Arc<Watch>,
     _permit: OwnedSemaphorePermit,
 }
 
+/// Le rendez-vous entre la pompe `Fetch` et l'étape qui navigue.
+///
+/// **La synchronisation est l'ordre d'écriture, pas un canal.** `Fetch.enable`
+/// met la réponse en attente : `Page.navigate` ne rend la main que lorsque
+/// quelqu'un a continué ou rempli cette réponse. La pompe écrit `found`
+/// **avant** de répondre à la requête en attente ; donc au retour de
+/// `Page.navigate`, `found` est déjà posé. Un `oneshot` ferait le même travail
+/// avec une allocation par navigation et une branche « et si l'émetteur est
+/// mort » qui n'a pas de bonne réponse.
+#[derive(Default)]
+struct Watch {
+    /// Vrai entre l'armement et la décision. Une réponse de document en
+    /// attente que personne n'a armée est simplement continuée.
+    armed: AtomicBool,
+    /// `Some` quand la navigation a rapporté un document (ou un refus de
+    /// document) ; `None` quand c'était une page.
+    found: Mutex<Option<Result<BrowserOutcome, ProviderError>>>,
+}
+
+impl Watch {
+    fn arm(&self) {
+        *self.found.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// Désarme et rend ce que la pompe a trouvé.
+    fn take(&self) -> Option<Result<BrowserOutcome, ProviderError>> {
+        self.armed.store(false, Ordering::Release);
+        self.found.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 struct Inner {
-    cdp_url: Url,
+    fleet: Fleet,
     http: reqwest::Client,
     driver: CdpWebsocket,
     vet: Arc<dyn UrlVet>,
     jar: Arc<dyn CookieJar>,
     observer: Arc<dyn BrowserObserver>,
     profiles: Arc<dyn BrowserProfiles>,
+    proxies: Arc<dyn Proxies>,
+    solver: Arc<dyn CaptchaSolver>,
     /// The User-Agent this Chromium reports, `HeadlessChrome` already taken
     /// out of it. Filled by the first [`Inner::browser_ws`] and never again:
     /// a running binary does not change version.
+    ///
+    /// Une flotte est faite de la même image épinglée par le même
+    /// `compose.yml` ; le premier point qui répond décide donc pour tous, et
+    /// deux versions dans une flotte est un problème de déploiement, pas
+    /// d'adaptateur.
     user_agent: Mutex<Option<String>>,
-    tokens: Arc<Semaphore>,
     tabs: Mutex<BTreeMap<String, Tab>>,
     queue_wait: Duration,
     step_timeout: Duration,
     tab_idle: Duration,
+    health_probe: Duration,
 }
 
 /// The self-hosted browser. `Clone` is cheap and shares the tabs and the
@@ -643,21 +928,25 @@ pub struct ChromeBrowser {
 
 impl std::fmt::Debug for ChromeBrowser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (total, healthy) = self.inner.fleet.health();
         f.debug_struct("ChromeBrowser")
-            .field("cdp_url", &self.inner.cdp_url.as_str())
+            .field("endpoints", &total)
+            .field("healthy", &healthy)
             .field("open_tabs", &self.inner.lock().len())
-            .field("free_tokens", &self.inner.tokens.available_permits())
             .finish()
     }
 }
 
 impl ChromeBrowser {
-    /// A browser at `cdp_url` (`http://browser:9222`), dialling only what
+    /// A browser on `cdp_urls` (`[http://browser:9222]`), dialling only what
     /// `vet` permits, keeping cookies in `jar`.
-    pub fn new(cdp_url: Url, vet: Arc<dyn UrlVet>, jar: Arc<dyn CookieJar>) -> Self {
+    ///
+    /// La liste est la flotte, dans l'ordre de `BROWSER_CDP_URL` ; une seule
+    /// adresse reste le cas ordinaire et ne coûte rien de plus.
+    pub fn new(cdp_urls: Vec<Url>, vet: Arc<dyn UrlVet>, jar: Arc<dyn CookieJar>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                cdp_url,
+                fleet: Fleet::new(cdp_urls, DEFAULT_MAX_TABS),
                 http: reqwest::Client::builder()
                     .timeout(crate::cdp::DEFAULT_CONNECT_TIMEOUT)
                     .build()
@@ -667,20 +956,49 @@ impl ChromeBrowser {
                 jar,
                 observer: Arc::new(NoopObserver),
                 profiles: Arc::new(DefaultProfiles),
+                proxies: Arc::new(NoProxies),
+                solver: Arc::new(NoSolver),
                 user_agent: Mutex::new(None),
-                tokens: Arc::new(Semaphore::new(DEFAULT_MAX_TABS)),
                 tabs: Mutex::new(BTreeMap::new()),
                 queue_wait: DEFAULT_QUEUE_WAIT,
                 step_timeout: STEP_TIMEOUT,
                 tab_idle: TAB_IDLE,
+                health_probe: HEALTH_PROBE,
             }),
         }
     }
 
-    /// `BROWSER_MAX_TABS`. Only before the first tab: the semaphore is built here.
+    /// `BROWSER_MAX_TABS`, **par machine**. Only before the first tab: the
+    /// semaphores are built here.
     #[must_use]
     pub fn with_max_tabs(self, max_tabs: usize) -> Self {
-        self.map(|inner| inner.tokens = Arc::new(Semaphore::new(max_tabs.max(1))))
+        self.map(|inner| {
+            let urls = inner
+                .fleet
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.url.clone())
+                .collect();
+            inner.fleet = Fleet::new(urls, max_tabs);
+        })
+    }
+
+    /// Par où les onglets de chaque contexte sortent. Défaut : [`NoProxies`].
+    #[must_use]
+    pub fn with_proxies(self, proxies: Arc<dyn Proxies>) -> Self {
+        self.map(|inner| inner.proxies = proxies)
+    }
+
+    /// Qui franchit un défi de captcha. Défaut : [`NoSolver`], qui refuse.
+    #[must_use]
+    pub fn with_solver(self, solver: Arc<dyn CaptchaSolver>) -> Self {
+        self.map(|inner| inner.solver = solver)
+    }
+
+    /// Raccourcir la cadence des sondes de santé — les tests seuls.
+    #[must_use]
+    pub fn with_health_probe(self, every: Duration) -> Self {
+        self.map(|inner| inner.health_probe = every)
     }
 
     /// `BROWSER_QUEUE_WAIT_SECS`.
@@ -762,16 +1080,16 @@ impl Inner {
         self.tabs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Where Chrome is reachable *by address*: the host of `cdp_url` resolved
+    /// Where a Chrome is reachable *by address*: the host of `url` resolved
     /// now, because Chrome refuses a `Host` header that is a name (module
     /// docs) and because a container's address changes on restart. IPv4
     /// first: Chrome listens on `127.0.0.1` by default and a `localhost` that
     /// resolves to `::1` first would dial an ear that is not there.
-    async fn endpoint(&self) -> Result<SocketAddr, ProviderError> {
-        let host = self.cdp_url.host_str().ok_or(ProviderError::Terminal {
+    async fn endpoint(url: &Url) -> Result<SocketAddr, ProviderError> {
+        let host = url.host_str().ok_or(ProviderError::Terminal {
             code: "bad_cdp_url",
         })?;
-        let port = self.cdp_url.port_or_known_default().unwrap_or(9222);
+        let port = url.port_or_known_default().unwrap_or(9222);
         let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
             .await
             .map_err(|_| ProviderError::timeout())?
@@ -814,6 +1132,55 @@ impl Inner {
         Ok(format!("ws://{at}{}", advertised.path()))
     }
 
+    // -- la flotte ----------------------------------------------------------
+
+    /// Démarre une sonde par point, une fois pour la vie du processus.
+    ///
+    /// Appelée depuis le chemin d'une tâche mais **ne s'y trouve pas** : elle
+    /// arme des tâches détachées et rend la main. Ce que le chemin d'une tâche
+    /// paie, c'est un `compare_exchange`.
+    fn start_probes(self: &Arc<Self>) {
+        if self
+            .fleet
+            .probing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        for index in 0..self.fleet.endpoints.len() {
+            let inner = Arc::clone(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(inner.health_probe).await;
+                    let endpoint = &inner.fleet.endpoints[index];
+                    // `/json/version` et rien d'autre : c'est ce que le
+                    // `healthcheck` du conteneur interroge déjà, donc les deux
+                    // ne peuvent pas être d'avis différents sur ce qu'est un
+                    // Chromium vivant.
+                    let alive = match Self::endpoint(&endpoint.url).await {
+                        Ok(at) => inner
+                            .http
+                            .get(format!("http://{at}/json/version"))
+                            .send()
+                            .await
+                            .is_ok_and(|response| response.status().is_success()),
+                        Err(_) => false,
+                    };
+                    // Journalisé au changement seulement : une flotte saine ne
+                    // doit pas écrire une ligne toutes les trente secondes.
+                    if endpoint.healthy.swap(alive, Ordering::AcqRel) != alive {
+                        if alive {
+                            tracing::info!(endpoint = %endpoint.url, "browser endpoint is back");
+                        } else {
+                            tracing::warn!(endpoint = %endpoint.url, "browser endpoint is down");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /// The tab this context is driving, opened if there is none. Touches it.
     async fn tab(
         self: &Arc<Self>,
@@ -824,6 +1191,7 @@ impl Inner {
             tab.last_used = Instant::now();
             return Ok(tab.page_url.clone());
         }
+        self.start_probes();
         let tab = self.open(ctx, employee).await?;
         let page_url = tab.page_url.clone();
         // The narration starts here and not at the first step: a task is a
@@ -848,15 +1216,34 @@ impl Inner {
         ctx: &str,
         employee: agentos_domain::ids::EmployeeId,
     ) -> Result<Tab, ProviderError> {
-        let permit =
-            tokio::time::timeout(self.queue_wait, Arc::clone(&self.tokens).acquire_owned())
-                .await
-                // Every tab is busy and has been for the whole wait: the turn is
-                // better off retried later than parked with a terminal error.
-                .map_err(|_| ProviderError::Retryable {
-                    after: self.queue_wait,
-                })?
-                .map_err(|_| ProviderError::Terminal { code: "no_browser" })?;
+        // Le point est choisi **avant** le jeton, parce que le jeton est celui
+        // d'un point. Aucun point sain : rien à attendre ici — le sémaphore
+        // d'une machine morte se libérerait sans que la machine revienne — donc
+        // `Retryable` tout de suite, et le message nomme les deux nombres, la
+        // seule ligne qui distingue « la flotte est pleine » de « la flotte est
+        // tombée ».
+        let Some(endpoint) = self.fleet.pick() else {
+            let (total, healthy) = self.fleet.health();
+            tracing::warn!(
+                endpoints = total,
+                unhealthy = total - healthy,
+                "no healthy browser endpoint: all {total} of them are down"
+            );
+            return Err(ProviderError::Retryable {
+                after: self.health_probe,
+            });
+        };
+        let permit = tokio::time::timeout(
+            self.queue_wait,
+            Arc::clone(&endpoint.tokens).acquire_owned(),
+        )
+        .await
+        // Every tab is busy and has been for the whole wait: the turn is
+        // better off retried later than parked with a terminal error.
+        .map_err(|_| ProviderError::Retryable {
+            after: self.queue_wait,
+        })?
+        .map_err(|_| ProviderError::Terminal { code: "no_browser" })?;
 
         // Read before the browser socket is even open: one of the six
         // commands it drives is on the *browser* endpoint (the geolocation
@@ -870,13 +1257,37 @@ impl Inner {
             );
             BrowserProfile::default()
         });
+        // Et le proxy, pour la raison symétrique : une ligne illisible est un
+        // onglet qui sort par l'adresse de la machine — visible, récupérable —
+        // là où un onglet qui refuse de s'ouvrir est un tour mort.
+        let proxy = self.proxies.proxy_for(ctx).await.unwrap_or_else(|err| {
+            tracing::warn!(
+                ctx,
+                code = err.code(),
+                "no proxy for this context; the tab leaves by the machine's own address"
+            );
+            None
+        });
 
-        let at = self.endpoint().await?;
+        let at = Self::endpoint(&endpoint.url).await?;
         let browser_ws = self.browser_ws(at).await?;
         let mut browser = self.driver.connect(&Secret::new(browser_ws)).await?;
 
+        // **Le proxy est un paramètre du contexte, jamais un drapeau du
+        // processus.** `--proxy-server` voudrait un Chromium par locataire ;
+        // `proxyServer` ici donne une adresse de sortie par tâche sur le même
+        // binaire, et le contexte est déjà jeté à la fin de la tâche. Les deux
+        // noms sont ceux du protocole, relevés le 2026-09-10 dans
+        // `GET /json/protocol` de Chrome 152.0.7977.83.
+        let mut params = serde_json::Map::new();
+        if let Some(proxy) = &proxy {
+            params.insert("proxyServer".to_owned(), json!(proxy.server));
+            if let Some(bypass) = &proxy.bypass {
+                params.insert("proxyBypassList".to_owned(), json!(bypass));
+            }
+        }
         let context_id = browser
-            .call("Target.createBrowserContext", json!({}))
+            .call("Target.createBrowserContext", Value::Object(params))
             .await?["browserContextId"]
             .as_str()
             .ok_or(ProviderError::Terminal { code: NO_TARGET })?
@@ -923,6 +1334,7 @@ impl Inner {
 
         let page_url = format!("ws://{at}/devtools/page/{target_id}");
         let tab = Tab {
+            at,
             context_id,
             target_id,
             page_url,
@@ -936,6 +1348,7 @@ impl Inner {
             outcome: StepOutcome::Ok,
             filming: Arc::new(AtomicBool::new(false)),
             dressed: Arc::new(AtomicBool::new(false)),
+            watch: Arc::new(Watch::default()),
             _permit: permit,
         };
 
@@ -975,29 +1388,99 @@ impl Inner {
                     );
                 }
             }
-            // Not closed, and not kept here either. See `Tab::dressed`:
-            // closing it is what made the emulation invisible to every page,
-            // and holding it unread is what would fill a socket buffer.
+            // L'interception, sur **cette** socket et sur aucune autre : c'est
+            // la seule qui vive aussi longtemps que l'onglet, et deux sessions
+            // `Fetch` sur une même cible sont deux interceptions qui se
+            // disputent le même `requestPaused`. Un Chromium trop vieux pour
+            // `Fetch` est un Chromium qui lit des pages : pas d'interception,
+            // pas d'échec.
+            let credentials = proxy.as_ref().and_then(|proxy| proxy.credentials.clone());
+            let intercepting = page
+                .call("Fetch.enable", fetch_patterns(credentials.is_some()))
+                .await
+                .is_ok();
             tab.dressed.store(true, Ordering::Release);
-            Self::hold_the_dressing(page, Arc::clone(&tab.dressed));
+            // Not closed, and not kept here either. See `Tab::dressed`: closing
+            // it is what made the emulation invisible to every page, and
+            // holding it unread is what would fill a socket buffer.
+            Self::pump(
+                page,
+                Arc::clone(&tab.dressed),
+                Arc::clone(&tab.watch),
+                intercepting.then_some(credentials).flatten(),
+            );
         }
         Ok(tab)
     }
 
-    /// Hold the session that carries the disguise open, and read what it is
-    /// subscribed to so nothing piles up behind it.
+    /// **La seule session `Fetch` de l'onglet**, et la socket qui porte
+    /// l'habillage.
     ///
-    /// Every event is discarded: this socket enables `Page` for exactly one
-    /// reason — `addScriptToEvaluateOnNewDocument` is inert otherwise — and
-    /// nothing here wants a lifecycle notification. Reading them is not the
-    /// point; *not accumulating them* is.
-    fn hold_the_dressing(mut page: crate::cdp::PageSocket, dressed: Arc<AtomicBool>) {
+    /// Elle existait déjà en v2 pour une raison qui n'a pas changé :
+    /// `Emulation.*` est défait quand le client qui l'a posé se déconnecte, et
+    /// `addScriptToEvaluateOnNewDocument` est inerte sans `Page.enable` —
+    /// donc quelqu'un doit rester abonné, et quelqu'un doit donc lire les
+    /// événements pour qu'ils ne s'empilent pas. Ce quelqu'un fait maintenant
+    /// le travail au lieu de le jeter.
+    ///
+    /// Trois choses arrivent ici :
+    ///
+    /// * **`Fetch.authRequired`** → `continueWithAuth`, avec les identifiants
+    ///   quand il y en a et `Default` sinon. `Default` et pas `CancelAuth` :
+    ///   un site qui demande une authentification HTTP à laquelle nous n'avons
+    ///   rien à répondre doit se comporter comme pour un humain qui ferme la
+    ///   boîte de dialogue, c'est-à-dire rendre son 401 à la page.
+    /// * **Une requête en attente** (`requestPaused` sans `responseStatusCode`)
+    ///   → `continueRequest`. C'est l'étage que l'authentification oblige à
+    ///   ajouter, voir [`fetch_patterns`].
+    /// * **Une réponse en attente** → si une navigation est armée
+    ///   ([`Watch`]), la décision document/page est prise ici et **écrite avant
+    ///   que la réponse soit rendue** ; sinon la réponse est simplement
+    ///   continuée.
+    fn pump(
+        mut page: crate::cdp::PageSocket,
+        alive: Arc<AtomicBool>,
+        watch: Arc<Watch>,
+        credentials: Option<(String, String)>,
+    ) {
         tokio::spawn(async move {
-            while dressed.load(Ordering::Acquire) {
+            while alive.load(Ordering::Acquire) {
                 // A dead socket ends the hold, and with it the disguise — the
                 // tab is on its way out anyway when that happens.
-                if page.next_event(PUMP_PATIENCE).await.is_err() {
-                    break;
+                let event = match page.next_event(PUMP_PATIENCE).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                match event["method"].as_str() {
+                    Some("Fetch.authRequired") => {
+                        let answer = match &credentials {
+                            Some((username, password)) => json!({
+                                "response": "ProvideCredentials",
+                                "username": username,
+                                // Le mot de passe est ici, dans le corps d'une
+                                // trame sortante, et nulle part ailleurs : rien
+                                // de cette fonction ne le formate, et
+                                // `cdp.rs::call_inner` trace la méthode et
+                                // l'identifiant, jamais les paramètres.
+                                "password": password,
+                            }),
+                            None => json!({ "response": "Default" }),
+                        };
+                        let _ = page
+                            .call(
+                                "Fetch.continueWithAuth",
+                                json!({
+                                    "requestId": event["params"]["requestId"],
+                                    "authChallengeResponse": answer,
+                                }),
+                            )
+                            .await;
+                    }
+                    Some("Fetch.requestPaused") => {
+                        answer_paused(&mut page, &event["params"], &watch).await;
+                    }
+                    _ => {}
                 }
             }
             page.close().await;
@@ -1200,57 +1683,6 @@ impl Inner {
         filming.store(false, Ordering::Release);
     }
 
-    // -- a navigation that answers with a file ------------------------------
-
-    /// Watch the navigation to `url` for a response that is not a page.
-    ///
-    /// **Why a second socket here too, and a spawned one.** `Fetch.enable`
-    /// pauses the response *before* the renderer sees it, which means
-    /// `Page.navigate` does not return until somebody continues or fulfils it.
-    /// So the decision cannot be taken after the navigation — it has to be
-    /// taken during, by something else. `run`'s signature does not move.
-    ///
-    /// The pattern is narrowed to `resourceType: "Document"` so no subresource
-    /// is ever paused: an interception that had to continue every image on
-    /// every page would put a round trip in front of each one, on the socket,
-    /// for a feature that concerns one response in a thousand.
-    ///
-    /// ponytail: the **first** document response of the navigation decides,
-    /// and a 3xx is skipped so a redirect to a PDF still lands here. An iframe
-    /// cannot beat its own parent's response, so « first » is « the main
-    /// navigation » in practice. A page that is HTML ends the watch on the
-    /// spot. The upgrade, if a frame ever does race: compare `frameId` against
-    /// `Page.getFrameTree`.
-    async fn arm_document_watch(&self, page_url: &str) -> Option<DocumentWatch> {
-        let mut page = self
-            .driver
-            .connect(&Secret::new(page_url.to_owned()))
-            .await
-            .ok()?;
-        // A Chromium too old for `Fetch` is a Chromium that reads pages, which
-        // is what it was doing yesterday. No watch, no failure.
-        if page
-            .call(
-                "Fetch.enable",
-                json!({ "patterns": [{ "requestStage": "Response", "resourceType": "Document" }] }),
-            )
-            .await
-            .is_err()
-        {
-            page.close().await;
-            return None;
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        let until = Arc::clone(&stop);
-        let handle = tokio::spawn(async move {
-            let found = watch_documents(&mut page, &until).await;
-            let _ = page.call("Fetch.disable", json!({})).await;
-            page.close().await;
-            found
-        });
-        Some(DocumentWatch { stop, handle })
-    }
-
     /// Export the cookies, then tear the tab down. Best effort at every
     /// stage: a tab whose socket is already dead still has to give its
     /// context back, and the permit is returned when `tab` drops whatever
@@ -1284,8 +1716,11 @@ impl Inner {
             }
             page.close().await;
         }
-        if let Ok(at) = self.endpoint().await
-            && let Ok(browser_ws) = self.browser_ws(at).await
+        // `tab.at` et non une nouvelle résolution : la cible et le contexte
+        // sont sur *cette* machine-là, et un DNS qui a bougé depuis
+        // l'ouverture enverrait la fermeture sur un Chromium qui n'a jamais
+        // entendu parler d'eux.
+        if let Ok(browser_ws) = self.browser_ws(tab.at).await
             && let Ok(mut browser) = self.driver.connect(&Secret::new(browser_ws)).await
         {
             let _ = browser
@@ -1349,21 +1784,51 @@ impl Inner {
         });
     }
 
-    /// After a navigation landed: is the page a wall?
-    async fn wall_check(&self, page_url: &str) -> Result<(), ProviderError> {
+    /// After a navigation landed: is the page a wall, or a challenge we can
+    /// name?
+    ///
+    /// **Le défi passe avant le mur, et c'est l'ordre qui compte.** Une page
+    /// Turnstile porte le titre « Just a moment… » *et* un `.cf-turnstile` :
+    /// les deux tests réussissent, et le plus précis des deux est celui qui
+    /// dit quoi faire. `blocked_by_site` reste pour ce qui n'a pas de défi
+    /// lisible — un 403 nu, un « Access denied » — c'est-à-dire pour ce qu'une
+    /// clé de solveur ne changerait pas.
+    async fn wall_check(&self, page_url: &str, landed: &Url) -> Result<(), ProviderError> {
         let mut page = self
             .driver
             .connect(&Secret::new(page_url.to_owned()))
             .await?;
         let answer = page.evaluate(WALL_CHECK.to_owned()).await;
-        page.close().await;
-        let answer = answer?;
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(err) => {
+                page.close().await;
+                return Err(err);
+            }
+        };
         let title = answer[0].as_str().unwrap_or_default().to_ascii_lowercase();
         let status = answer[1].as_u64().unwrap_or_default();
+        let challenge =
+            ChallengeKind::parse(answer[2].as_str().unwrap_or_default()).and_then(|kind| {
+                let site_key = answer[3].as_str().unwrap_or_default();
+                (!site_key.is_empty()).then(|| Challenge {
+                    kind,
+                    site_key: site_key.to_owned(),
+                    page_url: landed.clone(),
+                })
+            });
+
+        if let Some(challenge) = challenge {
+            let outcome = self.solve(&mut page, &challenge).await;
+            page.close().await;
+            return outcome;
+        }
+        page.close().await;
+
         if matches!(status, 403 | 503) || BLOCKED_TITLES.iter().any(|wall| title.contains(wall)) {
             tracing::warn!(
                 status,
-                "the site answered with a wall; no proxy and no stealth here"
+                "the site answered with a wall; no challenge to name in it"
             );
             return Err(ProviderError::Terminal {
                 code: BLOCKED_BY_SITE,
@@ -1371,26 +1836,208 @@ impl Inner {
         }
         Ok(())
     }
-}
 
-// ---------------------------------------------------------------------------
-// The document watch
-// ---------------------------------------------------------------------------
-
-/// A running [`Inner::arm_document_watch`]. Dropping it without
-/// [`Self::finish`] leaves the pump to notice the socket died, which it does
-/// within [`WATCH_PATIENCE`]; calling it is how the answer comes back.
-struct DocumentWatch {
-    stop: Arc<AtomicBool>,
-    handle: tokio::task::JoinHandle<Option<Result<BrowserOutcome, ProviderError>>>,
-}
-
-impl DocumentWatch {
-    /// Stop watching and say what was seen: `None` for an ordinary page.
-    async fn finish(self) -> Option<Result<BrowserOutcome, ProviderError>> {
-        self.stop.store(true, Ordering::Release);
-        self.handle.await.ok().flatten()
+    /// Franchir un défi : demander le jeton, le poser dans le champ, et rendre
+    /// la main.
+    ///
+    /// # Ce que « poursuivre » veut dire, et ce qu'il ne veut pas dire
+    ///
+    /// Le jeton est posé dans le champ que le widget expose
+    /// ([`ChallengeKind::response_field`]), créé s'il n'y est pas — c'est ce
+    /// que reCAPTCHA fait lui-même : un `<textarea>` caché dans le conteneur.
+    /// C'est ce champ que le `submit` de la page lit, donc l'étape suivante du
+    /// modèle (un `Click` sur le bouton) part avec le jeton.
+    ///
+    /// **Le plafond, écrit ici parce que quelqu'un le croira plus large.** Un
+    /// widget dont le *rappel* JavaScript soumet le formulaire tout seul n'est
+    /// pas couvert : nous posons une valeur, nous n'appelons pas son rappel,
+    /// parce que le nom du rappel est celui du site et qu'aller le chercher
+    /// dans `___grecaptcha_cfg` est exactement le genre d'astuce qui marche
+    /// jusqu'au jour où elle échoue sans le dire. La montée, le jour où un
+    /// client la paie : lire les rappels enregistrés et en appeler un.
+    async fn solve(
+        &self,
+        page: &mut crate::cdp::PageSocket,
+        challenge: &Challenge,
+    ) -> Result<(), ProviderError> {
+        let token = match self.solver.solve(challenge).await {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::warn!(
+                    kind = challenge.kind.as_str(),
+                    code = err.code(),
+                    solver = self.solver.configured(),
+                    "a captcha stood in the way and was not solved"
+                );
+                return Err(err);
+            }
+        };
+        let field = challenge.kind.response_field();
+        // Le jeton n'est pas un identifiant — c'est un porteur à usage unique
+        // pour un widget public — mais il traverse quand même l'expression
+        // échappé plutôt que concaténé, parce qu'une chaîne rendue par un
+        // tiers dans du JavaScript qu'on construit n'a qu'une bonne façon
+        // d'entrer.
+        let js = format!(
+            "(() => {{ const name = {name}, token = {token}; \
+             let e = document.querySelector('[name=\"' + name + '\"]'); \
+             if (!e) {{ const host = document.querySelector({host}); if (!host) return false; \
+               e = document.createElement('textarea'); e.name = name; e.id = name; \
+               e.style.display = 'none'; host.appendChild(e); }} \
+             e.value = token; \
+             e.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+             e.dispatchEvent(new Event('change', {{ bubbles: true }})); return true; }})()",
+            name = json!(field),
+            token = json!(token),
+            host = json!(match challenge.kind {
+                ChallengeKind::Recaptcha2 => ".g-recaptcha",
+                ChallengeKind::Turnstile => ".cf-turnstile",
+                ChallengeKind::HCaptcha => ".h-captcha",
+            }),
+        );
+        if page.evaluate(js).await? != Value::Bool(true) {
+            tracing::warn!(
+                kind = challenge.kind.as_str(),
+                "the captcha was solved but the page has nowhere to put the token"
+            );
+            return Err(ProviderError::Terminal { code: CAPTCHA });
+        }
+        tracing::info!(
+            kind = challenge.kind.as_str(),
+            "a captcha was solved and its token posted in {field}"
+        );
+        Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The one Fetch session
+// ---------------------------------------------------------------------------
+
+/// Les motifs d'interception de l'onglet, et le seul jeu qu'il y aura.
+///
+/// # Ce que la mesure a contredit (2026-09-10, Chrome 152.0.7977.83)
+///
+/// La v2 interceptait `{ requestStage: "Response", resourceType: "Document" }`
+/// — la réponse seule, pour ne pas mettre un aller-retour de socket devant
+/// chaque image de chaque page. Le brief supposait qu'ajouter
+/// `handleAuthRequests: true` suffisait à faire arriver `Fetch.authRequired`.
+/// **C'est faux.** Avec ce seul motif, contre un proxy qui répond `407` :
+///
+/// * aucun `Fetch.authRequired` n'arrive ;
+/// * le `407` arrive en `requestPaused` **au stade réponse**, comme une
+///   réponse ordinaire ;
+/// * et le continuer donne `net::ERR_INVALID_AUTH_CREDENTIALS` à la
+///   navigation.
+///
+/// Autrement dit, l'interception au stade réponse *avale* le défi
+/// d'authentification avant que la pile réseau ait pu le poser. En ajoutant
+/// `{ requestStage: "Request", resourceType: "Document" }`, la même navigation
+/// donne : pause au stade requête → `continueRequest` → `Fetch.authRequired` →
+/// `continueWithAuth { ProvideCredentials }` → pause au stade réponse avec un
+/// `200`, **sur le même `requestId`**. Le proxy voit alors deux requêtes, la
+/// seconde portant `Proxy-Authorization: Basic …`.
+///
+/// D'où le motif conditionnel : le stade requête n'est ajouté que quand il y a
+/// des identifiants à fournir. Il coûte un aller-retour de socket **par
+/// document**, pas par sous-ressource — et seulement aux locataires qui ont
+/// acheté un proxy authentifié. Un déploiement sans proxy envoie exactement la
+/// trame que la v2 envoyait.
+fn fetch_patterns(with_credentials: bool) -> Value {
+    let mut patterns = Vec::with_capacity(2);
+    if with_credentials {
+        patterns.push(json!({ "requestStage": "Request", "resourceType": "Document" }));
+    }
+    patterns.push(json!({ "requestStage": "Response", "resourceType": "Document" }));
+    json!({ "patterns": patterns, "handleAuthRequests": with_credentials })
+}
+
+/// Répondre à une requête en attente, et décider si la navigation armée a
+/// rapporté un document.
+///
+/// ponytail: the **first** document response of the navigation decides, and a
+/// 3xx is skipped so a redirect to a PDF still lands here. An iframe cannot
+/// beat its own parent's response, so « first » is « the main navigation » in
+/// practice. The upgrade, if a frame ever does race: compare `frameId` against
+/// `Page.getFrameTree`.
+async fn answer_paused(page: &mut crate::cdp::PageSocket, params: &Value, watch: &Watch) {
+    let request_id = params["requestId"].clone();
+    // Pas de `responseStatusCode` : la requête est en attente *avant* d'être
+    // envoyée. C'est l'étage que l'authentification de proxy oblige à ajouter
+    // (voir `fetch_patterns`), et il n'y a rien à décider dessus — y compris
+    // pour la tentative `https://` que Chrome fait avant `http://`, mesurée le
+    // 2026-09-10, qui est paus­ée ici et n'arrive jamais au stade réponse.
+    if params["responseStatusCode"].is_null() && params["responseErrorReason"].is_null() {
+        let _ = page
+            .call("Fetch.continueRequest", json!({ "requestId": request_id }))
+            .await;
+        return;
+    }
+
+    let status = params["responseStatusCode"].as_u64().unwrap_or_default();
+    let headers = &params["responseHeaders"];
+    let content_type = header(headers, "content-type").unwrap_or_default();
+    let disposition = header(headers, "content-disposition");
+    let armed = watch.armed.load(Ordering::Acquire);
+
+    // A redirect has no body worth having and is not the answer: let it
+    // through and keep watching, which is how `Goto(/tarifs)` → `302` →
+    // `/tarifs.pdf` still arrives here. Une réponse que personne n'a armée est
+    // continuée sans autre forme de procès.
+    if !armed || (300..400).contains(&status) || !is_a_document(content_type, disposition) {
+        let _ = page
+            .call("Fetch.continueResponse", json!({ "requestId": request_id }))
+            .await;
+        // The main navigation's response is the first document response of a
+        // navigation, and it was this one. It is a page; there is nothing left
+        // for this watch to find.
+        if armed && !(300..400).contains(&status) {
+            watch.armed.store(false, Ordering::Release);
+        }
+        return;
+    }
+
+    let content_type = content_type.to_owned();
+    let filename = disposition.and_then(filename_from);
+    // La déclaration d'abord, pour qu'un export de 400 Mo soit refusé *avant*
+    // de traverser la socket en base64. Un serveur qui ne déclare rien est
+    // quand même attrapé plus bas, le transfert payé.
+    let declared = header(headers, "content-length").and_then(|raw| raw.parse::<usize>().ok());
+    let found = if declared.is_some_and(|length| length > MAX_DOCUMENT) {
+        Err(ProviderError::Terminal { code: TOO_LARGE })
+    } else {
+        match page
+            .call("Fetch.getResponseBody", json!({ "requestId": request_id }))
+            .await
+        {
+            Ok(body) => {
+                let raw = body["body"].as_str().unwrap_or_default();
+                let bytes = if body["base64Encoded"].as_bool().unwrap_or(false) {
+                    BASE64.decode(raw).unwrap_or_default()
+                } else {
+                    raw.as_bytes().to_vec()
+                };
+                if bytes.len() > MAX_DOCUMENT {
+                    Err(ProviderError::Terminal { code: TOO_LARGE })
+                } else {
+                    Ok(BrowserOutcome::Document {
+                        content_type,
+                        filename,
+                        bytes,
+                    })
+                }
+            }
+            // The tab still has to become a page, whatever the body did.
+            Err(err) => Err(err),
+        }
+    };
+
+    // **L'ordre est la synchronisation** : la décision est posée avant que la
+    // réponse en attente soit rendue, et c'est le fait de la rendre qui laisse
+    // `Page.navigate` revenir. Voir [`Watch`].
+    *watch.found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+    watch.armed.store(false, Ordering::Release);
+    fulfil_placeholder(page, &request_id).await;
 }
 
 /// A header value by name, case-insensitively — CDP hands headers back as an
@@ -1446,85 +2093,6 @@ fn filename_from(disposition: &str) -> Option<String> {
     (!name.is_empty() && name != "." && name != "..").then(|| name.to_owned())
 }
 
-/// Read paused document responses until one of them is a file, the page turns
-/// out to be a page, or the navigation is over.
-async fn watch_documents<S>(
-    page: &mut crate::cdp::Cdp<S>,
-    until: &AtomicBool,
-) -> Option<Result<BrowserOutcome, ProviderError>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
-    while !until.load(Ordering::Acquire) {
-        let event = match page.next_event(WATCH_PATIENCE).await {
-            Ok(Some(event)) => event,
-            Ok(None) => continue,
-            Err(_) => return None,
-        };
-        if event["method"] != "Fetch.requestPaused" {
-            continue;
-        }
-        let params = &event["params"];
-        let request_id = params["requestId"].clone();
-        let status = params["responseStatusCode"].as_u64().unwrap_or_default();
-        let headers = &params["responseHeaders"];
-        let content_type = header(headers, "content-type").unwrap_or_default();
-        let disposition = header(headers, "content-disposition");
-
-        // A redirect has no body worth having and is not the answer: let it
-        // through and keep watching, which is how `Goto(/tarifs)` → `302` →
-        // `/tarifs.pdf` still arrives here.
-        if (300..400).contains(&status) || !is_a_document(content_type, disposition) {
-            let _ = page
-                .call("Fetch.continueResponse", json!({ "requestId": request_id }))
-                .await;
-            // The main navigation's response is the first document response of
-            // a navigation, and it was this one. It is a page; there is
-            // nothing left for this watch to find.
-            return None;
-        }
-
-        let content_type = content_type.to_owned();
-        let filename = disposition.and_then(filename_from);
-        // The declared length first, so a 400 Mo export is refused *before* it
-        // crosses the socket base64-encoded. A server that declares nothing
-        // still gets caught below, having cost us the transfer.
-        let declared = header(headers, "content-length").and_then(|raw| raw.parse::<usize>().ok());
-        if declared.is_some_and(|length| length > MAX_DOCUMENT) {
-            fulfil_placeholder(page, &request_id).await;
-            return Some(Err(ProviderError::Terminal { code: TOO_LARGE }));
-        }
-        let body = page
-            .call("Fetch.getResponseBody", json!({ "requestId": request_id }))
-            .await;
-        let bytes = match body {
-            Ok(body) => {
-                let raw = body["body"].as_str().unwrap_or_default();
-                if body["base64Encoded"].as_bool().unwrap_or(false) {
-                    BASE64.decode(raw).unwrap_or_default()
-                } else {
-                    raw.as_bytes().to_vec()
-                }
-            }
-            // The tab still has to become a page, whatever the body did.
-            Err(err) => {
-                fulfil_placeholder(page, &request_id).await;
-                return Some(Err(err));
-            }
-        };
-        fulfil_placeholder(page, &request_id).await;
-        if bytes.len() > MAX_DOCUMENT {
-            return Some(Err(ProviderError::Terminal { code: TOO_LARGE }));
-        }
-        return Some(Ok(BrowserOutcome::Document {
-            content_type,
-            filename,
-            bytes,
-        }));
-    }
-    None
-}
-
 /// Answer the paused request with a page of our own, so the tab stays a tab.
 ///
 /// Called on every exit that took the body, refused it, or failed to read it:
@@ -1574,9 +2142,12 @@ fn outcome_of(outcome: &Result<BrowserOutcome, ProviderError>) -> StepOutcome {
     match outcome {
         Ok(_) => StepOutcome::Ok,
         Err(err) => match err.code() {
-            code @ (BLOCKED_BY_SITE | TOO_LARGE | "blocked_address" | "unresolvable") => {
-                StepOutcome::Refused { code }
-            }
+            code @ (BLOCKED_BY_SITE
+            | TOO_LARGE
+            | CAPTCHA
+            | crate::captcha::CAPTCHA_UNSOLVED
+            | "blocked_address"
+            | "unresolvable") => StepOutcome::Refused { code },
             code => StepOutcome::Failed { code },
         },
     }
@@ -1630,23 +2201,26 @@ impl BrowserProvider for ChromeBrowser {
 
         let page_url = inner.tab(ctx, session.employee_id).await?;
         let navigating = matches!(step, BrowserStep::Goto(_));
+        let watch = inner.lock().get(ctx).map(|tab| Arc::clone(&tab.watch));
         let started = Instant::now();
         let drive = async {
-            // Armed before `Page.navigate` and not after: `Fetch.enable`
-            // pauses the response, so the decision has to be taken while the
-            // navigation is in flight. See `arm_document_watch`.
-            let watch = if navigating {
-                inner.arm_document_watch(&page_url).await
-            } else {
-                None
-            };
+            // Armé avant `Page.navigate` et pas après : `Fetch.enable` met la
+            // réponse en attente, donc la décision se prend pendant la
+            // navigation, par la pompe de l'onglet. Voir [`Watch`] pour
+            // pourquoi rien n'attend ici.
+            if let (true, Some(watch)) = (navigating, watch.as_ref()) {
+                watch.arm();
+            }
             let outcome = inner
                 .driver
                 .run(&Secret::new(page_url.clone()), &step)
                 .await;
-            let document = match watch {
-                Some(watch) => watch.finish().await,
-                None => None,
+            // Au retour de `Page.navigate`, la pompe a déjà décidé : c'est sa
+            // réponse à la requête en attente qui a laissé la navigation
+            // revenir.
+            let document = match (navigating, watch.as_ref()) {
+                (true, Some(watch)) => watch.take(),
+                _ => None,
             };
             // A document outranks the navigation's own answer, including its
             // failure: `Page.navigate` reporting nothing useful about a
@@ -1658,8 +2232,14 @@ impl BrowserProvider for ChromeBrowser {
             let outcome = outcome?;
             if navigating {
                 // Only a real page can be a wall. Skipped above, because the
-                // page a document leaves in the tab is one we wrote.
-                inner.wall_check(&page_url).await?;
+                // page a document leaves in the tab is one we wrote. L'adresse
+                // où l'on a atterri est celle que le défi de captcha porte :
+                // le solveur refait la navigation depuis chez lui.
+                let landed = match &outcome {
+                    BrowserOutcome::Navigated(url) => url.clone(),
+                    _ => blank_page(),
+                };
+                inner.wall_check(&page_url, &landed).await?;
             }
             Ok(outcome)
         };
@@ -1712,6 +2292,10 @@ impl BrowserProvider for ChromeBrowser {
         // context would save the jar back on close, so it goes first.
         self.inner.close_tab(&binding.external_id, None).await;
         self.inner.jar.forget(&binding.external_id).await
+    }
+
+    fn fleet_health(&self) -> Option<(usize, usize)> {
+        Some(self.inner.fleet.health())
     }
 }
 
@@ -1789,6 +2373,19 @@ mod tests {
         /// body — the only way to test the refusal that happens *before* the
         /// transfer.
         declared_length: Option<usize>,
+        /// `(famille, clé de site)` que la sonde de mur rapporte, quand la page
+        /// porte un défi.
+        captcha: Option<(String, String)>,
+        /// Le jeton que l'expression d'injection a posé, si elle est passée.
+        injected: Option<String>,
+        /// Le proxy réclame une authentification : `Fetch.enable` fait alors
+        /// suivre un `Fetch.authRequired`, comme Chromium le fait à la première
+        /// requête. Mesuré le 2026-09-10 : le vrai n'y arrive qu'avec un motif
+        /// au stade requête, ce que `fetch_patterns` ajoute.
+        demands_auth: bool,
+        /// Ce Chromium ne répond plus à `/json/version` : la sonde de santé le
+        /// verra.
+        down: bool,
     }
 
     struct FakeChrome {
@@ -1838,7 +2435,7 @@ mod tests {
 
         fn browser(&self, jar: Arc<dyn CookieJar>) -> ChromeBrowser {
             ChromeBrowser::new(
-                Url::parse(&format!("http://{}", self.addr)).expect("url"),
+                vec![Url::parse(&format!("http://{}", self.addr)).expect("url")],
                 Arc::new(PinnedHost::new(SITE, IpAddr::V4(Ipv4Addr::LOCALHOST))),
                 jar,
             )
@@ -1878,8 +2475,12 @@ mod tests {
             let name = host
                 .rsplit_once(':')
                 .map_or(host.as_str(), |(name, _)| name);
-            let response = if name == "localhost"
-                || name.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
+            let down = state.lock().unwrap().down;
+            let response = if down {
+                // Ce que la sonde de santé lit : pas une connexion refusée (le
+                // port répond encore), un Chromium qui ne va pas bien.
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned()
+            } else if name == "localhost" || name.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
             {
                 // Chrome writes the loopback address *it* listens on, whatever
                 // `Host` asked — which is why the adapter re-bases the path.
@@ -2011,7 +2612,9 @@ mod tests {
             }
             "Fetch.enable"
             | "Fetch.disable"
+            | "Fetch.continueRequest"
             | "Fetch.continueResponse"
+            | "Fetch.continueWithAuth"
             | "Fetch.fulfillRequest"
                 if on_page =>
             {
@@ -2040,7 +2643,22 @@ mod tests {
                 if expression == "location.href" {
                     json!({ "result": { "type": "string", "value": state.here } })
                 } else if expression == WALL_CHECK {
-                    json!({ "result": { "type": "object", "value": [state.page.0, state.page.1] } })
+                    let (kind, key) = state
+                        .captcha
+                        .clone()
+                        .unwrap_or_else(|| (String::new(), String::new()));
+                    json!({ "result": { "type": "object",
+                        "value": [state.page.0, state.page.1, kind, key] } })
+                } else if expression.contains("createElement('textarea')") {
+                    // L'injection : le jeton est dans l'expression, échappé.
+                    let token = expression
+                        .split("token = \"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    state.injected = Some(token);
+                    json!({ "result": { "type": "boolean", "value": true } })
                 } else if expression.contains("innerText") {
                     json!({ "result": { "type": "string", "value": "Book a trip" } })
                 } else {
@@ -2063,8 +2681,20 @@ mod tests {
             // The paused response, as Chromium hands it over: headers first,
             // body only if somebody asks.
             "Fetch.enable" => {
+                let mut events = Vec::new();
+                if state.demands_auth {
+                    events.push(json!({
+                        "method": "Fetch.authRequired",
+                        "params": {
+                            "requestId": "interception-job-1.0",
+                            "resourceType": "Document",
+                            "authChallenge": { "source": "Proxy", "origin": "http://gate:7000",
+                                               "scheme": "basic", "realm": "proxy" },
+                        },
+                    }));
+                }
                 let Some((content_type, disposition, bytes)) = state.document.as_ref() else {
-                    return Vec::new();
+                    return events;
                 };
                 let mut headers = vec![json!({ "name": "Content-Type", "value": content_type })];
                 if let Some(disposition) = disposition {
@@ -2076,7 +2706,7 @@ mod tests {
                     "name": "Content-Length",
                     "value": state.declared_length.unwrap_or(bytes.len()).to_string(),
                 }));
-                vec![json!({
+                events.push(json!({
                     "method": "Fetch.requestPaused",
                     "params": {
                         "requestId": "interception-1",
@@ -2084,7 +2714,8 @@ mod tests {
                         "responseStatusCode": 200,
                         "responseHeaders": headers,
                     },
-                })]
+                }));
+                events
             }
             _ => Vec::new(),
         }
@@ -2179,13 +2810,17 @@ mod tests {
                 "Emulation.setDeviceMetricsOverride",
                 "Emulation.setGeolocationOverride",
                 "Network.setCookies",
-                // Armed before `Page.navigate`, because `Fetch` pauses the
-                // response and the decision cannot be taken afterwards.
+                // **Une fois, à l'ouverture de l'onglet, et plus jamais.** La
+                // v2 l'envoyait avant chaque `Page.navigate` sur une socket à
+                // elle, suivi d'un `Fetch.disable` ; la v3 n'a qu'une session
+                // d'interception, celle qui porte déjà l'habillage, parce que
+                // deux sessions `Fetch` sur une cible se disputent le même
+                // `requestPaused` — et l'authentification de proxy en voulait
+                // une deuxième. Voir `fetch_patterns`.
                 "Fetch.enable",
                 "Page.navigate",
                 "Runtime.evaluate", // location.href
-                "Fetch.disable",
-                "Runtime.evaluate", // the wall check
+                "Runtime.evaluate", // the wall and captcha check
                 "Runtime.evaluate", // Location
                 "Network.getAllCookies",
                 "Target.closeTarget",
@@ -2332,7 +2967,10 @@ mod tests {
             })
             .await
         );
-        assert_eq!(p.inner.tokens.available_permits(), DEFAULT_MAX_TABS);
+        assert_eq!(
+            p.inner.fleet.endpoints[0].tokens.available_permits(),
+            DEFAULT_MAX_TABS
+        );
 
         // Disarm: an error about *our* selector keeps the tab.
         p.act(&s, BrowserStep::Goto(&site("/login"))).await.unwrap();
@@ -2430,7 +3068,7 @@ mod tests {
 
         // The adapter, given a *name*, arrives with the address.
         let p = ChromeBrowser::new(
-            Url::parse(&format!("http://localhost:{}", chrome.addr.port())).unwrap(),
+            vec![Url::parse(&format!("http://localhost:{}", chrome.addr.port())).unwrap()],
             Arc::new(PinnedHost::new(SITE, IpAddr::V4(Ipv4Addr::LOCALHOST))),
             Arc::new(MemoryCookieJar::new()),
         )
@@ -2922,6 +3560,480 @@ mod tests {
         assert!(!is_a_document("image/png", Some("attachment")));
     }
 
+    // -- le proxy ---------------------------------------------------------------------
+
+    /// Le proxy d'un contexte, écrit par un test.
+    struct FixedProxy(Option<ProxyConfig>);
+
+    #[async_trait]
+    impl Proxies for FixedProxy {
+        async fn proxy_for(&self, _ctx: &str) -> Result<Option<ProxyConfig>, ProviderError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Un port qui refuse : la ligne ne se lit pas, et l'onglet s'ouvre quand
+    /// même — par l'adresse de la machine.
+    struct BrokenProxies;
+
+    #[async_trait]
+    impl Proxies for BrokenProxies {
+        async fn proxy_for(&self, _ctx: &str) -> Result<Option<ProxyConfig>, ProviderError> {
+            Err(ProviderError::timeout())
+        }
+    }
+
+    fn proxy(credentials: Option<(&str, &str)>) -> ProxyConfig {
+        ProxyConfig {
+            server: "http://gate.fournisseur.example:7000".to_owned(),
+            bypass: Some("<-loopback>;*.interne.example".to_owned()),
+            credentials: credentials.map(|(user, password)| (user.to_owned(), password.to_owned())),
+        }
+    }
+
+    /// **Le proxy est un paramètre du contexte**, avec son bypass, et il n'y a
+    /// pas de drapeau de processus à changer pour ça.
+    #[tokio::test]
+    async fn the_proxy_and_its_bypass_reach_the_browser_context() {
+        let chrome = FakeChrome::start().await;
+        let p = chrome
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_proxies(Arc::new(FixedProxy(Some(proxy(None)))));
+        let s = session(&p).await;
+        p.act(&s, BrowserStep::Goto(&site("/login"))).await.unwrap();
+
+        let created = chrome.frames("Target.createBrowserContext")[0].1["params"].clone();
+        assert_eq!(
+            created["proxyServer"],
+            "http://gate.fournisseur.example:7000"
+        );
+        assert_eq!(created["proxyBypassList"], "<-loopback>;*.interne.example");
+
+        // Désarmée deux fois : sans proxy le paramètre n'est pas là du tout —
+        // et un port qui **échoue** est un onglet qui s'ouvre quand même, ce
+        // qui est la moitié qu'on ne voit pas sinon.
+        for proxies in [
+            Arc::new(NoProxies) as Arc<dyn Proxies>,
+            Arc::new(BrokenProxies),
+        ] {
+            let plain = FakeChrome::start().await;
+            let d = plain
+                .browser(Arc::new(MemoryCookieJar::new()))
+                .with_proxies(proxies);
+            let ds = session(&d).await;
+            d.act(&ds, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect("a tab opens without a proxy");
+            let created = plain.frames("Target.createBrowserContext")[0].1["params"].clone();
+            assert_eq!(
+                created,
+                json!({}),
+                "a context was given a proxy it has none"
+            );
+        }
+    }
+
+    /// `Fetch.authRequired` reçoit les identifiants **ouverts** — c'est la
+    /// seule forme que `continueWithAuth` accepte — et le motif au stade
+    /// requête n'est là que quand il y a des identifiants à fournir.
+    #[tokio::test]
+    async fn the_proxy_credentials_answer_the_auth_challenge_and_nothing_else() {
+        let chrome = FakeChrome::start().await;
+        chrome.state().demands_auth = true;
+        let p = chrome
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_proxies(Arc::new(FixedProxy(Some(proxy(Some((
+                "orizn-eu",
+                "s3cr3t-de-passage",
+            )))))));
+        let s = session(&p).await;
+        p.act(&s, BrowserStep::Goto(&site("/login"))).await.unwrap();
+
+        assert!(
+            eventually(|| !chrome.frames("Fetch.continueWithAuth").is_empty()).await,
+            "the challenge was never answered: {:?}",
+            chrome.methods()
+        );
+        let answer =
+            chrome.frames("Fetch.continueWithAuth")[0].1["params"]["authChallengeResponse"].clone();
+        assert_eq!(answer["response"], "ProvideCredentials");
+        assert_eq!(answer["username"], "orizn-eu");
+        assert_eq!(answer["password"], "s3cr3t-de-passage");
+
+        // Les motifs : le stade requête est **acheté** par les identifiants et
+        // par rien d'autre. Mesuré le 2026-09-10 — sans lui, `authRequired`
+        // n'arrive jamais et le 407 revient en réponse en attente.
+        let patterns = chrome.frames("Fetch.enable")[0].1["params"].clone();
+        assert_eq!(patterns["handleAuthRequests"], true);
+        assert_eq!(
+            patterns["patterns"],
+            json!([
+                { "requestStage": "Request", "resourceType": "Document" },
+                { "requestStage": "Response", "resourceType": "Document" },
+            ])
+        );
+
+        // Désarmée : un proxy sans identifiants n'achète pas le stade requête,
+        // et un défi qui arrive quand même est refusé par le défaut de la pile
+        // réseau plutôt que par une invention de notre part.
+        let plain = FakeChrome::start().await;
+        plain.state().demands_auth = true;
+        let d = plain
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_proxies(Arc::new(FixedProxy(Some(proxy(None)))));
+        let ds = session(&d).await;
+        d.act(&ds, BrowserStep::Goto(&site("/login")))
+            .await
+            .unwrap();
+        let patterns = plain.frames("Fetch.enable")[0].1["params"].clone();
+        assert_eq!(patterns["handleAuthRequests"], false);
+        assert_eq!(
+            patterns["patterns"],
+            json!([{ "requestStage": "Response", "resourceType": "Document" }])
+        );
+        assert!(
+            eventually(|| !plain.frames("Fetch.continueWithAuth").is_empty()).await,
+            "{:?}",
+            plain.methods()
+        );
+        assert_eq!(
+            plain.frames("Fetch.continueWithAuth")[0].1["params"]["authChallengeResponse"]["response"],
+            "Default"
+        );
+    }
+
+    /// **Une seule session `Fetch` par onglet, comptée.** C'est le bug que ce
+    /// chantier prévoyait : deux pompes sur la même cible se volent le même
+    /// `requestPaused`, et la v2 en montait une par navigation.
+    #[tokio::test]
+    async fn one_tab_enables_fetch_exactly_once_however_many_navigations() {
+        let chrome = FakeChrome::start().await;
+        let p = chrome.browser(Arc::new(MemoryCookieJar::new()));
+        let s = session(&p).await;
+        for path in ["/login", "/account", "/tarifs"] {
+            p.act(&s, BrowserStep::Goto(&site(path))).await.unwrap();
+        }
+        assert_eq!(
+            chrome.frames("Page.navigate").len(),
+            3,
+            "the three navigations did not happen"
+        );
+        assert_eq!(
+            chrome.frames("Fetch.enable").len(),
+            1,
+            "a second interception session was opened: {:?}",
+            chrome.methods()
+        );
+        assert!(
+            chrome.frames("Fetch.disable").is_empty(),
+            "the one session was turned off under the tab"
+        );
+        // Et elle est sur la socket de l'onglet, celle qui porte l'habillage —
+        // pas sur une deuxième connexion à la même cible.
+        let (path, _) = chrome.frames("Fetch.enable")[0].clone();
+        assert_eq!(path, "/devtools/page/target1");
+
+        // Un deuxième onglet a la sienne, et une seule aussi.
+        let other = session(&p).await;
+        p.act(&other, BrowserStep::Goto(&site("/login")))
+            .await
+            .unwrap();
+        assert_eq!(chrome.frames("Fetch.enable").len(), 2);
+    }
+
+    // -- le captcha ---------------------------------------------------------------------
+
+    /// Un solveur écrit par un test : il rend un jeton, ou il refuse.
+    struct FakeSolver(Mutex<Vec<Challenge>>, Option<String>);
+
+    #[async_trait]
+    impl CaptchaSolver for FakeSolver {
+        async fn solve(&self, challenge: &Challenge) -> Result<String, ProviderError> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(challenge.clone());
+            match &self.1 {
+                Some(token) => Ok(token.clone()),
+                None => Err(ProviderError::Terminal {
+                    code: crate::captcha::CAPTCHA_UNSOLVED,
+                }),
+            }
+        }
+    }
+
+    /// Sans solveur branché, un défi est `captcha` — **pas** `blocked_by_site`.
+    /// La distinction est ce qu'un opérateur lit pour savoir s'il y a quelque
+    /// chose à acheter.
+    #[tokio::test]
+    async fn a_challenge_without_a_solver_is_captcha_and_not_blocked_by_site() {
+        let chrome = FakeChrome::start().await;
+        let seen = Arc::new(Recorder::default());
+        let p = chrome
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_observer(Arc::clone(&seen) as Arc<dyn BrowserObserver>);
+        let s = session(&p).await;
+
+        for kind in ["recaptcha2", "turnstile", "hcaptcha"] {
+            chrome.state().captcha = Some((kind.to_owned(), "6LfD3PIbAAAAAJs".to_owned()));
+            // Et le titre d'un mur **par-dessus** : une page Turnstile porte les
+            // deux, et c'est le défi qui gagne parce qu'il dit quoi faire.
+            chrome.state().page = ("Just a moment...".to_owned(), 200);
+            let err = p
+                .act(&s, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect_err("a challenge");
+            assert_eq!(err.code(), CAPTCHA, "{kind}");
+            assert!(!err.is_retryable(), "a second try has no solver either");
+            assert_eq!(p.open_tabs(), 0, "the tab on a challenge is closed");
+        }
+        assert_eq!(
+            seen.log().finished.last().expect("a task").1,
+            StepOutcome::Refused { code: CAPTCHA },
+            "the task ends on the challenge, as a refusal"
+        );
+
+        // Désarmée : le même mur **sans** défi lisible reste `blocked_by_site`,
+        // qui est l'issue de ce qu'aucune clé ne franchirait.
+        chrome.state().captcha = None;
+        let err = p
+            .act(&s, BrowserStep::Goto(&site("/login")))
+            .await
+            .expect_err("a wall");
+        assert_eq!(err.code(), BLOCKED_BY_SITE);
+        // Et une clé de site vide n'est pas un défi : rien à donner au solveur.
+        chrome.state().captcha = Some(("recaptcha2".to_owned(), String::new()));
+        assert_eq!(
+            p.act(&s, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect_err("still the wall")
+                .code(),
+            BLOCKED_BY_SITE
+        );
+    }
+
+    /// Avec un solveur, le jeton est posé dans le champ que le widget expose et
+    /// la navigation se poursuit.
+    #[tokio::test]
+    async fn a_solved_challenge_posts_its_token_and_the_navigation_carries_on() {
+        let chrome = FakeChrome::start().await;
+        chrome.state().captcha = Some(("turnstile".to_owned(), "0x4AAA".to_owned()));
+        chrome.state().page = ("Just a moment...".to_owned(), 200);
+        let solver = Arc::new(FakeSolver(
+            Mutex::default(),
+            Some("0.jeton-du-defi".to_owned()),
+        ));
+        let p = chrome
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_solver(Arc::clone(&solver) as Arc<dyn CaptchaSolver>);
+        let s = session(&p).await;
+
+        assert_eq!(
+            p.act(&s, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect("the challenge was solved"),
+            BrowserOutcome::Navigated(site("/login")),
+            "a solved challenge is a navigation, not an error"
+        );
+        assert_eq!(p.open_tabs(), 1, "the tab survives a solved challenge");
+
+        // Ce que le solveur a reçu : la famille, la clé publique du widget, et
+        // l'adresse où l'on a atterri — rien de la page.
+        let asked = solver.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].kind, ChallengeKind::Turnstile);
+        assert_eq!(asked[0].site_key, "0x4AAA");
+        assert_eq!(asked[0].page_url, site("/login"));
+        // Et ce que la page a reçu : le jeton, dans `cf-turnstile-response`.
+        assert_eq!(
+            chrome.state().injected.as_deref(),
+            Some("0.jeton-du-defi"),
+            "the token never reached the page"
+        );
+        let injection = chrome
+            .frames("Runtime.evaluate")
+            .into_iter()
+            .find_map(|(_, frame)| {
+                let js = frame["params"]["expression"].as_str()?.to_owned();
+                js.contains("createElement('textarea')").then_some(js)
+            })
+            .expect("no injection");
+        assert!(injection.contains("cf-turnstile-response"), "{injection}");
+
+        // Désarmée : un solveur qui refuse rend son code, et l'onglet part.
+        let refusing = FakeChrome::start().await;
+        refusing.state().captcha = Some(("recaptcha2".to_owned(), "6LfD".to_owned()));
+        let r = refusing
+            .browser(Arc::new(MemoryCookieJar::new()))
+            .with_solver(Arc::new(FakeSolver(Mutex::default(), None)));
+        let rs = session(&r).await;
+        assert_eq!(
+            r.act(&rs, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect_err("unsolved")
+                .code(),
+            crate::captcha::CAPTCHA_UNSOLVED
+        );
+        assert!(refusing.state().injected.is_none());
+    }
+
+    // -- la flotte ----------------------------------------------------------------------
+
+    /// Une flotte sur plusieurs faux Chromium.
+    fn fleet_of(machines: &[&FakeChrome], max_tabs: usize) -> ChromeBrowser {
+        ChromeBrowser::new(
+            machines
+                .iter()
+                .map(|chrome| Url::parse(&format!("http://{}", chrome.addr)).expect("url"))
+                .collect(),
+            Arc::new(PinnedHost::new(SITE, IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            Arc::new(MemoryCookieJar::new()),
+        )
+        .with_driver(
+            CdpWebsocket::new()
+                .with_connect_timeout(Duration::from_millis(500))
+                .with_command_timeout(Duration::from_millis(300)),
+        )
+        .with_max_tabs(max_tabs)
+        .with_queue_wait(Duration::from_millis(200))
+        .with_step_timeout(Duration::from_secs(2))
+    }
+
+    /// **Le moins chargé, et par machine.** Le sémaphore est par point : deux
+    /// machines à deux onglets portent quatre onglets, et le deuxième onglet va
+    /// sur la machine vide plutôt que de remplir la première.
+    #[tokio::test]
+    async fn the_fleet_fills_the_least_loaded_endpoint_and_counts_tabs_per_machine() {
+        let one = FakeChrome::start().await;
+        let two = FakeChrome::start().await;
+        let p = fleet_of(&[&one, &two], 2);
+
+        let mut sessions = Vec::new();
+        for _ in 0..4 {
+            sessions.push(session(&p).await);
+        }
+        for s in &sessions {
+            p.act(s, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect("a tab each");
+        }
+        assert_eq!(p.open_tabs(), 4, "two machines at two tabs carry four");
+        assert_eq!(one.state().targets, 2, "the fleet piled up on one machine");
+        assert_eq!(two.state().targets, 2);
+        assert_eq!(p.fleet_health(), Some((2, 2)));
+
+        // Le cinquième attend puis revient plus tard : le plafond est par
+        // machine, pas par flotte, et deux fois deux font quatre et pas cinq.
+        let fifth = session(&p).await;
+        let err = p
+            .act(&fifth, BrowserStep::Goto(&site("/login")))
+            .await
+            .expect_err("both machines are full");
+        assert!(err.is_retryable(), "{err:?}");
+        assert_eq!(one.state().targets + two.state().targets, 4);
+    }
+
+    /// Un point malade est sauté, et la tâche qui vit dessus n'y est plus pour
+    /// rien : elle reste sur le sien.
+    #[tokio::test]
+    async fn an_unhealthy_endpoint_is_skipped_and_a_task_stays_on_its_own() {
+        let sick = FakeChrome::start().await;
+        let well = FakeChrome::start().await;
+        let p = fleet_of(&[&sick, &well], 3);
+
+        // Une tâche d'abord, sur le point qui va tomber : la sonde ne l'en
+        // délogera pas, parce que l'onglet y est.
+        let resident = session(&p).await;
+        p.act(&resident, BrowserStep::Goto(&site("/login")))
+            .await
+            .unwrap();
+        assert_eq!(sick.state().targets, 1);
+
+        // Marqué malade à la main : la sonde par défaut dort trente secondes,
+        // donc rien ne le remettra debout pendant ce test. La sonde elle-même
+        // est éprouvée par le test suivant.
+        p.inner.fleet.endpoints[0]
+            .healthy
+            .store(false, Ordering::Release);
+        assert_eq!(p.fleet_health(), Some((2, 1)));
+
+        for _ in 0..3 {
+            let s = session(&p).await;
+            p.act(&s, BrowserStep::Goto(&site("/login")))
+                .await
+                .expect("the well one takes them");
+        }
+        assert_eq!(sick.state().targets, 1, "a sick endpoint took a new tab");
+        assert_eq!(well.state().targets, 3);
+
+        // Et l'onglet du résident est toujours sur sa machine : une étape de
+        // plus y va, sans en ouvrir un autre ailleurs.
+        p.act(&resident, BrowserStep::Location).await.unwrap();
+        assert_eq!(sick.state().targets, 1);
+        assert_eq!(well.state().targets, 3);
+    }
+
+    /// Toute la flotte malade : `Retryable`, et la ligne de journal nomme les
+    /// deux nombres — la seule chose qui distingue « pleine » de « tombée ».
+    #[tokio::test]
+    async fn a_whole_fleet_that_is_down_is_retryable_and_says_how_many() {
+        let one = FakeChrome::start().await;
+        let two = FakeChrome::start().await;
+        let p = fleet_of(&[&one, &two], 3).with_health_probe(Duration::from_millis(20));
+
+        // Une première tâche démarre les sondes ; ensuite les deux machines
+        // cessent de répondre à `/json/version` et les sondes le voient.
+        let first = session(&p).await;
+        p.act(&first, BrowserStep::Goto(&site("/login")))
+            .await
+            .unwrap();
+        one.state().down = true;
+        two.state().down = true;
+        assert!(
+            eventually(|| p.fleet_health() == Some((2, 0))).await,
+            "the probes never noticed: {:?}",
+            p.fleet_health()
+        );
+
+        // **Ce qui distingue « la flotte est tombée » d'un simple échec de
+        // transport** : on ne compose *rien*. Un adaptateur sans flotte
+        // essaierait, échouerait sur `/json/version` et rendrait lui aussi un
+        // `Retryable` — donc `is_retryable()` seul est une assertion aveugle,
+        // et c'est le désarmement qui l'a montrée telle. Le compte de requêtes
+        // HTTP est la ligne qui mord.
+        let dialled = |chrome: &FakeChrome| chrome.state().hosts.len();
+        let (before_one, before_two) = (dialled(&one), dialled(&two));
+        let s = session(&p).await;
+        let started = Instant::now();
+        let err = p
+            .act(&s, BrowserStep::Goto(&site("/login")))
+            .await
+            .expect_err("nothing is up");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "the task queued on a dead machine instead of being told to come back"
+        );
+        assert_eq!(
+            (dialled(&one), dialled(&two)),
+            (before_one, before_two),
+            "a dead machine was dialled anyway"
+        );
+        assert_eq!(one.state().targets, 1, "a dead machine was asked for a tab");
+        assert_eq!(two.state().targets, 0);
+
+        // Désarmée : une machine qui revient est reprise sans redémarrage.
+        two.state().down = false;
+        assert!(
+            eventually(|| p.fleet_health() == Some((2, 1))).await,
+            "the probe never brought it back"
+        );
+        p.act(&s, BrowserStep::Goto(&site("/login")))
+            .await
+            .expect("the healthy one takes it");
+        assert_eq!(two.state().targets, 1);
+    }
+
     // -- a real Chromium --------------------------------------------------------------
     //
     // `BROWSER_CDP_URL=http://127.0.0.1:9222`, or these skip — the same
@@ -3053,7 +4165,7 @@ mod tests {
 
     fn real_browser(cdp: Url, jar: Arc<dyn CookieJar>) -> ChromeBrowser {
         ChromeBrowser::new(
-            cdp,
+            vec![cdp],
             Arc::new(PinnedHost::new(site_host().to_string(), site_host())),
             jar,
         )
@@ -3291,6 +4403,229 @@ mod tests {
             BrowserOutcome::Navigated(_)
         ));
         p.release(&s.binding).await.unwrap();
+    }
+
+    /// Un proxy HTTP qui **sert la page lui-même** plutôt que de la relayer,
+    /// et qui réclame une authentification Basic quand on le lui demande.
+    ///
+    /// ponytail: pas de relais, pas de `CONNECT`, pas de TLS. La question à
+    /// laquelle ce faux répond est « Chromium a-t-il envoyé la requête *par
+    /// là*, et avec quels identifiants ? » — et servir la réponse soi-même y
+    /// répond aussi bien que la relayer, en trente lignes au lieu de deux
+    /// cents. La montée, si un jour on veut mesurer une chaîne complète :
+    /// relayer, et gérer `CONNECT` pour du HTTPS.
+    struct FakeProxy {
+        addr: SocketAddr,
+        /// Chaque requête vue : `(ligne de requête, en-tête Proxy-Authorization)`.
+        seen: Arc<Mutex<Vec<ProxyHit>>>,
+    }
+
+    impl FakeProxy {
+        async fn start(demands_auth: bool) -> Self {
+            let listener = TcpListener::bind((site_host(), 0)).await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let addr = SocketAddr::new(site_host(), addr.port());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let served = Arc::clone(&seen);
+            tokio::spawn(async move {
+                while let Ok((mut io, _)) = listener.accept().await {
+                    let seen = Arc::clone(&served);
+                    tokio::spawn(async move {
+                        let mut head = [0u8; 4096];
+                        let n = io.read(&mut head).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&head[..n]).to_string();
+                        let request_line = head.lines().next().unwrap_or_default().to_owned();
+                        let authorization = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("proxy-authorization")
+                                .then(|| value.trim().to_owned())
+                        });
+                        seen.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((request_line, authorization.clone()));
+                        let response = if demands_auth && authorization.is_none() {
+                            "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                             Proxy-Authenticate: Basic realm=\"fixture\"\r\n\
+                             Content-Length: 0\r\nProxy-Connection: close\r\n\r\n"
+                                .to_owned()
+                        } else {
+                            let body = "<!doctype html><title>Through the proxy</title>\
+                                        <p id=\"who\">the proxy answered</p>";
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        let _ = io.write_all(response.as_bytes()).await;
+                        let _ = io.shutdown().await;
+                    });
+                }
+            });
+            Self { addr, seen }
+        }
+
+        fn requests(&self) -> Vec<ProxyHit> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    /// Le site que le faux proxy sert : un nom que Chromium ne résout jamais
+    /// lui-même, puisque c'est le proxy qui s'en charge.
+    const PROXIED: &str = "proxied.example.com";
+
+    /// Une requête arrivée au faux proxy : sa ligne de requête, et son en-tête
+    /// `Proxy-Authorization` s'il en portait un.
+    type ProxyHit = (String, Option<String>);
+
+    fn proxied_url() -> Url {
+        Url::parse(&format!("http://{PROXIED}/tarifs")).expect("url")
+    }
+
+    fn browser_through(cdp: Url, proxy: ProxyConfig) -> ChromeBrowser {
+        ChromeBrowser::new(
+            vec![cdp],
+            Arc::new(PinnedHost::new(PROXIED, site_host())),
+            Arc::new(MemoryCookieJar::new()),
+        )
+        .with_proxies(Arc::new(FixedProxy(Some(proxy))))
+    }
+
+    /// **Le vrai Chromium sort par le proxy du contexte, et l'authentification
+    /// passe par `Fetch`.** Les deux moitiés de la v3 côté proxy, mesurées sur
+    /// le navigateur plutôt que sur la trame qu'on lui a envoyée.
+    #[tokio::test]
+    async fn a_real_chromium_leaves_by_the_context_proxy_and_authenticates_to_it() {
+        let Some(cdp) = real_chrome() else { return };
+        let proxy = FakeProxy::start(true).await;
+        let p = browser_through(
+            cdp,
+            ProxyConfig {
+                server: format!("http://{}", proxy.addr),
+                // Le site est sur la boucle locale dans ce test, et Chromium ne
+                // proxifie pas la boucle locale par défaut : `<-loopback>` est
+                // ce qui retire cette exception. Mesuré le 2026-09-10 — sans
+                // lui, la navigation part en direct et le faux ne voit rien.
+                bypass: Some("<-loopback>".to_owned()),
+                credentials: Some(("orizn-eu".to_owned(), "s3cr3t-de-passage".to_owned())),
+            },
+        );
+        let s = session(&p).await;
+        p.act(&s, BrowserStep::Goto(&proxied_url()))
+            .await
+            .expect("the navigation went through the proxy");
+        assert_eq!(text(&p, &s, "#who").await.unwrap(), "the proxy answered");
+
+        // Ce que le proxy a vu, et **ce que la mesure a corrigé** (2026-09-10,
+        // Chrome 152.0.7977.83) : la première requête n'est pas le `GET` qu'on
+        // attendait, c'est un `CONNECT proxied.example.com:443` — la tentative
+        // HTTPS-first du navigateur, elle aussi proxifiée. C'est *sur ce
+        // `CONNECT`* que le 407 tombe et que `Fetch.authRequired` se déclenche ;
+        // quand Chromium retombe sur `http://`, les identifiants sont déjà en
+        // cache. Il passe aussi des `CONNECT www.google.com:443` de son cru
+        // (ses sondes de connectivité) par le même proxy, ce qu'il faut savoir
+        // avant de facturer des octets à un client au gigaoctet.
+        //
+        // Donc les trois assertions sont : la requête du site est arrivée là en
+        // **forme absolue** (adressée au proxy, pas au site), quelque chose y
+        // est arrivé **sans** identifiants (le défi a bien eu lieu), et les
+        // identifiants ouverts ont suivi.
+        let requests = proxy.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|(line, _)| line == &format!("GET http://{PROXIED}/tarifs HTTP/1.1")),
+            "the navigation did not reach the proxy in absolute form: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|(_, auth)| auth.is_none()),
+            "nothing was ever challenged, so nothing proves the auth round trip: {requests:?}"
+        );
+        let expected = format!("Basic {}", BASE64.encode("orizn-eu:s3cr3t-de-passage"));
+        assert!(
+            requests
+                .iter()
+                .any(|(_, auth)| auth.as_deref() == Some(expected.as_str())),
+            "the credentials never reached the proxy: {requests:?}"
+        );
+        p.release(&s.binding).await.unwrap();
+
+        // Désarmée : **sans** identifiants, le même proxy refuse et la
+        // navigation échoue par un code nommé. Donc l'aller-retour ci-dessus
+        // est bien l'authentification et pas un proxy complaisant.
+        let refusing = FakeProxy::start(true).await;
+        let d = browser_through(
+            Url::parse(&std::env::var("BROWSER_CDP_URL").unwrap()).unwrap(),
+            ProxyConfig {
+                server: format!("http://{}", refusing.addr),
+                bypass: Some("<-loopback>".to_owned()),
+                credentials: None,
+            },
+        );
+        let ds = session(&d).await;
+        let err = d
+            .act(&ds, BrowserStep::Goto(&proxied_url()))
+            .await
+            .expect_err("407 with nothing to answer it");
+        assert_eq!(err.code(), NAVIGATION_FAILED, "{err:?}");
+        assert!(
+            refusing.requests().iter().all(|(_, auth)| auth.is_none()),
+            "credentials appeared from nowhere: {:?}",
+            refusing.requests()
+        );
+        d.release(&ds.binding).await.unwrap();
+    }
+
+    /// Un proxy qui n'existe pas : une **erreur de navigation nommée**, pas un
+    /// panic et pas une page vide qui se lirait comme un site muet.
+    #[tokio::test]
+    async fn a_real_chromium_names_the_failure_of_a_proxy_that_is_not_there() {
+        let Some(cdp) = real_chrome() else { return };
+        // Un port qu'on vient d'ouvrir puis de fermer : rien n'écoute là, et
+        // rien ne s'y installera pendant le test.
+        let closed = {
+            let listener = TcpListener::bind((site_host(), 0)).await.expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let p = browser_through(
+            cdp,
+            ProxyConfig {
+                server: format!("http://{}:{closed}", site_host()),
+                bypass: Some("<-loopback>".to_owned()),
+                credentials: None,
+            },
+        );
+        let s = session(&p).await;
+        let err = p
+            .act(&s, BrowserStep::Goto(&proxied_url()))
+            .await
+            .expect_err("nothing is listening on that proxy");
+        assert_eq!(err.code(), NAVIGATION_FAILED, "{err:?}");
+        // **Et l'onglet reste**, ce qui est la règle de `tab_survives` et non
+        // un oubli : `navigation_failed` est une erreur sur *notre* adresse, et
+        // la page est toujours là pour l'étape suivante — celle où le modèle
+        // essaie autre chose, ou celle où un opérateur répare la ligne du
+        // proxy. Un proxy mort n'est pas une raison de perdre la session.
+        assert_eq!(p.open_tabs(), 1);
+        p.release(&s.binding).await.unwrap();
+        assert_eq!(p.open_tabs(), 0, "release left a target behind");
+
+        // Désarmée : le même Chromium, sans proxy, atteint le site servi par
+        // l'axum de `real_site` — donc l'échec ci-dessus est le proxy.
+        let addr = real_site().await;
+        let plain = real_browser(
+            Url::parse(&std::env::var("BROWSER_CDP_URL").unwrap()).unwrap(),
+            Arc::new(MemoryCookieJar::new()),
+        );
+        let ps = session(&plain).await;
+        plain
+            .act(
+                &ps,
+                BrowserStep::Goto(&Url::parse(&format!("http://{addr}/login")).unwrap()),
+            )
+            .await
+            .expect("no proxy, no problem");
+        plain.release(&ps.binding).await.unwrap();
     }
 
     #[tokio::test]

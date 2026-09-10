@@ -6773,7 +6773,7 @@ mod tests {
         };
 
         let chrome: Arc<dyn BrowserProvider> = Arc::new(ChromeBrowser::new(
-            Url::parse(&cdp).expect("BROWSER_CDP_URL is a URL"),
+            vec![Url::parse(&cdp).expect("BROWSER_CDP_URL is a URL")],
             vet(),
             Arc::new(MemoryCookieJar::new()),
         ));
