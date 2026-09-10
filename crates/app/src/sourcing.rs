@@ -1510,7 +1510,10 @@ impl Buyer {
             .send_email(ok, body)
             .await)
         {
-            Ok(Ok(message_id)) => Contacted::Sent { to, message_id },
+            Ok(Ok(sent)) => Contacted::Sent {
+                to,
+                message_id: sent.id,
+            },
             Ok(Err(why)) => Contacted::Failed { to, why },
             Err(why) => Contacted::Refused { to, why },
         }
@@ -1643,6 +1646,9 @@ mod tests {
         .await
         .expect("insert employee");
         tx.commit().await.expect("commit seed");
+        // A verified sending domain: since 0094 a tenant without one sends
+        // nothing (`sending_domain::pick_from`).
+        crate::sending_domain::adopt_for_tests(db, tenant).await;
 
         Principal::employee(tenant, employee)
     }

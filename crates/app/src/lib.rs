@@ -42,7 +42,7 @@ pub mod rolepack;
 pub mod rolepack_sales; // wave 12
 pub mod rolepack_service; // customer success, growth, finance
 pub mod secrets; // U22
-pub mod sending_domain; // le domaine d'envoi est au locataire, vérifié chez le fournisseur avant qu'un siège s'y assoie
+pub mod sending_domain; // les domaines d'envoi sont au locataire, vérifiés chez le fournisseur, chacun sous un plafond ; l'expéditeur est choisi à l'envoi
 pub mod sequence; // la séquence: several promises in a row, branching on what the provider saw, and never a second send path
 pub mod sourcing;
 pub mod stripe; // une livraison Stripe encaisse une facture : le quatrième schéma de webhook

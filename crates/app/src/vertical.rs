@@ -3765,6 +3765,9 @@ mod tests {
         .await
         .expect("insert employee");
         tx.commit().await.expect("commit seed");
+        // A verified sending domain: since 0094 a tenant without one sends
+        // nothing (`sending_domain::pick_from`).
+        crate::sending_domain::adopt_for_tests(db, tenant).await;
 
         Principal::employee(tenant, employee)
     }

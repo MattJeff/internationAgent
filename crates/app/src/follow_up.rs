@@ -131,11 +131,16 @@ pub fn subject(contact: &str) -> String {
 ///
 /// The idempotency key is the provider's message id: one send, one row,
 /// however many times the recording is replayed.
+///
+/// `from` is the sender the mail actually left with — chosen by
+/// `sending_domain::pick_from`, which reads it back from this row to keep a
+/// thread on one address. Before 0094 the column was written empty here.
 pub async fn sent(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
     to: &EmailAddress,
     subject: Option<&str>,
+    from: &str,
     provider_message_id: &str,
     now: DateTime<Utc>,
 ) -> Result<ConversationId, StoreError> {
@@ -152,7 +157,7 @@ pub async fn sent(
              (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
               recipients, provider_message_id, subject, trust_label, idempotency_key, \
               received_at, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 'outbound', '', $6, $7, $8, 'trusted', $9, $10, $10) \
+         VALUES ($1, $2, $3, $4, $5, 'outbound', $11, $6, $7, $8, 'trusted', $9, $10, $10) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
     )
     .bind(Uuid::now_v7())
@@ -165,6 +170,7 @@ pub async fn sent(
     .bind(subject)
     .bind(format!("sent:{provider_message_id}"))
     .bind(now)
+    .bind(from)
     .execute(&mut ***tx)
     .await?;
     sqlx::query("UPDATE conversations SET last_message_at = $2, updated_at = $2 WHERE id = $1")
@@ -339,6 +345,9 @@ mod tests {
         .await
         .expect("employee");
         admin.commit().await.expect("commit");
+        // A verified sending domain: since 0094 a tenant without one sends
+        // nothing (`sending_domain::pick_from`).
+        crate::sending_domain::adopt_for_tests(db, tenant).await;
         (tenant, employee)
     }
 
@@ -355,9 +364,17 @@ mod tests {
         now: DateTime<Utc>,
     ) -> (ConversationId, Option<AppointmentId>) {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let conversation = sent(&mut tx, employee, &prospect(), Some("hello"), id, now)
-            .await
-            .expect("record the send");
+        let conversation = sent(
+            &mut tx,
+            employee,
+            &prospect(),
+            Some("hello"),
+            "lena@ours.example",
+            id,
+            now,
+        )
+        .await
+        .expect("record the send");
         let promised = schedule(&mut tx, employee, conversation, &prospect(), now)
             .await
             .expect("schedule");

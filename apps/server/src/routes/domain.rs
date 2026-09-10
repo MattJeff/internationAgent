@@ -1,34 +1,44 @@
-//! `/v1/domain` : le domaine d'envoi du locataire, posé depuis la console,
-//! vérifié chez le fournisseur, et ses enregistrements DNS recopiés chez
-//! Cloudflare en un appel.
+//! `/v1/domain` et `/v1/domains` : les domaines d'envoi du locataire, posés
+//! depuis la console, vérifiés chez le fournisseur, chacun sous un plafond
+//! journalier, et leurs enregistrements DNS recopiés chez Cloudflare en un
+//! appel.
 //!
 //! # Pourquoi une route, et pas une variable
 //!
 //! `AGENT_EMAIL_DOMAIN` était le domaine d'envoi de *tout* le déploiement,
 //! et rien ne vérifiait qu'il existe chez le fournisseur : Orizn a tourné
 //! cinq jours sur `agent-orizn.com`, un domaine que personne ne possède
-//! (mesuré le 2026-09-10). Un deuxième client doit poser **son** domaine
+//! (mesuré le 2026-09-10). Un deuxième client doit poser **ses** domaines
 //! lui-même, voir ce que le fournisseur lui demande, et savoir quand ses
 //! sièges peuvent écrire. La variable reste, comme **défaut** du locataire
 //! qui n'en nomme aucun — `config.rs` le dit — et
 //! `agentos_app::sending_domain` porte la logique ; ce fichier n'est que la
 //! porte.
 //!
-//! # Quatre gestes
+//! # Plusieurs domaines, une primaire (0094)
+//!
+//! Depuis 0094 un locataire a plusieurs lignes ; **la primaire** est celle
+//! dont les sièges lisent le domaine et que `GET /v1/domain` rend — le
+//! contrat de la console tient. `POST /v1/domain` **ajoute** (la première
+//! est la primaire), et les gestes par nom sont sous `/v1/domains/{domain}`.
 //!
 //! | Route | Réponse |
 //! |---|---|
-//! | `GET /v1/domain` | 404 `no_domain`, ou la ligne |
-//! | `POST /v1/domain {domain}` | 201 la ligne ; 200 si c'était déjà celle-là ; 409 `another_domain` ; 409 `domain_taken` (un autre locataire) ; 400 `bad_domain` |
-//! | `POST /v1/domain/verify` | 200 la ligne, relue chez le fournisseur ; réveille les sièges qui attendaient |
-//! | `POST /v1/domain/dns {cloudflare_api_token}` | 200 `{posed, skipped, zone}` |
+//! | `GET /v1/domain` | 404 `no_domain`, ou la primaire |
+//! | `GET /v1/domains` | 200 `{domains: [ligne…]}`, la primaire en tête |
+//! | `POST /v1/domain {domain}` | 201 la ligne ajoutée ; 200 si elle y était ; 409 `domain_taken` (un autre locataire) ; 400 `bad_domain` |
+//! | `POST /v1/domain/verify {domain?}` | 200 la ligne, relue chez le fournisseur ; réveille les sièges qui attendaient ; la primaire sans corps |
+//! | `POST /v1/domain/dns {cloudflare_api_token, domain?}` | 200 `{posed, skipped, zone}` ; la primaire sans `domain` |
+//! | `PUT /v1/domains/{domain}/cap {daily_cap}` | 200 la ligne ; 400 `bad_cap` sur zéro |
+//! | `DELETE /v1/domains/{domain}` | 204 ; 409 `primary_domain` sur la primaire ; 404 `no_domain` |
 //!
 //! La ligne : `{domain, provider, status, records: [{record, type, name,
-//! value, priority?, ttl, status}], checked_at, verified_at}`. `records` est
-//! ce que le fournisseur a répondu, tel quel — la console l'affiche, `dns`
-//! le pose. Le MX de réception n'y est pas tant que la réception n'est pas
-//! activée chez le fournisseur ; `dns` le dérive de la région
-//! (`docs/PROVIDERS.md` §Resend).
+//! value, priority?, ttl, status}], checked_at, verified_at, is_primary,
+//! daily_cap, sent_today}`. `records` est ce que le fournisseur a répondu,
+//! tel quel — la console l'affiche, `dns` le pose. Le MX de réception n'y est
+//! pas tant que la réception n'est pas activée chez le fournisseur ; `dns` le
+//! dérive de la région (`docs/PROVIDERS.md` §Resend). `sent_today` est le
+//! compteur UTC du jour, fil collant compris.
 //!
 //! # Le jeton Cloudflare
 //!
@@ -56,10 +66,10 @@ use agentos_app::mocks::ProviderError;
 use agentos_app::sending_domain::{self, Refusal, Row};
 use agentos_store::db::Db;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRef, State};
+use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get as get_route, post};
+use axum::routing::{delete as delete_route, get as get_route, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -125,8 +135,11 @@ impl Hiring {
 pub fn router(hiring: Hiring) -> Router {
     Router::new()
         .route("/v1/domain", get_route(get).post(register))
+        .route("/v1/domains", get_route(list))
         .route("/v1/domain/verify", post(verify))
         .route("/v1/domain/dns", post(dns))
+        .route("/v1/domains/{domain}/cap", axum::routing::put(cap))
+        .route("/v1/domains/{domain}", delete_route(remove))
         .with_state(hiring)
 }
 
@@ -136,21 +149,43 @@ struct RegisterBody {
     domain: String,
 }
 
-/// Pas de `Debug`, exprès : le seul champ est un jeton.
+/// `verify` : la primaire sans corps, ou le domaine nommé.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NamedBody {
+    domain: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapBody {
+    daily_cap: u32,
+}
+
+/// Pas de `Debug`, exprès : un des champs est un jeton.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsBody {
     cloudflare_api_token: String,
+    domain: Option<String>,
 }
 
 async fn get(State(hiring): State<Hiring>, principal: Principal) -> Result<Response, ApiError> {
     let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
-    let row = sending_domain::current(&mut tx).await?;
+    let row = sending_domain::primary(&mut tx).await?;
     tx.rollback().await?;
     match row {
         Some(row) => Ok((StatusCode::OK, Json(view(&row))).into_response()),
         None => Err(no_domain()),
     }
+}
+
+async fn list(State(hiring): State<Hiring>, principal: Principal) -> Result<Response, ApiError> {
+    let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
+    let rows = sending_domain::all(&mut tx).await?;
+    tx.rollback().await?;
+    let domains: Vec<Value> = rows.iter().map(view).collect();
+    Ok((StatusCode::OK, Json(json!({ "domains": domains }))).into_response())
 }
 
 async fn register(
@@ -160,12 +195,13 @@ async fn register(
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
     let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
-    let had = sending_domain::current(&mut tx).await?;
+    let had = sending_domain::all(&mut tx).await?.len();
     let row = sending_domain::register(&mut tx, &*hiring.ports.email, &body.domain)
         .await
         .map_err(refused)?;
+    let now = sending_domain::all(&mut tx).await?.len();
     tx.commit().await?;
-    let status = if had.is_some() {
+    let status = if now == had {
         StatusCode::OK
     } else {
         tracing::info!(
@@ -173,6 +209,7 @@ async fn register(
             domain = %row.domain,
             provider = %row.provider,
             status = row.status.as_str(),
+            primary = row.is_primary,
             "sending domain registered"
         );
         StatusCode::CREATED
@@ -180,9 +217,14 @@ async fn register(
     Ok((status, Json(view(&row))).into_response())
 }
 
-async fn verify(State(hiring): State<Hiring>, principal: Principal) -> Result<Response, ApiError> {
+async fn verify(
+    State(hiring): State<Hiring>,
+    principal: Principal,
+    body: Option<Json<NamedBody>>,
+) -> Result<Response, ApiError> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
-    let row = sending_domain::verify(&mut tx, &*hiring.ports.email)
+    let row = sending_domain::verify(&mut tx, &*hiring.ports.email, body.domain.as_deref())
         .await
         .map_err(refused)?;
     tx.commit().await?;
@@ -202,13 +244,20 @@ async fn dns(
 ) -> Result<Response, ApiError> {
     // Un texte fixe : le message de serde cite parfois la valeur refusée.
     let Json(body) = body.map_err(|_| {
-        ApiError::bad_request("body must be {\"cloudflare_api_token\": \"<token>\"}")
+        ApiError::bad_request(
+            "body must be {\"cloudflare_api_token\": \"<token>\", \"domain\"?: \"<name>\"}",
+        )
     })?;
     let token = Secret::new(body.cloudflare_api_token);
     let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
-    let posed = sending_domain::pose_dns(&mut tx, token, &hiring.cloudflare_api)
-        .await
-        .map_err(refused)?;
+    let posed = sending_domain::pose_dns(
+        &mut tx,
+        token,
+        &hiring.cloudflare_api,
+        body.domain.as_deref(),
+    )
+    .await
+    .map_err(refused)?;
     tx.rollback().await?;
     tracing::info!(
         tenant_id = %principal.tenant_id,
@@ -218,6 +267,45 @@ async fn dns(
         "dns records posed"
     );
     Ok((StatusCode::OK, Json(json!(posed))).into_response())
+}
+
+async fn cap(
+    State(hiring): State<Hiring>,
+    principal: Principal,
+    Path(domain): Path<String>,
+    body: Result<Json<CapBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
+    let row = sending_domain::set_cap(&mut tx, &domain, body.daily_cap)
+        .await
+        .map_err(refused)?;
+    tx.commit().await?;
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        domain = %row.domain,
+        daily_cap = row.daily_cap,
+        "sending domain cap set"
+    );
+    Ok((StatusCode::OK, Json(view(&row))).into_response())
+}
+
+async fn remove(
+    State(hiring): State<Hiring>,
+    principal: Principal,
+    Path(domain): Path<String>,
+) -> Result<Response, ApiError> {
+    let mut tx = hiring.db.tenant_tx(principal.tenant_id).await?;
+    sending_domain::remove(&mut tx, &domain)
+        .await
+        .map_err(refused)?;
+    tx.commit().await?;
+    tracing::info!(
+        tenant_id = %principal.tenant_id,
+        domain = %domain,
+        "sending domain removed"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// La ligne, sur le fil. `records` passe par la sérialisation de
@@ -230,6 +318,9 @@ fn view(row: &Row) -> Value {
         "records": row.records,
         "checked_at": row.checked_at,
         "verified_at": row.verified_at,
+        "is_primary": row.is_primary,
+        "daily_cap": row.daily_cap,
+        "sent_today": row.sent_today,
     })
 }
 
@@ -237,7 +328,7 @@ fn no_domain() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "no_domain",
-        "this tenant has no sending domain yet",
+        "this tenant has no such sending domain",
     )
 }
 
@@ -251,16 +342,19 @@ pub(crate) fn refused(err: Refusal) -> ApiError {
             "not a sending domain",
         )
         .with_detail(detail),
-        Refusal::AnotherDomain { current } => ApiError::conflict(
-            "another_domain",
-            "this tenant already sends from another domain",
-        )
-        .with_extension("current", json!(current)),
         Refusal::DomainTaken => ApiError::conflict(
             "domain_taken",
             "another tenant already sends from this domain",
         ),
         Refusal::NoDomain => no_domain(),
+        Refusal::PrimaryDomain => {
+            ApiError::conflict("primary_domain", "the primary domain cannot be removed")
+        }
+        Refusal::BadCap => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_cap",
+            "daily_cap must be at least 1",
+        ),
         // Le fournisseur a dit non à quelque chose que le client contrôle
         // (jeton refusé, zone introuvable, domaine rejeté) : son mot, en 422.
         Refusal::Provider(ProviderError::Terminal { code }) => ApiError::new(
@@ -539,6 +633,7 @@ mod tests {
             "no priority on a TXT"
         );
         assert!(body["checked_at"].is_string() && body["verified_at"].is_string());
+        assert_eq!(body["is_primary"], true, "the first domain is the primary");
 
         let (status, read) = h.send("GET", "/v1/domain", SECRET_A, None).await;
         assert_eq!(status, StatusCode::OK);
@@ -556,18 +651,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{again}");
         assert_eq!(again, body);
 
-        // Another domain: another story. A bad one: a 400 with its name.
+        // Another domain: added, a 201, and not the primary. A bad one: a
+        // 400 with its name.
+        let second = unique();
         let (status, body) = h
             .send(
                 "POST",
                 "/v1/domain",
                 SECRET_A,
-                Some(json!({"domain": unique()})),
+                Some(json!({"domain": second})),
             )
             .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["code"], "another_domain");
-        assert_eq!(body["current"], name);
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["is_primary"], false);
+        assert_eq!(body["daily_cap"], 50);
+        assert_eq!(body["sent_today"], 0);
         let (status, body) = h
             .send(
                 "POST",
@@ -578,6 +676,16 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "bad_domain");
+
+        // `GET /v1/domain` is still the primary; `/v1/domains` has both.
+        let (status, body) = h.send("GET", "/v1/domain", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["domain"], name);
+        let (status, body) = h.send("GET", "/v1/domains", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["domains"][0]["domain"], name, "the primary first");
+        assert_eq!(body["domains"][1]["domain"], second);
+        assert_eq!(body["domains"].as_array().map(Vec::len), Some(2));
 
         // Tenant B: RLS — no domain, and A's name is taken.
         let (status, body) = h.send("GET", "/v1/domain", SECRET_B, None).await;
@@ -593,12 +701,27 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "domain_taken");
 
-        // Verify reads the provider again and answers the same shape.
+        // Verify reads the provider again and answers the same shape — the
+        // primary without a body, a named one with.
         let (status, body) = h.send("POST", "/v1/domain/verify", SECRET_A, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "verified");
+        assert_eq!(body["domain"], name);
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/domain/verify",
+                SECRET_A,
+                Some(json!({"domain": second})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["domain"], second);
         let (status, body) = h.send("POST", "/v1/domain/verify", SECRET_B, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = h.send("GET", "/v1/domains", SECRET_B, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({"domains": []}), "RLS: nothing of A's");
 
         h.teardown().await;
     }
@@ -700,6 +823,86 @@ mod tests {
             !log.contains("cf_wrong"),
             "the refused token reached a log line:\n{log}"
         );
+
+        h.teardown().await;
+    }
+    /// **Le plafond et le retrait.** `PUT …/cap` pose le plafond, zéro est
+    /// refusé ; `DELETE` retire un secondaire et refuse la primaire ; le
+    /// locataire d'à côté ne voit ni ne touche rien.
+    #[tokio::test]
+    async fn the_cap_is_set_by_route_and_only_a_secondary_can_be_deleted() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let first = unique();
+        let second = unique();
+        for name in [&first, &second] {
+            let (status, body) = h
+                .send(
+                    "POST",
+                    "/v1/domain",
+                    SECRET_A,
+                    Some(json!({"domain": name})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        let (status, body) = h
+            .send(
+                "PUT",
+                &format!("/v1/domains/{second}/cap"),
+                SECRET_A,
+                Some(json!({"daily_cap": 7})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["domain"], second);
+        assert_eq!(body["daily_cap"], 7);
+        let (status, body) = h
+            .send(
+                "PUT",
+                &format!("/v1/domains/{second}/cap"),
+                SECRET_A,
+                Some(json!({"daily_cap": 0})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "bad_cap");
+        // Tenant B: A's domain is nobody's, to it.
+        let (status, body) = h
+            .send(
+                "PUT",
+                &format!("/v1/domains/{second}/cap"),
+                SECRET_B,
+                Some(json!({"daily_cap": 3})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "no_domain");
+        let (status, body) = h
+            .send("DELETE", &format!("/v1/domains/{second}"), SECRET_B, None)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // The primary stays; the secondary goes; twice is a 404.
+        let (status, body) = h
+            .send("DELETE", &format!("/v1/domains/{first}"), SECRET_A, None)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "primary_domain");
+        let (status, _) = h
+            .send("DELETE", &format!("/v1/domains/{second}"), SECRET_A, None)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = h
+            .send("DELETE", &format!("/v1/domains/{second}"), SECRET_A, None)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = h.send("GET", "/v1/domains", SECRET_A, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["domains"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["domains"][0]["domain"], first);
 
         h.teardown().await;
     }

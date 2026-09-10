@@ -574,6 +574,21 @@ pub struct RenderedEmail {
     pub in_reply_to: Option<ProviderMessageId>,
 }
 
+/// What [`Effects::send_email`] answers: the provider's id, and the sender
+/// the mail actually left with.
+///
+/// `from` is not [`RenderedEmail::from`]: that one is the primary address the
+/// turn was configured with, this one is what `sending_domain::pick_from`
+/// chose — the thread's previous sender, or the verified domain with the
+/// most cap left today. It travels back so [`Effects::chase`] can write it on
+/// the `messages` row, which is where the next pick reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentEmail {
+    pub id: ProviderMessageId,
+    /// `slug@domain`, the envelope sender as sent.
+    pub from: String,
+}
+
 /// A rendered SMS, minus the recipient.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedSms {
@@ -913,11 +928,38 @@ pub enum EffectError {
     #[error("the email reads like spam and was not sent; rewrite it:\n{0}")]
     Deliverability(crate::deliverability::Verdict),
 
+    /// Aucun domaine d'envoi du locataire n'a de plafond aujourd'hui — ou
+    /// aucun n'est vérifié — et le mail n'est pas parti.
+    ///
+    /// Comme [`Deliverability`](EffectError::Deliverability), pas un
+    /// [`Refused`](EffectError::Refused) : le code fermé est
+    /// [`DOMAIN_CAPS_EXHAUSTED`], mais le modèle doit lire **l'heure** du
+    /// prochain créneau pour la mettre dans son plan plutôt que de réessayer
+    /// dans la minute. Levé par [`Effects::send_email`] seul, avant tout
+    /// appel fournisseur ; voir [`crate::sending_domain`].
+    #[error("{}", caps_exhausted_text(*.0))]
+    DomainCapsExhausted(crate::sending_domain::Exhausted),
+
     /// The effect could not be recorded, so it is reported as failed. The audit
     /// row and the effect are one unit: an unrecorded effect is worse than a
     /// missing one.
     #[error(transparent)]
     Unavailable(StoreError),
+}
+
+/// [`EffectError::DomainCapsExhausted`]'s code.
+pub const DOMAIN_CAPS_EXHAUSTED: &str = "domain_caps_exhausted";
+
+/// La phrase que le modèle lit : l'heure est là pour qu'il la note, et
+/// `None` est un locataire qui n'a rien à attendre.
+fn caps_exhausted_text(exhausted: crate::sending_domain::Exhausted) -> String {
+    match exhausted.next_slot {
+        Some(at) => format!(
+            "every sending domain reached its daily cap; the next slot opens at {}",
+            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None => "this company has no verified sending domain yet; nothing can be sent".to_owned(),
+    }
 }
 
 impl EffectError {
@@ -928,6 +970,7 @@ impl EffectError {
             EffectError::OutOfScope(_) => "out_of_scope",
             EffectError::Refused(code) => code,
             EffectError::Deliverability(_) => crate::deliverability::CODE,
+            EffectError::DomainCapsExhausted(_) => DOMAIN_CAPS_EXHAUSTED,
             EffectError::Unavailable(_) => "unavailable",
         }
     }
@@ -1095,7 +1138,7 @@ impl Effects {
         &self,
         ok: Authorized<A>,
         body: RenderedEmail,
-    ) -> Result<ProviderMessageId, EffectError> {
+    ) -> Result<SentEmail, EffectError> {
         // Le lecteur qui dit non — ici et pas dans `dispatch_email`, parce que
         // cette méthode est la seule route de la prospection : `send_invoice`
         // partage `dispatch_email` et une facture n'a pas à passer un contrôle
@@ -1118,11 +1161,45 @@ impl Effects {
                 "email sent with deliverability warnings"
             );
         }
+        // L'expéditeur, choisi et réservé ici — le même embranchement que le
+        // lecteur au-dessus, et pour la même raison : c'est la prospection, et
+        // elle seule, qui tourne sur plusieurs domaines. `body.from` est
+        // l'adresse primaire de la fiche ; `pick_from` la remplace par le fil
+        // ou par le domaine le moins chargé. Réservé et commis avant le
+        // fournisseur, comme la ligne d'intention : un envoi qui échoue
+        // ensuite a quand même quitté ce domaine, et `outreach` argue déjà
+        // pourquoi une place rendue est une place qu'une boucle reprend.
+        let to = ok.action().subject().to.clone();
+        let from = {
+            let mut tx = self
+                .db
+                .tenant_tx(self.principal.tenant_id)
+                .await
+                .map_err(EffectError::Unavailable)?;
+            let picked = crate::sending_domain::pick_from(
+                &mut tx,
+                self.principal.employee_id,
+                &to,
+                Utc::now(),
+            )
+            .await
+            .map_err(EffectError::Unavailable)?;
+            match picked {
+                Ok(from) => {
+                    tx.commit().await.map_err(EffectError::Unavailable)?;
+                    from.to_string()
+                }
+                Err(exhausted) => {
+                    let _ = tx.rollback().await;
+                    return Err(EffectError::DomainCapsExhausted(exhausted));
+                }
+            }
+        };
         let email = OutboundEmail {
-            from: body.from,
+            from: from.clone(),
             // The recipient is the one that was ruled on, not one the renderer
             // put in a header.
-            to: vec![ok.action().subject().to.to_string()],
+            to: vec![to.to_string()],
             subject: body.subject,
             body_text: body.body_text,
             in_reply_to: body.in_reply_to,
@@ -1131,7 +1208,12 @@ impl Effects {
             unsubscribe_token: None,
             attachments: Vec::new(),
         };
-        self.dispatch_email(ok, email, Map::new()).await
+        // `from` on the audit row too: the one place an operator can ask which
+        // domain a given send left from, once the thread's row is gone.
+        let mut extra = Map::new();
+        extra.insert("from".to_owned(), json!(from));
+        let id = self.dispatch_email(ok, email, extra).await?;
+        Ok(SentEmail { id, from })
     }
 
     /// Put an issued invoice in front of the customer: the document
@@ -3141,7 +3223,7 @@ impl Effects {
         ok: Authorized<A>,
         to: &EmailAddress,
         subject: &str,
-        sent: &ProviderMessageId,
+        sent: &SentEmail,
     ) -> Result<Option<AppointmentId>, EffectError> {
         let now = Utc::now();
         let mut tx = self
@@ -3151,12 +3233,20 @@ impl Effects {
             .map_err(EffectError::Unavailable)?;
         let employee = self.principal.employee_id;
         let promised = async {
-            let thread =
-                follow_up::sent(&mut tx, employee, to, Some(subject), sent.as_str(), now).await?;
+            let thread = follow_up::sent(
+                &mut tx,
+                employee,
+                to,
+                Some(subject),
+                &sent.from,
+                sent.id.as_str(),
+                now,
+            )
+            .await?;
             // A send a sequence step was waiting for advances the run, and the
             // sequence is then the chase: no J+3 promise beside it, or the
             // thread is written to twice on day three by two mechanisms.
-            if sequence::sent(&mut tx, employee, thread, to, sent.as_str(), now)
+            if sequence::sent(&mut tx, employee, thread, to, sent.id.as_str(), now)
                 .await?
                 .is_some()
             {
@@ -3695,8 +3785,16 @@ mod tests {
         // small budget. It is a row, not a constructor argument — the gate
         // loads the four layers per decision.
         install_policy(db, tenant, &["portal.example.com"], BTreeSet::new()).await;
+        // And a verified sending domain: since 0094 a tenant without one
+        // sends nothing (`sending_domain::pick_from`).
+        crate::sending_domain::adopt_for_tests(db, tenant).await;
 
         Principal::employee(tenant, employee)
+    }
+
+    /// The domain `seed` adopted, as `sending_domain::adopt_for_tests` names it.
+    fn adopted_domain(principal: &Principal) -> String {
+        format!("{}.example.com", principal.tenant_id.as_uuid().simple())
     }
 
     /// The tenant layer, with exactly the hosts a test wants written to and
@@ -5026,7 +5124,7 @@ mod tests {
             .expect("email is allowed");
         let decision_id = token.decision_id();
 
-        let id = effects
+        let sent = effects
             .send_email(token, body())
             .await
             .expect("the mock sends");
@@ -5042,7 +5140,7 @@ mod tests {
         assert_eq!(rows[0].1["effect"], json!("email_send"));
         assert_eq!(
             rows[0].1["detail"]["provider_message_id"],
-            json!(id.as_str())
+            json!(sent.id.as_str())
         );
     }
 
@@ -6646,5 +6744,148 @@ mod tests {
             "the body is the model's, untouched"
         );
         assert_eq!(sent[0].body_text.matches("https://").count(), 3);
+    }
+    /// **L'expéditeur est choisi à l'envoi, pour l'extérieur seulement.** Le
+    /// tour rend `lena@acme.example` ; le mail part de `lena@<domaine du
+    /// locataire>`, le compteur du domaine avance, la ligne d'audit le dit —
+    /// et un mot à un collègue ne touche ni le fournisseur ni le compteur.
+    #[tokio::test]
+    async fn an_outside_email_leaves_from_the_chosen_domain_and_a_note_to_a_colleague_does_not() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let (bruno, _, _) = org_around(&db, &principal).await;
+        agentos_store::policy::install(
+            &db,
+            principal.tenant_id,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email, Channel::Internal]),
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("open the internal channel");
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+            }),
+            principal.clone(),
+        );
+        let expected = format!("lena@{}", adopted_domain(&principal));
+
+        let ok = gate(&db)
+            .authorize(&principal, to("marie@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        let sent = effects
+            .send_email(ok, body())
+            .await
+            .expect("the mock sends");
+        assert_eq!(sent.from, expected, "not `body().from`, the picked one");
+        let out = email.sent_emails();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].from, expected,
+            "the envelope sender is the picked one"
+        );
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows[0].1["detail"]["from"], json!(expected));
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let domains = crate::sending_domain::all(&mut tx).await.expect("all");
+        assert_eq!(domains[0].sent_today, 1, "one reserved slot");
+        tx.rollback().await.expect("rollback");
+
+        // A colleague: no provider, no bucket.
+        let ok = gate(&db)
+            .authorize(&principal, InternalSend { to: slug("bruno") })
+            .await
+            .expect("a team-mate");
+        let delivered = effects
+            .send_internal(
+                ok,
+                &InternalNote {
+                    errand: Errand::Question,
+                    body: "one for you".to_owned(),
+                    thread: None,
+                },
+            )
+            .await
+            .expect("delivered");
+        assert_eq!(delivered.recipient, bruno);
+        assert_eq!(
+            email.sent_count(),
+            1,
+            "the colleague's note never reached the provider"
+        );
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let domains = crate::sending_domain::all(&mut tx).await.expect("all");
+        assert_eq!(domains[0].sent_today, 1, "and reserved nothing");
+    }
+
+    /// **Le plafond mord avant le fournisseur.** Cap 1 sur le seul domaine :
+    /// le premier inconnu part, le deuxième est `domain_caps_exhausted` avec
+    /// l'heure du prochain créneau dans le texte que le modèle lit, rien ne
+    /// touche le fournisseur, et aucune ligne d'intention n'est ouverte.
+    #[tokio::test]
+    async fn the_second_stranger_of_the_day_is_refused_before_the_provider_when_every_cap_is_full()
+    {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+            }),
+            principal.clone(),
+        );
+        {
+            let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+            crate::sending_domain::set_cap(&mut tx, &adopted_domain(&principal), 1)
+                .await
+                .expect("cap");
+            tx.commit().await.expect("commit");
+        }
+
+        let ok = gate(&db)
+            .authorize(&principal, to("first@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        effects.send_email(ok, body()).await.expect("one slot");
+
+        let ok = gate(&db)
+            .authorize(&principal, to("second@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        let refused = effects
+            .send_email(ok, body())
+            .await
+            .expect_err("the cap is full");
+        assert_eq!(refused.code(), DOMAIN_CAPS_EXHAUSTED);
+        let text = refused.to_string();
+        assert!(
+            text.starts_with("every sending domain reached its daily cap; the next slot opens at "),
+            "the model must read when to try again: {text}"
+        );
+        assert!(text.ends_with("T00:00:00Z"), "midnight UTC: {text}");
+        assert_eq!(email.sent_count(), 1, "nothing more reached the provider");
+        assert_eq!(
+            intent_rows(&db, &principal).await.len(),
+            1,
+            "no intent row was opened for a send that did not happen"
+        );
     }
 }

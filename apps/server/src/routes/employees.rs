@@ -115,11 +115,10 @@ pub fn router(hiring: Hiring) -> Router {
 struct CreateEmployee {
     /// Becomes the local part of the address and the employee's handle.
     slug: String,
-    /// The sending/receiving domain, e.g. `agents.example.com` — **the
-    /// tenant's** (`tenant_domains`, 0093): registered on the way if the
-    /// tenant has none, 409 `another_domain` if it has another. Absent, the
-    /// tenant's own — or, for a tenant with none, the deployment's
-    /// `AGENT_EMAIL_DOMAIN`.
+    /// The sending/receiving domain, e.g. `agents.example.com` — **one of
+    /// the tenant's** (`tenant_domains`, 0093, 0094): registered on the way
+    /// if the tenant does not have it yet. Absent, the tenant's primary — or,
+    /// for a tenant with none, the deployment's `AGENT_EMAIL_DOMAIN`.
     #[serde(default)]
     domain: Option<String>,
 }
