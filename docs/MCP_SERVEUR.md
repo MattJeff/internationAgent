@@ -51,6 +51,38 @@ C'est celle qui mord le plus directement sur un binaire côté serveur piloté p
 un abonnement : un processus Claude Code lancé par notre backend est un accès
 automatisé, non humain, et pas par une clé d'API.
 
+**Et la source la plus directe, qui nomme cet arrangement en toutes lettres** —
+<https://code.claude.com/docs/en/legal-and-compliance>, section
+`Authentication and credential use`, relevée le 2026-09-10 :
+
+> « **OAuth authentication** is intended exclusively for purchasers of Claude
+> Free, Pro, Max, Team, and Enterprise subscription plans and is designed to
+> support ordinary use of Claude Code and other native Anthropic applications.
+> **Developers** building products or services that interact with Claude's
+> capabilities […] should use API key authentication […]. Anthropic does not
+> permit third-party developers to offer Claude.ai login into their own
+> applications, **or to route requests through Free, Pro, or Max plan
+> credentials on behalf of their users**. Moreover, developers may not collect,
+> store, or intermediate Claude.ai credentials or session tokens — sign-in to a
+> Claude account must complete through Anthropic's own flow. »
+
+La même page ajoute, sous `Acceptable use` : « Advertised usage limits for Pro
+and Max plans assume **ordinary, individual usage** of Claude Code and the Agent
+SDK », et, plus bas : « Anthropic reserves the right to take measures to enforce
+these restrictions and may do so without prior notice. »
+
+Il n'y a donc pas besoin de tirer une interdiction de la conjonction de deux
+phrases générales : elle est écrite, elle nomme le stockage d'un jeton de
+session par un développeur tiers, et notre déploiement faisait exactement cela
+jusqu'au 2026-09-06. **La première rédaction de cette section disait qu'aucune
+clause publiée ne nommait cet arrangement ; c'est faux, et la voici.**
+
+Ce que la même page **permet** explicitement, et qui est la raison d'être de ce
+serveur : « Nor does it prevent an end user from signing in to the unmodified
+Claude Code binary with their own Claude subscription. » Le fondateur devant son
+terminal est cet utilisateur ; nous ne touchons ni à son jeton, ni à sa session,
+ni à son compte.
+
 Deux mises en garde, parce qu'une doc qui surinterprète est une doc qui se
 retourne :
 

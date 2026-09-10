@@ -56,6 +56,106 @@ mod tests {
         }
     }
 
+    /// **Le test qui répond à « est-ce que j'ai vraiment tout ? »**
+    ///
+    /// Les trois domaines prouvent chacun que leurs chemins existent. Personne
+    /// ne prouvait l'inverse — qu'aucune route montée n'a été oubliée — et
+    /// c'est pourtant la seule direction qui compte pour la promesse faite au
+    /// fondateur : *toutes* les fonctionnalités du site, atteignables depuis un
+    /// terminal. Sans ce test, une route ajoutée demain reste invisible et
+    /// personne ne s'en aperçoit.
+    ///
+    /// Les exclusions sont nommées une par une, avec leur raison. Une liste
+    /// d'exclusions sans raisons est une liste où l'on range ce qu'on n'a pas
+    /// eu le temps de faire.
+    #[test]
+    fn every_mounted_route_is_reachable_or_excluded_by_name() {
+        /// Ce qui n'est délibérément pas un outil, et pourquoi.
+        const EXCLUDED: &[(&str, &str)] = &[
+            (
+                "/v1/mcp/server",
+                "c'est ce serveur : un outil qui l'appellerait serait une boucle",
+            ),
+            (
+                "/v1/browser/live/{employee_id}",
+                "un flux SSE ; s'y abonner allume la capture d'écran et rendre l'éteindrait",
+            ),
+        ];
+        /// Les préfixes qui ne sont pas des verbes de locataire.
+        const NOT_A_TENANT_VERB: &[(&str, &str)] = &[
+            ("/v1/platform", "surface de déploiement, pas d'un locataire"),
+            ("/v1/accounts", "identifiants d'une personne, pas un verbe"),
+            ("/v1/webhooks", "porte d'un tiers qui signe, pas un verbe"),
+            (
+                "/v1/mcp/oauth",
+                "moitié publique d'un passage OAuth, un navigateur y arrive",
+            ),
+        ];
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/server/src/routes");
+        let mut mounted: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("les routes du serveur") {
+            let path = entry.expect("entrée").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("lire un module de routes");
+            let mut rest = source.as_str();
+            while let Some(at) = rest.find(".route(") {
+                rest = &rest[at + ".route(".len()..];
+                let trimmed = rest.trim_start();
+                let Some(quoted) = trimmed.strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = quoted.find('"') else {
+                    continue;
+                };
+                let route = &quoted[..end];
+                if route.starts_with("/v1/") {
+                    mounted.push(route.to_owned());
+                }
+            }
+        }
+        mounted.sort_unstable();
+        mounted.dedup();
+        assert!(
+            mounted.len() > 50,
+            "l'extraction n'a trouvé que {} routes : le format a changé",
+            mounted.len()
+        );
+
+        let declared: Vec<&str> = registry().iter().map(|tool| tool.path).collect();
+        let mut forgotten: Vec<&str> = Vec::new();
+        for route in &mounted {
+            if declared.contains(&route.as_str())
+                || EXCLUDED.iter().any(|(path, _)| path == route)
+                || NOT_A_TENANT_VERB
+                    .iter()
+                    .any(|(prefix, _)| route.starts_with(prefix))
+            {
+                continue;
+            }
+            forgotten.push(route);
+        }
+        assert!(
+            forgotten.is_empty(),
+            "ces routes sont montées et aucun outil ne les déclare — ajoutez-les à un \
+             domaine, ou à EXCLUDED avec la raison : {forgotten:#?}"
+        );
+
+        // Et l'autre sens, pour toute la table d'un coup : un outil qui
+        // déclare un chemin que le serveur ne monte pas rend 404 à un modèle
+        // qui croit avoir bien appelé.
+        for tool in registry() {
+            assert!(
+                mounted.iter().any(|route| route == tool.path),
+                "{} déclare {}, que le serveur ne monte pas",
+                tool.name,
+                tool.path
+            );
+        }
+    }
+
     /// Un nom d'outil est lu par un modèle et tapé par un humain.
     #[test]
     fn every_name_is_lower_snake_case() {

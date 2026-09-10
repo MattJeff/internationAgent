@@ -355,9 +355,21 @@ pub async fn execute(
     }
 
     let holes = tool.placeholders();
+    // Le corps brut, s'il y en a un : la propriété nommée part telle quelle,
+    // avec son type MIME, et rien d'autre ne devient un corps. C'est ce qui
+    // rend `POST /v1/prospects/import` atteignable — elle lit des octets et
+    // refuse en 415 tout ce qui n'est pas `text/csv`.
+    let raw = tool.raw_body.and_then(|(mime, property)| {
+        args.get(property)
+            .map(|value| (mime, as_text(value).into_bytes()))
+    });
     let body: Map<String, Value> = args
         .into_iter()
-        .filter(|(key, _)| !holes.contains(&key.as_str()) && !tool.query.contains(&key.as_str()))
+        .filter(|(key, _)| {
+            !holes.contains(&key.as_str())
+                && !tool.query.contains(&key.as_str())
+                && tool.raw_body.is_none_or(|(_, property)| key != property)
+        })
         .collect();
 
     let mut request = HttpRequest::builder()
@@ -370,7 +382,11 @@ pub async fn execute(
     // `DELETE` d'un `POST {}` — la seconde forme donne un `content-type` et un
     // corps à une route qui n'attend rien, et l'extracteur y répond par un code
     // que personne n'associerait à un outil sans argument.
-    let request = if body.is_empty() {
+    let request = if let Some((mime, bytes)) = raw {
+        request
+            .header(header::CONTENT_TYPE, mime)
+            .body(Body::from(bytes))
+    } else if body.is_empty() {
         request.body(Body::empty())
     } else {
         request
@@ -655,6 +671,7 @@ mod tests {
             path,
             schema,
             query,
+            raw_body: None,
             risk,
         }
     }

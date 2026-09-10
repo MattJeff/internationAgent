@@ -97,7 +97,50 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/prospects/segments",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
+        },
+        ToolDef {
+            name: "prospects_import",
+            title: "Importer une liste de prospects, à blanc ou pour de vrai",
+            description: "Verse un export CSV au format Smartlead — les huit premières colonnes, \
+                 en-tête compris — dans les comptes et contacts de cette entreprise. Le corps \
+                 est le CSV lui-même, pas du JSON. **Passez d'abord `dry_run: true`** : rien \
+                 n'est écrit, et le rapport nomme chaque ligne refusée avec son numéro, ce qui \
+                 est la seule façon de voir un en-tête de travers avant d'avoir importé la \
+                 moitié d'un fichier. Le segment doit venir de `prospects_segments`. Un second \
+                 import du même fichier ne duplique rien : un compte est son domaine, un contact \
+                 son adresse. Corps plafonné à 1 Mio comme toute requête de cette API.",
+            method: Method::Post,
+            path: "/v1/prospects/import",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "csv": {
+                        "type": "string",
+                        "description": "le contenu du fichier CSV, en-tête compris"
+                    },
+                    "segment": {
+                        "type": "string",
+                        "description": "un segment rendu par `prospects_segments`"
+                    },
+                    "country": {
+                        "type": "string",
+                        "description": "code pays à deux lettres, pour les lignes qui n'en portent pas"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "true n'écrit rien et rend le rapport ; à faire en premier"
+                    }
+                },
+                "required": ["csv", "segment"],
+            }),
+            query: &["segment", "country", "dry_run"],
+            // La seule ligne de ce déploiement à corps brut, et la raison
+            // d'être du champ : la route lit des octets et refuse en 415 tout
+            // ce qui n'est pas `text/csv`.
+            raw_body: Some(("text/csv", "csv")),
+            risk: Risk::Write,
         },
         // -------------------------------------------------------------------
         // outreach — l'activité commerciale, pas l'administration
@@ -116,6 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/outreach",
             schema: schema(window_props(), &[]),
             query: WINDOW,
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -141,6 +185,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["days"],
+            raw_body: None,
             risk: Risk::Read,
         },
         // -------------------------------------------------------------------
@@ -156,6 +201,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/sequences",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -242,6 +288,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["name", "steps"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -278,6 +325,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id", "contact_id", "employee_id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         ToolDef {
@@ -297,6 +345,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -315,6 +364,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         // -------------------------------------------------------------------
@@ -332,6 +382,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/domain",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -345,6 +396,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/domains",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -367,6 +419,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["domain"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -389,6 +442,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -415,6 +469,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["cloudflare_api_token"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -439,6 +494,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["domain", "daily_cap"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -456,6 +512,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["domain"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         // -------------------------------------------------------------------
@@ -484,6 +541,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         // -------------------------------------------------------------------
@@ -502,6 +560,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/quotes",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -522,6 +581,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         ToolDef {
@@ -541,6 +601,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         // -------------------------------------------------------------------
@@ -559,6 +620,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/invoices",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -572,6 +634,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/invoices/issuer",
             schema: nothing(),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -603,6 +666,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -623,6 +687,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         ToolDef {
@@ -654,6 +719,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id", "amount_minor", "memo"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Destructive,
         },
         // -------------------------------------------------------------------
@@ -678,6 +744,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["from", "to"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -700,6 +767,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["month"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -724,6 +792,7 @@ pub fn tools() -> Vec<ToolDef> {
                 schema(props, &["journal"])
             },
             query: &["journal", "days", "from", "to"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -738,6 +807,7 @@ pub fn tools() -> Vec<ToolDef> {
             path: "/v1/pnl",
             schema: schema(window_props(), &[]),
             query: WINDOW,
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -767,6 +837,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["days"],
             ),
             query: &["days", "infra_usd_per_month"],
+            raw_body: None,
             risk: Risk::Read,
         },
         // -------------------------------------------------------------------
@@ -790,6 +861,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["from", "to"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -812,6 +884,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["days"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -835,6 +908,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id", "currency"],
             ),
             query: &["currency"],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -878,6 +952,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id", "daily_total", "per_transaction", "daily_transactions"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Write,
         },
         ToolDef {
@@ -897,6 +972,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &["id"],
             ),
             query: &[],
+            raw_body: None,
             risk: Risk::Read,
         },
         ToolDef {
@@ -928,6 +1004,7 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &["since", "limit"],
+            raw_body: None,
             risk: Risk::Read,
         },
     ]
@@ -1036,12 +1113,14 @@ mod tests {
         // Désarmée : les deux formes que la garde refuse existent bien comme
         // valeurs — c'est la boucle, et elle seule, qui les tient dehors.
         let lying_get = ToolDef {
+            raw_body: None,
             risk: Risk::Destructive,
             ..find("pnl_read")
         };
         assert_eq!(lying_get.method, Method::Get);
         assert!(lying_get.risk.destructive());
         let lying_delete = ToolDef {
+            raw_body: None,
             risk: Risk::Read,
             ..find("domain_remove")
         };
@@ -1266,15 +1345,30 @@ mod tests {
         }
     }
 
-    /// L'import de prospects n'est pas ici, et c'est écrit : son corps est du
-    /// `text/csv` que le contrat d'exécution ne sait pas porter. Le jour où il
-    /// le saura, c'est cette ligne qui tombe.
+    /// **Ce test disait l'inverse jusqu'au 2026-09-11**, et c'est la bonne
+    /// forme de dette : il affirmait que l'import n'était pas là parce que le
+    /// contrat d'exécution ne savait pas porter un corps `text/csv`, et il
+    /// nommait la ligne qui tomberait le jour où il le saurait. Le champ
+    /// `raw_body` est arrivé ; la voici tombée, et remplacée par la garde qui
+    /// compte désormais — la route refuse en 415 tout ce qui n'est pas du CSV,
+    /// donc annoncer un corps JSON ici serait un outil qui échoue à chaque
+    /// appel.
     #[test]
-    fn the_csv_import_is_deliberately_absent() {
-        assert!(
-            !tools().iter().any(|t| t.path == "/v1/prospects/import"),
-            "un outil qui annoncerait un corps JSON sur cette route prendrait un \
-             415 à chaque appel"
+    fn the_csv_import_carries_its_body_raw_and_not_as_json() {
+        let tool = find("prospects_import");
+        assert_eq!(
+            tool.raw_body,
+            Some(("text/csv", "csv")),
+            "la route lit des octets et refuse le JSON en 415"
         );
+        assert!(
+            tool.properties().contains(&"csv"),
+            "la propriété qui porte le corps doit être déclarée au schéma"
+        );
+        // Le reste part en chaîne de requête : la route les lit là, et un
+        // corps brut n'a pas de place pour eux.
+        for key in ["segment", "country", "dry_run"] {
+            assert!(tool.query.contains(&key), "{key}");
+        }
     }
 }

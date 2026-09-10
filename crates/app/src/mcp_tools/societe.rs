@@ -55,6 +55,9 @@ fn t(
         path,
         schema,
         query,
+        // Aucune route de ce domaine ne prend autre chose que du JSON ; le
+        // corps brut existe pour l'import de prospects, côté commerce.
+        raw_body: None,
         risk,
     }
 }
@@ -80,6 +83,47 @@ fn employee_id_only(what: &'static str) -> Value {
 #[allow(clippy::too_many_lines)]
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        // -------------------------------------------------------------------
+        // Le registre public : la seule chose que cette société publie d'elle
+        // -------------------------------------------------------------------
+        t(
+            "public_register_read",
+            "Lire le registre public : ce que les gates des entreprises consentantes ont arrêté",
+            "Rend le tableau public, en temps réel, de ce que les politiques ont refusé chez \
+             les entreprises qui l'ont accepté. Sert à situer la vôtre, et à répondre à « à quoi \
+             sert la gate » par un chiffre plutôt que par une phrase. Lecture publique : aucune \
+             donnée d'un locataire n'y figure sans son consentement explicite, et une entreprise \
+             qui n'a rien accepté n'apparaît pas, même agrégée.",
+            Method::Get,
+            "/v1/public-register",
+            nothing(),
+            &[],
+            Risk::Read,
+        ),
+        t(
+            "public_register_consent",
+            "Décider si cette société figure au registre public",
+            "Bascule le consentement de cette entreprise à figurer au registre public. \
+             `consent: true` la publie, `false` la retire. C'est une décision du fondateur et \
+             pas un réglage : à `true`, un chiffre tiré de vos refus devient visible de \
+             n'importe qui. La bascule et sa ligne d'audit sont écrites dans la même \
+             transaction, donc un registre qui montre une entreprise montre aussi quand elle a \
+             dit oui.",
+            Method::Post,
+            "/v1/public-register/consent",
+            json!({
+                "type": "object",
+                "properties": {
+                    "consent": {
+                        "type": "boolean",
+                        "description": "true publie cette société au registre, false l'en retire"
+                    }
+                },
+                "required": ["consent"],
+            }),
+            &[],
+            Risk::Destructive,
+        ),
         // -------------------------------------------------------------------
         // La société : la porte par laquelle tout commence
         // -------------------------------------------------------------------
@@ -1488,7 +1532,7 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 14] = [
+    const ROUTE_SOURCES: [&str; 15] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
@@ -1503,6 +1547,10 @@ mod tests {
         include_str!("../../../../apps/server/src/routes/model.rs"),
         include_str!("../../../../apps/server/src/routes/interview.rs"),
         include_str!("../../../../apps/server/src/routes/refusals.rs"),
+        // Ajouté le 2026-09-11 avec les deux outils du registre public : le
+        // test de couverture de `mod.rs` a montré que ces deux routes étaient
+        // montées et déclarées par personne.
+        include_str!("../../../../apps/server/src/routes/public_register.rs"),
     ];
 
     /// Tout chemin passé à un `.route(` dans ces sources.
