@@ -26,7 +26,7 @@
 //! [`EmailProvider::send`]; the provider does not give it to us and no caller
 //! should assume it does.
 //!
-//! # `ensure_identity` reconciles a domain *name*
+//! # `ensure_identity` reconciles a domain *name*, and binds a *seat*
 //!
 //! Resend domains have no free-form metadata field to stamp
 //! [`EnsureCtx::tag`] into, so the reconcile key is the domain name itself —
@@ -34,13 +34,22 @@
 //! consequence: one adapter owns one sending domain, and every employee sits on
 //! it.
 //!
-//! That is the one place this adapter differs from
-//! [`crate::email::contract_suite`]'s default expectation, and it is a
-//! parameter rather than an exemption: the suite runs here as
-//! [`crate::email::IdentityScope::AccountWide`], which flips "distinct keys
-//! must not collapse onto one resource" into "distinct keys must collapse onto
-//! *the* resource" and checks everything else unchanged, against the hermetic
-//! server below.
+//! What every employee does **not** share is the `external_id` this method
+//! hands back. Measured in production on 2026-09-10: the first seat to
+//! provision against Resend got `external_id = <domain id>`, and the second
+//! tripped `employee_resources_provider_external_id_key` — the global unique
+//! index from `migrations/0001_core.sql` whose sentence is "the same external
+//! resource must never be bound to two employees". The domain is not the
+//! employee's resource; the mailbox on it is. So the id is `<domain id>/<tag>`,
+//! where the tag is the step's idempotency key: unique per seat, stable across
+//! retries, and still readable as "this seat, on that domain". Nothing here
+//! ever parses it back — `release` is not supported, and inbound is keyed on
+//! message ids, not on bindings.
+//!
+//! That is why the suite runs here as [`crate::email::IdentityScope::PerKey`]
+//! like every other adapter, and why the hermetic test below still counts one
+//! `POST /domains` for three ensures: the domain reconciles, the binding does
+//! not collapse.
 
 use agentos_domain::ids::IdempotencyKey;
 use async_trait::async_trait;
@@ -84,6 +93,12 @@ pub const API_BASE: &str = "https://api.resend.com";
 /// How long an attachment `download_url` lives. Resend does not return an
 /// expiry, it just stops working, so we stamp the documented hour ourselves.
 pub const ATTACHMENT_URL_TTL_SECS: i64 = 3600;
+
+/// The binding one seat holds on the shared domain — see the module docs for
+/// why it is not the domain id alone.
+fn seat_on(domain_id: &str, ctx: &EnsureCtx) -> String {
+    format!("{domain_id}/{}", ctx.tag())
+}
 
 /// The real Resend adapter.
 #[derive(Debug)]
@@ -384,7 +399,7 @@ struct RetrievedAttachment {
 
 #[async_trait]
 impl EmailProvider for ResendEmailProvider {
-    async fn ensure_identity(&self, _ctx: &EnsureCtx) -> Result<Provisioned, ProviderError> {
+    async fn ensure_identity(&self, ctx: &EnsureCtx) -> Result<Provisioned, ProviderError> {
         // 1 & 2: look up first, return the hit without creating. This is the
         // whole reason a crashed provisioning run does not buy a second domain.
         let listed: DomainList = self.call_json(self.get("/domains")).await?;
@@ -397,7 +412,7 @@ impl EmailProvider for ResendEmailProvider {
                     code: "duplicate_resource",
                 });
             }
-            return Ok(Provisioned::new(Self::PROVIDER, hit.id.clone()));
+            return Ok(Provisioned::new(Self::PROVIDER, seat_on(&hit.id, ctx)));
         }
 
         // 3: only now create, under the same name the lookup reads.
@@ -407,7 +422,7 @@ impl EmailProvider for ResendEmailProvider {
                     .json(&serde_json::json!({ "name": self.domain })),
             )
             .await?;
-        Ok(Provisioned::new(Self::PROVIDER, created.id))
+        Ok(Provisioned::new(Self::PROVIDER, seat_on(&created.id, ctx)))
     }
 
     /// **Not supported, on purpose.**
@@ -1110,7 +1125,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.provider, ResendEmailProvider::PROVIDER);
-        assert_eq!(first.external_id, "dom_0001");
+        assert_eq!(first.external_id, format!("dom_0001/{}", ctx.tag()));
         assert_eq!(fake.domain_count(), 1, "exactly one domain, ever");
         assert_eq!(
             fake.seen(),
@@ -1376,15 +1391,14 @@ mod tests {
     /// The real client against the shared contract — the thing that makes
     /// swapping a vendor provable rather than hopeful.
     ///
-    /// [`IdentityScope::AccountWide`] because Resend genuinely reconciles every
-    /// employee onto one sending domain (see this module's header). That one
-    /// difference used to keep the adapter out of the suite entirely, which
-    /// bought a documented exception at the price of testing nothing.
+    /// [`IdentityScope::PerKey`] like every adapter: Resend reconciles every
+    /// employee onto one sending domain, but the binding each seat holds on it
+    /// is its own (see this module's header — the day it was not, the second
+    /// seat in production could not provision at all).
     #[tokio::test]
     async fn the_real_client_satisfies_the_contract() {
         let fake = FakeResend::start().await;
-        crate::email::contract_suite(&fake.provider(), crate::email::IdentityScope::AccountWide)
-            .await;
+        crate::email::contract_suite(&fake.provider(), crate::email::IdentityScope::PerKey).await;
 
         // One domain for three ensures, checked on the socket rather than taken
         // from the adapter's word.

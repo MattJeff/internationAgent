@@ -299,7 +299,8 @@ fn browser_provider(credentials: &Credentials) -> Arc<dyn BrowserProvider> {
             BrowserbaseBrowser::new(browser.project_id.clone(), &browser.api_key)
                 .with_cdp(Arc::new(CdpWebsocket::new()) as Arc<dyn CdpDriver>),
         ),
-        None => Arc::new(MockBrowser::new()),
+        // `booted`, not `new`: a deployment's mock must not reuse `ctx-1`.
+        None => Arc::new(MockBrowser::booted()),
     }
 }
 

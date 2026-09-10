@@ -685,11 +685,13 @@ and `BrowserProvider`'s are all `pub` for that reason; the last two used to be
 private to their own `mod tests`, which meant the only implementation they could
 prove anything about was the mock.
 
-One parameter carries the only legitimate difference between two real email
-adapters: `email::contract_suite` takes an `IdentityScope`, and Resend runs as
-`AccountWide` because its sending domain genuinely is one resource for the whole
-account rather than one per employee. Everything else in the contract is checked
-unchanged. A documented exemption tests nothing; a parameter tests the other
+`email::contract_suite` takes an `IdentityScope`, and since 2026-09-10 there is
+only `PerKey`: Resend's sending domain is one resource for the whole account,
+but the binding each seat holds on it is `<domain id>/<idempotency tag>`, its
+own. The `AccountWide` scope that let every seat share the domain id licensed
+exactly the collision `employee_resources_provider_external_id_key` exists to
+forbid, and the second seat in production could not provision. Everything else
+in the contract is checked unchanged. A documented exemption tests nothing; a parameter tests the other
 ninety percent.
 
 There is no suite for `Llm`, and there should not be. What the other traits pin
