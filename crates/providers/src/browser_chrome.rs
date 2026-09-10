@@ -57,7 +57,7 @@
 //! pas celle par laquelle on l'atteint.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -709,6 +709,19 @@ impl BrowserProvider for ChromeBrowser {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Where a **test** site must advertise itself so the Chromium under test can
+/// reach it — `BROWSER_TEST_SITE_HOST`, loopback when unset.
+///
+/// `pub` and outside `cfg(test)` because `agentos-app`'s end-to-end read needs
+/// the same answer and cannot see this crate's test module. Nothing in
+/// production reads it: a deployment has no test site.
+pub fn test_site_host() -> IpAddr {
+    std::env::var("BROWSER_TEST_SITE_HOST")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1363,6 +1376,18 @@ mod tests {
         Some(Url::parse(&raw).expect("BROWSER_CDP_URL is a URL"))
     }
 
+    /// Where the browser must look for the site these tests serve.
+    ///
+    /// Locally the browser and the site share a loopback. In CI (siglair's
+    /// workflows, 2026-09-10) Chromium runs in a service **container**, where
+    /// `127.0.0.1` is the container itself — three tests failed with
+    /// `navigation_failed` for exactly that. So the site binds every interface
+    /// and advertises the address the runner hands it in
+    /// `BROWSER_TEST_SITE_HOST`; unset means loopback, as before.
+    pub(crate) fn site_host() -> IpAddr {
+        super::test_site_host()
+    }
+
     /// A site Chromium can actually fetch: a login page, a page that sets a
     /// cookie, a page that echoes the cookies it received, and a page that
     /// only says something once its script has run.
@@ -1405,8 +1430,8 @@ mod tests {
             )
                 .into_response()
         }
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
+        let listener = TcpListener::bind("0.0.0.0:0").await.expect("bind");
+        let addr = SocketAddr::new(site_host(), listener.local_addr().expect("addr").port());
         let app = Router::new()
             .route("/login", get(login))
             .route("/set", get(set))
@@ -1420,10 +1445,7 @@ mod tests {
     fn real_browser(cdp: Url, jar: Arc<dyn CookieJar>) -> ChromeBrowser {
         ChromeBrowser::new(
             cdp,
-            Arc::new(PinnedHost::new(
-                "127.0.0.1",
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            )),
+            Arc::new(PinnedHost::new(site_host().to_string(), site_host())),
             jar,
         )
     }
@@ -1465,8 +1487,8 @@ mod tests {
         p.release(&s.binding).await.unwrap();
 
         let http = crate::browser_http::HttpBrowser::new(Arc::new(PinnedHost::new(
-            "127.0.0.1",
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            site_host().to_string(),
+            site_host(),
         )));
         let hs = ChromeBrowser::session_for(
             EmployeeId::new_v7(Utc::now()),
