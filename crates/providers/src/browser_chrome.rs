@@ -2386,6 +2386,13 @@ mod tests {
         /// Ce Chromium ne répond plus à `/json/version` : la sonde de santé le
         /// verra.
         down: bool,
+        /// Vrai entre le `Fetch.requestPaused` que le faux a posé et la réponse
+        /// que quelqu'un y donne. C'est l'état qui retient `Page.navigate` ;
+        /// voir le rendez-vous dans [`serve`].
+        paused: bool,
+        /// Réveille le `Page.navigate` retenu quand la réponse en attente vient
+        /// d'être continuée ou remplie.
+        unpaused: Arc<tokio::sync::Notify>,
     }
 
     struct FakeChrome {
@@ -2551,9 +2558,63 @@ mod tests {
                 let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                 state.seen.push((path.clone(), request.clone()));
                 let answer = answer(&path, &request, &mut state);
-                let events = events_for(&request, &state);
+                let events = events_for(&request, &mut state);
                 (answer, events)
             };
+            // **Le rendez-vous, et il *est* la garantie du vrai protocole.**
+            // Avec `Fetch.enable` posé, Chromium ne rend pas la main à
+            // `Page.navigate` tant que la réponse mise en attente n'a pas été
+            // continuée ou remplie ; et la pompe écrit sa décision *avant* de
+            // répondre à cette requête (voir [`Watch`]). Donc au retour de
+            // `Page.navigate`, `found` est déjà posé — par construction, pas
+            // par chance.
+            //
+            // Le faux répondait `{"frameId":"frame-1"}` tout de suite. L'étape
+            // qui navigue courait alors contre la pompe, qui vit sur une autre
+            // socket, et sur une machine chargée elle gagnait cette course et
+            // lisait un `Watch` vide.
+            //
+            // **La mesure, 2026-09-10, sans le rendez-vous** (retard injecté
+            // sur l'envoi du `Fetch.requestPaused` du faux, cinquante tours par
+            // ligne) :
+            //
+            // | retard  | verts | rouges |
+            // |---------|-------|--------|
+            // | aucun   | 50    | 0      |
+            // | 0 ms    | 18    | **32** |
+            // | 1 ms    | 0     | **50** |
+            // | 2 ms    | 0     | **50** |
+            //
+            // Zéro milliseconde — *un point de reprise en plus* pour
+            // l'ordonnanceur, pas une microseconde d'horloge — fait déjà tomber
+            // les deux tiers des tours, et le rouge obtenu est mot pour mot
+            // celui de la CI : `Navigated(https://portal.example.com/tarifs)`
+            // là où le test attend un `Document`. Avec le rendez-vous,
+            // cinquante tours verts à chacun de ces retards et jusqu'à 50 ms.
+            //
+            // Donc ces deux tests ne passaient pas, ils avaient de la chance —
+            // et charger la machine ne le montre même pas (cinquante tours
+            // verts à une charge moyenne de 90). Le produit n'a jamais été en
+            // cause, il est vérifié contre un vrai Chrome juste en dessous ;
+            // c'est le faux qui ne reproduisait pas l'ordre dont l'adaptateur
+            // dépend.
+            //
+            // Et seulement quand une interception est réellement armée pour
+            // cette navigation : sans `document`, aucun `requestPaused` n'a été
+            // posé, `paused` est faux et la navigation répond tout de suite.
+            if request["method"] == "Page.navigate" {
+                let unpaused = {
+                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    Arc::clone(&state.unpaused)
+                };
+                // `notify_one` et non `notify_waiters` : le permis est conservé
+                // quand personne n'attend encore, donc aucun réveil ne peut se
+                // perdre entre le relâchement du verrou et l'attente. Jamais un
+                // `sleep` — un délai qui « suffit » est la panne qu'on répare.
+                while state.lock().unwrap_or_else(|e| e.into_inner()).paused {
+                    unpaused.notified().await;
+                }
+            }
             let Some(result) = answer else {
                 // Hang: the adapter's deadline has to be what ends this.
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2610,14 +2671,18 @@ mod tests {
             {
                 json!({})
             }
-            "Fetch.enable"
-            | "Fetch.disable"
-            | "Fetch.continueRequest"
-            | "Fetch.continueResponse"
-            | "Fetch.continueWithAuth"
-            | "Fetch.fulfillRequest"
+            "Fetch.enable" | "Fetch.disable" | "Fetch.continueWithAuth" if on_page => json!({}),
+            // La réponse à la requête en attente : c'est *elle* qui laisse
+            // `Page.navigate` revenir, exactement comme sur le vrai protocole.
+            // Les trois méthodes sont là parce que l'adaptateur en choisit une
+            // selon ce qu'il a décidé : `continueResponse` pour une page,
+            // `fulfillRequest` pour le placeholder d'un document pris ou
+            // refusé, `continueRequest` pour une pause au stade requête.
+            "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.fulfillRequest"
                 if on_page =>
             {
+                state.paused = false;
+                state.unpaused.notify_one();
                 json!({})
             }
             "Fetch.getResponseBody" if on_page => {
@@ -2670,7 +2735,7 @@ mod tests {
     }
 
     /// What a command makes the browser say afterwards, unprompted.
-    fn events_for(request: &Value, state: &FakeState) -> Vec<Value> {
+    fn events_for(request: &Value, state: &mut FakeState) -> Vec<Value> {
         match request["method"].as_str().unwrap_or_default() {
             // One frame per ack, so the stream sustains itself for as long as
             // the pump keeps acking — and stops the moment it stops.
@@ -2693,7 +2758,7 @@ mod tests {
                         },
                     }));
                 }
-                let Some((content_type, disposition, bytes)) = state.document.as_ref() else {
+                let Some((content_type, disposition, bytes)) = state.document.clone() else {
                     return events;
                 };
                 let mut headers = vec![json!({ "name": "Content-Type", "value": content_type })];
@@ -2706,6 +2771,10 @@ mod tests {
                     "name": "Content-Length",
                     "value": state.declared_length.unwrap_or(bytes.len()).to_string(),
                 }));
+                // L'interception est armée à partir d'ici, et c'est ce qui
+                // retiendra le prochain `Page.navigate` : voir le rendez-vous
+                // dans `serve`.
+                state.paused = true;
                 events.push(json!({
                     "method": "Fetch.requestPaused",
                     "params": {
@@ -4422,9 +4491,14 @@ mod tests {
 
     impl FakeProxy {
         async fn start(demands_auth: bool) -> Self {
-            let listener = TcpListener::bind((site_host(), 0)).await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let addr = SocketAddr::new(site_host(), addr.port());
+            // Toutes les interfaces, annoncé à `site_host()` : c'est *Chromium*
+            // qui compose ici, et en CI il est dans un conteneur où
+            // `127.0.0.1` est lui-même et pas le runner. Même règle que
+            // `real_site`, pour la même raison — un `bind((site_host(), 0))`
+            // marchait par accident tant que l'adresse annoncée était la boucle
+            // locale.
+            let listener = TcpListener::bind("0.0.0.0:0").await.expect("bind");
+            let addr = SocketAddr::new(site_host(), listener.local_addr().expect("addr").port());
             let seen = Arc::new(Mutex::new(Vec::new()));
             let served = Arc::clone(&seen);
             tokio::spawn(async move {
@@ -4502,10 +4576,20 @@ mod tests {
             cdp,
             ProxyConfig {
                 server: format!("http://{}", proxy.addr),
-                // Le site est sur la boucle locale dans ce test, et Chromium ne
-                // proxifie pas la boucle locale par défaut : `<-loopback>` est
-                // ce qui retire cette exception. Mesuré le 2026-09-10 — sans
-                // lui, la navigation part en direct et le faux ne voit rien.
+                // `<-loopback>` retire l'exception implicite qui ne proxifie
+                // pas la boucle locale. **Remesuré le 2026-09-10 sur Chrome
+                // 152.0.7977.83, et la mesure contredit la note précédente :
+                // sans lui le test passe quand même**, parce que la
+                // destination de ce test est un *nom* — `proxied.example.com`,
+                // que le proxy résout et que la troisième assertion vérifie en
+                // forme absolue — et jamais une adresse de boucle. L'exception
+                // implicite ne l'a donc jamais concerné.
+                //
+                // Il reste posé pour la raison qui devient vraie le jour où un
+                // test proxifie une destination locale, et cette raison n'est
+                // plus « le site est sur la boucle locale » : depuis que les
+                // faux s'annoncent à `site_host()`, l'adresse peut ne pas être
+                // une boucle du tout, et alors la négation ne retire rien.
                 bypass: Some("<-loopback>".to_owned()),
                 credentials: Some(("orizn-eu".to_owned(), "s3cr3t-de-passage".to_owned())),
             },
@@ -4558,6 +4642,8 @@ mod tests {
             Url::parse(&std::env::var("BROWSER_CDP_URL").unwrap()).unwrap(),
             ProxyConfig {
                 server: format!("http://{}", refusing.addr),
+                // Même remarque qu'au-dessus : pas ce qui route cette
+                // navigation, et son sens dépend de ce que `site_host()` rend.
                 bypass: Some("<-loopback>".to_owned()),
                 credentials: None,
             },
@@ -4583,14 +4669,19 @@ mod tests {
         let Some(cdp) = real_chrome() else { return };
         // Un port qu'on vient d'ouvrir puis de fermer : rien n'écoute là, et
         // rien ne s'y installera pendant le test.
+        // Toutes les interfaces, pour que le port soit libre *partout* et pas
+        // seulement sur celle qu'on annonce : l'adresse donnée à Chromium plus
+        // bas est `site_host()`, et en CI ce n'est pas la boucle locale.
         let closed = {
-            let listener = TcpListener::bind((site_host(), 0)).await.expect("bind");
+            let listener = TcpListener::bind("0.0.0.0:0").await.expect("bind");
             listener.local_addr().expect("addr").port()
         };
         let p = browser_through(
             cdp,
             ProxyConfig {
                 server: format!("http://{}:{closed}", site_host()),
+                // Idem : la destination est un nom, et l'échec mesuré ici est
+                // celui du proxy, pas celui d'une exception de boucle locale.
                 bypass: Some("<-loopback>".to_owned()),
                 credentials: None,
             },
