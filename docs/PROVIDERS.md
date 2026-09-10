@@ -625,12 +625,31 @@ needs.
 **One task is this CDP conversation, in this order** (`browser_chrome.rs`,
 test `one_task_is_context_target_cookies_steps_cookies_close_dispose`):
 `GET /json/version` → `Target.createBrowserContext` → `Target.createTarget
-{url: about:blank, browserContextId}` → `Network.setCookies` with the
-employee's jar, when there is one → every `BrowserStep` of the task over
+{url: about:blank, browserContextId}` → `Browser.grantPermissions
+{geolocation}` when the profile has a position → then, on the tab's own
+socket and **before anything navigates**:
+`Page.addScriptToEvaluateOnNewDocument` (the disguise),
+`Emulation.setUserAgentOverride`, `Emulation.setLocaleOverride`,
+`Emulation.setTimezoneOverride`, `Emulation.setDeviceMetricsOverride`,
+`Emulation.setGeolocationOverride` (the profile), `Network.setCookies` with
+the employee's jar when there is one — **and that socket stays open, with
+`Page` enabled, for as long as the tab lives**: measured 2026-09-10 on Chrome
+152, an `Emulation.*` override is reverted when the client that set it
+disconnects, and `Page.addScriptToEvaluateOnNewDocument` is silently inert
+without `Page.enable` while still answering with a valid identifier. A small
+task holds that socket and discards the `Page` events it is therefore
+subscribed to → every `BrowserStep` of the task over
 `ws://<ip>:9222/devtools/page/<targetId>` (`Page.navigate`, `Runtime.evaluate`,
 …, plus one `Runtime.evaluate` after each navigation for the wall check
-below) → `Network.getAllCookies` → `Target.closeTarget` →
+below, and a `Fetch.enable`/`Fetch.disable` pair around each navigation for
+the documents below) → `Network.getAllCookies` → `Target.closeTarget` →
 `Target.disposeBrowserContext`.
+
+Two of those live on **sockets of their own**, opened on the same page and
+dropped with it: the screencast pump and the document watch. The CDP driver
+skips every frame that is not the answer to its own command — deliberately,
+so a command path never grows an unbounded event queue — so anything that
+arrives unbidden is read somewhere else.
 
 **The cookie jar, and what it contains.** A CDP browser context is
 incognito-shaped: isolated, and gone with the process. What survives between
@@ -665,6 +684,87 @@ this adapter**, on purpose (resources with a gatekeeper, paid for when a task
 needs them): a site that walls the VPS's address stays walled, and the upgrade
 is `BROWSER_API_KEY`, not a retry.
 
+**Stealth, in software — and its ceiling.** Every context installs one
+script before its first navigation (`Page.addScriptToEvaluateOnNewDocument`)
+plus a User-Agent override. The script sets `navigator.webdriver` to `false`,
+gives `navigator.plugins` and `navigator.mimeTypes` a non-empty PDF viewer,
+makes `navigator.languages`/`language`/`platform` agree with the profile,
+defines `window.chrome`, and puts **stable per-context** noise on
+`HTMLCanvasElement.toDataURL` and on `WebGLRenderingContext.getParameter`'s
+`UNMASKED_VENDOR_WEBGL`/`UNMASKED_RENDERER_WEBGL` — stable because a seat
+whose fingerprint changes every visit is *more* identifiable than one that
+never changed it. The seed is SHA-256 of the context id. The User-Agent is
+the running binary's own, read from `/json/version`, with `HeadlessChrome/`
+replaced by `Chrome/`: the version stays the engine's, because a UA that
+disagrees with the engine is a louder signal than the token it hides.
+
+The list is the public one — the evasions `puppeteer-extra-plugin-stealth`
+ships, read 2026-09-10 from its evasion directory, against the surface
+`fingerprintjs` probes. **Write down what it does not do: this passes naïve
+detection and it does not pass Cloudflare Turnstile or DataDome.** Those score
+TLS fingerprints, IP reputation, timing and behaviour, and no injected script
+touches any of the four. `blocked_by_site` is still the honest outcome, and
+the upgrade is still a resource (a residential address, a solver) rather than
+more code. Two things are deliberately *not* faked: `hardwareConcurrency` and
+`deviceMemory` (a container with 2 cores is a machine with 2 cores, and a
+claim of 8 is contradicted by the first timing measurement a page takes), and
+`Permissions.query` (already consistent under `--headless=new`).
+
+**Emulation, per employee.** `BrowserProfiles::profile_for(context)` answers a
+locale, a timezone, a viewport (width, height, mobile) and an optional
+position; the default is **`fr-FR` / `Europe/Paris` / 1366×768 / desktop /
+no position**, and it is not neutral on purpose — an unconfigured headless
+Chromium announces `en-US` and `UTC`, which is a datacentre. A deployment
+reads it from `employees.spec.browser` (`{"locale", "timezone", "viewport":
+{"w","h","mobile"}, "geolocation": [lat, lon]}`, every field optional, no
+migration); a field that does not parse is that field's default and never a
+failed tab. `deviceScaleFactor` is derived rather than configured — 2 on
+mobile, 1 on desktop — because a phone reporting 1 is a desktop in a small
+window. No position means `Emulation.setGeolocationOverride {}`, which CDP
+reads as « position unavailable »: the answer a laptop with the permission
+denied gives, and a much less strange thing to be than 0,0 in the Gulf of
+Guinea.
+
+**A navigation that answers with a file.** `application/pdf`, `text/csv`,
+`application/vnd.*`, and `application/octet-stream` when the server also said
+`Content-Disposition: attachment`, used to come back as `navigation_failed` —
+a false sentence about the supplier's site. They now come back as
+`BrowserOutcome::Document { content_type, filename, bytes }`, intercepted at
+`Fetch` response stage on the main navigation (the pattern is narrowed to
+`resourceType: "Document"`, so no subresource is ever paused), fetched with
+`Fetch.getResponseBody`, and answered with a minimal HTML page via
+`Fetch.fulfillRequest` so the tab stays a tab and the next step has somewhere
+to stand. **Ceiling 8 MB** — a declared `Content-Length` over it is refused
+before the body crosses the socket — and over it is
+`Terminal { code: "too_large" }`, never a truncation: half a tariff filed
+under a name that says « tariff » is worse than no tariff. `application/json`,
+`text/plain` and images are *not* documents: they are readable, and filing
+them would take a working read away.
+
+`effects::read_page` files the bytes in the classeur under
+`navigateur/<employee>/<date>/<filename or URL leaf>` — every component
+sanitised on both sides of the crate boundary — and hands the model
+« document <type> de N Ko rangé sous <nom> » in place of the text: a type, a
+length and a name, of which only the type is theirs, and stripped of
+everything after its semicolon. The selector the caller asked for never runs;
+there is nothing to run it against, and extracting text from a PDF on the
+reading path of every navigation is `knowledge::ingest`'s job done in the
+wrong place. Filing is first-write-wins, so reading the same document twice
+in a day answers with the file already there.
+
+**Narration.** The adapter tells a `BrowserObserver` what it is doing — a task
+started (a tab opened), a step done (its variant's name, the URL for `Goto`
+only, an outcome, a duration), a task finished (the tab closed by a park, an
+error or the reaper) — and, while `wants_frames` says somebody is watching,
+JPEG frames from `Page.startScreencast` (`quality: 60`, `maxWidth: 1280`,
+`everyNthFrame: 2`, each one acked). It never learns who listens: the journal
+and the live view are two readers of one port. **Nothing is encoded when
+nobody is watching** — the default observer answers `false` and no screencast
+is ever started — which is the whole reason the question is a method rather
+than a setting, on a box with two vCPU shared with three tabs and a Postgres.
+A password typed by a `Fill` never crosses this port: a step is *named*, never
+quoted.
+
 **The address check is the same one.** Every `Goto` goes through
 `mcp::resolve_and_vet` at `Reach::Public` before a tab is even opened — a
 loopback or RFC 1918 target is `blocked_address` with no `Page.navigate`
@@ -684,11 +784,18 @@ name itself and dials every socket — HTTP and websocket — by address.
 beside three more real-Chromium tests: a page rendered by JavaScript that
 `HttpBrowser` reads as empty on the same run, a cookie set in one task and
 sent by the next through a fresh context, a 403 reported as
-`blocked_by_site`. A fake CDP on a loopback port proves the semaphore, the
-jar's shape on the wire, the teardown after a failed step, the wall check,
-the refused private address and the `Host` rule. `effects.rs` reads a
-JavaScript page end to end through `read_page`, token and audit row
-included.
+`blocked_by_site`, a probe page that reads `navigator.webdriver`, the
+timezone, the language list, the plugin count, the WebGL vendor and its own
+`navigator.userAgent` back to us — disarmed against `/json/version`, where the
+same binary still says `HeadlessChrome` — and a PDF served on the same site
+that arrives as a `Document`. A fake CDP on a loopback port proves the
+semaphore, the jar's shape on the wire, the teardown after a failed step, the
+wall check, the refused private address, the `Host` rule, the narration in
+order with the right step names, a screencast that starts for a watcher and
+stops for none, the script installed before the first navigation, the five
+`Emulation.*` commands carrying the profile, and both document arms.
+`effects.rs` reads a JavaScript page end to end through `read_page`, token and
+audit row included, and files a PDF through the same path.
 
 Measured in production on 2026-09-10: `readyz` listed `browser` under
 `mock_adapters`, and every `read_page` an Orizn employee made answered

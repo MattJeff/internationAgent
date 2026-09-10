@@ -332,10 +332,30 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         db.clone(),
         agentos_app::identity::envelope(&config.master_key),
     ));
+    // Le profil de navigation de chaque siège — langue, fuseau, écran, lus sur
+    // `employees.spec`. Bâti ici comme le pot de cookies, et partagé par les
+    // deux côtés pour la même raison : un provisionneur qui bâtirait un
+    // `ChromeBrowser` habillé autrement serait un deuxième navigateur portant
+    // le même nom.
+    let browser_profiles = Arc::new(agentos_app::browser_profile::SpecBrowserProfiles::new(
+        db.clone(),
+    ));
+    // Ce qui écoute le navigateur : le journal, **une seule instance pour le
+    // processus**, et c'est la couture entre les deux moitiés de la deuxième
+    // phase. L'adaptateur lui raconte ses tâches ; les routes `/v1/browser`
+    // lisent la même instance. Elles doivent être la même : `wants_frames` est
+    // « est-ce que quelqu'un regarde ? », et ce que le journal compte comme
+    // abonnés, ce sont les flux SSE que ces routes tiennent ouverts. Deux
+    // instances rendraient toujours non, et la vue en direct serait un cadre
+    // vide que rien n'explique.
+    let browser_journal = agentos_app::browser_journal::Journal::new(db.clone());
+    let browser_observer: Arc<dyn agentos_app::mocks::BrowserObserver> = browser_journal.clone();
     let ports = Arc::new(agentos_app::mocks::ports_for(
         &config.credentials,
         &config.public_host,
         cookie_jar.clone(),
+        browser_observer.clone(),
+        browser_profiles.clone(),
     ));
     // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
     // the real client and its absence selects the SHA-256 hash. Not a field of
@@ -371,6 +391,8 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             &config.master_key,
             &config.credentials,
             secrets.clone(),
+            browser_observer,
+            browser_profiles,
         ),
         EngineConfig::default(),
     );
@@ -521,6 +543,7 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             bridges,
             ports.clone(),
             ModelWiring { llm },
+            browser_journal,
         ),
         {
             let cancel = cancel.clone();
@@ -632,6 +655,7 @@ fn app(
     bridges: Option<Arc<agentos_app::hosted::Bridges>>,
     ports: Arc<Ports>,
     model: ModelWiring,
+    browser_journal: Arc<agentos_app::browser_journal::Journal>,
 ) -> Router {
     // Read off the same `Credentials` the turn path's was, rather than passed
     // in as a ninth argument. A second instance and not a shared one, which is
@@ -673,12 +697,12 @@ fn app(
         default_domain: config.agent_email_domain.clone(),
         cloudflare_api: agentos_app::sending_domain::CLOUDFLARE_API.to_owned(),
     };
-    // The reader of `BrowserObserver`: one journal per process, built here so
-    // the routes can read it and the adapter can narrate to it. The adapter's
-    // setter is the integration's seam, not this unit's.
+    // The reader of `BrowserObserver`, built far above with the ports: the
+    // adapter narrates to this very instance, so a live view opened here is
+    // what makes `wants_frames` say yes over there.
     let browser = routes::browser::BrowserState {
         db: db.clone(),
-        journal: agentos_app::browser_journal::Journal::new(db.clone()),
+        journal: browser_journal.clone(),
         browser_js: config.browser_js(),
     };
     let api = with_api_stack(

@@ -93,6 +93,16 @@ pub use agentos_providers::llm::{Content, Llm, LlmRequest, LlmResponse, Scripted
 // in the crate that cannot reach the loop.
 pub use agentos_providers::browser::MockBrowser;
 
+// And the two ports `ports_for` and `adapters_for` now take, for a fourth time
+// and the same reason: the binary composes both calls, the binary may not name
+// a type from `agentos-providers`, and « pass the no-op » is a decision the
+// composition root has to be able to *write*. `NoopObserver` is what a
+// deployment hands until the browser journal is wired to it — the one line
+// that changes then — and `DefaultProfiles` is what a test hands where
+// `SpecBrowserProfiles` needs a database.
+pub use agentos_providers::browser_chrome::{BrowserProfiles, DefaultProfiles};
+pub use agentos_providers::browser_observer::{BrowserObserver, NoopObserver};
+
 // And the lead sink, for the third time and the same reason: `routes::queue`
 // is the only caller of the send path, it lives in the binary, and the binary
 // may not name `agentos-providers`. Without this line the export route's
@@ -373,10 +383,18 @@ fn telephony_provider(
 /// sealed in `jar` between two tasks — then the `GET` browser, then the fake.
 /// The jar is a parameter rather than built here because the real one needs
 /// the database and the deployment's cipher, which this module does not hold;
-/// only the Chrome branch reads it.
+/// only the Chrome branch reads it. `observer` and `profiles` arrive the same
+/// way and for the same reason, and — like the jar — **only the Chrome branch
+/// reads them**: Browserbase narrates through its own dashboard and emulates
+/// through its own API, the `GET` browser has no page to film and no engine to
+/// disguise, and the fake has nothing to say. Passing them to all four would
+/// suggest the other three could grow a live view, which they cannot without
+/// somebody else's product.
 fn browser_provider(
     credentials: &Credentials,
     jar: Arc<dyn CookieJar>,
+    observer: Arc<dyn BrowserObserver>,
+    profiles: Arc<dyn BrowserProfiles>,
 ) -> Arc<dyn BrowserProvider> {
     match (
         &credentials.browser,
@@ -390,7 +408,9 @@ fn browser_provider(
         (None, Some(chrome), _) => Arc::new(
             ChromeBrowser::new(chrome.url.clone(), Arc::new(PublicWeb), jar)
                 .with_max_tabs(chrome.max_tabs)
-                .with_queue_wait(chrome.queue_wait),
+                .with_queue_wait(chrome.queue_wait)
+                .with_observer(observer)
+                .with_profiles(profiles),
         ),
         (None, None, true) => Arc::new(HttpBrowser::new(Arc::new(PublicWeb))),
         // `booted`, not `new`: a deployment's mock must not reuse `ctx-1`.
@@ -465,6 +485,8 @@ pub fn adapters(master_key: &str) -> Adapters {
         master_key,
         &Credentials::default(),
         secret_store(master_key),
+        Arc::new(NoopObserver),
+        Arc::new(DefaultProfiles),
     )
 }
 
@@ -531,19 +553,25 @@ pub fn secret_store(master_key: &str) -> Arc<LocalEnvelopeSecretStore> {
 ///
 /// `jar` is where the Chrome browser keeps an employee's cookies — the
 /// provisioner only ever *releases* through it, which is the one call that
-/// throws a jar away; see `browser_provider`.
+/// throws a jar away; see `browser_provider`. `observer` and `profiles` ride
+/// along for the same reason the jar does: this side builds the *same*
+/// `ChromeBrowser` the effects side does, and a provisioner that built a
+/// differently-dressed one would be a second browser with the same name. It
+/// never opens a tab, so neither is ever read here.
 pub fn adapters_for(
     jar: Arc<dyn CookieJar>,
     master_key: &str,
     credentials: &Credentials,
     secrets: Arc<dyn SecretStore>,
+    observer: Arc<dyn BrowserObserver>,
+    profiles: Arc<dyn BrowserProfiles>,
 ) -> Adapters {
     Adapters {
         email: email_provider(credentials, None),
         // `None`: the provisioner buys and releases numbers and never places a
         // call, so there is no outcome for a carrier to report back.
         telephony: telephony_provider(credentials, None),
-        browser: browser_provider(credentials, jar),
+        browser: browser_provider(credentials, jar, observer, profiles),
         // Passed in rather than built here: see `secret_store`. One deployment,
         // one vault, so the provisioning canary a step writes is the one the
         // next step reads.
@@ -566,6 +594,8 @@ pub fn ports() -> Ports {
         &Credentials::default(),
         "http://localhost",
         Arc::new(MemoryCookieJar::new()),
+        Arc::new(NoopObserver),
+        Arc::new(DefaultProfiles),
     )
 }
 
@@ -589,12 +619,23 @@ pub fn ports() -> Ports {
 /// `jar` is the sealed cookie jar the Chrome browser reads and writes between
 /// two tasks — `crate::cookie_jar::SealedCookieJar` in a deployment, a map
 /// in a test. Passed in for `secret_store`'s reason: it needs the database,
-/// and this module builds nothing that does.
-pub fn ports_for(credentials: &Credentials, public_host: &str, jar: Arc<dyn CookieJar>) -> Ports {
+/// and this module builds nothing that does. `observer` and `profiles` are
+/// there on the same argument: the first is `NoopObserver` until the browser
+/// journal is wired to it, the second is
+/// `crate::browser_profile::SpecBrowserProfiles` in a deployment and
+/// `DefaultProfiles` in a test — both of them database-shaped, and neither of
+/// them this module's to build.
+pub fn ports_for(
+    credentials: &Credentials,
+    public_host: &str,
+    jar: Arc<dyn CookieJar>,
+    observer: Arc<dyn BrowserObserver>,
+    profiles: Arc<dyn BrowserProfiles>,
+) -> Ports {
     Ports {
         email: email_provider(credentials, Some(public_host)),
         telephony: telephony_provider(credentials, Some(public_host)),
-        browser: browser_provider(credentials, jar),
+        browser: browser_provider(credentials, jar, observer, profiles),
         mcp: Arc::new(NotConfigured),
         payments: Arc::new(NotConfigured),
         // Always the mock, and there is no `Credentials` field to select on
@@ -1151,12 +1192,18 @@ mod tests {
             "browser",
         );
         let provider_of = async |credentials: &Credentials| {
-            ports_for(credentials, "https://agents.test", jar())
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            ports_for(
+                credentials,
+                "https://agents.test",
+                jar(),
+                Arc::new(NoopObserver),
+                Arc::new(DefaultProfiles),
+            )
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(provider_of(&Credentials::default()).await, MOCK_PROVIDER);
@@ -1171,7 +1218,13 @@ mod tests {
             browser_fetch_http: true,
             ..Credentials::default()
         };
-        let ports = ports_for(&both, "https://agents.test", jar());
+        let ports = ports_for(
+            &both,
+            "https://agents.test",
+            jar(),
+            Arc::new(NoopObserver),
+            Arc::new(DefaultProfiles),
+        );
         let existing = ProviderBinding {
             provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
             external_id: "ctx_bb".to_owned(),
@@ -1219,12 +1272,18 @@ mod tests {
             })
         };
         let provider_of = async |credentials: &Credentials| {
-            ports_for(credentials, "https://agents.test", jar())
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            ports_for(
+                credentials,
+                "https://agents.test",
+                jar(),
+                Arc::new(NoopObserver),
+                Arc::new(DefaultProfiles),
+            )
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(
@@ -1257,12 +1316,18 @@ mod tests {
             external_id: "ctx_bb".to_owned(),
         };
         assert_eq!(
-            ports_for(&both, "https://agents.test", jar())
-                .browser
-                .ensure_context(&ctx.clone().with_existing(existing))
-                .await
-                .expect("a persisted binding needs no round trip")
-                .provider,
+            ports_for(
+                &both,
+                "https://agents.test",
+                jar(),
+                Arc::new(NoopObserver),
+                Arc::new(DefaultProfiles)
+            )
+            .browser
+            .ensure_context(&ctx.clone().with_existing(existing))
+            .await
+            .expect("a persisted binding needs no round trip")
+            .provider,
             agentos_providers::browser_browserbase::PROVIDER
         );
     }
@@ -1285,7 +1350,13 @@ mod tests {
         };
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let real = ports_for(&live(), "https://agents.test", jar());
+        let real = ports_for(
+            &live(),
+            "https://agents.test",
+            jar(),
+            Arc::new(NoopObserver),
+            Arc::new(DefaultProfiles),
+        );
         let mock = ports();
 
         // -- email: signed with a secret only Resend was handed -------------
@@ -1370,6 +1441,8 @@ mod tests {
             },
             "https://agents.test",
             jar(),
+            Arc::new(NoopObserver),
+            Arc::new(DefaultProfiles),
         );
         let ctx = EnsureCtx::new(
             agentos_domain::ids::TenantId::new_v7(Utc::now()),
@@ -1454,6 +1527,8 @@ mod tests {
             },
             "https://agents.test",
             jar(),
+            Arc::new(NoopObserver),
+            Arc::new(DefaultProfiles),
         );
         let body = br#"{"type":"email.received"}"#;
         let timestamp = Utc::now().timestamp().to_string();

@@ -141,7 +141,7 @@ employé, trois onglets, `blocked_by_site`.
 Chaque phase s'appuie sur l'adaptateur de la précédente et ne démarre qu'une
 fois celle-ci fusionnée : deux agents sur `browser_chrome.rs` en même temps,
 c'est le bug de couture qu'on connaît.
-## Ce qui a été mesuré en construisant
+## Ce qui a été mesuré en construisant la v1
 
 Adaptateur écrit le 2026-09-10 contre Google Chrome 152 en local (Docker
 absent sur la machine de développement) ; l'agent infra a mesuré la même
@@ -231,3 +231,122 @@ BROWSER_CDP_URL=http://127.0.0.1:9222 cargo test -p agentos-providers -p agentos
 La règle de résolution sert au test de bout en bout d'`effects.rs`
 (`Domain::parse` refuse une IP littérale) ; sans la variable, les tests
 sautent en le disant.
+
+## Ce qui a été mesuré en construisant la v2
+
+Adaptateur étendu le 2026-09-10, même machine, même Chrome 152. Le document
+ci-dessus promettait cinq choses ; trois se sont écrites comme prévu et
+**quatre l'ont été autrement**, chaque fois parce que la mesure a contredit
+la première lecture.
+
+1. **`Xvfb` est retiré du plan, et ce n'est pas un report.** La v2 disait
+   « mode avec tête sous Xvfb dans le conteneur, qui passe mieux que
+   `--headless` face aux détecteurs ». C'était vrai de l'ancien headless.
+   `--headless=new` (le mode par défaut depuis Chrome 112) est le *même*
+   binaire de rendu que le mode avec tête : `Permissions.query`,
+   `Notification.permission`, `window.chrome` et le rendu WebGL y répondent
+   comme avec tête, et la seule chose que le mode ancien trahissait encore —
+   le jeton `HeadlessChrome` de l'UA — est un `replace` d'une ligne. Xvfb
+   aurait coûté un serveur X, ~80 Mo et un point de panne dans un conteneur
+   plafonné à 1 Go, pour une différence qu'on ne sait pas mesurer. Ce qui
+   reste vrai : ni l'un ni l'autre ne passe Turnstile ou DataDome, parce que
+   ces deux-là ne lisent pas le navigateur, ils lisent l'adresse, le TLS et le
+   temps.
+
+2. **Le pilote ne peut pas voir un événement, donc les événements ont leurs
+   propres sockets.** `CdpDriver::run` ignore tout ce qui n'est pas la réponse
+   à sa propre commande — exprès, argumenté dans `cdp.rs` — et le contrat
+   interdisait de changer sa signature. Deux besoins de la v2 sont pourtant
+   des événements : `Page.screencastFrame` et `Fetch.requestPaused`. La sortie
+   n'est pas de faire tamponner les événements par `call` (ce serait une file
+   sans borne que personne ne vide, sur *chaque* commande) : c'est **une
+   deuxième socket sur la même cible**, une par usage, avec pour seul travail
+   de lire des événements. CDP diffuse un domaine activé au client qui l'a
+   activé, donc `Fetch.enable` sur une socket et `Page.navigate` sur l'autre
+   fonctionnent ensemble. `Cdp::next_event` est le seul ajout, et il rend
+   `Ok(None)` (rien n'est arrivé) et `Err` (la socket est morte) séparément —
+   une pompe qui ne saurait pas les distinguer tournerait à vide contre un
+   pair mort jusqu'à ce qu'autre chose le remarque.
+
+3. **`Fetch.enable` met la navigation en attente, donc la décision se prend
+   *pendant*.** `Page.navigate` ne rend la main que lorsque la réponse a été
+   continuée ou remplie : un document ne peut donc pas être détecté après la
+   navigation, seulement à travers elle. D'où une tâche détachée armée
+   **avant** `Page.navigate` et récoltée après. Et le motif est restreint à
+   `resourceType: "Document"` : un `Fetch.enable` sans motif met en attente
+   *chaque* sous-ressource, ce qui ajouterait un aller-retour de socket devant
+   chaque image de chaque page, pour une réponse sur mille.
+
+4. **Le premier document d'une navigation décide, et un 3xx ne compte pas.**
+   Une redirection est mise en attente elle aussi (`responseStatusCode` 302,
+   pas de corps utile) : elle est laissée passer et la surveillance continue,
+   ce qui est la seule façon que `Goto(/tarifs)` → `302` → `/tarifs.pdf`
+   arrive quand même en `Document`. La première réponse de type document qui
+   n'est pas une redirection est la navigation principale — un iframe ne peut
+   pas devancer la réponse de son propre parent — donc « la première » est
+   « la principale » sans avoir à lire `Page.getFrameTree`.
+
+5. **Le plafond de 8 Mo est celui de la socket, pas celui du classeur.** Le
+   corps traverse CDP en base64 : 8 Mo de PDF, c'est ~10,7 Mo de trame tenue
+   deux fois en mémoire, dans un conteneur à 1 Go avec deux autres onglets.
+   `files` en prendrait bien plus. Et le `Content-Length` déclaré est lu
+   **avant** `Fetch.getResponseBody`, sinon le refus arrive après avoir payé
+   le transfert.
+
+6. **Le défaut d'émulation n'est pas neutre, et c'est mesuré.** Un Chromium
+   sans tête non configuré répond `en-US` et `UTC` à
+   `Intl.DateTimeFormat().resolvedOptions().timeZone`, sur une machine dont
+   l'horloge est à Paris. Un employé qui écrit en français depuis un
+   navigateur américain dans un fuseau que personne n'habite est incohérent
+   *gratuitement* — donc le défaut est `fr-FR / Europe/Paris / 1366×768`, et
+   `employees.spec.browser` le remplace sans migration : `spec` est déjà la
+   colonne jsonb de ce qui décrit un employé sans avoir de colonne.
+
+7. **Une empreinte stable est meilleure qu'une empreinte absente, et bien
+   meilleure qu'une empreinte neuve à chaque visite.** Le bruit canvas/WebGL
+   est dérivé d'une graine SHA-256 de `ctx-<tag>` : un siège est une machine
+   tant que son contexte dure. Un bruit aléatoire par tâche donnerait « un
+   nouvel appareil à chaque visite », une forme qu'aucun parc de vrais
+   portables n'a — c'est-à-dire un signal, pas une protection.
+
+8. **Une session CDP qui se ferme emporte son émulation, et un script accepté
+   n'est pas un script qui tourne.** Les deux mesures les plus coûteuses de ce
+   chantier, toutes deux contre Chrome 152, toutes deux invisibles sans un vrai
+   navigateur :
+
+   * `Emulation.setLocaleOverride` et ses quatre voisins sont **portés par le
+     client qui les a envoyés**. La première version habillait l'onglet sur une
+     socket qu'elle refermait aussitôt ; la page sonde a lu `Asia/Manila` —
+     le fuseau de la *machine* — au lieu d'`Europe/Paris`. La socket qui habille
+     l'onglet vit donc aussi longtemps que lui.
+   * `Page.addScriptToEvaluateOnNewDocument` **ne fait rien sans `Page.enable`**,
+     et rend un `identifier` parfaitement valide dans les deux cas. Avec la
+     socket tenue ouverte mais le domaine jamais activé, la sonde lisait le
+     `navigator.languages` de Chrome et un vendeur WebGL `null` : le script
+     avait été accepté et n'avait jamais tourné. Un `Page.disable` ensuite le
+     dés-enregistre — la session doit rester abonnée.
+
+   Et le prix de rester abonné : `Page` est un domaine bavard, une douzaine de
+   trames par navigation, dans une socket que personne ne lit. Donc la socket
+   n'est pas un champ de l'onglet mais appartient à une petite tâche qui lit et
+   jette, jusqu'à ce que l'onglet se ferme. Trois onglets, trois tâches.
+
+   Ce que ça dit du reste : **trois des quatre assertions de la page sonde
+   passaient déjà avant le correctif.** `navigator.webdriver` est déjà `false`
+   sous `--headless=new`, les cinq greffons PDF sont déjà là, et l'UA était
+   corrigé par `Emulation.setUserAgentOverride`, qui lui marchait. Seul le
+   vendeur WebGL — `null` sans l'extension, une chaîne de notre table avec —
+   distinguait « le script tourne » de « le script a été accepté ». C'est
+   l'assertion qui est restée dans le test, et c'est le genre de garde que
+   `docs/` appelle « une garde qui mord ».
+
+9. **Le screencast ne tourne jamais pour personne.** `wants_frames` est
+   demandé à l'ouverture, après chaque étape, et par la pompe elle-même entre
+   deux images ; l'observateur par défaut répond toujours non, donc un
+   déploiement que personne ne regarde n'encode pas un octet. La pompe attend
+   au plus une seconde entre deux lectures pour pouvoir reposer la question :
+   une page qui n'affiche rien n'envoie rien, donc « quand la prochaine image
+   arrive » ne peut pas être la réponse. Et l'acquittement part avant le
+   décodage — Chromium n'envoie qu'une image non acquittée à la fois, donc
+   décoder d'abord diviserait la cadence par deux et une image illisible
+   arrêterait le flux pour de bon.

@@ -150,10 +150,7 @@ impl CdpWebsocket {
     /// *browser* endpoint (`Target.*`) and to a page it owns (`Network.*`)
     /// with the same pump, on the same deadlines, and with no second
     /// websocket in the crate.
-    pub(crate) async fn connect(
-        &self,
-        connect_url: &Secret,
-    ) -> Result<Cdp<MaybeTlsStream<TcpStream>>, ProviderError> {
+    pub(crate) async fn connect(&self, connect_url: &Secret) -> Result<PageSocket, ProviderError> {
         // The URL is exposed straight into the handshake call and bound to no
         // name that outlives this expression.
         let attempt = tokio::time::timeout(
@@ -206,6 +203,14 @@ impl CdpDriver for CdpWebsocket {
 // ---------------------------------------------------------------------------
 // One connection's worth of CDP
 // ---------------------------------------------------------------------------
+
+/// A connection to a page, as [`CdpWebsocket::connect`] hands it back.
+///
+/// Named because `browser_chrome.rs` **keeps one per open tab**: measured
+/// 2026-09-10 on Chrome 152, every `Emulation.*` override is undone when the
+/// client that set it disconnects, so a locale applied on a socket that is
+/// then closed is a locale the page never sees.
+pub(crate) type PageSocket = Cdp<MaybeTlsStream<TcpStream>>;
 
 /// A connected CDP endpoint with a monotonic request id.
 pub(crate) struct Cdp<S> {
@@ -423,6 +428,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Cdp<S> {
     /// on a closed socket.
     pub(crate) async fn close(mut self) {
         let _ = self.conn.close().await;
+    }
+
+    /// The next **event** — a frame with a `method` and no `id` — or `None`
+    /// when nothing arrived inside `patience`.
+    ///
+    /// [`CdpDriver::run`] ignores events on purpose, and
+    /// [`Self::call_inner`] below is where it does so: a frame whose `id` is
+    /// not the one we asked about is skipped. That is right for a
+    /// request/response driver and wrong for the two things the second phase
+    /// of `docs/BROWSER.md` needs — a screencast frame and a paused request —
+    /// which arrive unbidden. Rather than teach `call` to buffer them (which
+    /// would give every command an unbounded queue nobody drains),
+    /// `browser_chrome.rs` opens a **second socket per page** and pumps it
+    /// here. So `run`'s signature does not move and no command path grows a
+    /// branch.
+    ///
+    /// `patience` and not the command deadline: a pump wants to come back
+    /// empty-handed regularly so it can ask whether anybody is still
+    /// watching. `Ok(None)` is « nothing arrived, ask me again »; `Err` is
+    /// « the socket is gone, stop asking » — two answers and not one, because
+    /// a pump that could not tell them apart would spin at the patience
+    /// interval against a dead peer until something else noticed.
+    pub(crate) async fn next_event(
+        &mut self,
+        patience: Duration,
+    ) -> Result<Option<Value>, ProviderError> {
+        let read = async {
+            loop {
+                let text = match self.conn.recv().await {
+                    Ok(Message::Text(text)) => text,
+                    Ok(Message::Close(_)) | Err(_) => return Err(ProviderError::timeout()),
+                    Ok(_) => continue,
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                // An answer to a command we sent is not an event. There is at
+                // most one in flight on this socket and its caller already
+                // gave up on it, so dropping it is the whole handling.
+                if value["method"].is_string() {
+                    return Ok(value);
+                }
+            }
+        };
+        match tokio::time::timeout(patience, read).await {
+            Ok(Ok(event)) => Ok(Some(event)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(None),
+        }
     }
 
     /// One JSON-RPC round trip, bounded, answered by `id`.
