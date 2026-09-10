@@ -107,7 +107,7 @@ use crate::routes::webhooks::Webhooks;
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Wall clock a handler gets before the client is answered 408.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -724,6 +724,7 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            .merge(routes::prospects::router(db.clone()))
             .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))

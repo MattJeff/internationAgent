@@ -228,6 +228,28 @@ not given as ISO-2 (the location string is kept verbatim instead). An address on
 the suppression list is skipped and never re-activated. `docs/ORIZN.md` §8 is the
 column-by-column table and `agentos_app::prospects` is the argument for each.
 
+**The same import, from the console.** `POST /v1/prospects/import` is the
+subcommand as a route, for the founder who has the CSV on a laptop and no shell
+in the container. Same auth as `outreach`, the body is the file:
+
+```bash
+curl -sX POST -H "Authorization: Bearer $KEY" -H "Content-Type: text/csv" \
+     --data-binary @list.csv \
+     "$HOST/v1/prospects/import?segment=relocation&country=PH&dry_run=true"
+```
+
+`segment` is required (`GET /v1/prospects/segments` lists the eight the CHECK
+admits), `country` defaults to `ZZ`, and `dry_run=true` rolls the transaction
+back after producing the full report — the console requires a clean dry run
+before it enables the write. The response counts what `import` counts:
+`rows`, `accounts.{created,existing}`, `contacts.{created,existing,skipped}`
+(skipped = on the suppression list), `nameless`, `phones_dropped`,
+`linkedin_dropped`, `unknown_country`, and `errors[{line,reason}]` for every
+refused row. Refusals of the whole file are `400 bad_csv` (with the expected
+header in `detail`), `bad_segment`, `bad_country`; `415` on anything but
+`text/csv`; `413` over the body limit every route shares (1 MiB — the largest
+list on file is 141 KB).
+
 ### 1.4e The file you upload — the other end of the same pipeline
 
 `import` puts prospects in. This takes them out, in the shape Smartlead loads:
