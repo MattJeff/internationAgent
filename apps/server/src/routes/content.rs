@@ -937,10 +937,10 @@ mod tests {
     /// **Le dépôt d'un siège, et ce que la proposition refuse avant de sortir.**
     ///
     /// Ce que ce test ne fait pas : aucune pull request, aucun appel d'outil.
-    /// La flotte du harnais est vide et la politique des sièges ne nomme aucun
-    /// outil, donc tout ce qui pourrait partir est refusé par la Gate — ce qui
-    /// est exactement la propriété qu'une route doit avoir. Le chemin heureux
-    /// est mesuré dans `agentos_app::content`, contre un faux GitHub.
+    /// La couche de politique posée plus bas ne nomme aucun outil, donc tout ce
+    /// qui pourrait partir est refusé par la Gate — ce qui est exactement la
+    /// propriété qu'une route doit avoir. Le chemin heureux est mesuré dans
+    /// `agentos_app::content`, contre un faux GitHub.
     #[tokio::test]
     async fn un_depot_se_pose_sur_un_branchement_et_une_proposition_sans_depot_est_refusee() {
         let Some(h) = Harness::new().await else {
@@ -1038,8 +1038,30 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "no_repo");
 
-        // Et avec le siège qui en a un : la politique de ce locataire ne nomme
-        // aucun outil, donc la Gate refuse avant qu'un octet sorte.
+        // Et avec le siège qui en a un. **La couche du locataire est posée ici
+        // et pas laissée vide**, et ce n'est pas une précaution : un locataire
+        // qui n'écrit aucune couche hérite du plafond de la plateforme, qui est
+        // **une seule ligne partagée par toute la base** et que
+        // `policy::install` *élargit* à chaque appel (`store::policy::install`
+        // le dit). Sans ces trois lignes, ce test passait ou échouait selon que
+        // les tests de `agentos_app::content` avaient tourné avant lui sur la
+        // même base et y avaient laissé les trois outils de GitHub. Mesuré le
+        // 2026-09-11, en rouge.
+        agentos_store::policy::install(
+            &h.db,
+            h.a,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                // Le nécessaire pour qu'un tour existe, et **aucun outil** :
+                // le refus doit porter sur l'outil et pas sur un plafond
+                // journalier, sinon ce test dirait 403 pour autre chose.
+                max_turns_per_day: 10,
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+
         let (status, body) = h
             .call(
                 "POST",
@@ -1049,6 +1071,10 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["code"], "no_rule",
+            "le refus doit venir de l'allowlist d'outils : {body}"
+        );
 
         // Le brouillon n'a pas bougé : ni proposé, ni publié.
         let (_, body) = h.call("GET", "/v1/content/drafts", SECRET_A, None).await;
