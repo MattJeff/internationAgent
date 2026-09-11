@@ -10,7 +10,7 @@
 //! Un modèle choisit un outil sur sa `description` seule, et les trois pièges
 //! d'ici ne se devinent pas depuis un nom de route :
 //!
-//! * **`content_measure` nomme un siège.** La mesure est une lecture de page
+//! * **`content_questions_measure` nomme un siège.** La mesure est une lecture de page
 //!   publique, donc une action sur laquelle la Policy Gate statue pour un
 //!   employé. Un siège sans `web` ne mesure pas, et le refus est un 403 avec
 //!   une raison, pas un bug.
@@ -28,7 +28,7 @@
 //! [`Risk::Destructive`] sur trois lignes seulement : retirer une question
 //! emporte sa série de mesures et ses brouillons par cascade ; réviser un
 //! brouillon remplace son texte et ce qui est omis est perdu ; et
-//! `content_measure` **sort sur le web au nom de la société**, ce qui est la
+//! `content_questions_measure` **sort sur le web au nom de la société**, ce qui est la
 //! deuxième moitié de la définition du mot ici. Ajouter une question ou ouvrir
 //! un brouillon n'enlève rien et n'engage personne : [`Risk::Write`].
 
@@ -141,7 +141,7 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Destructive,
         ),
         t(
-            "content_measure",
+            "content_questions_measure",
             "Mesurer : qui est cité sur cette question, aujourd'hui",
             "Pose la question à un moteur, lit la page de résultats et classe une mesure : y sommes-nous, \
              à quel rang, et qui l'est à notre place. **Nomme un siège** (`employee_id`) parce que lire une \
@@ -199,7 +199,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Ce qu'il faut écrire pour dépasser ceux qui sont cités",
             "Rend une **structure**, pas un texte : les facettes que les pages citées couvrent déjà, celles \
              qu'aucune ne couvre (c'est là qu'est la place), les hôtes à dépasser, et l'angle. Bâti sur la \
-             dernière mesure de la question — appeler `content_measure` d'abord, sinon la réponse est un 409 \
+             dernière mesure de la question — appeler `content_questions_measure` d'abord, sinon la réponse est un 409 \
              qui le dit. C'est l'employé qui écrit l'article à partir de ça, et `content_drafts_add` qui le range.",
             Method::Get,
             "/v1/content/briefs",
@@ -237,7 +237,7 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Write,
         ),
         t(
-            "content_drafts_revise",
+            "content_drafts_amend",
             "Réécrire un brouillon, ou constater qu'il est publié",
             "Remplace le titre et le texte — **ce qui est omis est perdu**, envoyer les deux à chaque fois. \
              Passer une `url` marque le brouillon comme publié à cette adresse ; ne la passer que si \
@@ -300,8 +300,8 @@ mod tests {
     fn le_schema_de_la_mesure_ferme_la_liste_des_moteurs() {
         let measure = tools()
             .into_iter()
-            .find(|tool| tool.name == "content_measure")
-            .expect("content_measure");
+            .find(|tool| tool.name == "content_questions_measure")
+            .expect("content_questions_measure");
         let engines = measure.schema["properties"]["engine"]["enum"]
             .as_array()
             .expect("une liste fermée");

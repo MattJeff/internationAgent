@@ -125,11 +125,11 @@ C'est le chiffre de départ, et c'est exactement ce que la boucle ci-dessous ser
 | étape | ce qui la fait | où ça vit |
 |---|---|---|
 | **1. la question** | `content_questions_add` / `POST /v1/content/questions` | `content_questions` |
-| **2. la mesure** | `content_measure` / `POST /v1/content/questions/{id}/measure` — **nomme un siège** | `content_citations`, en ajout seul |
+| **2. la mesure** | `content_questions_measure` / `POST /v1/content/questions/{id}/measure` — **nomme un siège** | `content_citations`, en ajout seul |
 | **3. le brief** | `content_briefs_get` / `GET /v1/content/briefs?question_id` | rien : une fonction pure de (1) et (2) |
 | **4. le texte** | **un employé, avec son modèle** — rien dans ce dépôt n'engendre de prose | `content_drafts`, par `content_drafts_add` |
-| **5. la publication** | **une personne, à la main** — voir § 5 | `content_drafts.url`, constatée par `content_drafts_revise` |
-| **6. la mesure suivante** | `content_measure`, à nouveau | la série de `content_citations` |
+| **5. la publication** | **une personne, à la main** — voir § 5 | `content_drafts.url`, constatée par `content_drafts_amend` |
+| **6. la mesure suivante** | `content_questions_measure`, à nouveau | la série de `content_citations` |
 
 Trois choses méritent d'être dites au-dessus du tableau.
 
