@@ -94,7 +94,29 @@ const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 /// starvation, so the number has to clear it; what changed for good is that it
 /// now clears *silence* rather than *duration*, so a loop that is merely slow
 /// is never accused, however long it takes.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(180);
+///
+/// **Measured a third time, 2026-09-11 au soir, and raised to 300s.** Same
+/// test, same tree, same private database, three runs an hour apart:
+///
+/// | machine | wall clock |
+/// |---|---|
+/// | idle | **33 s** |
+/// | one agent compiling the workspace | **226 s** |
+/// | the same, a minute later | **252 s** |
+///
+/// 180s of *silence* was still not enough at the top of that range, and the red
+/// it produced looked exactly like a product defect — a seat stuck on its
+/// browser step. I spent half an hour proving it was the browser before running
+/// the control: the same test **without** a browser configured was slower
+/// still. Nothing about the product had changed; the laptop had. That half hour
+/// is what a deadline set too tight actually costs, and it is why this one is
+/// set from a measurement rather than from a guess.
+///
+/// The asymmetry decides the number: a deadline too long makes a genuine wedge
+/// take five minutes to report, which costs five minutes. A deadline too short
+/// accuses the product of a defect it does not have, which costs an afternoon
+/// and teaches whoever reads the red to stop believing it.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Harness
