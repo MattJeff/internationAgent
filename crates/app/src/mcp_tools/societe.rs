@@ -270,9 +270,12 @@ pub fn tools() -> Vec<ToolDef> {
             "Créer la société : organigramme, limites par rôle et date d'arrêt, en un appel",
             "Monte une société entière — la ligne « tenant », l'organigramme complet, une couche \
              de limites par rôle, et l'instant où ses agents s'arrêtent — en une seule \
-             transaction. À utiliser une fois, sur une société qui n'existe pas encore : elle ne \
-             remplace jamais rien, un rôle dont la couche diffère est un 409 `role_layer_exists` \
-             et une fenêtre différente un 409 `window_exists`. Trois refus, avant toute écriture : \
+             transaction. **Se rejoue** : la route converge au lieu de dupliquer, et c'est la seule \
+             façon de poser la **première** couche d'un rôle qui n'en a pas — `policy_role_set` \
+             retouche une couche existante, il n'en crée pas. Elle ne remplace jamais rien : un \
+             rôle dont la couche diffère est un 409 `role_layer_exists` et une fenêtre différente \
+             un 409 `window_exists`, donc un rejeu qui n'ajoute qu'un rôle passe et un rejeu qui \
+             en modifie un est refusé. Trois refus, avant toute écriture : \
              `window_ends_at` est obligatoire et sans défaut (une durée serait un prix que \
              personne ici n'a le droit d'inventer), chaque `team` cité dans `org.rows` doit avoir \
              son entrée dans `roles` (une couche absente hérite du plafond, donc un siège sans \
