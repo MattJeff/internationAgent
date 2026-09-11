@@ -601,7 +601,7 @@ que le ×10 en passe par là.
 
 *Fait le 2026-09-11*, et nommé ici pour que personne ne le rebâtisse : la
 colonne et son `CHECK` sont
-`migrations/0102_un_role_sur_les_comptes_humains.sql` (`owner` par défaut, et la
+`migrations/0104_un_role_sur_les_comptes_humains.sql` (`owner` par défaut, et la
 première personne d'un locataire est propriétaire quand les suivantes ne le sont
 pas) ; la vérification est `auth::require_console_role`, une couche de
 `with_api_stack`, qui refuse **tout ce qui n'est ni une lecture ni l'une des

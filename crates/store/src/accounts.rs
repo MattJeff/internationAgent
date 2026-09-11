@@ -46,7 +46,7 @@ use crate::db::{Db, StoreError};
 
 /// Ce qu'une personne a le droit de décider dans la console de son locataire.
 ///
-/// **Deux valeurs, et `migrations/0102_un_role_sur_les_comptes_humains.sql`
+/// **Deux valeurs, et `migrations/0104_un_role_sur_les_comptes_humains.sql`
 /// argumente pourquoi pas quatre.** Le résumé : ce qu'un humain fait depuis la
 /// console se range en deux tas — ce qui engage l'argent ou l'existence de la
 /// société, et ce qui se corrige en le refaisant. La liste exacte des routes
@@ -174,7 +174,7 @@ pub async fn create(
     let mut tx = db.admin_tx_bypassing_rls().await?;
 
     // **La première personne d'un locataire est propriétaire, la deuxième ne
-    // l'est pas.** C'est le `DEFAULT owner` de `0102` prolongé d'un cran, et
+    // l'est pas.** C'est le `DEFAULT owner` de `0104` prolongé d'un cran, et
     // c'est ce qui ferme le trou que la colonne seule laissait : le fournisseur
     // crée le collègue qu'un client lui demande, et sans cette ligne ce
     // collègue pouvait arrêter la société entre sa création et le geste que
