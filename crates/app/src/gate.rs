@@ -1583,6 +1583,16 @@ fn counterparty(action: &Action) -> Option<String> {
         // any sense the ceiling means, and the domain's
         // `spends_contact_budget` says so from the other side.
         | Action::InvoiceIssue { .. }
+        // `None`, and here the answer is easier than the invoice's above rather
+        // than harder: a quote addresses a prospect, who is emphatically *not*
+        // somebody this company has already won a deal with — so the invoice's
+        // argument does not transfer. What holds instead is that this action
+        // reaches nobody at all. `Effects::propose_quote` writes a row and files
+        // a PDF and sends nothing; putting the offer in front of the prospect is
+        // a separate `EmailSend`, and *that* one is the approach that spends a
+        // stranger's slot. `spends_contact_budget` says the same from the other
+        // side.
+        | Action::QuoteIssue { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }
@@ -1657,6 +1667,13 @@ fn suppressible(action: &Action) -> Option<(Option<String>, Option<String>)> {
         | Action::McpCall { .. }
         | Action::PaymentCreate { .. }
         | Action::InvoiceIssue { .. }
+        // A quote reaches nobody by itself, so there is no address to ask the
+        // suppression list about. The send that carries it is an `EmailSend`,
+        // which is the first arm of this match and is checked there — which is
+        // the right place: somebody who asked us to stop writing to them stops
+        // receiving the document, and the register still records what we had
+        // priced.
+        | Action::QuoteIssue { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }

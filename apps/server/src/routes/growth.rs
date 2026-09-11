@@ -263,10 +263,12 @@ const UNMEASURED: &[&str] = &[
     "replied compte les fils qui nous ont écrit, pas les fils qu'une approche a ouverts : \
      conversations n'a aucune colonne qui nomme l'approche, et une réponse automatique, un \
      message d'absence ou un avis de rebond y ressemblent à une réponse.",
-    "quotes_issued et quotes_accepted ne se remplissent que depuis Rust : il n'existe aucune \
-     route qui émette un devis (voir routes::quotes), donc un devis négocié hors du système \
-     n'y est pas. Une entreprise qui vend au téléphone lit deux zéros au milieu de son \
-     entonnoir sans que rien ne soit cassé.",
+    "quotes_issued et quotes_accepted comptent ce que le système a écrit, et il n'y a qu'une \
+     façon d'y entrer : un employé qui propose, avec un jeton de la Policy Gate \
+     (agentos_app::effects::propose_quote). Aucune route d'opérateur n'émet de devis et c'est \
+     délibéré — voir routes::quotes. Un devis négocié au téléphone et jamais saisi n'y est \
+     donc pas, et l'entreprise qui vend ainsi lit deux zéros au milieu de son entonnoir sans \
+     que rien ne soit cassé.",
     "outstanding_minor porte tout le registre et non la fenêtre : une créance de l'an dernier \
      y est encore. C'est le seul des cinq montants qui ne se compare pas aux quatre autres.",
     "mrr_minor est une recette de trente jours glissants, pas un abonnement : rien dans ce \
@@ -720,6 +722,11 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    use agentos_app::effects::{Effects, QuoteDraft, QuoteIssue};
+    use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
+    use agentos_domain::money::Money;
+    use std::sync::Arc;
+
     use super::*;
     use crate::auth::ApiKeys;
 
@@ -1072,6 +1079,175 @@ mod tests {
 
         tx.commit().await.expect("commit");
         seat
+    }
+
+    /// **La couture que ce chantier existe pour fermer : un devis proposé par
+    /// un employé apparaît dans l'entonnoir.**
+    ///
+    /// Les deux étapes du milieu — `quotes_issued` et `quotes_accepted` — ont
+    /// compté zéro quoi que fasse l'entreprise tant que rien ne pouvait créer un
+    /// devis : les tables, le SQL, le PDF et trois outils de lecture existaient,
+    /// et aucun chemin d'écriture. `UNMEASURED` le disait dans le corps de la
+    /// réponse.
+    ///
+    /// Ce test mesure l'avant et l'après du même entonnoir, sur la même
+    /// entreprise, dans la même fenêtre. Rien n'est inséré en SQL au milieu :
+    /// c'est `agentos_app::effects::Effects::propose_quote` qui écrit, derrière
+    /// un jeton que la Policy Gate a frappé pour ce siège — donc ce qui est
+    /// affirmé ici est le chemin entier, du refus possible jusqu'au compte.
+    #[tokio::test]
+    async fn un_devis_propose_par_un_employe_fait_avancer_lentonnoir() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (seat, opportunity) = un_siege_et_une_affaire(&h.db, h.a).await;
+
+        // Avant : l'étape existe, elle est mesurée, et elle vaut zéro.
+        let (status, avant) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{avant}");
+        assert_eq!(avant["funnel"][3]["stage"], "quotes_issued");
+        assert_eq!(
+            avant["funnel"][3]["count"], 0,
+            "un vrai zéro mesuré, et pas une absence de table"
+        );
+
+        let principal = GatePrincipal::employee(h.a, seat);
+        let effects = Effects::new(
+            h.db.clone(),
+            Arc::new(agentos_app::mocks::ports()),
+            principal.clone(),
+        );
+        let token = PolicyGate::new(h.db.clone())
+            .authorize(
+                &principal,
+                QuoteIssue {
+                    amount: Money::new(19_000, Currency::Usd).expect("non nul"),
+                },
+            )
+            .await
+            .expect("la couche du locataire ouvre Channel::Email");
+        effects
+            .propose_quote(
+                token,
+                &QuoteDraft {
+                    opportunity_id: opportunity,
+                    memo: "Trois mois de veille".to_owned(),
+                    valid_until: Utc::now() + Duration::days(30),
+                    supersedes: None,
+                    lines: Vec::new(),
+                },
+            )
+            .await
+            .expect("un employé propose un devis");
+
+        // Après : la quatrième étape compte un, et le taux de la troisième
+        // cesse d'être `null` — c'est-à-dire que l'entonnoir cesse d'être coupé
+        // en deux à cet endroit.
+        let (status, apres) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{apres}");
+        assert_eq!(apres["funnel"][3]["count"], 1, "{apres}");
+        assert_eq!(
+            apres["funnel"][2]["to_next_rate"],
+            json!(1.0),
+            "une réponse, un devis"
+        );
+        // Et l'acceptation reste à zéro : c'est un acte d'opérateur, sur
+        // `POST /v1/quotes/{id}/accepted`, et cet effet ne le touche pas.
+        assert_eq!(apres["funnel"][4]["count"], 0);
+
+        h.teardown().await;
+    }
+
+    /// Un siège, un compte, un contact qui a répondu, et une affaire **en
+    /// négociation**.
+    ///
+    /// Pas `closed_won` : un devis est ce qui arrive *avant* la clôture, et une
+    /// fixture qui gagnerait l'affaire d'abord testerait le mauvais moment.
+    async fn un_siege_et_une_affaire(db: &Db, tenant: TenantId) -> (EmployeeId, Uuid) {
+        let seat = EmployeeId::new_v7(Utc::now());
+        let account = Uuid::now_v7();
+        let conversation = Uuid::now_v7();
+        let opportunity = Uuid::now_v7();
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let t = tenant.as_uuid();
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, 'Lena', 'active')",
+        )
+        .bind(seat.as_uuid())
+        .bind(t)
+        .bind(format!("lena-{}", seat.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("employee");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Buyer plc', $3, 'airline', 'FR')",
+        )
+        .bind(account)
+        .bind(t)
+        .bind(format!("buyer-{}.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("account");
+        // Une réponse, pour que l'étape qui précède le devis ne soit pas nulle :
+        // un taux de passage sans dénominateur n'est pas zéro, il n'existe pas,
+        // et c'est lui que l'assertion d'après lit.
+        sqlx::query(
+            "INSERT INTO conversations (id, tenant_id, employee_id, channel, subject) \
+             VALUES ($1, $2, $3, 'email', 'Re: bonjour')",
+        )
+        .bind(conversation)
+        .bind(t)
+        .bind(seat.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("conversation");
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, tenant_id, conversation_id, employee_id, channel, direction, sender, body, \
+                  idempotency_key, received_at) \
+             VALUES ($1, $2, $3, $4, 'email', 'inbound', 'ada@buyer.example', 'oui', $5, now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(conversation)
+        .bind(seat.as_uuid())
+        .bind(conversation.to_string())
+        .execute(&mut **tx)
+        .await
+        .expect("message");
+        sqlx::query(
+            "INSERT INTO opportunities (id, tenant_id, account_id, stage, currency, value_minor) \
+             VALUES ($1, $2, $3, 'negotiation', 'USD', 19000)",
+        )
+        .bind(opportunity)
+        .bind(t)
+        .bind(account)
+        .execute(&mut **tx)
+        .await
+        .expect("opportunity");
+        tx.commit().await.expect("commit");
+
+        // La couche du locataire : le courriel, et rien d'autre. C'est le canal
+        // qu'`always_denies(QuoteIssue)` lit — un siège dont une couche le ferme
+        // ne peut pas nommer de prix, ce que `crates/app` affirme de son côté.
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                allowed_channels: std::collections::BTreeSet::from([
+                    agentos_domain::action::Channel::Email,
+                ]),
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("installer la politique");
+
+        (seat, opportunity)
     }
 
     /// **L'entonnoir de bout en bout**, sur une entreprise fabriquée étape par

@@ -336,17 +336,25 @@ struct HealthView {
     clicked: u32,
     bounced: u32,
     complained: u32,
-    /// `complained * 1000 / sent`, deux décimales ; `0` si rien n'est parti.
-    complaint_rate_per_mille: f64,
-    /// `bounced * 1000 / sent`, deux décimales ; `0` si rien n'est parti.
-    bounce_rate_per_mille: f64,
+    /// `complained * 1000 / sent`, deux décimales, **`null` si rien n'est parti**.
+    complaint_rate_per_mille: Option<f64>,
+    /// `bounced * 1000 / sent`, deux décimales, **`null` si rien n'est parti**.
+    bounce_rate_per_mille: Option<f64>,
 }
 
-/// `n` pour mille de `sent`, arrondi à deux décimales.
-fn per_mille(n: u32, sent: u32) -> f64 {
+/// `n` pour mille de `sent`, arrondi à deux décimales — **`None` sans envoi**.
+///
+/// Zéro sur zéro envoi n'est pas un taux de rebond nul, c'est l'absence de
+/// mesure, et les deux se lisent de façon opposée : « aucun rebond » est une
+/// bonne nouvelle, « rien n'est parti » en est une mauvaise. `GET /v1/growth`
+/// tient déjà cette règle sur ses sept étapes et la nomme dans sa description —
+/// un taux sans dénominateur n'existe pas. Un déploiement qui la tient à un
+/// endroit et pas à l'autre apprend à son lecteur à ne croire ni l'un ni
+/// l'autre.
+fn per_mille(n: u32, sent: u32) -> Option<f64> {
     match sent {
-        0 => 0.0,
-        sent => (f64::from(n) * 1000.0 / f64::from(sent) * 100.0).round() / 100.0,
+        0 => None,
+        sent => Some((f64::from(n) * 1000.0 / f64::from(sent) * 100.0).round() / 100.0),
     }
 }
 
@@ -940,23 +948,30 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
         }
 
-        // Le voisin lit des zéros, et des taux à zéro sans division.
+        // Le voisin lit des zéros — et des taux **nuls au sens de `null`**, pas
+        // à zéro : il n'a rien envoyé, donc il n'a pas un excellent taux de
+        // plainte, il n'en a aucun.
         let (status, body) = h.get("/v1/outreach/health?days=7", SECRET_B).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["sent"], Value::from(0), "{body}");
-        assert_eq!(body["complaint_rate_per_mille"], Value::from(0.0), "{body}");
+        assert_eq!(body["complaint_rate_per_mille"], Value::Null, "{body}");
+        assert_eq!(body["bounce_rate_per_mille"], Value::Null, "{body}");
 
         h.teardown().await;
     }
 
     /// Les deux taux, sur des comptes posés à la main : 1 plainte et 2 rebonds
     /// sur 8 envoyés font 125 ‰ et 250 ‰ ; 1 sur 3 arrondit à 333,33.
+    ///
+    /// Et les deux zéros qui ne veulent pas dire la même chose : zéro rebond
+    /// **sur trois envois** est une mesure, et c'est `0.0` ; zéro envoi n'en
+    /// est pas une, et c'est `None`.
     #[test]
     fn les_taux_sont_en_pour_mille_sur_les_envoyes() {
-        assert_eq!(per_mille(1, 8), 125.0);
-        assert_eq!(per_mille(2, 8), 250.0);
-        assert_eq!(per_mille(1, 3), 333.33);
-        assert_eq!(per_mille(0, 3), 0.0);
-        assert_eq!(per_mille(3, 0), 0.0, "rien de parti : zéro, pas NaN");
+        assert_eq!(per_mille(1, 8), Some(125.0));
+        assert_eq!(per_mille(2, 8), Some(250.0));
+        assert_eq!(per_mille(1, 3), Some(333.33));
+        assert_eq!(per_mille(0, 3), Some(0.0));
+        assert_eq!(per_mille(3, 0), None, "rien de parti : aucune mesure");
     }
 }

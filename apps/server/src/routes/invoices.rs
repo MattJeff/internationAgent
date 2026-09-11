@@ -356,7 +356,7 @@ async fn credit(
     State(db): State<Db>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<CreditBody>,
+    crate::error::JsonBody(body): crate::error::JsonBody<CreditBody>,
 ) -> Result<Response, ApiError> {
     // Both ends of `invoices_memo_shape`, and it has to be both, before a number
     // is claimed. Left to the `CHECK`, a blank line or a 201-character sentence
@@ -555,7 +555,7 @@ async fn read_issuer(State(db): State<Db>, principal: Principal) -> Result<Respo
 async fn write_issuer(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<IssuerBody>,
+    crate::error::JsonBody(body): crate::error::JsonBody<IssuerBody>,
 ) -> Result<Response, ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let name = invoices::issuer(&mut tx).await?.name;

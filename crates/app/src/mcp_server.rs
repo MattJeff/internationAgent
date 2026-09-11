@@ -54,7 +54,7 @@ use serde_json::Value;
 /// `knowledge_search` fait plonger la question par le fournisseur
 /// d'embeddings — sortant, payant, sans écriture — et c'est le seul autre
 /// candidat. **Deux cas ne valent pas un cran** : un quatrième mal défini
-/// coûterait une décision à chacun des 136 outils.
+/// coûterait une décision à chacun des 140 outils.
 ///
 /// Et surtout, le cran serait le mauvais outil. Ce que ce rapport décrit, MCP
 /// l'a déjà nommé : **`openWorldHint`**, une annotation *orthogonale* à

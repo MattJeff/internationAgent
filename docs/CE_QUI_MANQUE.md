@@ -599,6 +599,17 @@ deux premiers parce qu'il ne produit pas d'euro chez Orizn, où le fondateur est
 seul ; il passe avant tout le reste parce qu'il bloque le troisième client, et
 que le ×10 en passe par là.
 
+*Fait le 2026-09-11*, et nommé ici pour que personne ne le rebâtisse : la
+colonne et son `CHECK` sont
+`migrations/0104_un_role_sur_les_comptes_humains.sql` (`owner` par défaut, et la
+première personne d'un locataire est propriétaire quand les suivantes ne le sont
+pas) ; la vérification est `auth::require_console_role`, une couche de
+`with_api_stack`, qui refuse **tout ce qui n'est ni une lecture ni l'une des
+vingt-et-une écritures qui n'engagent rien** — donc une route ajoutée demain est
+fermée, pas ouverte ; l'attribution est `PUT /v1/console/accounts/role` et
+l'outil `console_accounts_role_set`. Ce qui reste est côté console : griser ce
+qu'un membre ne peut pas presser, en lisant `console_role` sur `GET /v1/whoami`.
+
 ### Quatrième — la signature d'un document
 
 **Une vague.** Les trois moitiés existent (DocuSign au catalogue, les deux

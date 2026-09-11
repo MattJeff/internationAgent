@@ -579,7 +579,7 @@ async fn approve(
     State(state): State<Approvals>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Approve>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Approve>,
 ) -> Result<Json<Value>, ApiError> {
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     let row = decidable(&mut tx, id).await?;
@@ -702,7 +702,7 @@ async fn deny(
     State(state): State<Approvals>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Deny>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Deny>,
 ) -> Result<Json<Value>, ApiError> {
     let now = Utc::now();
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
@@ -912,7 +912,7 @@ struct DecideCapability {
 async fn decide_capability(
     State(state): State<Approvals>,
     principal: Principal,
-    Json(body): Json<DecideCapability>,
+    crate::error::JsonBody(body): crate::error::JsonBody<DecideCapability>,
 ) -> Result<Json<Value>, ApiError> {
     if held_role(&principal.actor) != Some(CAPABILITY_ROLE) {
         return Err(forbidden(

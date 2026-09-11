@@ -44,6 +44,53 @@ use crate::api_keys;
 use crate::audit::AuditActor;
 use crate::db::{Db, StoreError};
 
+/// Ce qu'une personne a le droit de décider dans la console de son locataire.
+///
+/// **Deux valeurs, et `migrations/0104_un_role_sur_les_comptes_humains.sql`
+/// argumente pourquoi pas quatre.** Le résumé : ce qu'un humain fait depuis la
+/// console se range en deux tas — ce qui engage l'argent ou l'existence de la
+/// société, et ce qui se corrige en le refaisant. La liste exacte des routes
+/// qui tombent du premier côté est dans `apps/server/src/auth.rs`, parce que
+/// c'est là qu'elle est lue, et à un seul endroit.
+///
+/// Ce n'est **pas** le rôle d'un employé IA. Celui-là est une couche de
+/// politique (`agentos_domain::policy`) qui borne ce qu'un logiciel a le droit
+/// de faire tout seul ; celui-ci borne ce qu'un humain a le droit de décider.
+/// Les deux se ressemblent de loin et n'ont pas une ligne en commun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleRole {
+    /// Tout, y compris donner ce rôle.
+    Owner,
+    /// Tout ce qui n'engage ni l'argent ni l'existence de la société.
+    Member,
+}
+
+impl ConsoleRole {
+    /// Le mot que la colonne porte. `console_accounts_role_is_known` n'accepte
+    /// que ces deux-là.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Member => "member",
+        }
+    }
+
+    /// `None` pour tout le reste — y compris pour une valeur qu'une migration
+    /// future ajouterait sans que ce `match` la connaisse. Un binaire déployé
+    /// qui lit un rôle qu'il ne comprend pas ne doit pas deviner : deviner
+    /// `owner` ouvre la société, deviner `member` la ferme en silence. Le
+    /// lecteur ([`role_of`]) rend ce `None` tel quel et son appelant refuse.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "owner" => Some(Self::Owner),
+            "member" => Some(Self::Member),
+            _ => None,
+        }
+    }
+}
+
 /// One person, as the platform surface renders her. **No `password_hash`**:
 /// nothing outside the verification path needs the stored bytes, and a struct
 /// that carries them is a struct somebody serialises into a response.
@@ -60,6 +107,8 @@ pub struct AccountRecord {
     pub created_at: DateTime<Utc>,
     /// `None` while she may still open a session.
     pub deactivated_at: Option<DateTime<Utc>>,
+    /// Ce qu'elle a le droit de décider. Voir [`ConsoleRole`].
+    pub role: ConsoleRole,
 }
 
 /// What a login attempt needs, and nothing else.
@@ -124,9 +173,29 @@ pub async fn create(
 ) -> Result<AccountRecord, StoreError> {
     let mut tx = db.admin_tx_bypassing_rls().await?;
 
+    // **La première personne d'un locataire est propriétaire, la deuxième ne
+    // l'est pas.** C'est le `DEFAULT owner` de `0104` prolongé d'un cran, et
+    // c'est ce qui ferme le trou que la colonne seule laissait : le fournisseur
+    // crée le collègue qu'un client lui demande, et sans cette ligne ce
+    // collègue pouvait arrêter la société entre sa création et le geste que
+    // personne n'aurait pensé à faire. Dans l'autre sens, le premier compte est
+    // le fondateur : lui donner `member` serait livrer un locataire que
+    // personne ne peut administrer.
+    //
+    // Une sous-requête et pas un argument de cette fonction : un appelant qui
+    // passe le rôle est un appelant qui peut se tromper, et le seul appelant
+    // est `POST /v1/platform/accounts`, où le champ n'existerait que pour être
+    // oublié. Se promouvoir se demande ensuite, explicitement, à un
+    // propriétaire — `PUT /v1/console/accounts/role`.
+    //
+    // Les lignes désactivées comptent : une personne fermée reste nommée
+    // (`0089`), et un locataire qui a eu un propriétaire en a eu un.
     let row = sqlx::query(
-        "INSERT INTO console_accounts (id, tenant_id, email, password_hash, created_at) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING created_at",
+        "INSERT INTO console_accounts (id, tenant_id, email, password_hash, created_at, role) \
+         VALUES ($1, $2, $3, $4, $5, \
+                 CASE WHEN EXISTS (SELECT 1 FROM console_accounts WHERE tenant_id = $2) \
+                      THEN 'member' ELSE 'owner' END) \
+         RETURNING created_at, role",
     )
     .bind(id)
     .bind(tenant_id.as_uuid())
@@ -136,6 +205,7 @@ pub async fn create(
     .fetch_one(&mut *tx)
     .await?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let role: String = row.try_get("role")?;
 
     tx.commit().await?;
 
@@ -145,7 +215,135 @@ pub async fn create(
         email: email.to_owned(),
         created_at,
         deactivated_at: None,
+        // La colonne vient d'être écrite par le CASE ci-dessus : les deux
+        // valeurs qu'il peut produire sont les deux que `parse` connaît, et un
+        // `expect` ici serait un panic sur une branche que le CHECK interdit.
+        role: ConsoleRole::parse(&role).unwrap_or(ConsoleRole::Member),
     })
+}
+
+/// Le rôle de cette personne, maintenant.
+///
+/// Lu à chaque geste qui engage, jamais mis en cache, et pour la raison
+/// d'`api_keys::lookup` une table plus loin : un rôle retiré doit être senti
+/// par la requête suivante, pas par le prochain déploiement ni par la prochaine
+/// ouverture de session. C'est une égalité sur la clé primaire, et elle n'est
+/// payée que par les appels que `auth::require_console_role` s'apprête à
+/// refuser ou à laisser passer — une lecture ne la paie pas.
+///
+/// `Ok(None)` est « pas de ligne, ou une valeur que ce binaire ne connaît
+/// pas ». L'appelant refuse dans les deux cas ; voir [`ConsoleRole::parse`].
+pub async fn role_of(db: &Db, account_id: Uuid) -> Result<Option<ConsoleRole>, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let row: Option<String> = sqlx::query_scalar("SELECT role FROM console_accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    tx.rollback().await?;
+
+    Ok(row.as_deref().and_then(ConsoleRole::parse))
+}
+
+/// Ce qu'une demande de changement de rôle a donné.
+///
+/// Un `enum` plutôt qu'un `StoreError` par cas : les trois issues sont des
+/// réponses différentes pour l'humain qui appelle (200, 404, 409), et une
+/// chaîne de caractères dans un `Conflict` serait un contrat que la route lit
+/// avec un `if` sur du texte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleChange {
+    /// Le nouveau rôle est posé. Idempotent : redonner le rôle qu'elle a déjà
+    /// rend ceci, pas une erreur.
+    Changed(AccountRecord),
+    /// Personne de cette adresse **chez ce locataire**.
+    NoSuchPerson,
+    /// Rétrograder celle-ci laisserait le locataire sans aucun propriétaire
+    /// actif — c'est-à-dire sans personne pour rendre le rôle. Refusé.
+    WouldLeaveNoOwner,
+}
+
+/// Donner (ou retirer) le rôle propriétaire, par adresse, chez soi.
+///
+/// **Par adresse et pas par id**, parce qu'il n'existe aucune route qui liste
+/// les personnes d'un locataire : un identifiant qu'on ne peut pas obtenir est
+/// un geste qu'on ne peut pas faire. L'adresse est ce que le propriétaire
+/// connaît — c'est celle avec laquelle son collègue se connecte.
+///
+/// `tenant_id` vient du credential et entre dans le prédicat, comme dans
+/// `api_keys::revoke_session_in` : l'adresse est unique sur tout le
+/// déploiement (`0089`), donc sans cette colonne dans le `WHERE`, un
+/// propriétaire nommant l'adresse d'un autre client écrirait chez lui. Avec,
+/// il ne trouve personne.
+///
+/// La transaction est admin parce que `0089` n'accorde aucun UPDATE à
+/// `app_role` sur cette table — et les trois instructions sont dans la même
+/// pour que le compte des propriétaires restants soit celui du moment où la
+/// ligne change, pas celui d'un instant d'avant.
+pub async fn set_role(
+    db: &Db,
+    tenant_id: TenantId,
+    email: &str,
+    role: ConsoleRole,
+) -> Result<RoleChange, StoreError> {
+    let mut tx = db.admin_tx_bypassing_rls().await?;
+
+    let Some(row) = sqlx::query(
+        "SELECT id, created_at, deactivated_at, role FROM console_accounts \
+          WHERE tenant_id = $1 AND email = $2 FOR UPDATE",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(email)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(RoleChange::NoSuchPerson);
+    };
+    let id: Uuid = row.try_get("id")?;
+    let held: Option<ConsoleRole> = ConsoleRole::parse(row.try_get("role")?);
+
+    // Le dernier propriétaire ne se rétrograde pas lui-même. Sans ce refus, un
+    // locataire se ferme à clé de l'intérieur en un appel : plus personne pour
+    // arrêter la société, plus personne pour émettre une clé, et plus personne
+    // pour rendre le rôle — puisque le rendre demande le rôle. La sortie serait
+    // un UPDATE à la main dans la base du fournisseur.
+    if role == ConsoleRole::Member && held == Some(ConsoleRole::Owner) {
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM console_accounts \
+              WHERE tenant_id = $1 AND id <> $2 AND role = 'owner' \
+                AND deactivated_at IS NULL",
+        )
+        .bind(tenant_id.as_uuid())
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if others == 0 {
+            tx.rollback().await?;
+            return Ok(RoleChange::WouldLeaveNoOwner);
+        }
+    }
+
+    sqlx::query("UPDATE console_accounts SET role = $2 WHERE id = $1")
+        .bind(id)
+        .bind(role.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    Ok(RoleChange::Changed(AccountRecord {
+        id,
+        tenant_id,
+        email: email.to_owned(),
+        created_at: row.try_get("created_at")?,
+        deactivated_at: row.try_get("deactivated_at")?,
+        role,
+    }))
 }
 
 /// Resolve an address to what is needed to check a password.
@@ -483,6 +681,94 @@ mod tests {
         // ...and now a second login can mint, which is what `clear_session`
         // buys: without it this is `api_keys_tenant_label_key`.
         open_session(&db, a, dana.id).await;
+    }
+
+    /// **Le fondateur reste propriétaire, son collègue ne l'est pas, et le
+    /// dernier propriétaire ne peut pas se retirer le rôle.**
+    ///
+    /// Les quatre faits dont dépend tout ce que `auth::require_console_role`
+    /// refuse, dans l'ordre où ils se produisent chez un client.
+    #[tokio::test]
+    async fn the_first_person_owns_the_console_and_the_last_owner_cannot_step_down() {
+        let Some(db) = db().await else { return };
+        let t = tenant(&db, "roles").await;
+        let founder_email = email("fondatrice");
+        let founder = create(
+            &db,
+            Uuid::now_v7(),
+            t,
+            &founder_email,
+            &digest(),
+            Utc::now(),
+        )
+        .await
+        .expect("la fondatrice");
+        assert_eq!(founder.role, ConsoleRole::Owner, "la première personne");
+
+        let intern_email = email("stagiaire");
+        let intern = create(&db, Uuid::now_v7(), t, &intern_email, &digest(), Utc::now())
+            .await
+            .expect("le stagiaire");
+        assert_eq!(
+            intern.role,
+            ConsoleRole::Member,
+            "la deuxième personne n'arrive pas propriétaire"
+        );
+
+        assert_eq!(
+            role_of(&db, intern.id).await.expect("lu"),
+            Some(ConsoleRole::Member)
+        );
+        assert_eq!(role_of(&db, Uuid::now_v7()).await.expect("lu"), None);
+
+        // Rétrograder la seule propriétaire fermerait le locataire à clé.
+        assert_eq!(
+            set_role(&db, t, &founder_email, ConsoleRole::Member)
+                .await
+                .expect("refus"),
+            RoleChange::WouldLeaveNoOwner
+        );
+        assert_eq!(
+            role_of(&db, founder.id).await.expect("lu"),
+            Some(ConsoleRole::Owner)
+        );
+
+        // Promue, elle peut l'être : il y a alors deux propriétaires, et la
+        // première peut redescendre.
+        let promoted = set_role(&db, t, &intern_email, ConsoleRole::Owner)
+            .await
+            .expect("promotion");
+        assert!(matches!(promoted, RoleChange::Changed(ref who) if who.role == ConsoleRole::Owner));
+        assert_eq!(
+            role_of(&db, intern.id).await.expect("lu"),
+            Some(ConsoleRole::Owner)
+        );
+        assert!(matches!(
+            set_role(&db, t, &founder_email, ConsoleRole::Member)
+                .await
+                .expect("rétrogradation"),
+            RoleChange::Changed(_)
+        ));
+        assert_eq!(
+            role_of(&db, founder.id).await.expect("lu"),
+            Some(ConsoleRole::Member)
+        );
+
+        // L'adresse est unique sur tout le déploiement : un propriétaire qui
+        // nomme celle d'un autre client ne trouve personne, il n'écrit pas
+        // chez lui.
+        let other = tenant(&db, "voisin").await;
+        assert_eq!(
+            set_role(&db, other, &intern_email, ConsoleRole::Member)
+                .await
+                .expect("chez le voisin"),
+            RoleChange::NoSuchPerson
+        );
+        assert_eq!(
+            role_of(&db, intern.id).await.expect("lu"),
+            Some(ConsoleRole::Owner),
+            "la ligne du voisin n'a pas bougé"
+        );
     }
 
     /// An account for a tenant that was never created is the first-run mistake,

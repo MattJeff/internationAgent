@@ -2,7 +2,7 @@
 //! modèle comment faire ce que nous vendons.**
 //!
 //! `agentos_app::content` porte la thèse et les limites de la mesure,
-//! `docs/CONTENU.md` la boucle entière. Neuf lignes, une par route montée par
+//! `docs/CONTENU.md` la boucle entière. Douze lignes, une par route montée par
 //! `apps/server/src/routes/content.rs`.
 //!
 //! # Ce que les descriptions portent, et pourquoi
@@ -18,19 +18,25 @@
 //!   pas « à venir » : ils demandent un compte ou le refusent dans leur
 //!   `robots.txt`. La description le dit pour qu'un modèle cesse de proposer
 //!   `chatgpt` comme valeur.
-//! * **Rien ici ne publie, et rien n'écrit de texte.** `content_briefs_get`
+//! * **Rien ici n'écrit de texte, et rien ici ne publie.** `content_briefs_get`
 //!   rend une structure — ce qui est couvert, ce qui ne l'est pas, qui
 //!   dépasser — et c'est l'employé qui écrit l'article, puis `content_drafts_*`
-//!   qui le range. L'`url` d'un brouillon est une adresse **constatée**.
+//!   qui le range. L'`url` d'un brouillon est une adresse **constatée**, et
+//!   `content_drafts_propose` ne la remplit pas : elle ouvre une pull request,
+//!   ce qui laisse le brouillon `proposed` et l'article nulle part. C'est la
+//!   distinction que les deux descriptions répètent, parce que c'est celle
+//!   qu'un modèle pressé écrasera.
 //!
 //! # Le risque, ligne par ligne
 //!
-//! [`Risk::Destructive`] sur trois lignes seulement : retirer une question
-//! emporte sa série de mesures et ses brouillons par cascade ; réviser un
-//! brouillon remplace son texte et ce qui est omis est perdu ; et
-//! `content_questions_measure` **sort sur le web au nom de la société**, ce qui est la
-//! deuxième moitié de la définition du mot ici. Ajouter une question ou ouvrir
-//! un brouillon n'enlève rien et n'engage personne : [`Risk::Write`].
+//! [`Risk::Destructive`] sur cinq lignes : retirer une question emporte sa
+//! série de mesures et ses brouillons par cascade ; réviser un brouillon, comme
+//! remplacer le dépôt d'un siège, écrase ce qui est omis ;
+//! `content_questions_measure` **sort sur le web au nom de la société** et
+//! `content_drafts_propose` **écrit dans le dépôt d'un client et y ouvre une
+//! demande en son nom**, ce qui est la deuxième moitié de la définition du mot
+//! ici. Ajouter une question ou ouvrir un brouillon n'enlève rien et n'engage
+//! personne : [`Risk::Write`].
 
 use serde_json::{Value, json};
 
@@ -210,8 +216,9 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "content_drafts_list",
             "Ce qui a été écrit, et ce qui est publié",
-            "Les brouillons de cette entreprise, du plus récent au plus ancien. `state` vaut `draft` ou \
-             `published` ; un publié porte l'adresse où il a été vu et la date où il l'a été.",
+            "Les brouillons de cette entreprise, du plus récent au plus ancien. `state` vaut `draft`, \
+             `proposed` — une pull request est ouverte à l'adresse `review_url`, et rien n'est en ligne — ou \
+             `published`, auquel cas la ligne porte l'adresse où l'article a été vu et la date où il l'a été.",
             Method::Get,
             "/v1/content/drafts",
             nothing(),
@@ -241,9 +248,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Réécrire un brouillon, ou constater qu'il est publié",
             "Remplace le titre et le texte — **ce qui est omis est perdu**, envoyer les deux à chaque fois. \
              Passer une `url` marque le brouillon comme publié à cette adresse ; ne la passer que si \
-             l'article y est réellement, parce que rien ici ne publie et que cette colonne est un constat. \
-             La date de publication est posée la première fois et ne bouge plus : corriger une typo ne \
-             republie pas.",
+             l'article y est réellement, parce que cette colonne est un constat — `content_drafts_propose` \
+             ouvre une pull request et ne remplit jamais celle-ci. La date de publication est posée la \
+             première fois et ne bouge plus : corriger une typo ne republie pas. Corriger un brouillon déjà \
+             proposé le laisse `proposed` et ne repousse rien dans la pull request ouverte.",
             Method::Put,
             "/v1/content/drafts/{id}",
             schema(
@@ -265,6 +273,88 @@ pub fn tools() -> Vec<ToolDef> {
             &[],
             Risk::Destructive,
         ),
+        t(
+            "content_repos_list",
+            "Les dépôts où les sièges poussent leurs articles",
+            "Le dépôt de chaque siège qui en a un : le branchement GitHub utilisé, `propriétaire/nom`, la \
+             branche qui sert le site et le dossier des articles. À lire avant `content_drafts_propose`, \
+             qui échoue en `no_repo` pour un siège absent de cette liste.",
+            Method::Get,
+            "/v1/content/repos",
+            nothing(),
+            &[],
+            Risk::Read,
+        ),
+        t(
+            "content_repos_set",
+            "Attacher un dépôt à un siège, ou remplacer le sien",
+            "Dit où ce siège pousse ses articles. **Remplace la ligne en entier** : les quatre champs sont \
+             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_list` \
+             rend — pas le nom du connecteur — et rien n'est écrit si aucun branchement ne porte ce handle. \
+             `branch` est la branche **qui sert le site**, c'est-à-dire la cible de la pull request : celle \
+             qui porte l'article est créée par `content_drafts_propose` et n'a pas à être configurée.",
+            Method::Put,
+            "/v1/content/repos/{employee_id}",
+            schema(
+                json!({
+                    "employee_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le siège, tel qu'`employees_list` le rend."
+                    },
+                    "server": {
+                        "type": "string",
+                        "description": "Le handle du branchement GitHub de ce locataire, tel qu'`integrations_list` le rend."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "`propriétaire/nom`, comme GitHub l'écrit."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "La branche qui sert le site, p. ex. `main` : la pull request est ouverte vers elle."
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Le dossier que le générateur lit, p. ex. `content/blog` ou `_posts`. Relatif, sans `..` ni barre de tête."
+                    }
+                }),
+                &["employee_id", "server", "repo", "branch", "folder"],
+            ),
+            &[],
+            Risk::Destructive,
+        ),
+        t(
+            "content_drafts_propose",
+            "L'article devient une pull request chez le client",
+            "Pousse l'article dans le dépôt du siège, sur une branche à lui, et ouvre une pull request vers \
+             la branche qui sert le site. **Ça ne publie pas** : le brouillon passe à `proposed`, pas à \
+             `published`, et ce qui met l'article en ligne est une personne qui fusionne la demande — c'est \
+             elle, la relecture. Le siège nommé doit avoir un dépôt (`content_repos_set`) et une politique \
+             qui l'autorise à appeler `create-branch`, `create-or-update-file` et `create-pull-request` sur \
+             son branchement GitHub ; chacun des trois est un verdict de la Policy Gate, et un refus est un \
+             403 avec sa raison. Seul un brouillon se propose : rappeler cet outil sur un brouillon déjà \
+             proposé rend `not_a_draft` plutôt qu'une deuxième pull request.",
+            Method::Post,
+            "/v1/content/drafts/{id}/propose",
+            schema(
+                json!({
+                    "id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "L'identifiant du brouillon, tel que `content_drafts_list` le rend."
+                    },
+                    "employee_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le siège au nom de qui la pull request s'ouvre, et celui dont le dépôt est lu."
+                    }
+                }),
+                &["id", "employee_id"],
+            ),
+            &[],
+            Risk::Destructive,
+        ),
     ]
 }
 
@@ -275,9 +365,9 @@ mod tests {
     /// Une ligne par route montée, et le chemin de chacune est bien un chemin de
     /// ce domaine. Le test de couverture de `mod.rs` prouve l'autre sens.
     #[test]
-    fn neuf_lignes_pour_neuf_routes() {
+    fn douze_lignes_pour_douze_routes() {
         let all = tools();
-        assert_eq!(all.len(), 9, "une route montée n'a pas sa ligne");
+        assert_eq!(all.len(), 12, "une route montée n'a pas sa ligne");
         for tool in &all {
             assert!(
                 tool.path.starts_with("/v1/content/"),

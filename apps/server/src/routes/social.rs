@@ -234,7 +234,7 @@ struct Connect {
 async fn connect(
     State(fleets): State<Fleets>,
     principal: Principal,
-    Json(body): Json<Connect>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Connect>,
 ) -> Result<Json<Value>, ApiError> {
     appeler(
         &fleets,
@@ -249,7 +249,7 @@ async fn connect(
 async fn preview(
     State(fleets): State<Fleets>,
     principal: Principal,
-    Json(body): Json<Value>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
     appeler(&fleets, &principal, OUTILS[2], objet(body)?).await
 }
@@ -258,7 +258,7 @@ async fn preview(
 async fn publish(
     State(fleets): State<Fleets>,
     principal: Principal,
-    Json(body): Json<Value>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
     appeler(&fleets, &principal, OUTILS[3], objet(body)?).await
 }

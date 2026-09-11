@@ -1309,6 +1309,17 @@ pub const fn spends_contact_budget(action: &Action) -> bool {
         // ones. It asks `channel_open` rather than `channel_rules` for exactly
         // this reason, the same split `BrowserRead` made.
         | Action::InvoiceIssue { .. }
+        // A quote reaches nobody *by itself* — `Effects::propose_quote` writes
+        // a row and files a PDF and sends nothing, exactly as issuing an
+        // invoice does — so there is no counterparty here for the day's
+        // allowance of strangers to be spent on. Putting the offer in front of
+        // the prospect is a separate `EmailSend`, and that one is charged.
+        //
+        // This is a *stronger* answer than the invoice's one line up, and worth
+        // the distinction: that arm rests on the party already being a won
+        // customer, which is not true of a prospect being quoted. What holds
+        // here is simply that nothing leaves.
+        | Action::QuoteIssue { .. }
         | Action::ContractSign { .. }
         | Action::CredentialChange { .. }
         | Action::DataDelete { .. }
@@ -1458,6 +1469,14 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         // `0066_invoices.sql` carries that argument and the founder's open
         // question about an amount ceiling.
         ActionKind::InvoiceIssue => closed(Channel::Email),
+        // ChannelNotAllowed / NoRule, on `InvoiceIssue`'s channel and by its
+        // argument: an offer is only an offer once it reaches the prospect, the
+        // one way this company reaches one is mail, so a layer that takes
+        // `Channel::Email` from a seat takes quoting with it. It narrows like
+        // every other allowlist here, and — the invoice's other half, unchanged
+        // — it is **not** a spend cap: `spend` bounds what leaves the company,
+        // and a price offered is a claim on somebody else.
+        ActionKind::QuoteIssue => closed(Channel::Email),
         // Never denied by policy: signing escalates to a human under every
         // policy this system can express, empty included, so there is no
         // `DenyReason` to predict and withholding the tool would withhold the
@@ -1761,6 +1780,28 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             None => Decision::Allow,
         },
 
+        // `InvoiceIssue`'s arm, one step earlier in the sale, and the three
+        // decisions in it are copied rather than re-taken: `channel_open` and
+        // not `channel_rules`, because nothing leaves here and the day's cold
+        // contacts must not be spent on a document that reaches nobody; no
+        // amount read, because there is no ceiling in this file that could be
+        // one and inventing a threshold would read as a decision somebody took;
+        // and `Allow` rather than an escalation, because a price is the seat's
+        // job and `Risk::High` already refuses one derived from a stranger's
+        // text before this arm is reached.
+        //
+        // The one thing an invoice has that this does not is a foreign key that
+        // narrows it further — `invoices::issue` insists on `closed_won`. A
+        // quote deliberately has none (`agentos_store::quotes::propose`: "a
+        // quote is what happens *before* a deal is won"), so the channel is the
+        // whole of the ceiling here. That is the argument for `valid_until`
+        // being NOT NULL one layer down: what bounds an offer is its own
+        // expiry, and `0090` refuses to let a document be written without one.
+        Action::QuoteIssue { amount: _ } => match channel_open(Channel::Email) {
+            Some(reason) => Decision::deny(reason),
+            None => Decision::Allow,
+        },
+
         // Unconditional. There is no policy field to widen, no flag to flip and
         // no `if` to get wrong: signing binds the tenant, so a human signs off.
         Action::ContractSign { title } => Decision::RequireApproval {
@@ -2010,6 +2051,9 @@ mod tests {
                 payee: "acct-supplier".to_owned(),
             },
             Action::InvoiceIssue {
+                amount: usd_minor(100),
+            },
+            Action::QuoteIssue {
                 amount: usd_minor(100),
             },
             Action::ContractSign {

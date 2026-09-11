@@ -22,32 +22,47 @@
 //! derrière elle, exactement ce que `routes::quotes` refuse d'être pour
 //! l'émission d'un devis.
 //!
-//! # Il n'y a pas de route qui publie
+//! # Il n'y a toujours pas de route qui publie
 //!
 //! `PUT /v1/content/drafts/{id}` accepte une `url`, et cette URL est
-//! **constatée** : c'est la personne qui a publié qui l'écrit. Rien dans ce
-//! dépôt ne pousse un texte nulle part. `docs/CONTENU.md` § « ce qui manque
-//! pour publier » nomme les deux chemins possibles et dit pourquoi aucun n'est
-//! codé.
+//! **constatée** : c'est la personne qui a publié qui l'écrit.
+//!
+//! `POST /v1/content/drafts/{id}/propose` n'en est pas une non plus, et c'est
+//! la moitié la plus importante de ce module. Elle pousse l'article dans le
+//! dépôt qui sert le site du client et ouvre une pull request — le **chemin A**
+//! de `docs/CONTENU.md` § 5 — et le brouillon en ressort `proposed`, pas
+//! `published`. Ce qui met un article en ligne est la fusion de cette demande
+//! par une personne, chez le client, et ce dépôt n'a aucun moyen de la faire.
+//!
+//! Elle nomme un siège pour la même raison que la mesure, et un peu plus fort :
+//! ce qui part est une écriture chez un tiers, sous un `Action::McpCall` par
+//! outil prononcé. Le dépôt lui-même est une ressource de ce siège
+//! (`content_repos`, `migrations/0102`), posée par
+//! `PUT /v1/content/repos/{employee_id}` — jamais une variable d'environnement,
+//! parce que deux clients ont deux dépôts.
 //!
 //! [`ActionKind::BrowserRead`]: agentos_domain::action::ActionKind::BrowserRead
 
-use agentos_app::content::{self, Engine, MeasureError, Source, citations, drafts, questions};
-use agentos_app::effects::{Effects, Ports};
+use agentos_app::content::{
+    self, Engine, MeasureError, ProposeError, Source, citations, drafts, questions, repos,
+};
+use agentos_app::effects::{Effects, McpCaller, Ports};
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_domain::ids::EmployeeId;
-use agentos_store::db::Db;
+use agentos_store::db::{Db, StoreError};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::mcp::Fleets;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
@@ -62,6 +77,15 @@ pub struct Content {
     pub db: Db,
     pub gate: PolicyGate,
     pub ports: Arc<Ports>,
+    /// Les branchements MCP, par locataire — ce qui donne à une proposition le
+    /// GitHub de **ce** client.
+    ///
+    /// Le même registre que `routes::social` et que la boucle qui relie ;
+    /// `Fleets` partage sa carte, donc en tenir une copie ici n'est pas un
+    /// deuxième jeu de connexions. Un locataire que le lieur n'a pas encore
+    /// atteint a une flotte vide, et le premier appel d'outil sort en
+    /// `unknown_tool` plutôt qu'en promesse.
+    pub fleets: Fleets,
 }
 
 /// Les routes de cette unité. Fusionnées dans le routeur d'API, donc elles
@@ -78,6 +102,9 @@ pub fn router(state: Content) -> Router {
         .route("/v1/content/drafts", get(list_drafts))
         .route("/v1/content/drafts", post(add_draft))
         .route("/v1/content/drafts/{id}", put(revise_draft))
+        .route("/v1/content/drafts/{id}/propose", post(propose_draft))
+        .route("/v1/content/repos", get(list_repos))
+        .route("/v1/content/repos/{employee_id}", put(set_repo))
         .with_state(state)
 }
 
@@ -389,6 +416,223 @@ async fn revise_draft(
         .ok_or_else(ApiError::not_found)
 }
 
+// ---------------------------------------------------------------------------
+// Le dépôt d'un siège, et la proposition
+// ---------------------------------------------------------------------------
+
+async fn list_repos(
+    State(state): State<Content>,
+    principal: Principal,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let rows = repos::list(&mut tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "repos": rows })))
+}
+
+/// Où ce siège pousse ses articles.
+#[derive(Debug, Deserialize)]
+struct NewRepo {
+    /// Le handle sous lequel ce locataire a branché son GitHub — celui
+    /// qu'`integrations_list` rend, pas le nom du connecteur.
+    server: String,
+    /// `propriétaire/nom`.
+    repo: String,
+    /// La branche qui sert le site : la **cible** de la pull request.
+    branch: String,
+    /// Le dossier que le générateur lit.
+    folder: String,
+}
+
+/// Poser ou remplacer le dépôt d'un siège.
+///
+/// Les formes — `propriétaire/nom`, une branche sans blanc, un dossier relatif
+/// sans `..` — sont des CHECK de `migrations/0102` et pas des `if` ici : c'est
+/// la seule place où elles valent pour toutes les lignes, y compris celles
+/// qu'une console écrirait un jour par un autre chemin. [`store_failed`] les
+/// rend en 400 avec le nom de la contrainte, qui dit laquelle des trois a
+/// refusé.
+async fn set_repo(
+    State(state): State<Content>,
+    principal: Principal,
+    Path(employee_id): Path<Uuid>,
+    body: Result<Json<NewRepo>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let row = repos::set(
+        &mut tx,
+        employee_id,
+        &body.server,
+        &body.repo,
+        &body.branch,
+        &body.folder,
+    )
+    .await
+    // Un siège qui n'est pas à ce locataire n'existe pas dans cette
+    // transaction, donc la clé étrangère tombe : 404, pas 500. La forme, elle,
+    // est un CHECK et remonte en 422 — voir `ApiError::from(StoreError)`.
+    .map_err(store_failed)?;
+    tx.commit().await?;
+    let Some(row) = row else {
+        return Err(ApiError::conflict(
+            "no_such_binding",
+            "nothing is bound under that server handle for this tenant",
+        )
+        .with_detail(
+            "branchez GitHub d'abord avec `integrations_connect`, puis reprenez le handle \
+             que `integrations_list` rend.",
+        ));
+    };
+    Ok(Json(json!({ "repo": row })))
+}
+
+/// Qui propose.
+#[derive(Debug, Deserialize)]
+struct Proposer {
+    /// Le siège au nom de qui la pull request s'ouvre, et celui dont le dépôt
+    /// est lu. Du corps, jamais du chemin — la forme de la mesure.
+    employee_id: Uuid,
+}
+
+/// `POST /v1/content/drafts/{id}/propose` — pousser l'article et ouvrir la
+/// pull request.
+///
+/// Trois appels d'outil, trois verdicts de la Gate, trois lignes d'audit. Ce
+/// qui est écrit ici après coup est `state = 'proposed'` et l'adresse de la
+/// relecture ; `url` et `published_at` ne bougent pas, parce qu'une pull
+/// request ouverte n'est pas un article en ligne.
+async fn propose_draft(
+    State(state): State<Content>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    body: Result<Json<Proposer>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+
+    // Tout ce que la proposition a besoin de savoir, lu d'un coup et la
+    // transaction rendue avant que la gate ouvre la sienne — `measure` et
+    // `routes::approvals` font pareil.
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let draft = drafts::list(&mut tx)
+        .await?
+        .into_iter()
+        .find(|row| row.id == id);
+    let repo = repos::of(&mut tx, body.employee_id).await?;
+    tx.commit().await?;
+
+    let Some(draft) = draft else {
+        return Err(ApiError::not_found());
+    };
+    let Some(repo) = repo else {
+        return Err(propose_failed(ProposeError::NoRepo));
+    };
+
+    let gate_principal = GatePrincipal {
+        tenant_id: principal.tenant_id,
+        employee_id: EmployeeId::from_uuid(body.employee_id),
+        actor: principal.actor.clone(),
+    };
+    // Le seul port qui change : le GitHub de **ce** locataire. Les autres sont
+    // ceux du processus, comme pour la mesure.
+    let mcp: Arc<dyn McpCaller> = state.fleets.for_tenant(principal.tenant_id);
+    let ports = Arc::new(Ports {
+        mcp,
+        ..(*state.ports).clone()
+    });
+    let effects = Effects::new(state.db.clone(), ports, gate_principal);
+    let proposal = content::propose(&effects, &state.gate, &repo, &draft, Utc::now())
+        .await
+        .map_err(propose_failed)?;
+
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let row = drafts::propose(&mut tx, draft.id, &proposal.review_url).await?;
+    tx.commit().await?;
+
+    // `None` : la ligne a cessé d'être un brouillon entre la lecture et
+    // maintenant. La pull request est ouverte et son adresse est dans la
+    // réponse — mieux vaut la rendre avec le refus que la perdre.
+    let Some(row) = row else {
+        return Err(
+            propose_failed(ProposeError::NotADraft(draft.state)).with_extension(
+                "proposal",
+                serde_json::to_value(&proposal).unwrap_or(Value::Null),
+            ),
+        );
+    };
+    Ok(Json(json!({ "draft": row, "proposal": proposal })))
+}
+
+/// Une contrainte de base qui parle de la requête, pas de la machine.
+///
+/// Deux traductions, et rien d'autre. Sans elles, les deux fautes qu'un
+/// appelant peut réellement commettre ici — une forme refusée, un siège qui
+/// n'est pas le sien — sortent en 500 « nous avons cassé », ce qui envoie un
+/// opérateur lire nos journaux pour une faute de frappe dans son dossier.
+///
+/// * un CHECK de `content_repos` est une valeur mal formée : 400, avec le nom
+///   de la contrainte, qui dit laquelle des trois formes a été refusée ;
+/// * une clé étrangère est un siège que ce locataire ne possède pas : 404,
+///   comme `add_draft`. Celle du locataire lui-même ne passe pas par ici —
+///   `StoreError` en fait un `UnknownTenant` avant.
+fn store_failed(err: StoreError) -> ApiError {
+    if let StoreError::Database(inner) = &err
+        && let Some(db) = inner.as_database_error()
+    {
+        if let Some(name) = db.constraint().filter(|n| n.starts_with("content_repos_")) {
+            return ApiError::bad_request(format!("{name}: refusé"));
+        }
+        if db.is_foreign_key_violation() {
+            return ApiError::not_found();
+        }
+    }
+    err.into()
+}
+
+fn propose_failed(err: ProposeError) -> ApiError {
+    match err {
+        ProposeError::Denied(denied) => denied.into(),
+        ProposeError::Store(err) => err.into(),
+        ProposeError::NoRepo => ApiError::conflict(
+            "no_repo",
+            "this seat has no repository, so there is nowhere to push",
+        )
+        .with_detail(
+            "posez-le avec `content_repos_set` : le handle du branchement GitHub, \
+             `propriétaire/nom`, la branche qui sert le site, et le dossier des articles.",
+        ),
+        ProposeError::NotADraft(state) => ApiError::conflict(
+            "not_a_draft",
+            "only a draft can be proposed; this one has moved on",
+        )
+        .with_extension("state", json!(state)),
+        ProposeError::MalformedRepo => ApiError::conflict(
+            "repo_malformed",
+            "this seat's repository row cannot be read",
+        ),
+        // Le mot du port, comme la mesure rend celui du navigateur : un
+        // opérateur qui lit ce 502 et un opérateur qui lit le journal lisent la
+        // même chaîne. `Refused` porte l'outil, jamais le message de GitHub.
+        ProposeError::Refused(tool) => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "github_refused",
+            "the repository host refused one of the three calls",
+        )
+        .with_extension("tool", json!(tool)),
+        ProposeError::NoReviewUrl => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "no_review_url",
+            "the pull request may be open, but the answer carried no address inside this repository",
+        ),
+        ProposeError::Effect(err) => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "repo_unreachable",
+            "the repository host did not answer",
+        )
+        .with_extension("tool_error", json!(err.code())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::TenantId;
@@ -431,6 +675,13 @@ mod tests {
                 db: db.clone(),
                 gate: PolicyGate::new(db.clone()),
                 ports: Arc::new(agentos_app::mocks::ports()),
+                // Une flotte vide, comme un locataire que le lieur n'a pas
+                // encore atteint. Rien ici ne parle à GitHub : ce que ces tests
+                // mesurent est la surface — qui peut poser un dépôt, et ce que
+                // la route répond avant qu'un seul appel d'outil parte.
+                // `agentos_app::content` tient la proposition elle-même, contre
+                // son propre faux GitHub.
+                fleets: super::super::mcp::Fleets::new().0,
             };
 
             Some(Self {
@@ -681,5 +932,187 @@ mod tests {
         assert_eq!(body["citations"].as_array().map(Vec::len), Some(0));
 
         h.teardown().await;
+    }
+
+    /// **Le dépôt d'un siège, et ce que la proposition refuse avant de sortir.**
+    ///
+    /// Ce que ce test ne fait pas : aucune pull request, aucun appel d'outil.
+    /// La couche de politique posée plus bas ne nomme aucun outil, donc tout ce
+    /// qui pourrait partir est refusé par la Gate — ce qui est exactement la
+    /// propriété qu'une route doit avoir. Le chemin heureux est mesuré dans
+    /// `agentos_app::content`, contre un faux GitHub.
+    #[tokio::test]
+    async fn un_depot_se_pose_sur_un_branchement_et_une_proposition_sans_depot_est_refusee() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let employee = employee(&h.db, h.a).await;
+
+        // Rien n'est branché sous ce handle : la route le dit plutôt que de
+        // laisser tomber une clé étrangère.
+        let (status, body) = h
+            .call(
+                "PUT",
+                &format!("/v1/content/repos/{employee}"),
+                SECRET_A,
+                Some(json!({
+                    "server": "github",
+                    "repo": "acme/site",
+                    "branch": "main",
+                    "folder": "content/blog"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "no_such_binding");
+
+        bind_github(&h.db, h.a).await;
+
+        // Une forme que `0102` refuse est une faute de l'appelant, pas un 500.
+        let (status, _) = h
+            .call(
+                "PUT",
+                &format!("/v1/content/repos/{employee}"),
+                SECRET_A,
+                Some(json!({
+                    "server": "github",
+                    "repo": "acme/site",
+                    "branch": "main",
+                    "folder": "../../etc"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = h
+            .call(
+                "PUT",
+                &format!("/v1/content/repos/{employee}"),
+                SECRET_A,
+                Some(json!({
+                    "server": "github",
+                    "repo": "acme/site",
+                    "branch": "main",
+                    "folder": "content/blog"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["repo"]["repo"], "acme/site");
+
+        // Le voisin ne voit pas le dépôt d'à côté.
+        let (_, body) = h.call("GET", "/v1/content/repos", SECRET_B, None).await;
+        assert_eq!(body["repos"].as_array().map(Vec::len), Some(0));
+        let (_, body) = h.call("GET", "/v1/content/repos", SECRET_A, None).await;
+        assert_eq!(body["repos"].as_array().map(Vec::len), Some(1));
+
+        // Un brouillon, et une proposition pour un siège qui n'a pas de dépôt.
+        let (_, body) = h
+            .call(
+                "POST",
+                "/v1/content/questions",
+                SECRET_A,
+                Some(json!({ "question": "q", "locale": "fr", "source": "founder" })),
+            )
+            .await;
+        let question_id = body["question"]["id"].as_str().expect("id").to_owned();
+        let (_, body) = h
+            .call(
+                "POST",
+                "/v1/content/drafts",
+                SECRET_A,
+                Some(json!({ "question_id": question_id, "title": "Un titre", "body": "…" })),
+            )
+            .await;
+        let draft_id = body["draft"]["id"].as_str().expect("id").to_owned();
+        assert!(body["draft"]["review_url"].is_null());
+
+        let (status, body) = h
+            .call(
+                "POST",
+                &format!("/v1/content/drafts/{draft_id}/propose"),
+                SECRET_A,
+                Some(json!({ "employee_id": Uuid::now_v7() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "no_repo");
+
+        // Et avec le siège qui en a un. **La couche du locataire est posée ici
+        // et pas laissée vide**, et ce n'est pas une précaution : un locataire
+        // qui n'écrit aucune couche hérite du plafond de la plateforme, qui est
+        // **une seule ligne partagée par toute la base** et que
+        // `policy::install` *élargit* à chaque appel (`store::policy::install`
+        // le dit). Sans ces trois lignes, ce test passait ou échouait selon que
+        // les tests de `agentos_app::content` avaient tourné avant lui sur la
+        // même base et y avaient laissé les trois outils de GitHub. Mesuré le
+        // 2026-09-11, en rouge.
+        agentos_store::policy::install(
+            &h.db,
+            h.a,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                // Le nécessaire pour qu'un tour existe, et **aucun outil** :
+                // le refus doit porter sur l'outil et pas sur un plafond
+                // journalier, sinon ce test dirait 403 pour autre chose.
+                max_turns_per_day: 10,
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+
+        let (status, body) = h
+            .call(
+                "POST",
+                &format!("/v1/content/drafts/{draft_id}/propose"),
+                SECRET_A,
+                Some(json!({ "employee_id": employee })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["code"], "no_rule",
+            "le refus doit venir de l'allowlist d'outils : {body}"
+        );
+
+        // Le brouillon n'a pas bougé : ni proposé, ni publié.
+        let (_, body) = h.call("GET", "/v1/content/drafts", SECRET_A, None).await;
+        assert_eq!(body["drafts"][0]["state"], "draft");
+        assert!(body["drafts"][0]["review_url"].is_null());
+
+        h.teardown().await;
+    }
+
+    /// Un siège actif chez ce locataire.
+    async fn employee(db: &Db, tenant: TenantId) -> Uuid {
+        let id = Uuid::now_v7();
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'lena', 'active')",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit");
+        id
+    }
+
+    /// Un branchement GitHub, sous le handle que le test reprend. L'URL n'est
+    /// jamais composée : la flotte du harnais est vide.
+    async fn bind_github(db: &Db, tenant: TenantId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector) \
+             VALUES ($1, 'github', 'https://api.githubcopilot.com/mcp/', 'public', 'github')",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("insert binding");
+        tx.commit().await.expect("commit");
     }
 }

@@ -220,7 +220,22 @@ pub(crate) const WHOLE_PAGE: &str = "body";
 ///
 /// The reasons are not "not yet implemented". Each one names the thing that does
 /// not exist, so the entry can be deleted the day it does.
-pub const UNSERVED: [(ActionKind, &str); 10] = [
+pub const UNSERVED: [(ActionKind, &str); 11] = [
+    (
+        ActionKind::QuoteIssue,
+        "the catalogue row does not exist yet, and the thing that does not exist is a measured \
+         one rather than an argument. `Effects::propose_quote` is written, gated and audited — a \
+         quote can be proposed by an employee holding a `QuoteIssue` token, and `GET /v1/growth` \
+         counts it — but a row here moves `agentos_eval::toolchoice::{TRUSTED_PROMPT, \
+         UNTRUSTED_PROMPT}` and `cost::DIGEST`, whose re-measure needs a live model run. That is \
+         the same sentence `issue_invoice`'s row carried for a wave before it was applied, and \
+         the procedure is its procedure. **No pack proposes it either**, which is the other half \
+         and is a separate decision: `rolepack_sales` is the obvious holder — naming a price is \
+         what a seller does, and it is refused `InvoiceIssue` precisely because it stops before \
+         commercial terms exist — but widening a pack's `proposable` set is a change to what a \
+         seat may put on the table, and it belongs in the commit that ships the tool rather than \
+         in the one that ships the effect.",
+    ),
     (
         ActionKind::SmsSend,
         "no pack proposes it: SMS is the cheapest way to intrude on a stranger and every pack \
@@ -3929,7 +3944,7 @@ mod tests {
     ///
     /// 1. **Every kind is decided.** [`ActionKind::ALL`] is partitioned by the
     ///    catalogue and [`UNSERVED`], with no overlap and nothing left over — so
-    ///    a seventeenth discriminant fails here until somebody writes down which
+    ///    a nineteenth discriminant fails here until somebody writes down which
     ///    side it is on. "No schema" becomes a decision with a reason attached,
     ///    instead of an omission. `AppointmentBook` is on the
     ///    served side: `promise_an_hour`.

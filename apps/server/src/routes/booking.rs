@@ -276,7 +276,7 @@ async fn set_open(
     State(db): State<Db>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Open>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Open>,
 ) -> Result<Response, ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let changed =

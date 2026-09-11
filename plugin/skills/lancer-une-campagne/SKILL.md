@@ -72,6 +72,12 @@ Ce qu'il faut avoir en tête en l'écrivant :
 
 ## 4. L'enrôlement
 
+**`contacts_list` d'abord** : c'est la seule source du `contact_id`. L'import ne rend que des
+compteurs et le tirage de file ne rend que les colonnes de Smartlead — aucun des deux ne donne
+d'identifiant, et un UUID inventé est un 404 qui ressemble à une erreur de ta part. Pagine
+jusqu'au bout — une page pleine porte un curseur, une page courte termine la marche — avant de
+compter les inscrits.
+
 **`sequences_enroll`**, un appel par contact : la séquence, le contact, et **le siège qui
 écrira**. C'est le budget et la Gate de ce siège qui s'appliqueront, pas les tiens — choisis-le
 en connaissance de cause, et relis `controls_get` si tu ne sais pas ce qui le borne.

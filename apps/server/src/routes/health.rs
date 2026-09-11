@@ -130,10 +130,40 @@ struct Counts {
     last_success_at: Option<DateTime<Utc>>,
 }
 
-/// Le verdict, à partir des seuls chiffres.
+/// Ce que rend `last_failure_detail` d'une société qui n'a connecté aucun
+/// modèle et n'a donc encore rien pu rater.
 ///
-/// L'ordre des trois questions est le sens de la route :
+/// La phrase est celle que `model_access` écrit déjà quand un tour meurt faute
+/// de modèle ; la recopier ici plutôt que d'en inventer une seconde évite deux
+/// vocabulaires pour une même cause.
+const NO_MODEL: &str = "this tenant has connected no model, so none of its employees can take a \
+                        turn. Connect one with POST /v1/model — an Anthropic API key, or this \
+                        host's claude CLI";
+
+/// Le verdict, à partir des chiffres **et** de la présence d'un modèle.
 ///
+/// # Pourquoi le modèle entre dans le verdict
+///
+/// Mesuré le 2026-09-11 sur une installation neuve, en marchant le chemin du
+/// fondateur depuis un terminal : société créée, siège embauché, un ordre
+/// envoyé au bureau. L'ordre a réveillé le siège, le tour est mort faute de
+/// modèle, l'événement a brûlé ses huit tentatives et a été mis au rebut — et
+/// cette route répondait `working`, avec `turns_attempted_today: 0` et
+/// `last_failure_detail: null`, parce que `turn_outcomes` n'avait pas encore de
+/// ligne. Le premier écran que le fondateur regarde disait que tout allait bien
+/// à la minute où rien ne pouvait marcher.
+///
+/// **Une société sans modèle n'est pas au repos, elle est hors service** : ce
+/// n'est pas « rien à faire », c'est « rien n'est faisable ». Une société qui
+/// dort garde donc `working`, et celle qui n'a pas de quoi penser rend
+/// `stopped` — le verdict que sa propre description promet déjà : « `stopped`
+/// nomme la cause dans `last_failure_detail`, et c'est presque toujours la
+/// connexion au modèle ».
+///
+/// L'ordre des questions est le sens de la route :
+///
+/// 0. **Aucun modèle connecté → `stopped`.** Avant tout comptage : aucun tour
+///    ne peut aboutir, quel que soit ce que les compteurs disent.
 /// 1. **Rien tenté, ou rien raté → `working`.** Dit en premier parce que c'est
 ///    le cas d'une société qui va bien *et* de celle qui dort, et que confondre
 ///    les deux avec une panne est la faute qui décrédibilise l'écran.
@@ -149,7 +179,10 @@ struct Counts {
 /// « Plus de six heures » est strict : à six heures pile, le dernier succès est
 /// encore dans la fenêtre et le verdict est `degraded`.
 /// `la_fenetre_de_six_heures_a_ses_deux_bornes` tient les deux côtés.
-fn verdict(counts: Counts, now: DateTime<Utc>) -> Verdict {
+fn verdict(counts: Counts, model_connected: bool, now: DateTime<Utc>) -> Verdict {
+    if !model_connected {
+        return Verdict::Stopped;
+    }
     if counts.attempted_today == 0 || counts.failed_today == 0 {
         return Verdict::Working;
     }
@@ -242,6 +275,11 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
 
     let (last_failure_at, last_failure_code, last_failure_detail) = match failure {
         Some((at, code, detail)) => (Some(at), Some(code), detail),
+        // Pas de tour raté, mais pas de modèle non plus : le verdict est
+        // `stopped` et sa cause doit être lisible. On ne date pas cet échec —
+        // il n'a pas eu lieu, c'est l'absence qui parle — et on n'écrase jamais
+        // un vrai dernier échec, qui est plus informatif.
+        None if model.is_none() => (None, Some("no_model".to_owned()), Some(NO_MODEL.to_owned())),
         None => (None, None, None),
     };
 
@@ -253,8 +291,8 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         last_failure_code,
         last_failure_detail,
         dead_lettered_today: dead_lettered,
+        verdict: verdict(counts, model.is_some(), now),
         model: model.map(|connection| connection.access),
-        verdict: verdict(counts, now),
     })
     .into_response())
 }
@@ -299,18 +337,21 @@ mod tests {
     #[test]
     fn une_societe_qui_essaie_et_ne_reussit_plus_est_stopped() {
         assert_eq!(
-            verdict(counts(288, 288, 72, Some(96)), now()),
+            verdict(counts(288, 288, 72, Some(96)), true, now()),
             Verdict::Stopped
         );
         // Et sans le moindre succès depuis toujours, même verdict : `None`
         // n'est pas « récent », c'est « jamais ».
-        assert_eq!(verdict(counts(12, 12, 12, None), now()), Verdict::Stopped);
+        assert_eq!(
+            verdict(counts(12, 12, 12, None), true, now()),
+            Verdict::Stopped
+        );
     }
 
     #[test]
     fn des_echecs_et_des_succes_meles_sont_degraded() {
         assert_eq!(
-            verdict(counts(40, 9, 12, Some(1)), now()),
+            verdict(counts(40, 9, 12, Some(1)), true, now()),
             Verdict::Degraded
         );
     }
@@ -319,10 +360,16 @@ mod tests {
     /// société au repos n'est pas malade.
     #[test]
     fn pas_dechec_ou_aucun_tour_tente_est_working() {
-        assert_eq!(verdict(counts(40, 0, 12, Some(0)), now()), Verdict::Working);
+        assert_eq!(
+            verdict(counts(40, 0, 12, Some(0)), true, now()),
+            Verdict::Working
+        );
         // Aucun battement du tout — une entreprise neuve, un samedi, une flotte
         // sans cadence posée. Aucun succès non plus, et pourtant rien de rouge.
-        assert_eq!(verdict(counts(0, 0, 0, None), now()), Verdict::Working);
+        assert_eq!(
+            verdict(counts(0, 0, 0, None), true, now()),
+            Verdict::Working
+        );
     }
 
     /// La fenêtre, aux deux bornes. « Plus de six heures » est strict : à six
@@ -333,13 +380,33 @@ mod tests {
             last_success_at: Some(now() - STALE_AFTER),
             ..counts(48, 40, 12, None)
         };
-        assert_eq!(verdict(dedans, now()), Verdict::Degraded);
+        assert_eq!(verdict(dedans, true, now()), Verdict::Degraded);
 
         let dehors = Counts {
             last_success_at: Some(now() - STALE_AFTER - Duration::seconds(1)),
             ..counts(48, 40, 12, None)
         };
-        assert_eq!(verdict(dehors, now()), Verdict::Stopped);
+        assert_eq!(verdict(dehors, true, now()), Verdict::Stopped);
+    }
+
+    /// **Le défaut mesuré le 2026-09-11 sur une installation neuve.** Aucun
+    /// modèle connecté : les compteurs sont à zéro parce que rien n'a encore
+    /// été tenté, et c'est exactement la forme d'une société au repos — sauf
+    /// qu'ici rien ne pourra jamais aboutir. Le premier écran du fondateur
+    /// disait `working` à la minute où le produit ne pouvait rien faire.
+    #[test]
+    fn sans_modele_connecte_une_societe_neuve_nest_pas_working() {
+        assert_eq!(
+            verdict(counts(0, 0, 0, None), false, now()),
+            Verdict::Stopped
+        );
+        // Et la présence d'un modèle ne suffit pas non plus à rendre `working`
+        // une société qui rate : le drapeau s'ajoute aux chiffres, il ne les
+        // remplace pas.
+        assert_eq!(
+            verdict(counts(288, 288, 72, Some(96)), true, now()),
+            Verdict::Stopped
+        );
     }
 
     /// L'autre moitié de `stopped`. Une entreprise qui a raté ce matin et que
@@ -348,7 +415,7 @@ mod tests {
     #[test]
     fn sans_tentative_dans_la_fenetre_ce_nest_pas_un_arret() {
         assert_eq!(
-            verdict(counts(20, 20, 0, Some(30)), now()),
+            verdict(counts(20, 20, 0, Some(30)), true, now()),
             Verdict::Degraded
         );
     }
@@ -455,6 +522,31 @@ mod tests {
         id
     }
 
+    /// Une connexion au modèle, écrite directement.
+    ///
+    /// Sans elle le verdict est `stopped` quoi que disent les compteurs, ce qui
+    /// est le sujet de `sans_modele_connecte_une_societe_neuve_nest_pas_working`
+    /// — les tests qui parlent d'autre chose la posent d'abord, pour que ce
+    /// qu'ils mesurent reste ce qu'ils disent mesurer.
+    async fn connect_model(db: &Db, tenant: TenantId) {
+        use agentos_domain::model_access::{ModelAccess, ModelPath};
+        use agentos_domain::policy::ModelId;
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::model_access::save(
+            &mut tx,
+            &ModelAccess {
+                path: ModelPath::ApiKey,
+                model: ModelId::Haiku45,
+                verified_at: Utc::now(),
+            },
+            Some(b"scelle"),
+            Utc::now(),
+        )
+        .await
+        .expect("save model access");
+        tx.commit().await.expect("commit");
+    }
+
     /// Par le même chemin que la boucle : l'écriture est cross-tenant depuis
     /// `admin_tx_bypassing_rls`, la lecture ne l'est pas.
     async fn trace(
@@ -535,13 +627,16 @@ mod tests {
         h.teardown().await;
     }
 
-    /// Une société qui n'a jamais battu répond 200 et `working` : pas de
-    /// bannière le premier matin.
+    /// Une société **montée** qui n'a jamais battu répond 200 et `working` :
+    /// pas de bannière le premier matin. Montée veut dire que son modèle est
+    /// connecté ; sans lui le verdict est `stopped`, ce qui est le sujet de
+    /// `sans_modele_connecte_une_societe_neuve_nest_pas_working`.
     #[tokio::test]
     async fn une_societe_au_repos_reste_working() {
         let Some(h) = Harness::new().await else {
             return;
         };
+        connect_model(&h.db, h.b).await;
         let (status, body) = h.health(SECRET_B).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["verdict"], "working", "{body}");
@@ -552,6 +647,29 @@ mod tests {
         h.teardown().await;
     }
 
+    /// Le même défaut, par la route : une société neuve sans modèle doit dire
+    /// pourquoi elle est arrêtée, et pas seulement qu'elle l'est.
+    #[tokio::test]
+    async fn une_societe_sans_modele_nomme_sa_cause() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (status, body) = h.health(SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["verdict"], "stopped", "{body}");
+        assert_eq!(body["last_failure_code"], "no_model", "{body}");
+        assert!(
+            body["last_failure_detail"]
+                .as_str()
+                .expect("un détail")
+                .contains("POST /v1/model"),
+            "la phrase doit nommer ce qui répare : {body}"
+        );
+        // Et elle ne date pas un échec qui n'a pas eu lieu.
+        assert!(body["last_failure_at"].is_null(), "{body}");
+        h.teardown().await;
+    }
+
     /// RLS. Qu'une entreprise soit à l'arrêt depuis quatre jours est un fait
     /// commercial : un concurrent qui le lirait saurait quand appeler.
     #[tokio::test]
@@ -559,6 +677,10 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
+        // Les deux sont montées : ce test mesure l'étanchéité entre locataires,
+        // pas l'absence de modèle.
+        connect_model(&h.db, h.a).await;
+        connect_model(&h.db, h.b).await;
         let seat = employee(&h.db, h.a, "a-ventes").await;
         trace(
             &h.db,

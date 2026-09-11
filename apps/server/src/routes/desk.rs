@@ -334,7 +334,7 @@ async fn say(
     State(db): State<Db>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Message>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Message>,
 ) -> Result<Response, ApiError> {
     let words = body.body.trim();
     if words.is_empty() {
@@ -511,11 +511,27 @@ impl From<Refusal> for ApiError {
             // one that is not active are one answer on purpose — three
             // distinguishable ones are an org chart a caller can enumerate by
             // asking, which is the silence `resolve_colleague` keeps.
+            //
+            // **What is not a secret is the rule**, and leaving it out cost the
+            // walk of 2026-09-11 the whole gesture. A founder filing a prospect
+            // list and handing it to a seat read "no colleague of that name to
+            // write to", concluded the slug was wrong, and went looking for a
+            // directory that does not exist — when what was missing was the
+            // reporting line between the chair and the seat. The sentence below
+            // says the rule without saying whether the name exists, which keeps
+            // the silence exactly where it was argued for.
             InternalError::Unreachable => Self::conflict(
                 "unreachable_colleague",
                 "no colleague of that name to write to",
             )
-            .with_detail(err.to_string()),
+            .with_detail(format!(
+                "{err}. The rule, which is not a secret: an `order` only travels DOWN this \
+                 chair's reporting line, and a `question` or an `answer` only reaches a seat the \
+                 org chart connects to it. So a slug that is spelled right is still refused when \
+                 nothing links the two — `POST /v1/org` with `reports_to` naming this chair's \
+                 head is what links them, and `GET /v1/teams` shows the chart as it stands. \
+                 Whether that name exists at all is deliberately not answered here."
+            )),
             InternalError::NotAnswerable => {
                 Self::conflict("not_answerable", "that is not a question put to this seat")
                     .with_detail(err.to_string())
@@ -967,6 +983,19 @@ mod tests {
             refused["code"],
             json!("unreachable_colleague"),
             "the org chart is the rule here, not this route: {refused}"
+        );
+        // **And it says which rule, because the rule is not the secret.** A
+        // founder handing a seat a file read only "no colleague of that name",
+        // concluded the slug was wrong, and went hunting for a directory. The
+        // name is still not confirmed or denied; the link is what gets named.
+        let detail = refused["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("reports_to") && detail.contains("/v1/org"),
+            "the refusal must name what links two seats: {refused}"
+        );
+        assert!(
+            !detail.contains("lena"),
+            "and must still not say whether that name exists: {refused}"
         );
 
         // A blank message is a blank line in a brief.

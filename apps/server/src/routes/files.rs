@@ -276,7 +276,7 @@ async fn content(
 async fn deposit(
     State(FilesState { db, embedder }): State<FilesState>,
     principal: Principal,
-    Json(body): Json<Deposit>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Deposit>,
 ) -> Result<Response, ApiError> {
     // All three ends of `files_name_shape` and `files_content_type_shape`, and
     // it has to be all three. Refusing only the empty one left the rest to the

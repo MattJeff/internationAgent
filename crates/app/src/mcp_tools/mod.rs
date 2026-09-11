@@ -216,6 +216,12 @@ mod tests {
                 "/v1/browser/live/{employee_id}",
                 "un flux SSE ; s'y abonner allume la capture d'écran et rendre l'éteindrait",
             ),
+            (
+                "/v1/public-register",
+                "lecture anonyme servie hors de l'étage `api` ; l'exécuteur ne rejoue que \
+                 cet étage-là, donc un outil qui la déclarerait rendrait un 404 nu — voir \
+                 `aucun_outil_ne_pointe_sur_un_chemin_de_letage_public`",
+            ),
         ];
         /// Les préfixes qui ne sont pas des verbes de locataire.
         const NOT_A_TENANT_VERB: &[(&str, &str)] = &[
@@ -292,6 +298,80 @@ mod tests {
         }
     }
 
+    /// **Ce que le test au-dessus ne voyait pas, et qui coûtait un outil mort.**
+    ///
+    /// Il demande qu'un chemin soit monté *quelque part*. L'exécuteur MCP, lui,
+    /// ne rejoue qu'un seul étage — celui que `with_api_stack` enveloppe — et un
+    /// chemin servi hors de cet étage n'y est pas atteignable. Mesuré le
+    /// 2026-09-11 en marchant le chemin du fondateur depuis un terminal :
+    /// `public_register_get` déclarait `/v1/public-register`, servi uniquement
+    /// par `public_register::public_router`, et rendait un **404 nu** — sans
+    /// code, sans phrase — à chaque appel, sur chaque déploiement. Un 404 qu'un
+    /// modèle prend pour sa propre faute est pire qu'un outil absent.
+    ///
+    /// L'étage se lit dans le nom de la fonction qui monte la route : ce dépôt
+    /// appelle `public_router` (et `card_router`) ce qu'il sert sans credential.
+    /// Un chemin qui n'est monté que là, et nulle part dans un `router`
+    /// ordinaire, ne peut pas être un outil.
+    #[test]
+    fn aucun_outil_ne_pointe_sur_un_chemin_de_letage_public() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/server/src/routes");
+        let mut public_only: Vec<String> = Vec::new();
+        let mut behind_a_key: Vec<String> = Vec::new();
+
+        for entry in std::fs::read_dir(dir).expect("les routes du serveur") {
+            let path = entry.expect("entrée").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("lire un module de routes");
+            // Découpé sur les déclarations de fonction : chaque morceau
+            // appartient à la dernière signature vue, et le nom de celle-ci dit
+            // l'étage. `#[cfg(test)]` compris — un module de test qui monte la
+            // route dans un `router` ordinaire dit la même chose que le vrai.
+            let mut sans_credential = false;
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ") {
+                    sans_credential =
+                        trimmed.contains("public_router") || trimmed.contains("card_router");
+                }
+                let Some(at) = trimmed.find(".route(\"") else {
+                    continue;
+                };
+                let rest = &trimmed[at + ".route(\"".len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let route = rest[..end].to_owned();
+                if !route.starts_with("/v1/") {
+                    continue;
+                }
+                if sans_credential {
+                    public_only.push(route);
+                } else {
+                    behind_a_key.push(route);
+                }
+            }
+        }
+        assert!(
+            !public_only.is_empty(),
+            "l'extraction n'a trouvé aucun chemin d'étage public : le format a changé"
+        );
+
+        let unreachable: Vec<&str> = registry()
+            .iter()
+            .map(|tool| tool.path)
+            .filter(|path| {
+                public_only.iter().any(|route| route == path)
+                    && !behind_a_key.iter().any(|route| route == path)
+            })
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "ces chemins ne sont servis que sur l'étage public, que l'exécuteur MCP ne rejoue \
+             pas : un outil qui les déclare rend un 404 nu à chaque appel. {unreachable:#?}"
+        );
+    }
+
     /// Les seuls derniers segments qu'un nom d'outil peut porter.
     ///
     /// Fermée exprès. Une liste ouverte — « le dernier segment doit être un
@@ -344,6 +424,13 @@ mod tests {
         "release",
         "reassign",
         "amend",
+        // Soumettre à quelqu'un d'autre ce qu'il décidera. Ajouté le 2026-09-11
+        // pour `content_drafts_propose`, et il a fallu qu'aucun des trente
+        // autres ne dise le geste : `publish` et `post` promettent que c'est en
+        // ligne, `send` qu'il n'y a rien à décider, `create` et `add` que c'est
+        // chez nous. Une pull request est les trois contraires — chez le
+        // client, pas en ligne, et elle attend qu'une personne tranche.
+        "propose",
     ];
 
     /// `domaine[_objet]_verbe` : au moins deux segments, et le dernier est un

@@ -78,6 +78,65 @@ fn employee_id_only(what: &'static str) -> Value {
     })
 }
 
+/// Le corps d'un organigramme, écrit **une seule fois**.
+///
+/// `POST /v1/org` le prend tel quel et `POST /v1/companies` le porte sous sa
+/// clé `org` : deux portes, une forme. Elle était décrite en entier d'un côté
+/// et réduite à `{"type": "object"}` de l'autre — donc le tout premier appel du
+/// fondateur, celui qui monte la société, n'indiquait nulle part ce qu'est une
+/// ligne. Mesuré le 2026-09-11 en marchant le chemin depuis un terminal : un
+/// modèle qui lit `tools/list` et rien d'autre envoie `{"team": …, "employee":
+/// …}` et lit un 400. `les_deux_portes_de_lorganigramme_decrivent_la_meme_ligne`
+/// refuse désormais qu'elles divergent.
+fn org_body() -> Value {
+    json!({
+        "type": "object",
+        "description": "L'organigramme : une ligne par fonction, chacune nommant son équipe, sa mission, son responsable et, sauf pour la ligne du sommet, à qui elle rend compte.",
+        "properties": {
+            "domain": {
+                "type": "string",
+                "description": "Le domaine d'envoi donné aux employés que cet appel embauche. Ignoré pour un employé déjà existant, dont l'adresse a été frappée à sa création.",
+            },
+            "rows": {
+                "type": "array",
+                "maxItems": 500,
+                "description": "Une ligne par fonction, dans n'importe quel ordre : tous les sièges sont résolus avant qu'une seule ligne hiérarchique soit tracée, donc le CEO peut être la dernière ligne.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "team": {
+                            "type": "string",
+                            "description": "La fonction comme handle : le slug de l'équipe, et l'identité sur laquelle le document est ré-apparié. C'est aussi le `role_name` sous lequel ses limites seront lues **si l'équipe est neuve** ; le pointeur d'une équipe existante n'est jamais déplacé ici.",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "La fonction telle que l'opérateur l'écrit : « Produit et technologie ».",
+                        },
+                        "mission": {
+                            "type": "string",
+                            "description": "Ce à quoi sert cette fonction. De la prose, jamais une limite.",
+                        },
+                        "head": {
+                            "type": "string",
+                            "description": "Le responsable comme handle : le slug de l'employé. Un employé que ce locataire n'a pas encore est embauché.",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Le responsable tel que l'opérateur l'écrit : « CFO externalisé ». Texte d'affichage ; rien ne s'y résout et rien n'y est accordé.",
+                        },
+                        "reports_to": {
+                            "type": "string",
+                            "description": "Le `head` d'une autre ligne du même document. Absent : un siège sans personne au-dessus, ce à quoi ressemble la ligne du CEO.",
+                        },
+                    },
+                    "required": ["team", "name", "mission", "head", "title"],
+                },
+            },
+        },
+        "required": ["rows"],
+    })
+}
+
 /// Les lignes de ce domaine.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -147,6 +206,46 @@ pub fn tools() -> Vec<ToolDef> {
             &[],
             Risk::Destructive,
         ),
+        // -------------------------------------------------------------------
+        // Les humains : qui, chez le client, peut engager la société
+        // -------------------------------------------------------------------
+        t(
+            "console_accounts_role_set",
+            "Qui, parmi vos humains, peut engager la société",
+            "Donne ou retire le rôle `owner` à une personne de votre entreprise, désignée par \
+             l'adresse avec laquelle elle ouvre la console. Un `owner` peut tout : approuver un \
+             paiement, arrêter l'entreprise, résilier un siège, brancher le modèle, émettre une \
+             clé, déplacer un plafond. Un `member` lit tout et écrit ce qui n'engage rien — une \
+             tâche, un rendez-vous, un brouillon, un message à un siège. À ne pas confondre avec \
+             `policy_role_set`, qui borne ce qu'un employé **logiciel** fait tout seul ; celui-ci \
+             dit ce qu'un **humain** a le droit de décider. Trois pièges : la personne doit déjà \
+             avoir un compte (c'est le fournisseur qui le crée, pas cet outil, et une adresse \
+             inconnue rend 404) ; le dernier `owner` actif ne peut pas se rétrograder, sinon plus \
+             personne ne pourrait rendre le rôle ; et le changement est senti par la requête \
+             suivante, sans reconnexion.",
+            Method::Put,
+            "/v1/console/accounts/role",
+            json!({
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "l'adresse avec laquelle cette personne ouvre la console"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["owner", "member"],
+                        "description": "`owner` : tout, y compris donner ce rôle. `member` : \
+                                        tout ce qui n'engage ni l'argent ni l'existence de la \
+                                        société"
+                    },
+                },
+                "required": ["email", "role"],
+            }),
+            &[],
+            // Rétrograder retire un droit, et c'est bien un `set` qui remplace.
+            Risk::Destructive,
+        ),
         t(
             "company_health_get",
             "Est-ce que cette société travaille encore ?",
@@ -167,22 +266,16 @@ pub fn tools() -> Vec<ToolDef> {
             &[],
             Risk::Read,
         ),
-        t(
-            "public_register_get",
-            "Lire le registre public : ce que les gates des entreprises consentantes ont arrêté",
-            "Rend le tableau public, en temps réel, de ce que les politiques ont refusé chez les \
-             entreprises qui l'ont accepté. Sert à situer la vôtre, et à répondre à « à quoi sert \
-             la gate » par un chiffre plutôt que par une phrase. Lecture publique : aucune donnée \
-             d'un locataire n'y figure sans son consentement explicite, et une entreprise qui n'a \
-             rien accepté n'apparaît pas, même agrégée. Le consentement de cette société-ci se \
-             bascule avec `public_register_consent_set`, et ce que sa propre gate a refusé se lit \
-             sur `refusals_get`.",
-            Method::Get,
-            "/v1/public-register",
-            nothing(),
-            &[],
-            Risk::Read,
-        ),
+        // Il n'y a **pas** de ligne pour `GET /v1/public-register`, et c'est une
+        // correction plutôt qu'un oubli. Mesuré le 2026-09-11 depuis un
+        // terminal : l'outil qui existait ici rendait un 404 nu à chaque appel,
+        // sur chaque déploiement. La raison est structurelle — cette lecture est
+        // montée sur l'étage **public** du serveur (`public_register::public_router`,
+        // sans credential, parce qu'un anonyme doit pouvoir la lire), et
+        // l'exécuteur MCP ne rejoue que l'étage `api`. Un chemin qui n'est pas
+        // dans cet étage-là n'est pas atteignable, quoi que la table déclare.
+        // `aucun_outil_ne_pointe_sur_un_chemin_de_letage_public` refuse
+        // désormais la ligne qu'on rajouterait par distraction.
         t(
             "public_register_consent_set",
             "Décider si cette société figure au registre public",
@@ -191,7 +284,9 @@ pub fn tools() -> Vec<ToolDef> {
              réglage : à `true`, un chiffre tiré de vos refus devient visible de n'importe qui. La \
              bascule et sa ligne d'audit sont écrites dans la même transaction, donc un registre \
              qui montre une entreprise montre aussi quand elle a dit oui. Ce que la bascule publie \
-             se relit sur `public_register_get`.",
+             se relit sur `GET /v1/public-register`, qui n'a **pas** d'outil ici parce que c'est \
+             une lecture anonyme, servie hors de l'étage que ce serveur rejoue : elle s'ouvre dans \
+             un navigateur ou avec `curl`, sans clé.",
             Method::Post,
             "/v1/public-register/consent",
             json!({
@@ -215,9 +310,12 @@ pub fn tools() -> Vec<ToolDef> {
             "Créer la société : organigramme, limites par rôle et date d'arrêt, en un appel",
             "Monte une société entière — la ligne « tenant », l'organigramme complet, une couche \
              de limites par rôle, et l'instant où ses agents s'arrêtent — en une seule \
-             transaction. À utiliser une fois, sur une société qui n'existe pas encore : elle ne \
-             remplace jamais rien, un rôle dont la couche diffère est un 409 `role_layer_exists` \
-             et une fenêtre différente un 409 `window_exists`. Trois refus, avant toute écriture : \
+             transaction. **Se rejoue** : la route converge au lieu de dupliquer, et c'est la seule \
+             façon de poser la **première** couche d'un rôle qui n'en a pas — `policy_role_set` \
+             retouche une couche existante, il n'en crée pas. Elle ne remplace jamais rien : un \
+             rôle dont la couche diffère est un 409 `role_layer_exists` et une fenêtre différente \
+             un 409 `window_exists`, donc un rejeu qui n'ajoute qu'un rôle passe et un rejeu qui \
+             en modifie un est refusé. Trois refus, avant toute écriture : \
              `window_ends_at` est obligatoire et sans défaut (une durée serait un prix que \
              personne ici n'a le droit d'inventer), chaque `team` cité dans `org.rows` doit avoir \
              son entrée dans `roles` (une couche absente hérite du plafond, donc un siège sans \
@@ -239,15 +337,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "La société telle qu'on l'écrit : « Orizn ».",
                     },
-                    "org": {
-                        "type": "object",
-                        "description": "L'organigramme, exactement la forme que prend `org_apply` : `{ domain?, rows: [...] }`.",
-                        "properties": {
-                            "domain": { "type": "string" },
-                            "rows": { "type": "array", "items": { "type": "object" } },
-                        },
-                        "required": ["rows"],
-                    },
+                    // Le corps d'`org_apply` mot pour mot, parce que c'est le
+                    // même document : le décrire à moitié ici laissait le
+                    // premier appel du fondateur sans forme de ligne.
+                    "org": org_body(),
                     "window_ends_at": {
                         "type": "string",
                         "format": "date-time",
@@ -414,51 +507,7 @@ pub fn tools() -> Vec<ToolDef> {
              `reporting_cycle` si une ligne ferme une boucle. 500 lignes au plus.",
             Method::Post,
             "/v1/org",
-            json!({
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Le domaine d'envoi donné aux employés que cet appel embauche. Ignoré pour un employé déjà existant, dont l'adresse a été frappée à sa création.",
-                    },
-                    "rows": {
-                        "type": "array",
-                        "maxItems": 500,
-                        "description": "Une ligne par fonction, dans n'importe quel ordre : tous les sièges sont résolus avant qu'une seule ligne hiérarchique soit tracée, donc le CEO peut être la dernière ligne.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "team": {
-                                    "type": "string",
-                                    "description": "La fonction comme handle : le slug de l'équipe, et l'identité sur laquelle le document est ré-apparié. C'est aussi le `role_name` sous lequel ses limites seront lues **si l'équipe est neuve** ; le pointeur d'une équipe existante n'est jamais déplacé ici.",
-                                },
-                                "name": {
-                                    "type": "string",
-                                    "description": "La fonction telle que l'opérateur l'écrit : « Produit et technologie ».",
-                                },
-                                "mission": {
-                                    "type": "string",
-                                    "description": "Ce à quoi sert cette fonction. De la prose, jamais une limite.",
-                                },
-                                "head": {
-                                    "type": "string",
-                                    "description": "Le responsable comme handle : le slug de l'employé. Un employé que ce locataire n'a pas encore est embauché.",
-                                },
-                                "title": {
-                                    "type": "string",
-                                    "description": "Le responsable tel que l'opérateur l'écrit : « CFO externalisé ». Texte d'affichage ; rien ne s'y résout et rien n'y est accordé.",
-                                },
-                                "reports_to": {
-                                    "type": "string",
-                                    "description": "Le `head` d'une autre ligne du même document. Absent : un siège sans personne au-dessus, ce à quoi ressemble la ligne du CEO.",
-                                },
-                            },
-                            "required": ["team", "name", "mission", "head", "title"],
-                        },
-                    },
-                },
-                "required": ["rows"],
-            }),
+            org_body(),
             &[],
             Risk::Write,
         ),
@@ -845,7 +894,16 @@ pub fn tools() -> Vec<ToolDef> {
              question précise** : il porte l'`id` d'un message lu sur `desk_messages_list`, il est \
              obligatoire pour `kind: \"answer\"` et ignoré par les deux autres. Un siège que cette \
              société n'a pas est un 404 ; tout ce que l'organigramme, la question ou le budget \
-             refusent est un 409 nommé.",
+             refusent est un 409 nommé. **Deux choses à monter avant le premier message, et \
+             aucune des deux ne se devine.** Un fauteuil : il n'en existe aucun sur une société \
+             neuve — c'est un siège d'une équipe dont `policy_role_set` met `max_turns_per_day` à \
+             zéro, et `company_create` est ce qui écrit la première couche d'un rôle. Et la ligne \
+             hiérarchique : un `order` ne descend que la ligne du fauteuil, une `question` ne \
+             joint qu'un siège que l'organigramme relie à lui — sans ce lien, un slug pourtant \
+             juste rend un 409 `unreachable_colleague` qui se lit comme « ce nom n'existe pas ». \
+             `org_apply` avec `reports_to` est ce qui pose le lien. Joindre un fichier à un \
+             message est la seule façon de faire lire un document à un employé : le déposer avec \
+             `files_create`, le nommer dans `attachments`.",
             Method::Post,
             "/v1/employees/{id}/desk",
             json!({
@@ -1361,7 +1419,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "objective": {
                         "type": "object",
-                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire), `market`, `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiatives_get` rend la question en `clarify` plutôt qu'un refus.",
+                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire, l'un de `airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line` — **ce n'est pas la liste de `prospects_segments_list`**, qui en admet huit, épelle la croisière `cruise` et connaît `tmc`, `relocation` et `other` ; une valeur de là rend un 400 `objective_field`), `market` (code pays ISO-3166 à deux lettres, `FR` et non `France`), `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiatives_get` rend la question en `clarify` plutôt qu'un refus.",
                         "properties": {
                             "role": {
                                 "type": "string",
@@ -1621,7 +1679,7 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 17] = [
+    const ROUTE_SOURCES: [&str; 18] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
@@ -1642,6 +1700,11 @@ mod tests {
         include_str!("../../../../apps/server/src/routes/public_register.rs"),
         include_str!("../../../../apps/server/src/routes/health.rs"),
         include_str!("../../../../apps/server/src/routes/keys.rs"),
+        // Les comptes humains, ajoutés le 2026-09-11 avec le rôle de console :
+        // deux des trois routes de ce fichier sont sur l'étage public et ne
+        // sont donc pas des verbes de locataire, mais la troisième — celle qui
+        // donne le rôle — en est un et a son outil.
+        include_str!("../../../../apps/server/src/routes/accounts.rs"),
     ];
 
     /// Tout chemin passé à un `.route(` dans ces sources.
@@ -1938,6 +2001,72 @@ mod tests {
             "company_create",
             &["slug", "name", "org", "window_ends_at", "roles"],
         );
+    }
+
+    /// **Deux listes fermées portent le même nom, et une seule est offerte.**
+    ///
+    /// Mesuré le 2026-09-11 : le geste « lancer une campagne » fait lire
+    /// `prospects_segments_list` (huit valeurs, la CHECK de la base), puis poser
+    /// un objectif `sales-development` — dont le `segment` est une *autre* liste
+    /// de cinq, qui épelle la croisière `cruise_line` et ignore `tmc`,
+    /// `relocation` et `other`. Un modèle qui enchaîne les deux comme la carte
+    /// l'y invite lit un 400. Le schéma d'`initiatives_set` ne peut pas porter
+    /// un `enum` — l'objectif est une union étiquetée dans un objet libre — donc
+    /// la liste est dans la phrase, et ce test la tient collée au code.
+    #[test]
+    fn lobjectif_commercial_nomme_sa_propre_liste_de_segments() {
+        let schema = &tool_named("initiatives_set").schema;
+        let dit = schema["properties"]["objective"]["description"]
+            .as_str()
+            .expect("l'objectif décrit ses champs");
+        for segment in crate::rolepack_sales::Segment::ALL {
+            assert!(
+                dit.contains(segment.code()),
+                "initiatives_set doit nommer le segment {} qu'il accepte",
+                segment.code()
+            );
+        }
+        // Et l'autre porte prévient qu'elle n'est pas celle-là. Depuis le
+        // registre entier : elle vit dans `commerce`, et c'est justement la
+        // distance entre les deux modules qui a laissé les listes diverger.
+        let autre = crate::mcp_tools::registry()
+            .into_iter()
+            .find(|tool| tool.name == "prospects_segments_list")
+            .expect("prospects_segments_list est au registre")
+            .description;
+        assert!(
+            autre.contains("cruise_line") && autre.contains("initiatives_set"),
+            "prospects_segments_list doit dire que sa liste n'est pas celle d'un objectif"
+        );
+    }
+
+    /// **Le tout premier appel du fondateur décrit ce qu'il demande.**
+    ///
+    /// `company_create.org` et le corps d'`org_apply` sont le même document,
+    /// lu par la même fonction du serveur. Le premier le réduisait à
+    /// `{"type": "object"}` : un modèle qui n'a que `tools/list` ne pouvait pas
+    /// savoir qu'une ligne porte `team`, `name`, `mission`, `head` et `title`,
+    /// et devait apprendre la forme d'un 400. Les deux doivent rester
+    /// identiques, pas seulement « compatibles » — une seule des deux tenue à
+    /// jour est exactement le défaut d'origine.
+    #[test]
+    fn les_deux_portes_de_lorganigramme_decrivent_la_meme_ligne() {
+        let porte_editrice = &tool_named("org_apply").schema;
+        let porte_dentree = &tool_named("company_create").schema["properties"]["org"];
+        assert_eq!(
+            porte_dentree, porte_editrice,
+            "`company_create.org` doit être le corps d'`org_apply`, au caractère près"
+        );
+        // Et la forme décrite est bien celle d'une ligne, pas un objet vide.
+        let colonnes = porte_dentree["properties"]["rows"]["items"]["properties"]
+            .as_object()
+            .expect("une ligne décrit ses colonnes");
+        for colonne in ["team", "name", "mission", "head", "title", "reports_to"] {
+            assert!(
+                colonnes.contains_key(colonne),
+                "une ligne d'organigramme doit décrire {colonne}"
+            );
+        }
     }
 
     #[test]

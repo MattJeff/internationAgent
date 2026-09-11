@@ -78,7 +78,7 @@ use agentos_store::audit::AuditActor;
 use agentos_store::db::Db;
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ring::pbkdf2;
@@ -383,6 +383,243 @@ pub(crate) fn unauthorized() -> Response {
         HeaderValue::from_static("Bearer realm=\"agentos\""),
     );
     response
+}
+
+// ---------------------------------------------------------------------------
+// Le rôle de l'humain qui appelle
+// ---------------------------------------------------------------------------
+
+/// **Les gestes qu'une personne sans le rôle propriétaire peut faire.**
+///
+/// # Pourquoi la liste est dans ce sens
+///
+/// L'autre sens est le réflexe : lister les routes qui engagent la société et
+/// refuser celles-là. Il a un défaut qui ne se voit qu'une fois — **l'oubli
+/// laisse la porte ouverte**. Une route ajoutée la vague prochaine, qui déplace
+/// un plafond ou signe un contrat, n'est dans aucune liste et n'est donc
+/// refusée à personne ; rien ne rougit, et le trou se découvre chez un client.
+/// Soixante-et-une routes de ce déploiement engagent l'argent ou l'existence de
+/// la société aujourd'hui, contre vingt-et-une qui écrivent sans engager : la
+/// liste courte est aussi celle qui se tient à jour.
+///
+/// Ici l'oubli ferme une porte. Une route d'écriture anodine ajoutée demain et
+/// non listée est refusée à un membre, qui lit une phrase qui dit exactement
+/// quoi demander et à qui — et un propriétaire, lui, continue de passer. C'est
+/// la règle que `agentos_app::gate` applique un étage plus bas et pour la même
+/// raison : *un déploiement sans couche plateforme n'a pas de plafond à faire
+/// respecter, donc la gate refuse tout jusqu'à ce qu'un opérateur en installe
+/// une — l'autre choix est un déploiement mal configuré qui est silencieusement
+/// permissif.*
+///
+/// # Ce qui est dedans, et la seule ligne qui s'est discutée
+///
+/// Ce qui s'écrit et se corrige en le refaisant : un carnet de tâches, un
+/// rendez-vous, un brouillon, une question de contenu, une équipe et sa
+/// mission, un document, un fichier, une liste de prospects, les pas d'une
+/// séquence (qui n'envoie rien elle-même), une cible de croissance. Plus trois
+/// `POST` qui sont des lectures que HTTP ne sait pas dire autrement : la
+/// prévisualisation d'un post, la découverte des outils d'un serveur MCP, et la
+/// sonde d'un proxy.
+///
+/// `POST /v1/employees/{id}/desk` est la ligne qui s'est discutée : écrire à un
+/// siège le réveille, et un tour coûte de l'argent. Elle reste ouverte parce
+/// que c'est *le* geste du deuxième humain — répondre sur le fil — et parce que
+/// la dépense qu'elle déclenche est déjà bornée deux fois sans elle : le budget
+/// de tours du siège (409 quand il est épuisé) et la gate, qui refuse tout
+/// paiement au-delà des plafonds. Un membre ne peut pas déplacer ces deux
+/// bornes-là ; c'est ce que la liste protège.
+///
+/// Les lectures ne sont pas ici : **toutes** sont ouvertes à un membre, et
+/// c'est un choix. Le rôle existe pour empêcher quelqu'un d'engager la société,
+/// pas pour cloisonner ce qu'un collègue à qui on a déjà donné un mot de passe
+/// a le droit de voir. `GET /v1/files/content` rend les octets d'un contrat
+/// signé : le jour où un client veut cloisonner ça, c'est un troisième rôle et
+/// c'est une autre conversation.
+const MEMBER_WRITES: &[(&str, &str)] = &[
+    ("POST", "/v1/work"),
+    ("PUT", "/v1/work/{id}"),
+    ("POST", "/v1/calendar"),
+    ("POST", "/v1/employees/{id}/desk"),
+    ("POST", "/v1/content/questions"),
+    ("DELETE", "/v1/content/questions/{id}"),
+    ("POST", "/v1/content/drafts"),
+    ("PUT", "/v1/content/drafts/{id}"),
+    ("POST", "/v1/prospects/import"),
+    ("POST", "/v1/sequences"),
+    ("DELETE", "/v1/sequences/{id}"),
+    ("POST", "/v1/knowledge/documents"),
+    ("POST", "/v1/files"),
+    ("POST", "/v1/teams"),
+    ("POST", "/v1/teams/{team_id}/sections"),
+    ("PUT", "/v1/teams/{team_id}/mission"),
+    ("PUT", "/v1/growth/target"),
+    // Les trois `POST` qui ne changent rien chez nous.
+    ("POST", "/v1/social/preview"),
+    ("POST", "/v1/mcp/servers/{server}/discover"),
+    ("POST", "/v1/browser/proxy/check"),
+];
+
+/// Est-ce qu'un membre a le droit de jouer ce couple ?
+///
+/// Une fonction pure, testée sur la liste complète des routes qui engagent —
+/// écrite en toutes lettres dans le test, jamais dérivée de [`MEMBER_WRITES`],
+/// sans quoi le test dirait seulement que la table est égale à elle-même.
+fn member_may(method: &axum::http::Method, matched_path: &str) -> bool {
+    // `HEAD` est un `GET` sans corps et `OPTIONS` est du CORS. Aucune des trois
+    // ne change quoi que ce soit.
+    if matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return true;
+    }
+    MEMBER_WRITES
+        .iter()
+        .any(|(verb, path)| method == verb && *path == matched_path)
+}
+
+/// Le compte de console que ce credential est, s'il en est un.
+///
+/// L'étiquette porte déjà l'identité : `agentos_store::api_keys::session_label`
+/// écrit `session-<uuid>` et documente que c'est *la* propriété du format. On
+/// la relit ici plutôt que d'ajouter un champ à [`Principal`] — et ce n'est pas
+/// de la paresse, c'est ce qui fait que **la lecture ne paie rien** : le rôle
+/// n'est lu que sur les appels qui engagent, donc jamais sur un `GET`, qui est
+/// tout ce que la console fait en boucle.
+///
+/// `None` pour tout le reste : une clé de l'environnement, une clé
+/// d'intégration d'un client, un employé, le système. Voir
+/// [`require_console_role`] pour pourquoi ceux-là sont propriétaires.
+fn console_account_of(actor: &AuditActor) -> Option<uuid::Uuid> {
+    let AuditActor::Operator(label) = actor else {
+        return None;
+    };
+    label
+        .strip_prefix(agentos_store::api_keys::SESSION_LABEL_PREFIX)
+        .and_then(|rest| rest.parse().ok())
+}
+
+/// Le rôle de ce credential, pour qui veut l'afficher plutôt que le faire
+/// respecter.
+///
+/// `Ok(None)` couvre les deux « pas de rôle » que [`require_console_role`]
+/// sépare — ce n'est pas une session de console, ou c'est une session dont la
+/// ligne ne se lit pas — parce que l'appelant qui affiche n'a rien à décider
+/// entre les deux : les deux se rendent `null`. Le seul appelant est
+/// `GET /v1/whoami`.
+pub(crate) async fn console_role_of(
+    db: &Db,
+    principal: &Principal,
+) -> Result<Option<agentos_store::accounts::ConsoleRole>, agentos_store::db::StoreError> {
+    match console_account_of(&principal.actor) {
+        Some(account_id) => agentos_store::accounts::role_of(db, account_id).await,
+        None => Ok(None),
+    }
+}
+
+/// Le refus, et il nomme le droit qui manque et qui peut le donner.
+///
+/// Un 403 nu envoie la personne demander au support ce que cette phrase lui
+/// dit. `code` reste un littéral à faible cardinalité (`error.rs`, règle 2), le
+/// `detail` dit quoi faire, et les deux membres d'extension sont là pour la
+/// console : elle peut griser le bouton *avant* le clic et écrire la même
+/// phrase que nous, comme `approbations/Queue.tsx` le fait déjà pour
+/// `role_required`.
+fn not_the_owner() -> Response {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "owner_role_required",
+        "this console account does not hold the owner role",
+    )
+    .with_detail(
+        "Ce geste engage l'argent ou l'existence de la société : seul un compte `owner` de ce \
+         locataire peut l'appeler. La lecture vous reste entière, ainsi que les écritures qui \
+         n'engagent rien. Pour l'obtenir, demandez à un `owner` d'appeler `PUT \
+         /v1/console/accounts/role` (outil MCP `console_accounts_role_set`) avec votre adresse et \
+         `\"role\": \"owner\"`.",
+    )
+    .with_extension("required_role", serde_json::json!("owner"))
+    .into_response()
+}
+
+/// **Le seul endroit qui décide de ce qu'un humain a le droit de faire.**
+///
+/// Posé dans `with_api_stack`, juste sous [`require_api_key`], donc au-dessus
+/// de tout ce qui lit ou écrit les données d'un locataire — y compris des
+/// outils MCP, que `routes::mcp_server` rejoue **dans ce routeur-ci** avec
+/// l'en-tête `Authorization` du client. Un outil n'est donc pas une deuxième
+/// porte : c'est la même.
+///
+/// Une couche plutôt qu'un extracteur `Owner` que les gestionnaires
+/// concernés extrairaient : les deux sont un seul endroit où la règle est
+/// écrite, mais l'extracteur se *nomme* soixante-et-une fois, et une route
+/// ajoutée sans lui est une route ouverte. Ici, une route ajoutée sans rien est
+/// une route fermée aux membres. C'est la même différence qu'entre les deux
+/// sens de [`MEMBER_WRITES`], au niveau du dessus.
+///
+/// # Ce que la couche lit, et quand
+///
+/// Rien, tant que le geste n'engage pas. `member_may` répond sur la méthode et
+/// le chemin **routé** (`MatchedPath`, donc `/v1/employees/{id}/desk` et pas
+/// l'uuid), et la base n'est touchée que sur les appels qui restent. Sur
+/// ceux-là, une égalité sur la clé primaire de `console_accounts`, sans cache,
+/// pour que retirer un rôle soit senti par la requête suivante.
+///
+/// # Qui est propriétaire sans avoir de ligne
+///
+/// Les credentials qui ne sont pas des sessions de console : les clés de
+/// `AGENTOS_API_KEYS`, qui sont celles de l'opérateur du déploiement, et les
+/// clés d'intégration qu'un locataire s'émet pour son propre Claude Code. Elles
+/// n'ont pas de compte humain derrière, donc pas de rôle à lire, et les
+/// rétrograder couperait l'intégration de chaque client le jour du déploiement.
+/// C'est le même argument que le `DEFAULT 'owner'` de la migration, une couche
+/// plus haut : une politique se resserre depuis un état qui marche.
+pub async fn require_console_role(State(db): State<Db>, req: Request, next: Next) -> Response {
+    let matched = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    // Pas de `MatchedPath` : la requête n'a été routée nulle part, elle finira
+    // en 404. On la laisse passer vers ce 404 plutôt que d'inventer un 403 sur
+    // un chemin qui n'existe pas — dire « il vous manque un droit » sur une
+    // URL fautive envoie chercher un rôle au lieu d'une faute de frappe.
+    let Some(matched) = matched else {
+        return next.run(req).await;
+    };
+
+    if member_may(req.method(), &matched) {
+        return next.run(req).await;
+    }
+
+    let Some(principal) = req.extensions().get::<Principal>() else {
+        // Cette couche est sous `require_api_key`, qui en pose un ou refuse.
+        // Y arriver sans principal veut dire qu'on l'a montée ailleurs, et le
+        // silence ici serait une route qui n'a jamais eu de rôle à vérifier.
+        tracing::error!("require_console_role runs without require_api_key above it");
+        return unauthorized();
+    };
+
+    let Some(account_id) = console_account_of(&principal.actor) else {
+        return next.run(req).await;
+    };
+
+    match agentos_store::accounts::role_of(&db, account_id).await {
+        Ok(Some(agentos_store::accounts::ConsoleRole::Owner)) => next.run(req).await,
+        Ok(Some(agentos_store::accounts::ConsoleRole::Member)) => not_the_owner(),
+        // Pas de ligne, ou un mot que ce binaire ne connaît pas. La première
+        // est un état que rien ne produit — désactiver un compte supprime sa
+        // session dans la même transaction (`0089`) — et la seconde est un
+        // binaire en retard sur sa base. Les deux se refusent : deviner
+        // « propriétaire » ici, c'est ouvrir la société sur une ligne qu'on n'a
+        // pas su lire.
+        Ok(None) => {
+            tracing::warn!(%account_id, "a console session resolves to no readable role");
+            not_the_owner()
+        }
+        // Jamais un 403 : une base en panne qui se lit comme un droit manquant
+        // envoie tout le monde réclamer un rôle qu'il a déjà.
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,5 +1553,283 @@ mod tests {
         assert!(keys.is_empty());
         assert!(keys.lookup(SECRET).is_none());
         assert!(keys.lookup("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Le rôle de console
+    // -----------------------------------------------------------------------
+
+    /// **Les soixante-et-une routes qui engagent l'argent ou l'existence de la
+    /// société, écrites en toutes lettres.**
+    ///
+    /// Écrites, et pas dérivées de [`MEMBER_WRITES`] : une liste construite à
+    /// partir de la table que la table est censée décider serait l'assertion
+    /// « la table est égale à elle-même », qui ne peut pas rougir. Celle-ci
+    /// rougit dans les deux sens qui comptent — si quelqu'un ouvre une de ces
+    /// routes aux membres, et si quelqu'un renomme un chemin sans le dire.
+    const ENGAGES_THE_COMPANY: &[(&str, &str)] = &[
+        // Les credentials
+        ("POST", "/v1/keys"),
+        ("DELETE", "/v1/keys/{id}"),
+        // Les sièges : en créer un achète onze ressources, en résilier un les rend
+        ("POST", "/v1/employees"),
+        ("POST", "/v1/employees/{id}/suspend"),
+        ("POST", "/v1/employees/{id}/resume"),
+        ("POST", "/v1/employees/{id}/terminate"),
+        ("POST", "/v1/companies"),
+        ("POST", "/v1/org"),
+        // Le domaine d'envoi : la réputation d'expéditeur du client
+        ("POST", "/v1/domain"),
+        ("POST", "/v1/domain/verify"),
+        ("POST", "/v1/domain/dns"),
+        ("PUT", "/v1/domains/{domain}/cap"),
+        ("DELETE", "/v1/domains/{domain}"),
+        // L'existence même
+        ("POST", "/v1/halt"),
+        ("DELETE", "/v1/halt"),
+        ("PUT", "/v1/window"),
+        ("PUT", "/v1/employees/{id}/initiative"),
+        // L'argent qu'on approuve, et les plafonds qui le bornent
+        ("POST", "/v1/approvals/{id}/approve"),
+        ("POST", "/v1/approvals/{id}/deny"),
+        ("POST", "/v1/capability-requests/decide"),
+        ("PUT", "/v1/employees/{id}/spend-caps"),
+        ("PUT", "/v1/policy/roles/{role}"),
+        ("PUT", "/v1/teams/{team_id}/budget"),
+        ("PUT", "/v1/teams/{team_id}/policy-role"),
+        ("POST", "/v1/teams/{team_id}/members"),
+        ("PUT", "/v1/teams/{team_id}/members/{employee_id}"),
+        ("DELETE", "/v1/teams/{team_id}/members/{employee_id}"),
+        // De qui est la facture du modèle, et par où sort le navigateur
+        ("POST", "/v1/model"),
+        ("PUT", "/v1/browser/proxy"),
+        ("DELETE", "/v1/browser/proxy"),
+        // Les outils que les sièges ont le droit d'appeler
+        ("POST", "/v1/mcp/connect"),
+        ("POST", "/v1/mcp/servers"),
+        ("DELETE", "/v1/mcp/servers/{server}"),
+        ("PUT", "/v1/mcp/servers/{server}/tools/{tool}"),
+        ("POST", "/v1/mcp/oauth/start"),
+        // Ce qui sort devant des tiers
+        ("POST", "/v1/social/accounts/connect"),
+        ("POST", "/v1/social/posts"),
+        ("POST", "/v1/public-register/consent"),
+        ("PUT", "/v1/employees/{id}/booking"),
+        ("POST", "/v1/sequences/{id}/enroll"),
+        ("POST", "/v1/employees/{id}/queue/export"),
+        ("POST", "/v1/content/questions/{id}/measure"),
+        ("POST", "/v1/employees/{id}/interview"),
+        ("POST", "/a2a/jsonrpc"),
+        // Les livres
+        ("POST", "/v1/invoices/{id}/paid"),
+        ("POST", "/v1/invoices/{id}/credit"),
+        ("PUT", "/v1/invoices/issuer"),
+        ("POST", "/v1/quotes/{id}/accepted"),
+        ("POST", "/v1/quotes/{id}/declined"),
+        // Les numéros
+        ("POST", "/v1/pool/numbers"),
+        ("POST", "/v1/pool/numbers/{id}/reassign"),
+        // Et le rôle lui-même : sans cette ligne, un membre se promeut
+        ("PUT", "/v1/console/accounts/role"),
+    ];
+
+    /// **Aucune de ces routes n'est jouable sans le rôle, et les autres le
+    /// sont.**
+    ///
+    /// La deuxième moitié est la garde : sans elle, un `member_may` qui
+    /// rendrait `false` partout passerait la première et aurait tout fermé, y
+    /// compris la lecture.
+    #[test]
+    fn a_member_may_not_touch_what_engages_the_company_and_may_touch_the_rest() {
+        for (verb, path) in ENGAGES_THE_COMPANY {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(
+                !member_may(&method, path),
+                "{verb} {path} engage la société et un membre peut l'appeler"
+            );
+        }
+
+        // La garde. Les lectures d'abord — toutes ouvertes, y compris celles
+        // des chemins ci-dessus.
+        for (verb, path) in [
+            ("GET", "/v1/halt"),
+            ("GET", "/v1/keys"),
+            ("GET", "/v1/employees/{id}/spend-caps"),
+            ("HEAD", "/v1/pnl"),
+        ] {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(member_may(&method, path), "{verb} {path}");
+        }
+        // Puis les écritures qui n'engagent rien, telles que la table les
+        // nomme : celle-ci peut se lire depuis `MEMBER_WRITES` sans rien
+        // affaiblir, puisque l'assertion qui compte est celle du dessus.
+        for (verb, path) in MEMBER_WRITES {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(member_may(&method, path), "{verb} {path}");
+        }
+
+        // Une route d'écriture que personne n'a classée est fermée aux
+        // membres, pas ouverte. C'est le sens de la liste, et c'est ce qui
+        // rend une vague future sûre par défaut.
+        assert!(!member_may(
+            &axum::http::Method::POST,
+            "/v1/quelque-chose-que-personne-na-encore-ecrit"
+        ));
+    }
+
+    /// L'étiquette d'une session porte l'id du compte, et rien d'autre ne la
+    /// porte.
+    #[test]
+    fn only_a_console_session_label_names_a_person() {
+        let account = Uuid::now_v7();
+        let label = agentos_store::api_keys::session_label(account);
+        assert_eq!(
+            console_account_of(&AuditActor::Operator(label)),
+            Some(account)
+        );
+        for other in ["ops-console", "claude-code", "session-pas-un-uuid", ""] {
+            assert_eq!(
+                console_account_of(&AuditActor::Operator(other.to_owned())),
+                None,
+                "{other:?}"
+            );
+        }
+        assert_eq!(console_account_of(&AuditActor::System), None);
+    }
+
+    /// **Le refus et son contraire, par la vraie pile HTTP.**
+    ///
+    /// Quatre appels sur deux routes, dont l'une engage : le membre est refusé
+    /// avec la phrase qui dit quoi demander, le propriétaire passe, le membre
+    /// passe sur l'écriture qui n'engage rien, et la clé d'intégration —
+    /// celle qui n'a aucun humain derrière — n'a rien perdu.
+    #[tokio::test]
+    async fn a_member_is_refused_where_an_owner_and_an_integration_key_pass() {
+        let Some(db) = db().await else { return };
+
+        let tenant = TenantId::new_v7(chrono::Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'roles')")
+            .bind(tenant.as_uuid())
+            .bind(format!("roles-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit");
+
+        let keys = Keyring::new(ApiKeys::parse("").expect("empty"), db.clone(), MASTER);
+
+        // Deux personnes : la première est propriétaire par construction, la
+        // seconde ne l'est pas. C'est `accounts::create` qui décide, et c'est
+        // le fait sur lequel tout ce fichier repose.
+        let token_of = |who: &str| {
+            let db = db.clone();
+            let hasher = keys.hasher().clone();
+            let email = format!("{who}-{}@example.test", Uuid::now_v7().simple());
+            async move {
+                let account = agentos_store::accounts::create(
+                    &db,
+                    Uuid::now_v7(),
+                    tenant,
+                    &email,
+                    &hash_password("un-mot-de-passe-honnete"),
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("créer la personne");
+                let issued = agentos_app::api_keys::issue(
+                    &db,
+                    &hasher,
+                    tenant,
+                    &agentos_store::api_keys::session_label(account.id),
+                    &AuditActor::Operator("test".to_owned()),
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("ouvrir la session");
+                (
+                    account.role,
+                    format!("Bearer {}", issued.secret.expose_for_transport()),
+                )
+            }
+        };
+        let (owner_role, owner) = token_of("fondatrice").await;
+        let (member_role, member) = token_of("stagiaire").await;
+        assert_eq!(owner_role, agentos_store::accounts::ConsoleRole::Owner);
+        assert_eq!(member_role, agentos_store::accounts::ConsoleRole::Member);
+
+        // La clé d'intégration du locataire : aucune ligne dans
+        // `console_accounts`, donc aucun rôle à lire.
+        let integration = agentos_app::api_keys::issue(
+            &db,
+            keys.hasher(),
+            tenant,
+            "claude-code",
+            &AuditActor::Operator("test".to_owned()),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("émettre");
+        let integration = format!("Bearer {}", integration.secret.expose_for_transport());
+
+        // Deux routes, l'une engage et l'autre non, derrière les deux couches
+        // dans l'ordre où `with_api_stack` les monte.
+        let app = Router::new()
+            .route("/v1/halt", axum::routing::post(|| async { "arrêtée" }))
+            .route("/v1/work", axum::routing::post(|| async { "notée" }))
+            .layer(axum::middleware::from_fn_with_state(
+                db.clone(),
+                require_console_role,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                keys.clone(),
+                require_api_key,
+            ));
+
+        let call = |token: String, path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        HttpRequest::post(path)
+                            .header(header::AUTHORIZATION, token)
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("service");
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let (status, body) = call(member.clone(), "/v1/halt").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("owner_role_required"), "{body}");
+        assert!(
+            body.contains("/v1/console/accounts/role"),
+            "le refus doit dire qui peut donner le droit : {body}"
+        );
+
+        // Et avec le droit, ça passe — sans quoi on aurait tout fermé.
+        let (status, body) = call(owner.clone(), "/v1/halt").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(member.clone(), "/v1/work").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "un membre écrit ce qui n'engage rien : {body}"
+        );
+
+        let (status, body) = call(integration, "/v1/halt").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "une clé d'intégration n'a pas d'humain derrière et ne perd rien : {body}"
+        );
     }
 }

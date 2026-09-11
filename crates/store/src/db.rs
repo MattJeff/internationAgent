@@ -622,6 +622,114 @@ mod tests {
         tx.rollback().await.expect("rollback");
     }
 
+    /// **Une clé étrangère est vérifiée hors de la RLS, et celles qui pointent
+    /// vers `employees` portent donc le locataire.**
+    ///
+    /// Postgres exécute `RI_FKey_check_ins` en tant que propriétaire de la table
+    /// référencée — `postgres` ici — donc la lecture de `employees` que la
+    /// contrainte fait ne voit aucune policy. `references employees (id)`
+    /// accepte l'identifiant du siège de n'importe quel locataire, pendant que
+    /// la policy de la table enfant, elle, ne regarde que `tenant_id` — que la
+    /// ligne écrite porte correctement, puisque le code la remplit depuis
+    /// `tx.tenant_id()`. Les deux gardes sont satisfaites et la ligne passe.
+    ///
+    /// Le test au-dessous prouve ce qu'il en coûte. Celui-ci tient la classe :
+    /// `0103` a rendu les trente-sept clés composites, et une trente-huitième
+    /// écrite demain sans son `tenant_id` échoue ici plutôt que dans six mois.
+    /// Le compte final est la moitié qui compte — une balade qui ne trouve rien
+    /// satisfait l'assertion pour toujours.
+    #[tokio::test]
+    async fn every_foreign_key_into_employees_carries_the_tenant() {
+        let Some(db) = db().await else { return };
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+
+        let loose: Vec<String> = sqlx::query_scalar(
+            "SELECT conrelid::regclass::text || '.' || conname \
+               FROM pg_constraint \
+              WHERE contype = 'f' AND confrelid = 'employees'::regclass \
+                AND NOT EXISTS ( \
+                      SELECT 1 FROM unnest(conkey) AS k \
+                       JOIN pg_attribute a \
+                         ON a.attrelid = conrelid AND a.attnum = k \
+                       WHERE a.attname = 'tenant_id') \
+              ORDER BY 1",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("query pg_constraint");
+        assert!(
+            loose.is_empty(),
+            "ces clés étrangères vers `employees` ne portent pas `tenant_id`, donc Postgres \
+             les vérifie hors de la RLS et un locataire peut poser une ligne sur le siège \
+             d'un autre : {loose:?} — voir `migrations/0103` pour la forme composite"
+        );
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint \
+              WHERE contype = 'f' AND confrelid = 'employees'::regclass",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+        assert!(
+            total >= 38,
+            "seulement {total} clés étrangères vers `employees` ; ce test interroge la mauvaise base"
+        );
+
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **Ce que la clé composite empêche, en une ligne écrite depuis le
+    /// voisin.**
+    ///
+    /// `employee_charters` est le pire cas de la classe parce que sa clé
+    /// primaire est `employee_id` seul : B écrit une charte sur le siège de A,
+    /// la ligne porte le `tenant_id` de B donc la policy la laisse passer, et A
+    /// ne peut plus poser la sienne — ni voir pourquoi, la ligne fautive lui
+    /// étant invisible. Avant `0103` cet `INSERT` réussissait.
+    ///
+    /// Écrit en SQL nu plutôt qu'à travers `Charter::save` : le sujet est la
+    /// contrainte, pas l'appelant, et les appelants d'aujourd'hui sont tous
+    /// gardés par une lecture de `employees` à la main — c'est exactement ce que
+    /// cette contrainte cesse de demander à chaque nouvel appelant.
+    #[tokio::test]
+    async fn a_neighbour_cannot_file_a_row_against_another_tenants_seat() {
+        let Some(db) = db().await else { return };
+        let (a, a_employee) = seed(&db, "charter-a").await;
+        let (b, _) = seed(&db, "charter-b").await;
+
+        let mut tx = db.tenant_tx(b).await.expect("tenant tx");
+        let squatted = sqlx::query(
+            "INSERT INTO employee_charters (employee_id, tenant_id, role, objective) \
+             VALUES ($1, $2, 'international-buyer', '{}'::jsonb)",
+        )
+        .bind(a_employee)
+        .bind(b.as_uuid())
+        .execute(&mut **tx)
+        .await;
+        assert!(
+            squatted.is_err(),
+            "B a posé une charte sur le siège de A : la clé étrangère ne porte pas le locataire"
+        );
+        tx.rollback().await.expect("rollback");
+
+        // Et chez lui, rien n'a changé.
+        let mut tx = db.tenant_tx(a).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO employee_charters (employee_id, tenant_id, role, objective) \
+             VALUES ($1, $2, 'international-buyer', '{}'::jsonb)",
+        )
+        .bind(a_employee)
+        .bind(a.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("A doit pouvoir charter son propre siège");
+        tx.commit().await.expect("commit");
+
+        drop_tenant(&db, a).await;
+        drop_tenant(&db, b).await;
+    }
+
     /// **Every table in the schema is confined, and confined against its owner.**
     ///
     /// Asked of `pg_class` and `pg_policies` rather than of the migrations, for
