@@ -776,6 +776,17 @@ const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 ///   première pour ce registre, où la revendication tient sur un test qui
 ///   casse et pas sur une lecture datée de la liste d'outils d'un tiers.
 ///
+///   **2026-09-11 — le service est rattaché, et sans cette entrée.** Rien
+///   n'attendait l'entrée nommée pour brancher : [`CUSTOM`] prend l'URL dans
+///   la requête, c'est le cas « le client fait tourner ce serveur et donne son
+///   adresse », et `apps/server/src/routes/social.rs` ne lit pas le
+///   connecteur — il lit le HANDLE (`social`). Donc l'entrée reste à écrire le
+///   jour du déploiement, elle vaudra toujours douze lignes, et rien du
+///   câblage ne bougera ce jour-là. Ce module de routes argumente le choix
+///   « connecteur » contre l'autre (hébergé par le déploiement et branché tout
+///   seul), et `docs/SOCIAL.md` § « Comment un locataire publie aujourd'hui »
+///   porte les six gestes.
+///
 /// * **Buffer** — le miroir exact du refus Vercel, resondé le 2026-09-02 sur
 ///   `mcp.buffer.com` : `token_endpoint_auth_methods_supported: ["none"]` et
 ///   rien d'autre — un client public en PKCE seul — aggravé de

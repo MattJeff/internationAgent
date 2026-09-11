@@ -519,6 +519,73 @@ Pannes possibles, et ce qu'elles veulent dire :
 | `-32603` « pas de routeur » | le déploiement est mal câblé : `McpServerState::attach` n'a pas été appelé |
 | `isError: true` avec un `code` | la route a refusé. C'est le produit qui parle, pas le transport ; le code est celui que la route rend déjà à la console |
 
+### 1.4i Publier sur les réseaux sociaux — un connecteur, pas un service interne
+
+`apps/social` (`docs/SOCIAL.md`) est un serveur MCP **séparé** : sa base, ses
+jetons par tenant, ses six outils, ses cinq plateformes. Le produit ne l'héberge
+pas et ne le branche pour personne tout seul — un locataire le branche comme il
+branche GitHub, et publie ensuite par quatre chemins de ce déploiement.
+
+Prérequis, dans l'ordre. Les trois premiers sont des outils qui existaient déjà,
+et c'est le but :
+
+```bash
+# 0. Le service tourne quelque part, et ce locataire-ci a un jeton.
+#    (sur l'hôte du service, pas ici) agentos-social mint-tenant acme
+#    -> imprime le jeton UNE fois ; il n'y a pas de route qui le refrappe.
+
+# 1. Brancher, sous le handle `social` — ce nom est ce que les routes cherchent.
+curl -sX POST $API/v1/mcp/connect -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"server":"social","connector":"custom","url":"https://social.example/mcp",
+       "reach":"public","token":"<le jeton frappé>"}'
+
+# 2. Lire sa table et l'empreinte de chaque outil.
+curl -sX POST $API/v1/mcp/servers/social/discover -H "$AUTH"
+
+# 3. Épingler les outils qu'on veut, au digest qu'on vient de lire.
+curl -sX PUT $API/v1/mcp/servers/social/tools/post_publish -H "$AUTH" \
+  -H 'content-type: application/json' -d '{"risk":"write","digest":"<64 hex>"}'
+```
+
+**L'étape 3 n'est pas une formalité** : un outil que personne n'a déclaré est
+`destructive`, donc il demande un humain, donc l'appel est refusé. C'est la
+panne la plus probable d'un premier essai, et elle se lit `403
+tool_not_declared`.
+
+Puis les quatre routes, toutes sous la clé du locataire :
+
+```
+GET  /v1/social/accounts           # les comptes connectés (plateforme, handle, état)
+POST /v1/social/accounts/connect   # {"platform":"x|linkedin|instagram|tiktok|youtube"}
+                                   #   -> l'URL OAuth qu'un HUMAIN ouvre
+POST /v1/social/preview            # {"account_id","text","media"?,"poll"?,…}
+                                   #   -> le contenu exact + l'empreinte à contresigner
+POST /v1/social/posts              # idem + "idempotency_key" (obligatoire) et
+                                   #   "expected_media_digests" (celles de l'aperçu)
+GET  /v1/social/posts?limit=<1..200>  # ce qui est parti
+```
+
+Le corps part **tel quel** comme arguments de l'outil : le service est
+l'autorité sur son propre schéma, il borne chaque champ et cite la limite exacte
+de chaque plateforme. La réponse est le `CallToolResult` du service, intact —
+`content[0].text` porte le JSON de l'outil, `isError` dit si l'outil a refusé.
+Un refus d'outil (une limite de plateforme, `media_change`, un compte inconnu)
+est **200 avec `isError: true`**, parce que c'est une réponse et pas une panne.
+
+| ce que l'appelant voit | ce que c'est |
+|---|---|
+| `404 no_social_binding` | rien n'est branché sous le handle `social` — ou ce qui l'est ne sert pas cet outil |
+| `403 tool_not_declared` | branché mais pas vetté : `discover`, puis `declare_tool` avec le digest lu |
+| `422` avec le code du service | le service a dit non à quelque chose que l'appelant contrôle |
+| `503 social_unavailable` | le service n'a pas répondu ; la flotte se relie toute seule à la prochaine passe (§3.5) |
+| `200` avec `isError: true` | la plateforme ou l'aperçu a refusé, avec le mot du service |
+
+Deux choses que ce câblage ne fait pas, et c'est écrit dans le code plutôt que
+promis ici : il ne sait prononcer que **cinq noms d'outils**, tous de la table
+d'éditeur, aucun de la seconde table `/mcp/messagerie` — un test crible la liste
+et le source du module. Et il ne mint, ne stocke et ne déchiffre aucun jeton de
+plateforme : ceux-ci vivent scellés chez le service, sous **sa** clé maître.
+
 ### 1.5 The policy ceiling you have to install
 
 **This is the step that decides whether the deployment does anything at all.**

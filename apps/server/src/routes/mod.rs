@@ -81,6 +81,11 @@ pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money 
 pub mod policy;
 pub mod pool;
 pub mod sequences;
+// le social : `apps/social` est un agrégateur abouti et séparé ; ces quatre
+// chemins sont tout ce qu'il fallait pour qu'un locataire qui l'a branché
+// publie depuis le produit. Aucun octet de plateforme ne passe par ici — le
+// service le fait, et lui seul sait ce qu'une plateforme accepte.
+pub mod social;
 // le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
 // pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
 // lecture est montée hors de toute clé; sa bascule est un acte de locataire.

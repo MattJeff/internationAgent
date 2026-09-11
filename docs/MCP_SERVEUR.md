@@ -206,6 +206,7 @@ Un outil par route utile de `/v1/*`, groupés en trois domaines
 | `societe`      | ce que la société **est** : employés, équipes, entreprises, limites, arrêt   |
 | `commerce`     | ce qu'elle **vend** : prospects, séquences, devis, factures, rendez-vous     |
 | `exploitation` | ce qu'elle **exploite** : journal, dépenses, files, approbations, rapports   |
+| `social`       | ce qu'elle **publie** : comptes sociaux branchés, aperçu, publication, historique (2026-09-11 ; `docs/SOCIAL.md`) |
 
 Chaque outil déclare un risque, et le risque devient l'annotation que le client
 lit pour décider quoi faire confirmer :

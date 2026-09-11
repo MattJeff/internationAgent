@@ -703,7 +703,11 @@ fn app(
     // as `secret_decrypt_failed` on a verifier that was sealed correctly.
     let mcp_state = McpState::new(
         db.clone(),
-        fleets,
+        // Cloné, pas déplacé : `routes::social` lit le MÊME registre. Deux
+        // registres seraient un branchement visible par la page des
+        // intégrations et absent de la flotte que les routes sociales
+        // interrogent — un `Fleets` partage sa carte, pas ses copies.
+        fleets.clone(),
         credentials.clone(),
         config.oauth_clients.clone(),
         bridges,
@@ -861,6 +865,13 @@ fn app(
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
             .merge(routes::mcp::router(mcp_state.clone()))
+            // Juste après, et c'est l'ordre du parcours : on branche
+            // l'agrégateur comme n'importe quel connecteur, puis on publie par
+            // lui. Ces routes ne détiennent que le registre des flottes —
+            // aucune base, aucun credential, aucun octet de média : le service
+            // branché fait tout, et son module dit pourquoi c'est un
+            // connecteur et pas un service interne.
+            .merge(routes::social::router(fleets))
             // The step that changes whose bill this is. Before it, no tenant has
             // a model and no employee takes a turn; after it, every token is the
             // customer's. See its module docs for why a refused key is a 200.

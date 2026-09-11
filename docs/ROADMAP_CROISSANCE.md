@@ -127,6 +127,12 @@ de rendez-vous. **Ensuite** seulement, l'enrichissement et la qualification.
 locataire branche ses comptes, ses employés publient — est du câblage, pas de
 la conception.
 
+**Fait le 2026-09-11**, et par du câblage en effet : le service reste un serveur
+MCP séparé que le locataire branche comme il branche GitHub (`CUSTOM`, handle
+`social`), et cinq outils du produit publient par lui — `docs/SOCIAL.md`
+§ « Comment un locataire publie aujourd'hui ». Ce qui reste n'est plus du code :
+déployer le service, frapper un jeton, et les revues d'app du fondateur.
+
 ### 2.4 Les appels
 L'adaptateur Twilio est réel et mocké en production. Le levier est vrai mais il
 vient après : un appel coûte cher, et il ne sert qu'à des prospects déjà
